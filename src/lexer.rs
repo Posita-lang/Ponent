@@ -1,24 +1,28 @@
 use logos::Logos;
 
-fn parse_char_literal(s: &str) -> u8 {
+fn parse_char_literal(s: &str) -> Result<u8, String> {
     let inner = &s[1..s.len() - 1];
     let mut chars = inner.chars();
     match chars.next() {
         Some('\\') => match chars.next() {
-            Some('n') => b'\n',
-            Some('r') => b'\r',
-            Some('t') => b'\t',
-            Some('\\') => b'\\',
-            Some('"') => b'"',
-            Some('\'') => b'\'',
-            Some('0') => b'\0',
+            Some('n') => Ok(b'\n'),
+            Some('r') => Ok(b'\r'),
+            Some('t') => Ok(b'\t'),
+            Some('\\') => Ok(b'\\'),
+            Some('"') => Ok(b'"'),
+            Some('\'') => Ok(b'\''),
+            Some('0') => Ok(b'\0'),
             Some('x') => {
                 let hex: String = chars.by_ref().take(2).collect();
-                u8::from_str_radix(&hex, 16).unwrap_or(0)
+                if hex.len() != 2 {
+                    return Err("invalid hex escape in char literal".to_string());
+                }
+                u8::from_str_radix(&hex, 16)
+                    .map_err(|_| "invalid hex digit in char literal".to_string())
             }
             Some('u') => {
                 if chars.next() != Some('{') {
-                    return 0;
+                    return Err("expected '{' after \\u in char literal".to_string());
                 }
                 let mut scalar = String::new();
                 let mut closed = false;
@@ -30,28 +34,43 @@ fn parse_char_literal(s: &str) -> u8 {
                     scalar.push(c);
                 }
                 if !closed {
-                    return 0;
+                    return Err("unclosed \\u{...} in char literal".to_string());
                 }
-                let code = u32::from_str_radix(&scalar, 16).unwrap_or(0);
-                if code <= 0x7F { code as u8 } else { 0 }
+                let code = u32::from_str_radix(&scalar, 16)
+                    .map_err(|_| "invalid hex in \\u{...} in char literal".to_string())?;
+                if code > 0x7F {
+                    return Err(
+                        "unicode scalar in char literal must be <= 0x7F (single byte UTF-8)"
+                            .to_string(),
+                    );
+                }
+                Ok(code as u8)
             }
-            _ => 0,
+            _ => Err("unknown escape sequence in char literal".to_string()),
         },
-        Some(c) => c as u8,
-        None => 0,
+        Some(c) => {
+            if c.len_utf8() == 1 {
+                Ok(c as u8)
+            } else {
+                Err(
+                    "multi-byte characters not allowed in char literal (use ASCII or \\u)"
+                        .to_string(),
+                )
+            }
+        }
+        None => Err("empty char literal".to_string()),
     }
 }
 
-fn parse_string_literal(s: &str) -> String {
+fn parse_string_literal(s: &str) -> Result<String, String> {
     let inner = &s[1..s.len() - 1];
     let mut result = String::new();
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
-            let next = match chars.next() {
-                Some(ch) => ch,
-                None => break,
-            };
+            let next = chars
+                .next()
+                .ok_or("unexpected end of string after backslash")?;
             match next {
                 'n' => result.push('\n'),
                 'r' => result.push('\r'),
@@ -62,12 +81,16 @@ fn parse_string_literal(s: &str) -> String {
                 '0' => result.push('\0'),
                 'x' => {
                     let hex: String = chars.by_ref().take(2).collect();
-                    let byte = u8::from_str_radix(&hex, 16).unwrap_or(0);
+                    if hex.len() != 2 {
+                        return Err("invalid hex escape in string literal".to_string());
+                    }
+                    let byte = u8::from_str_radix(&hex, 16)
+                        .map_err(|_| "invalid hex digit in string literal".to_string())?;
                     result.push(byte as char);
                 }
                 'u' => {
                     if chars.next() != Some('{') {
-                        continue;
+                        return Err("expected '{' after \\u in string literal".to_string());
                     }
                     let mut scalar = String::new();
                     let mut closed = false;
@@ -79,30 +102,38 @@ fn parse_string_literal(s: &str) -> String {
                         scalar.push(c);
                     }
                     if !closed {
-                        continue;
+                        return Err("unclosed \\u{...} in string literal".to_string());
                     }
-                    let code = u32::from_str_radix(&scalar, 16).unwrap_or(0);
-                    result.push(std::char::from_u32(code).unwrap_or('\u{FFFD}'));
+                    let code = u32::from_str_radix(&scalar, 16)
+                        .map_err(|_| "invalid hex in \\u{...} in string literal".to_string())?;
+                    let c = std::char::from_u32(code).ok_or_else(|| {
+                        format!("invalid unicode scalar {:#x} in string literal", code)
+                    })?;
+                    result.push(c);
                 }
-                _ => {}
+                _ => {
+                    return Err(format!(
+                        "unknown escape sequence '\\{}' in string literal",
+                        next
+                    ));
+                }
             }
         } else {
             result.push(c);
         }
     }
-    result
+    Ok(result)
 }
 
-fn parse_byte_string_literal(s: &str) -> Vec<u8> {
+fn parse_byte_string_literal(s: &str) -> Result<Vec<u8>, String> {
     let inner = &s[2..s.len() - 1];
     let mut result = Vec::new();
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
-            let next = match chars.next() {
-                Some(ch) => ch,
-                None => break,
-            };
+            let next = chars
+                .next()
+                .ok_or("unexpected end of byte string after backslash")?;
             match next {
                 'n' => result.push(b'\n'),
                 'r' => result.push(b'\r'),
@@ -113,21 +144,30 @@ fn parse_byte_string_literal(s: &str) -> Vec<u8> {
                 '0' => result.push(b'\0'),
                 'x' => {
                     let hex: String = chars.by_ref().take(2).collect();
-                    let byte = u8::from_str_radix(&hex, 16).unwrap_or(0);
+                    if hex.len() != 2 {
+                        return Err("invalid hex escape in byte string literal".to_string());
+                    }
+                    let byte = u8::from_str_radix(&hex, 16)
+                        .map_err(|_| "invalid hex digit in byte string literal".to_string())?;
                     result.push(byte);
                 }
-                _ => {}
+                _ => {
+                    return Err(format!(
+                        "unknown escape sequence '\\{}' in byte string literal",
+                        next
+                    ));
+                }
             }
         } else {
             result.push(c as u8);
         }
     }
-    result
+    Ok(result)
 }
 
 #[derive(Logos, Debug, PartialEq, Clone)]
 pub enum Token {
-    #[regex("[ \t\n\x0C]+", logos::skip)]
+    #[regex("[ \t\r\n\x0C]+", logos::skip)]
     #[regex("//[^\n]*", logos::skip, allow_greedy = true)]
     #[regex("/\\*[^\\*]*\\*+(?:[^/\\*][^\\*]*\\*+)*/", logos::skip)]
     WhitespaceOrComment,
@@ -320,6 +360,8 @@ pub enum Token {
     Old,
     #[token("audit_log")]
     AuditLog,
+    #[token("interrupt")]
+    Interrupt,
 
     #[regex("[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
@@ -339,13 +381,15 @@ pub enum Token {
 
     #[regex("[0-9][0-9_]*\\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?", |lex| {
         let s = lex.slice().replace('_', "");
-        s.parse::<f64>().map(|f| if f.is_finite() { f } else { 0.0 }).unwrap_or(0.0)
+        let val = s.parse::<f64>().unwrap_or(f64::INFINITY);
+        if val.is_finite() { Ok(val) } else { Err("float literal not finite".to_string()) }
     })]
     #[regex("[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*", |lex| {
         let s = lex.slice().replace('_', "");
-        s.parse::<f64>().map(|f| if f.is_finite() { f } else { 0.0 }).unwrap_or(0.0)
+        let val = s.parse::<f64>().unwrap_or(f64::INFINITY);
+        if val.is_finite() { Ok(val) } else { Err("float literal not finite".to_string()) }
     })]
-    FloatLiteral(f64),
+    FloatLiteral(Result<f64, String>),
 
     #[regex("[0-9][0-9_]*", |lex| lex.slice().replace('_', "").parse::<i64>().unwrap_or(0))]
     IntLiteral(i64),
@@ -354,12 +398,15 @@ pub enum Token {
     #[regex("0b[01][01_]*", |lex| i64::from_str_radix(&lex.slice()[2..].replace('_', ""), 2).unwrap_or(0))]
     BinLiteral(i64),
 
-    #[regex("'(([^'\\\\]|\\\\.)*)'", |lex| parse_char_literal(lex.slice()))]
-    CharLiteral(u8),
+    #[regex("'(?:[^'\\\\]|\\\\[^']*|\\\\')'", |lex| parse_char_literal(lex.slice()))]
+    CharLiteral(Result<u8, String>),
     #[regex("b\"(\\\\.|[^\"\\\\])*\"", |lex| parse_byte_string_literal(lex.slice()))]
-    ByteStringLiteral(Vec<u8>),
+    ByteStringLiteral(Result<Vec<u8>, String>),
     #[regex("\"(\\\\.|[^\"\\\\])*\"", |lex| parse_string_literal(lex.slice()))]
-    StringLiteral(String),
+    StringLiteral(Result<String, String>),
+
+    #[token("'")]
+    Apostrophe,
 
     #[token("+")]
     Plus,
@@ -506,27 +553,30 @@ mod tests {
 
     #[test]
     fn test_parse_char_literal_fn() {
-        assert_eq!(parse_char_literal(r"'\n'"), b'\n');
-        assert_eq!(parse_char_literal(r"'\x41'"), b'A');
-        assert_eq!(parse_char_literal(r"'\u{7F}'"), 0x7F);
-        assert_eq!(parse_char_literal(r"'a'"), b'a');
+        assert_eq!(parse_char_literal(r"'\n'").unwrap(), b'\n');
+        assert_eq!(parse_char_literal(r"'\x41'").unwrap(), b'A');
+        assert_eq!(parse_char_literal(r"'\u{7F}'").unwrap(), 0x7F);
+        assert_eq!(parse_char_literal(r"'a'").unwrap(), b'a');
     }
 
     #[test]
     fn test_parse_string_literal_fn() {
-        assert_eq!(parse_string_literal(r#""hello\nworld""#), "hello\nworld");
-        assert_eq!(parse_string_literal(r#""\u{00E9}""#), "é");
-        assert_eq!(parse_string_literal(r#""\x41\x42""#), "AB");
+        assert_eq!(
+            parse_string_literal(r#""hello\nworld""#).unwrap(),
+            "hello\nworld"
+        );
+        assert_eq!(parse_string_literal(r#""\u{00E9}""#).unwrap(), "é");
+        assert_eq!(parse_string_literal(r#""\x41\x42""#).unwrap(), "AB");
     }
 
     #[test]
     fn test_parse_byte_string_literal_fn() {
         assert_eq!(
-            parse_byte_string_literal(r#"b"hello\nworld""#),
+            parse_byte_string_literal(r#"b"hello\nworld""#).unwrap(),
             b"hello\nworld".to_vec()
         );
         assert_eq!(
-            parse_byte_string_literal(r#"b"\x00\xFF""#),
+            parse_byte_string_literal(r#"b"\x00\xFF""#).unwrap(),
             vec![0x00, 0xFF]
         );
     }
@@ -564,7 +614,7 @@ mod tests {
     #[test]
     fn more_keywords() {
         check_tokens(
-            "and or not sizeof alignof catch panic unsafe let finally where requires ensures invariant constraint move dyn by copy ref mut wrap saturate trap Self no_default extern pub edition deprecated experimental endian bit_order align pad packed async await task channel linear consume pure io trusted ghost scope_cleanup trigger validate missing_match apply_lemma exists forall on trait impl decreases terminates cfg isolate hint must_use must_handle link_proof exhaustive no_alloc_error no_panic debug_info old audit_log",
+            "and or not sizeof alignof catch panic unsafe let finally where requires ensures invariant constraint move dyn by copy ref mut wrap saturate trap Self no_default extern pub edition deprecated experimental endian bit_order align pad packed async await task channel linear consume pure io trusted ghost scope_cleanup trigger validate missing_match apply_lemma exists forall on trait impl decreases terminates cfg isolate hint must_use must_handle link_proof exhaustive no_alloc_error no_panic debug_info old audit_log interrupt",
             vec![
                 Token::And,
                 Token::Or,
@@ -636,6 +686,7 @@ mod tests {
                 Token::DebugInfo,
                 Token::Old,
                 Token::AuditLog,
+                Token::Interrupt,
             ],
         );
     }
@@ -660,10 +711,10 @@ mod tests {
         check_tokens(
             "3.14 2.5e-3 1_000.5 1e10",
             vec![
-                Token::FloatLiteral(3.14),
-                Token::FloatLiteral(0.0025),
-                Token::FloatLiteral(1000.5),
-                Token::FloatLiteral(1e10),
+                Token::FloatLiteral(Ok(3.14)),
+                Token::FloatLiteral(Ok(0.0025)),
+                Token::FloatLiteral(Ok(1000.5)),
+                Token::FloatLiteral(Ok(1e10)),
             ],
         );
     }
@@ -673,12 +724,12 @@ mod tests {
         check_tokens(
             r"'\n' '\t' '\\' '\'' '\x41' 'a'",
             vec![
-                Token::CharLiteral(b'\n'),
-                Token::CharLiteral(b'\t'),
-                Token::CharLiteral(b'\\'),
-                Token::CharLiteral(b'\''),
-                Token::CharLiteral(b'A'),
-                Token::CharLiteral(b'a'),
+                Token::CharLiteral(Ok(b'\n')),
+                Token::CharLiteral(Ok(b'\t')),
+                Token::CharLiteral(Ok(b'\\')),
+                Token::CharLiteral(Ok(b'\'')),
+                Token::CharLiteral(Ok(b'A')),
+                Token::CharLiteral(Ok(b'a')),
             ],
         );
     }
@@ -687,9 +738,9 @@ mod tests {
     fn string_literals() {
         let source = r#""hello" "\nworld\t" "\u{00E9}""#;
         let expected = vec![
-            Token::StringLiteral("hello".into()),
-            Token::StringLiteral("\nworld\t".into()),
-            Token::StringLiteral("é".into()),
+            Token::StringLiteral(Ok("hello".into())),
+            Token::StringLiteral(Ok("\nworld\t".into())),
+            Token::StringLiteral(Ok("é".into())),
         ];
         check_tokens(source, expected);
     }
@@ -698,8 +749,8 @@ mod tests {
     fn byte_string_literals() {
         let source = r#"b"hello" b"\n\x00\xFF""#;
         let expected = vec![
-            Token::ByteStringLiteral(b"hello".to_vec()),
-            Token::ByteStringLiteral(vec![b'\n', 0x00, 0xFF]),
+            Token::ByteStringLiteral(Ok(b"hello".to_vec())),
+            Token::ByteStringLiteral(Ok(vec![b'\n', 0x00, 0xFF])),
         ];
         check_tokens(source, expected);
     }
@@ -707,7 +758,7 @@ mod tests {
     #[test]
     fn operators_and_delimiters() {
         check_tokens(
-            "+ - * / % +% -? *! & | ^ << >> ~ == != < > <= >= = += -= *= /= ! ? . .. ..= :: : ; , ( ) { } [ ] -> @ => ...",
+            "+ - * / % +% -? *! & | ^ << >> ~ == != < > <= >= = += -= *= /= ! ? . .. ..= :: : ; , ( ) { } [ ] -> @ => ... '",
             vec![
                 Token::Plus,
                 Token::Minus,
@@ -753,6 +804,7 @@ mod tests {
                 Token::At,
                 Token::FatArrow,
                 Token::Ellipsis,
+                Token::Apostrophe,
             ],
         );
     }
@@ -839,20 +891,20 @@ mod tests {
     #[test]
     fn comprehensive_small_example() {
         let source = r#"
-edition = "2026";
-type Age = exists n: UInt<8> invariant n >= 18;
-def main() -> Result<(), AppError> {
-    set x: Int<32> = 42 + 15;
-    // line comment
-    /// doc comment
-    let y = "hello\nworld";
-    return Ok(());
-}
-"#;
+        edition = "2026";
+        type Age = exists n: UInt<8> invariant n >= 18;
+        def main() -> Result<(), AppError> {
+            set x: Int<32> = 42 + 15;
+            // line comment
+            /// doc comment
+            let y = "hello\nworld";
+            return Ok(());
+        }
+        "#;
         let expected = vec![
             Token::Edition,
             Token::Assign,
-            Token::StringLiteral("2026".into()),
+            Token::StringLiteral(Ok("2026".into())),
             Token::Semicolon,
             Token::Type,
             Token::Ident("Age".into()),
@@ -898,7 +950,7 @@ def main() -> Result<(), AppError> {
             Token::Let,
             Token::Ident("y".into()),
             Token::Assign,
-            Token::StringLiteral("hello\nworld".into()),
+            Token::StringLiteral(Ok("hello\nworld".into())),
             Token::Semicolon,
             Token::Return,
             Token::Ident("Ok".into()),
@@ -914,20 +966,29 @@ def main() -> Result<(), AppError> {
 
     #[test]
     fn test_unicode_escape_handling() {
-        assert_eq!(parse_string_literal(r#""\u{41}""#), "A");
-        assert_eq!(parse_string_literal(r#""\u{0041}BC""#), "ABC");
-        assert_eq!(parse_string_literal(r#""\u{7F}""#), "\u{7F}");
-        assert_eq!(parse_string_literal(r#""\u{41""#), "");
-        assert_eq!(parse_string_literal(r#""\u{GG}""#), "\0");
+        assert_eq!(parse_string_literal(r#""\u{41}""#).unwrap(), "A");
+        assert_eq!(parse_string_literal(r#""\u{0041}BC""#).unwrap(), "ABC");
+        assert_eq!(parse_string_literal(r#""\u{7F}""#).unwrap(), "\u{7F}");
+        assert!(parse_string_literal(r#""\u{41""#).is_err());
+        assert!(parse_string_literal(r#""\u{GG}""#).is_err());
         assert_eq!(
-            parse_string_literal(r#""hello\u{26}world""#),
+            parse_string_literal(r#""hello\u{26}world""#).unwrap(),
             "hello\u{26}world"
         );
-        assert_eq!(parse_char_literal(r"'\u{41}'"), b'A');
-        assert_eq!(parse_char_literal(r"'\u{7F}'"), 0x7F);
-        assert_eq!(parse_char_literal(r"'\u{41"), 0);
-        check_tokens(r#""\u{41}BC""#, vec![Token::StringLiteral("ABC".into())]);
-        check_tokens(r#""\u{41""#, vec![Token::StringLiteral("".into())]);
+        assert_eq!(parse_char_literal(r"'\u{41}'").unwrap(), b'A');
+        assert_eq!(parse_char_literal(r"'\u{7F}'").unwrap(), 0x7F);
+        assert!(parse_char_literal(r"'\u{80}'").is_err());
+        assert!(parse_char_literal(r"'\u{41").is_err());
+        check_tokens(
+            r#""\u{41}BC""#,
+            vec![Token::StringLiteral(Ok("ABC".into()))],
+        );
+        check_tokens(
+            r#""\u{41""#,
+            vec![Token::StringLiteral(Err(
+                "unclosed \\u{...} in string literal".into(),
+            ))],
+        );
     }
 
     #[test]
@@ -951,7 +1012,10 @@ def main() -> Result<(), AppError> {
             .filter_map(|r| r.ok())
             .filter(|t| *t != Token::WhitespaceOrComment)
             .collect();
-        assert_eq!(tokens, vec![Token::FloatLiteral(0.0)]);
+        assert_eq!(
+            tokens,
+            vec![Token::FloatLiteral(Err("float literal not finite".into()))]
+        );
     }
 
     #[test]
@@ -983,26 +1047,25 @@ def main() -> Result<(), AppError> {
 
     #[test]
     fn escape_x_short_hex() {
-        assert_eq!(parse_string_literal(r#""\x1""#), "\x01");
-        assert_eq!(parse_string_literal(r#""\xAG""#), "\0");
+        assert!(parse_string_literal(r#""\x1""#).is_err());
+        assert!(parse_string_literal(r#""\xAG""#).is_err());
     }
 
     #[test]
     fn escape_u_incomplete() {
-        assert_eq!(parse_string_literal(r#""\u""#), "");
-        assert_eq!(parse_string_literal(r#""\u{""#), "");
-        assert_eq!(parse_string_literal(r#""\u{41""#), "");
+        assert!(parse_string_literal(r#""\u""#).is_err());
+        assert!(parse_string_literal(r#""\u{""#).is_err());
+        assert!(parse_string_literal(r#""\u{41""#).is_err());
     }
 
     #[test]
-    fn escape_u_surrogate_pair_yields_replacement_char() {
-        let s = parse_string_literal(r#""\u{D800}""#);
-        assert_eq!(s, "\u{FFFD}");
+    fn escape_u_surrogate_pair_yields_error() {
+        assert!(parse_string_literal(r#""\u{D800}""#).is_err());
     }
 
     #[test]
     fn escape_u_max_code_point() {
-        let s = parse_string_literal(r#""\u{10FFFF}""#);
+        let s = parse_string_literal(r#""\u{10FFFF}""#).unwrap();
         assert_eq!(s, "\u{10FFFF}");
     }
 
@@ -1010,28 +1073,27 @@ def main() -> Result<(), AppError> {
     fn multiple_escapes_in_one_string() {
         let src = r#""\n\t\\\0\x41\u{263A}""#;
         let expected = "\n\t\\\0\x41\u{263A}";
-        assert_eq!(parse_string_literal(src), expected);
+        assert_eq!(parse_string_literal(src).unwrap(), expected);
     }
 
     #[test]
     fn byte_string_escapes() {
         assert_eq!(
-            parse_byte_string_literal(r#"b"\x00\x7F\x80\xFF""#),
+            parse_byte_string_literal(r#"b"\x00\x7F\x80\xFF""#).unwrap(),
             vec![0x00, 0x7F, 0x80, 0xFF]
         );
-        assert_eq!(parse_byte_string_literal(r#"b"\x1G""#), vec![0]);
+        assert!(parse_byte_string_literal(r#"b"\x1G""#).is_err());
     }
 
     #[test]
     fn char_literal_unicode_rejects_non_ascii() {
-        assert_eq!(parse_char_literal(r"'\u{80}'"), 0);
+        assert!(parse_char_literal(r"'\u{80}'").is_err());
     }
 
     #[test]
     fn ident_with_keyword_prefix() {
-        let source = "defi letx type2";
         check_tokens(
-            source,
+            "defi letx type2",
             vec![
                 Token::Ident("defi".into()),
                 Token::Ident("letx".into()),
@@ -1090,14 +1152,15 @@ def main() -> Result<(), AppError> {
 
     #[test]
     fn line_comment_stops_at_newline() {
-        let source = "// comment\na";
-        check_tokens(source, vec![Token::Ident("a".into())]);
+        check_tokens("// comment\na", vec![Token::Ident("a".into())]);
     }
 
     #[test]
     fn mixed_whitespace_and_comments() {
-        let source = " \t  // skip\n  /* skip */ \n x";
-        check_tokens(source, vec![Token::Ident("x".into())]);
+        check_tokens(
+            " \t  // skip\n  /* skip */ \n x",
+            vec![Token::Ident("x".into())],
+        );
     }
 
     #[test]
@@ -1215,14 +1278,28 @@ def main() -> Result<(), AppError> {
 
     #[test]
     fn float_special_values_are_rejected() {
-        check_tokens("1e9999", vec![Token::FloatLiteral(0.0)]);
-        check_tokens("-1e9999", vec![Token::Minus, Token::FloatLiteral(0.0)]);
+        check_tokens(
+            "1e9999",
+            vec![Token::FloatLiteral(Err("float literal not finite".into()))],
+        );
+        check_tokens(
+            "-1e9999",
+            vec![
+                Token::Minus,
+                Token::FloatLiteral(Err("float literal not finite".into())),
+            ],
+        );
     }
 
     #[test]
     fn byte_string_literal_with_invalid_hex() {
         let source = r#"b"\xGG""#;
-        check_tokens(source, vec![Token::ByteStringLiteral(vec![0])]);
+        check_tokens(
+            source,
+            vec![Token::ByteStringLiteral(Err(
+                "invalid hex digit in byte string literal".into(),
+            ))],
+        );
     }
 
     #[test]
@@ -1243,5 +1320,78 @@ def main() -> Result<(), AppError> {
             .filter(|t| *t != Token::WhitespaceOrComment)
             .collect();
         assert_eq!(tokens, vec![Token::ModuleDocComment(String::new())]);
+    }
+
+    #[test]
+    fn apostrophe_in_attribute_access() {
+        let source = "x'len y'first";
+        check_tokens(
+            source,
+            vec![
+                Token::Ident("x".into()),
+                Token::Apostrophe,
+                Token::Ident("len".into()),
+                Token::Ident("y".into()),
+                Token::Apostrophe,
+                Token::Ident("first".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn apostrophe_not_confusing_with_char_literal() {
+        let source = "'a' x'len";
+        check_tokens(
+            source,
+            vec![
+                Token::CharLiteral(Ok(b'a')),
+                Token::Ident("x".into()),
+                Token::Apostrophe,
+                Token::Ident("len".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn carriage_return_skipped() {
+        let source = "a\r\nb";
+        let tokens: Vec<_> = Token::lexer(source)
+            .filter_map(|r| r.ok())
+            .filter(|t| *t != Token::WhitespaceOrComment)
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![Token::Ident("a".into()), Token::Ident("b".into())]
+        );
+    }
+
+    #[test]
+    fn invalid_char_escape_reports_error() {
+        let source = r"'\q'";
+        let tokens: Vec<_> = Token::lexer(source)
+            .filter_map(|r| r.ok())
+            .filter(|t| *t != Token::WhitespaceOrComment)
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![Token::CharLiteral(Err(
+                "unknown escape sequence in char literal".into()
+            ))]
+        );
+    }
+
+    #[test]
+    fn invalid_string_escape_reports_error() {
+        let source = r#""\p""#;
+        let tokens: Vec<_> = Token::lexer(source)
+            .filter_map(|r| r.ok())
+            .filter(|t| *t != Token::WhitespaceOrComment)
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![Token::StringLiteral(Err(
+                "unknown escape sequence '\\p' in string literal".into()
+            ))]
+        );
     }
 }
