@@ -15,7 +15,16 @@ fn parse_char_literal(s: &str) -> Result<u8, String> {
             Some('x') => {
                 let hex: String = chars.by_ref().take(2).collect();
                 if hex.len() != 2 {
-                    return Err("invalid hex escape in char literal".to_string());
+                    return Err("\\x must be followed by exactly 2 hex digits".to_string());
+                }
+                if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err("invalid hex digit in char literal".to_string());
+                }
+                let mut peekable = chars.clone();
+                if let Some(c) = peekable.next() {
+                    if c.is_ascii_hexdigit() {
+                        return Err("expected exactly 2 hex digits after \\x".to_string());
+                    }
                 }
                 u8::from_str_radix(&hex, 16)
                     .map_err(|_| "invalid hex digit in char literal".to_string())
@@ -26,23 +35,29 @@ fn parse_char_literal(s: &str) -> Result<u8, String> {
                 }
                 let mut scalar = String::new();
                 let mut closed = false;
-                for c in chars.by_ref() {
+                for c in chars.by_ref().take(6) {
                     if c == '}' {
                         closed = true;
                         break;
                     }
+                    if !c.is_ascii_hexdigit() {
+                        return Err("invalid hex digit in \\u{...} in char literal".to_string());
+                    }
                     scalar.push(c);
                 }
                 if !closed {
-                    return Err("unclosed \\u{...} in char literal".to_string());
+                    if let Some(c) = chars.next() {
+                        if c != '}' {
+                            return Err("too many hex digits in \\u{...} (max 6)".to_string());
+                        }
+                    } else {
+                        return Err("unclosed \\u{...} in char literal".to_string());
+                    }
                 }
                 let code = u32::from_str_radix(&scalar, 16)
                     .map_err(|_| "invalid hex in \\u{...} in char literal".to_string())?;
-                if code > 0x7F {
-                    return Err(
-                        "unicode scalar in char literal must be <= 0x7F (single byte UTF-8)"
-                            .to_string(),
-                    );
+                if code > 0xFF || (0xD800..=0xDFFF).contains(&code) || code > 0x10FFFF {
+                    return Err("unicode scalar in char literal must be 0x00..0xFF, not a surrogate, and valid Unicode".to_string());
                 }
                 Ok(code as u8)
             }
@@ -82,7 +97,16 @@ fn parse_string_literal(s: &str) -> Result<String, String> {
                 'x' => {
                     let hex: String = chars.by_ref().take(2).collect();
                     if hex.len() != 2 {
-                        return Err("invalid hex escape in string literal".to_string());
+                        return Err("\\x must be followed by exactly 2 hex digits".to_string());
+                    }
+                    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Err("invalid hex digit in string literal".to_string());
+                    }
+                    let mut peekable = chars.clone();
+                    if let Some(c) = peekable.next() {
+                        if c.is_ascii_hexdigit() {
+                            return Err("expected exactly 2 hex digits after \\x".to_string());
+                        }
                     }
                     let byte = u8::from_str_radix(&hex, 16)
                         .map_err(|_| "invalid hex digit in string literal".to_string())?;
@@ -94,15 +118,26 @@ fn parse_string_literal(s: &str) -> Result<String, String> {
                     }
                     let mut scalar = String::new();
                     let mut closed = false;
-                    for c in chars.by_ref() {
+                    for c in chars.by_ref().take(6) {
                         if c == '}' {
                             closed = true;
                             break;
                         }
+                        if !c.is_ascii_hexdigit() {
+                            return Err(
+                                "invalid hex digit in \\u{...} in string literal".to_string()
+                            );
+                        }
                         scalar.push(c);
                     }
                     if !closed {
-                        return Err("unclosed \\u{...} in string literal".to_string());
+                        if let Some(c) = chars.next() {
+                            if c != '}' {
+                                return Err("too many hex digits in \\u{...} (max 6)".to_string());
+                            }
+                        } else {
+                            return Err("unclosed \\u{...} in string literal".to_string());
+                        }
                     }
                     let code = u32::from_str_radix(&scalar, 16)
                         .map_err(|_| "invalid hex in \\u{...} in string literal".to_string())?;
@@ -145,12 +180,22 @@ fn parse_byte_string_literal(s: &str) -> Result<Vec<u8>, String> {
                 'x' => {
                     let hex: String = chars.by_ref().take(2).collect();
                     if hex.len() != 2 {
-                        return Err("invalid hex escape in byte string literal".to_string());
+                        return Err("\\x must be followed by exactly 2 hex digits".to_string());
+                    }
+                    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Err("invalid hex digit in byte string literal".to_string());
+                    }
+                    let mut peekable = chars.clone();
+                    if let Some(c) = peekable.next() {
+                        if c.is_ascii_hexdigit() {
+                            return Err("expected exactly 2 hex digits after \\x".to_string());
+                        }
                     }
                     let byte = u8::from_str_radix(&hex, 16)
                         .map_err(|_| "invalid hex digit in byte string literal".to_string())?;
                     result.push(byte);
                 }
+                'u' => return Err("\\u{...} is not allowed in byte string literals".to_string()),
                 _ => {
                     return Err(format!(
                         "unknown escape sequence '\\{}' in byte string literal",
@@ -381,13 +426,19 @@ pub enum Token {
 
     #[regex("[0-9][0-9_]*\\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?", |lex| {
         let s = lex.slice().replace('_', "");
-        let val = s.parse::<f64>().unwrap_or(f64::INFINITY);
-        if val.is_finite() { Ok(val) } else { Err("float literal not finite".to_string()) }
+        match s.parse::<f64>() {
+            Ok(val) if val.is_finite() => Ok(val),
+            Ok(_) => Err("float literal must be finite (no NaN or Inf)".to_string()),
+            Err(_) => Err("invalid float literal".to_string()),
+        }
     })]
     #[regex("[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*", |lex| {
         let s = lex.slice().replace('_', "");
-        let val = s.parse::<f64>().unwrap_or(f64::INFINITY);
-        if val.is_finite() { Ok(val) } else { Err("float literal not finite".to_string()) }
+        match s.parse::<f64>() {
+            Ok(val) if val.is_finite() => Ok(val),
+            Ok(_) => Err("float literal must be finite (no NaN or Inf)".to_string()),
+            Err(_) => Err("invalid float literal".to_string()),
+        }
     })]
     FloatLiteral(Result<f64, String>),
 
@@ -517,9 +568,6 @@ pub enum Token {
     FatArrow,
     #[token("...")]
     Ellipsis,
-
-    #[allow(dead_code)]
-    Error,
 }
 
 #[cfg(test)]
@@ -566,6 +614,11 @@ mod tests {
         assert_eq!(parse_char_literal(r"'\x41'").unwrap(), b'A');
         assert_eq!(parse_char_literal(r"'\u{7F}'").unwrap(), 0x7F);
         assert_eq!(parse_char_literal(r"'a'").unwrap(), b'a');
+        assert_eq!(parse_char_literal(r"'\u{80}'").unwrap(), 0x80);
+        assert_eq!(parse_char_literal(r"'\u{FF}'").unwrap(), 0xFF);
+        assert!(parse_char_literal(r"'\u{100}'").is_err());
+        assert!(parse_char_literal(r"'\u{D800}'").is_err());
+        assert!(parse_char_literal(r"'\u{10FFFF}'").is_err());
     }
 
     #[test]
@@ -588,6 +641,7 @@ mod tests {
             parse_byte_string_literal(r#"b"\x00\xFF""#).unwrap(),
             vec![0x00, 0xFF]
         );
+        assert!(parse_byte_string_literal(r#"b"\u{41}""#).is_err());
     }
 
     #[test]
@@ -1003,7 +1057,7 @@ mod tests {
         );
         assert_eq!(parse_char_literal(r"'\u{41}'").unwrap(), b'A');
         assert_eq!(parse_char_literal(r"'\u{7F}'").unwrap(), 0x7F);
-        assert!(parse_char_literal(r"'\u{80}'").is_err());
+        assert!(parse_char_literal(r"'\u{80}'").unwrap() == 0x80);
         assert!(parse_char_literal(r"'\u{41").is_err());
         check_tokens(
             r#""\u{41}BC""#,
@@ -1046,7 +1100,9 @@ mod tests {
             .collect();
         assert_eq!(
             tokens,
-            vec![Token::FloatLiteral(Err("float literal not finite".into()))]
+            vec![Token::FloatLiteral(Err(
+                "float literal must be finite (no NaN or Inf)".into()
+            ))]
         );
     }
 
@@ -1081,6 +1137,7 @@ mod tests {
     fn escape_x_short_hex() {
         assert!(parse_string_literal(r#""\x1""#).is_err());
         assert!(parse_string_literal(r#""\xAG""#).is_err());
+        assert!(parse_string_literal(r#""\x41A""#).is_err());
     }
 
     #[test]
@@ -1115,11 +1172,13 @@ mod tests {
             vec![0x00, 0x7F, 0x80, 0xFF]
         );
         assert!(parse_byte_string_literal(r#"b"\x1G""#).is_err());
+        assert!(parse_byte_string_literal(r#"b"\u{41}""#).is_err());
     }
 
     #[test]
     fn char_literal_unicode_rejects_non_ascii() {
-        assert!(parse_char_literal(r"'\u{80}'").is_err());
+        assert!(parse_char_literal(r"'\u{100}'").is_err());
+        assert!(parse_char_literal(r"'\u{D800}'").is_err());
     }
 
     #[test]
@@ -1312,13 +1371,15 @@ mod tests {
     fn float_special_values_are_rejected() {
         check_tokens(
             "1e9999",
-            vec![Token::FloatLiteral(Err("float literal not finite".into()))],
+            vec![Token::FloatLiteral(Err(
+                "float literal must be finite (no NaN or Inf)".into(),
+            ))],
         );
         check_tokens(
             "-1e9999",
             vec![
                 Token::Minus,
-                Token::FloatLiteral(Err("float literal not finite".into())),
+                Token::FloatLiteral(Err("float literal must be finite (no NaN or Inf)".into())),
             ],
         );
     }
@@ -1431,5 +1492,17 @@ mod tests {
     fn integer_max_values() {
         check_tokens("9223372036854775807", vec![Token::IntLiteral(Ok(i64::MAX))]);
         check_tokens("0x7FFFFFFFFFFFFFFF", vec![Token::HexLiteral(Ok(i64::MAX))]);
+    }
+
+    #[test]
+    fn escaped_quote_in_string() {
+        let src = r#""\"""#;
+        check_tokens(src, vec![Token::StringLiteral(Ok("\"".into()))]);
+    }
+
+    #[test]
+    fn strict_hex_escape_length() {
+        assert!(parse_string_literal(r#""\x41A""#).is_err());
+        assert!(parse_char_literal(r"'\x41A'").is_err());
     }
 }
