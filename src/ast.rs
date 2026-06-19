@@ -101,7 +101,7 @@ pub enum Expr {
     },
     Cast {
         expr: Box<Expr>,
-        ty: Type,
+        ty: Box<Type>,
         safe: bool,
         span: Span,
     },
@@ -389,6 +389,7 @@ pub enum Type {
     Path(Vec<String>, Span),
     Generic(Box<Type>, Vec<Type>, Span),
     Reference(Box<Type>, bool, Span),
+    Pointer(Box<Type>, Span),
     Slice(Box<Type>, Span),
     Array(Box<Type>, Box<Expr>, Span),
     Tuple(Vec<Type>, Span),
@@ -399,6 +400,13 @@ pub enum Type {
     },
     Projection(Box<Type>, String, Span),
     DynTrait(Vec<Type>, Span),
+    Exists {
+        name: String,
+        base: Box<Type>,
+        invariant: Box<Expr>,
+        span: Span,
+    },
+    Literal(Box<Expr>, Span),
     Never(Span),
     Error(Span),
 }

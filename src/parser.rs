@@ -5,7 +5,7 @@ use logos::Logos;
 pub struct Parser<'source> {
     lexer: logos::Lexer<'source, Token>,
     peeked: Option<Result<Token, ()>>,
-    diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,13 +70,20 @@ impl<'source> Parser<'source> {
     fn synchronize(&mut self) {
         loop {
             match self.peek() {
-                Ok(Token::Semicolon) | Ok(Token::RBrace) => return,
+                Ok(Token::Semicolon) | Ok(Token::RBrace) => {
+                    self.advance().ok();
+                    return;
+                }
                 Ok(Token::Def) | Ok(Token::Set) | Ok(Token::Let) | Ok(Token::Type)
                 | Ok(Token::Import) | Ok(Token::From) | Ok(Token::Extern) | Ok(Token::Edition)
                 | Ok(Token::At) => return,
                 Err(()) => return,
                 _ => {
-                    self.advance().ok();
+                    let tok = self.advance().ok();
+                    self.diagnostics.push(Diagnostic {
+                        message: format!("unexpected token during error recovery: {:?}", tok),
+                        span: self.span(),
+                    });
                 }
             }
         }
@@ -320,95 +327,179 @@ impl<'source> Parser<'source> {
 
     fn parse_type(&mut self) -> Result<Type, Diagnostic> {
         let start = self.span().start;
-        match self.advance() {
-            Ok(Token::Ident(name)) => {
-                let mut path = vec![name];
-                while matches!(self.peek(), Ok(Token::ColonColon)) {
+        match self.peek() {
+            Ok(Token::Ampersand) => {
+                self.advance().ok();
+                let mutable = matches!(self.peek(), Ok(Token::Mut));
+                if mutable {
                     self.advance().ok();
-                    if let Ok(Token::Ident(part)) = self.advance() {
-                        path.push(part);
-                    } else {
-                        return Err(Diagnostic {
-                            message: "expected identifier after '::'".to_string(),
-                            span: self.span(),
-                        });
-                    }
                 }
-                if matches!(self.peek(), Ok(Token::Lt)) {
+                let ty = self.parse_type()?;
+                let end = self.span().end;
+                Ok(Type::Reference(
+                    Box::new(ty),
+                    mutable,
+                    Span::new(start, end),
+                ))
+            }
+            Ok(Token::Star) => {
+                self.advance().ok();
+                let ty = self.parse_type()?;
+                let end = self.span().end;
+                Ok(Type::Pointer(Box::new(ty), Span::new(start, end)))
+            }
+            Ok(Token::LBracket) => {
+                self.advance().ok();
+                let ty = self.parse_type()?;
+                if matches!(self.peek(), Ok(Token::Semicolon)) {
                     self.advance().ok();
-                    let mut args = Vec::new();
-                    loop {
-                        let arg = self.parse_type()?;
-                        args.push(arg);
-                        match self.peek() {
-                            Ok(Token::Comma) => {
-                                self.advance().ok();
-                            }
-                            Ok(Token::Gt) => {
-                                self.advance().ok();
-                                break;
-                            }
-                            _ => {
-                                return Err(Diagnostic {
-                                    message: "expected ',' or '>' in type parameters".to_string(),
-                                    span: self.span(),
-                                });
-                            }
-                        }
-                    }
+                    let size = self.parse_expr()?;
+                    self.expect(Token::RBracket)?;
                     let end = self.span().end;
-                    Ok(Type::Generic(
-                        Box::new(Type::Path(path, Span::new(start, end))),
-                        args,
+                    Ok(Type::Array(
+                        Box::new(ty),
+                        Box::new(size),
                         Span::new(start, end),
                     ))
                 } else {
+                    self.expect(Token::RBracket)?;
                     let end = self.span().end;
-                    Ok(Type::Path(path, Span::new(start, end)))
+                    Ok(Type::Slice(Box::new(ty), Span::new(start, end)))
                 }
             }
-            Ok(Token::LParen) => {
-                if matches!(self.peek(), Ok(Token::RParen)) {
+            Ok(Token::Dyn) => {
+                self.advance().ok();
+                let mut traits = Vec::new();
+                loop {
+                    let t = self.parse_type()?;
+                    traits.push(t);
+                    if !matches!(self.peek(), Ok(Token::Plus)) {
+                        break;
+                    }
                     self.advance().ok();
-                    let end = self.span().end;
-                    Ok(Type::Tuple(Vec::new(), Span::new(start, end)))
-                } else {
-                    let mut types = Vec::new();
-                    loop {
-                        let ty = self.parse_type()?;
-                        types.push(ty);
-                        match self.peek() {
-                            Ok(Token::Comma) => {
-                                self.advance().ok();
-                            }
-                            Ok(Token::RParen) => {
-                                self.advance().ok();
-                                break;
-                            }
-                            _ => {
-                                return Err(Diagnostic {
-                                    message: "expected ',' or ')' in tuple type".to_string(),
-                                    span: self.span(),
-                                });
-                            }
+                }
+                let end = self.span().end;
+                Ok(Type::DynTrait(traits, Span::new(start, end)))
+            }
+            Ok(Token::Exists) => {
+                self.advance().ok();
+                let name = match self.advance() {
+                    Ok(Token::Ident(n)) => n,
+                    _ => {
+                        return Err(Diagnostic {
+                            message: "expected identifier after exists".to_string(),
+                            span: self.span(),
+                        });
+                    }
+                };
+                self.expect(Token::Colon)?;
+                let base = self.parse_type()?;
+                self.expect(Token::Invariant)?;
+                let invariant = Box::new(self.parse_expr()?);
+                let end = self.span().end;
+                Ok(Type::Exists {
+                    name,
+                    base: Box::new(base),
+                    invariant,
+                    span: Span::new(start, end),
+                })
+            }
+            Ok(Token::IntLiteral(_)) | Ok(Token::HexLiteral(_)) | Ok(Token::BinLiteral(_)) => {
+                let expr = self.parse_literal()?;
+                let end = self.span().end;
+                Ok(Type::Literal(Box::new(expr), Span::new(start, end)))
+            }
+            _ => match self.advance() {
+                Ok(Token::Ident(name)) => {
+                    let mut path = vec![name];
+                    while matches!(self.peek(), Ok(Token::ColonColon)) {
+                        self.advance().ok();
+                        if let Ok(Token::Ident(part)) = self.advance() {
+                            path.push(part);
+                        } else {
+                            return Err(Diagnostic {
+                                message: "expected identifier after '::'".to_string(),
+                                span: self.span(),
+                            });
                         }
                     }
-                    let end = self.span().end;
-                    Ok(Type::Tuple(types, Span::new(start, end)))
+                    if matches!(self.peek(), Ok(Token::Lt)) {
+                        self.advance().ok();
+                        let mut args = Vec::new();
+                        loop {
+                            let arg = self.parse_type()?;
+                            args.push(arg);
+                            match self.peek() {
+                                Ok(Token::Comma) => {
+                                    self.advance().ok();
+                                }
+                                Ok(Token::Gt) => {
+                                    self.advance().ok();
+                                    break;
+                                }
+                                _ => {
+                                    return Err(Diagnostic {
+                                        message: "expected ',' or '>' in type parameters"
+                                            .to_string(),
+                                        span: self.span(),
+                                    });
+                                }
+                            }
+                        }
+                        let end = self.span().end;
+                        Ok(Type::Generic(
+                            Box::new(Type::Path(path, Span::new(start, end))),
+                            args,
+                            Span::new(start, end),
+                        ))
+                    } else {
+                        let end = self.span().end;
+                        Ok(Type::Path(path, Span::new(start, end)))
+                    }
                 }
-            }
-            Ok(Token::Bang) => {
-                let end = self.span().end;
-                Ok(Type::Never(Span::new(start, end)))
-            }
-            Ok(tok) => Err(Diagnostic {
-                message: format!("expected type, found {:?}", tok),
-                span: self.span(),
-            }),
-            Err(()) => Err(Diagnostic {
-                message: "unexpected end of file in type".to_string(),
-                span: self.span(),
-            }),
+                Ok(Token::LParen) => {
+                    if matches!(self.peek(), Ok(Token::RParen)) {
+                        self.advance().ok();
+                        let end = self.span().end;
+                        Ok(Type::Tuple(Vec::new(), Span::new(start, end)))
+                    } else {
+                        let mut types = Vec::new();
+                        loop {
+                            let ty = self.parse_type()?;
+                            types.push(ty);
+                            match self.peek() {
+                                Ok(Token::Comma) => {
+                                    self.advance().ok();
+                                }
+                                Ok(Token::RParen) => {
+                                    self.advance().ok();
+                                    break;
+                                }
+                                _ => {
+                                    return Err(Diagnostic {
+                                        message: "expected ',' or ')' in tuple type".to_string(),
+                                        span: self.span(),
+                                    });
+                                }
+                            }
+                        }
+                        let end = self.span().end;
+                        Ok(Type::Tuple(types, Span::new(start, end)))
+                    }
+                }
+                Ok(Token::Bang) => {
+                    let end = self.span().end;
+                    Ok(Type::Never(Span::new(start, end)))
+                }
+                Ok(tok) => Err(Diagnostic {
+                    message: format!("expected type, found {:?}", tok),
+                    span: self.span(),
+                }),
+                Err(()) => Err(Diagnostic {
+                    message: "unexpected end of file in type".to_string(),
+                    span: self.span(),
+                }),
+            },
         }
     }
 
@@ -422,6 +513,7 @@ impl<'source> Parser<'source> {
                     Err(diag) => {
                         self.diagnostics.push(diag);
                         self.synchronize();
+                        stmts.push(Stmt::Error(Span::new(self.span().start, self.span().start)));
                     }
                 },
             }
@@ -718,6 +810,7 @@ impl<'source> Parser<'source> {
     fn parse_scope_cleanup(&mut self) -> Result<Stmt, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
+        self.expect(Token::At)?;
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
             _ => {
@@ -741,6 +834,7 @@ impl<'source> Parser<'source> {
     fn parse_trigger(&mut self) -> Result<Stmt, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
+        self.expect(Token::At)?;
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
             _ => {
@@ -1079,17 +1173,49 @@ impl<'source> Parser<'source> {
                     TypeDefinition::Enum(variants)
                 }
                 _ => {
-                    return Err(Diagnostic {
-                        message: "expected struct or enum definition".to_string(),
-                        span: self.span(),
-                    });
+                    let ty = self.parse_type()?;
+                    if matches!(self.peek(), Ok(Token::Semicolon)) {
+                        self.advance().ok();
+                    } else if matches!(self.peek(), Ok(Token::With)) {
+                        while matches!(self.peek(), Ok(Token::With)) {
+                            self.advance().ok();
+                            while !matches!(self.peek(), Ok(Token::Semicolon) | Err(())) {
+                                self.advance().ok();
+                            }
+                            if matches!(self.peek(), Ok(Token::Semicolon)) {
+                                self.advance().ok();
+                            }
+                        }
+                    } else {
+                        return Err(Diagnostic {
+                            message: "expected ';' or 'with' after type alias".to_string(),
+                            span: self.span(),
+                        });
+                    }
+                    TypeDefinition::Alias(ty)
                 }
             }
         } else {
-            return Err(Diagnostic {
-                message: "expected struct or enum definition".to_string(),
-                span: self.span(),
-            });
+            let ty = self.parse_type()?;
+            if matches!(self.peek(), Ok(Token::Semicolon)) {
+                self.advance().ok();
+            } else if matches!(self.peek(), Ok(Token::With)) {
+                while matches!(self.peek(), Ok(Token::With)) {
+                    self.advance().ok();
+                    while !matches!(self.peek(), Ok(Token::Semicolon) | Err(())) {
+                        self.advance().ok();
+                    }
+                    if matches!(self.peek(), Ok(Token::Semicolon)) {
+                        self.advance().ok();
+                    }
+                }
+            } else {
+                return Err(Diagnostic {
+                    message: "expected ';' or 'with' after type alias".to_string(),
+                    span: self.span(),
+                });
+            }
+            TypeDefinition::Alias(ty)
         };
         let end = self.span().end;
         Ok(Stmt::TypeDef {
@@ -1749,11 +1875,24 @@ impl<'source> Parser<'source> {
 mod tests {
     use super::*;
 
+    fn check_parse(source: &str) -> Program {
+        let mut parser = Parser::new(source);
+        match parser.parse_program() {
+            Ok(prog) => {
+                assert!(
+                    parser.diagnostics.is_empty(),
+                    "unexpected diagnostics: {:?}",
+                    parser.diagnostics
+                );
+                prog
+            }
+            Err(diags) => panic!("parse failed with diagnostics: {:?}", diags),
+        }
+    }
+
     #[test]
     fn test_empty_function() {
-        let src = "def main() { }";
-        let mut parser = Parser::new(src);
-        let program = parser.parse_program().expect("parse failed");
+        let program = check_parse("def main() { }");
         assert_eq!(program.items.len(), 1);
         match &program.items[0] {
             Stmt::FunctionDef {
@@ -1769,9 +1908,7 @@ mod tests {
 
     #[test]
     fn test_variable_def() {
-        let src = "def main() { set x = 42; }";
-        let mut parser = Parser::new(src);
-        let program = parser.parse_program().expect("parse failed");
+        let program = check_parse("def main() { set x = 42; }");
         match &program.items[0] {
             Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
                 Stmt::VariableDef { name, .. } => assert_eq!(name.as_ref().unwrap(), "x"),
@@ -1783,14 +1920,80 @@ mod tests {
 
     #[test]
     fn test_if_stmt() {
-        let src = "def main() { if true { } }";
-        let mut parser = Parser::new(src);
-        let program = parser.parse_program().expect("parse failed");
+        let program = check_parse("def main() { if true { } }");
         match &program.items[0] {
             Stmt::FunctionDef { body, .. } => {
                 assert!(matches!(body.as_ref().unwrap()[0], Stmt::If { .. }));
             }
             _ => panic!("expected FunctionDef"),
         }
+    }
+
+    #[test]
+    fn test_scope_cleanup_with_at() {
+        let program = check_parse("def main() { scope_cleanup @close_file { } }");
+        match &program.items[0] {
+            Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+                Stmt::ScopeCleanup { name, body: _, .. } => assert_eq!(name, "close_file"),
+                _ => panic!("expected ScopeCleanup"),
+            },
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_trigger_with_at() {
+        let program = check_parse("def main() { trigger @close_file; }");
+        match &program.items[0] {
+            Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+                Stmt::Trigger { name, .. } => assert_eq!(name, "close_file"),
+                _ => panic!("expected Trigger"),
+            },
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_reference_type() {
+        let program = check_parse("def main() { set x: &Int<32> = 0; }");
+        assert!(program.items.len() == 1);
+    }
+
+    #[test]
+    fn test_pointer_type() {
+        let program = check_parse("def main() { set x: *Int<32> = 0; }");
+        assert!(program.items.len() == 1);
+    }
+
+    #[test]
+    fn test_slice_type() {
+        let program = check_parse("def main() { set x: [Int<32>] = 0; }");
+        assert!(program.items.len() == 1);
+    }
+
+    #[test]
+    fn test_array_type() {
+        let program = check_parse("def main() { set x: [Int<32>; 10] = 0; }");
+        assert!(program.items.len() == 1);
+    }
+
+    #[test]
+    fn test_dyn_trait_type() {
+        let program = check_parse("def main() { set x: dyn Display = 0; }");
+        assert!(program.items.len() == 1);
+    }
+
+    #[test]
+    fn test_exists_type() {
+        let program = check_parse("type Age = exists n: UInt<8> invariant n >= 18;");
+        assert!(program.items.len() == 1);
+    }
+
+    #[test]
+    fn test_ellipsis_is_invalid() {
+        let src = "def main() { ...; }";
+        let mut parser = Parser::new(src);
+        let result = parser.parse_program();
+        assert!(result.is_err() || !parser.diagnostics.is_empty());
     }
 }
