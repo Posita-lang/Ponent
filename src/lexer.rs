@@ -391,12 +391,21 @@ pub enum Token {
     })]
     FloatLiteral(Result<f64, String>),
 
-    #[regex("[0-9][0-9_]*", |lex| lex.slice().replace('_', "").parse::<i64>().unwrap_or(0))]
-    IntLiteral(i64),
-    #[regex("0x[0-9a-fA-F][0-9a-fA-F_]*", |lex| i64::from_str_radix(&lex.slice()[2..].replace('_', ""), 16).unwrap_or(0))]
-    HexLiteral(i64),
-    #[regex("0b[01][01_]*", |lex| i64::from_str_radix(&lex.slice()[2..].replace('_', ""), 2).unwrap_or(0))]
-    BinLiteral(i64),
+    #[regex("[0-9][0-9_]*", |lex| {
+        let s = lex.slice().replace('_', "");
+        s.parse::<i64>().map(Ok).unwrap_or_else(|_| Err("integer literal overflow".to_string()))
+    })]
+    IntLiteral(Result<i64, String>),
+    #[regex("0x[0-9a-fA-F][0-9a-fA-F_]*", |lex| {
+        let s = lex.slice()[2..].replace('_', "");
+        i64::from_str_radix(&s, 16).map(Ok).unwrap_or_else(|_| Err("hex literal overflow".to_string()))
+    })]
+    HexLiteral(Result<i64, String>),
+    #[regex("0b[01][01_]*", |lex| {
+        let s = lex.slice()[2..].replace('_', "");
+        i64::from_str_radix(&s, 2).map(Ok).unwrap_or_else(|_| Err("binary literal overflow".to_string()))
+    })]
+    BinLiteral(Result<i64, String>),
 
     #[regex("'(?:[^'\\\\]|\\\\[^']*|\\\\')'", |lex| parse_char_literal(lex.slice()))]
     CharLiteral(Result<u8, String>),
@@ -696,14 +705,31 @@ mod tests {
         check_tokens(
             "42 0xFF 0b1010 42i32 0xFFu8 0b1101u4",
             vec![
-                Token::IntLiteral(42),
-                Token::HexLiteral(255),
-                Token::BinLiteral(10),
+                Token::IntLiteral(Ok(42)),
+                Token::HexLiteral(Ok(255)),
+                Token::BinLiteral(Ok(10)),
                 Token::IntSuffix("42i32".into()),
                 Token::HexUIntSuffix("0xFFu8".into()),
                 Token::BinUIntSuffix("0b1101u4".into()),
             ],
         );
+    }
+
+    #[test]
+    fn integer_overflow_errors() {
+        check_tokens(
+            "99999999999999999999",
+            vec![Token::IntLiteral(Err("integer literal overflow".into()))],
+        );
+        check_tokens(
+            "0xFFFFFFFFFFFFFFFFF",
+            vec![Token::HexLiteral(Err("hex literal overflow".into()))],
+        );
+        check_tokens(
+            "0b111111111111111111111111111111111111111111111111111111111111111111",
+            vec![Token::BinLiteral(Err("binary literal overflow".into()))],
+        );
+        check_tokens("-42", vec![Token::Minus, Token::IntLiteral(Ok(42))]);
     }
 
     #[test]
@@ -914,12 +940,12 @@ mod tests {
             Token::Colon,
             Token::Ident("UInt".into()),
             Token::Lt,
-            Token::IntLiteral(8),
+            Token::IntLiteral(Ok(8)),
             Token::Gt,
             Token::Invariant,
             Token::Ident("n".into()),
             Token::Ge,
-            Token::IntLiteral(18),
+            Token::IntLiteral(Ok(18)),
             Token::Semicolon,
             Token::Def,
             Token::Ident("main".into()),
@@ -939,12 +965,12 @@ mod tests {
             Token::Colon,
             Token::Ident("Int".into()),
             Token::Lt,
-            Token::IntLiteral(32),
+            Token::IntLiteral(Ok(32)),
             Token::Gt,
             Token::Assign,
-            Token::IntLiteral(42),
+            Token::IntLiteral(Ok(42)),
             Token::Plus,
-            Token::IntLiteral(15),
+            Token::IntLiteral(Ok(15)),
             Token::Semicolon,
             Token::DocComment("doc comment".into()),
             Token::Let,
@@ -998,14 +1024,20 @@ mod tests {
             .filter_map(|r| r.ok())
             .filter(|t| *t != Token::WhitespaceOrComment)
             .collect();
-        assert_eq!(tokens, vec![Token::IntLiteral(0)]);
+        assert_eq!(
+            tokens,
+            vec![Token::IntLiteral(Err("integer literal overflow".into()))]
+        );
 
         let huge_hex = "0xFFFFFFFFFFFFFFFFF";
         let tokens: Vec<_> = Token::lexer(huge_hex)
             .filter_map(|r| r.ok())
             .filter(|t| *t != Token::WhitespaceOrComment)
             .collect();
-        assert_eq!(tokens, vec![Token::HexLiteral(0)]);
+        assert_eq!(
+            tokens,
+            vec![Token::HexLiteral(Err("hex literal overflow".into()))]
+        );
 
         let huge_float = "1e9999";
         let tokens: Vec<_> = Token::lexer(huge_float)
@@ -1168,9 +1200,9 @@ mod tests {
         check_tokens(
             "1_000 0xDead_Beef 0b1111_0000",
             vec![
-                Token::IntLiteral(1000),
-                Token::HexLiteral(0xDEADBEEF),
-                Token::BinLiteral(0b11110000),
+                Token::IntLiteral(Ok(1000)),
+                Token::HexLiteral(Ok(0xDEADBEEF)),
+                Token::BinLiteral(Ok(0b11110000)),
             ],
         );
     }
@@ -1393,5 +1425,11 @@ mod tests {
                 "unknown escape sequence '\\p' in string literal".into()
             ))]
         );
+    }
+
+    #[test]
+    fn integer_max_values() {
+        check_tokens("9223372036854775807", vec![Token::IntLiteral(Ok(i64::MAX))]);
+        check_tokens("0x7FFFFFFFFFFFFFFF", vec![Token::HexLiteral(Ok(i64::MAX))]);
     }
 }
