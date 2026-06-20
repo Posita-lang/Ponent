@@ -1,6 +1,17 @@
 use crate::ast::*;
 use crate::lexer::Token;
+use bitflags::bitflags;
 use logos::Logos;
+
+bitflags! {
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct ParseRestrictions: u8 {
+        const NO_STRUCT_LITERAL = 1 << 0;
+        const ALLOW_TYPE_PARAMS = 1 << 1;
+        const STMT_EXPR         = 1 << 2;
+        const VALUE_BLOCK       = 1 << 3;
+    }
+}
 
 pub struct Parser<'source> {
     lexer: logos::Lexer<'source, Token>,
@@ -8,7 +19,7 @@ pub struct Parser<'source> {
     pub diagnostics: Vec<Diagnostic>,
     recursion_depth: usize,
     max_recursion_depth: usize,
-    restrict_struct_literal: bool,
+    restrictions: ParseRestrictions,
 }
 
 #[derive(Debug, Clone)]
@@ -25,7 +36,7 @@ impl<'source> Parser<'source> {
             diagnostics: Vec::new(),
             recursion_depth: 0,
             max_recursion_depth: 256,
-            restrict_struct_literal: false,
+            restrictions: ParseRestrictions::STMT_EXPR,
         }
     }
 
@@ -95,6 +106,30 @@ impl<'source> Parser<'source> {
         }
     }
 
+    fn with_restrictions<T>(
+        &mut self,
+        extra: ParseRestrictions,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let old = self.restrictions;
+        self.restrictions |= extra;
+        let result = f(self);
+        self.restrictions = old;
+        result
+    }
+
+    fn without_restrictions<T>(
+        &mut self,
+        remove: ParseRestrictions,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let old = self.restrictions;
+        self.restrictions -= remove;
+        let result = f(self);
+        self.restrictions = old;
+        result
+    }
+
     pub fn parse_program(&mut self) -> Result<Program, Vec<Diagnostic>> {
         let start = self.span().start;
         let mut items = Vec::new();
@@ -135,12 +170,21 @@ impl<'source> Parser<'source> {
             }
         }
         match self.peek() {
-            Ok(Token::Def) => self.parse_function_def(attributes, doc),
+            Ok(Token::Def) => self
+                .with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
+                    this.parse_function_def(attributes, doc)
+                }),
             Ok(Token::Edition) => self.parse_edition(),
             Ok(Token::Import) | Ok(Token::From) => self.parse_import(),
             Ok(Token::Extern) => self.parse_extern_function(attributes),
-            Ok(Token::Type) => self.parse_type_def(attributes, doc),
-            Ok(Token::Impl) => self.parse_impl_block(attributes),
+            Ok(Token::Type) => self
+                .with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
+                    this.parse_type_def(attributes, doc)
+                }),
+            Ok(Token::Impl) => self
+                .with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
+                    this.parse_impl_block(attributes)
+                }),
             _ => {
                 let tok = self.advance().ok();
                 Err(Diagnostic {
@@ -219,7 +263,11 @@ impl<'source> Parser<'source> {
                 });
             }
         };
-        let type_params = if matches!(self.peek(), Ok(Token::Lt)) {
+        let type_params = if self
+            .restrictions
+            .contains(ParseRestrictions::ALLOW_TYPE_PARAMS)
+            && matches!(self.peek(), Ok(Token::Lt))
+        {
             self.parse_type_params()?
         } else {
             Vec::new()
@@ -643,24 +691,24 @@ impl<'source> Parser<'source> {
     }
 
     fn parse_block_inner(&mut self) -> Result<Vec<Stmt>, Diagnostic> {
-        let old_restrict = self.restrict_struct_literal;
-        self.restrict_struct_literal = false;
-        let mut stmts = Vec::new();
-        loop {
-            match self.peek() {
-                Ok(Token::RBrace) | Err(()) => break,
-                _ => match self.parse_stmt() {
-                    Ok(stmt) => stmts.push(stmt),
-                    Err(diag) => {
-                        self.diagnostics.push(diag);
-                        self.synchronize();
-                        stmts.push(Stmt::Error(Span::new(self.span().start, self.span().start)));
-                    }
-                },
+        self.without_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+            let mut stmts = Vec::new();
+            loop {
+                match this.peek() {
+                    Ok(Token::RBrace) | Err(()) => break,
+                    _ => match this.parse_stmt() {
+                        Ok(stmt) => stmts.push(stmt),
+                        Err(diag) => {
+                            this.diagnostics.push(diag);
+                            this.synchronize();
+                            stmts
+                                .push(Stmt::Error(Span::new(this.span().start, this.span().start)));
+                        }
+                    },
+                }
             }
-        }
-        self.restrict_struct_literal = old_restrict;
-        Ok(stmts)
+            Ok(stmts)
+        })
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, Diagnostic> {
@@ -734,12 +782,23 @@ impl<'source> Parser<'source> {
                         value,
                         span: Span::new(start, end),
                     })
-                } else if matches!(self.peek(), Ok(Token::RBrace) | Err(())) {
-                    Ok(Stmt::Expression(lhs))
                 } else {
-                    self.expect(Token::Semicolon)
-                        .or_else(|_| Ok(Token::Semicolon))?;
-                    Ok(Stmt::Expression(lhs))
+                    let at_end = matches!(self.peek(), Ok(Token::RBrace) | Err(()));
+                    if at_end {
+                        if self.restrictions.contains(ParseRestrictions::VALUE_BLOCK) {
+                            Ok(Stmt::Expression(lhs))
+                        } else {
+                            self.expect(Token::Semicolon)
+                                .or_else(|_| Ok(Token::Semicolon))?;
+                            Ok(Stmt::Expression(lhs))
+                        }
+                    } else {
+                        if self.restrictions.contains(ParseRestrictions::STMT_EXPR) {
+                            self.expect(Token::Semicolon)
+                                .or_else(|_| Ok(Token::Semicolon))?;
+                        }
+                        Ok(Stmt::Expression(lhs))
+                    }
                 }
             }
         }
@@ -886,10 +945,10 @@ impl<'source> Parser<'source> {
             self.advance().ok();
             let pattern = self.parse_pattern()?;
             self.expect(Token::Assign)?;
-            let old_restrict = self.restrict_struct_literal;
-            self.restrict_struct_literal = true;
+            let old_restrict = self.restrictions;
+            self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
             let scrutinee = self.parse_expr()?;
-            self.restrict_struct_literal = old_restrict;
+            self.restrictions = old_restrict;
             self.expect(Token::LBrace)?;
             let then_branch = self.parse_block()?;
             self.expect(Token::RBrace)?;
@@ -915,10 +974,10 @@ impl<'source> Parser<'source> {
                 span: Span::new(start, end),
             });
         }
-        let old_restrict = self.restrict_struct_literal;
-        self.restrict_struct_literal = true;
+        let old_restrict = self.restrictions;
+        self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
         let cond = self.parse_expr()?;
-        self.restrict_struct_literal = old_restrict;
+        self.restrictions = old_restrict;
         self.expect(Token::LBrace)?;
         let then_branch = self.parse_block()?;
         self.expect(Token::RBrace)?;
@@ -951,10 +1010,10 @@ impl<'source> Parser<'source> {
             self.advance().ok();
             let pattern = self.parse_pattern()?;
             self.expect(Token::Assign)?;
-            let old_restrict = self.restrict_struct_literal;
-            self.restrict_struct_literal = true;
+            let old_restrict = self.restrictions;
+            self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
             let scrutinee = self.parse_expr()?;
-            self.restrict_struct_literal = old_restrict;
+            self.restrictions = old_restrict;
             self.expect(Token::LBrace)?;
             let body = self.parse_block()?;
             self.expect(Token::RBrace)?;
@@ -966,10 +1025,10 @@ impl<'source> Parser<'source> {
                 span: Span::new(start, end),
             });
         }
-        let old_restrict = self.restrict_struct_literal;
-        self.restrict_struct_literal = true;
+        let old_restrict = self.restrictions;
+        self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
         let cond = self.parse_expr()?;
-        self.restrict_struct_literal = old_restrict;
+        self.restrictions = old_restrict;
         self.expect(Token::LBrace)?;
         let body = self.parse_block()?;
         self.expect(Token::RBrace)?;
@@ -986,10 +1045,10 @@ impl<'source> Parser<'source> {
         self.advance().ok();
         let pattern = self.parse_pattern()?;
         self.expect(Token::In)?;
-        let old_restrict = self.restrict_struct_literal;
-        self.restrict_struct_literal = true;
+        let old_restrict = self.restrictions;
+        self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
         let iterable = self.parse_expr()?;
-        self.restrict_struct_literal = old_restrict;
+        self.restrictions = old_restrict;
         self.expect(Token::LBrace)?;
         let body = self.parse_block()?;
         self.expect(Token::RBrace)?;
@@ -1360,7 +1419,11 @@ impl<'source> Parser<'source> {
                 });
             }
         };
-        let params = if matches!(self.peek(), Ok(Token::Lt)) {
+        let params = if self
+            .restrictions
+            .contains(ParseRestrictions::ALLOW_TYPE_PARAMS)
+            && matches!(self.peek(), Ok(Token::Lt))
+        {
             self.parse_type_params()?
         } else {
             Vec::new()
@@ -2056,7 +2119,10 @@ impl<'source> Parser<'source> {
             }
             Ok(Token::Pipe) => self.parse_closure(start),
             Ok(Token::LBrace) => {
-                if self.restrict_struct_literal {
+                if self
+                    .restrictions
+                    .contains(ParseRestrictions::NO_STRUCT_LITERAL)
+                {
                     self.advance().ok();
                     let body = self.parse_block()?;
                     self.expect(Token::RBrace)?;
@@ -2154,7 +2220,8 @@ impl<'source> Parser<'source> {
             None
         };
         self.expect(Token::LBrace)?;
-        let body = self.parse_block()?;
+        let body =
+            self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block())?;
         self.expect(Token::RBrace)?;
         let end = self.span().end;
         Ok(Expr::Closure {
@@ -2184,7 +2251,9 @@ impl<'source> Parser<'source> {
                 });
             }
         }
-        let restrict = self.restrict_struct_literal;
+        let restrict = self
+            .restrictions
+            .contains(ParseRestrictions::NO_STRUCT_LITERAL);
         match self.peek() {
             Ok(Token::LBrace) if !restrict => self.parse_struct_lit(path, start),
             Ok(Token::LParen) => {
@@ -2623,7 +2692,10 @@ impl<'source> Parser<'source> {
                         vec![Stmt::Expression(expr)]
                     } else {
                         self.expect(Token::LBrace)?;
-                        let block = self.parse_block()?;
+                        let block = self
+                            .with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| {
+                                this.parse_block()
+                            })?;
                         self.expect(Token::RBrace)?;
                         block
                     };
@@ -2672,12 +2744,13 @@ impl<'source> Parser<'source> {
             self.advance().ok();
             let pattern = self.parse_pattern()?;
             self.expect(Token::Assign)?;
-            let old_restrict = self.restrict_struct_literal;
-            self.restrict_struct_literal = true;
+            let old_restrict = self.restrictions;
+            self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
             let scrutinee = self.parse_expr()?;
-            self.restrict_struct_literal = old_restrict;
+            self.restrictions = old_restrict;
             self.expect(Token::LBrace)?;
-            let then_branch = self.parse_block()?;
+            let then_branch =
+                self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block())?;
             self.expect(Token::RBrace)?;
             let else_branch = if matches!(self.peek(), Ok(Token::Else)) {
                 self.advance().ok();
@@ -2685,7 +2758,9 @@ impl<'source> Parser<'source> {
                     Some(vec![Stmt::Expression(self.parse_if_expr()?)])
                 } else {
                     self.expect(Token::LBrace)?;
-                    let block = self.parse_block()?;
+                    let block = self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| {
+                        this.parse_block()
+                    })?;
                     self.expect(Token::RBrace)?;
                     Some(block)
                 }
@@ -2701,12 +2776,13 @@ impl<'source> Parser<'source> {
                 span: Span::new(start, end),
             });
         }
-        let old_restrict = self.restrict_struct_literal;
-        self.restrict_struct_literal = true;
+        let old_restrict = self.restrictions;
+        self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
         let cond = self.parse_expr()?;
-        self.restrict_struct_literal = old_restrict;
+        self.restrictions = old_restrict;
         self.expect(Token::LBrace)?;
-        let then_branch = self.parse_block()?;
+        let then_branch =
+            self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block())?;
         self.expect(Token::RBrace)?;
         let else_branch = if matches!(self.peek(), Ok(Token::Else)) {
             self.advance().ok();
@@ -2714,7 +2790,8 @@ impl<'source> Parser<'source> {
                 Some(vec![Stmt::Expression(self.parse_if_expr()?)])
             } else {
                 self.expect(Token::LBrace)?;
-                let block = self.parse_block()?;
+                let block = self
+                    .with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block())?;
                 self.expect(Token::RBrace)?;
                 Some(block)
             }
@@ -2734,10 +2811,10 @@ impl<'source> Parser<'source> {
     fn parse_match_expr(&mut self) -> Result<Expr, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
-        let old_restrict = self.restrict_struct_literal;
-        self.restrict_struct_literal = true;
+        let old_restrict = self.restrictions;
+        self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
         let scrutinee = self.parse_expr()?;
-        self.restrict_struct_literal = old_restrict;
+        self.restrictions = old_restrict;
         self.expect(Token::LBrace)?;
         let mut arms = Vec::new();
         loop {
@@ -2754,7 +2831,8 @@ impl<'source> Parser<'source> {
                 None
             };
             self.expect(Token::FatArrow)?;
-            let body = self.parse_expr()?;
+            let body =
+                self.with_restrictions(ParseRestrictions::VALUE_BLOCK | ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
             arms.push(MatchArm {
                 pattern,
                 guard,
@@ -2992,7 +3070,7 @@ mod tests {
 
     #[test]
     fn test_pattern_literal() {
-        let program = check_parse("def main() { match x { 1 => {}, _ => {} } }");
+        let program = check_parse("def main() { match x { 1 => {}, _ => {} }; }");
         assert_eq!(program.items.len(), 1);
     }
 
