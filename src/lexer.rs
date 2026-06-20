@@ -406,6 +406,14 @@ pub enum Token {
     Interrupt,
     #[token("match")]
     Match,
+    #[token("round")]
+    Round,
+    #[token("trunc")]
+    Trunc,
+    #[token("ceil")]
+    Ceil,
+    #[token("floor")]
+    Floor,
 
     #[regex("[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
