@@ -233,6 +233,8 @@ pub enum Stmt {
         type_params: Vec<TypeParam>,
         where_clause: Option<()>,
         finally: Option<Vec<Stmt>>,
+        is_comptime: bool,
+        is_async: bool,
     },
     TypeDef {
         span: Span,
@@ -242,6 +244,14 @@ pub enum Stmt {
         params: Vec<TypeParam>,
         definition: TypeDefinition,
         contracts: Vec<Contract>,
+    },
+    TraitDef {
+        span: Span,
+        attributes: Vec<Attribute>,
+        doc: Option<String>,
+        name: String,
+        methods: Vec<TraitMethod>,
+        associated_types: Vec<AssociatedType>,
     },
     Import {
         path: Vec<String>,
@@ -256,6 +266,11 @@ pub enum Stmt {
         return_type: Type,
         span: Span,
         attributes: Vec<Attribute>,
+    },
+    Constraint {
+        name: String,
+        bounds: Vec<Type>,
+        span: Span,
     },
     Edition(String, Span),
     TestBlock {
@@ -292,6 +307,8 @@ pub enum Stmt {
         pattern: Pattern,
         iterable: Expr,
         body: Vec<Stmt>,
+        invariant: Option<Expr>,
+        decreases: Option<Expr>,
         span: Span,
     },
     Loop {
@@ -386,7 +403,22 @@ pub enum TypeDefinition {
         methods: Vec<ImplMethod>,
     },
     Constraint(Vec<Type>),
-    Alias(Type),
+    Alias(Type, Vec<TypeModifier>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeModifier {
+    Overflow(OverflowPolicy),
+    Default(Expr),
+    Validate(Expr),
+    NoDefault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverflowPolicy {
+    Wrap,
+    Saturate,
+    Trap,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -480,13 +512,14 @@ pub enum Pattern {
 pub struct Attribute {
     pub name: String,
     pub args: Vec<Expr>,
+    pub named_args: Vec<(String, Expr)>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Contract {
     Requires(Expr, Span),
-    Ensures(Expr, Span),
+    Ensures(Expr, Span, Option<Pattern>),
     Invariant(Expr, Span),
     Decreases(Expr, Span),
     Terminates(Expr, Span),

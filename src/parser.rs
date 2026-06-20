@@ -91,9 +91,20 @@ impl<'source> Parser<'source> {
                     self.advance().ok();
                     return;
                 }
-                Ok(Token::Def) | Ok(Token::Set) | Ok(Token::Let) | Ok(Token::Type)
-                | Ok(Token::Import) | Ok(Token::From) | Ok(Token::Extern) | Ok(Token::Edition)
-                | Ok(Token::At) => return,
+                Ok(Token::Def)
+                | Ok(Token::Set)
+                | Ok(Token::Let)
+                | Ok(Token::Type)
+                | Ok(Token::Import)
+                | Ok(Token::From)
+                | Ok(Token::Extern)
+                | Ok(Token::Edition)
+                | Ok(Token::At)
+                | Ok(Token::Comptime)
+                | Ok(Token::Async)
+                | Ok(Token::Trait)
+                | Ok(Token::Impl)
+                | Ok(Token::Constraint) => return,
                 Err(()) => return,
                 _ => {
                     let tok = self.advance().ok();
@@ -128,6 +139,109 @@ impl<'source> Parser<'source> {
         let result = f(self);
         self.restrictions = old;
         result
+    }
+
+    fn keyword_to_ident(&self, tok: &Token) -> Option<String> {
+        match tok {
+            Token::Def => Some("def".into()),
+            Token::Set => Some("set".into()),
+            Token::Type => Some("type".into()),
+            Token::With => Some("with".into()),
+            Token::Default => Some("default".into()),
+            Token::Return => Some("return".into()),
+            Token::If => Some("if".into()),
+            Token::Else => Some("else".into()),
+            Token::For => Some("for".into()),
+            Token::In => Some("in".into()),
+            Token::While => Some("while".into()),
+            Token::Loop => Some("loop".into()),
+            Token::Leave => Some("leave".into()),
+            Token::Continue => Some("continue".into()),
+            Token::Comptime => Some("comptime".into()),
+            Token::Import => Some("import".into()),
+            Token::From => Some("from".into()),
+            Token::As => Some("as".into()),
+            Token::True => Some("true".into()),
+            Token::False => Some("false".into()),
+            Token::Auto => Some("auto".into()),
+            Token::And => Some("and".into()),
+            Token::Or => Some("or".into()),
+            Token::Not => Some("not".into()),
+            Token::Sizeof => Some("sizeof".into()),
+            Token::Alignof => Some("alignof".into()),
+            Token::Catch => Some("catch".into()),
+            Token::Panic => Some("panic".into()),
+            Token::Unsafe => Some("unsafe".into()),
+            Token::Let => Some("let".into()),
+            Token::Finally => Some("finally".into()),
+            Token::Where => Some("where".into()),
+            Token::Requires => Some("requires".into()),
+            Token::Ensures => Some("ensures".into()),
+            Token::Invariant => Some("invariant".into()),
+            Token::Constraint => Some("constraint".into()),
+            Token::Move => Some("move".into()),
+            Token::Dyn => Some("dyn".into()),
+            Token::By => Some("by".into()),
+            Token::Copy => Some("copy".into()),
+            Token::Ref => Some("ref".into()),
+            Token::Mut => Some("mut".into()),
+            Token::Wrap => Some("wrap".into()),
+            Token::Saturate => Some("saturate".into()),
+            Token::Trap => Some("trap".into()),
+            Token::SelfKw => Some("Self".into()),
+            Token::NoDefault => Some("no_default".into()),
+            Token::Extern => Some("extern".into()),
+            Token::Pub => Some("pub".into()),
+            Token::Edition => Some("edition".into()),
+            Token::Deprecated => Some("deprecated".into()),
+            Token::Experimental => Some("experimental".into()),
+            Token::Endian => Some("endian".into()),
+            Token::BitOrder => Some("bit_order".into()),
+            Token::Align => Some("align".into()),
+            Token::Pad => Some("pad".into()),
+            Token::Packed => Some("packed".into()),
+            Token::Async => Some("async".into()),
+            Token::Await => Some("await".into()),
+            Token::Task => Some("task".into()),
+            Token::Channel => Some("channel".into()),
+            Token::Linear => Some("linear".into()),
+            Token::Consume => Some("consume".into()),
+            Token::Pure => Some("pure".into()),
+            Token::Io => Some("io".into()),
+            Token::Trusted => Some("trusted".into()),
+            Token::Ghost => Some("ghost".into()),
+            Token::ScopeCleanup => Some("scope_cleanup".into()),
+            Token::Trigger => Some("trigger".into()),
+            Token::Validate => Some("validate".into()),
+            Token::MissingMatch => Some("missing_match".into()),
+            Token::ApplyLemma => Some("apply_lemma".into()),
+            Token::Exists => Some("exists".into()),
+            Token::Forall => Some("forall".into()),
+            Token::On => Some("on".into()),
+            Token::Trait => Some("trait".into()),
+            Token::Impl => Some("impl".into()),
+            Token::Decreases => Some("decreases".into()),
+            Token::Terminates => Some("terminates".into()),
+            Token::Cfg => Some("cfg".into()),
+            Token::Isolate => Some("isolate".into()),
+            Token::Hint => Some("hint".into()),
+            Token::MustUse => Some("must_use".into()),
+            Token::MustHandle => Some("must_handle".into()),
+            Token::LinkProof => Some("link_proof".into()),
+            Token::Exhaustive => Some("exhaustive".into()),
+            Token::NoAllocError => Some("no_alloc_error".into()),
+            Token::NoPanic => Some("no_panic".into()),
+            Token::DebugInfo => Some("debug_info".into()),
+            Token::Old => Some("old".into()),
+            Token::AuditLog => Some("audit_log".into()),
+            Token::Interrupt => Some("interrupt".into()),
+            Token::Match => Some("match".into()),
+            Token::Round => Some("round".into()),
+            Token::Trunc => Some("trunc".into()),
+            Token::Ceil => Some("ceil".into()),
+            Token::Floor => Some("floor".into()),
+            _ => None,
+        }
     }
 
     pub fn parse_program(&mut self) -> Result<Program, Vec<Diagnostic>> {
@@ -166,14 +280,59 @@ impl<'source> Parser<'source> {
                     doc = Some(s.clone());
                     self.advance().ok();
                 }
+                Ok(Token::ModuleDocComment(s)) => {
+                    doc = Some(s.clone());
+                    self.advance().ok();
+                }
                 _ => break,
             }
         }
         match self.peek() {
-            Ok(Token::Def) => self
-                .with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
-                    this.parse_function_def(attributes, doc)
-                }),
+            Ok(Token::Comptime) => {
+                self.advance().ok();
+                match self.peek() {
+                    Ok(Token::Def) => {
+                        self.advance().ok();
+                        self.with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
+                            this.parse_function_def(attributes, doc, true, false)
+                        })
+                    }
+                    Ok(Token::LBrace) => {
+                        let start = self.span().start;
+                        self.expect(Token::LBrace)?;
+                        let body = self.parse_block()?;
+                        self.expect(Token::RBrace)?;
+                        let end = self.span().end;
+                        Ok(Stmt::ComptimeBlock {
+                            body,
+                            span: Span::new(start, end),
+                        })
+                    }
+                    _ => {
+                        let tok = self.advance().ok();
+                        Err(Diagnostic {
+                            message: format!(
+                                "expected 'def' or '{{' after comptime, found {:?}",
+                                tok
+                            ),
+                            span: self.span(),
+                        })
+                    }
+                }
+            }
+            Ok(Token::Async) => {
+                self.advance().ok();
+                self.expect(Token::Def)?;
+                self.with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
+                    this.parse_function_def(attributes, doc, false, true)
+                })
+            }
+            Ok(Token::Def) => {
+                self.advance().ok();
+                self.with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
+                    this.parse_function_def(attributes, doc, false, false)
+                })
+            }
             Ok(Token::Edition) => self.parse_edition(),
             Ok(Token::Import) | Ok(Token::From) => self.parse_import(),
             Ok(Token::Extern) => self.parse_extern_function(attributes),
@@ -181,10 +340,12 @@ impl<'source> Parser<'source> {
                 .with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
                     this.parse_type_def(attributes, doc)
                 }),
+            Ok(Token::Trait) => self.parse_trait_def(attributes, doc),
             Ok(Token::Impl) => self
                 .with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
                     this.parse_impl_block(attributes)
                 }),
+            Ok(Token::Constraint) => self.parse_constraint(),
             _ => {
                 let tok = self.advance().ok();
                 Err(Diagnostic {
@@ -197,15 +358,12 @@ impl<'source> Parser<'source> {
 
     fn parse_attribute(&mut self) -> Result<Attribute, Diagnostic> {
         let start = self.span().start;
-        self.advance().ok();
+        self.advance().ok(); // eat @
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
-            Ok(tok) => {
-                return Err(Diagnostic {
-                    message: format!("expected attribute name, found {:?}", tok),
-                    span: self.span(),
-                });
-            }
+            Ok(tok) => self
+                .keyword_to_ident(&tok)
+                .unwrap_or_else(|| format!("{:?}", tok)),
             Err(()) => {
                 return Err(Diagnostic {
                     message: "unexpected end of file in attribute".to_string(),
@@ -213,15 +371,30 @@ impl<'source> Parser<'source> {
                 });
             }
         };
-        let args = if matches!(self.peek(), Ok(Token::LParen)) {
+        let mut args = Vec::new();
+        let mut named_args = Vec::new();
+        if matches!(self.peek(), Ok(Token::LParen)) {
             self.advance().ok();
-            let mut args = Vec::new();
             loop {
                 if matches!(self.peek(), Ok(Token::RParen)) {
                     self.advance().ok();
                     break;
                 }
-                args.push(self.parse_expr()?);
+                let is_named = match self.peek() {
+                    Ok(Token::Ident(_)) => {
+                        matches!(self.peek_next(), Some(Token::Assign))
+                    }
+                    _ => false,
+                };
+                if is_named {
+                    if let Ok(Token::Ident(key)) = self.advance() {
+                        self.expect(Token::Assign)?;
+                        let value = self.parse_expr()?;
+                        named_args.push((key, value));
+                    }
+                } else {
+                    args.push(self.parse_expr()?);
+                }
                 if matches!(self.peek(), Ok(Token::Comma)) {
                     self.advance().ok();
                 } else {
@@ -229,14 +402,15 @@ impl<'source> Parser<'source> {
                     break;
                 }
             }
-            args
-        } else {
-            Vec::new()
-        };
+        } else if matches!(self.peek(), Ok(Token::Assign)) {
+            self.advance().ok();
+            args.push(self.parse_expr()?);
+        }
         let end = self.span().end;
         Ok(Attribute {
             name,
             args,
+            named_args,
             span: Span::new(start, end),
         })
     }
@@ -245,9 +419,10 @@ impl<'source> Parser<'source> {
         &mut self,
         attributes: Vec<Attribute>,
         doc: Option<String>,
+        is_comptime: bool,
+        is_async: bool,
     ) -> Result<Stmt, Diagnostic> {
         let start = self.span().start;
-        self.advance().ok();
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
             Ok(tok) => {
@@ -337,6 +512,161 @@ impl<'source> Parser<'source> {
             type_params,
             where_clause: None,
             finally,
+            is_comptime,
+            is_async,
+        })
+    }
+
+    fn parse_trait_def(
+        &mut self,
+        attributes: Vec<Attribute>,
+        doc: Option<String>,
+    ) -> Result<Stmt, Diagnostic> {
+        let start = self.span().start;
+        self.advance().ok(); // eat 'trait'
+        let name = match self.advance() {
+            Ok(Token::Ident(name)) => name,
+            _ => {
+                return Err(Diagnostic {
+                    message: "expected trait name".into(),
+                    span: self.span(),
+                });
+            }
+        };
+        let mut methods = Vec::new();
+        let mut associated_types = Vec::new();
+        if matches!(self.peek(), Ok(Token::LBrace)) {
+            self.expect(Token::LBrace)?;
+            loop {
+                if matches!(self.peek(), Ok(Token::RBrace)) {
+                    self.advance().ok();
+                    break;
+                }
+                match self.peek() {
+                    Ok(Token::Type) => {
+                        self.advance().ok();
+                        let assoc_name = match self.advance() {
+                            Ok(Token::Ident(n)) => n,
+                            _ => {
+                                return Err(Diagnostic {
+                                    message: "expected associated type name".into(),
+                                    span: self.span(),
+                                });
+                            }
+                        };
+                        let default = if matches!(self.peek(), Ok(Token::Assign)) {
+                            self.advance().ok();
+                            Some(self.parse_type()?)
+                        } else {
+                            None
+                        };
+                        self.expect(Token::Semicolon)?;
+                        associated_types.push(AssociatedType {
+                            name: assoc_name,
+                            default,
+                            span: Span::new(start, self.span().end),
+                        });
+                    }
+                    Ok(Token::Def) => {
+                        self.advance().ok();
+                        let method_name = match self.advance() {
+                            Ok(Token::Ident(n)) => n,
+                            _ => {
+                                return Err(Diagnostic {
+                                    message: "expected method name".into(),
+                                    span: self.span(),
+                                });
+                            }
+                        };
+                        self.expect(Token::LParen)?;
+                        let mut params = Vec::new();
+                        loop {
+                            match self.peek() {
+                                Ok(Token::RParen) => {
+                                    self.advance().ok();
+                                    break;
+                                }
+                                Ok(Token::Ampersand) | Ok(Token::Ident(_)) => {
+                                    let param = self.parse_self_param()?;
+                                    params.push(param);
+                                }
+                                _ => {
+                                    let param = self.parse_param()?;
+                                    params.push(param);
+                                }
+                            }
+                            if matches!(self.peek(), Ok(Token::Comma)) {
+                                self.advance().ok();
+                            } else {
+                                self.expect(Token::RParen)?;
+                                break;
+                            }
+                        }
+                        let return_type = if matches!(self.peek(), Ok(Token::Arrow)) {
+                            self.advance().ok();
+                            self.parse_type()?
+                        } else {
+                            Type::Never(self.span())
+                        };
+                        self.expect(Token::Semicolon)?;
+                        methods.push(TraitMethod {
+                            name: method_name,
+                            params,
+                            return_type,
+                            span: Span::new(start, self.span().end),
+                        });
+                    }
+                    _ => {
+                        return Err(Diagnostic {
+                            message: "expected 'type' or 'def' in trait body".into(),
+                            span: self.span(),
+                        });
+                    }
+                }
+            }
+        }
+        let end = self.span().end;
+        Ok(Stmt::TraitDef {
+            span: Span::new(start, end),
+            attributes,
+            doc,
+            name,
+            methods,
+            associated_types,
+        })
+    }
+
+    fn parse_constraint(&mut self) -> Result<Stmt, Diagnostic> {
+        let start = self.span().start;
+        self.advance().ok(); // eat 'constraint'
+        let name = match self.advance() {
+            Ok(Token::Ident(name)) => name,
+            _ => {
+                return Err(Diagnostic {
+                    message: "expected constraint name".into(),
+                    span: self.span(),
+                });
+            }
+        };
+        self.expect(Token::LBrace)?;
+        let mut bounds = Vec::new();
+        loop {
+            if matches!(self.peek(), Ok(Token::RBrace)) {
+                self.advance().ok();
+                break;
+            }
+            bounds.push(self.parse_type()?);
+            if !matches!(self.peek(), Ok(Token::Plus)) {
+                break;
+            }
+            self.advance().ok();
+        }
+        self.expect(Token::RBrace)?;
+        let end = self.span().end;
+        Ok(Stmt::Constraint {
+            name,
+            bounds,
+            span: Span::new(start, end),
         })
     }
 
@@ -455,9 +785,37 @@ impl<'source> Parser<'source> {
                 Ok(Contract::Requires(expr, Span::new(start, end)))
             }
             Token::Ensures => {
+                let on_ok = if matches!(self.peek(), Ok(Token::On)) {
+                    self.advance().ok();
+                    match self.peek() {
+                        Ok(Token::Ident(s)) if s == "Ok" => {
+                            self.advance().ok();
+                            self.expect(Token::LParen)?;
+                            let pat = self.parse_pattern()?;
+                            self.expect(Token::RParen)?;
+                            if matches!(self.peek(), Ok(Token::FatArrow)) {
+                                self.advance().ok();
+                            } else {
+                                return Err(Diagnostic {
+                                    message: "expected '=>' after on Ok(...)".into(),
+                                    span: self.span(),
+                                });
+                            }
+                            Some(pat)
+                        }
+                        _ => {
+                            return Err(Diagnostic {
+                                message: "expected 'Ok' after 'on'".into(),
+                                span: self.span(),
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
                 let expr = self.parse_expr()?;
                 let end = self.span().end;
-                Ok(Contract::Ensures(expr, Span::new(start, end)))
+                Ok(Contract::Ensures(expr, Span::new(start, end), on_ok))
             }
             Token::Invariant => {
                 let expr = self.parse_expr()?;
@@ -746,12 +1104,30 @@ impl<'source> Parser<'source> {
                 let end = self.span().end;
                 Ok(Stmt::Expression(Expr::Block(body, Span::new(start, end))))
             }
-            Ok(Token::Comptime) => self.parse_comptime_block(),
+            Ok(Token::Comptime) => {
+                let start = self.span().start;
+                self.advance().ok();
+                self.expect(Token::LBrace)?;
+                let body = self.parse_block()?;
+                self.expect(Token::RBrace)?;
+                let end = self.span().end;
+                Ok(Stmt::ComptimeBlock {
+                    body,
+                    span: Span::new(start, end),
+                })
+            }
             Ok(Token::ScopeCleanup) => self.parse_scope_cleanup(),
             Ok(Token::Trigger) => self.parse_trigger(),
             Ok(Token::Unsafe) => self.parse_unsafe_block(),
             Ok(Token::Ghost) => self.parse_ghost_variable(),
             Ok(Token::Isolate) => self.parse_isolate_block(),
+            Ok(Token::Match) => {
+                let start = self.span().start;
+                let expr = self.parse_match_expr()?;
+                self.expect(Token::Semicolon)?;
+                let end = self.span().end;
+                Ok(Stmt::Expression(expr))
+            }
             _ => {
                 let start = self.span().start;
                 let lhs = self.parse_expr()?;
@@ -949,6 +1325,8 @@ impl<'source> Parser<'source> {
             self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
             let scrutinee = self.parse_expr()?;
             self.restrictions = old_restrict;
+            let mut invariant: Option<Expr> = None;
+            let mut decreases: Option<Expr> = None;
             self.expect(Token::LBrace)?;
             let then_branch = self.parse_block()?;
             self.expect(Token::RBrace)?;
@@ -978,6 +1356,8 @@ impl<'source> Parser<'source> {
         self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
         let cond = self.parse_expr()?;
         self.restrictions = old_restrict;
+        let mut invariant: Option<Expr> = None;
+        let mut decreases: Option<Expr> = None;
         self.expect(Token::LBrace)?;
         let then_branch = self.parse_block()?;
         self.expect(Token::RBrace)?;
@@ -1014,6 +1394,8 @@ impl<'source> Parser<'source> {
             self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
             let scrutinee = self.parse_expr()?;
             self.restrictions = old_restrict;
+            let mut invariant: Option<Expr> = None;
+            let mut decreases: Option<Expr> = None;
             self.expect(Token::LBrace)?;
             let body = self.parse_block()?;
             self.expect(Token::RBrace)?;
@@ -1029,6 +1411,8 @@ impl<'source> Parser<'source> {
         self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
         let cond = self.parse_expr()?;
         self.restrictions = old_restrict;
+        let mut invariant: Option<Expr> = None;
+        let mut decreases: Option<Expr> = None;
         self.expect(Token::LBrace)?;
         let body = self.parse_block()?;
         self.expect(Token::RBrace)?;
@@ -1049,6 +1433,23 @@ impl<'source> Parser<'source> {
         self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
         let iterable = self.parse_expr()?;
         self.restrictions = old_restrict;
+        let mut invariant: Option<Expr> = None;
+        let mut decreases: Option<Expr> = None;
+        while matches!(self.peek(), Ok(Token::Invariant) | Ok(Token::Decreases)) {
+            match self.peek() {
+                Ok(Token::Invariant) => {
+                    self.advance().ok();
+                    let inv = self.parse_expr()?;
+                    invariant = Some(inv);
+                }
+                Ok(Token::Decreases) => {
+                    self.advance().ok();
+                    let dec = self.parse_expr()?;
+                    decreases = Some(dec);
+                }
+                _ => break,
+            }
+        }
         self.expect(Token::LBrace)?;
         let body = self.parse_block()?;
         self.expect(Token::RBrace)?;
@@ -1057,6 +1458,8 @@ impl<'source> Parser<'source> {
             pattern,
             iterable,
             body,
+            invariant,
+            decreases,
             span: Span::new(start, end),
         })
     }
@@ -1123,19 +1526,6 @@ impl<'source> Parser<'source> {
         let end = self.span().end;
         Ok(Stmt::Return {
             value,
-            span: Span::new(start, end),
-        })
-    }
-
-    fn parse_comptime_block(&mut self) -> Result<Stmt, Diagnostic> {
-        let start = self.span().start;
-        self.advance().ok();
-        self.expect(Token::LBrace)?;
-        let body = self.parse_block()?;
-        self.expect(Token::RBrace)?;
-        let end = self.span().end;
-        Ok(Stmt::ComptimeBlock {
-            body,
             span: Span::new(start, end),
         })
     }
@@ -1514,48 +1904,20 @@ impl<'source> Parser<'source> {
                 }
                 _ => {
                     let ty = self.parse_type()?;
+                    let modifiers = self.parse_type_modifiers()?;
                     if matches!(self.peek(), Ok(Token::Semicolon)) {
                         self.advance().ok();
-                    } else if matches!(self.peek(), Ok(Token::With)) {
-                        while matches!(self.peek(), Ok(Token::With)) {
-                            self.advance().ok();
-                            while !matches!(self.peek(), Ok(Token::Semicolon) | Err(())) {
-                                self.advance().ok();
-                            }
-                            if matches!(self.peek(), Ok(Token::Semicolon)) {
-                                self.advance().ok();
-                            }
-                        }
-                    } else {
-                        return Err(Diagnostic {
-                            message: "expected ';' or 'with' after type alias".to_string(),
-                            span: self.span(),
-                        });
                     }
-                    TypeDefinition::Alias(ty)
+                    TypeDefinition::Alias(ty, modifiers)
                 }
             }
         } else {
             let ty = self.parse_type()?;
+            let modifiers = self.parse_type_modifiers()?;
             if matches!(self.peek(), Ok(Token::Semicolon)) {
                 self.advance().ok();
-            } else if matches!(self.peek(), Ok(Token::With)) {
-                while matches!(self.peek(), Ok(Token::With)) {
-                    self.advance().ok();
-                    while !matches!(self.peek(), Ok(Token::Semicolon) | Err(())) {
-                        self.advance().ok();
-                    }
-                    if matches!(self.peek(), Ok(Token::Semicolon)) {
-                        self.advance().ok();
-                    }
-                }
-            } else {
-                return Err(Diagnostic {
-                    message: "expected ';' or 'with' after type alias".to_string(),
-                    span: self.span(),
-                });
             }
-            TypeDefinition::Alias(ty)
+            TypeDefinition::Alias(ty, modifiers)
         };
         let end = self.span().end;
         Ok(Stmt::TypeDef {
@@ -1567,6 +1929,84 @@ impl<'source> Parser<'source> {
             definition,
             contracts: Vec::new(),
         })
+    }
+
+    fn parse_type_modifiers(&mut self) -> Result<Vec<TypeModifier>, Diagnostic> {
+        let mut modifiers = Vec::new();
+        while matches!(self.peek(), Ok(Token::With)) {
+            self.advance().ok();
+            match self.peek() {
+                Ok(Token::Ident(_)) | Ok(Token::Default) | Ok(Token::NoDefault) => {
+                    let tok = self.advance().unwrap();
+                    match tok {
+                        Token::Ident(ref s) if s.as_str() == "overflow" => {
+                            self.expect(Token::Assign)?;
+                            let policy = match self.advance() {
+                                Ok(Token::Wrap) => OverflowPolicy::Wrap,
+                                Ok(Token::Saturate) => OverflowPolicy::Saturate,
+                                Ok(Token::Trap) => OverflowPolicy::Trap,
+                                _ => {
+                                    return Err(Diagnostic {
+                                        message: "expected overflow policy (wrap, saturate, trap)"
+                                            .into(),
+                                        span: self.span(),
+                                    });
+                                }
+                            };
+                            modifiers.push(TypeModifier::Overflow(policy));
+                            if matches!(self.peek(), Ok(Token::Semicolon)) {
+                                self.advance().ok();
+                            }
+                        }
+                        Token::Ident(ref s) if s.as_str() == "validate" => {
+                            self.expect(Token::Assign)?;
+                            let closure = self.parse_closure(self.span().start)?;
+                            modifiers.push(TypeModifier::Validate(closure));
+                            if matches!(self.peek(), Ok(Token::Semicolon)) {
+                                self.advance().ok();
+                            }
+                        }
+                        Token::Default => {
+                            self.expect(Token::Assign)?;
+                            let expr = self.parse_expr()?;
+                            modifiers.push(TypeModifier::Default(expr));
+                            if matches!(self.peek(), Ok(Token::Semicolon)) {
+                                self.advance().ok();
+                            }
+                        }
+                        Token::NoDefault => {
+                            modifiers.push(TypeModifier::NoDefault);
+                            if matches!(self.peek(), Ok(Token::Semicolon)) {
+                                self.advance().ok();
+                            }
+                        }
+                        _ => {
+                            while !matches!(
+                                self.peek(),
+                                Ok(Token::Semicolon) | Ok(Token::RBrace) | Err(())
+                            ) {
+                                self.advance().ok();
+                            }
+                            if matches!(self.peek(), Ok(Token::Semicolon)) {
+                                self.advance().ok();
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    while !matches!(
+                        self.peek(),
+                        Ok(Token::Semicolon) | Ok(Token::RBrace) | Err(())
+                    ) {
+                        self.advance().ok();
+                    }
+                    if matches!(self.peek(), Ok(Token::Semicolon)) {
+                        self.advance().ok();
+                    }
+                }
+            }
+        }
+        Ok(modifiers)
     }
 
     fn parse_impl_block(&mut self, attributes: Vec<Attribute>) -> Result<Stmt, Diagnostic> {
@@ -2831,8 +3271,10 @@ impl<'source> Parser<'source> {
                 None
             };
             self.expect(Token::FatArrow)?;
-            let body =
-                self.with_restrictions(ParseRestrictions::VALUE_BLOCK | ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
+            let body = self.with_restrictions(
+                ParseRestrictions::VALUE_BLOCK | ParseRestrictions::NO_STRUCT_LITERAL,
+                |this| this.parse_expr(),
+            )?;
             arms.push(MatchArm {
                 pattern,
                 guard,
@@ -3077,6 +3519,215 @@ mod tests {
     #[test]
     fn test_ghost_variable() {
         let program = check_parse("def main() { ghost set mut x = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_comptime_function_def() {
+        let program = check_parse("comptime def eval() -> Int<32> { return 42; }");
+        assert_eq!(program.items.len(), 1);
+        match &program.items[0] {
+            Stmt::FunctionDef {
+                is_comptime, name, ..
+            } => {
+                assert!(is_comptime);
+                assert_eq!(name, "eval");
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_async_function_def() {
+        let program = check_parse("async def fetch() -> Data { }");
+        assert_eq!(program.items.len(), 1);
+        match &program.items[0] {
+            Stmt::FunctionDef { is_async, name, .. } => {
+                assert!(is_async);
+                assert_eq!(name, "fetch");
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_trait_def() {
+        let src = "trait Show { def show(&self) -> String; type Output = Int<32>; }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+        match &program.items[0] {
+            Stmt::TraitDef {
+                name,
+                methods,
+                associated_types,
+                ..
+            } => {
+                assert_eq!(name, "Show");
+                assert_eq!(methods.len(), 1);
+                assert_eq!(associated_types.len(), 1);
+            }
+            _ => panic!("expected TraitDef"),
+        }
+    }
+
+    #[test]
+    fn test_constraint() {
+        let src = "constraint MyConstraint { Display + Debug }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+        match &program.items[0] {
+            Stmt::Constraint { name, bounds, .. } => {
+                assert_eq!(name, "MyConstraint");
+                assert_eq!(bounds.len(), 2);
+            }
+            _ => panic!("expected Constraint"),
+        }
+    }
+
+    #[test]
+    fn test_type_alias_with_overflow() {
+        let src = "type MyInt = Int<32> with overflow = saturate;";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+        match &program.items[0] {
+            Stmt::TypeDef {
+                definition: TypeDefinition::Alias(_, modifiers),
+                ..
+            } => {
+                assert_eq!(modifiers.len(), 1);
+                assert!(matches!(
+                    modifiers[0],
+                    TypeModifier::Overflow(OverflowPolicy::Saturate)
+                ));
+            }
+            _ => panic!("expected type alias with overflow"),
+        }
+    }
+
+    #[test]
+    fn test_type_alias_with_default() {
+        let src = "type MyInt = Int<32> with default = 42;";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::TypeDef {
+                definition: TypeDefinition::Alias(_, modifiers),
+                ..
+            } => {
+                assert_eq!(modifiers.len(), 1);
+                assert!(matches!(modifiers[0], TypeModifier::Default(_)));
+            }
+            _ => panic!("expected default"),
+        }
+    }
+
+    #[test]
+    fn test_type_alias_with_no_default() {
+        let src = "type MyInt = Int<32> with no_default;";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::TypeDef {
+                definition: TypeDefinition::Alias(_, modifiers),
+                ..
+            } => {
+                assert_eq!(modifiers.len(), 1);
+                assert!(matches!(modifiers[0], TypeModifier::NoDefault));
+            }
+            _ => panic!("expected no_default"),
+        }
+    }
+
+    #[test]
+    fn test_ensures_on_ok() {
+        let src = "def div(a: Int<32>, b: Int<32>) -> Int<32> requires b != 0 ensures on Ok(result) => result * b == a { return a / b; }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { contracts, .. } => {
+                assert_eq!(contracts.len(), 2);
+                match &contracts[1] {
+                    Contract::Ensures(_, _, on_ok) => {
+                        assert!(on_ok.is_some());
+                    }
+                    _ => panic!("expected Ensures contract"),
+                }
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_deprecated_attribute() {
+        let src = "@deprecated(\"use new_method\") def old() { }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { attributes, .. } => {
+                assert_eq!(attributes.len(), 1);
+                assert_eq!(attributes[0].name, "deprecated");
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_cfg_attribute() {
+        let src = "@cfg(target_os = \"linux\") def linux_only() { }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { attributes, .. } => {
+                assert_eq!(attributes.len(), 1);
+                assert_eq!(attributes[0].name, "cfg");
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_module_doc_comment() {
+        let src = "//! module doc\ndef main() { }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { doc, .. } => {
+                assert_eq!(doc.as_deref(), Some("module doc"));
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_comptime_block() {
+        let src = "comptime { let x = 42; }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+        match &program.items[0] {
+            Stmt::ComptimeBlock { .. } => {}
+            _ => panic!("expected ComptimeBlock"),
+        }
+    }
+
+    #[test]
+    fn test_isolate_block() {
+        let src = "def main() { isolate { set x = 42; } }";
+        let program = check_parse(src);
+        assert!(program.items.len() == 1);
+    }
+
+    #[test]
+    fn test_catch_expression() {
+        let src = "def main() -> Result<(), Error> { let data = fetch() catch { |NetworkError| { leave with Err(ProcessError::NetworkFail); } }; return Ok(()); }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_match_exhaustive() {
+        let src = "def main() { match x { 1 => {}, _ => {} }; }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_for_loop_with_invariant() {
+        let src = "def sum(arr: &[Int<32>]) -> Int<32> { set mut total = 0; for i in 0..arr'len invariant total == fold(arr[0..i], 0, +) decreases arr'len - i { total += arr[i]; } return total; }";
+        let program = check_parse(src);
         assert_eq!(program.items.len(), 1);
     }
 }
