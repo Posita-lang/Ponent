@@ -295,12 +295,16 @@ pub enum Stmt {
     While {
         cond: Expr,
         body: Vec<Stmt>,
+        invariant: Option<Expr>,
+        decreases: Option<Expr>,
         span: Span,
     },
     WhileLet {
         pattern: Pattern,
         scrutinee: Expr,
         body: Vec<Stmt>,
+        invariant: Option<Expr>,
+        decreases: Option<Expr>,
         span: Span,
     },
     For {

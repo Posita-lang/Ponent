@@ -1382,6 +1382,29 @@ impl<'source> Parser<'source> {
             self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
             let scrutinee = self.parse_expr()?;
             self.restrictions = old_restrict;
+            let mut invariant: Option<Expr> = None;
+            let mut decreases: Option<Expr> = None;
+            while matches!(self.peek(), Ok(Token::Invariant) | Ok(Token::Decreases)) {
+                match self.peek() {
+                    Ok(Token::Invariant) => {
+                        self.advance().ok();
+                        let inv = self
+                            .with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+                                this.parse_expr()
+                            })?;
+                        invariant = Some(inv);
+                    }
+                    Ok(Token::Decreases) => {
+                        self.advance().ok();
+                        let dec = self
+                            .with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+                                this.parse_expr()
+                            })?;
+                        decreases = Some(dec);
+                    }
+                    _ => break,
+                }
+            }
             self.expect(Token::LBrace)?;
             let body = self.parse_block()?;
             self.expect(Token::RBrace)?;
@@ -1390,6 +1413,8 @@ impl<'source> Parser<'source> {
                 pattern,
                 scrutinee,
                 body,
+                invariant,
+                decreases,
                 span: Span::new(start, end),
             });
         }
@@ -1397,6 +1422,29 @@ impl<'source> Parser<'source> {
         self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
         let cond = self.parse_expr()?;
         self.restrictions = old_restrict;
+        let mut invariant: Option<Expr> = None;
+        let mut decreases: Option<Expr> = None;
+        while matches!(self.peek(), Ok(Token::Invariant) | Ok(Token::Decreases)) {
+            match self.peek() {
+                Ok(Token::Invariant) => {
+                    self.advance().ok();
+                    let inv = self
+                        .with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+                            this.parse_expr()
+                        })?;
+                    invariant = Some(inv);
+                }
+                Ok(Token::Decreases) => {
+                    self.advance().ok();
+                    let dec = self
+                        .with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+                            this.parse_expr()
+                        })?;
+                    decreases = Some(dec);
+                }
+                _ => break,
+            }
+        }
         self.expect(Token::LBrace)?;
         let body = self.parse_block()?;
         self.expect(Token::RBrace)?;
@@ -1404,6 +1452,8 @@ impl<'source> Parser<'source> {
         Ok(Stmt::While {
             cond,
             body,
+            invariant,
+            decreases,
             span: Span::new(start, end),
         })
     }
@@ -2922,12 +2972,16 @@ impl<'source> Parser<'source> {
             }
             Ok(Token::As) => {
                 self.advance().ok();
+                let safe = !matches!(self.peek(), Ok(Token::Bang));
+                if !safe {
+                    self.advance().ok(); // eat '!'
+                }
                 let ty = self.parse_type()?;
                 let end = self.span().end;
                 Ok(Expr::Cast {
                     expr: Box::new(lhs),
                     ty: Box::new(ty),
-                    safe: true,
+                    safe,
                     span: Span::new(start, end),
                 })
             }
@@ -3764,5 +3818,32 @@ mod tests {
         check_parse(
             "def f() -> Result<(), ()> { let _ = x() catch { |E| { leave with Err(()); } }; Ok(()) }",
         );
+    }
+
+    #[test]
+    fn test_while_with_invariant() {
+        let src =
+            "def f() { set mut i = 0; while i < 10 invariant i >= 0 decreases 10 - i { i += 1; } }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_as_bitcast() {
+        let src = "def f() { set x = 42 as! Float<64>; }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+        match &program.items[0] {
+            Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+                Stmt::VariableDef {
+                    value: Some(Expr::Cast { safe, .. }),
+                    ..
+                } => {
+                    assert!(!safe);
+                }
+                _ => panic!("expected Cast"),
+            },
+            _ => panic!("expected FunctionDef"),
+        }
     }
 }
