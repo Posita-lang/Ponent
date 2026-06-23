@@ -370,6 +370,10 @@ pub enum Token {
     Forall,
     #[token("on")]
     On,
+    #[token("on_timeout")]
+    OnTimeout,
+    #[token("on_cancel")]
+    OnCancel,
     #[token("trait")]
     Trait,
     #[token("impl")]
@@ -688,7 +692,7 @@ mod tests {
     #[test]
     fn more_keywords() {
         check_tokens(
-            "and or not sizeof alignof catch panic unsafe let finally where requires ensures invariant constraint move dyn by copy ref mut wrap saturate trap Self no_default extern pub edition deprecated experimental endian bit_order align pad packed async await task channel linear consume pure io trusted ghost scope_cleanup trigger validate missing_match apply_lemma exists forall on trait impl decreases terminates cfg isolate hint must_use must_handle link_proof exhaustive no_alloc_error no_panic debug_info old audit_log interrupt round trunc ceil floor propagates overrides",
+            "and or not sizeof alignof catch panic unsafe let finally where requires ensures invariant constraint move dyn by copy ref mut wrap saturate trap Self no_default extern pub edition deprecated experimental endian bit_order align pad packed async await task channel linear consume pure io trusted ghost scope_cleanup trigger validate missing_match apply_lemma exists forall on on_timeout on_cancel trait impl decreases terminates cfg isolate hint must_use must_handle link_proof exhaustive no_alloc_error no_panic debug_info old audit_log interrupt round trunc ceil floor propagates overrides",
             vec![
                 Token::And,
                 Token::Or,
@@ -744,6 +748,8 @@ mod tests {
                 Token::Exists,
                 Token::Forall,
                 Token::On,
+                Token::OnTimeout,
+                Token::OnCancel,
                 Token::Trait,
                 Token::Impl,
                 Token::Decreases,

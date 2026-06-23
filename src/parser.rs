@@ -218,6 +218,8 @@ impl<'source> Parser<'source> {
             Token::Exists => Some("exists".into()),
             Token::Forall => Some("forall".into()),
             Token::On => Some("on".into()),
+            Token::OnTimeout => Some("on_timeout".into()),
+            Token::OnCancel => Some("on_cancel".into()),
             Token::Trait => Some("trait".into()),
             Token::Impl => Some("impl".into()),
             Token::Decreases => Some("decreases".into()),
@@ -786,54 +788,81 @@ impl<'source> Parser<'source> {
             }
             Token::Ensures => {
                 let mut target = EnsuresTarget::Unconditional;
-                if matches!(self.peek(), Ok(Token::On)) {
-                    self.advance().ok();
-                    match self.peek() {
-                        Ok(Token::Ident(s)) if s == "Ok" => {
+                match self.peek() {
+                    Ok(Token::OnTimeout) => {
+                        self.advance().ok();
+                        if matches!(self.peek(), Ok(Token::FatArrow)) {
                             self.advance().ok();
-                            self.expect(Token::LParen)?;
-                            let pat = if !matches!(self.peek(), Ok(Token::RParen)) {
-                                Some(self.parse_pattern()?)
-                            } else {
-                                None
-                            };
-                            self.expect(Token::RParen)?;
-                            if matches!(self.peek(), Ok(Token::FatArrow)) {
-                                self.advance().ok();
-                            } else {
-                                return Err(Diagnostic {
-                                    message: "expected '=>' after on Ok(...)".into(),
-                                    span: self.span(),
-                                });
-                            }
-                            target = EnsuresTarget::OnOk(pat);
-                        }
-                        Ok(Token::Ident(s)) if s == "Err" => {
-                            self.advance().ok();
-                            self.expect(Token::LParen)?;
-                            let pat = if !matches!(self.peek(), Ok(Token::RParen)) {
-                                Some(self.parse_pattern()?)
-                            } else {
-                                None
-                            };
-                            self.expect(Token::RParen)?;
-                            if matches!(self.peek(), Ok(Token::FatArrow)) {
-                                self.advance().ok();
-                            } else {
-                                return Err(Diagnostic {
-                                    message: "expected '=>' after on Err(...)".into(),
-                                    span: self.span(),
-                                });
-                            }
-                            target = EnsuresTarget::OnErr(pat);
-                        }
-                        _ => {
+                        } else {
                             return Err(Diagnostic {
-                                message: "expected 'Ok' or 'Err' after 'on'".into(),
+                                message: "expected '=>' after on_timeout".into(),
                                 span: self.span(),
                             });
                         }
+                        target = EnsuresTarget::OnTimeout;
                     }
+                    Ok(Token::OnCancel) => {
+                        self.advance().ok();
+                        if matches!(self.peek(), Ok(Token::FatArrow)) {
+                            self.advance().ok();
+                        } else {
+                            return Err(Diagnostic {
+                                message: "expected '=>' after on_cancel".into(),
+                                span: self.span(),
+                            });
+                        }
+                        target = EnsuresTarget::OnCancel;
+                    }
+                    Ok(Token::On) => {
+                        self.advance().ok();
+                        match self.peek() {
+                            Ok(Token::Ident(s)) if s == "Ok" => {
+                                self.advance().ok();
+                                self.expect(Token::LParen)?;
+                                let pat = if !matches!(self.peek(), Ok(Token::RParen)) {
+                                    Some(self.parse_pattern()?)
+                                } else {
+                                    None
+                                };
+                                self.expect(Token::RParen)?;
+                                if matches!(self.peek(), Ok(Token::FatArrow)) {
+                                    self.advance().ok();
+                                } else {
+                                    return Err(Diagnostic {
+                                        message: "expected '=>' after on Ok(...)".into(),
+                                        span: self.span(),
+                                    });
+                                }
+                                target = EnsuresTarget::OnOk(pat);
+                            }
+                            Ok(Token::Ident(s)) if s == "Err" => {
+                                self.advance().ok();
+                                self.expect(Token::LParen)?;
+                                let pat = if !matches!(self.peek(), Ok(Token::RParen)) {
+                                    Some(self.parse_pattern()?)
+                                } else {
+                                    None
+                                };
+                                self.expect(Token::RParen)?;
+                                if matches!(self.peek(), Ok(Token::FatArrow)) {
+                                    self.advance().ok();
+                                } else {
+                                    return Err(Diagnostic {
+                                        message: "expected '=>' after on Err(...)".into(),
+                                        span: self.span(),
+                                    });
+                                }
+                                target = EnsuresTarget::OnErr(pat);
+                            }
+                            _ => {
+                                return Err(Diagnostic {
+                                    message: "expected 'Ok' or 'Err' after 'on'".into(),
+                                    span: self.span(),
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 let old_restrict = self.restrictions;
                 self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
@@ -864,7 +893,6 @@ impl<'source> Parser<'source> {
             _ => unreachable!(),
         }
     }
-
     fn parse_type(&mut self) -> Result<Type, Diagnostic> {
         self.recursion_depth += 1;
         if self.recursion_depth > self.max_recursion_depth {
@@ -2554,7 +2582,21 @@ impl<'source> Parser<'source> {
             | Ok(Token::ByteStringLiteral(_))
             | Ok(Token::CharLiteral(_))
             | Ok(Token::True)
-            | Ok(Token::False) => self.parse_literal(),
+            | Ok(Token::False) => {
+                let expr = self.parse_literal()?;
+                if matches!(self.peek(), Ok(Token::Colon)) {
+                    self.advance().ok();
+                    let ty = self.parse_type()?;
+                    let end = self.span().end;
+                    Ok(Expr::TypeAnnotated {
+                        expr: Box::new(expr),
+                        ty: Box::new(ty),
+                        span: Span::new(start, end),
+                    })
+                } else {
+                    Ok(expr)
+                }
+            }
             Ok(Token::Ident(_)) => self.parse_path_or_literal(start),
             Ok(Token::LParen) => {
                 self.advance().ok();
@@ -2767,7 +2809,19 @@ impl<'source> Parser<'source> {
                         .replace('_', "");
                     num_part.parse::<i64>().unwrap_or(0)
                 };
-                Ok(Expr::Literal(Literal::Int(value), Span::new(start, end)))
+                let expr = Expr::Literal(Literal::Int(value), Span::new(start, end));
+                if matches!(self.peek(), Ok(Token::Colon)) {
+                    self.advance().ok();
+                    let ty = self.parse_type()?;
+                    let end = self.span().end;
+                    Ok(Expr::TypeAnnotated {
+                        expr: Box::new(expr),
+                        ty: Box::new(ty),
+                        span: Span::new(start, end),
+                    })
+                } else {
+                    Ok(expr)
+                }
             }
             _ => Err(Diagnostic {
                 message: "expected expression".to_string(),
@@ -2775,7 +2829,6 @@ impl<'source> Parser<'source> {
             }),
         }
     }
-
     fn parse_closure(&mut self, start: usize) -> Result<Expr, Diagnostic> {
         self.advance().ok();
         let mut params = Vec::new();
@@ -4085,6 +4138,61 @@ mod tests {
             Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
                 Stmt::Trigger { name, .. } => assert_eq!(name, "close_file"),
                 _ => panic!("expected Trigger"),
+            },
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_ensures_on_timeout() {
+        let src = "async def f() -> Int<32> ensures on_timeout => result == 0 { return 1; }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { contracts, .. } => {
+                assert_eq!(contracts.len(), 1);
+                match &contracts[0] {
+                    Contract::Ensures { target, .. } => {
+                        assert!(matches!(target, EnsuresTarget::OnTimeout));
+                    }
+                    _ => panic!("expected Ensures with OnTimeout"),
+                }
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_ensures_on_cancel() {
+        let src = "async def f() -> Int<32> ensures on_cancel => result == -1 { return 1; }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { contracts, .. } => {
+                assert_eq!(contracts.len(), 1);
+                match &contracts[0] {
+                    Contract::Ensures { target, .. } => {
+                        assert!(matches!(target, EnsuresTarget::OnCancel));
+                    }
+                    _ => panic!("expected Ensures with OnCancel"),
+                }
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_literal_type_annotation() {
+        let src = "def main() { set x = 1: PositiveInt; }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+                Stmt::VariableDef {
+                    value: Some(Expr::TypeAnnotated { expr, ty, .. }),
+                    ..
+                } => {
+                    assert!(matches!(**expr, Expr::Literal(Literal::Int(1), _)));
+                    assert!(matches!(**ty, Type::Path(ref path, _) if path == &["PositiveInt"]));
+                }
+                _ => panic!("expected TypeAnnotated"),
             },
             _ => panic!("expected FunctionDef"),
         }

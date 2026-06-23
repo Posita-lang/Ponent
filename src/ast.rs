@@ -75,6 +75,11 @@ pub enum Rounding {
 pub enum Expr {
     Literal(Literal, Span),
     Ident(String, Span),
+    TypeAnnotated {
+        expr: Box<Expr>,
+        ty: Box<Type>,
+        span: Span,
+    },
     BinaryOp {
         left: Box<Expr>,
         op: BinOp,
@@ -407,7 +412,7 @@ pub struct TypeParam {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeDefinition {
     Struct(Vec<StructField>),
-    Enum(Vec<EnumVariant>, Option<String>), // missing_match message
+    Enum(Vec<EnumVariant>, Option<String>),
     TraitDef {
         methods: Vec<TraitMethod>,
         associated_types: Vec<AssociatedType>,
