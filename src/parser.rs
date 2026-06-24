@@ -893,6 +893,7 @@ impl<'source> Parser<'source> {
             _ => unreachable!(),
         }
     }
+
     fn parse_type(&mut self) -> Result<Type, Diagnostic> {
         self.recursion_depth += 1;
         if self.recursion_depth > self.max_recursion_depth {
@@ -1944,7 +1945,7 @@ impl<'source> Parser<'source> {
             Vec::new()
         };
         self.expect(Token::Assign)?;
-        let definition = if let Ok(Token::Ident(s)) = self.peek().clone() {
+        let (mut ty, is_struct_or_enum) = if let Ok(Token::Ident(s)) = self.peek().clone() {
             match s.as_str() {
                 "struct" => {
                     self.advance().ok();
@@ -1985,7 +1986,17 @@ impl<'source> Parser<'source> {
                             break;
                         }
                     }
-                    TypeDefinition::Struct(fields)
+                    let definition = TypeDefinition::Struct(fields);
+                    let end = self.span().end;
+                    return Ok(Stmt::TypeDef {
+                        span: Span::new(start, end),
+                        attributes,
+                        doc,
+                        name,
+                        params,
+                        definition,
+                        contracts: Vec::new(),
+                    });
                 }
                 "enum" => {
                     self.advance().ok();
@@ -2043,45 +2054,53 @@ impl<'source> Parser<'source> {
                     } else {
                         None
                     };
-                    TypeDefinition::Enum(variants, missing_match)
+                    let definition = TypeDefinition::Enum(variants, missing_match);
+                    let end = self.span().end;
+                    return Ok(Stmt::TypeDef {
+                        span: Span::new(start, end),
+                        attributes,
+                        doc,
+                        name,
+                        params,
+                        definition,
+                        contracts: Vec::new(),
+                    });
                 }
                 _ => {
                     let ty = self.parse_type()?;
-                    let ty = if matches!(self.peek(), Ok(Token::Pipe)) {
-                        let mut types = vec![ty];
-                        while matches!(self.peek(), Ok(Token::Pipe)) {
-                            self.advance().ok();
-                            types.push(self.parse_type()?);
-                        }
-                        Type::Union(types, Span::new(start, self.span().end))
-                    } else {
-                        ty
-                    };
-                    let modifiers = self.parse_type_modifiers()?;
-                    if matches!(self.peek(), Ok(Token::Semicolon)) {
-                        self.advance().ok();
-                    }
-                    TypeDefinition::Alias(ty, modifiers)
+                    (ty, false)
                 }
             }
         } else {
             let ty = self.parse_type()?;
-            let ty = if matches!(self.peek(), Ok(Token::Pipe)) {
-                let mut types = vec![ty];
-                while matches!(self.peek(), Ok(Token::Pipe)) {
-                    self.advance().ok();
-                    types.push(self.parse_type()?);
-                }
-                Type::Union(types, Span::new(start, self.span().end))
-            } else {
-                ty
-            };
-            let modifiers = self.parse_type_modifiers()?;
-            if matches!(self.peek(), Ok(Token::Semicolon)) {
-                self.advance().ok();
-            }
-            TypeDefinition::Alias(ty, modifiers)
+            (ty, false)
         };
+
+        if matches!(self.peek(), Ok(Token::Where)) {
+            self.advance().ok();
+            let invariant = self.parse_expr()?;
+            let name = format!("_where_{}", self.diagnostics.len());
+            ty = Type::Exists {
+                name,
+                base: Box::new(ty),
+                invariant: Box::new(invariant),
+                span: Span::new(start, self.span().end),
+            };
+        }
+
+        if matches!(self.peek(), Ok(Token::Pipe)) {
+            let mut types = vec![ty];
+            while matches!(self.peek(), Ok(Token::Pipe)) {
+                self.advance().ok();
+                types.push(self.parse_type()?);
+            }
+            ty = Type::Union(types, Span::new(start, self.span().end));
+        }
+
+        let modifiers = self.parse_type_modifiers()?;
+        if matches!(self.peek(), Ok(Token::Semicolon)) {
+            self.advance().ok();
+        }
         let end = self.span().end;
         Ok(Stmt::TypeDef {
             span: Span::new(start, end),
@@ -2089,7 +2108,7 @@ impl<'source> Parser<'source> {
             doc,
             name,
             params,
-            definition,
+            definition: TypeDefinition::Alias(ty, modifiers),
             contracts: Vec::new(),
         })
     }
@@ -2829,6 +2848,7 @@ impl<'source> Parser<'source> {
             }),
         }
     }
+
     fn parse_closure(&mut self, start: usize) -> Result<Expr, Diagnostic> {
         self.advance().ok();
         let mut params = Vec::new();
@@ -4195,6 +4215,30 @@ mod tests {
                 _ => panic!("expected TypeAnnotated"),
             },
             _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_type_where_clause() {
+        let src = "type PositiveInt = Int<32> where value > 0 with default = 1;";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::TypeDef {
+                definition: TypeDefinition::Alias(ty, modifiers),
+                ..
+            } => {
+                assert!(matches!(
+                    ty,
+                    Type::Exists {
+                        name,
+                        base,
+                        invariant,
+                        ..
+                    }
+                ));
+                assert_eq!(modifiers.len(), 1);
+            }
+            _ => panic!("expected TypeDef with where clause"),
         }
     }
 }

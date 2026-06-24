@@ -287,11 +287,6 @@ pub enum Stmt {
         span: Span,
     },
     Edition(String, Span),
-    TestBlock {
-        name: String,
-        body: Vec<Stmt>,
-        span: Span,
-    },
     Expression(Expr),
     If {
         cond: Expr,
