@@ -1,7 +1,7 @@
 use crate::ast::Span;
 use crate::hir::traits::TraitEnv;
 use crate::hir::types::*;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeVariableKind {
@@ -183,7 +183,7 @@ impl InferenceContext {
     }
 
     pub fn finalize(&self, ctx: &TypeContext) -> HashMap<usize, TypeId> {
-        let mut solution = HashMap::new();
+        let mut solution = HashMap::default();
         for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
             let resolved = ctx.resolve_binding(ty_id);
             let data = ctx.get(resolved);

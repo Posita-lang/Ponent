@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -111,10 +111,10 @@ impl TypeContext {
     pub fn new() -> Self {
         let mut ctx = TypeContext {
             types: Vec::new(),
-            type_map: HashMap::new(),
-            bindings: RefCell::new(HashMap::new()),
-            meta: HashMap::new(),
-            def_id_to_type_id: HashMap::new(),
+            type_map: HashMap::default(),
+            bindings: RefCell::new(HashMap::default()),
+            meta: HashMap::default(),
+            def_id_to_type_id: HashMap::default(),
             builtin_unit: TypeId(0),
             builtin_never: TypeId(0),
             builtin_error: TypeId(0),
@@ -845,7 +845,7 @@ pub struct Subst {
 impl Subst {
     pub fn new() -> Self {
         Subst {
-            map: HashMap::new(),
+            map: HashMap::default(),
         }
     }
 

@@ -1,7 +1,7 @@
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
 use crate::hir::types::*;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 #[derive(Debug, Clone)]
 pub struct FieldBinding {
@@ -107,12 +107,12 @@ impl Scope {
     pub fn new(parent: Option<usize>) -> Self {
         Scope {
             parent,
-            variables: HashMap::new(),
-            functions: HashMap::new(),
-            types: HashMap::new(),
-            traits: HashMap::new(),
+            variables: HashMap::default(),
+            functions: HashMap::default(),
+            types: HashMap::default(),
+            traits: HashMap::default(),
             impls: Vec::new(),
-            constraints: HashMap::new(),
+            constraints: HashMap::default(),
         }
     }
 }
@@ -132,8 +132,8 @@ impl SymbolTable {
         SymbolTable {
             scopes: vec![root],
             current_scope: 0,
-            type_defs: HashMap::new(),
-            trait_defs: HashMap::new(),
+            type_defs: HashMap::default(),
+            trait_defs: HashMap::default(),
             next_def_id: 0,
             local_crate_id,
         }
