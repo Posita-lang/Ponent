@@ -1,16 +1,19 @@
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticCollector, DiagnosticLevel};
 use crate::hir::symbol::*;
+use crate::hir::traits::{ImplCandidate, TraitEnv};
 use crate::hir::types::*;
 
 pub struct NameResolver<'a> {
     ctx: &'a mut TypeContext,
     symbols: SymbolTable,
+    trait_env: TraitEnv,
     diagnostics: DiagnosticCollector,
     current_scope: usize,
     current_function: Option<DefId>,
     current_type: Option<DefId>,
     import_map: Vec<ImportEntry>,
+    local_crate_id: CrateId,
 }
 
 struct ImportEntry {
@@ -21,33 +24,35 @@ struct ImportEntry {
 }
 
 impl<'a> NameResolver<'a> {
-    pub fn new(ctx: &'a mut TypeContext) -> Self {
+    pub fn new(ctx: &'a mut TypeContext, local_crate_id: CrateId) -> Self {
         NameResolver {
             ctx,
-            symbols: SymbolTable::new(),
+            symbols: SymbolTable::new(local_crate_id),
+            trait_env: TraitEnv::new(),
             diagnostics: DiagnosticCollector::new(),
             current_scope: 0,
             current_function: None,
             current_type: None,
             import_map: Vec::new(),
+            local_crate_id,
         }
     }
 
     pub fn resolve_program(
         &mut self,
         program: &Program,
-    ) -> Result<(SymbolTable, DiagnosticCollector), DiagnosticCollector> {
-        self.enter_scope();
+    ) -> Result<(SymbolTable, TraitEnv, DiagnosticCollector), DiagnosticCollector> {
         for item in &program.items {
             self.resolve_item(item);
         }
-        self.exit_scope();
 
         if self.diagnostics.has_errors() {
             Err(std::mem::take(&mut self.diagnostics))
         } else {
-            let symbols = std::mem::take(&mut self.symbols);
-            Ok((symbols, std::mem::take(&mut self.diagnostics)))
+            let symbols =
+                std::mem::replace(&mut self.symbols, SymbolTable::new(self.local_crate_id));
+            let trait_env = std::mem::replace(&mut self.trait_env, TraitEnv::new());
+            Ok((symbols, trait_env, std::mem::take(&mut self.diagnostics)))
         }
     }
 
@@ -64,6 +69,7 @@ impl<'a> NameResolver<'a> {
                 where_clause,
                 is_comptime,
                 is_async,
+                contracts,
                 ..
             } => {
                 let def_id = self.allocate_def_id();
@@ -75,7 +81,7 @@ impl<'a> NameResolver<'a> {
                     is_comptime: *is_comptime,
                     is_async: *is_async,
                     is_pure: self.has_pure_attribute(attributes),
-                    contracts: Vec::new(),
+                    contracts: contracts.clone(),
                     attributes: attributes.clone(),
                 };
                 if let Err(diag) = self.symbols.insert_function(name.clone(), binding, *span) {
@@ -135,16 +141,37 @@ impl<'a> NameResolver<'a> {
                 let mut fields = Vec::new();
                 let mut variants = Vec::new();
                 let mut alias_ast = None;
+                let mut invariant = None;
+                let mut default_value = None;
+                let mut no_default = false;
 
                 match definition {
                     TypeDefinition::Struct(fields_def) => {
-                        fields = fields_def.clone();
+                        fields = fields_def
+                            .iter()
+                            .map(|f| {
+                                let field_ty = self.resolve_type_expr(&f.ty);
+                                FieldBinding {
+                                    name: f.name.clone(),
+                                    ty: field_ty,
+                                    default: f.default.clone(),
+                                    span: f.span,
+                                }
+                            })
+                            .collect();
                     }
                     TypeDefinition::Enum(variants_def, _) => {
                         variants = variants_def.clone();
                     }
-                    TypeDefinition::Alias(ty, _) => {
+                    TypeDefinition::Alias(ty, mods) => {
                         alias_ast = Some(ty.clone());
+                        for m in mods {
+                            match m {
+                                TypeModifier::Default(expr) => default_value = Some(expr.clone()),
+                                TypeModifier::NoDefault => no_default = true,
+                                _ => {}
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -157,6 +184,10 @@ impl<'a> NameResolver<'a> {
                     alias_ast,
                     fields,
                     variants,
+                    invariant,
+                    default_value,
+                    no_default,
+                    crate_id: self.symbols.local_crate_id,
                 };
                 if let Err(diag) = self.symbols.insert_type(name.clone(), binding, *span) {
                     self.diagnostics.push(diag);
@@ -184,6 +215,7 @@ impl<'a> NameResolver<'a> {
                         .map(|at| (at.name.clone(), at.default.clone()))
                         .collect(),
                     span: *span,
+                    crate_id: self.symbols.local_crate_id,
                 };
                 if let Err(diag) = self.symbols.insert_trait(name.clone(), binding, *span) {
                     self.diagnostics.push(diag);
@@ -191,7 +223,6 @@ impl<'a> NameResolver<'a> {
             }
             Stmt::ImplBlock {
                 span,
-                attributes,
                 trait_path,
                 for_type,
                 methods,
@@ -209,6 +240,18 @@ impl<'a> NameResolver<'a> {
                     span: *span,
                 };
                 self.symbols.insert_impl(binding, *span);
+
+                if let Some(trait_id) = resolved_trait {
+                    let candidate = ImplCandidate {
+                        trait_id,
+                        for_type: resolved_for,
+                        methods: methods.clone(),
+                        span: *span,
+                    };
+                    self.trait_env
+                        .add_impl(candidate, &self.symbols, self.ctx, false);
+                }
+
                 self.exit_scope();
             }
             Stmt::Import {
@@ -224,6 +267,7 @@ impl<'a> NameResolver<'a> {
                     span: *span,
                 });
             }
+            Stmt::Edition(..) => {}
             Stmt::Constraint { name, bounds, span } => {
                 let resolved_bounds: Vec<TypeId> =
                     bounds.iter().map(|b| self.resolve_type_expr(b)).collect();
@@ -327,7 +371,7 @@ impl<'a> NameResolver<'a> {
                 cond,
                 then_branch,
                 else_branch,
-                span,
+                ..
             } => {
                 self.resolve_expr(cond);
                 self.enter_scope();
@@ -349,7 +393,7 @@ impl<'a> NameResolver<'a> {
                 scrutinee,
                 then_branch,
                 else_branch,
-                span,
+                ..
             } => {
                 self.resolve_expr(scrutinee);
                 self.resolve_pattern(pattern);
@@ -372,7 +416,7 @@ impl<'a> NameResolver<'a> {
                 body,
                 invariant,
                 decreases,
-                span,
+                ..
             } => {
                 self.resolve_expr(cond);
                 if let Some(inv) = invariant {
@@ -393,7 +437,7 @@ impl<'a> NameResolver<'a> {
                 body,
                 invariant,
                 decreases,
-                span,
+                ..
             } => {
                 self.resolve_expr(scrutinee);
                 self.resolve_pattern(pattern);
@@ -415,7 +459,7 @@ impl<'a> NameResolver<'a> {
                 body,
                 invariant,
                 decreases,
-                span,
+                ..
             } => {
                 self.resolve_expr(iterable);
                 self.resolve_pattern(pattern);
@@ -431,75 +475,63 @@ impl<'a> NameResolver<'a> {
                 }
                 self.exit_scope();
             }
-            Stmt::Loop { body, span } => {
+            Stmt::Loop { body, .. } => {
                 self.enter_scope();
                 for stmt in body {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
             }
-            Stmt::Leave { label, span } => {}
-            Stmt::Continue { label, span } => {}
-            Stmt::Return { value, span } => {
+            Stmt::Leave { .. } => {}
+            Stmt::Continue { .. } => {}
+            Stmt::Return { value, .. } => {
                 if let Some(value) = value {
                     self.resolve_expr(value);
                 }
             }
-            Stmt::Assign {
-                target,
-                op,
-                value,
-                span,
-            } => {
+            Stmt::Assign { target, value, .. } => {
                 self.resolve_expr(target);
                 self.resolve_expr(value);
             }
-            Stmt::ComptimeBlock { body, span } => {
+            Stmt::ComptimeBlock { body, .. } => {
                 self.enter_scope();
                 for stmt in body {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
             }
-            Stmt::ScopeCleanup {
-                name,
-                body,
-                propagates,
-                overrides,
-                span,
-            } => {
+            Stmt::ScopeCleanup { body, .. } => {
                 self.enter_scope();
                 for stmt in body {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
             }
-            Stmt::Unsafe { body, span } => {
+            Stmt::Unsafe { body, .. } => {
                 self.enter_scope();
                 for stmt in body {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
             }
-            Stmt::GhostVariableDef { inner, span } => {
+            Stmt::GhostVariableDef { inner, .. } => {
                 self.resolve_stmt(inner);
             }
-            Stmt::Isolate { body, span } => {
+            Stmt::Isolate { body, .. } => {
                 self.enter_scope();
                 for stmt in body {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
             }
-            Stmt::Trigger { name, span } => {}
-            Stmt::Error(span) => {}
+            Stmt::Trigger { .. } => {}
             _ => {}
         }
     }
 
     fn resolve_expr(&mut self, expr: &Expr) -> Option<TypeId> {
         match expr {
-            Expr::Literal(lit, span) => {
+            Expr::Literal(lit, _span) => {
                 let ty = self.literal_type(lit);
                 Some(ty)
             }
@@ -512,8 +544,8 @@ impl<'a> NameResolver<'a> {
                         .ctx
                         .function(sig.params.iter().map(|p| p.ty).collect(), sig.return_type);
                     Some(ty)
-                } else if let Some(ty_binding) = self.symbols.lookup_type(name) {
-                    Some(ty_binding.def_id.0 as TypeId)
+                } else if let Some(_ty_binding) = self.symbols.lookup_type(name) {
+                    None
                 } else {
                     self.diagnostics.push(
                         Diagnostic::error(format!("undefined name: {}", name)).with_span(*span),
@@ -521,110 +553,101 @@ impl<'a> NameResolver<'a> {
                     Some(self.ctx.error())
                 }
             }
-            Expr::TypeAnnotated { expr, ty, span } => {
+            Expr::TypeAnnotated { expr, ty, .. } => {
                 let _ = self.resolve_type_expr(ty);
                 self.resolve_expr(expr)
             }
-            Expr::BinaryOp {
-                left,
-                op,
-                right,
-                span,
-            } => {
+            Expr::BinaryOp { left, right, .. } => {
                 self.resolve_expr(left);
                 self.resolve_expr(right);
-                Some(self.ctx.int(32, true))
+                None
             }
-            Expr::UnaryOp { op, expr, span } => {
+            Expr::UnaryOp { expr, .. } => {
                 self.resolve_expr(expr);
-                Some(self.ctx.int(32, true))
+                None
             }
-            Expr::Call {
-                callee,
-                args,
-                comptime,
-                span,
-            } => {
+            Expr::Call { callee, args, .. } => {
                 self.resolve_expr(callee);
                 for arg in args {
                     self.resolve_expr(arg);
                 }
-                Some(self.ctx.int(32, true))
+                None
             }
-            Expr::Index { base, index, span } => {
+            Expr::Index { base, index, .. } => {
                 self.resolve_expr(base);
                 self.resolve_expr(index);
-                Some(self.ctx.int(32, true))
+                None
             }
-            Expr::FieldAccess { base, field, span } => {
+            Expr::FieldAccess { base, .. } => {
                 self.resolve_expr(base);
-                Some(self.ctx.int(32, true))
+                None
             }
-            Expr::AttrAccess { base, attr, span } => {
+            Expr::AttrAccess { base, .. } => {
                 self.resolve_expr(base);
-                Some(self.ctx.int(32, true))
+                None
             }
-            Expr::Cast {
-                expr,
-                ty,
-                safe,
-                rounding,
-                span,
-            } => {
+            Expr::Cast { expr, ty, .. } => {
                 self.resolve_expr(expr);
                 let _ = self.resolve_type_expr(ty);
-                Some(self.ctx.int(32, true))
+                None
             }
-            Expr::Range {
-                start,
-                end,
-                inclusive,
-                span,
-            } => {
+            Expr::Range { start, end, .. } => {
                 if let Some(start) = start {
                     self.resolve_expr(start);
                 }
                 if let Some(end) = end {
                     self.resolve_expr(end);
                 }
-                Some(
-                    self.ctx
-                        .tuple(vec![self.ctx.int(32, true), self.ctx.int(32, true)]),
-                )
+                None
             }
-            Expr::StructLit { path, fields, span } => {
+            Expr::StructLit { path, fields, .. } => {
                 let def_id = self.resolve_type_path(path);
-                if let Some(def_id) = def_id {}
                 for (_, value) in fields {
                     self.resolve_expr(value);
                 }
-                Some(self.ctx.int(32, true))
+                if let Some(def_id) = def_id {
+                    if let Some(binding) = self.symbols.lookup_type_by_def_id(def_id) {
+                        if binding.kind == TypeKind::Struct {
+                            return Some(self.ctx.struct_ty(def_id, vec![]));
+                        }
+                    }
+                }
+                None
             }
             Expr::EnumLit {
                 path,
                 variant,
                 payload,
-                span,
+                ..
             } => {
                 if let Some(payload) = payload {
                     self.resolve_expr(payload);
                 }
-                Some(self.ctx.int(32, true))
+                if let Some(def_id) = self.resolve_type_path(path) {
+                    if let Some(binding) = self.symbols.lookup_type_by_def_id(def_id) {
+                        if binding.kind == TypeKind::Enum {
+                            return Some(self.ctx.enum_ty(def_id, vec![]));
+                        }
+                    }
+                }
+                None
             }
-            Expr::Move(expr, span) => {
+            Expr::Move(expr, ..) => {
                 self.resolve_expr(expr);
-                Some(self.ctx.int(32, true))
+                None
             }
-            Expr::Tuple(exprs, span) => {
+            Expr::Tuple(exprs, ..) => {
                 let mut elems = Vec::new();
                 for e in exprs {
                     if let Some(ty) = self.resolve_expr(e) {
                         elems.push(ty);
+                    } else {
+                        elems.push(self.ctx.error());
                     }
                 }
                 Some(self.ctx.tuple(elems))
             }
-            Expr::Array(exprs, span) => {
+            Expr::Array(exprs, ..) => {
                 let mut elem_ty = None;
                 for e in exprs {
                     if let Some(ty) = self.resolve_expr(e) {
@@ -641,9 +664,8 @@ impl<'a> NameResolver<'a> {
             Expr::Closure {
                 params,
                 return_type,
-                captures,
                 body,
-                span,
+                ..
             } => {
                 self.enter_scope();
                 for param in params {
@@ -687,11 +709,11 @@ impl<'a> NameResolver<'a> {
                     .collect();
                 Some(self.ctx.function(param_tys, ret_ty))
             }
-            Expr::Try { expr, span } => {
+            Expr::Try { expr, .. } => {
                 self.resolve_expr(expr);
-                Some(self.ctx.int(32, true))
+                None
             }
-            Expr::UnsafeBlock { body, span } => {
+            Expr::UnsafeBlock { body, .. } => {
                 self.enter_scope();
                 for stmt in body {
                     self.resolve_stmt(stmt);
@@ -699,11 +721,7 @@ impl<'a> NameResolver<'a> {
                 self.exit_scope();
                 Some(self.ctx.unit())
             }
-            Expr::Catch {
-                expr,
-                branches,
-                span,
-            } => {
+            Expr::Catch { expr, branches, .. } => {
                 self.resolve_expr(expr);
                 for branch in branches {
                     self.resolve_pattern(&branch.pattern);
@@ -727,22 +745,21 @@ impl<'a> NameResolver<'a> {
                     }
                     self.exit_scope();
                 }
-                Some(self.ctx.int(32, true))
+                None
             }
-            Expr::LeaveWith { expr, span } => {
+            Expr::LeaveWith { expr, .. } => {
                 self.resolve_expr(expr);
                 Some(self.ctx.never())
             }
-            Expr::Await { expr, span } => {
+            Expr::Await { expr, .. } => {
                 self.resolve_expr(expr);
-                Some(self.ctx.int(32, true))
+                None
             }
             Expr::If {
                 cond,
                 then_branch,
                 else_branch,
-                is_expression,
-                span,
+                ..
             } => {
                 self.resolve_expr(cond);
                 self.enter_scope();
@@ -758,14 +775,14 @@ impl<'a> NameResolver<'a> {
                     }
                     self.exit_scope();
                 }
-                Some(self.ctx.unit())
+                None
             }
             Expr::IfLet {
                 pattern,
                 scrutinee,
                 then_branch,
                 else_branch,
-                span,
+                ..
             } => {
                 self.resolve_expr(scrutinee);
                 self.resolve_pattern(pattern);
@@ -782,12 +799,10 @@ impl<'a> NameResolver<'a> {
                     }
                     self.exit_scope();
                 }
-                Some(self.ctx.unit())
+                None
             }
             Expr::Match {
-                scrutinee,
-                arms,
-                span,
+                scrutinee, arms, ..
             } => {
                 self.resolve_expr(scrutinee);
                 for arm in arms {
@@ -797,31 +812,28 @@ impl<'a> NameResolver<'a> {
                     }
                     self.resolve_expr(&arm.body);
                 }
-                Some(self.ctx.unit())
+                None
             }
-            Expr::Block(stmts, span) => {
+            Expr::Block(stmts, ..) => {
                 self.enter_scope();
-                let mut last_ty = self.ctx.unit();
+                let mut last_ty = None;
                 for stmt in stmts {
                     if let Stmt::Expression(expr) = stmt {
-                        if let Some(ty) = self.resolve_expr(expr) {
-                            last_ty = ty;
-                        }
+                        last_ty = self.resolve_expr(expr);
                     } else {
                         self.resolve_stmt(stmt);
-                        last_ty = self.ctx.unit();
                     }
                 }
                 self.exit_scope();
-                Some(last_ty)
+                last_ty
             }
-            Expr::Error(span) => Some(self.ctx.error()),
+            Expr::Error(..) => Some(self.ctx.error()),
         }
     }
 
     fn resolve_pattern(&mut self, pattern: &Pattern) {
         match pattern {
-            Pattern::Wildcard(span) => {}
+            Pattern::Wildcard(..) => {}
             Pattern::Ident(name, span) => {
                 let binding = VariableBinding {
                     ty: self.ctx.error(),
@@ -833,35 +845,30 @@ impl<'a> NameResolver<'a> {
                     self.diagnostics.push(diag);
                 }
             }
-            Pattern::Literal(expr, span) => {
+            Pattern::Literal(expr, ..) => {
                 self.resolve_expr(expr);
             }
-            Pattern::Tuple(patterns, span) => {
+            Pattern::Tuple(patterns, ..) => {
                 for p in patterns {
                     self.resolve_pattern(p);
                 }
             }
-            Pattern::Struct { path, fields, span } => {
+            Pattern::Struct { fields, .. } => {
                 for (_, p) in fields {
                     self.resolve_pattern(p);
                 }
             }
-            Pattern::Enum {
-                path,
-                variant,
-                inner,
-                span,
-            } => {
+            Pattern::Enum { inner, .. } => {
                 if let Some(inner) = inner {
                     self.resolve_pattern(inner);
                 }
             }
-            Pattern::Or(patterns, span) => {
+            Pattern::Or(patterns, ..) => {
                 for p in patterns {
                     self.resolve_pattern(p);
                 }
             }
-            Pattern::Error(span) => {}
+            Pattern::Error(..) => {}
         }
     }
 
@@ -869,31 +876,107 @@ impl<'a> NameResolver<'a> {
         match ty {
             Type::Path(path, span) => {
                 if let Some(def_id) = self.resolve_type_path(path) {
-                    self.ctx.int(32, true)
+                    let alias = self
+                        .symbols
+                        .lookup_type_by_def_id(def_id)
+                        .and_then(|b| b.alias_ast.clone());
+                    if let Some(alias) = alias {
+                        self.resolve_type_expr(&alias)
+                    } else if let Some(binding) = self.symbols.lookup_type_by_def_id(def_id) {
+                        match binding.kind {
+                            TypeKind::Struct => self.ctx.struct_ty(def_id, vec![]),
+                            TypeKind::Enum => self.ctx.enum_ty(def_id, vec![]),
+                            _ => self.ctx.error(),
+                        }
+                    } else {
+                        self.ctx.error()
+                    }
+                } else {
+                    // Check for built-in types
+                    let name = &path[0];
+                    match name.as_str() {
+                        "Bool" => self.ctx.bool(),
+                        "Char" => self.ctx.char(),
+                        "Byte" => self.ctx.byte(),
+                        "USize" => self.ctx.usize(),
+                        "Unit" => self.ctx.unit(),
+                        "Never" => self.ctx.never(),
+                        "Int" | "UInt" | "Float" => {
+                            // These require type arguments; handled in Type::Generic
+                            self.ctx.error()
+                        }
+                        _ => {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!("undefined type: {}", path.join("::")))
+                                    .with_span(*span),
+                            );
+                            self.ctx.error()
+                        }
+                    }
+                }
+            }
+            Type::Generic(base, args, span) => {
+                // Handle generic built-in types (Int, UInt, Float) by matching base path
+                if let Type::Path(path, _) = base.as_ref() {
+                    if path.len() == 1 {
+                        match path[0].as_str() {
+                            "Int" => {
+                                let bits = self.extract_int_from_type(&args[0])
+                                    .unwrap_or(32);
+                                return self.ctx.int(bits, true);
+                            }
+                            "UInt" => {
+                                let bits = self.extract_int_from_type(&args[0])
+                                    .unwrap_or(32);
+                                return self.ctx.int(bits, false);
+                            }
+                            "Float" => {
+                                let bits = self.extract_int_from_type(&args[0])
+                                    .unwrap_or(64);
+                                return self.ctx.float(bits);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let base_ty = self.resolve_type_expr(base);
+                if let Some(def_id) = self.ctx.get_def_id_for_type(base_ty) {
+                    let binding = self.symbols.lookup_type_by_def_id(def_id).cloned();
+                    if let Some(binding) = binding {
+                        let arg_tys: Vec<TypeId> =
+                            args.iter().map(|a| self.resolve_type_expr(a)).collect();
+                        match binding.kind {
+                            TypeKind::Struct => self.ctx.struct_ty(def_id, arg_tys),
+                            TypeKind::Enum => self.ctx.enum_ty(def_id, arg_tys),
+                            _ => {
+                                self.diagnostics.push(
+                                    Diagnostic::error("generic type arguments on non-generic type")
+                                        .with_span(*span),
+                                );
+                                self.ctx.error()
+                            }
+                        }
+                    } else {
+                        self.diagnostics
+                            .push(Diagnostic::error("type definition not found").with_span(*span));
+                        self.ctx.error()
+                    }
                 } else {
                     self.diagnostics.push(
-                        Diagnostic::error(format!("undefined type: {}", path.join("::")))
-                            .with_span(*span),
+                        Diagnostic::error("expected a path type for generic base").with_span(*span),
                     );
                     self.ctx.error()
                 }
             }
-            Type::Generic(base, args, span) => {
-                let _ = self.resolve_type_expr(base);
-                for arg in args {
-                    self.resolve_type_expr(arg);
-                }
-                self.ctx.int(32, true)
-            }
-            Type::Reference(ty, mutable, span) => {
+            Type::Reference(ty, mutable, ..) => {
                 let inner = self.resolve_type_expr(ty);
                 self.ctx.reference(inner, *mutable)
             }
-            Type::Pointer(ty, span) => {
+            Type::Pointer(ty, ..) => {
                 let inner = self.resolve_type_expr(ty);
                 self.ctx.pointer(inner)
             }
-            Type::Slice(ty, span) => {
+            Type::Slice(ty, ..) => {
                 let inner = self.resolve_type_expr(ty);
                 self.ctx.slice(inner)
             }
@@ -909,20 +992,20 @@ impl<'a> NameResolver<'a> {
                     self.ctx.error()
                 }
             }
-            Type::Tuple(tys, span) => {
+            Type::Tuple(tys, ..) => {
                 let elems: Vec<TypeId> = tys.iter().map(|t| self.resolve_type_expr(t)).collect();
                 self.ctx.tuple(elems)
             }
-            Type::Function { params, ret, span } => {
+            Type::Function { params, ret, .. } => {
                 let param_tys = params.iter().map(|p| self.resolve_type_expr(p)).collect();
                 let ret_ty = self.resolve_type_expr(ret);
                 self.ctx.function(param_tys, ret_ty)
             }
             Type::Projection(base, name, span) => {
-                let _ = self.resolve_type_expr(base);
-                self.ctx.int(32, true)
+                let _base_ty = self.resolve_type_expr(base);
+                self.ctx.error()
             }
-            Type::DynTrait(traits, span) => {
+            Type::DynTrait(traits, ..) => {
                 let trait_ids: Vec<DefId> = traits
                     .iter()
                     .filter_map(|t| {
@@ -939,25 +1022,16 @@ impl<'a> NameResolver<'a> {
                 name,
                 base,
                 invariant,
-                span,
+                ..
             } => {
                 let base_ty = self.resolve_type_expr(base);
                 self.ctx
                     .exists(name.clone(), base_ty, invariant.as_ref().clone())
             }
-            Type::Literal(expr, span) => {
-                self.resolve_expr(expr);
-                self.ctx.int(32, true)
-            }
-            Type::Never(span) => self.ctx.never(),
-            Type::Union(tys, span) => {
-                let mut resolved = Vec::new();
-                for t in tys {
-                    resolved.push(self.resolve_type_expr(t));
-                }
-                self.ctx.int(32, true)
-            }
-            Type::Error(span) => self.ctx.error(),
+            Type::Literal(expr, ..) => self.resolve_expr(expr).unwrap_or(self.ctx.error()),
+            Type::Never(..) => self.ctx.never(),
+            Type::Union(tys, ..) => self.ctx.error(),
+            Type::Error(..) => self.ctx.error(),
         }
     }
 
@@ -973,6 +1047,19 @@ impl<'a> NameResolver<'a> {
             return None;
         }
         self.symbols.lookup_trait_by_path(path)
+    }
+
+    fn extract_int_from_type(&self, ty: &Type) -> Option<u8> {
+        match ty {
+            Type::Literal(expr, _) => {
+                if let Expr::Literal(Literal::Int(val), _) = expr.as_ref() {
+                    Some(*val as u8)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     fn enter_scope(&mut self) {
@@ -1005,7 +1092,7 @@ impl<'a> NameResolver<'a> {
         attributes.iter().any(|attr| attr.name == "pure")
     }
 
-    fn literal_type(&self, lit: &Literal) -> TypeId {
+    fn literal_type(&mut self, lit: &Literal) -> TypeId {
         match lit {
             Literal::Int(_) => self.ctx.int(32, true),
             Literal::Float(_) => self.ctx.float(64),
@@ -1017,7 +1104,7 @@ impl<'a> NameResolver<'a> {
     }
 
     fn collect_function_signature(
-        &self,
+        &mut self,
         name: &str,
         params: &[Param],
         return_type: &Type,
@@ -1044,7 +1131,7 @@ impl<'a> NameResolver<'a> {
         }
     }
 
-    fn collect_trait_method_signature(&self, method: &TraitMethod) -> FunctionSignature {
+    fn collect_trait_method_signature(&mut self, method: &TraitMethod) -> FunctionSignature {
         FunctionSignature {
             params: method
                 .params

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -5,11 +6,17 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeId(pub usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CrateId(pub DefId);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeData {
     Int {
         bits: u8,
         signed: bool,
+    },
+    UInt {
+        bits: u8,
     },
     Float {
         bits: u8,
@@ -67,6 +74,9 @@ pub enum TypeData {
         name: String,
         self_ty: TypeId,
     },
+    InferVar {
+        id: usize,
+    },
     Never,
     Unit,
     Error,
@@ -75,12 +85,26 @@ pub enum TypeData {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DefId(pub usize);
 
+#[derive(Debug, Clone)]
+pub struct TypeMeta {
+    pub default_value: Option<crate::ast::Expr>,
+    pub invariant: Option<crate::ast::Expr>,
+    pub no_default: bool,
+}
+
 pub struct TypeContext {
     types: Vec<Arc<TypeData>>,
     type_map: HashMap<TypeData, TypeId>,
-    bindings: HashMap<TypeId, TypeId>,
-    invariants: HashMap<TypeId, Expr>,
+    pub(crate) bindings: RefCell<HashMap<TypeId, TypeId>>,
+    meta: HashMap<TypeId, TypeMeta>,
     def_id_to_type_id: HashMap<DefId, TypeId>,
+    pub builtin_unit: TypeId,
+    pub builtin_never: TypeId,
+    pub builtin_error: TypeId,
+    pub builtin_bool: TypeId,
+    pub builtin_char: TypeId,
+    pub builtin_byte: TypeId,
+    pub builtin_usize: TypeId,
 }
 
 impl TypeContext {
@@ -88,22 +112,29 @@ impl TypeContext {
         let mut ctx = TypeContext {
             types: Vec::new(),
             type_map: HashMap::new(),
-            bindings: HashMap::new(),
-            invariants: HashMap::new(),
+            bindings: RefCell::new(HashMap::new()),
+            meta: HashMap::new(),
             def_id_to_type_id: HashMap::new(),
+            builtin_unit: TypeId(0),
+            builtin_never: TypeId(0),
+            builtin_error: TypeId(0),
+            builtin_bool: TypeId(0),
+            builtin_char: TypeId(0),
+            builtin_byte: TypeId(0),
+            builtin_usize: TypeId(0),
         };
-        let unit = ctx.alloc(TypeData::Unit);
-        let never = ctx.alloc(TypeData::Never);
-        let error = ctx.alloc(TypeData::Error);
-        let bool_ty = ctx.alloc(TypeData::Bool);
-        let char_ty = ctx.alloc(TypeData::Char);
-        let byte_ty = ctx.alloc(TypeData::Byte);
-        let usize_ty = ctx.alloc(TypeData::USize);
+        ctx.builtin_unit = ctx.alloc(TypeData::Unit);
+        ctx.builtin_never = ctx.alloc(TypeData::Never);
+        ctx.builtin_error = ctx.alloc(TypeData::Error);
+        ctx.builtin_bool = ctx.alloc(TypeData::Bool);
+        ctx.builtin_char = ctx.alloc(TypeData::Char);
+        ctx.builtin_byte = ctx.alloc(TypeData::Byte);
+        ctx.builtin_usize = ctx.alloc(TypeData::USize);
         ctx
     }
 
-    pub fn get_invariant(&self, id: TypeId) -> Option<&Expr> {
-        self.invariants.get(&id)
+    pub fn get_invariant(&self, id: TypeId) -> Option<&crate::ast::Expr> {
+        self.meta.get(&id).and_then(|m| m.invariant.as_ref())
     }
 
     pub fn alloc(&mut self, data: TypeData) -> TypeId {
@@ -116,24 +147,37 @@ impl TypeContext {
         id
     }
 
-    pub fn get(&mut self, id: TypeId) -> &TypeData {
-        self.resolve_binding(id)
+    pub fn get(&self, id: TypeId) -> &TypeData {
+        let resolved = self.resolve_binding(id);
+        &self.types[resolved.0]
     }
 
-    fn resolve_binding(&mut self, id: TypeId) -> &TypeData {
-        if let Some(&bound) = self.bindings.get(&id) {
-            let root = self.resolve_binding(bound);
-            if root != bound {
-                self.bindings.insert(id, root);
+    pub(crate) fn resolve_binding(&self, id: TypeId) -> TypeId {
+        let mut current = id;
+        loop {
+            let bound = self.bindings.borrow().get(&current).copied();
+            match bound {
+                Some(next) => current = next,
+                None => break,
             }
-            root
-        } else {
-            &self.types[id.0]
         }
+        let root = current;
+        let mut cur = id;
+        while cur != root {
+            let next = self.bindings.borrow().get(&cur).copied().unwrap();
+            self.bindings.borrow_mut().insert(cur, root);
+            cur = next;
+        }
+        root
+    }
+
+    pub fn alloc_infer_var(&mut self, id: usize) -> TypeId {
+        self.alloc(TypeData::InferVar { id })
     }
 
     pub fn get_def_id_for_type(&self, id: TypeId) -> Option<DefId> {
-        match self.resolve_binding(id) {
+        let resolved = self.resolve_binding(id);
+        match &self.types[resolved.0].as_ref() {
             TypeData::Struct { def_id, .. } => Some(*def_id),
             TypeData::Enum { def_id, .. } => Some(*def_id),
             _ => None,
@@ -153,7 +197,7 @@ impl TypeContext {
     }
 
     pub fn uint(&mut self, bits: u8) -> TypeId {
-        self.int(bits, false)
+        self.alloc(TypeData::UInt { bits })
     }
 
     pub fn float(&mut self, bits: u8) -> TypeId {
@@ -161,31 +205,31 @@ impl TypeContext {
     }
 
     pub fn bool(&self) -> TypeId {
-        TypeId(3)
+        self.builtin_bool
     }
 
     pub fn char(&self) -> TypeId {
-        TypeId(4)
+        self.builtin_char
     }
 
     pub fn byte(&self) -> TypeId {
-        TypeId(5)
+        self.builtin_byte
     }
 
     pub fn usize(&self) -> TypeId {
-        TypeId(6)
+        self.builtin_usize
     }
 
     pub fn unit(&self) -> TypeId {
-        TypeId(0)
+        self.builtin_unit
     }
 
     pub fn never(&self) -> TypeId {
-        TypeId(1)
+        self.builtin_never
     }
 
     pub fn error(&self) -> TypeId {
-        TypeId(2)
+        self.builtin_error
     }
 
     pub fn struct_ty(&mut self, def_id: DefId, args: Vec<TypeId>) -> TypeId {
@@ -232,9 +276,13 @@ impl TypeContext {
         self.alloc(TypeData::DynTrait { traits })
     }
 
-    pub fn exists(&mut self, name: String, base: TypeId, invariant: Expr) -> TypeId {
+    pub fn exists(&mut self, name: String, base: TypeId, invariant: crate::ast::Expr) -> TypeId {
         let id = self.alloc(TypeData::Exists { name, base });
-        self.invariants.insert(id, invariant);
+        self.meta.entry(id).or_insert(TypeMeta {
+            default_value: None,
+            invariant: Some(invariant),
+            no_default: false,
+        });
         id
     }
 
@@ -250,11 +298,12 @@ impl TypeContext {
         })
     }
 
-    fn occurs_check(&mut self, param: TypeId, ty: TypeId) -> bool {
+    fn occurs_check(&self, param: TypeId, ty: TypeId) -> bool {
         if param == ty {
             return true;
         }
-        match self.resolve_binding(ty) {
+        let resolved = self.resolve_binding(ty);
+        match &self.types[resolved.0].as_ref() {
             TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
                 args.iter().any(|&a| self.occurs_check(param, a))
             }
@@ -272,8 +321,9 @@ impl TypeContext {
             }
             TypeData::Exists { base, .. } => self.occurs_check(param, *base),
             TypeData::AssociatedType { self_ty, .. } => self.occurs_check(param, *self_ty),
-            TypeData::GenericParam { .. } => false,
+            TypeData::GenericParam { .. } | TypeData::InferVar { .. } => false,
             TypeData::Int { .. }
+            | TypeData::UInt { .. }
             | TypeData::Float { .. }
             | TypeData::Bool
             | TypeData::Char
@@ -286,9 +336,9 @@ impl TypeContext {
         }
     }
 
-    pub fn unify(&mut self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
-        let data_a = self.resolve_binding(a).clone();
-        let data_b = self.resolve_binding(b).clone();
+    pub fn unify(&self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
+        let data_a = self.get(a).clone();
+        let data_b = self.get(b).clone();
 
         if data_a == data_b {
             return Ok(a);
@@ -305,37 +355,57 @@ impl TypeContext {
                 if self.occurs_check(a, b) {
                     return Err(TypeError::RecursiveType {
                         ty: a,
-                        span: Span::new(0, 0),
+                        span: crate::ast::Span::new(0, 0),
                     });
                 }
-                self.bindings.insert(a, b);
+                self.bindings.borrow_mut().insert(a, b);
                 Ok(b)
             }
             (_, TypeData::GenericParam { .. }) => {
                 if self.occurs_check(b, a) {
                     return Err(TypeError::RecursiveType {
                         ty: b,
-                        span: Span::new(0, 0),
+                        span: crate::ast::Span::new(0, 0),
                     });
                 }
-                self.bindings.insert(b, a);
+                self.bindings.borrow_mut().insert(b, a);
+                Ok(a)
+            }
+            (TypeData::InferVar { .. }, _) => {
+                if self.occurs_check(a, b) {
+                    return Err(TypeError::RecursiveType {
+                        ty: a,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+            (_, TypeData::InferVar { .. }) => {
+                if self.occurs_check(b, a) {
+                    return Err(TypeError::RecursiveType {
+                        ty: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
+                self.bindings.borrow_mut().insert(b, a);
                 Ok(a)
             }
             _ => Err(TypeError::Mismatch {
                 expected: b,
                 found: a,
-                span: Span::new(0, 0),
+                span: crate::ast::Span::new(0, 0),
             }),
         }
     }
 
-    pub fn subtype(&mut self, sub: TypeId, sup: TypeId) -> bool {
+    pub fn subtype(&self, sub: TypeId, sup: TypeId) -> bool {
         if sub == sup {
             return true;
         }
 
-        let sub_data = self.resolve_binding(sub);
-        let sup_data = self.resolve_binding(sup);
+        let sub_data = self.get(sub);
+        let sup_data = self.get(sup);
 
         match (sub_data, sup_data) {
             (TypeData::Error, _) => true,
@@ -371,22 +441,15 @@ impl TypeContext {
                 if p1.len() != p2.len() {
                     return false;
                 }
-                for (a, b) in p1.iter().zip(p2.iter()) {
-                    if !self.subtype(*a, *b) {
-                        return false;
-                    }
-                }
-                self.subtype(*r1, *r2)
+                p1.iter().zip(p2.iter()).all(|(a, b)| self.subtype(*a, *b))
+                    && self.subtype(*r1, *r2)
             }
             (TypeData::Array { elem: e1, size: s1 }, TypeData::Array { elem: e2, size: s2 }) => {
                 *s1 == *s2 && self.subtype(*e1, *e2)
             }
             (TypeData::Slice { elem: e1 }, TypeData::Slice { elem: e2 }) => self.subtype(*e1, *e2),
             (TypeData::Tuple { elems: e1 }, TypeData::Tuple { elems: e2 }) => {
-                if e1.len() != e2.len() {
-                    return false;
-                }
-                e1.iter().zip(e2.iter()).all(|(a, b)| self.subtype(*a, *b))
+                e1.len() == e2.len() && e1.iter().zip(e2.iter()).all(|(a, b)| self.subtype(*a, *b))
             }
             (
                 TypeData::Int {
@@ -403,12 +466,13 @@ impl TypeContext {
         }
     }
 
-    fn find_type(&self, data: &TypeData) -> Option<TypeId> {
+    pub(crate) fn find_type(&self, data: &TypeData) -> Option<TypeId> {
         self.type_map.get(data).copied()
     }
 
-    pub fn subst(&mut self, ty: TypeId, subst: &Subst) -> TypeId {
-        match self.resolve_binding(ty) {
+    pub fn subst(&self, ty: TypeId, subst: &Subst) -> TypeId {
+        let resolved = self.resolve_binding(ty);
+        match &self.types[resolved.0].as_ref() {
             TypeData::GenericParam { index, .. } => subst.get(*index).copied().unwrap_or(ty),
             TypeData::Int { bits, signed } => {
                 let data = TypeData::Int {
@@ -417,6 +481,11 @@ impl TypeContext {
                 };
                 self.find_type(&data)
                     .expect("built-in Int type should exist")
+            }
+            TypeData::UInt { bits } => {
+                let data = TypeData::UInt { bits: *bits };
+                self.find_type(&data)
+                    .expect("built-in UInt type should exist")
             }
             TypeData::Float { bits } => {
                 let data = TypeData::Float { bits: *bits };
@@ -478,7 +547,7 @@ impl TypeContext {
                 self.fn_ty_no_alloc(new_params, new_ret)
                     .expect("function type should exist")
             }
-            TypeData::DynTrait { traits } => ty,
+            TypeData::DynTrait { .. } => ty,
             TypeData::Exists { name, base } => {
                 let new_base = self.subst(*base, subst);
                 self.exists_ty_no_alloc(name.clone(), new_base)
@@ -550,211 +619,221 @@ impl TypeContext {
         })
     }
 
-    pub fn is_numeric(&mut self, ty: TypeId) -> bool {
-        match self.resolve_binding(ty) {
-            TypeData::Int { .. } | TypeData::Float { .. } => true,
+    pub fn is_numeric(&self, ty: TypeId) -> bool {
+        match self.get(ty) {
+            TypeData::Int { .. } | TypeData::UInt { .. } | TypeData::Float { .. } => true,
             _ => false,
         }
     }
 
-    pub fn is_integer(&mut self, ty: TypeId) -> bool {
-        match self.resolve_binding(ty) {
-            TypeData::Int { .. } | TypeData::USize => true,
+    pub fn is_integer(&self, ty: TypeId) -> bool {
+        match self.get(ty) {
+            TypeData::Int { .. } | TypeData::UInt { .. } | TypeData::USize => true,
             _ => false,
         }
     }
 
-    pub fn is_unsigned(&mut self, ty: TypeId) -> bool {
-        match self.resolve_binding(ty) {
-            TypeData::Int { signed, .. } => !signed,
+    pub fn is_unsigned(&self, ty: TypeId) -> bool {
+        match self.get(ty) {
+            TypeData::Int { signed, .. } => !*signed,
+            TypeData::UInt { .. } => true,
             TypeData::USize => true,
             _ => false,
         }
     }
 
-    pub fn is_signed(&mut self, ty: TypeId) -> bool {
-        match self.resolve_binding(ty) {
+    pub fn is_signed(&self, ty: TypeId) -> bool {
+        match self.get(ty) {
             TypeData::Int { signed, .. } => *signed,
             _ => false,
         }
     }
 
-    pub fn is_float(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Float { .. })
+    pub fn is_float(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Float { .. })
     }
 
-    pub fn is_bool(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Bool)
+    pub fn is_bool(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Bool)
     }
 
-    pub fn is_char(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Char)
+    pub fn is_char(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Char)
     }
 
-    pub fn is_byte(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Byte)
+    pub fn is_byte(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Byte)
     }
 
-    pub fn is_usize(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::USize)
+    pub fn is_usize(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::USize)
     }
 
-    pub fn is_unit(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Unit)
+    pub fn is_unit(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Unit)
     }
 
-    pub fn is_never(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Never)
+    pub fn is_never(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Never)
     }
 
-    pub fn is_error(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Error)
+    pub fn is_error(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Error)
     }
 
-    pub fn is_reference(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Ref { .. })
+    pub fn is_reference(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Ref { .. })
     }
 
-    pub fn is_pointer(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Pointer { .. })
+    pub fn is_pointer(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Pointer { .. })
     }
 
-    pub fn is_struct(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Struct { .. })
+    pub fn is_struct(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Struct { .. })
     }
 
-    pub fn is_enum(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Enum { .. })
+    pub fn is_enum(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Enum { .. })
     }
 
-    pub fn is_tuple(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Tuple { .. })
+    pub fn is_tuple(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Tuple { .. })
     }
 
-    pub fn is_array(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Array { .. })
+    pub fn is_array(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Array { .. })
     }
 
-    pub fn is_slice(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Slice { .. })
+    pub fn is_slice(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Slice { .. })
     }
 
-    pub fn is_fn(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Fn { .. })
+    pub fn is_fn(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Fn { .. })
     }
 
-    pub fn is_dyn_trait(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::DynTrait { .. })
+    pub fn is_dyn_trait(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::DynTrait { .. })
     }
 
-    pub fn is_exists(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Exists { .. })
+    pub fn is_exists(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Exists { .. })
     }
 
-    pub fn is_generic_param(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::GenericParam { .. })
+    pub fn is_generic_param(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::GenericParam { .. })
     }
 
-    pub fn is_associated_type(&mut self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::AssociatedType { .. })
+    pub fn is_associated_type(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::AssociatedType { .. })
     }
 
-    pub fn bits_of_int(&mut self, ty: TypeId) -> Option<u8> {
-        match self.resolve_binding(ty) {
-            TypeData::Int { bits, .. } => Some(*bits),
+    pub fn bits_of_int(&self, ty: TypeId) -> Option<u8> {
+        match self.get(ty) {
+            TypeData::Int { bits, .. } | TypeData::UInt { bits } => Some(*bits),
             _ => None,
         }
     }
 
-    pub fn signedness_of_int(&mut self, ty: TypeId) -> Option<bool> {
-        match self.resolve_binding(ty) {
+    pub fn signedness_of_int(&self, ty: TypeId) -> Option<bool> {
+        match self.get(ty) {
             TypeData::Int { signed, .. } => Some(*signed),
+            TypeData::UInt { .. } => Some(false),
             _ => None,
         }
     }
 
-    pub fn bits_of_float(&mut self, ty: TypeId) -> Option<u8> {
-        match self.resolve_binding(ty) {
+    pub fn bits_of_float(&self, ty: TypeId) -> Option<u8> {
+        match self.get(ty) {
             TypeData::Float { bits } => Some(*bits),
             _ => None,
         }
     }
 
-    pub fn size_of_array(&mut self, ty: TypeId) -> Option<u64> {
-        match self.resolve_binding(ty) {
+    pub fn size_of_array(&self, ty: TypeId) -> Option<u64> {
+        match self.get(ty) {
             TypeData::Array { size, .. } => Some(*size),
             _ => None,
         }
     }
 
-    pub fn elem_of_array(&mut self, ty: TypeId) -> Option<TypeId> {
-        match self.resolve_binding(ty) {
+    pub fn elem_of_array(&self, ty: TypeId) -> Option<TypeId> {
+        match self.get(ty) {
             TypeData::Array { elem, .. } => Some(*elem),
             _ => None,
         }
     }
 
-    pub fn elem_of_slice(&mut self, ty: TypeId) -> Option<TypeId> {
-        match self.resolve_binding(ty) {
+    pub fn elem_of_slice(&self, ty: TypeId) -> Option<TypeId> {
+        match self.get(ty) {
             TypeData::Slice { elem } => Some(*elem),
             _ => None,
         }
     }
 
-    pub fn pointee_of_ref(&mut self, ty: TypeId) -> Option<TypeId> {
-        match self.resolve_binding(ty) {
+    pub fn pointee_of_ref(&self, ty: TypeId) -> Option<TypeId> {
+        match self.get(ty) {
             TypeData::Ref { ty: t, .. } => Some(*t),
             _ => None,
         }
     }
 
-    pub fn mutability_of_ref(&mut self, ty: TypeId) -> Option<bool> {
-        match self.resolve_binding(ty) {
+    pub fn mutability_of_ref(&self, ty: TypeId) -> Option<bool> {
+        match self.get(ty) {
             TypeData::Ref { mutable, .. } => Some(*mutable),
             _ => None,
         }
     }
 
-    pub fn pointee_of_pointer(&mut self, ty: TypeId) -> Option<TypeId> {
-        match self.resolve_binding(ty) {
+    pub fn pointee_of_pointer(&self, ty: TypeId) -> Option<TypeId> {
+        match self.get(ty) {
             TypeData::Pointer { ty: t } => Some(*t),
             _ => None,
         }
     }
 
-    pub fn params_of_fn(&mut self, ty: TypeId) -> Option<&[TypeId]> {
-        match self.resolve_binding(ty) {
+    pub fn params_of_fn(&self, ty: TypeId) -> Option<&[TypeId]> {
+        match self.get(ty) {
             TypeData::Fn { params, .. } => Some(params),
             _ => None,
         }
     }
 
-    pub fn ret_of_fn(&mut self, ty: TypeId) -> Option<TypeId> {
-        match self.resolve_binding(ty) {
+    pub fn ret_of_fn(&self, ty: TypeId) -> Option<TypeId> {
+        match self.get(ty) {
             TypeData::Fn { ret, .. } => Some(*ret),
             _ => None,
         }
     }
 
-    pub fn tuple_elems(&mut self, ty: TypeId) -> Option<&[TypeId]> {
-        match self.resolve_binding(ty) {
+    pub fn tuple_elems(&self, ty: TypeId) -> Option<&[TypeId]> {
+        match self.get(ty) {
             TypeData::Tuple { elems } => Some(elems),
             _ => None,
         }
     }
 
-    pub fn base_of_exists(&mut self, ty: TypeId) -> Option<TypeId> {
-        match self.resolve_binding(ty) {
+    pub fn base_of_exists(&self, ty: TypeId) -> Option<TypeId> {
+        match self.get(ty) {
             TypeData::Exists { base, .. } => Some(*base),
             _ => None,
         }
     }
 
-    pub fn name_of_exists(&mut self, ty: TypeId) -> Option<&String> {
-        match self.resolve_binding(ty) {
+    pub fn name_of_exists(&self, ty: TypeId) -> Option<&String> {
+        match self.get(ty) {
             TypeData::Exists { name, .. } => Some(name),
             _ => None,
         }
+    }
+
+    pub fn set_meta(&mut self, id: TypeId, meta: TypeMeta) {
+        self.meta.insert(id, meta);
+    }
+
+    pub fn get_meta(&self, id: TypeId) -> Option<&TypeMeta> {
+        self.meta.get(&id)
     }
 }
 
@@ -800,90 +879,90 @@ pub enum TypeError {
     Mismatch {
         expected: TypeId,
         found: TypeId,
-        span: Span,
+        span: crate::ast::Span,
     },
     UndefinedName {
         name: String,
-        span: Span,
+        span: crate::ast::Span,
         suggestions: Vec<String>,
     },
     TypeNotFound {
         name: String,
-        span: Span,
+        span: crate::ast::Span,
     },
     CannotInfer {
-        span: Span,
+        span: crate::ast::Span,
     },
     GenericArgumentCount {
         expected: usize,
         found: usize,
-        span: Span,
+        span: crate::ast::Span,
     },
     TraitNotImplemented {
         ty: TypeId,
         trait_name: String,
-        span: Span,
+        span: crate::ast::Span,
     },
     InvariantViolation {
         ty: TypeId,
         expr: String,
-        span: Span,
+        span: crate::ast::Span,
     },
     MutableBorrow {
-        span: Span,
+        span: crate::ast::Span,
     },
     ImmutableBorrow {
-        span: Span,
+        span: crate::ast::Span,
     },
     OutOfBounds {
         index: u64,
         size: u64,
-        span: Span,
+        span: crate::ast::Span,
     },
     DivisionByZero {
-        span: Span,
+        span: crate::ast::Span,
     },
     Overflow {
-        span: Span,
+        span: crate::ast::Span,
     },
     NeverType {
-        span: Span,
+        span: crate::ast::Span,
     },
     CircularDependency {
         name: String,
-        span: Span,
+        span: crate::ast::Span,
     },
     DuplicateDefinition {
         name: String,
-        span: Span,
-        previous: Span,
+        span: crate::ast::Span,
+        previous: crate::ast::Span,
     },
     PrivateField {
         name: String,
-        span: Span,
+        span: crate::ast::Span,
     },
     PrivateType {
         name: String,
-        span: Span,
+        span: crate::ast::Span,
     },
     PrivateFunction {
         name: String,
-        span: Span,
+        span: crate::ast::Span,
     },
     PatternNotExhaustive {
-        span: Span,
+        span: crate::ast::Span,
     },
     PatternRedundant {
-        span: Span,
+        span: crate::ast::Span,
     },
     PatternTypeMismatch {
         expected: TypeId,
         found: TypeId,
-        span: Span,
+        span: crate::ast::Span,
     },
     RecursiveType {
         ty: TypeId,
-        span: Span,
+        span: crate::ast::Span,
     },
 }
 

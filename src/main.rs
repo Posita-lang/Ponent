@@ -1,9 +1,23 @@
 mod ast;
 mod cli;
+mod diagnostics;
+mod hir {
+    pub mod builtins;
+    pub mod checker;
+    pub mod hir;
+    pub mod infer;
+    pub mod resolver;
+    pub mod symbol;
+    pub mod traits;
+    pub mod types;
+}
 mod lexer;
 mod parser;
 
 use clap::Parser;
+use hir::checker::TypeChecker;
+use hir::resolver::NameResolver;
+use hir::types::{CrateId, DefId, TypeContext};
 use logos::Logos;
 use std::fs;
 use std::process;
@@ -33,7 +47,38 @@ fn main() {
                     if ast {
                         println!("{:#?}", program);
                     } else {
-                        println!("Parsed successfully.");
+                        let mut ctx = TypeContext::new();
+                        let local_crate_id = CrateId(DefId(0));
+                        let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
+                        match resolver.resolve_program(&program) {
+                            Ok((mut symbols, mut trait_env, _diags)) => {
+                                // Register built-in traits and impls before type checking
+                                hir::builtins::register_builtins(
+                                    &mut symbols,
+                                    &mut trait_env,
+                                    &mut ctx,
+                                );
+
+                                let mut checker = TypeChecker::new(&mut ctx, &symbols, &trait_env);
+                                match checker.check_program(&program) {
+                                    Ok(_hir_program) => {
+                                        println!("Type checking succeeded.");
+                                    }
+                                    Err(errors) => {
+                                        for err in errors.into_inner() {
+                                            eprintln!("type error: {:?}", err);
+                                        }
+                                        process::exit(1);
+                                    }
+                                }
+                            }
+                            Err(errors) => {
+                                for diag in errors.into_inner() {
+                                    eprintln!("error: {:?}", diag);
+                                }
+                                process::exit(1);
+                            }
+                        }
                     }
                 }
                 Err(diagnostics) => {

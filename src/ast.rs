@@ -245,7 +245,7 @@ pub enum Stmt {
         return_type: Type,
         body: Option<Vec<Stmt>>,
         type_params: Vec<TypeParam>,
-        where_clause: Option<()>,
+        where_clause: Option<WhereClause>,
         finally: Option<Vec<Stmt>>,
         is_comptime: bool,
         is_async: bool,
@@ -434,6 +434,18 @@ pub enum OverflowPolicy {
     Wrap,
     Saturate,
     Trap,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WherePredicate {
+    pub ty: Type,
+    pub bounds: Vec<Type>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WhereClause {
+    pub predicates: Vec<WherePredicate>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

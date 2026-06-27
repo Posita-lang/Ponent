@@ -1,71 +1,65 @@
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticCollector, DiagnosticLevel};
 use crate::hir::hir::*;
+use crate::hir::infer::*;
 use crate::hir::symbol::*;
+use crate::hir::traits::TraitEnv;
 use crate::hir::types::*;
 use std::collections::HashSet;
 
 pub struct TypeChecker<'a> {
     ctx: &'a mut TypeContext,
     symbols: &'a SymbolTable,
+    trait_env: &'a TraitEnv,
     diagnostics: DiagnosticCollector,
     current_function: Option<DefId>,
     current_return_type: Option<TypeId>,
     current_scope: usize,
     next_var_id: usize,
-    type_vars: Vec<TypeVariable>,
-    constraints: Vec<TypeConstraint>,
     subst: Subst,
     resolving_aliases: HashSet<DefId>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TypeVariable {
-    pub id: usize,
-    pub bound: Option<TypeId>,
-    pub kind: TypeVariableKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TypeVariableKind {
-    Unconstrained,
-    Integer,
-    Float,
-    Numeric,
-    Bool,
-    Any,
-}
-
-#[derive(Debug, Clone)]
-pub struct TypeConstraint {
-    pub left: TypeId,
-    pub right: TypeId,
-    pub kind: ConstraintKind,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConstraintKind {
-    Eq,
-    Sub,
-    Impl(DefId),
+    infer: InferenceContext,
+    infer_stack: Vec<InferenceContext>,
 }
 
 impl<'a> TypeChecker<'a> {
-    pub fn new(ctx: &'a mut TypeContext, symbols: &'a SymbolTable) -> Self {
+    pub fn new(
+        ctx: &'a mut TypeContext,
+        symbols: &'a SymbolTable,
+        trait_env: &'a TraitEnv,
+    ) -> Self {
         TypeChecker {
             ctx,
             symbols,
+            trait_env,
             diagnostics: DiagnosticCollector::new(),
             current_function: None,
             current_return_type: None,
             current_scope: 0,
             next_var_id: 0,
-            type_vars: Vec::new(),
-            constraints: Vec::new(),
             subst: Subst::new(),
             resolving_aliases: HashSet::new(),
+            infer: InferenceContext::new(),
+            infer_stack: Vec::new(),
         }
+    }
+
+    fn enter_inference_scope(&mut self) {
+        let old = std::mem::replace(&mut self.infer, InferenceContext::new());
+        self.infer_stack.push(old);
+    }
+
+    fn exit_inference_scope(&mut self) -> Result<(), DiagnosticCollector> {
+        let mut current =
+            std::mem::replace(&mut self.infer, self.infer_stack.pop().unwrap_or_default());
+        if let Err(err) = current.solve(self.ctx, self.trait_env) {
+            let diag = Diagnostic::error(format!("type inference error: {:?}", err))
+                .with_span(Span::new(0, 0));
+            self.diagnostics.push(diag);
+            return Err(std::mem::take(&mut self.diagnostics));
+        }
+        let solution = current.finalize(self.ctx);
+        Ok(())
     }
 
     pub fn check_program(&mut self, program: &Program) -> Result<HirProgram, DiagnosticCollector> {
@@ -107,7 +101,7 @@ impl<'a> TypeChecker<'a> {
                 let ty_id = if let Some(ty) = ty {
                     self.resolve_type(ty)?
                 } else {
-                    self.ctx.error()
+                    self.new_infer_var(TypeVariableKind::Unconstrained)
                 };
 
                 let value_hir = if let Some(value) = value {
@@ -188,6 +182,8 @@ impl<'a> TypeChecker<'a> {
                 let old_return = self.current_return_type;
                 self.current_return_type = Some(return_ty);
 
+                self.enter_inference_scope();
+
                 let body_hir = if let Some(body) = body {
                     let mut stmts = Vec::new();
                     for s in body {
@@ -197,6 +193,10 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     None
                 };
+
+                if let Err(err) = self.exit_inference_scope() {
+                    return Err(Diagnostic::error("inference failure").with_span(*span));
+                }
 
                 self.current_return_type = old_return;
                 self.current_function = old_function;
@@ -221,7 +221,7 @@ impl<'a> TypeChecker<'a> {
                     return_type: return_ty,
                     body: body_hir,
                     type_params: type_params.clone(),
-                    where_clause: where_clause.clone(),
+                    where_clause: where_clause.clone().map(|_| ()),
                     finally: finally_hir,
                     is_comptime: *is_comptime,
                     is_async: *is_async,
@@ -508,34 +508,13 @@ impl<'a> TypeChecker<'a> {
                     span: *span,
                 })
             }
-            Stmt::TypeDef { .. } => Err(Diagnostic::error(
-                "type definitions cannot appear in statement position",
-            )
-            .with_span(stmt.span())),
-            Stmt::TraitDef { .. } => Err(Diagnostic::error(
-                "trait definitions cannot appear in statement position",
-            )
-            .with_span(stmt.span())),
-            Stmt::Import { .. } => Err(Diagnostic::error(
-                "imports cannot appear in statement position",
-            )
-            .with_span(stmt.span())),
-            Stmt::ExternFunction { .. } => Err(Diagnostic::error(
-                "extern functions cannot appear in statement position",
-            )
-            .with_span(stmt.span())),
-            Stmt::Constraint { .. } => Err(Diagnostic::error(
-                "constraints cannot appear in statement position",
-            )
-            .with_span(stmt.span())),
-            Stmt::Edition(_, span) => Err(Diagnostic::error(
-                "edition declaration cannot appear in statement position",
-            )
-            .with_span(*span)),
-            Stmt::ImplBlock { .. } => Err(Diagnostic::error(
-                "impl blocks cannot appear in statement position",
-            )
-            .with_span(stmt.span())),
+            Stmt::TypeDef { .. } => Ok(HirStmt::Error),
+            Stmt::TraitDef { .. } => Ok(HirStmt::Error),
+            Stmt::Import { .. } => Ok(HirStmt::Error),
+            Stmt::ExternFunction { .. } => Ok(HirStmt::Error),
+            Stmt::Constraint { .. } => Ok(HirStmt::Error),
+            Stmt::Edition(..) => Ok(HirStmt::Error),
+            Stmt::ImplBlock { .. } => Ok(HirStmt::Error),
             Stmt::Error(span) => Err(Diagnostic::error("invalid statement").with_span(*span)),
         }
     }
@@ -595,7 +574,7 @@ impl<'a> TypeChecker<'a> {
                     .lookup_type_by_def_id(def_id)
                     .ok_or_else(|| Diagnostic::error("struct not found").with_span(*span))?;
                 if let TypeKind::Struct = binding.kind {
-                    let type_args = self.collect_type_args(path, span)?;
+                    let type_args = self.collect_type_args(path, *span)?;
                     let mut subst = Subst::new();
                     for (i, param) in binding.params.iter().enumerate() {
                         if let Some(&arg) = type_args.get(i) {
@@ -637,7 +616,7 @@ impl<'a> TypeChecker<'a> {
                     .lookup_type_by_def_id(def_id)
                     .ok_or_else(|| Diagnostic::error("enum not found").with_span(*span))?;
                 if let TypeKind::Enum = binding.kind {
-                    let type_args = self.collect_type_args(path, span)?;
+                    let type_args = self.collect_type_args(path, *span)?;
                     let mut subst = Subst::new();
                     for (i, param) in binding.params.iter().enumerate() {
                         if let Some(&arg) = type_args.get(i) {
@@ -652,9 +631,10 @@ impl<'a> TypeChecker<'a> {
                             Diagnostic::error(format!("variant '{}' not found", variant))
                                 .with_span(*span)
                         })?;
-                    let inner_ty = variant_def
-                        .payload
-                        .map_or(self.ctx.error(), |t| self.ctx.subst(t, &subst));
+                    let inner_ty = match &variant_def.payload {
+                        Some(payload_ty) => self.resolve_type(payload_ty)?,
+                        None => self.ctx.error(),
+                    };
                     let inner_hir = if let Some(inner) = inner {
                         Some(Box::new(self.check_pattern(inner, inner_ty)?))
                     } else {
@@ -684,7 +664,14 @@ impl<'a> TypeChecker<'a> {
     fn synthesize(&mut self, expr: &Expr) -> Result<(HirExpr, TypeId), Diagnostic> {
         match expr {
             Expr::Literal(lit, span) => {
-                let ty = self.literal_type(lit);
+                let kind = match lit {
+                    Literal::Int(_) => TypeVariableKind::Integer,
+                    Literal::Float(_) => TypeVariableKind::Float,
+                    Literal::Bool(_) => TypeVariableKind::Bool,
+                    Literal::Char(_) => TypeVariableKind::Any,
+                    Literal::String(_) | Literal::ByteString(_) => TypeVariableKind::Any,
+                };
+                let ty = self.new_infer_var(kind);
                 Ok((HirExpr::Literal(lit.clone(), ty, *span), ty))
             }
             Expr::Ident(name, span) => {
@@ -695,9 +682,6 @@ impl<'a> TypeChecker<'a> {
                     let ty = self
                         .ctx
                         .function(sig.params.iter().map(|p| p.ty).collect(), sig.return_type);
-                    Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
-                } else if let Some(ty_binding) = self.symbols.lookup_type(name) {
-                    let ty = self.ctx.int(32, true);
                     Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
                 } else {
                     self.diagnostics.push(
@@ -725,9 +709,33 @@ impl<'a> TypeChecker<'a> {
                 right,
                 span,
             } => {
+                let trait_id = self
+                    .get_trait_id_for_binop(*op, *span)
+                    .unwrap_or(DefId(usize::MAX));
+                let result_ty = match op {
+                    BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
+                    | BinOp::And | BinOp::Or => self.ctx.bool(),
+                    _ => self.new_infer_var(TypeVariableKind::Numeric),
+                };
+
                 let (left_hir, left_ty) = self.synthesize(left)?;
                 let (right_hir, right_ty) = self.synthesize(right)?;
-                let result_ty = self.binary_op_type(*op, left_ty, right_ty, *span)?;
+
+                self.unify(left_ty, right_ty, *span)?;
+                // Only add trait constraints if the trait was found
+                if trait_id != DefId(usize::MAX) {
+                    self.add_constraint(Constraint::Impl(left_ty, trait_id, *span));
+                    self.add_constraint(Constraint::Impl(right_ty, trait_id, *span));
+                }
+                // Only unify result with left_ty for non-comparison ops
+                match op {
+                    BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
+                    | BinOp::And | BinOp::Or => {}
+                    _ => {
+                        self.add_constraint(Constraint::Eq(result_ty, left_ty, *span));
+                    }
+                }
+
                 Ok((
                     HirExpr::BinaryOp {
                         left: Box::new(left_hir),
@@ -740,8 +748,12 @@ impl<'a> TypeChecker<'a> {
                 ))
             }
             Expr::UnaryOp { op, expr, span } => {
-                let (hir, ty) = self.synthesize(expr)?;
-                let result_ty = self.unary_op_type(*op, ty, *span)?;
+                let operand_ty = self.new_infer_var(TypeVariableKind::Numeric);
+                let result_ty = self.new_infer_var(TypeVariableKind::Numeric);
+                let (hir, actual) = self.synthesize(expr)?;
+                self.add_constraint(Constraint::Eq(operand_ty, actual, *span));
+                self.add_constraint(Constraint::Eq(result_ty, operand_ty, *span));
+
                 Ok((
                     HirExpr::UnaryOp {
                         op: *op,
@@ -791,7 +803,7 @@ impl<'a> TypeChecker<'a> {
                         self.ctx.error()
                     };
                     let (hir, actual) = self.synthesize(arg)?;
-                    self.unify(expected, actual, arg.span())?;
+                    self.unify(expected, actual, hir.span())?;
                     hir_args.push(hir);
                 }
                 Ok((
@@ -806,12 +818,16 @@ impl<'a> TypeChecker<'a> {
                 ))
             }
             Expr::Index { base, index, span } => {
-                let (base_hir, base_ty) = self.synthesize(base)?;
-                let (index_hir, index_ty) = self.synthesize(index)?;
-
-                let elem_ty = if let Some(slice_ty) = self.ctx.elem_of_slice(base_ty) {
+                let base_ty = self.new_infer_var(TypeVariableKind::Any);
+                let index_ty = self.new_infer_var(TypeVariableKind::Integer);
+                let elem_ty = self.new_infer_var(TypeVariableKind::Any);
+                let (base_hir, base_actual) = self.synthesize(base)?;
+                let (index_hir, index_actual) = self.synthesize(index)?;
+                self.add_constraint(Constraint::Eq(base_ty, base_actual, *span));
+                self.add_constraint(Constraint::Eq(index_ty, index_actual, *span));
+                let resolved_elem = if let Some(slice_ty) = self.ctx.elem_of_slice(base_actual) {
                     slice_ty
-                } else if let Some(arr_ty) = self.ctx.elem_of_array(base_ty) {
+                } else if let Some(arr_ty) = self.ctx.elem_of_array(base_actual) {
                     arr_ty
                 } else {
                     self.diagnostics.push(
@@ -819,8 +835,8 @@ impl<'a> TypeChecker<'a> {
                     );
                     self.ctx.error()
                 };
-
-                if !self.ctx.is_integer(index_ty) && !self.ctx.is_usize(index_ty) {
+                self.add_constraint(Constraint::Eq(elem_ty, resolved_elem, *span));
+                if !self.ctx.is_integer(index_actual) && !self.ctx.is_usize(index_actual) {
                     self.diagnostics
                         .push(Diagnostic::error("index must be an integer").with_span(*span));
                 }
@@ -835,8 +851,10 @@ impl<'a> TypeChecker<'a> {
                 ))
             }
             Expr::FieldAccess { base, field, span } => {
-                let (base_hir, base_ty) = self.synthesize(base)?;
-                let field_ty = self.lookup_field(base_ty, field, *span)?;
+                let base_ty = self.new_infer_var(TypeVariableKind::Any);
+                let (base_hir, base_actual) = self.synthesize(base)?;
+                self.add_constraint(Constraint::Eq(base_ty, base_actual, *span));
+                let field_ty = self.lookup_field(base_actual, field, *span)?;
                 Ok((
                     HirExpr::FieldAccess {
                         base: Box::new(base_hir),
@@ -848,8 +866,10 @@ impl<'a> TypeChecker<'a> {
                 ))
             }
             Expr::AttrAccess { base, attr, span } => {
-                let (base_hir, base_ty) = self.synthesize(base)?;
-                let attr_ty = self.lookup_attr(base_ty, attr, *span)?;
+                let base_ty = self.new_infer_var(TypeVariableKind::Any);
+                let (base_hir, base_actual) = self.synthesize(base)?;
+                self.add_constraint(Constraint::Eq(base_ty, base_actual, *span));
+                let attr_ty = self.lookup_attr(base_actual, attr, *span)?;
                 Ok((
                     HirExpr::AttrAccess {
                         base: Box::new(base_hir),
@@ -897,9 +917,8 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     None
                 };
-                let ty = self
-                    .ctx
-                    .tuple(vec![self.ctx.int(32, true), self.ctx.int(32, true)]);
+                let int_ty = self.ctx.int(32, true);
+                let ty = self.ctx.tuple(vec![int_ty, int_ty]);
                 Ok((
                     HirExpr::Range {
                         start: start_hir,
@@ -916,7 +935,7 @@ impl<'a> TypeChecker<'a> {
                 let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| {
                     Diagnostic::error(format!("struct not found: {:?}", path)).with_span(*span)
                 })?;
-                let type_args = self.collect_type_args(path, span)?;
+                let type_args = self.collect_type_args(path, *span)?;
                 let struct_ty = self.ctx.struct_ty(def_id, type_args.clone());
                 let mut subst = Subst::new();
                 for (i, param) in binding.params.iter().enumerate() {
@@ -962,7 +981,7 @@ impl<'a> TypeChecker<'a> {
                 let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| {
                     Diagnostic::error(format!("enum not found: {:?}", path)).with_span(*span)
                 })?;
-                let type_args = self.collect_type_args(path, span)?;
+                let type_args = self.collect_type_args(path, *span)?;
                 let enum_ty = self.ctx.enum_ty(def_id, type_args.clone());
                 let mut subst = Subst::new();
                 for (i, param) in binding.params.iter().enumerate() {
@@ -980,9 +999,10 @@ impl<'a> TypeChecker<'a> {
                             Diagnostic::error(format!("variant '{}' not found", variant))
                                 .with_span(*span)
                         })?;
-                    let payload_ty = variant_def
-                        .payload
-                        .map_or(self.ctx.error(), |t| self.ctx.subst(t, &subst));
+                    let payload_ty = match &variant_def.payload {
+                        Some(payload_ty) => self.resolve_type(payload_ty)?,
+                        None => self.ctx.error(),
+                    };
                     let (hir, _) = self.synthesize(payload)?;
                     self.unify(payload_ty, hir.ty(), *span)?;
                     Some(Box::new(hir))
@@ -1024,6 +1044,8 @@ impl<'a> TypeChecker<'a> {
                     hirs.push(hir);
                     if elem_ty.is_none() {
                         elem_ty = Some(ty);
+                    } else {
+                        self.unify(elem_ty.unwrap(), ty, *span)?;
                     }
                 }
                 let ty = self
@@ -1289,7 +1311,24 @@ impl<'a> TypeChecker<'a> {
     fn resolve_type(&mut self, ty: &Type) -> Result<TypeId, Diagnostic> {
         match ty {
             Type::Path(path, span) => {
-                let def_id = self.resolve_def_id(path)?;
+                let def_id = match self.resolve_def_id(path) {
+                    Ok(did) => did,
+                    Err(_) => {
+                        let name = &path[0];
+                        return match name.as_str() {
+                            "Bool" => Ok(self.ctx.bool()),
+                            "Char" => Ok(self.ctx.char()),
+                            "Byte" => Ok(self.ctx.byte()),
+                            "USize" => Ok(self.ctx.usize()),
+                            "Unit" => Ok(self.ctx.unit()),
+                            "Never" => Ok(self.ctx.never()),
+                            _ => Err(
+                                Diagnostic::error(format!("type '{}' not found", name))
+                                    .with_span(*span),
+                            ),
+                        };
+                    }
+                };
                 let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| {
                     Diagnostic::error(format!("type not found: {:?}", path)).with_span(*span)
                 })?;
@@ -1310,11 +1349,11 @@ impl<'a> TypeChecker<'a> {
                         result
                     }
                     TypeKind::Struct => {
-                        let args = self.collect_type_args(path, span)?;
+                        let args = self.collect_type_args(path, *span)?;
                         Ok(self.ctx.struct_ty(def_id, args))
                     }
                     TypeKind::Enum => {
-                        let args = self.collect_type_args(path, span)?;
+                        let args = self.collect_type_args(path, *span)?;
                         Ok(self.ctx.enum_ty(def_id, args))
                     }
                     _ => {
@@ -1324,6 +1363,26 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Type::Generic(base, args, span) => {
+                // Handle generic built-in types
+                if let Type::Path(path, _) = base.as_ref() {
+                    if path.len() == 1 {
+                        match path[0].as_str() {
+                            "Int" => {
+                                let bits = self.extract_int_from_type(&args[0]).unwrap_or(32);
+                                return Ok(self.ctx.int(bits, true));
+                            }
+                            "UInt" => {
+                                let bits = self.extract_int_from_type(&args[0]).unwrap_or(32);
+                                return Ok(self.ctx.int(bits, false));
+                            }
+                            "Float" => {
+                                let bits = self.extract_int_from_type(&args[0]).unwrap_or(64);
+                                return Ok(self.ctx.float(bits));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let base_ty = self.resolve_type(base)?;
                 let expanded_base = self.expand_base_type(base_ty, *span)?;
                 let mut arg_tys = Vec::new();
@@ -1405,10 +1464,7 @@ impl<'a> TypeChecker<'a> {
                 let ret_ty = self.resolve_type(ret)?;
                 Ok(self.ctx.function(param_tys, ret_ty))
             }
-            Type::Projection(base, name, span) => {
-                let base_ty = self.resolve_type(base)?;
-                Ok(self.ctx.int(32, true))
-            }
+            Type::Projection(base, name, span) => Ok(self.ctx.error()),
             Type::DynTrait(traits, span) => {
                 let mut trait_ids = Vec::new();
                 for t in traits {
@@ -1432,23 +1488,14 @@ impl<'a> TypeChecker<'a> {
                     self.diagnostics
                         .push(Diagnostic::error("invariant must be boolean").with_span(*span));
                 }
-                Ok(self.ctx.exists(name.clone(), base_ty, inv_hir))
+                Ok(self.ctx.exists(name.clone(), base_ty, *invariant.clone()))
             }
             Type::Literal(expr, span) => {
                 let (_, ty) = self.synthesize(expr)?;
                 Ok(ty)
             }
             Type::Never(span) => Ok(self.ctx.never()),
-            Type::Union(tys, span) => {
-                let mut ty = None;
-                for t in tys {
-                    let resolved = self.resolve_type(t)?;
-                    if ty.is_none() {
-                        ty = Some(resolved);
-                    }
-                }
-                Ok(ty.unwrap_or(self.ctx.error()))
-            }
+            Type::Union(tys, span) => Ok(self.ctx.error()),
             Type::Error(span) => Ok(self.ctx.error()),
         }
     }
@@ -1693,7 +1740,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn extract_ok_type(&self, ty: TypeId) -> Option<TypeId> {
-        if let TypeData::Enum { def_id, args } = self.ctx.get(ty) {
+        if let TypeData::Enum { def_id: _, args } = self.ctx.get(ty) {
             if args.len() == 2 {
                 return Some(args[0]);
             }
@@ -1702,7 +1749,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn extract_future_type(&self, ty: TypeId) -> Option<TypeId> {
-        if let TypeData::Enum { def_id, args } = self.ctx.get(ty) {
+        if let TypeData::Enum { def_id: _, args } = self.ctx.get(ty) {
             if args.len() == 1 {
                 return Some(args[0]);
             }
@@ -1711,7 +1758,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn extract_result_types(&self, ty: TypeId, span: Span) -> Result<(TypeId, TypeId), Diagnostic> {
-        if let TypeData::Enum { def_id, args } = self.ctx.get(ty) {
+        if let TypeData::Enum { def_id: _, args } = self.ctx.get(ty) {
             if args.len() == 2 {
                 return Ok((args[0], args[1]));
             }
@@ -1788,7 +1835,42 @@ impl<'a> TypeChecker<'a> {
         self.ctx.unit()
     }
 
-    fn literal_type(&self, lit: &Literal) -> TypeId {
+    fn get_trait_id_for_binop(&self, op: BinOp, span: Span) -> Result<DefId, Diagnostic> {
+        let trait_name = match op {
+            BinOp::Add => "Add",
+            BinOp::Sub => "Sub",
+            BinOp::Mul => "Mul",
+            BinOp::Div => "Div",
+            BinOp::Rem => "Rem",
+            BinOp::BitAnd => "BitAnd",
+            BinOp::BitOr => "BitOr",
+            BinOp::BitXor => "BitXor",
+            BinOp::Shl => "Shl",
+            BinOp::Shr => "Shr",
+            BinOp::Eq => "Eq",
+            BinOp::Neq => "Neq",
+            BinOp::Lt => "Lt",
+            BinOp::Gt => "Gt",
+            BinOp::Le => "Le",
+            BinOp::Ge => "Ge",
+            BinOp::And => "And",
+            BinOp::Or => "Or",
+            _ => {
+                return Err(
+                    Diagnostic::error("overflow operators not yet supported via traits")
+                        .with_span(span),
+                );
+            }
+        };
+        self.symbols
+            .lookup_trait(trait_name)
+            .map(|b| b.def_id)
+            .ok_or_else(|| {
+                Diagnostic::error(format!("trait `{}` not found", trait_name)).with_span(span)
+            })
+    }
+
+    fn literal_type(&mut self, lit: &Literal) -> TypeId {
         match lit {
             Literal::Int(_) => self.ctx.int(32, true),
             Literal::Float(_) => self.ctx.float(64),
@@ -1797,5 +1879,26 @@ impl<'a> TypeChecker<'a> {
             Literal::ByteString(_) => self.ctx.slice(self.ctx.byte()),
             Literal::Bool(_) => self.ctx.bool(),
         }
+    }
+
+    fn extract_int_from_type(&self, ty: &Type) -> Option<u8> {
+        match ty {
+            Type::Literal(expr, _) => {
+                if let Expr::Literal(Literal::Int(val), _) = expr.as_ref() {
+                    Some(*val as u8)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn new_infer_var(&mut self, kind: TypeVariableKind) -> TypeId {
+        self.infer.new_type_var(self.ctx, kind)
+    }
+
+    fn add_constraint(&mut self, c: Constraint) {
+        self.infer.add_constraint(c);
     }
 }

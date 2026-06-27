@@ -1,6 +1,15 @@
 use crate::ast::*;
+use crate::diagnostics::Diagnostic;
 use crate::hir::types::*;
 use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub struct FieldBinding {
+    pub name: String,
+    pub ty: TypeId,
+    pub default: Option<Expr>,
+    pub span: Span,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TypeKind {
@@ -54,8 +63,12 @@ pub struct TypeBinding {
     pub kind: TypeKind,
     pub span: Span,
     pub alias_ast: Option<Type>,
-    pub fields: Vec<StructField>,
+    pub fields: Vec<FieldBinding>,
     pub variants: Vec<EnumVariant>,
+    pub invariant: Option<Expr>,
+    pub default_value: Option<Expr>,
+    pub no_default: bool,
+    pub crate_id: CrateId,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +77,7 @@ pub struct TraitBinding {
     pub methods: Vec<(String, FunctionSignature)>,
     pub associated_types: Vec<(String, Option<Type>)>,
     pub span: Span,
+    pub crate_id: CrateId,
 }
 
 #[derive(Debug, Clone)]
@@ -107,17 +121,21 @@ pub struct SymbolTable {
     scopes: Vec<Scope>,
     current_scope: usize,
     type_defs: HashMap<DefId, TypeBinding>,
+    trait_defs: HashMap<DefId, TraitBinding>,
     next_def_id: usize,
+    pub local_crate_id: CrateId,
 }
 
 impl SymbolTable {
-    pub fn new() -> Self {
+    pub fn new(local_crate_id: CrateId) -> Self {
         let root = Scope::new(None);
         SymbolTable {
             scopes: vec![root],
             current_scope: 0,
             type_defs: HashMap::new(),
+            trait_defs: HashMap::new(),
             next_def_id: 0,
+            local_crate_id,
         }
     }
 
@@ -201,6 +219,8 @@ impl SymbolTable {
                 Diagnostic::error(format!("trait '{}' already defined", name)).with_span(span),
             );
         }
+        let def_id = binding.def_id;
+        self.trait_defs.insert(def_id, binding.clone());
         scope.traits.insert(name, binding);
         Ok(())
     }
@@ -236,6 +256,13 @@ impl SymbolTable {
                 idx = parent;
             } else {
                 break;
+            }
+        }
+        // Fallback: search all scopes for variables registered by the resolver
+        // (needed because the checker shares the symbol table but scopes have been popped)
+        for scope in &self.scopes {
+            if let Some(binding) = scope.variables.get(name) {
+                return Some(binding);
             }
         }
         None
@@ -290,6 +317,10 @@ impl SymbolTable {
         None
     }
 
+    pub fn lookup_trait_by_def_id(&self, def_id: DefId) -> Option<&TraitBinding> {
+        self.trait_defs.get(&def_id)
+    }
+
     pub fn lookup_constraint(&self, name: &str) -> Option<&ConstraintBinding> {
         let mut idx = self.current_scope;
         while let Some(scope) = self.scopes.get(idx) {
@@ -338,5 +369,18 @@ impl SymbolTable {
         let id = DefId(self.next_def_id);
         self.next_def_id += 1;
         id
+    }
+
+    pub fn allocate_crate_id(&mut self) -> CrateId {
+        CrateId(self.allocate_def_id())
+    }
+
+    pub fn lookup_method(
+        &self,
+        _type_id: TypeId,
+        _trait_id: DefId,
+        _method_name: &str,
+    ) -> Option<&FunctionBinding> {
+        None
     }
 }
