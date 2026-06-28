@@ -246,6 +246,7 @@ impl<'a> NameResolver<'a> {
                         trait_id,
                         for_type: resolved_for,
                         methods: methods.clone(),
+                        assoc_tys: Vec::new(),
                         span: *span,
                     };
                     self.trait_env

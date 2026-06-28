@@ -98,7 +98,36 @@ impl InferenceContext {
                         span: *span,
                     });
                 }
-                // Future: generate obligations for associated types
+                // Generate obligations for associated types: when we have a
+                // resolved Impl(concrete_ty, trait_id, _), look for concrete types
+                // for any AssociatedType { trait_id, name, self_ty } by matching
+                // the impl's assoc_tys entries.
+                if let Some(impl_candidate) = trait_env.lookup_impl(*trait_id, resolved) {
+                    for (assoc_name, assoc_ty) in &impl_candidate.assoc_tys {
+                        // Walk all Eq constraints to substitute any AssociatedType
+                        // that matches this name, trait_id, and self_ty
+                        for eq_c in &self.constraints {
+                            if let Constraint::Eq(a, b, _) = eq_c {
+                                for id in &[*a, *b] {
+                                    let resolved_id = ctx.resolve_binding(*id);
+                                    if let TypeData::AssociatedType {
+                                        trait_id: at_trait_id,
+                                        name: at_name,
+                                        self_ty: at_self,
+                                    } = ctx.get(resolved_id).clone()
+                                    {
+                                        if at_trait_id == *trait_id
+                                            && at_name == *assoc_name
+                                            && ctx.resolve_binding(at_self) == resolved
+                                        {
+                                            ctx.unify(resolved_id, *assoc_ty)?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 

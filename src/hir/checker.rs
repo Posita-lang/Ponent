@@ -2091,4 +2091,32 @@ mod tests {
         );
         assert!(result.is_ok(), "simple program should type-check: {:?}", result.err());
     }
+
+    #[test]
+    fn test_add_operator_overload() {
+        let result = check_source(
+            "
+            def main() -> Int<32> {
+                set x = 10;
+                set y = 20;
+                set z = x + y;
+                return z;
+            }",
+        );
+        assert!(result.is_ok(), "operator + should work for Int<32>: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_mul_operator_overload() {
+        let result = check_source(
+            "
+            def main() -> Int<32> {
+                set x = 6;
+                set y = 7;
+                set z = x * y;
+                return z;
+            }",
+        );
+        assert!(result.is_ok(), "operator * should work for Int<32>: {:?}", result.err());
+    }
 }

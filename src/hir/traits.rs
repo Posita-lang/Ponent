@@ -8,6 +8,7 @@ pub struct ImplCandidate {
     pub trait_id: DefId,
     pub for_type: TypeId,
     pub methods: Vec<crate::ast::ImplMethod>,
+    pub assoc_tys: Vec<(String, TypeId)>,
     pub span: Span,
 }
 
