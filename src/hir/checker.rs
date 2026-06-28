@@ -101,6 +101,24 @@ pub enum Expectation {
     CastableToType(TypeId),
 }
 
+/// Describes what context a type check is happening in,
+/// used to produce more precise error messages.
+#[derive(Debug, Clone, Copy)]
+pub enum TypingContext {
+    /// No specific context
+    None,
+    /// Checking an argument to a function call
+    Argument { index: usize, total: usize },
+    /// Checking the body of a closure
+    ClosureBody,
+    /// Checking the condition of an if/while
+    Condition,
+    /// Checking a field initializer in a struct literal
+    StructFieldInit,
+    /// Checking the return value of a function
+    ReturnValue,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CtxKind {
     /// A normaw function body or top-wevel bwock (•́ω•̀)

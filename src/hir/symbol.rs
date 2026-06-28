@@ -1,6 +1,8 @@
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
 use crate::hir::types::*;
+use indexmap::IndexMap;
+use rustc_hash::FxBuildHasher;
 use rustc_hash::FxHashMap as HashMap;
 
 #[derive(Debug, Clone)]
@@ -95,24 +97,28 @@ pub struct ConstraintBinding {
 
 pub struct Scope {
     pub parent: Option<usize>,
-    pub variables: HashMap<String, VariableBinding>,
+    pub variables: IndexMap<String, VariableBinding, FxBuildHasher>,
     pub functions: HashMap<String, FunctionBinding>,
     pub types: HashMap<String, TypeBinding>,
     pub traits: HashMap<String, TraitBinding>,
     pub impls: Vec<ImplBinding>,
     pub constraints: HashMap<String, ConstraintBinding>,
+    /// If true, duplicate names in this scope are allowed (shadowing).
+    /// Block scopes are ordered; module/function scopes are not.
+    pub ordered: bool,
 }
 
 impl Scope {
-    pub fn new(parent: Option<usize>) -> Self {
+    pub fn new(parent: Option<usize>, ordered: bool) -> Self {
         Scope {
             parent,
-            variables: HashMap::default(),
+            variables: IndexMap::with_hasher(FxBuildHasher::default()),
             functions: HashMap::default(),
             types: HashMap::default(),
             traits: HashMap::default(),
             impls: Vec::new(),
             constraints: HashMap::default(),
+            ordered,
         }
     }
 }
@@ -128,7 +134,7 @@ pub struct SymbolTable {
 
 impl SymbolTable {
     pub fn new(local_crate_id: CrateId) -> Self {
-        let root = Scope::new(None);
+        let root = Scope::new(None, false);
         SymbolTable {
             scopes: vec![root],
             current_scope: 0,
@@ -141,7 +147,7 @@ impl SymbolTable {
 
     pub fn push_scope(&mut self) -> usize {
         let parent = Some(self.current_scope);
-        let scope = Scope::new(parent);
+        let scope = Scope::new(parent, true); // block scopes are ordered (allow shadowing)
         self.scopes.push(scope);
         self.current_scope = self.scopes.len() - 1;
         self.current_scope
@@ -164,7 +170,7 @@ impl SymbolTable {
         span: Span,
     ) -> Result<(), Diagnostic> {
         let scope = &mut self.scopes[self.current_scope];
-        if scope.variables.contains_key(&name) {
+        if !scope.ordered && scope.variables.contains_key(&name) {
             return Err(
                 Diagnostic::error(format!("variable '{}' already defined", name)).with_span(span),
             );

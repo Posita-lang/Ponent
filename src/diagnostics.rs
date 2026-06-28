@@ -54,6 +54,8 @@ pub struct Diagnostic {
     pub code: Option<String>,
     pub help: Option<String>,
     pub suggestions: Vec<String>,
+    /// Additional labeled sub-spans for multi-span error highlighting
+    pub labels: Vec<(Span, String)>,
 }
 
 impl Diagnostic {
@@ -65,6 +67,7 @@ impl Diagnostic {
             code: None,
             help: None,
             suggestions: Vec::new(),
+            labels: Vec::new(),
         }
     }
 
@@ -113,6 +116,14 @@ impl Diagnostic {
         self
     }
 
+    /// Add a labeled sub-span to this diagnostic for multi-span highlighting.
+    /// The span should point to a related location (e.g. the definition of a type
+    /// that caused a type mismatch).
+    pub fn with_label(mut self, span: Span, label: impl Into<String>) -> Self {
+        self.labels.push((span, label.into()));
+        self
+    }
+
     pub fn is_error(&self) -> bool {
         matches!(self.level, DiagnosticLevel::Error)
     }
@@ -152,6 +163,16 @@ impl fmt::Display for Diagnostic {
                 "{}suggestion: {}{}",
                 DiagnosticLevel::ansi_color_for_level(DiagnosticLevel::Help),
                 suggestion,
+                DiagnosticLevel::ansi_reset()
+            )?;
+        }
+        for (label_span, label_text) in &self.labels {
+            writeln!(
+                f,
+                "{}  --> {}: {}{}",
+                DiagnosticLevel::ansi_color_for_level(DiagnosticLevel::Help),
+                label_span,
+                label_text,
                 DiagnosticLevel::ansi_reset()
             )?;
         }
