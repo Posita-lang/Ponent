@@ -142,6 +142,8 @@ pub fn register_builtins(
             default_value: None,
             no_default: true,
             crate_id: symbols.local_crate_id,
+            missing_match: None,
+            exhaustive: false,
         };
         symbols.insert_type("Result".to_string(), binding, Span::new(0, 0)).ok();
     }
@@ -176,6 +178,8 @@ pub fn register_builtins(
             default_value: None,
             no_default: true,
             crate_id: symbols.local_crate_id,
+            missing_match: None,
+            exhaustive: false,
         };
         symbols.insert_type("Option".to_string(), binding, Span::new(0, 0)).ok();
     }
@@ -205,6 +209,8 @@ pub fn register_builtins(
             default_value: None,
             no_default: true,
             crate_id: symbols.local_crate_id,
+            missing_match: None,
+            exhaustive: false,
         };
         symbols.insert_type("Future".to_string(), binding, Span::new(0, 0)).ok();
     }

@@ -71,6 +71,13 @@ pub struct TypeBinding {
     pub default_value: Option<Expr>,
     pub no_default: bool,
     pub crate_id: CrateId,
+    /// Custom error message for non-exhaustive match on this type.
+    /// Set by `with missing_match = "..."` on enum definitions.
+    pub missing_match: Option<String>,
+    /// If true, all `match`, `if let`, and `while let` on this type
+    /// must be exhaustive — `_` wildcards are forbidden.
+    /// Set by `@exhaustive` attribute on the type.
+    pub exhaustive: bool,
 }
 
 #[derive(Debug, Clone)]

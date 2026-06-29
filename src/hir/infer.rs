@@ -32,6 +32,12 @@ pub struct InferenceContext {
     var_type_ids: Vec<TypeId>,
     constraints: Vec<Constraint>,
     next_var_id: usize,
+    /// Per-variable lower bounds (subtypes that must be ≤ this variable).
+    /// lower_bounds[i] contains TypeIds that must be subtypes of variable i.
+    lower_bounds: Vec<Vec<TypeId>>,
+    /// Per-variable upper bounds (supertypes that this variable must be ≤).
+    /// upper_bounds[i] contains TypeIds that variable i must be a subtype of.
+    upper_bounds: Vec<Vec<TypeId>>,
 }
 
 impl InferenceContext {
@@ -41,6 +47,8 @@ impl InferenceContext {
             var_type_ids: Vec::new(),
             constraints: Vec::new(),
             next_var_id: 0,
+            lower_bounds: Vec::new(),
+            upper_bounds: Vec::new(),
         }
     }
 
@@ -50,7 +58,19 @@ impl InferenceContext {
         let ty_id = ctx.alloc_infer_var(id);
         self.type_vars.push(TypeVar { id, kind });
         self.var_type_ids.push(ty_id);
+        // Grow bounds vectors to match the new variable id
+        while self.lower_bounds.len() <= id {
+            self.lower_bounds.push(Vec::new());
+        }
+        while self.upper_bounds.len() <= id {
+            self.upper_bounds.push(Vec::new());
+        }
         ty_id
+    }
+
+    /// Look up the kind of a type variable by its id.
+    pub fn get_var_kind(&self, id: usize) -> Option<TypeVariableKind> {
+        self.type_vars.iter().find(|tv| tv.id == id).map(|tv| tv.kind)
     }
 
     pub fn add_constraint(&mut self, c: Constraint) {
@@ -65,15 +85,36 @@ impl InferenceContext {
             }
         }
 
-        // Then check Sub constraints
+        // Then process Sub constraints: record bounds for inference variables
         for c in &self.constraints {
-            if let Constraint::Sub(sub, sup, span) = c {
-                if !ctx.subtype(*sub, *sup) {
-                    return Err(TypeError::Mismatch {
-                        expected: *sup,
-                        found: *sub,
-                        span: *span,
-                    });
+            if let Constraint::Sub(sub, sup, _span) = c {
+                let resolved_sub = ctx.resolve_binding(*sub);
+                let resolved_sup = ctx.resolve_binding(*sup);
+
+                // If sup is an InferVar, record sub as a lower bound of sup
+                if let TypeData::InferVar { id } = ctx.get(resolved_sup) {
+                    if *id < self.lower_bounds.len() {
+                        self.lower_bounds[*id].push(resolved_sub);
+                    }
+                }
+                // If sub is an InferVar, record sup as an upper bound of sub
+                if let TypeData::InferVar { id } = ctx.get(resolved_sub) {
+                    if *id < self.upper_bounds.len() {
+                        self.upper_bounds[*id].push(resolved_sup);
+                    }
+                }
+
+                // If both sides are resolved (not InferVar), check the subtype relationship now
+                let sub_is_infer = matches!(ctx.get(resolved_sub), TypeData::InferVar { .. });
+                let sup_is_infer = matches!(ctx.get(resolved_sup), TypeData::InferVar { .. });
+                if !sub_is_infer && !sup_is_infer {
+                    if !ctx.subtype(resolved_sub, resolved_sup) {
+                        return Err(TypeError::Mismatch {
+                            expected: resolved_sup,
+                            found: resolved_sub,
+                            span: *_span,
+                        });
+                    }
                 }
             }
         }
@@ -218,14 +259,51 @@ impl InferenceContext {
         Ok(())
     }
 
-    pub fn finalize(&self, ctx: &TypeContext) -> HashMap<usize, TypeId> {
+    pub fn finalize(&self, ctx: &mut TypeContext) -> HashMap<usize, TypeId> {
         let mut solution = HashMap::default();
         for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
             let resolved = ctx.resolve_binding(ty_id);
             let data = ctx.get(resolved);
             match data {
                 TypeData::InferVar { id } => {
-                    solution.insert(*id, ctx.error());
+                    // Variable is still unbound — try to infer from bounds
+                    let var_id = *id;
+                    let lbs: &[TypeId] = if var_id < self.lower_bounds.len() {
+                        &self.lower_bounds[var_id]
+                    } else {
+                        &[]
+                    };
+                    let ubs: &[TypeId] = if var_id < self.upper_bounds.len() {
+                        &self.upper_bounds[var_id]
+                    } else {
+                        &[]
+                    };
+                    let chosen = if !lbs.is_empty() {
+                        // Covariant: pick the least upper bound from lower bounds
+                        // (simple heuristic: pick the first resolved lower bound)
+                        let first_resolved = lbs.iter().find(|t| {
+                            let r = ctx.resolve_binding(**t);
+                            !matches!(ctx.get(r), TypeData::InferVar { .. })
+                        });
+                        first_resolved.copied().unwrap_or(ctx.error())
+                    } else if !ubs.is_empty() {
+                        // Contravariant: pick the greatest lower bound from upper bounds
+                        let first_resolved = ubs.iter().find(|t| {
+                            let r = ctx.resolve_binding(**t);
+                            !matches!(ctx.get(r), TypeData::InferVar { .. })
+                        });
+                        first_resolved.copied().unwrap_or(ctx.error())
+                    } else {
+                        // No bounds — default based on kind
+                        match self.type_vars[i].kind {
+                            TypeVariableKind::Integer => ctx.int(32, true),
+                            TypeVariableKind::Float => ctx.float(64),
+                            TypeVariableKind::Bool => ctx.bool(),
+                            TypeVariableKind::Numeric => ctx.int(32, true),
+                            _ => ctx.error(),
+                        }
+                    };
+                    solution.insert(var_id, chosen);
                 }
                 _ => {
                     solution.insert(self.type_vars[i].id, resolved);
@@ -364,6 +442,11 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
                 self_ty: new_self,
             })
             .unwrap_or(ctx.error())
+        }
+        TypeData::Forall { param_index, param_name, body } => {
+            let new_body = replace_infer(body, solution, ctx);
+            ctx.find_type(&TypeData::Forall { param_index, param_name, body: new_body })
+                .unwrap_or(ctx.error())
         }
     }
 }

@@ -13,6 +13,7 @@ mod hir {
 }
 mod lexer;
 mod parser;
+mod vfs;
 
 use clap::Parser;
 use hir::checker::TypeChecker;

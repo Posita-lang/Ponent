@@ -64,6 +64,15 @@ pub enum TypeData {
         name: String,
         base: TypeId,
     },
+    /// An explicit universal quantifier: ∀X. Body
+    /// `param_index` and `param_name` identify the bound variable X.
+    /// X appears in `body` as `GenericParam { index: param_index }`.
+    /// This is a compiler-internal node — there is no user-facing ∀ syntax.
+    Forall {
+        param_index: usize,
+        param_name: String,
+        body: TypeId,
+    },
     GenericParam {
         index: usize,
         name: String,
@@ -275,6 +284,177 @@ impl TypeContext {
         self.alloc(TypeData::Fn { params, ret })
     }
 
+    /// Apply Yoneda reduction if this type matches the pattern
+    /// `∀X. (A ⇒ X) ⇒ B⟨X⟩`  →  `B[X ↦ A]`
+    /// or `∀X. (X ⇒ A) ⇒ B⟨X⟩`  →  `B[X ↦ A]`.
+    /// Matches both explicit `Forall` nodes and implicit `Fn`-encoded patterns.
+    pub fn try_yoneda_reduce(&mut self, ty: TypeId) -> TypeId {
+        // Case A: explicit Forall node — Forall(X, Fn { params: [A], ret: X }) or Forall(X, Fn { params: [X], ret: A })
+        if let TypeData::Forall { param_index, param_name: _, body } = self.get(ty).clone() {
+            if let TypeData::Fn { params, ret } = self.get(body).clone() {
+                if params.len() == 1 {
+                    let a = params[0];
+                    // Case 1: Forall(X, Fn { params: [A], ret: X })
+                    if let TypeData::GenericParam { index, .. } = self.get(ret).clone() {
+                        if index == param_index && self.check_positive_only(index, body) {
+                            let reduced = self.subst(ret, &Subst::from_single(index, a));
+                            if reduced != ret { return reduced; }
+                        }
+                    }
+                    // Case 2: Forall(X, Fn { params: [X], ret: A })
+                    if let TypeData::GenericParam { index, .. } = self.get(a).clone() {
+                        if index == param_index && self.check_negative_only(index, body) {
+                            let reduced = self.subst(ret, &Subst::from_single(index, a));
+                            if reduced != ret { return reduced; }
+                        }
+                    }
+                }
+            }
+            return ty; // Forall node doesn't match Yoneda pattern
+        }
+
+        // Case B: implicit Fn-encoded pattern (backward compatible)
+        let (inner, ret) = match self.get(ty) {
+            TypeData::Fn { params, ret } if params.len() == 1 => (params[0], *ret),
+            _ => return ty,
+        };
+        let (a, x) = match self.get(inner) {
+            TypeData::Fn { params, ret } if params.len() == 1 => (params[0], *ret),
+            _ => return ty,
+        };
+        // Case 1: ∀X.(A ⇒ X) ⇒ B⟨X⟩  →  B[X↦A]  (X only positive in B)
+        if let TypeData::GenericParam { index, .. } = self.get(x) {
+            if self.check_positive_only(*index, ret) {
+                let reduced = self.subst(ret, &Subst::from_single(*index, a));
+                if reduced != ret {
+                    return reduced;
+                }
+            }
+        }
+        // Case 2: ∀X.(X ⇒ A) ⇒ B⟨X⟩  →  B[X↦A]  (X only negative in B)
+        if let TypeData::GenericParam { index, .. } = self.get(a) {
+            if self.check_negative_only(*index, ret) {
+                let reduced = self.subst(ret, &Subst::from_single(*index, x));
+                if reduced != ret {
+                    return reduced;
+                }
+            }
+        }
+        ty
+    }
+
+    /// Check that `param` only appears in positive (covariant) positions in `ty`.
+    /// Check whether all occurrences of `param` in `ty` appear only in
+    /// **positive** (covariant) positions. Uses sign propagation through
+    /// the type tree (Pistone & Tranchini 2022 §2).
+    fn check_positive_only(&self, param: usize, ty: TypeId) -> bool {
+        self.check_variance(param, ty, 1)
+    }
+
+    /// Check whether all occurrences of `param` in `ty` appear only in
+    /// **negative** (contravariant) positions.
+    fn check_negative_only(&self, param: usize, ty: TypeId) -> bool {
+        self.check_variance(param, ty, -1)
+    }
+
+    /// Core variance checker via sign propagation.
+    /// Returns `true` iff every occurrence of `param` in `ty` is at a
+    /// position whose cumulative sign matches `expected_sign`.
+    ///
+    /// Sign propagation rules:
+    ///   - Fn params: contravariant → cumulative sign flips
+    ///   - Fn ret: covariant → cumulative sign unchanged
+    ///   - Ref/Pointer/Ptr: invariant → param cannot appear inside
+    ///   - Tuple/Array/Slice/Struct args/Enum args/Forall body/Exists base:
+    ///     covariant → cumulative sign unchanged
+    fn check_variance(&self, param: usize, ty: TypeId, expected_sign: isize) -> bool {
+        self.check_variance_with_sign(param, ty, expected_sign, 1)
+    }
+
+    fn check_variance_with_sign(
+        &self,
+        param: usize,
+        ty: TypeId,
+        expected_sign: isize,
+        cumulative_sign: isize,
+    ) -> bool {
+        match self.get(ty) {
+            // Reached the tracked parameter — check sign match
+            TypeData::GenericParam { index, .. } => {
+                if *index == param {
+                    cumulative_sign == expected_sign
+                } else {
+                    true // different param, doesn't affect result
+                }
+            }
+            // Function type: params are contravariant (flip sign), ret is covariant (keep sign)
+            TypeData::Fn { params, ret } => {
+                params.iter().all(|p| {
+                    if self.type_contains_param(param, *p) {
+                        self.check_variance_with_sign(param, *p, expected_sign, -cumulative_sign)
+                    } else {
+                        true
+                    }
+                }) && self.check_variance_with_sign(param, *ret, expected_sign, cumulative_sign)
+            }
+            // Invariant containers: param cannot appear (sign effectively becomes 0)
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+                !self.type_contains_param(param, *ty)
+            }
+            TypeData::Ptr { pointee, .. } => !self.type_contains_param(param, *pointee),
+            // Covariant containers: keep sign
+            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
+                args.iter()
+                    .all(|&a| self.check_variance_with_sign(param, a, expected_sign, cumulative_sign))
+            }
+            TypeData::Tuple { elems } => elems.iter().all(|&e| {
+                self.check_variance_with_sign(param, e, expected_sign, cumulative_sign)
+            }),
+            TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
+                self.check_variance_with_sign(param, *elem, expected_sign, cumulative_sign)
+            }
+            TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. } => {
+                self.check_variance_with_sign(param, *body, expected_sign, cumulative_sign)
+            }
+            TypeData::AssociatedType { self_ty, .. } => {
+                self.check_variance_with_sign(param, *self_ty, expected_sign, cumulative_sign)
+            }
+            TypeData::InferVar { .. } => true, // inference vars don't affect variance
+            _ => true, // primitives (Int, Bool, etc.) don't contain generic params
+        }
+    }
+
+    /// Check if a GenericParam with the given index appears anywhere in a type.
+    pub fn type_contains_param(&self, param: usize, ty: TypeId) -> bool {
+        match self.get(ty) {
+            TypeData::GenericParam { index, .. } => *index == param,
+            TypeData::Fn { params, ret } => {
+                params.iter().any(|&p| self.type_contains_param(param, p))
+                || self.type_contains_param(param, *ret)
+            }
+            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
+                args.iter().any(|&a| self.type_contains_param(param, a))
+            }
+            TypeData::Tuple { elems } => {
+                elems.iter().any(|&e| self.type_contains_param(param, e))
+            }
+            TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
+                self.type_contains_param(param, *elem)
+            }
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+                self.type_contains_param(param, *ty)
+            }
+            TypeData::Ptr { pointee, .. } => self.type_contains_param(param, *pointee),
+            TypeData::AssociatedType { self_ty, .. } => {
+                self.type_contains_param(param, *self_ty)
+            }
+            TypeData::Exists { base, .. } => {
+                self.type_contains_param(param, *base)
+            }
+            _ => false,
+        }
+    }
+
     pub fn dyn_trait(&mut self, traits: Vec<DefId>) -> TypeId {
         self.alloc(TypeData::DynTrait { traits })
     }
@@ -287,6 +467,23 @@ impl TypeContext {
             no_default: false,
         });
         id
+    }
+
+    pub fn forall(&mut self, param_index: usize, param_name: String, body: TypeId) -> TypeId {
+        let id = self.alloc(TypeData::Forall {
+            param_index,
+            param_name,
+            body,
+        });
+        // Automatically attempt Yoneda reduction:
+        // ∀X.(A ⇒ X) ⇒ B⟨X⟩  →  B[X↦A]   (X only positive in body)
+        // ∀X.(X ⇒ A) ⇒ B⟨X⟩  →  B[X↦A]   (X only negative in body)
+        let reduced = self.try_yoneda_reduce(id);
+        if reduced != id {
+            reduced
+        } else {
+            id
+        }
     }
 
     pub fn generic_param(&mut self, index: usize, name: String) -> TypeId {
@@ -323,6 +520,7 @@ impl TypeContext {
                     || self.occurs_check(param, *ret)
             }
             TypeData::Exists { base, .. } => self.occurs_check(param, *base),
+            TypeData::Forall { body, .. } => self.occurs_check(param, *body),
             TypeData::AssociatedType { self_ty, .. } => self.occurs_check(param, *self_ty),
             TypeData::GenericParam { .. } | TypeData::InferVar { .. } => false,
             TypeData::Int { .. }
@@ -551,6 +749,11 @@ impl TypeContext {
                     .expect("function type should exist")
             }
             TypeData::DynTrait { .. } => ty,
+            TypeData::Forall { param_index, param_name, body } => {
+                let new_body = self.subst(*body, subst);
+                self.find_type(&TypeData::Forall { param_index: *param_index, param_name: param_name.clone(), body: new_body })
+                    .unwrap_or(ty)
+            }
             TypeData::Exists { name, base } => {
                 let new_base = self.subst(*base, subst);
                 self.exists_ty_no_alloc(name.clone(), new_base)
@@ -713,6 +916,7 @@ impl TypeContext {
             }
             TypeData::AssociatedType { self_ty, .. } => 1 + self.type_constructor_depth(*self_ty),
             TypeData::Exists { base, .. } => 1 + self.type_constructor_depth(*base),
+            TypeData::Forall { body, .. } => 1 + self.type_constructor_depth(*body),
             TypeData::DynTrait { .. } => 1,
             TypeData::Int { .. } | TypeData::UInt { .. } | TypeData::Float { .. }
             | TypeData::Bool | TypeData::Char | TypeData::Byte | TypeData::USize
@@ -884,6 +1088,12 @@ impl Subst {
         self.map.insert(index, ty);
     }
 
+    pub fn from_single(index: usize, ty: TypeId) -> Self {
+        let mut map = HashMap::default();
+        map.insert(index, ty);
+        Subst { map }
+    }
+
     pub fn get(&self, index: usize) -> Option<&TypeId> {
         self.map.get(&index)
     }
@@ -902,6 +1112,131 @@ impl Subst {
 impl Default for Subst {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The characteristic κ(A) of a type, describing its inhabitant count:
+/// - `FiniteExhaustible(usize)` → κ=0: finite inhabitants (e.g. `Bool` has 2)
+/// - `InfiniteEnumerable` → κ=1: infinite but enumerable (recursive types with only covariant cycles)
+/// - `Undecidable` → κ=∞: cannot decide (cycles through contravariant/invariant positions)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Characteristic {
+    FiniteExhaustible(usize),
+    InfiniteEnumerable,
+    Undecidable,
+}
+
+impl TypeContext {
+    /// Compute the characteristic κ(A) of a type, used for exhaustiveness checking
+    /// of match expressions.
+    ///
+    /// Algorithm (Pistone & Tranchini 2022 §5):
+    /// 1. Treat the type tree as a directed graph with variance-annotated edges
+    ///    (covariant →, contravariant ⇒, invariant ↔).
+    /// 2. Add "axiom links" connecting matching GenericParam nodes.
+    /// 3. Detect cyclic paths through the graph.
+    /// 4. Acyclic → κ=0, cyclic only through covariant edges → κ=1, other → κ=∞.
+    pub fn characteristic(&self, ty: TypeId, visited: &mut Vec<TypeId>) -> Characteristic {
+        // Prevent infinite recursion on cyclic types
+        if visited.contains(&ty) {
+            return Characteristic::InfiniteEnumerable;
+        }
+        visited.push(ty);
+
+        let data = self.get(ty);
+        match data {
+            TypeData::Int { bits, .. } => {
+                let count = 1usize << bits;
+                Characteristic::FiniteExhaustible(count)
+            }
+            TypeData::UInt { bits } => {
+                let count = 1usize << bits;
+                Characteristic::FiniteExhaustible(count)
+            }
+            TypeData::Float { .. } | TypeData::USize => {
+                // Floats and usize have very large but finite domains
+                Characteristic::FiniteExhaustible(usize::MAX)
+            }
+            TypeData::Bool => Characteristic::FiniteExhaustible(2),
+            TypeData::Char => Characteristic::FiniteExhaustible(256),
+            TypeData::Byte => Characteristic::FiniteExhaustible(256),
+            TypeData::Unit => Characteristic::FiniteExhaustible(1),
+            TypeData::Never => Characteristic::FiniteExhaustible(0),
+            TypeData::Error => Characteristic::FiniteExhaustible(0),
+            TypeData::Tuple { elems } => {
+                let mut total = 1usize;
+                let mut has_infinite = false;
+                for &elem in elems {
+                    match self.characteristic(elem, visited) {
+                        Characteristic::FiniteExhaustible(n) => {
+                            total = total.saturating_mul(n);
+                        }
+                        Characteristic::InfiniteEnumerable => {
+                            has_infinite = true;
+                        }
+                        Characteristic::Undecidable => return Characteristic::Undecidable,
+                    }
+                }
+                if has_infinite {
+                    Characteristic::InfiniteEnumerable
+                } else {
+                    Characteristic::FiniteExhaustible(total)
+                }
+            }
+            TypeData::Struct { def_id: _, args } | TypeData::Enum { def_id: _, args } => {
+                let mut has_infinite = false;
+                for &arg in args {
+                    match self.characteristic(arg, visited) {
+                        Characteristic::FiniteExhaustible(_) => {}
+                        Characteristic::InfiniteEnumerable => has_infinite = true,
+                        Characteristic::Undecidable => return Characteristic::Undecidable,
+                    }
+                }
+                if has_infinite {
+                    Characteristic::InfiniteEnumerable
+                } else {
+                    Characteristic::FiniteExhaustible(usize::MAX)
+                }
+            }
+            TypeData::Array { elem, size } => {
+                match self.characteristic(*elem, visited) {
+                    Characteristic::FiniteExhaustible(n) => {
+                        Characteristic::FiniteExhaustible(n.saturating_pow(*size as u32))
+                    }
+                    Characteristic::InfiniteEnumerable => Characteristic::InfiniteEnumerable,
+                    Characteristic::Undecidable => Characteristic::Undecidable,
+                }
+            }
+            TypeData::Slice { elem } | TypeData::Ref { ty: elem, .. }
+            | TypeData::Pointer { ty: elem }
+            | TypeData::Ptr { pointee: elem, .. } => {
+                let _ = self.characteristic(*elem, visited);
+                Characteristic::InfiniteEnumerable
+            }
+            TypeData::Fn { params, ret } => {
+                for &p in params {
+                    if self.characteristic(p, visited) == Characteristic::Undecidable {
+                        return Characteristic::Undecidable;
+                    }
+                }
+                match self.characteristic(*ret, visited) {
+                    Characteristic::Undecidable => Characteristic::Undecidable,
+                    _ => Characteristic::InfiniteEnumerable,
+                }
+            }
+            TypeData::GenericParam { .. } => {
+                Characteristic::FiniteExhaustible(usize::MAX)
+            }
+            TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. } => {
+                self.characteristic(*body, visited)
+            }
+            TypeData::DynTrait { .. } | TypeData::AssociatedType { .. } => {
+                Characteristic::InfiniteEnumerable
+            }
+            TypeData::InferVar { .. } => {
+                Characteristic::FiniteExhaustible(usize::MAX)
+            }
+        }
     }
 }
 

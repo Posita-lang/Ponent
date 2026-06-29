@@ -1,4 +1,5 @@
 mod checker;
+mod comptime;
 mod hir;
 mod infer;
 mod resolver;
@@ -7,6 +8,7 @@ mod traits;
 mod types;
 
 pub use checker::*;
+pub use comptime::*;
 pub use hir::*;
 pub use infer::*;
 pub use resolver::*;

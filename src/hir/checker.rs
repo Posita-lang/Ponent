@@ -138,6 +138,8 @@ enum CtxKind {
     For,
     /// A wabewed bwock (can be bweaked via `bweak 'wabew`) (｀・ω・´)
     LabeledBlock,
+    /// A comptime evawuation bwock — `wetuwn` inside is comptime contwow fwow, not an ewwow. (◕‿◕)
+    Comptime,
 }
 
 /// A fwame howding the context kind and its span (*/ω＼*)
@@ -473,6 +475,13 @@ impl<'a> TypeChecker<'a> {
                 span, attributes, contracts, name, params, return_type, body, type_params,
                 where_clause, finally, is_comptime, is_async, ..
             } => {
+                // Register generic type parameters FIRST so that `T` in parameter types,
+                // return types, and where clauses can be resolved.
+                for (i, tp) in type_params.iter().enumerate() {
+                    let generic_id = self.ctx.generic_param(i, tp.name.clone());
+                    self.local_type_param_cache.insert(tp.name.clone(), generic_id);
+                }
+
                 let return_ty = self.resolve_type(return_type)?;
                 let mut hir_params = Vec::new();
                 for param in params {
@@ -488,13 +497,6 @@ impl<'a> TypeChecker<'a> {
                         default: param.default.clone(),
                         span: param.span,
                     });
-                }
-
-                // Register generic type parameters so that `T` in where clauses
-                // and function bodies can be resolved.
-                for (i, tp) in type_params.iter().enumerate() {
-                    let generic_id = self.ctx.generic_param(i, tp.name.clone());
-                    self.local_type_param_cache.insert(tp.name.clone(), generic_id);
                 }
 
                 let guard = ScopeGuard::new(self);
@@ -751,6 +753,20 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Stmt::Return { value, span } => {
+                // Check if we're inside a comptime block — if so, return is comptime
+                // control flow, not a real function return.
+                let in_comptime = self.loop_stack.iter().rev()
+                    .any(|f| matches!(f.kind, CtxKind::Comptime));
+                if in_comptime {
+                    // Inside comptime, `return` acts as comptime control flow:
+                    // the value is evaluated and propagated out of the comptime block.
+                    if let Some(value) = value {
+                        let (hir, _) = self.infer_expr(value)?;
+                        return Err(Diagnostic::error(format!("comptime return with value: {:?}", hir)));
+                    }
+                    return Err(Diagnostic::error("comptime return".to_string()));
+                }
+
                 // Check that return is inside a function or closure context
                 let in_function = self.loop_stack.iter().rev()
                     .any(|f| matches!(f.kind, CtxKind::Function | CtxKind::Closure));
@@ -808,13 +824,20 @@ impl<'a> TypeChecker<'a> {
                 Ok(HirStmt::Assign { target: Box::new(target_hir), op: *op, value: Box::new(value_hir), span: *span })
             }
             Stmt::ComptimeBlock { body, span } => {
-                // Catch comptime control flow (return/break/continue inside comptime { })
-                // and wrap them into the HIR so they are not lost during type-checking.
+                // Push a comptime context frame so that `return` inside comptime
+                // blocks is treated as comptime control flow, not an error.
+                self.push_ctx(CtxKind::Comptime, *span, None);
                 let body_hir = match self.check_block(body) {
-                    Ok(hir) => hir,
-                    Err(diag) => return Err(diag),
+                    Ok(hir) => {
+                        self.pop_ctx();
+                        Ok(HirStmt::ComptimeBlock { body: hir, span: *span })
+                    }
+                    Err(diag) => {
+                        self.pop_ctx();
+                        Err(diag)
+                    }
                 };
-                Ok(HirStmt::ComptimeBlock { body: body_hir, span: *span })
+                body_hir
             }
             Stmt::ScopeCleanup { name, body, propagates, overrides, span } => {
                 let body_hir = self.check_block(body)?;
@@ -957,8 +980,19 @@ impl<'a> TypeChecker<'a> {
                     Ok((HirExpr::Ident(name.clone(), binding.ty, *span), binding.ty))
                 } else if let Some(func) = self.symbols.lookup_function(name) {
                     let sig = &func.signature;
-                    let ty = self.ctx.function(sig.params.iter().map(|p| p.ty).collect(), sig.return_type);
-                    Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
+                    // Construct the function type: Fn(params..., ret)
+                    let mut fn_ty = self.ctx.function(
+                        sig.params.iter().map(|p| p.ty).collect(),
+                        sig.return_type,
+                    );
+                    // If the function has type parameters, wrap with Forall:
+                    // def foo<T, U>(x: T, y: U) → Forall(0, "T", Forall(1, "U", Fn(...)))
+                    if !sig.type_params.is_empty() {
+                        for (i, tp) in sig.type_params.iter().enumerate().rev() {
+                            fn_ty = self.ctx.forall(i, tp.name.clone(), fn_ty);
+                        }
+                    }
+                    Ok((HirExpr::Ident(name.clone(), fn_ty, *span), fn_ty))
                 } else {
                     self.diagnostics.push(Diagnostic::error(format!("undefined name: {}", name)).with_span(*span));
                     Ok((HirExpr::Error(*span), self.ctx.error()))
@@ -1073,10 +1107,20 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
 
-                // Normal (non-polymorphic) function call
-                if let Some(params) = self.ctx.params_of_fn(callee_ty) {
+                // Normal (non-polymorphic) function call — peel any Forall wrapping
+                let inner_call_ty = {
+                    let mut t = callee_ty;
+                    loop {
+                        match self.ctx.get(t) {
+                            TypeData::Forall { body, .. } => t = *body,
+                            _ => break,
+                        }
+                    }
+                    t
+                };
+                if let Some(params) = self.ctx.params_of_fn(inner_call_ty) {
                     let param_tys = params.to_vec();
-                    let ret_ty = self.ctx.ret_of_fn(callee_ty).unwrap_or(self.ctx.error());
+                    let ret_ty = self.ctx.ret_of_fn(inner_call_ty).unwrap_or(self.ctx.error());
                     if param_tys.len() != args.len() {
                         self.diagnostics.push(Diagnostic::error(format!(
                             "wrong number of arguments: expected {}, found {}", param_tys.len(), args.len()
@@ -1309,6 +1353,106 @@ impl<'a> TypeChecker<'a> {
                     hir_arms.push(HirMatchArm { pattern: pattern_hir, guard: guard_hir, body: Box::new(body_hir), span: arm.span });
                 }
                 let result_ty = arm_ty.unwrap_or(self.ctx.unit());
+
+                // ── Exhaustiveness check ────────────────────────────
+                // Check that all enum variants or finite values are covered
+                // by the match arms (unless `_` wildcard present).
+                // Use resolve_binding to see through any InferVar bindings.
+                let resolved_scrut_ty = self.ctx.resolve_binding(scrut_ty);
+                let has_wildcard = hir_arms.iter().any(|a| matches!(a.pattern, HirPattern::Wildcard(_)));
+
+                if !has_wildcard {
+                    // Enumerate checked variants/patterns from all arms
+                    let mut covered_variants: Vec<String> = Vec::new();
+                    for arm in &hir_arms {
+                        match &arm.pattern {
+                            HirPattern::Enum { variant, .. } => {
+                                if !covered_variants.contains(variant) {
+                                    covered_variants.push(variant.clone());
+                                }
+                            }
+                            HirPattern::Or(patterns, _) => {
+                                for p in patterns {
+                                    if let HirPattern::Enum { variant, .. } = p {
+                                        if !covered_variants.contains(variant) {
+                                            covered_variants.push(variant.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            HirPattern::Literal(expr, _) => {
+                                if let HirExpr::Literal(lit, _, _) = expr.as_ref() {
+                                    let lit_key = format!("{:?}", lit);
+                                    if !covered_variants.contains(&lit_key) {
+                                        covered_variants.push(lit_key);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Path A: type has explicit enum variants
+                    if let Some(binding) = self.lookup_type_binding(resolved_scrut_ty) {
+                        let total_variants = binding.variants.len();
+                        if total_variants > 0 && covered_variants.len() < total_variants {
+                            let msg = binding.missing_match.clone().unwrap_or_else(|| {
+                                format!(
+                                    "non-exhaustive match: covered {}/{} variants; add missing arms or a `_` wildcard",
+                                    covered_variants.len(),
+                                    total_variants,
+                                )
+                            });
+                            self.diagnostics.push(
+                                Diagnostic::error(msg).with_span(*span)
+                            );
+                        }
+                        // Path A.2: @exhaustive forbids wildcard
+                        if binding.exhaustive && has_wildcard && total_variants > 0 {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    "`@exhaustive` enum does not allow `_` wildcard; list all variants explicitly"
+                                ).with_span(*span)
+                            );
+                        }
+                    }
+
+                    // Path B: small finite type with literal patterns (Bool, etc.)
+                    // Use characteristic κ after resolving inference variables.
+                    // For InferVars, also check the variable kind directly
+                    // (characteristic returns usize::MAX for unresolved infer vars).
+                    let mut visited = Vec::new();
+                    let char = self.ctx.characteristic(resolved_scrut_ty, &mut visited);
+                    let total_count_from_char = match char {
+                        Characteristic::FiniteExhaustible(n) => Some(n),
+                        _ => None,
+                    };
+                    let inferred_count: Option<usize> = match self.ctx.get(resolved_scrut_ty) {
+                        TypeData::InferVar { id } => {
+                            match self.infer.get_var_kind(*id) {
+                                Some(TypeVariableKind::Bool) => Some(2),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    // inferred_count takes priority over characteristic for unresolved vars
+                    let total_count = inferred_count.or(total_count_from_char);
+                    match total_count {
+                        Some(n) if n <= 256 && covered_variants.len() < (n as usize) => {
+                            let msg = format!(
+                                "non-exhaustive match: covered {}/{} possible values; add more arms or a `_` wildcard",
+                                covered_variants.len(),
+                                n,
+                            );
+                            self.diagnostics.push(
+                                Diagnostic::error(msg).with_span(*span)
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+
                 Ok((HirExpr::Match { scrutinee: Box::new(scrut_hir), arms: hir_arms, ty: result_ty, span: *span }, result_ty))
             }
             Expr::Block(stmts, span) => {
@@ -1991,9 +2135,21 @@ impl<'a> TypeChecker<'a> {
         expected: Option<TypeId>,
         span: Span,
     ) -> Result<Option<(HirExpr, TypeId)>, Diagnostic> {
+        // Peel off Forall layers to get the underlying Fn type.
+        // For polymorphic functions, the type is wrapped as:
+        //   Forall(0, "T", Forall(1, "U", Fn { params: [...], ret: ... }))
+        // We strip the Forall nodes and recover the Fn body.
+        let mut inner_ty = callee_ty;
+        loop {
+            match self.ctx.get(inner_ty) {
+                TypeData::Forall { body, .. } => inner_ty = *body,
+                _ => break,
+            }
+        }
+
         // Only works on Fn types
-        let (params, ret) = match self.ctx.params_of_fn(callee_ty)
-            .zip(self.ctx.ret_of_fn(callee_ty)) {
+        let (params, ret) = match self.ctx.params_of_fn(inner_ty)
+            .zip(self.ctx.ret_of_fn(inner_ty)) {
             Some(p) => p,
             None => return Ok(None),
         };
@@ -2345,6 +2501,17 @@ impl<'a> TypeChecker<'a> {
 
     fn new_infer_var(&mut self, kind: TypeVariableKind) -> TypeId { self.infer.new_type_var(self.ctx, kind) }
     fn add_constraint(&mut self, c: Constraint) { self.infer.add_constraint(c); }
+
+    /// Look up the TypeBinding for a Struct or Enum type, if available.
+    fn lookup_type_binding(&self, ty: TypeId) -> Option<TypeBinding> {
+        let resolved = self.ctx.resolve_binding(ty);
+        match self.ctx.get(resolved) {
+            TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } => {
+                self.symbols.lookup_type_by_def_id(*def_id).cloned()
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2585,12 +2752,14 @@ mod tests {
     }
 
     // ── Generic type parameter synthesis ──────────────────────────
-    // Note: these require the resolver to register generic type parameters
-    // from function signatures. Currently the resolver does not do this,
-    // so these tests are ignored until that support is added.
+    // Note: the resolver stores type_params in FunctionSignature but does NOT
+    // register them in current_impl_type_params during FunctionDef processing.
+    // This means `T` in `def id<T>(x: T)` cannot be resolved by resolve_type_expr
+    // during the resolver phase, producing "undefined type: T" before the
+    // checker ever runs. Fix: populate current_impl_type_params in the
+    // FunctionDef branch of resolve_item, same as ImplBlock already does.
 
     #[test]
-    #[ignore = "resolver does not yet register generic type params from function sigs"]
     fn test_polymorphic_identity_call() {
         let result = check_source(
             "def id<T>(x: T) -> T { return x; }
@@ -2602,7 +2771,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "resolver does not yet register generic type params from function sigs"]
     fn test_polymorphic_bool_call() {
         let result = check_source(
             "def id<T>(x: T) -> T { return x; }
@@ -2615,7 +2783,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "resolver does not yet register generic type params from function sigs"]
     fn test_polymorphic_pair() {
         let result = check_source(
             "def pair<T, U>(a: T, b: U) -> T { return a; }
@@ -2749,5 +2916,86 @@ mod tests {
         assert!(result.is_err(), "no matching method should error");
         let all = result.err().unwrap().join(" ");
         assert!(all.contains("no method"), "error should mention 'no method': {}", all);
+    }
+
+    // ── Exhaustiveness matching tests ──────────────────────────────
+
+    #[test]
+    fn test_match_exhaustive_enum_ok() {
+        let result = check_source(
+            "type MyBool = enum { True, False }
+             def main() -> Int<32> {
+                 set b = MyBool::True;
+                 set x = match b { MyBool::True => 1, MyBool::False => 0 };
+                 return x;
+             }",
+        );
+        assert!(result.is_ok(), "exhaustive match should pass: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_match_non_exhaustive_enum_errors() {
+        let result = check_source(
+            "type State = enum { Init, Running, Stopped }
+             def main() -> Int<32> {
+                 set s = State::Init;
+                 set x = match s { State::Init => 1, State::Running => 2 };
+                 return x;
+             }",
+        );
+        assert!(result.is_err(), "non-exhaustive match should error");
+        let msg = result.err().unwrap().join(" ");
+        assert!(msg.contains("non-exhaustive"), "error should mention non-exhaustive: {}", msg);
+    }
+
+    #[test]
+    fn test_match_exhaustive_with_wildcard_ok() {
+        let result = check_source(
+            "type State = enum { A, B, C, D }
+             def main() -> Int<32> {
+                 set s = State::A;
+                 set x = match s { State::A => 1, _ => 0 };
+                 return x;
+             }",
+        );
+        assert!(result.is_ok(), "match with wildcard should pass: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_match_bool_exhaustive_required() {
+        let result = check_source(
+            "def main() -> Int<32> {
+                 set b = true;
+                 set x = match b { true => 1 };
+                 return x;
+             }",
+        );
+        assert!(result.is_err(), "non-exhaustive bool match should error");
+        let msg = result.err().unwrap().join(" ");
+        assert!(msg.contains("non-exhaustive"), "error should mention non-exhaustive: {}", msg);
+    }
+
+    #[test]
+    fn test_match_bool_exhaustive_with_wildcard_ok() {
+        let result = check_source(
+            "def main() -> Int<32> {
+                 set b = true;
+                 set x = match b { true => 1, _ => 0 };
+                 return x;
+             }",
+        );
+        assert!(result.is_ok(), "bool match with wildcard should pass: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_match_bool_full_exhaustive_ok() {
+        let result = check_source(
+            "def main() -> Int<32> {
+                 set b = true;
+                 set x = match b { true => 1, false => 0 };
+                 return x;
+             }",
+        );
+        assert!(result.is_ok(), "full bool match should pass: {:?}", result.err());
     }
 }

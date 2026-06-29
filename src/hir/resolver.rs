@@ -4,12 +4,38 @@ use crate::hir::symbol::*;
 use crate::hir::traits::{ImplCandidate, TraitEnv};
 use rustc_hash::FxHashMap;
 
+/// Represents the result of partially resolving a multi-segment path
+/// (e.g. `Foo::bar::Baz` where only `Foo` is known at resolver time).
+#[derive(Debug, Clone)]
+pub enum PartialRes {
+    /// Fully resolved — all path segments are known.
+    Full(Res),
+    /// Only the prefix `base` could be resolved; `remaining` segments
+    /// must be resolved during type-checking.
+    Unresolved { base: Res, remaining: usize },
+    /// Resolution encountered an error.
+    Err,
+}
+
+/// A resolved name/item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Res {
+    Def(DefId),
+    Type(DefId),
+    Module(DefId),
+    Primitive,
+}
+
 /// Pre-resolved name resolution results, populated by NameResolver and consumed by TypeChecker.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ResolutionMap {
     pub variable_types: FxHashMap<String, TypeId>,
     pub type_def_ids: FxHashMap<String, DefId>,
     pub type_bindings: FxHashMap<DefId, TypeBinding>,
+    /// Partial resolution of value paths (multi-segment), keyed by the first segment.
+    pub value_resolutions: FxHashMap<String, PartialRes>,
+    /// Partial resolution of type paths (multi-segment), keyed by the first segment.
+    pub type_resolutions: FxHashMap<String, PartialRes>,
 }
 use crate::hir::types::*;
 use rustc_hash::FxHashMap as HashMap;
@@ -91,6 +117,16 @@ impl<'a> NameResolver<'a> {
                 ..
             } => {
                 let def_id = self.allocate_def_id();
+
+                // Register generic parameters BEFORE collecting the function signature,
+                // so that resolve_type_expr can resolve T in `def foo<T>(x: T) -> T`.
+                let mut param_map = HashMap::default();
+                for (i, tp) in type_params.iter().enumerate() {
+                    let ty_id = self.ctx.generic_param(i, tp.name.clone());
+                    param_map.insert(tp.name.clone(), ty_id);
+                }
+                self.current_impl_type_params = Some(param_map);
+
                 let sig = self.collect_function_signature(name, params, return_type, type_params);
 
                 let binding = FunctionBinding {
@@ -137,10 +173,12 @@ impl<'a> NameResolver<'a> {
                 }
 
                 self.current_function = None;
+                self.current_impl_type_params = None;
                 self.exit_scope();
             }
             Stmt::TypeDef {
                 span,
+                attributes,
                 name,
                 params,
                 definition,
@@ -165,6 +203,8 @@ impl<'a> NameResolver<'a> {
                 let mut invariant = None;
                 let mut default_value = None;
                 let mut no_default = false;
+                let mut missing_match = None;
+                let exhaustive = attributes.iter().any(|a| a.name == "exhaustive");
 
                 match definition {
                     TypeDefinition::Struct(fields_def) => {
@@ -181,8 +221,9 @@ impl<'a> NameResolver<'a> {
                             })
                             .collect();
                     }
-                    TypeDefinition::Enum(variants_def, _) => {
+                    TypeDefinition::Enum(variants_def, mm) => {
                         variants = variants_def.clone();
+                        missing_match = mm.clone();
                     }
                     TypeDefinition::Alias(ty, mods) => {
                         alias_ast = Some(ty.clone());
@@ -209,6 +250,8 @@ impl<'a> NameResolver<'a> {
                     default_value,
                     no_default,
                     crate_id: self.symbols.local_crate_id,
+                    missing_match,
+                    exhaustive,
                 };
                 if let Err(diag) = self.symbols.insert_type(name.clone(), binding, *span) {
                     self.diagnostics.push(diag);
@@ -248,6 +291,7 @@ impl<'a> NameResolver<'a> {
             }
             Stmt::ImplBlock {
                 span,
+                attributes,
                 trait_path,
                 for_type,
                 methods,
@@ -298,13 +342,15 @@ impl<'a> NameResolver<'a> {
                 };
                 self.symbols.insert_impl(binding, *span);
 
+                let has_auto_deref = attributes.iter().any(|a| a.name == "auto_deref");
+
                 if let Some(trait_id) = resolved_trait {
                     let candidate = ImplCandidate {
                         trait_id,
                         for_type: resolved_for,
                         methods: methods.clone(),
                         assoc_tys: Vec::new(),
-                        has_auto_deref: false,
+                        has_auto_deref,
                         context,
                         span: *span,
                     };
