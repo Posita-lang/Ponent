@@ -2,6 +2,7 @@ use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticCollector};
 use crate::hir::hir::*;
 use crate::hir::infer::*;
+use crate::hir::resolver::ResolutionMap;
 use crate::hir::symbol::*;
 use crate::hir::traits::TraitEnv;
 use crate::hir::types::*;
@@ -111,12 +112,14 @@ pub enum TypingContext {
     Argument { index: usize, total: usize },
     /// Checking the body of a closure
     ClosureBody,
-    /// Checking the condition of an if/while
+    /// Checking the condition of an if/while (expression must be boolean)
     Condition,
     /// Checking a field initializer in a struct literal
     StructFieldInit,
     /// Checking the return value of a function
     ReturnValue,
+    /// Checking an array/slice index expression (must be integer)
+    Index,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +163,8 @@ pub struct TypeChecker<'a> {
     /// Locaw cache of variabwe types, updated by check_stmt for each VawiabweDef.
     /// Ovewwides the wesowvew's pwacehowdew `ewrow` type. (◕‿◕)
     local_variable_types: HashMap<String, TypeId>,
+    /// Pre-resolved by NameResolver: variable name → TypeId
+    resolution_map: ResolutionMap,
     /// Local cache of generic type parameter types (e.g. `T` in `def foo<T>(x: T)`).
     /// Populated when processing function definitions with type_params.
     local_type_param_cache: HashMap<String, TypeId>,
@@ -199,8 +204,9 @@ impl<'a> TypeChecker<'a> {
         ctx: &'a mut TypeContext,
         symbols: &'a SymbolTable,
         trait_env: &'a mut TraitEnv,
+        resolution_map: ResolutionMap,
     ) -> Self {
-        TypeChecker {
+        let mut checker = TypeChecker {
             ctx,
             symbols,
             trait_env,
@@ -213,7 +219,13 @@ impl<'a> TypeChecker<'a> {
             loop_stack: vec![CtxFrame { kind: CtxKind::Function, span: Span::new(0, 0), label: None }],
             local_variable_types: HashMap::new(),
             local_type_param_cache: HashMap::new(),
+            resolution_map,
+        };
+        // Pre-populate from the name resolver's results
+        for (name, ty) in &checker.resolution_map.variable_types {
+            checker.local_variable_types.insert(name.clone(), *ty);
         }
+        checker
     }
 
     fn enter_inference_scope(&mut self) {
@@ -367,7 +379,7 @@ impl<'a> TypeChecker<'a> {
                 let (value_hir, inferred_ty) = if let Some(value) = value {
                     // Explicit initializer present
                     if ty.is_some() {
-                        let hir = self.check_expr(value, Expectation::HasType(declared_ty))?;
+                        let hir = self.check_expr(value, Expectation::HasType(declared_ty), TypingContext::None)?;
                         let ty = hir.ty();
                         (Some(hir), ty)
                     } else {
@@ -378,7 +390,7 @@ impl<'a> TypeChecker<'a> {
                     // No explicit initializer: try type's default value
                     let default_expr = self.lookup_type_default_expr(declared_ty, *span)?;
                     if let Some(default_expr) = default_expr {
-                        let hir = self.check_expr(&default_expr, Expectation::HasType(declared_ty))?;
+                        let hir = self.check_expr(&default_expr, Expectation::HasType(declared_ty), TypingContext::None)?;
                         let ty = hir.ty();
                         (Some(hir), ty)
                     } else {
@@ -394,7 +406,7 @@ impl<'a> TypeChecker<'a> {
 
                 // Unify declared type with inferred type (if we have both)
                 if let Some(ref value_hir) = value_hir {
-                    self.unify(declared_ty, inferred_ty, *span)?;
+                    self.unify_with(declared_ty, inferred_ty, *span, TypingContext::None)?;
                 }
 
                 let pattern_hir = if let Some(pattern) = pattern {
@@ -515,7 +527,7 @@ impl<'a> TypeChecker<'a> {
 
                 if let Some(ref body_stmts) = body_hir {
                     let body_ty = self.block_type(body_stmts);
-                    self.unify(return_ty, body_ty, *span)?;
+                    self.unify_with(return_ty, body_ty, *span, TypingContext::ReturnValue)?;
                 }
 
                 // Contract verification skeleton: check that requires/ensures are bool,
@@ -588,7 +600,7 @@ impl<'a> TypeChecker<'a> {
             Stmt::If { cond, then_branch, else_branch, span } => {
                 let (cond_hir, cond_ty) = self.infer_expr(cond)?;
                 if !self.ctx.is_bool(cond_ty) {
-                    self.diagnostics.push(Diagnostic::error("if condition must be boolean").with_code("E004").with_span(*span));
+                    self.diagnostics.push(Diagnostic::error("if condition must be boolean").with_code("E004").with_span(*span).with_label(cond.span(), format!("got {:?}", self.ctx.get(cond_ty))));
                 }
                 let then_hir = self.check_block(then_branch)?;
                 let else_hir = if let Some(else_branch) = else_branch {
@@ -612,7 +624,7 @@ impl<'a> TypeChecker<'a> {
             Stmt::While { cond, body, invariant, decreases, span } => {
                 let (cond_hir, cond_ty) = self.infer_expr(cond)?;
                 if !self.ctx.is_bool(cond_ty) {
-                    self.diagnostics.push(Diagnostic::error("while condition must be boolean").with_span(*span));
+                    self.diagnostics.push(Diagnostic::error("while condition must be boolean").with_span(*span).with_label(cond.span(), format!("got {:?}", self.ctx.get(cond_ty))));
                 }
                 let inv_hir = invariant.as_ref().map(|inv| self.infer_expr(inv).map(|(h, _)| h)).transpose()?;
                 let dec_hir = decreases.as_ref().map(|dec| self.infer_expr(dec).map(|(h, _)| h)).transpose()?;
@@ -742,7 +754,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 if let Some(value) = value {
                     if let Some(ret_ty) = self.current_return_type {
-                        let hir = self.check_expr(value, Expectation::HasType(ret_ty))?;
+                        let hir = self.check_expr(value, Expectation::HasType(ret_ty), TypingContext::ReturnValue)?;
                         Ok(HirStmt::Return { value: Some(Box::new(hir)), span: *span })
                     } else {
                         let (hir, _) = self.infer_expr(value)?;
@@ -768,10 +780,10 @@ impl<'a> TypeChecker<'a> {
                 let (target_hir, target_ty) = self.infer_expr(target)?;
                 let value_hir = if let Some(op) = op {
                     let result_ty = self.binary_op_type(*op, target_ty, target_ty, *span)?;
-                    self.unify(target_ty, result_ty, *span)?;
-                    self.check_expr(value, Expectation::HasType(target_ty))?
+                    self.unify_with(target_ty, result_ty, *span, TypingContext::None)?;
+                    self.check_expr(value, Expectation::HasType(target_ty), TypingContext::None)?
                 } else {
-                    self.check_expr(value, Expectation::HasType(target_ty))?
+                    self.check_expr(value, Expectation::HasType(target_ty), TypingContext::None)?
                 };
                 Ok(HirStmt::Assign { target: Box::new(target_hir), op: *op, value: Box::new(value_hir), span: *span })
             }
@@ -912,6 +924,10 @@ impl<'a> TypeChecker<'a> {
                 // Check the local variable type cache first (set by VariableDef)
                 if let Some(&ty) = self.local_variable_types.get(name) {
                     Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
+                } else if let Some(&ty) = self.resolution_map.variable_types.get(name) {
+                    // Fall back to the name resolver's pre-resolved types
+                    self.local_variable_types.insert(name.clone(), ty);
+                    Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
                 } else if let Some(binding) = self.symbols.lookup_variable(name, *span) {
                     Ok((HirExpr::Ident(name.clone(), binding.ty, *span), binding.ty))
                 } else if let Some(func) = self.symbols.lookup_function(name) {
@@ -925,7 +941,7 @@ impl<'a> TypeChecker<'a> {
             }
             Expr::TypeAnnotated { expr, ty, span } => {
                 let expected = self.resolve_type(ty)?;
-                let hir = self.check_expr(expr, Expectation::HasType(expected))?;
+                let hir = self.check_expr(expr, Expectation::HasType(expected), TypingContext::None)?;
                 Ok((HirExpr::TypeAnnotated { expr: Box::new(hir), ty: expected, span: *span }, expected))
             }
             Expr::BinaryOp { left, op, right, span } => {
@@ -936,7 +952,7 @@ impl<'a> TypeChecker<'a> {
                 };
                 let (left_hir, left_ty) = self.infer_expr(left)?;
                 let (right_hir, right_ty) = self.infer_expr(right)?;
-                self.unify(left_ty, right_ty, *span)?;
+                self.unify_with(left_ty, right_ty, *span, TypingContext::None)?;
                 if let Ok(Some(trait_id)) = self.get_trait_id_for_binop(*op, *span) {
                     self.add_constraint(Constraint::Impl(left_ty, trait_id, *span));
                     self.add_constraint(Constraint::Impl(right_ty, trait_id, *span));
@@ -983,7 +999,8 @@ impl<'a> TypeChecker<'a> {
                         let mut hir_args = Vec::new();
                         for (i, arg) in args.iter().enumerate() {
                             let expected = explicit_param_tys.get(i).copied().unwrap_or(self.ctx.error());
-                            let hir_arg = self.check_expr(arg, Expectation::HasType(expected))?;
+                            let hir_arg = self.check_expr(arg, Expectation::HasType(expected),
+                                TypingContext::Argument { index: i, total: args.len() })?;
                             hir_args.push(hir_arg);
                         }
                         // Build the HIR: the callee is the field access; we keep it as-is
@@ -1029,7 +1046,8 @@ impl<'a> TypeChecker<'a> {
                     let mut hir_args = Vec::new();
                     for (i, arg) in args.iter().enumerate() {
                         let expected = param_tys.get(i).copied().unwrap_or(self.ctx.error());
-                        let hir_arg = self.check_expr(arg, Expectation::HasType(expected))?;
+                        let hir_arg = self.check_expr(arg, Expectation::HasType(expected),
+                            TypingContext::Argument { index: i, total: args.len() })?;
                         hir_args.push(hir_arg);
                     }
                     Ok((HirExpr::Call { callee: Box::new(callee_hir), args: hir_args, comptime: *comptime, ty: ret_ty, span: *span }, ret_ty))
@@ -1048,7 +1066,7 @@ impl<'a> TypeChecker<'a> {
                         self.ctx.error()
                     });
                 if !self.ctx.is_integer(index_ty) && !self.ctx.is_usize(index_ty) {
-                    self.diagnostics.push(Diagnostic::error("index must be an integer").with_span(*span));
+                    self.diagnostics.push(Diagnostic::error("index must be an integer").with_code("E030").with_span(*span).with_label(index.span(), format!("got {:?}", self.ctx.get(index_ty))));
                 }
                 Ok((HirExpr::Index { base: Box::new(base_hir), index: Box::new(index_hir), ty: elem_ty, span: *span }, elem_ty))
             }
@@ -1102,8 +1120,8 @@ impl<'a> TypeChecker<'a> {
                             diag
                         })?;
                     let field_ty = self.ctx.subst(field_def.ty, &subst);
-                    let hir = self.check_expr(value, Expectation::HasType(field_ty))?;
-                    self.unify(field_ty, hir.ty(), *span)?;
+                    let hir = self.check_expr(value, Expectation::HasType(field_ty), TypingContext::StructFieldInit)?;
+                    self.unify_with(field_ty, hir.ty(), *span, TypingContext::StructFieldInit)?;
                     hir_fields.push((name.clone(), Box::new(hir)));
                 }
                 Ok((HirExpr::StructLit { path: path.clone(), fields: hir_fields, ty: struct_ty, span: *span }, struct_ty))
@@ -1124,8 +1142,8 @@ impl<'a> TypeChecker<'a> {
                     .ok_or_else(|| Diagnostic::error(format!("variant '{}' not found", variant)).with_span(*span))?;
                 let payload_ty = variant_def.payload.as_ref().map(|ty| self.resolve_type(ty)).transpose()?.unwrap_or(self.ctx.error());
                 let payload_hir = if let Some(payload) = payload {
-                    let hir = self.check_expr(payload, Expectation::HasType(payload_ty))?;
-                    self.unify(payload_ty, hir.ty(), *span)?;
+                    let hir = self.check_expr(payload, Expectation::HasType(payload_ty), TypingContext::StructFieldInit)?;
+                    self.unify_with(payload_ty, hir.ty(), *span, TypingContext::StructFieldInit)?;
                     Some(Box::new(hir))
                 } else { None };
                 Ok((HirExpr::EnumLit { path: path.clone(), variant: variant.clone(), payload: payload_hir, ty: enum_ty, span: *span }, enum_ty))
@@ -1151,7 +1169,7 @@ impl<'a> TypeChecker<'a> {
                 for e in exprs {
                     let (hir, ty) = self.infer_expr(e)?;
                     if let Some(et) = elem_ty {
-                        self.unify(et, ty, *span)?;
+                        self.unify_with(et, ty, *span, TypingContext::None)?;
                     } else { elem_ty = Some(ty); }
                     hirs.push(hir);
                 }
@@ -1199,7 +1217,7 @@ impl<'a> TypeChecker<'a> {
                 // Validate that the error type matches the function's error type
                 if let Some(ret_ty) = self.current_return_type {
                     if let Ok((_, error_ty)) = self.extract_result_types(ret_ty, *span) {
-                        self.unify(error_ty, err_ty, *span)?;
+                        self.unify_with(error_ty, err_ty, *span, TypingContext::None)?;
                     }
                 }
                 let never = self.ctx.never();
@@ -1213,14 +1231,14 @@ impl<'a> TypeChecker<'a> {
             Expr::If { cond, then_branch, else_branch, is_expression, span } => {
                 let (cond_hir, cond_ty) = self.infer_expr(cond)?;
                 if !self.ctx.is_bool(cond_ty) {
-                    self.diagnostics.push(Diagnostic::error("if condition must be boolean").with_code("E004").with_span(*span));
+                    self.diagnostics.push(Diagnostic::error("if condition must be boolean").with_code("E004").with_span(*span).with_label(cond.span(), format!("got {:?}", self.ctx.get(cond_ty))));
                 }
                 let then_hir = self.check_block(then_branch)?;
                 let then_ty = self.block_type(&then_hir);
                 let else_hir = else_branch.as_ref().map(|b| self.check_block(b)).transpose()?;
                 let else_ty = else_hir.as_ref().map(|h| self.block_type(h)).unwrap_or(self.ctx.unit());
                 if *is_expression {
-                    self.unify(then_ty, else_ty, *span)?;
+                self.unify_with(then_ty, else_ty, *span, TypingContext::None)?;
                 }
                 let result_ty = if *is_expression { then_ty } else { self.ctx.unit() };
                 Ok((HirExpr::If { cond: Box::new(cond_hir), then_branch: then_hir, else_branch: else_hir, is_expression: *is_expression, ty: result_ty, span: *span }, result_ty))
@@ -1247,7 +1265,7 @@ impl<'a> TypeChecker<'a> {
                     })).transpose()?;
                     let (body_hir, body_ty) = self.infer_expr(&arm.body)?;
                     if let Some(prev) = arm_ty {
-                        self.unify(prev, body_ty, arm.span)?;
+                        self.unify_with(prev, body_ty, arm.span, TypingContext::None)?;
                     } else { arm_ty = Some(body_ty); }
                     hir_arms.push(HirMatchArm { pattern: pattern_hir, guard: guard_hir, body: Box::new(body_hir), span: arm.span });
                 }
@@ -1263,19 +1281,19 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn check_expr(&mut self, expr: &Expr, expected: Expectation) -> Result<HirExpr, Diagnostic> {
+    fn check_expr(&mut self, expr: &Expr, expected: Expectation, ctx: TypingContext) -> Result<HirExpr, Diagnostic> {
         match expr {
             Expr::Literal(_lit, span) => {
                 let (hir, ty) = self.infer_expr(expr)?;
                 if let Expectation::HasType(expected_ty) = expected {
-                    self.unify(expected_ty, ty, *span)?;
+                    self.unify_with(expected_ty, ty, *span, TypingContext::None)?;
                 }
                 Ok(hir)
             }
             Expr::Ident(_, _) | Expr::TypeAnnotated { .. } => {
                 let (hir, ty) = self.infer_expr(expr)?;
                 if let Expectation::HasType(expected_ty) = expected {
-                    self.unify(expected_ty, ty, expr.span())?;
+                    self.unify_with(expected_ty, ty, expr.span(), TypingContext::None)?;
                 }
                 Ok(hir)
             }
@@ -1285,7 +1303,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 let (cond_hir, cond_ty) = self.infer_expr(cond)?;
                 if !self.ctx.is_bool(cond_ty) {
-                    self.diagnostics.push(Diagnostic::error("if condition must be boolean").with_code("E004").with_span(*span));
+                    self.diagnostics.push(Diagnostic::error("if condition must be boolean").with_code("E004").with_span(*span).with_label(cond.span(), format!("got {:?}", self.ctx.get(cond_ty))));
                 }
                 let then_hir = self.check_block(then_branch)?;
                 let then_ty = self.block_type(&then_hir);
@@ -1295,8 +1313,8 @@ impl<'a> TypeChecker<'a> {
                     Expectation::HasType(ty) | Expectation::CastableToType(ty) => ty,
                     Expectation::None => self.new_infer_var(TypeVariableKind::Unconstrained),
                 };
-                self.unify(expected_ty, then_ty, *span)?;
-                self.unify(expected_ty, else_ty, *span)?;
+                self.unify_with(expected_ty, then_ty, *span, TypingContext::None)?;
+                self.unify_with(expected_ty, else_ty, *span, TypingContext::None)?;
                 Ok(HirExpr::If { cond: Box::new(cond_hir), then_branch: then_hir, else_branch: else_hir, is_expression: true, ty: expected_ty, span: *span })
             }
             Expr::Match { scrutinee, arms, span } => {
@@ -1310,7 +1328,7 @@ impl<'a> TypeChecker<'a> {
                         }
                         Box::new(h)
                     })).transpose()?;
-                    let body_hir = self.check_expr(&arm.body, expected)?;
+                    let body_hir = self.check_expr(&arm.body, expected, TypingContext::None)?;
                     hir_arms.push(HirMatchArm { pattern: pattern_hir, guard: guard_hir, body: Box::new(body_hir), span: arm.span });
                 }
                 let expected_ty = match expected {
@@ -1327,11 +1345,11 @@ impl<'a> TypeChecker<'a> {
                 let ty = self.block_type(&hir_stmts);
                 let expected_ty = match expected {
                     Expectation::HasType(expected_ty) => {
-                        self.unify(expected_ty, ty, *span)?;
+                        self.unify_with(expected_ty, ty, *span, TypingContext::None)?;
                         expected_ty
                     }
                     Expectation::CastableToType(expected_ty) => {
-                        self.unify(expected_ty, ty, *span)?;
+                        self.unify_with(expected_ty, ty, *span, TypingContext::None)?;
                         expected_ty
                     }
                     Expectation::None => ty,
@@ -1341,7 +1359,7 @@ impl<'a> TypeChecker<'a> {
             _ => {
                 let (hir, ty) = self.infer_expr(expr)?;
                 if let Expectation::HasType(expected_ty) = expected {
-                    self.unify(expected_ty, ty, expr.span())?;
+                    self.unify_with(expected_ty, ty, expr.span(), TypingContext::None)?;
                 }
                 Ok(hir)
             }
@@ -1354,7 +1372,7 @@ impl<'a> TypeChecker<'a> {
                 Pattern::Tuple(patterns, span) => {
                     let elem_tys: Vec<TypeId> = patterns.iter().map(|_| self.new_infer_var(TypeVariableKind::Unconstrained)).collect();
                     let tuple_ty = self.ctx.tuple(elem_tys.clone());
-                    self.unify(expected_ty, tuple_ty, *span)?;
+                    self.unify_with(expected_ty, tuple_ty, *span, TypingContext::None)?;
                     let mut hir_pats = Vec::new();
                     for (pat, &ety) in patterns.iter().zip(elem_tys.iter()) {
                         hir_pats.push(self.check_pattern(pat, ety)?);
@@ -1369,7 +1387,7 @@ impl<'a> TypeChecker<'a> {
                     }
                     let type_args = vec![self.new_infer_var(TypeVariableKind::Unconstrained); binding.params.len()];
                     let struct_ty = self.ctx.struct_ty(def_id, type_args.clone());
-                    self.unify(expected_ty, struct_ty, *span)?;
+                    self.unify_with(expected_ty, struct_ty, *span, TypingContext::None)?;
                     let mut subst = Subst::new();
                     for (i, _) in binding.params.iter().enumerate() {
                         subst.insert(i, type_args[i]);
@@ -1401,7 +1419,7 @@ impl<'a> TypeChecker<'a> {
                     }
                     let type_args = vec![self.new_infer_var(TypeVariableKind::Unconstrained); binding.params.len()];
                     let enum_ty = self.ctx.enum_ty(def_id, type_args.clone());
-                    self.unify(expected_ty, enum_ty, *span)?;
+                    self.unify_with(expected_ty, enum_ty, *span, TypingContext::None)?;
                     let mut subst = Subst::new();
                     for (i, _) in binding.params.iter().enumerate() { subst.insert(i, type_args[i]); }
                     let variant_def = binding.variants.iter().find(|v| v.name == *variant)
@@ -1418,7 +1436,7 @@ impl<'a> TypeChecker<'a> {
             Pattern::Ident(name, span) => Ok(HirPattern::Ident(name.clone(), expected_ty, *span)),
             Pattern::Literal(expr, span) => {
                 let (hir, ty) = self.infer_expr(expr)?;
-                self.unify(expected_ty, ty, *span)?;
+                self.unify_with(expected_ty, ty, *span, TypingContext::None)?;
                 Ok(HirPattern::Literal(Box::new(hir), *span))
             }
             Pattern::Tuple(patterns, span) => {
@@ -1486,7 +1504,7 @@ impl<'a> TypeChecker<'a> {
                 let elem_ty = if self.ctx.is_infer_var(expected_ty) {
                     let elem = self.new_infer_var(TypeVariableKind::Any);
                     let slice_ty = self.ctx.slice(elem);
-                    self.unify(expected_ty, slice_ty, *span)?;
+                    self.unify_with(expected_ty, slice_ty, *span, TypingContext::None)?;
                     elem
                 } else if let Some(elem) = self.ctx.elem_of_slice(expected_ty) {
                     elem
@@ -1546,7 +1564,14 @@ impl<'a> TypeChecker<'a> {
                         }
                         return Err(Diagnostic::error(format!("type '{}' not found", path[0])).with_span(*span));
                     }
-                    let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| Diagnostic::error(format!("type not found: {:?}", path)).with_span(*span))?;
+                    let binding: TypeBinding;
+                    if let Some(b) = self.resolution_map.type_bindings.get(&def_id) {
+                        binding = b.clone();
+                    } else {
+                        binding = self.symbols.lookup_type_by_def_id(def_id)
+                            .ok_or_else(|| Diagnostic::error(format!("type not found: {:?}", path)).with_span(*span))?
+                            .clone();
+                    };
                     match binding.kind {
                         TypeKind::Alias => {
                             if self.resolving_aliases.contains(&def_id) {
@@ -1704,6 +1729,12 @@ impl<'a> TypeChecker<'a> {
 
     fn resolve_def_id(&self, path: &[String]) -> Result<DefId, Diagnostic> {
         if path.is_empty() { return Err(Diagnostic::error("empty path").with_span(Span::new(0, 0))); }
+        // Check the resolution map first (populated by NameResolver)
+        if path.len() == 1 {
+            if let Some(&def_id) = self.resolution_map.type_def_ids.get(&path[0]) {
+                return Ok(def_id);
+            }
+        }
         // Check if this is a generic type parameter (e.g. `T` in `def foo<T>(x: T)`)
         if path.len() == 1 {
             if self.local_type_param_cache.contains_key(&path[0]) {
@@ -1716,18 +1747,51 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn unify(&mut self, expected: TypeId, actual: TypeId, span: Span) -> Result<(), Diagnostic> {
-        self.ctx.unify(expected, actual).map(|_| ()).map_err(|_err| Diagnostic::error(format!("type mismatch: expected {:?}, found {:?}", self.ctx.get(expected), self.ctx.get(actual))).with_span(span))
+        self.ctx.unify(expected, actual).map(|_| ()).map_err(|_err| {
+            let msg = format!("type mismatch: expected {:?}, found {:?}", self.ctx.get(expected), self.ctx.get(actual));
+            Diagnostic::error(msg).with_code("E030").with_span(span)
+        })
+    }
+
+    fn unify_with(&mut self, expected: TypeId, actual: TypeId, span: Span, ctx: TypingContext) -> Result<(), Diagnostic> {
+        self.ctx.unify(expected, actual).map(|_| ()).map_err(|_err| {
+            let msg = match ctx {
+                TypingContext::ReturnValue => {
+                    format!("return value type mismatch: expected {:?}, found {:?}", self.ctx.get(expected), self.ctx.get(actual))
+                }
+                TypingContext::StructFieldInit => {
+                    format!("field initializer type mismatch: expected {:?}, found {:?}", self.ctx.get(expected), self.ctx.get(actual))
+                }
+                TypingContext::Condition => {
+                    format!("condition must be boolean, got {:?}", self.ctx.get(actual))
+                }
+                TypingContext::Argument { index, total } => {
+                    format!("argument {} of {} has wrong type: expected {:?}, found {:?}", index + 1, total, self.ctx.get(expected), self.ctx.get(actual))
+                }
+                TypingContext::ClosureBody => {
+                    format!("closure body type mismatch: expected {:?}, found {:?}", self.ctx.get(expected), self.ctx.get(actual))
+                }
+                TypingContext::None => {
+                    format!("type mismatch: expected {:?}, found {:?}", self.ctx.get(expected), self.ctx.get(actual))
+                }
+                TypingContext::Index => {
+                    format!("index must be an integer, got {:?}", self.ctx.get(actual))
+                }
+            };
+            Diagnostic::error(msg).with_code("E030").with_span(span)
+                .with_label(span, format!("expected {:?}", self.ctx.get(expected)))
+        })
     }
 
     fn binary_op_type(&mut self, op: BinOp, left: TypeId, right: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
-        self.unify(left, right, span)?;
+        self.unify_with(left, right, span, TypingContext::None)?;
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem if self.ctx.is_numeric(left) => Ok(left),
             BinOp::AddWrap | BinOp::SubWrap | BinOp::MulWrap | BinOp::AddSaturate | BinOp::SubSaturate | BinOp::MulSaturate | BinOp::AddTrap | BinOp::SubTrap | BinOp::MulTrap if self.ctx.is_integer(left) => Ok(left),
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr if self.ctx.is_integer(left) => Ok(left),
             BinOp::Eq | BinOp::Neq => Ok(self.ctx.bool()),
             BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge if self.ctx.is_numeric(left) => Ok(self.ctx.bool()),
-            BinOp::And | BinOp::Or if self.ctx.is_bool(left) => { self.unify(left, right, span)?; Ok(self.ctx.bool()) }
+            BinOp::And | BinOp::Or if self.ctx.is_bool(left) => { self.unify_with(left, right, span, TypingContext::None)?; Ok(self.ctx.bool()) }
             _ => Err(Diagnostic::error("invalid operands for binary operator").with_span(span)),
         }
     }
@@ -2050,13 +2114,13 @@ mod tests {
         let mut ctx = TypeContext::new();
         let local_crate_id = CrateId(DefId(0));
         let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
-        let (mut symbols, mut trait_env, _res_diags) = resolver
+        let (mut symbols, mut trait_env, _res_diags, resolution_map) = resolver
             .resolve_program(&program)
             .map_err(|diags| diags.into_inner().into_iter().map(|d| d.message).collect::<Vec<_>>())?;
 
         builtins::register_builtins(&mut symbols, &mut trait_env, &mut ctx);
 
-        let mut checker = TypeChecker::new(&mut ctx, &symbols, &mut trait_env);
+        let mut checker = TypeChecker::new(&mut ctx, &symbols, &mut trait_env, resolution_map);
         checker
             .check_program(&program)
             .map_err(|diags| diags.into_inner().into_iter().map(|d| d.message).collect::<Vec<_>>())

@@ -51,7 +51,7 @@ fn main() {
                         let local_crate_id = CrateId(DefId(0));
                         let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
                         match resolver.resolve_program(&program) {
-                            Ok((mut symbols, mut trait_env, _diags)) => {
+                            Ok((mut symbols, mut trait_env, _diags, resolution_map)) => {
                                 // Register built-in traits and impls before type checking
                                 hir::builtins::register_builtins(
                                     &mut symbols,
@@ -59,7 +59,7 @@ fn main() {
                                     &mut ctx,
                                 );
 
-                                let mut checker = TypeChecker::new(&mut ctx, &symbols, &mut trait_env);
+                                let mut checker = TypeChecker::new(&mut ctx, &symbols, &mut trait_env, resolution_map);
                                 match checker.check_program(&program) {
                                     Ok(_hir_program) => {
                                         println!("Type checking succeeded.");

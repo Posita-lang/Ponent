@@ -2,6 +2,15 @@ use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticCollector, DiagnosticLevel};
 use crate::hir::symbol::*;
 use crate::hir::traits::{ImplCandidate, TraitEnv};
+use rustc_hash::FxHashMap;
+
+/// Pre-resolved name resolution results, populated by NameResolver and consumed by TypeChecker.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResolutionMap {
+    pub variable_types: FxHashMap<String, TypeId>,
+    pub type_def_ids: FxHashMap<String, DefId>,
+    pub type_bindings: FxHashMap<DefId, TypeBinding>,
+}
 use crate::hir::types::*;
 use rustc_hash::FxHashMap as HashMap;
 
@@ -18,6 +27,8 @@ pub struct NameResolver<'a> {
     /// Temporary mapping of type parameter names to GenericParam TypeIds
     /// used when resolving types inside an `impl<T>` block.
     current_impl_type_params: Option<HashMap<String, TypeId>>,
+    /// Pre-resolved name resolutions for the type checker.
+    resolution_map: ResolutionMap,
 }
 
 struct ImportEntry {
@@ -40,13 +51,14 @@ impl<'a> NameResolver<'a> {
             import_map: Vec::new(),
             local_crate_id,
             current_impl_type_params: None,
+            resolution_map: ResolutionMap::default(),
         }
     }
 
     pub fn resolve_program(
         &mut self,
         program: &Program,
-    ) -> Result<(SymbolTable, TraitEnv, DiagnosticCollector), DiagnosticCollector> {
+    ) -> Result<(SymbolTable, TraitEnv, DiagnosticCollector, ResolutionMap), DiagnosticCollector> {
         for item in &program.items {
             self.resolve_item(item);
         }
@@ -57,7 +69,8 @@ impl<'a> NameResolver<'a> {
             let symbols =
                 std::mem::replace(&mut self.symbols, SymbolTable::new(self.local_crate_id));
             let trait_env = std::mem::replace(&mut self.trait_env, TraitEnv::new());
-            Ok((symbols, trait_env, std::mem::take(&mut self.diagnostics)))
+            let resolution_map = std::mem::take(&mut self.resolution_map);
+            Ok((symbols, trait_env, std::mem::take(&mut self.diagnostics), resolution_map))
         }
     }
 
@@ -108,6 +121,7 @@ impl<'a> NameResolver<'a> {
                         span: param.span,
                         def_id: self.allocate_def_id(),
                     };
+                    self.resolution_map.variable_types.insert(param.name.clone(), ty);
                     if let Err(diag) =
                         self.symbols
                             .insert_variable(param.name.clone(), binding, param.span)
@@ -133,6 +147,8 @@ impl<'a> NameResolver<'a> {
                 ..
             } => {
                 let def_id = self.allocate_def_id();
+                // Register type name in the resolution map for the type checker
+                self.resolution_map.type_def_ids.insert(name.clone(), def_id);
                 let type_params = params.clone();
                 let kind = match definition {
                     TypeDefinition::Struct(_) => TypeKind::Struct,
@@ -196,6 +212,10 @@ impl<'a> NameResolver<'a> {
                 };
                 if let Err(diag) = self.symbols.insert_type(name.clone(), binding, *span) {
                     self.diagnostics.push(diag);
+                }
+                // Populate the resolution map for the type checker
+                if let Some(b) = self.symbols.lookup_type(&name) {
+                    self.resolution_map.type_bindings.insert(def_id, b.clone());
                 }
             }
             Stmt::TraitDef {
@@ -397,6 +417,8 @@ impl<'a> NameResolver<'a> {
                         span: *span,
                         def_id: self.allocate_def_id(),
                     };
+                    // Pre-populate resolution map for the type checker
+                    self.resolution_map.variable_types.insert(name.clone(), ty_id);
                     if let Err(diag) = self.symbols.insert_variable(name.clone(), binding, *span) {
                         self.diagnostics.push(diag);
                     }
@@ -730,6 +752,7 @@ impl<'a> NameResolver<'a> {
                         span: param.span,
                         def_id: self.allocate_def_id(),
                     };
+                    self.resolution_map.variable_types.insert(param.name.clone(), ty);
                     if let Err(diag) =
                         self.symbols
                             .insert_variable(param.name.clone(), binding, param.span)
@@ -1228,3 +1251,4 @@ impl<'a> NameResolver<'a> {
         &self.diagnostics
     }
 }
+// Use crate-level module instead
