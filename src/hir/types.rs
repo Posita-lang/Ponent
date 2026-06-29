@@ -100,6 +100,16 @@ pub struct TypeMeta {
     pub no_default: bool,
 }
 
+/// A variance-annotated edge in the type graph.
+/// Pre-computed so that variance propagation is a simple graph
+/// traversal over edges, not pattern-matching on TypeData each time.
+#[derive(Debug, Clone, Copy)]
+struct VarianceEdge {
+    target: TypeId,
+    /// +1 = covariant, -1 = contravariant, 0 = invariant
+    sign: isize,
+}
+
 pub struct TypeContext {
     types: Vec<Arc<TypeData>>,
     type_map: HashMap<TypeData, TypeId>,
@@ -113,6 +123,15 @@ pub struct TypeContext {
     pub builtin_char: TypeId,
     pub builtin_byte: TypeId,
     pub builtin_usize: TypeId,
+    /// Cache for variance check results: (param_index, TypeId, expected_sign) → bool.
+    variance_cache: RefCell<HashMap<(usize, TypeId, isize), bool>>,
+    /// Pre-computed variance-annotated outgoing edges for each TypeId.
+    /// Built lazily on first variance check, then reused.
+    variance_edges: RefCell<HashMap<TypeId, Vec<VarianceEdge>>>,
+    /// Transaction stack for atomic unification (OmniML-style rollback).
+    /// Each entry captures bindings before an operation.
+    /// On rollback, bindings are restored; on commit, snapshot is discarded.
+    transaction_stack: RefCell<Vec<HashMap<TypeId, TypeId>>>,
 }
 
 impl TypeContext {
@@ -130,6 +149,9 @@ impl TypeContext {
             builtin_char: TypeId(0),
             builtin_byte: TypeId(0),
             builtin_usize: TypeId(0),
+            variance_cache: RefCell::new(HashMap::default()),
+            variance_edges: RefCell::new(HashMap::default()),
+            transaction_stack: RefCell::new(Vec::new()),
         };
         ctx.builtin_unit = ctx.alloc(TypeData::Unit);
         ctx.builtin_never = ctx.alloc(TypeData::Never);
@@ -288,7 +310,27 @@ impl TypeContext {
     /// `∀X. (A ⇒ X) ⇒ B⟨X⟩`  →  `B[X ↦ A]`
     /// or `∀X. (X ⇒ A) ⇒ B⟨X⟩`  →  `B[X ↦ A]`.
     /// Matches both explicit `Forall` nodes and implicit `Fn`-encoded patterns.
+    ///
+    /// Uses iteration with convergence detection (max 10 rounds) to handle
+    /// chained reductions like Forall(X, Forall(Y, ...)) where reducing the
+    /// outer Forall exposes a new reducible inner Forall. This follows the
+    /// same convergence principle as Yen's KSP algorithm:
+    /// "keep iterating until no more candidates can be generated".
     pub fn try_yoneda_reduce(&mut self, ty: TypeId) -> TypeId {
+        const MAX_ITERATIONS: usize = 10;
+        let mut result = ty;
+        for _iteration in 0..MAX_ITERATIONS {
+            let before = result;
+            result = self.yoneda_reduce_once(result);
+            if result == before {
+                break; // converged
+            }
+        }
+        result
+    }
+
+    /// Single-pass Yoneda reduction (used internally by `try_yoneda_reduce`).
+    fn yoneda_reduce_once(&mut self, ty: TypeId) -> TypeId {
         // Case A: explicit Forall node — Forall(X, Fn { params: [A], ret: X }) or Forall(X, Fn { params: [X], ret: A })
         if let TypeData::Forall { param_index, param_name: _, body } = self.get(ty).clone() {
             if let TypeData::Fn { params, ret } = self.get(body).clone() {
@@ -378,49 +420,104 @@ impl TypeContext {
         expected_sign: isize,
         cumulative_sign: isize,
     ) -> bool {
-        match self.get(ty) {
-            // Reached the tracked parameter — check sign match
-            TypeData::GenericParam { index, .. } => {
-                if *index == param {
-                    cumulative_sign == expected_sign
-                } else {
-                    true // different param, doesn't affect result
+        // Check cache first
+        let cache_key = (param, ty, expected_sign);
+        if let Some(&cached) = self.variance_cache.borrow().get(&cache_key) {
+            return cached;
+        }
+        let result = self.check_variance_uncached(param, ty, expected_sign, cumulative_sign);
+        self.variance_cache.borrow_mut().insert(cache_key, result);
+        result
+    }
+
+    fn check_variance_uncached(
+        &self,
+        param: usize,
+        ty: TypeId,
+        expected_sign: isize,
+        cumulative_sign: isize,
+    ) -> bool {
+        // Use pre-computed variance edges instead of pattern-matching TypeData.
+        // This is faster because edges are computed once and reused.
+        let edges = self.get_variance_edges(ty);
+        for edge in &edges {
+            if self.type_contains_param(param, edge.target) {
+                // Propagate sign: contravariant flips, invariant blocks
+                match edge.sign {
+                    -1 => {
+                        // Contravariant: flip cumulative sign
+                        if !self.check_variance_with_sign(param, edge.target, expected_sign, -cumulative_sign) {
+                            return false;
+                        }
+                    }
+                    0 => {
+                        // Invariant: param cannot appear
+                        return false;
+                    }
+                    _ => {
+                        // Covariant: keep cumulative sign
+                        if !self.check_variance_with_sign(param, edge.target, expected_sign, cumulative_sign) {
+                            return false;
+                        }
+                    }
                 }
             }
-            // Function type: params are contravariant (flip sign), ret is covariant (keep sign)
+        }
+        // No edges → no sub-types (leaf node). Check if THIS node is the param.
+        if edges.is_empty() {
+            if let TypeData::GenericParam { index, .. } = self.get(ty) {
+                if *index == param {
+                    return cumulative_sign == expected_sign;
+                }
+            }
+        }
+        true
+    }
+
+    /// Get (or compute) the variance-annotated outgoing edges for a TypeId.
+    /// Edges represent "this type → child type with given variance sign".
+    fn get_variance_edges(&self, ty: TypeId) -> Vec<VarianceEdge> {
+        if let Some(edges) = self.variance_edges.borrow().get(&ty) {
+            return edges.clone();
+        }
+        let edges = self.compute_variance_edges(ty);
+        self.variance_edges.borrow_mut().insert(ty, edges.clone());
+        edges
+    }
+
+    /// Build the outgoing variance edges for a TypeId by inspecting its TypeData.
+    fn compute_variance_edges(&self, ty: TypeId) -> Vec<VarianceEdge> {
+        match self.get(ty) {
             TypeData::Fn { params, ret } => {
-                params.iter().all(|p| {
-                    if self.type_contains_param(param, *p) {
-                        self.check_variance_with_sign(param, *p, expected_sign, -cumulative_sign)
-                    } else {
-                        true
-                    }
-                }) && self.check_variance_with_sign(param, *ret, expected_sign, cumulative_sign)
+                let mut edges: Vec<VarianceEdge> = params.iter()
+                    .map(|&p| VarianceEdge { target: p, sign: -1 })
+                    .collect();
+                edges.push(VarianceEdge { target: *ret, sign: 1 });
+                edges
             }
-            // Invariant containers: param cannot appear (sign effectively becomes 0)
-            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
-                !self.type_contains_param(param, *ty)
-            }
-            TypeData::Ptr { pointee, .. } => !self.type_contains_param(param, *pointee),
-            // Covariant containers: keep sign
             TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
-                args.iter()
-                    .all(|&a| self.check_variance_with_sign(param, a, expected_sign, cumulative_sign))
+                args.iter().map(|&a| VarianceEdge { target: a, sign: 1 }).collect()
             }
-            TypeData::Tuple { elems } => elems.iter().all(|&e| {
-                self.check_variance_with_sign(param, e, expected_sign, cumulative_sign)
-            }),
+            TypeData::Tuple { elems } => {
+                elems.iter().map(|&e| VarianceEdge { target: e, sign: 1 }).collect()
+            }
             TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
-                self.check_variance_with_sign(param, *elem, expected_sign, cumulative_sign)
+                vec![VarianceEdge { target: *elem, sign: 1 }]
+            }
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+                vec![VarianceEdge { target: *ty, sign: 0 }]
+            }
+            TypeData::Ptr { pointee, .. } => {
+                vec![VarianceEdge { target: *pointee, sign: 0 }]
             }
             TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. } => {
-                self.check_variance_with_sign(param, *body, expected_sign, cumulative_sign)
+                vec![VarianceEdge { target: *body, sign: 1 }]
             }
             TypeData::AssociatedType { self_ty, .. } => {
-                self.check_variance_with_sign(param, *self_ty, expected_sign, cumulative_sign)
+                vec![VarianceEdge { target: *self_ty, sign: 1 }]
             }
-            TypeData::InferVar { .. } => true, // inference vars don't affect variance
-            _ => true, // primitives (Int, Bool, etc.) don't contain generic params
+            // Leaves: no edges (GenericParam, primitives, etc.)
+            _ => Vec::new(),
         }
     }
 
@@ -538,6 +635,26 @@ impl TypeContext {
     }
 
     pub fn unify(&self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
+        // ── Transaction: capture current bindings for rollback ──
+        self.begin_transaction();
+
+        let result = self.unify_internal(a, b);
+
+        // ── Commit or rollback ──
+        match result {
+            Ok(ty) => {
+                self.commit_transaction();
+                Ok(ty)
+            }
+            Err(e) => {
+                self.rollback_transaction();
+                Err(e)
+            }
+        }
+    }
+
+    /// Internal unification (no transaction wrapping).
+    fn unify_internal(&self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
         let data_a = self.get(a).clone();
         let data_b = self.get(b).clone();
 
@@ -597,6 +714,26 @@ impl TypeContext {
                 found: a,
                 span: crate::ast::Span::new(0, 0),
             }),
+        }
+    }
+
+    // ── Transaction support for atomic unification ────────────────
+
+    /// Begin a new transaction: save current bindings snapshot.
+    pub fn begin_transaction(&self) {
+        let snapshot = self.bindings.borrow().clone();
+        self.transaction_stack.borrow_mut().push(snapshot);
+    }
+
+    /// Commit the current transaction: discard the snapshot.
+    pub fn commit_transaction(&self) {
+        self.transaction_stack.borrow_mut().pop();
+    }
+
+    /// Rollback the current transaction: restore bindings from snapshot.
+    pub fn rollback_transaction(&self) {
+        if let Some(snapshot) = self.transaction_stack.borrow_mut().pop() {
+            *self.bindings.borrow_mut() = snapshot;
         }
     }
 
@@ -1137,12 +1274,50 @@ impl TypeContext {
     /// 3. Detect cyclic paths through the graph.
     /// 4. Acyclic → κ=0, cyclic only through covariant edges → κ=1, other → κ=∞.
     pub fn characteristic(&self, ty: TypeId, visited: &mut Vec<TypeId>) -> Characteristic {
-        // Prevent infinite recursion on cyclic types
+        self.characteristic_with_variance(ty, visited, false)
+    }
+
+    /// Compute κ with scoped (remove+recover) visited tracking.
+    /// When backtracking, `ty` is popped from `visited` so sibling
+    /// branches can traverse through it independently.
+    /// This follows the KSP `remove`+`recover` pattern — temporary
+    /// modification with guaranteed restoration.
+    fn characteristic_with_variance(
+        &self,
+        ty: TypeId,
+        visited: &mut Vec<TypeId>,
+        has_non_covariant_path: bool,
+    ) -> Characteristic {
+        // ── Cycle detection (before push) ──────────────────────────
+        // If ty is already on the current DFS path, we've found a cycle.
         if visited.contains(&ty) {
-            return Characteristic::InfiniteEnumerable;
+            return if has_non_covariant_path {
+                Characteristic::Undecidable      // κ=∞
+            } else {
+                Characteristic::InfiniteEnumerable // κ=1
+            };
         }
+        // ── Mark (remove from available) ───────────────────────────
         visited.push(ty);
 
+        // ── Recurse (compute) ──────────────────────────────────────
+        let result = self.characteristic_body(ty, visited, has_non_covariant_path);
+
+        // ── Recover (restore to available) ─────────────────────────
+        visited.pop();
+
+        result
+    }
+
+    /// The actual computation body, called after push and before pop.
+    /// All recursive calls go through `characteristic_with_variance`
+    /// so each level has proper scoping.
+    fn characteristic_body(
+        &self,
+        ty: TypeId,
+        visited: &mut Vec<TypeId>,
+        has_non_covariant_path: bool,
+    ) -> Characteristic {
         let data = self.get(ty);
         match data {
             TypeData::Int { bits, .. } => {
@@ -1167,7 +1342,7 @@ impl TypeContext {
                 let mut total = 1usize;
                 let mut has_infinite = false;
                 for &elem in elems {
-                    match self.characteristic(elem, visited) {
+                    match self.characteristic_with_variance(elem, visited, has_non_covariant_path) {
                         Characteristic::FiniteExhaustible(n) => {
                             total = total.saturating_mul(n);
                         }
@@ -1186,7 +1361,7 @@ impl TypeContext {
             TypeData::Struct { def_id: _, args } | TypeData::Enum { def_id: _, args } => {
                 let mut has_infinite = false;
                 for &arg in args {
-                    match self.characteristic(arg, visited) {
+                    match self.characteristic_with_variance(arg, visited, has_non_covariant_path) {
                         Characteristic::FiniteExhaustible(_) => {}
                         Characteristic::InfiniteEnumerable => has_infinite = true,
                         Characteristic::Undecidable => return Characteristic::Undecidable,
@@ -1199,7 +1374,7 @@ impl TypeContext {
                 }
             }
             TypeData::Array { elem, size } => {
-                match self.characteristic(*elem, visited) {
+                match self.characteristic_with_variance(*elem, visited, has_non_covariant_path) {
                     Characteristic::FiniteExhaustible(n) => {
                         Characteristic::FiniteExhaustible(n.saturating_pow(*size as u32))
                     }
@@ -1207,19 +1382,22 @@ impl TypeContext {
                     Characteristic::Undecidable => Characteristic::Undecidable,
                 }
             }
+            // Slice/Ref/Pointer/Ptr: invariant containers — mark path as non-covariant
             TypeData::Slice { elem } | TypeData::Ref { ty: elem, .. }
             | TypeData::Pointer { ty: elem }
             | TypeData::Ptr { pointee: elem, .. } => {
-                let _ = self.characteristic(*elem, visited);
+                let _ = self.characteristic_with_variance(*elem, visited, true);
                 Characteristic::InfiniteEnumerable
             }
+            // Fn params: contravariant → mark path as non-covariant
+            // Fn ret: covariant → keep existing flag
             TypeData::Fn { params, ret } => {
                 for &p in params {
-                    if self.characteristic(p, visited) == Characteristic::Undecidable {
+                    if self.characteristic_with_variance(p, visited, true) == Characteristic::Undecidable {
                         return Characteristic::Undecidable;
                     }
                 }
-                match self.characteristic(*ret, visited) {
+                match self.characteristic_with_variance(*ret, visited, has_non_covariant_path) {
                     Characteristic::Undecidable => Characteristic::Undecidable,
                     _ => Characteristic::InfiniteEnumerable,
                 }
@@ -1228,10 +1406,16 @@ impl TypeContext {
                 Characteristic::FiniteExhaustible(usize::MAX)
             }
             TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. } => {
-                self.characteristic(*body, visited)
+                self.characteristic_with_variance(*body, visited, has_non_covariant_path)
             }
-            TypeData::DynTrait { .. } | TypeData::AssociatedType { .. } => {
+            // DynTrait and AssociatedType: covariant containers but the concrete
+            // implementation is unknown — conservatively return InfiniteEnumerable.
+            // For AssociatedType, the self_ty variance propagates to the associated type.
+            TypeData::DynTrait { .. } => {
                 Characteristic::InfiniteEnumerable
+            }
+            TypeData::AssociatedType { self_ty, .. } => {
+                self.characteristic_with_variance(*self_ty, visited, has_non_covariant_path)
             }
             TypeData::InferVar { .. } => {
                 Characteristic::FiniteExhaustible(usize::MAX)

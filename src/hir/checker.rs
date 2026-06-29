@@ -143,11 +143,125 @@ enum CtxKind {
 }
 
 /// A fwame howding the context kind and its span (*/ω＼*)
+#[derive(Debug, Clone)]
 struct CtxFrame {
     kind: CtxKind,
     span: Span,
     /// Optionaw wabew name (onwy used by WabewedBwock)
     label: Option<String>,
+}
+
+/// A node in the region tree (OmniML-inspired generalization tree).
+/// Each region represents a scope boundary (function body, let body, loop body).
+/// Frames within a region are processed as a stack (LIFO).
+/// When searching for break/continue targets, we traverse the current region's
+/// frames, then the parent region's frames, etc., following the tree path to root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegionId(usize);
+
+#[derive(Debug, Clone)]
+struct Region {
+    id: usize,
+    parent: Option<RegionId>,
+    children: Vec<RegionId>,
+    frames: Vec<CtxFrame>,
+    /// Dirty flag (OmniML `With_dirty`): set when a variable in this region
+    /// is modified. Generalization only needs to process dirty regions.
+    dirty: bool,
+}
+
+/// Tree of scopes replacing the linear loop_stack.
+/// Enables partial generalization (PG/PI): variables can be generalized
+/// per-region, supporting nonlinear let-polymorphism scope management.
+#[derive(Debug, Clone)]
+struct RegionTree {
+    regions: Vec<Region>,
+    root: RegionId,
+    current: RegionId,
+}
+
+impl RegionTree {
+    fn new() -> Self {
+        let root = Region {
+            id: 0,
+            parent: None,
+            children: Vec::new(),
+            frames: Vec::new(),
+            dirty: false,
+        };
+        let root_id = RegionId(0);
+        RegionTree {
+            regions: vec![root],
+            root: root_id,
+            current: root_id,
+        }
+    }
+
+    fn current_frames(&self) -> &[CtxFrame] {
+        &self.regions[self.current.0].frames
+    }
+
+    fn push_frame(&mut self, frame: CtxFrame) {
+        self.regions[self.current.0].frames.push(frame);
+    }
+
+    fn pop_frame(&mut self) -> Option<CtxFrame> {
+        self.regions[self.current.0].frames.pop()
+    }
+
+    fn enter_region(&mut self) -> RegionId {
+        let new_id = RegionId(self.regions.len());
+        self.regions.push(Region {
+            id: new_id.0,
+            parent: Some(self.current),
+            children: Vec::new(),
+            frames: Vec::new(),
+            dirty: false,
+        });
+        self.regions[self.current.0].children.push(new_id);
+        let old = self.current;
+        self.current = new_id;
+        old
+    }
+
+    fn exit_region(&mut self) {
+        if let Some(parent) = self.regions[self.current.0].parent {
+            self.current = parent;
+        }
+    }
+
+    /// Iterate all frames from current region up to root.
+    /// Returns frames in reverse order (innermost first), which is the
+    /// same behavior as the old `loop_stack.iter().rev()`.
+    fn iter_frames_rev(&self) -> RegionFrameIter {
+        RegionFrameIter { tree: self, current: Some(self.current), frame_idx: None }
+    }
+}
+
+/// Iterator over frames: innermost region's frames first, then parent's, etc.
+struct RegionFrameIter<'a> {
+    tree: &'a RegionTree,
+    current: Option<RegionId>,
+    frame_idx: Option<usize>,
+}
+
+impl<'a> Iterator for RegionFrameIter<'a> {
+    type Item = &'a CtxFrame;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let region_id = self.current?;
+            let region = &self.tree.regions[region_id.0];
+            let idx = self.frame_idx.get_or_insert(region.frames.len());
+            if *idx > 0 {
+                *idx -= 1;
+                return Some(&region.frames[*idx]);
+            }
+            // Current region's frames exhausted — move to parent
+            self.current = region.parent;
+            self.frame_idx = None;
+        }
+    }
 }
 
 pub struct TypeChecker<'a> {
@@ -160,8 +274,10 @@ pub struct TypeChecker<'a> {
     resolving_aliases: HashSet<DefId>,
     infer: InferenceContext,
     infer_stack: Vec<InferenceContext>,
-    /// Context stack: twacks cuwwent function, woop, cwosuwe, etc. (｀・ω・´)
-    loop_stack: Vec<CtxFrame>,
+    /// Wegion twee: twacks cuwwent function, woop, cwosuwe, etc.
+    /// Wepwaces the owd wineaw `woop_stack` with a twee stwuctuwe
+    /// suppowting pawtiaw genewawization (OmniML §3.2). (｀・ω・´)
+    region_tree: RegionTree,
     /// Locaw cache of variabwe types, updated by check_stmt for each VawiabweDef.
     /// Ovewwides the wesowvew's pwacehowdew `ewrow` type. (◕‿◕)
     local_variable_types: HashMap<String, TypeId>,
@@ -238,7 +354,7 @@ impl<'a> TypeChecker<'a> {
             resolving_aliases: HashSet::new(),
             infer: InferenceContext::new(),
             infer_stack: Vec::new(),
-            loop_stack: vec![CtxFrame { kind: CtxKind::Function, span: Span::new(0, 0), label: None }],
+            region_tree: RegionTree::new(),
             local_variable_types: HashMap::new(),
             local_type_param_cache: HashMap::new(),
             resolution_map,
@@ -268,17 +384,17 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn push_ctx(&mut self, kind: CtxKind, span: Span, label: Option<String>) {
-        self.loop_stack.push(CtxFrame { kind, span, label });
+        self.region_tree.push_frame(CtxFrame { kind, span, label });
     }
 
     fn pop_ctx(&mut self) {
-        self.loop_stack.pop();
+        self.region_tree.pop_frame();
     }
 
     /// Find the innermost bweak tawget (Woop, Whiwe, Fow, WabewedBwock) (*＾▽＾)／
     /// Wetuwns the tawget's span and optionaw wabew. If `wabew` is Some, onwy match same-named WabewedBwock.
     fn find_break_target<'b>(&self, label: Option<&'b str>) -> Option<(Span, Option<&'b str>)> {
-        for frame in self.loop_stack.iter().rev() {
+        for frame in self.region_tree.iter_frames_rev() {
             match &frame.kind {
                 CtxKind::Loop | CtxKind::While | CtxKind::For => {
                     if label.is_none() {
@@ -305,7 +421,7 @@ impl<'a> TypeChecker<'a> {
 
     /// Find the innermost continue tawget (onwy Woop, Whiwe, Fow) ☆ﾟ.*･｡ﾟ
     fn find_continue_target<'b>(&self, label: Option<&'b str>) -> Option<(Span, &'b str)> {
-        for frame in self.loop_stack.iter().rev() {
+        for frame in self.region_tree.iter_frames_rev() {
             match &frame.kind {
                 CtxKind::Loop | CtxKind::While | CtxKind::For => {
                     if let Some(lbl) = label {
@@ -690,7 +806,7 @@ impl<'a> TypeChecker<'a> {
                 match target {
                     None => {
                         // Check if we're inside a cwosuwe (>_<)
-                        let enclosing_closure = self.loop_stack.iter().rev()
+                        let enclosing_closure = self.region_tree.iter_frames_rev()
                             .find_map(|f| match f.kind {
                                 CtxKind::Closure | CtxKind::AsyncBlock => Some(f.span),
                                 _ => None,
@@ -726,7 +842,7 @@ impl<'a> TypeChecker<'a> {
                 let target = self.find_continue_target(label.as_deref());
                 match target {
                     None => {
-                        let enclosing_closure = self.loop_stack.iter().rev()
+                        let enclosing_closure = self.region_tree.iter_frames_rev()
                             .find_map(|f| match f.kind {
                                 CtxKind::Closure | CtxKind::AsyncBlock => Some(f.span),
                                 _ => None,
@@ -755,7 +871,7 @@ impl<'a> TypeChecker<'a> {
             Stmt::Return { value, span } => {
                 // Check if we're inside a comptime block — if so, return is comptime
                 // control flow, not a real function return.
-                let in_comptime = self.loop_stack.iter().rev()
+                let in_comptime = self.region_tree.iter_frames_rev()
                     .any(|f| matches!(f.kind, CtxKind::Comptime));
                 if in_comptime {
                     // Inside comptime, `return` acts as comptime control flow:
@@ -768,7 +884,7 @@ impl<'a> TypeChecker<'a> {
                 }
 
                 // Check that return is inside a function or closure context
-                let in_function = self.loop_stack.iter().rev()
+                let in_function = self.region_tree.iter_frames_rev()
                     .any(|f| matches!(f.kind, CtxKind::Function | CtxKind::Closure));
                 if !in_function {
                     self.diagnostics.push(
@@ -2997,5 +3113,145 @@ mod tests {
              }",
         );
         assert!(result.is_ok(), "full bool match should pass: {:?}", result.err());
+    }
+
+    // ── Region Tree tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_region_tree_basic_ops() {
+        let mut rt = RegionTree::new();
+        // Root region exists with no frames
+        assert_eq!(rt.current_frames().len(), 0);
+
+        // Push a frame
+        rt.push_frame(CtxFrame { kind: CtxKind::Function, span: Span::new(0, 0), label: None });
+        assert_eq!(rt.current_frames().len(), 1);
+
+        // Pop it back
+        assert!(rt.pop_frame().is_some());
+        assert_eq!(rt.current_frames().len(), 0);
+    }
+
+    #[test]
+    fn test_region_tree_enter_exit() {
+        let mut rt = RegionTree::new();
+        rt.push_frame(CtxFrame { kind: CtxKind::Function, span: Span::new(0, 0), label: None });
+
+        // Enter a child region (e.g., loop body)
+        let parent = rt.enter_region();
+        assert_ne!(rt.current, rt.root);
+        rt.push_frame(CtxFrame { kind: CtxKind::Loop, span: Span::new(1, 2), label: None });
+        assert_eq!(rt.current_frames().len(), 1);
+
+        // Exit back to parent
+        rt.exit_region();
+        assert_eq!(rt.current, parent);
+        // Parent still has its original frame
+        assert_eq!(rt.current_frames().len(), 1);
+    }
+
+    #[test]
+    fn test_region_tree_iter_frames_rev_single_region() {
+        let mut rt = RegionTree::new();
+        rt.push_frame(CtxFrame { kind: CtxKind::Function, span: Span::new(0, 0), label: None });
+        rt.push_frame(CtxFrame { kind: CtxKind::Loop, span: Span::new(1, 2), label: None });
+
+        let frames: Vec<&CtxFrame> = rt.iter_frames_rev().collect();
+        assert_eq!(frames.len(), 2);
+        // Innermost first
+        assert!(matches!(frames[0].kind, CtxKind::Loop));
+        assert!(matches!(frames[1].kind, CtxKind::Function));
+    }
+
+    #[test]
+    fn test_region_tree_iter_frames_rev_across_regions() {
+        let mut rt = RegionTree::new();
+        rt.push_frame(CtxFrame { kind: CtxKind::Function, span: Span::new(0, 0), label: None });
+
+        // Enter nested scope (e.g., loop body)
+        let _parent = rt.enter_region();
+        rt.push_frame(CtxFrame { kind: CtxKind::Loop, span: Span::new(1, 2), label: None });
+
+        // iter_frames_rev should see loop frame first, then function frame
+        let frames: Vec<&CtxFrame> = rt.iter_frames_rev().collect();
+        assert_eq!(frames.len(), 2);
+        assert!(matches!(frames[0].kind, CtxKind::Loop));
+        assert!(matches!(frames[1].kind, CtxKind::Function));
+    }
+
+    #[test]
+    fn test_region_tree_multi_level_nesting() {
+        let mut rt = RegionTree::new();
+        rt.push_frame(CtxFrame { kind: CtxKind::Function, span: Span::new(0, 0), label: None });
+
+        // Level 1: loop
+        let _l1 = rt.enter_region();
+        rt.push_frame(CtxFrame { kind: CtxKind::Loop, span: Span::new(1, 2), label: None });
+
+        // Level 2: nested for
+        let _l2 = rt.enter_region();
+        rt.push_frame(CtxFrame { kind: CtxKind::For, span: Span::new(3, 4), label: None });
+
+        // Level 3: labeled block
+        let _l3 = rt.enter_region();
+        rt.push_frame(CtxFrame { kind: CtxKind::LabeledBlock, span: Span::new(5, 6), label: Some("outer".into()) });
+
+        // iter_frames_rev should traverse: LabeledBlock → For → Loop → Function
+        let frames: Vec<&CtxFrame> = rt.iter_frames_rev().collect();
+        assert_eq!(frames.len(), 4);
+        assert!(matches!(frames[0].kind, CtxKind::LabeledBlock));
+        assert!(matches!(frames[1].kind, CtxKind::For));
+        assert!(matches!(frames[2].kind, CtxKind::Loop));
+        assert!(matches!(frames[3].kind, CtxKind::Function));
+    }
+
+    #[test]
+    fn test_region_tree_find_break_in_nested() {
+        let mut rt = RegionTree::new();
+        rt.push_frame(CtxFrame { kind: CtxKind::Function, span: Span::new(0, 0), label: None });
+
+        // Loop is outside Closure (loop 先于 closure)
+        let _l = rt.enter_region();
+        rt.push_frame(CtxFrame { kind: CtxKind::Loop, span: Span::new(3, 4), label: None });
+
+        // Closure is innermost — iter_frames_rev sees Closure first
+        let _c = rt.enter_region();
+        rt.push_frame(CtxFrame { kind: CtxKind::Closure, span: Span::new(1, 2), label: None });
+
+        // find_break_target should stop at Closure boundary before reaching Loop
+        // (iter_frames_rev visits Closure first, then Loop)
+        let mut found_loop = false;
+        let mut stopped_at_closure = false;
+        for frame in rt.iter_frames_rev() {
+            match frame.kind {
+                CtxKind::Loop | CtxKind::While | CtxKind::For => { found_loop = true; break; }
+                CtxKind::Closure | CtxKind::AsyncBlock => { stopped_at_closure = true; break; }
+                _ => {}
+            }
+        }
+        assert!(!found_loop, "break should not see loop past closure");
+        assert!(stopped_at_closure, "should stop at closure boundary");
+    }
+
+    #[test]
+    fn test_region_tree_labeled_break() {
+        let mut rt = RegionTree::new();
+        rt.push_frame(CtxFrame { kind: CtxKind::Function, span: Span::new(0, 0), label: None });
+
+        let _l1 = rt.enter_region();
+        rt.push_frame(CtxFrame { kind: CtxKind::For, span: Span::new(1, 2), label: None });
+
+        let _l2 = rt.enter_region();
+        rt.push_frame(CtxFrame { kind: CtxKind::LabeledBlock, span: Span::new(3, 4), label: Some("outer".into()) });
+
+        // Search for labeled block "outer" — should find it
+        let found_label = rt.iter_frames_rev().find_map(|f| {
+            if let CtxKind::LabeledBlock = f.kind {
+                f.label.as_deref()
+            } else {
+                None
+            }
+        });
+        assert_eq!(found_label, Some("outer"));
     }
 }
