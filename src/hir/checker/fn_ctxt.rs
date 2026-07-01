@@ -114,11 +114,55 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     /// Check if a cast between two types is valid.
     pub fn check_cast(&mut self, from: TypeId, to: TypeId, safe: bool, span: Span) -> Result<TypeId, Diagnostic> {
-        self.checker.check_cast(from, to, safe, span)
+        if safe {
+            if (self.ctx().is_numeric(from) && self.ctx().is_numeric(to))
+                || (self.ctx().is_bool(from) && self.ctx().is_integer(to))
+                || (self.ctx().is_integer(from) && self.ctx().is_bool(to))
+            {
+                Ok(to)
+            } else if self.ctx().is_reference(from) {
+                Err(Diagnostic::error("safe cast from reference type requires explicit dereference or unsafe cast")
+                    .with_code("E601").with_span(span)
+                    .with_suggestion("consider dereferencing first: `*expr as TargetType`")
+                    .with_suggestion("or use `as!` for an unsafe bitcast"))
+            } else {
+                Err(Diagnostic::error("safe cast only allowed between numeric and boolean types")
+                    .with_code("E601").with_span(span)
+                    .with_suggestion("use `From` trait for non-primitive type conversions"))
+            }
+        } else {
+            if (self.ctx().is_numeric(from) && self.ctx().is_numeric(to))
+                || (self.ctx().is_reference(from) && self.ctx().is_pointer(to))
+                || (self.ctx().is_pointer(from) && self.ctx().is_reference(to))
+            {
+                Ok(to)
+            } else if self.ctx().is_reference(from) && self.ctx().is_integer(to) {
+                Err(Diagnostic::error("unsafe cast from reference to integer not yet supported")
+                    .with_code("E601").with_span(span)
+                    .with_suggestion("consider using `*expr as usize` via a pointer cast"))
+            } else {
+                let c = self.ctx();
+                match (c.get(from), c.get(to)) {
+                    (TypeData::Ptr { .. }, TypeData::Ptr { .. }) => Ok(to),
+                    _ => Err(Diagnostic::error("unsafe cast requires compatible types (numeric<->numeric, ref<->ptr, ptr<->ptr)")
+                        .with_code("E601").with_span(span)),
+                }
+            }
+        }
     }
 
     /// Infer the return type of a binary operation.
     pub fn binary_op_type(&mut self, op: BinOp, left: TypeId, right: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
         self.checker.binary_op_type(op, left, right, span)
+    }
+
+    /// Check a statement (delegates to TypeChecker).
+    pub fn check_stmt(&mut self, stmt: &Stmt) -> Result<HirStmt, Diagnostic> {
+        self.checker.check_stmt(stmt)
+    }
+
+    /// Check a block (delegates to TypeChecker).
+    pub fn check_block(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, Diagnostic> {
+        self.checker.check_block(stmts)
     }
 }

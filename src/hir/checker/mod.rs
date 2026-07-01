@@ -2103,7 +2103,7 @@ impl<'a> TypeChecker<'a> {
                     .with_span(span)
                     .with_suggestion("consider using `*expr as usize` via a pointer cast"))
             } else {
-                Err(Diagnostic::error("unsafe cast requires compatible types (numeric↔numeric, ref↔ptr, ptr↔ptr)")
+                Err(Diagnostic::error("unsafe cast requires compatible types (numeric<->numeric, ref<->ptr, ptr<->ptr)")
                     .with_code("E601")
                     .with_span(span))
             }

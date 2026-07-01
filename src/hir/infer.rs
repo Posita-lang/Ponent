@@ -282,9 +282,13 @@ impl InferenceContext {
 
     /// OmniML-inspired: suspend a constraint on the target InferVar id.
     /// When the var is bound, the constraint will be woken and reprocessed.
+    /// Also marks the variable as PartiallyGeneralizable (PG).
     pub fn suspend_on_var(&mut self, c: Constraint, var_id: usize) {
         if var_id < self.wait_lists.len() {
             self.wait_lists[var_id].push(c);
+            if var_id < self.gen_statuses.len() {
+                self.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
+            }
         } else {
             self.constraints.push(c);
         }
@@ -357,12 +361,19 @@ impl InferenceContext {
 
     /// Incrementally wake constraints for a resolved variable.
     /// Woken constraints are enqueued directly onto the heap.
+    /// After waking, if the wait list is empty, the variable can be re-generalised (G).
     fn wake_var_incremental(&mut self, var_id: usize, heap: &mut BinaryHeap<PrioritizedConstraint>, ctx: &TypeContext) {
         if var_id < self.wait_lists.len() && !self.wait_lists[var_id].is_empty() {
             let suspended = std::mem::take(&mut self.wait_lists[var_id]);
             for c in suspended {
                 let p = c.priority(ctx);
                 heap.push(PrioritizedConstraint { priority: p, constraint: c });
+            }
+            // All constraints woken — restore to Generalized if no guards remain
+            if var_id < self.gen_statuses.len()
+                && self.gen_statuses[var_id] == GenStatus::PartiallyGeneralizable
+            {
+                self.gen_statuses[var_id] = GenStatus::Generalized;
             }
         }
     }

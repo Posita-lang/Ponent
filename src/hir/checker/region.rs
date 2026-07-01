@@ -80,6 +80,21 @@ impl RegionTree {
     fn iter_frames_rev(&self) -> RegionFrameIter {
         RegionFrameIter { tree: self, current: Some(self.current), frame_idx: None }
     }
+
+    /// Mark the current region as dirty (a unification variable was bound).
+    fn mark_dirty(&mut self) {
+        self.regions[self.current.0].dirty = true;
+    }
+
+    /// Check whether the current region is dirty.
+    fn is_dirty(&self) -> bool {
+        self.regions[self.current.0].dirty
+    }
+
+    /// Clear the dirty flag on the current region.
+    fn clean_region(&mut self) {
+        self.regions[self.current.0].dirty = false;
+    }
 }
 
 /// Iterator over frames: innermost region's frames first, then parent's, etc.

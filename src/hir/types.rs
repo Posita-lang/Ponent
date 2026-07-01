@@ -1819,6 +1819,29 @@ mod tests {
         assert_eq!(ctx.characteristic(slice_ty, &mut vec![]), Characteristic::InfiniteEnumerable);
     }
 
+    #[test]
+    fn test_characteristic_ksp_convergence() {
+        // Simulate a recursive type pattern where KSP-style iteration
+        // is needed to reach convergence:
+        //   μX. Bool × X  — a recursive type representing an infinite
+        //   stream of Bools.  We encode it using Forall/GenericParam.
+        let mut ctx = TypeContext::new();
+        let bool_ty = ctx.bool();
+        let p0 = ctx.generic_param(0, "X".into());
+        // Simulate μX: Bool × X  via Forall(0, "X", (Bool, X) ⇒ X)
+        let body = {
+            let tup = ctx.tuple(vec![bool_ty, p0]);
+            ctx.function(vec![tup], p0)
+        };
+        let ty = ctx.forall(0, "X".into(), body);
+        // KSP iteration should converge and detect InfiniteEnumerable
+        // (recursive type with only covariant cycles)
+        let mut visited = Vec::new();
+        let kappa = ctx.characteristic(ty, &mut visited);
+        assert_eq!(kappa, Characteristic::InfiniteEnumerable,
+            "recursive stream type should be InfiniteEnumerable");
+    }
+
     // -- Transaction --
     #[test]
     fn test_transaction_commit() {
