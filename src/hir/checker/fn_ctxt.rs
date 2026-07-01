@@ -606,9 +606,184 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         self.check_expr(expr, expected, ctx)
     }
 
-    /// Resolve a syntactic type to a TypeId.
+    /// Resolve a syntactic type to a TypeId — actual implementation.
     pub fn resolve_type(&mut self, ty: &Type) -> Result<TypeId, Diagnostic> {
-        self.checker.resolve_type(ty)
+        match ty {
+            Type::Path(path, span) => {
+                if let Ok(def_id) = self.checker.resolve_def_id(path) {
+                    // Check if this is a generic type parameter (sentinel from resolve_def_id)
+                    if def_id == DefId(usize::MAX - 1) {
+                        if path.len() == 1 {
+                            if let Some(&ty) = self.checker.local_type_param_cache.get(&path[0]) {
+                                return Ok(ty);
+                            }
+                        }
+                        return Err(Diagnostic::error(format!("type '{}' not found", path[0])).with_span(*span));
+                    }
+                    let binding: TypeBinding;
+                    if let Some(b) = self.checker.resolution_map.type_bindings.get(&def_id) {
+                        binding = b.clone();
+                    } else {
+                        binding = self.checker.symbols.lookup_type_by_def_id(def_id)
+                            .ok_or_else(|| Diagnostic::error(format!("type not found: {:?}", path)).with_span(*span))?
+                            .clone();
+                    };
+                    match binding.kind {
+                        TypeKind::Alias => {
+                            if self.checker.resolving_aliases.contains(&def_id) {
+                                return Err(Diagnostic::error("circular alias definition").with_span(*span));
+                            }
+                            self.checker.resolving_aliases.insert(def_id);
+                            let result = binding.alias_ast.as_ref().map(|ast| self.resolve_type(ast)).unwrap_or(Err(Diagnostic::error("alias has no body").with_span(*span)));
+                            self.checker.resolving_aliases.remove(&def_id);
+                            result
+                        }
+                        TypeKind::Struct => {
+                            if binding.params.is_empty() {
+                                Ok(self.checker.ctx.struct_ty(def_id, vec![]))
+                            } else {
+                                let args: Vec<TypeId> = (0..binding.params.len())
+                                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained))
+                                    .collect();
+                                Ok(self.checker.ctx.struct_ty(def_id, args))
+                            }
+                        }
+                        TypeKind::Enum => {
+                            if binding.params.is_empty() {
+                                Ok(self.checker.ctx.enum_ty(def_id, vec![]))
+                            } else {
+                                let args: Vec<TypeId> = (0..binding.params.len())
+                                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained))
+                                    .collect();
+                                Ok(self.checker.ctx.enum_ty(def_id, args))
+                            }
+                        }
+                        _ => Err(Diagnostic::error("expected type, found something else").with_span(*span)),
+                    }
+                } else {
+                    match path[0].as_str() {
+                        "Bool" => Ok(self.checker.ctx.bool()),
+                        "Char" => Ok(self.checker.ctx.char()),
+                        "Byte" => Ok(self.checker.ctx.byte()),
+                        "USize" => Ok(self.checker.ctx.usize()),
+                        "Unit" => Ok(self.checker.ctx.unit()),
+                        "Never" => Ok(self.checker.ctx.never()),
+                        _ => {
+                            // Check if this is a generic type parameter registered in the local cache
+                            if path.len() == 1 {
+                                if let Some(&ty) = self.checker.local_type_param_cache.get(&path[0]) {
+                                    return Ok(ty);
+                                }
+                            }
+                            Err(Diagnostic::error(format!("type '{}' not found", path[0])).with_span(*span))
+                        }
+                    }
+                }
+            }
+            Type::Generic(base, args, span) => {
+                if let Type::Path(path, _) = base.as_ref() {
+                    if path.len() == 1 {
+                        match path[0].as_str() {
+                            "Int" => return Ok(self.checker.ctx.int(self.checker.extract_int_from_type(&args[0]).unwrap_or(32), true)),
+                            "UInt" => return Ok(self.checker.ctx.int(self.checker.extract_int_from_type(&args[0]).unwrap_or(32), false)),
+                            "Float" => return Ok(self.checker.ctx.float(self.checker.extract_int_from_type(&args[0]).unwrap_or(64))),
+                            _ => {}
+                        }
+                    }
+                }
+                let base_ty = self.resolve_type(base)?;
+                let expanded = self.expand_base_type(base_ty, *span)?;
+                let mut arg_tys = Vec::new();
+                for arg in args { arg_tys.push(self.resolve_type(arg)?); }
+                match self.checker.ctx.get(expanded) {
+                    TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } => {
+                        let binding = self.checker.symbols.lookup_type_by_def_id(*def_id).ok_or_else(|| Diagnostic::error("type definition not found").with_span(*span))?;
+                        if arg_tys.len() != binding.params.len() {
+                            return Err(Diagnostic::error(format!("wrong number of type arguments: expected {}, got {}", binding.params.len(), arg_tys.len())).with_span(*span));
+                        }
+                        match binding.kind {
+                            TypeKind::Struct => Ok(self.checker.ctx.struct_ty(*def_id, arg_tys)),
+                            TypeKind::Enum => Ok(self.checker.ctx.enum_ty(*def_id, arg_tys)),
+                            _ => Err(Diagnostic::error("generic type arguments on non-generic type").with_span(*span)),
+                        }
+                    }
+                    _ => Err(Diagnostic::error("generic type arguments on non-generic type").with_span(*span)),
+                }
+            }
+            Type::Reference(ty, mutable, _) => {
+                let inner = self.resolve_type(ty)?;
+                Ok(self.checker.ctx.reference(inner, *mutable))
+            }
+            Type::Pointer(ty, _) => {
+                let inner = self.resolve_type(ty)?;
+                Ok(self.checker.ctx.pointer(inner))
+            }
+            Type::Slice(ty, _) => {
+                let inner = self.resolve_type(ty)?;
+                Ok(self.checker.ctx.slice(inner))
+            }
+            Type::Array(ty, size, span) => {
+                let inner = self.resolve_type(ty)?;
+                if let Expr::Literal(Literal::Int(size_val), _) = size.as_ref() {
+                    Ok(self.checker.ctx.array(inner, *size_val as u64))
+                } else {
+                    Err(Diagnostic::error("array size must be a compile-time constant integer").with_span(*span))
+                }
+            }
+            Type::Tuple(tys, _) => {
+                let elems: Vec<_> = tys.iter().map(|t| self.resolve_type(t)).collect::<Result<_, _>>()?;
+                Ok(self.checker.ctx.tuple(elems))
+            }
+            Type::Function { params, ret, .. } => {
+                let param_tys: Vec<_> = params.iter().map(|p| self.resolve_type(p)).collect::<Result<_, _>>()?;
+                let ret_ty = self.resolve_type(ret)?;
+                Ok(self.checker.ctx.function(param_tys, ret_ty))
+            }
+            Type::Projection(_, _, span) => {
+                self.checker.diagnostics.push(Diagnostic::error("type projections are not yet implemented").with_span(*span));
+                Ok(self.checker.ctx.error())
+            }
+            Type::DynTrait(traits, _) => {
+                let trait_ids: Vec<_> = traits.iter().filter_map(|t| if let Type::Path(p, _) = t { self.checker.resolve_def_id(p).ok() } else { None }).collect();
+                Ok(self.checker.ctx.dyn_trait(trait_ids))
+            }
+            Type::Exists { name, base, invariant, span } => {
+                let base_ty = self.resolve_type(base)?;
+                let (inv_hir, inv_ty) = self.infer_expr(invariant)?;
+                if !self.checker.ctx.is_bool(inv_ty) {
+                    self.checker.diagnostics.push(Diagnostic::error("invariant must be boolean").with_span(*span));
+                }
+                Ok(self.checker.ctx.exists(name.clone(), base_ty, *invariant.clone()))
+            }
+            Type::Literal(expr, _) => {
+                let (_, ty) = self.infer_expr(expr)?;
+                Ok(ty)
+            }
+            Type::Never(_) => Ok(self.checker.ctx.never()),
+            Type::Union(_, span) => {
+                self.checker.diagnostics.push(Diagnostic::error("union types are not yet implemented").with_span(*span));
+                Ok(self.checker.ctx.error())
+            }
+            Type::Error(_) => Ok(self.checker.ctx.error()),
+        }
+    }
+
+    /// Expand type aliases: if `ty` is an alias, resolve it to its body.
+    pub fn expand_base_type(&mut self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
+        if let Some(def_id) = self.checker.ctx.get_def_id_for_type(ty) {
+            if let Some(binding) = self.checker.symbols.lookup_type_by_def_id(def_id) {
+                if binding.kind == TypeKind::Alias {
+                    if self.checker.resolving_aliases.contains(&def_id) {
+                        return Err(Diagnostic::error("circular alias definition").with_span(span));
+                    }
+                    self.checker.resolving_aliases.insert(def_id);
+                    let result = binding.alias_ast.as_ref().map(|ast| self.resolve_type(ast)).unwrap_or(Err(Diagnostic::error("alias has no body").with_span(span)));
+                    self.checker.resolving_aliases.remove(&def_id);
+                    return result;
+                }
+            }
+        }
+        Ok(ty)
     }
 
     /// Get the type yielded by a block (last expression's type, or unit/never).
@@ -675,9 +850,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         self.checker.check_stmt(stmt)
     }
 
-    /// Check a block (delegates to TypeChecker).
+    /// Check a block — actual implementation, not delegation.
     pub fn check_block(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, Diagnostic> {
-        self.checker.check_block(stmts)
+        let mut result = Vec::new();
+        for stmt in stmts {
+            result.push(self.checker.check_stmt(stmt)?);
+        }
+        Ok(result)
     }
 
     /// Check a pattern against an expected type.

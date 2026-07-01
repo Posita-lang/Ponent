@@ -523,10 +523,7 @@ impl<'a> TypeChecker<'a> {
                         let (_, ensures_ty) = guard.checker.infer_expr(expr).unwrap_or_else(|_| {
                             (HirExpr::Error(*span), guard.checker.ctx.bool())
                         });
-                        let g = Guarantee {
-                            postcondition: Some(ensures_ty),
-                            frame: None,
-                        };
+                        let g = Guarantee::new(None, Some(ensures_ty), None);
                         guard.checker.guarantee_chain.push(g);
                     }
                 }
@@ -803,7 +800,7 @@ impl<'a> TypeChecker<'a> {
                 // If there's an ensures clause, it acts as the postcondition
                 // and must be satisfied at this return point.
                 if let Some(g) = self.guarantee_chain.current() {
-                    if let Some(post) = g.postcondition {
+                    if let Some(post) = g.post {
                         // The postcondition type must be bool and should hold
                         // at the return point.  We verify this by type-checking
                         // unify(post, bool) as a basic consistency check.
@@ -999,11 +996,8 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn check_block(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, Diagnostic> {
-        let mut result = Vec::new();
-        for stmt in stmts {
-            result.push(self.check_stmt(stmt)?);
-        }
-        Ok(result)
+        let mut fc = FnCtxt::new(self);
+        fc.check_block(stmts)
     }
 
     fn infer_expr(&mut self, expr: &Expr) -> Result<(HirExpr, TypeId), Diagnostic> {
@@ -1623,170 +1617,13 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn resolve_type(&mut self, ty: &Type) -> Result<TypeId, Diagnostic> {
-        match ty {
-            Type::Path(path, span) => {
-                if let Ok(def_id) = self.resolve_def_id(path) {
-                    // Check if this is a generic type parameter (sentinel from resolve_def_id)
-                    if def_id == DefId(usize::MAX - 1) {
-                        if path.len() == 1 {
-                            if let Some(&ty) = self.local_type_param_cache.get(&path[0]) {
-                                return Ok(ty);
-                            }
-                        }
-                        return Err(Diagnostic::error(format!("type '{}' not found", path[0])).with_span(*span));
-                    }
-                    let binding: TypeBinding;
-                    if let Some(b) = self.resolution_map.type_bindings.get(&def_id) {
-                        binding = b.clone();
-                    } else {
-                        binding = self.symbols.lookup_type_by_def_id(def_id)
-                            .ok_or_else(|| Diagnostic::error(format!("type not found: {:?}", path)).with_span(*span))?
-                            .clone();
-                    };
-                    match binding.kind {
-                        TypeKind::Alias => {
-                            if self.resolving_aliases.contains(&def_id) {
-                                return Err(Diagnostic::error("circular alias definition").with_span(*span));
-                            }
-                            self.resolving_aliases.insert(def_id);
-                            let result = binding.alias_ast.as_ref().map(|ast| self.resolve_type(ast)).unwrap_or(Err(Diagnostic::error("alias has no body").with_span(*span)));
-                            self.resolving_aliases.remove(&def_id);
-                            result
-                        }
-                        TypeKind::Struct => {
-                            if binding.params.is_empty() {
-                                Ok(self.ctx.struct_ty(def_id, vec![]))
-                            } else {
-                                let args: Vec<TypeId> = (0..binding.params.len())
-                                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained))
-                                    .collect();
-                                Ok(self.ctx.struct_ty(def_id, args))
-                            }
-                        }
-                        TypeKind::Enum => {
-                            if binding.params.is_empty() {
-                                Ok(self.ctx.enum_ty(def_id, vec![]))
-                            } else {
-                                let args: Vec<TypeId> = (0..binding.params.len())
-                                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained))
-                                    .collect();
-                                Ok(self.ctx.enum_ty(def_id, args))
-                            }
-                        }
-                        _ => Err(Diagnostic::error("expected type, found something else").with_span(*span)),
-                    }
-                } else {
-                    match path[0].as_str() {
-                        "Bool" => Ok(self.ctx.bool()),
-                        "Char" => Ok(self.ctx.char()),
-                        "Byte" => Ok(self.ctx.byte()),
-                        "USize" => Ok(self.ctx.usize()),
-                        "Unit" => Ok(self.ctx.unit()),
-                        "Never" => Ok(self.ctx.never()),
-                        _ => {
-                            // Check if this is a generic type parameter registered in the local cache
-                            if path.len() == 1 {
-                                if let Some(&ty) = self.local_type_param_cache.get(&path[0]) {
-                                    return Ok(ty);
-                                }
-                            }
-                            Err(Diagnostic::error(format!("type '{}' not found", path[0])).with_span(*span))
-                        }
-                    }
-                }
-            }
-            Type::Generic(base, args, span) => {
-                if let Type::Path(path, _) = base.as_ref() {
-                    if path.len() == 1 {
-                        match path[0].as_str() {
-                            "Int" => return Ok(self.ctx.int(self.extract_int_from_type(&args[0]).unwrap_or(32), true)),
-                            "UInt" => return Ok(self.ctx.int(self.extract_int_from_type(&args[0]).unwrap_or(32), false)),
-                            "Float" => return Ok(self.ctx.float(self.extract_int_from_type(&args[0]).unwrap_or(64))),
-                            _ => {}
-                        }
-                    }
-                }
-                let base_ty = self.resolve_type(base)?;
-                let expanded = self.expand_base_type(base_ty, *span)?;
-                let mut arg_tys = Vec::new();
-                for arg in args { arg_tys.push(self.resolve_type(arg)?); }
-                match self.ctx.get(expanded) {
-                    TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } => {
-                        let binding = self.symbols.lookup_type_by_def_id(*def_id).ok_or_else(|| Diagnostic::error("type definition not found").with_span(*span))?;
-                        if arg_tys.len() != binding.params.len() {
-                            return Err(Diagnostic::error(format!("wrong number of type arguments: expected {}, got {}", binding.params.len(), arg_tys.len())).with_span(*span));
-                        }
-                        match binding.kind {
-                            TypeKind::Struct => Ok(self.ctx.struct_ty(*def_id, arg_tys)),
-                            TypeKind::Enum => Ok(self.ctx.enum_ty(*def_id, arg_tys)),
-                            _ => Err(Diagnostic::error("generic type arguments on non-generic type").with_span(*span)),
-                        }
-                    }
-                    _ => Err(Diagnostic::error("generic type arguments on non-generic type").with_span(*span)),
-                }
-            }
-            Type::Reference(ty, mutable, _) => {
-                let inner = self.resolve_type(ty)?;
-                Ok(self.ctx.reference(inner, *mutable))
-            }
-            Type::Pointer(ty, _) => {
-                let inner = self.resolve_type(ty)?;
-                Ok(self.ctx.pointer(inner))
-            }
-            Type::Slice(ty, _) => {
-                let inner = self.resolve_type(ty)?;
-                Ok(self.ctx.slice(inner))
-            }
-            Type::Array(ty, size, span) => {
-                let inner = self.resolve_type(ty)?;
-                if let Expr::Literal(Literal::Int(size_val), _) = size.as_ref() {
-                    Ok(self.ctx.array(inner, *size_val as u64))
-                } else {
-                    Err(Diagnostic::error("array size must be a compile-time constant integer").with_span(*span))
-                }
-            }
-            Type::Tuple(tys, _) => {
-                let elems: Vec<_> = tys.iter().map(|t| self.resolve_type(t)).collect::<Result<_, _>>()?;
-                Ok(self.ctx.tuple(elems))
-            }
-            Type::Function { params, ret, .. } => {
-                let param_tys: Vec<_> = params.iter().map(|p| self.resolve_type(p)).collect::<Result<_, _>>()?;
-                let ret_ty = self.resolve_type(ret)?;
-                Ok(self.ctx.function(param_tys, ret_ty))
-            }
-            Type::Projection(_, _, span) => { self.diagnostics.push(Diagnostic::error("type projections are not yet implemented").with_span(*span)); Ok(self.ctx.error()) }
-            Type::DynTrait(traits, _) => {
-                let trait_ids: Vec<_> = traits.iter().filter_map(|t| if let Type::Path(p, _) = t { self.resolve_def_id(p).ok() } else { None }).collect();
-                Ok(self.ctx.dyn_trait(trait_ids))
-            }
-            Type::Exists { name, base, invariant, span } => {
-                let base_ty = self.resolve_type(base)?;
-                let (inv_hir, inv_ty) = self.infer_expr(invariant)?;
-                if !self.ctx.is_bool(inv_ty) { self.diagnostics.push(Diagnostic::error("invariant must be boolean").with_span(*span)); }
-                Ok(self.ctx.exists(name.clone(), base_ty, *invariant.clone()))
-            }
-            Type::Literal(expr, _) => { let (_, ty) = self.infer_expr(expr)?; Ok(ty) }
-            Type::Never(_) => Ok(self.ctx.never()),
-            Type::Union(_, span) => { self.diagnostics.push(Diagnostic::error("union types are not yet implemented").with_span(*span)); Ok(self.ctx.error()) }
-            Type::Error(_) => Ok(self.ctx.error()),
-        }
+        let mut fc = FnCtxt::new(self);
+        fc.resolve_type(ty)
     }
 
     fn expand_base_type(&mut self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
-        if let Some(def_id) = self.ctx.get_def_id_for_type(ty) {
-            if let Some(binding) = self.symbols.lookup_type_by_def_id(def_id) {
-                if binding.kind == TypeKind::Alias {
-                    if self.resolving_aliases.contains(&def_id) {
-                        return Err(Diagnostic::error("circular alias definition").with_span(span));
-                    }
-                    self.resolving_aliases.insert(def_id);
-                    let result = binding.alias_ast.as_ref().map(|ast| self.resolve_type(ast)).unwrap_or(Err(Diagnostic::error("alias has no body").with_span(span)));
-                    self.resolving_aliases.remove(&def_id);
-                    return result;
-                }
-            }
-        }
-        Ok(ty)
+        let mut fc = FnCtxt::new(self);
+        fc.expand_base_type(ty, span)
     }
 
     fn resolve_type_to_struct_or_enum(&self, ty: TypeId, span: Span) -> Result<(DefId, Vec<TypeId>), Diagnostic> {
@@ -3185,12 +3022,12 @@ mod tests {
 
         // Push a guarantee with a boolean postcondition (simulating 'ensures result > 0')
         let post = checker.ctx.bool();
-        let g = Guarantee { postcondition: Some(post), frame: None };
+        let g = Guarantee::new(None, Some(post), None);
         checker.guarantee_chain.push(g);
 
         // The guarantee chain should have depth 1
         assert!(checker.guarantee_chain.current().is_some());
-        assert!(checker.guarantee_chain.current().unwrap().postcondition.is_some());
+        assert!(checker.guarantee_chain.current().unwrap().post.is_some());
 
         // Pop the guarantee on simulated return
         let popped = checker.guarantee_chain.pop();
@@ -3213,11 +3050,11 @@ mod tests {
         );
 
         // Push g₀ (caller's guarantee)
-        let g0 = Guarantee { postcondition: Some(checker.ctx.bool()), frame: None };
+        let g0 = Guarantee::new(None, Some(checker.ctx.bool()), None);
         checker.guarantee_chain.push(g0);
 
         // Push g' (callee's guarantee — CALL rule chains through callee)
-        let g_callee = Guarantee { postcondition: Some(checker.ctx.bool()), frame: None };
+        let g_callee = Guarantee::new(None, Some(checker.ctx.bool()), None);
         checker.guarantee_chain.push(g_callee);
 
         // Pop g' (callee returns)
@@ -3264,8 +3101,8 @@ mod tests {
         );
 
         // Push two guarantees (simulating two ensures clauses)
-        let g1 = Guarantee { postcondition: Some(checker.ctx.bool()), frame: None };
-        let g2 = Guarantee { postcondition: Some(checker.ctx.bool()), frame: None };
+        let g1 = Guarantee::new(None, Some(checker.ctx.bool()), None);
+        let g2 = Guarantee::new(None, Some(checker.ctx.bool()), None);
         checker.guarantee_chain.push(g1);
         checker.guarantee_chain.push(g2);
 
@@ -3296,7 +3133,7 @@ mod tests {
         );
 
         // Simulate entering a function: push a guarantee
-        let g = Guarantee { postcondition: Some(checker.ctx.bool()), frame: None };
+        let g = Guarantee::new(None, Some(checker.ctx.bool()), None);
         checker.guarantee_chain.push(g);
 
         // The return should see the guarantee and verify it

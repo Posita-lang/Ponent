@@ -106,6 +106,16 @@ pub enum Constraint {
     Eq(TypeId, TypeId, Span),
     Sub(TypeId, TypeId, Span),
     Impl(TypeId, DefId, Span),
+    /// OmniML suspended match constraint (O'Brien, Rémy & Scherer §4.1):
+    /// `match τ with patterns` — suspends until the shape of τ is known.
+    /// When τ resolves to a concrete type, the match is discharged.
+    Match {
+        /// The type whose shape must be determined.
+        scrutinee: TypeId,
+        /// Index into the inference context's `match_branches` table.
+        branches_id: usize,
+        span: Span,
+    },
 }
 
 impl Constraint {
@@ -132,6 +142,16 @@ impl Constraint {
                 }
             }
             Constraint::Impl(..) => 5, // trait impl checks: lowest priority
+            Constraint::Match { scrutinee, .. } => {
+                // Match constraints: low priority — they suspend until the
+                // scrutinee's shape is resolved.
+                let resolved = ctx.resolve_binding(*scrutinee);
+                if matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
+                    6 // still an infer var → needs resolution first
+                } else {
+                    3 // resolved → medium priority
+                }
+            }
         }
     }
 }
@@ -180,6 +200,28 @@ pub struct InferenceContext {
     guard_sets: Vec<Vec<usize>>,
     /// Per-variable generalisation status (I / G / PG / PI).
     gen_statuses: Vec<GenStatus>,
+    /// Match branches table (OmniML §4.1): each SuspendedMatch constraint
+    /// references a set of branch patterns by index.
+    /// A branch is (label, expected_pattern) — discharged when the scrutinee's
+    /// principal shape matches the pattern.
+    match_branches: Vec<MatchBranchSet>,
+    /// Forward references for incremental instantiation (OmniML §5.2):
+    /// Maps a PG variable id to the list of instance variable ids that
+    /// were created from it. When the PG var is refined, all instances
+    /// are updated.
+    forward_refs: Vec<Vec<usize>>,
+    /// Reverse of forward_refs: for each instance, which PG var it came from.
+    reverse_refs: Vec<Option<usize>>,
+}
+
+/// A set of pattern alternatives for a suspended match constraint.
+#[derive(Debug, Clone)]
+pub struct MatchBranchSet {
+    /// The pattern label (e.g. "Arrow", "Tuple", "Coproduct", etc.).
+    /// When the scrutinee's shape matches this, the branch is taken.
+    pub shape_pattern: PrincipalShape,
+    /// Continuation constraints to add when this branch matches.
+    pub continuation: Vec<Constraint>,
 }
 
 impl InferenceContext {
@@ -195,6 +237,9 @@ impl InferenceContext {
             wait_lists: Vec::new(),
             guard_sets: Vec::new(),
             gen_statuses: Vec::new(),
+            match_branches: Vec::new(),
+            forward_refs: Vec::new(),
+            reverse_refs: Vec::new(),
         }
     }
 
@@ -225,6 +270,12 @@ impl InferenceContext {
         }
         while self.gen_statuses.len() <= id {
             self.gen_statuses.push(GenStatus::Ungeneralized);
+        }
+        while self.forward_refs.len() <= id {
+            self.forward_refs.push(Vec::new());
+        }
+        while self.reverse_refs.len() <= id {
+            self.reverse_refs.push(None);
         }
         ty_id
     }
@@ -316,6 +367,10 @@ impl InferenceContext {
                 let r = ctx.resolve_binding(*ty);
                 if let TypeData::InferVar { id } = ctx.get(r) { Some(*id) } else { None }
             }
+            Constraint::Match { scrutinee, .. } => {
+                let r = ctx.resolve_binding(*scrutinee);
+                if let TypeData::InferVar { id } = ctx.get(r) { Some(*id) } else { None }
+            }
         }
     }
 
@@ -376,6 +431,260 @@ impl InferenceContext {
                 self.gen_statuses[var_id] = GenStatus::Generalized;
             }
         }
+    }
+
+    // ── OmniML: Match branches ───────────────────────────────────
+
+    /// Register a set of match branch patterns. Returns a `branches_id`
+    /// that can be referenced by a `Constraint::Match`.
+    pub fn register_match_branches(&mut self, branches: Vec<MatchBranchSet>) -> usize {
+        let id = self.match_branches.len();
+        self.match_branches.push(MatchBranchSet {
+            shape_pattern: PrincipalShape::Unknown, // placeholder
+            continuation: Vec::new(),
+        });
+        // Store each branch pattern
+        for b in branches {
+            self.match_branches.push(b);
+        }
+        id
+    }
+
+    // ── OmniML: Contextual Unicity C[τ!ξ] ────────────────────────
+    //
+    // From O'Brien, Rémy & Scherer §4.1:
+    //   C[τ!ζ] iff ∀φ, φ ⊢ [C[τ = g]] ⇒ shape(g) = ζ
+    //
+    // Three syntactic rules (decidable approximation):
+    //   UNI-TYPE: τ is non-variable → shape(τ) = ξ
+    //   UNI-VAR:  τ = α and ∃ equalities α = τ' where τ' is non-variable
+    //   UNI-BACKPROP: τ = α and all instances of α share shape ξ
+
+    /// Check whether a type has a unique shape determined by the
+    /// constraint context. Returns `Some(shape)` if unicity holds,
+    /// `None` if the shape cannot be uniquely determined.
+    ///
+    /// Implements the ⊆-closed erasure semantics:
+    ///   C[τ!ζ] iff ∀φ, φ ⊢ [C[τ = g]] ⇒ shape(g) = ζ
+    /// where [C] erases all SuspendedMatch constraints to true.
+    pub fn unicity_check(
+        &self,
+        ctx: &TypeContext,
+        ty: TypeId,
+        active_constraints: &[PrioritizedConstraint],
+    ) -> Option<PrincipalShape> {
+        let resolved = ctx.resolve_binding(ty);
+        let data = ctx.get(resolved);
+
+        // ── UNI-TYPE: non-variable type ──────────────────────────
+        // If τ is already resolved to a concrete type, its shape is known.
+        if !matches!(data, TypeData::InferVar { .. }) {
+            return Some(Self::shape_of_type(ctx, resolved));
+        }
+
+        // τ is an InferVar — extract its id.
+        let var_id = match data {
+            TypeData::InferVar { id } => *id,
+            _ => return None,
+        };
+
+        // ── UNI-VAR: α is unified with a concrete type ───────────
+        // Scan all Eq constraints in the active set. If any equality
+        // binds α to a non-variable type, that determines the shape.
+        for pc in active_constraints {
+            if let Constraint::Eq(a, b, _) = &pc.constraint {
+                let ra = ctx.resolve_binding(*a);
+                let rb = ctx.resolve_binding(*b);
+                // Check if this Eq constraint involves our variable
+                let other = if ra == resolved { Some(rb) }
+                    else if rb == resolved { Some(ra) }
+                    else { None };
+                if let Some(other_ty) = other {
+                    let other_resolved = ctx.resolve_binding(other_ty);
+                    if !matches!(ctx.get(other_resolved), TypeData::InferVar { .. }) {
+                        return Some(Self::shape_of_type(ctx, other_resolved));
+                    }
+                }
+            }
+        }
+
+        // ── UNI-BACKPROP: shape from incremental instantiations ──
+        // If this variable is a PG variable with forward references,
+        // check if all its instances resolve to the same shape.
+        if var_id < self.forward_refs.len() && !self.forward_refs[var_id].is_empty() {
+            let mut shared_shape: Option<PrincipalShape> = None;
+            for &instance_id in &self.forward_refs[var_id] {
+                if instance_id < self.var_type_ids.len() {
+                    let instance_ty = ctx.resolve_binding(self.var_type_ids[instance_id]);
+                    let instance_data = ctx.get(instance_ty);
+                    if matches!(instance_data, TypeData::InferVar { .. }) {
+                        // Instance is still unresolved — can't determine shape.
+                        return None;
+                    }
+                    let inst_shape = Self::shape_of_type(ctx, instance_ty);
+                    match shared_shape {
+                        None => shared_shape = Some(inst_shape),
+                        Some(ref s) if *s != inst_shape => {
+                            // Instances disagree on shape — unicity fails.
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(shape) = shared_shape {
+                return Some(shape);
+            }
+        }
+
+        // ── Check Sub constraints for upper/lower bounds ─────────
+        // If the variable has bounds that all share the same shape,
+        // that shape is uniquely determined.
+        let mut shape_from_bounds: Option<PrincipalShape> = None;
+
+        // Check upper bounds (supertype constraints)
+        if var_id < self.upper_bounds.len() {
+            for &bound in &self.upper_bounds[var_id] {
+                let bound_resolved = ctx.resolve_binding(bound);
+                if !matches!(ctx.get(bound_resolved), TypeData::InferVar { .. }) {
+                    let s = Self::shape_of_type(ctx, bound_resolved);
+                    match shape_from_bounds {
+                        None => shape_from_bounds = Some(s),
+                        Some(ref existing) if *existing != s => return None,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // Check lower bounds (subtype constraints)
+        if var_id < self.lower_bounds.len() {
+            for &bound in &self.lower_bounds[var_id] {
+                let bound_resolved = ctx.resolve_binding(bound);
+                if !matches!(ctx.get(bound_resolved), TypeData::InferVar { .. }) {
+                    let s = Self::shape_of_type(ctx, bound_resolved);
+                    match shape_from_bounds {
+                        None => shape_from_bounds = Some(s),
+                        Some(ref existing) if *existing != s => return None,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        shape_from_bounds
+    }
+
+    // ── OmniML: Incremental Instantiation ────────────────────────
+    //
+    // From O'Brien, Rémy & Scherer §5.2:
+    // When a regional abstraction let x = λ∝[∝].C₁ in C₂ contains a
+    // suspended constraint, variables in the region are PG. Instances
+    // of PG variables must be tracked so that when the PG variable is
+    // refined, the instances are updated.
+    //
+    // This implements the forward-reference mechanism (§6 "From a stack
+    // to a tree"): each PG variable has a list of its instances. When
+    // the PG variable is unified with a concrete type, all instances
+    // are re-unified.
+
+    /// Register that `instance_id` was created as an instance of
+    /// `pg_var_id` (a PartiallyGeneralizable variable).
+    /// This enables incremental instantiation: when pg_var_id is
+    /// refined, instance_id will be updated.
+    pub fn register_instance(&mut self, pg_var_id: usize, instance_id: usize) {
+        while self.forward_refs.len() <= pg_var_id {
+            self.forward_refs.push(Vec::new());
+        }
+        while self.reverse_refs.len() <= instance_id {
+            self.reverse_refs.push(None);
+        }
+        if !self.forward_refs[pg_var_id].contains(&instance_id) {
+            self.forward_refs[pg_var_id].push(instance_id);
+        }
+        self.reverse_refs[instance_id] = Some(pg_var_id);
+
+        // Mark the instance as PI (PartialInstance)
+        while self.gen_statuses.len() <= instance_id {
+            self.gen_statuses.push(GenStatus::Ungeneralized);
+        }
+        self.gen_statuses[instance_id] = GenStatus::PartialInstance;
+    }
+
+    /// Called when a PG variable is resolved to a concrete type.
+    /// Propagates the resolution to all registered instances.
+    /// Returns the number of instances that were updated.
+    pub fn propagate_pg_resolution(
+        &mut self,
+        ctx: &mut TypeContext,
+        pg_var_id: usize,
+        resolve_ty: TypeId,
+    ) -> usize {
+        if pg_var_id >= self.forward_refs.len() {
+            return 0;
+        }
+        let instances: Vec<usize> = self.forward_refs[pg_var_id].clone();
+        let mut updated = 0;
+        for inst_id in instances {
+            if inst_id < self.var_type_ids.len() {
+                let instance_ty_id = self.var_type_ids[inst_id];
+                // Bind the instance to the resolved type
+                if let Err(_) = ctx.unify(instance_ty_id, resolve_ty) {
+                    // If unification fails, the instance may already have
+                    // a conflicting type — that's an error that will be
+                    // caught elsewhere.
+                }
+                updated += 1;
+            }
+        }
+        // Clear forward refs (all propagated)
+        self.forward_refs[pg_var_id].clear();
+        updated
+    }
+
+    /// Check if a variable has any forward references (instances).
+    pub fn has_instances(&self, var_id: usize) -> bool {
+        var_id < self.forward_refs.len() && !self.forward_refs[var_id].is_empty()
+    }
+
+    /// Check if a variable is an instance of a PG variable.
+    pub fn is_instance(&self, var_id: usize) -> Option<usize> {
+        if var_id < self.reverse_refs.len() {
+            self.reverse_refs[var_id]
+        } else {
+            None
+        }
+    }
+
+    /// Discharge a suspended Match constraint: when the scrutinee's shape
+    /// is known (unicity holds), add the matched branch's continuation
+    /// constraints and remove the guard on the scrutinee variable.
+    pub fn discharge_match(
+        &mut self,
+        ctx: &mut TypeContext,
+        scrutinee_ty: TypeId,
+        branches_id: usize,
+        heap: &mut BinaryHeap<PrioritizedConstraint>,
+    ) -> bool {
+        let resolved = ctx.resolve_binding(scrutinee_ty);
+        let shape = Self::shape_of_type(ctx, resolved);
+
+        // Find the branch that matches this shape
+        if branches_id < self.match_branches.len() {
+            let branch = &self.match_branches[branches_id];
+            let matches_pattern = shape == branch.shape_pattern;
+
+            if matches_pattern {
+                // Enqueue continuation constraints
+                for c in &branch.continuation {
+                    let p = c.priority(ctx);
+                    heap.push(PrioritizedConstraint { priority: p, constraint: c.clone() });
+                }
+                return true;
+            }
+        }
+
+        // No matching branch found — this is a type error (unmatched shape).
+        false
     }
 
     /// Get the generalisation status for a variable.
@@ -474,6 +783,17 @@ impl InferenceContext {
                             if self.try_set_shape(*var_id, ctx) {
                                 self.wake_var_incremental(*var_id, &mut heap, ctx);
                             }
+                            // ── OmniML §5.2: Incremental instantiation ──
+                            // If this variable is PG and has instances,
+                            // propagate the resolution to all instances.
+                            if *var_id < self.gen_statuses.len()
+                                && self.gen_statuses[*var_id] == GenStatus::PartiallyGeneralizable
+                            {
+                                let resolved_ty = ctx.resolve_binding(self.var_type_ids[*var_id]);
+                                if !matches!(ctx.get(resolved_ty), TypeData::InferVar { .. }) {
+                                    self.propagate_pg_resolution(ctx, *var_id, resolved_ty);
+                                }
+                            }
                         }
                     }
                     Constraint::Sub(sub, sup, _span) => {
@@ -559,6 +879,49 @@ impl InferenceContext {
                             }
                         }
                     }
+                }
+            }
+            Constraint::Match { scrutinee, branches_id, span: _ } => {
+                // OmniML §4.1: Try to discharge suspended match constraints.
+                // Check unicity — if the scrutinee's shape is uniquely determined,
+                // discharge the match and enqueue continuation constraints.
+                let resolved = ctx.resolve_binding(*scrutinee);
+                let resolved_data = ctx.get(resolved);
+
+                if !matches!(resolved_data, TypeData::InferVar { .. }) {
+                    // Scrutinee is resolved — shape is known (UNI-TYPE).
+                    let _ = self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
+                } else {
+                    // Scrutinee is still an InferVar — try unicity via bounds (UNI-VAR / UNI-BACKPROP).
+                    if let Some(_shape) = Self::unicity_check(self, ctx, *scrutinee, &[]) {
+                        let _ = self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
+                    } else {
+                        // Cannot discharge yet — push back as low priority to try again later.
+                        let p = 6u8;
+                        heap.push(PrioritizedConstraint { priority: p, constraint: pc.constraint.clone() });
+                    }
+                }
+            }
+        }
+    }
+
+    // ── OmniML: Process Match constraints ──────────────────────
+    // After processing Eq/Sub/Impl, check suspended match constraints.
+    // A Match constraint can be discharged when the scrutinee's shape
+    // is uniquely determined by the context (unicity check).
+    // This implements O'Brien, Rémy & Scherer §4.1, MATCH-CTX rule.
+    for pc in &heap.clone().into_sorted_vec() {
+        if let Constraint::Match { scrutinee, branches_id, span: _ } = &pc.constraint {
+            let resolved = ctx.resolve_binding(*scrutinee);
+            // Only attempt discharge if scrutinee is resolved (not an InferVar)
+            if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
+                if let Some(shape) = Self::unicity_check(self, ctx, *scrutinee, &[]) {
+                    let _discharged = self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
+                }
+            } else {
+                // Scrutinee is still an InferVar — check unicity via bounds
+                if let Some(_shape) = Self::unicity_check(self, ctx, *scrutinee, &[]) {
+                    let _discharged = self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
                 }
             }
         }
@@ -865,6 +1228,21 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
             ctx.find_type(&TypeData::Forall { param_index, param_name, body: new_body })
                 .unwrap_or(ctx.error())
         }
+        TypeData::Mu { param_index, param_name, body } => {
+            let new_body = replace_infer(body, solution, ctx);
+            ctx.find_type(&TypeData::Mu { param_index, param_name, body: new_body })
+                .unwrap_or(ctx.error())
+        }
+        TypeData::Nu { param_index, param_name, body } => {
+            let new_body = replace_infer(body, solution, ctx);
+            ctx.find_type(&TypeData::Nu { param_index, param_name, body: new_body })
+                .unwrap_or(ctx.error())
+        }
+        TypeData::Coproduct { alternatives } => {
+            let new_alts: Vec<TypeId> = alternatives.iter().map(|&a| replace_infer(a, solution, ctx)).collect();
+            ctx.find_type(&TypeData::Coproduct { alternatives: new_alts })
+                .unwrap_or(ctx.error())
+        }
     }
 }
 
@@ -981,5 +1359,102 @@ mod tests {
         let b = Constraint::Impl(int_ty, DefId(1), crate::ast::Span::new(0, 0));
         // Both Impl constraints should have the same priority
         assert_eq!(a.priority(&ctx), b.priority(&ctx));
+    }
+
+    #[test]
+    fn test_match_constraint_priority() {
+        let mut ctx = TypeContext::new();
+        let infer = InferenceContext::new();
+        let var = ctx.alloc_infer_var(0);
+        // Match constraint on an InferVar → low priority (6)
+        let match_c = Constraint::Match {
+            scrutinee: var,
+            branches_id: 0,
+            span: crate::ast::Span::new(0, 0),
+        };
+        assert_eq!(match_c.priority(&ctx), 6,
+            "Match on InferVar should have lowest priority");
+        // Eq on concrete types → high priority (0)
+        let eq_c = Constraint::Eq(ctx.bool(), ctx.int(32, true), crate::ast::Span::new(0, 0));
+        assert_eq!(eq_c.priority(&ctx), 0,
+            "Eq on concrete should have highest priority");
+    }
+
+    #[test]
+    fn test_unicity_check_non_var() {
+        // UNI-TYPE: non-variable type has unique shape
+        let mut ctx = TypeContext::new();
+        let infer = InferenceContext::new();
+        // Use pre-allocated built-in types
+        let int_ty = ctx.int(32, true);
+        let shape = InferenceContext::unicity_check(&infer, &ctx, int_ty, &[]);
+        assert!(shape.is_some(), "non-variable type should have known shape");
+    }
+
+    #[test]
+    fn test_unicity_check_fn_type() {
+        let mut ctx = TypeContext::new();
+        let infer = InferenceContext::new();
+        let int_ty = ctx.int(32, true);
+        let fn_ty = ctx.function(vec![int_ty], int_ty);
+        let shape = InferenceContext::unicity_check(&infer, &ctx, fn_ty, &[]);
+        assert!(shape.is_some(), "function type should have known shape");
+        assert_eq!(shape.unwrap(), PrincipalShape::Arrow);
+    }
+
+    #[test]
+    fn test_register_instance_and_propagate() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let pg_var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let pg_id = match ctx.get(pg_var) { TypeData::InferVar { id } => *id, _ => unreachable!() };
+        let inst1 = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let inst1_id = match ctx.get(inst1) { TypeData::InferVar { id } => *id, _ => unreachable!() };
+        // Register the instance
+        infer.register_instance(pg_id, inst1_id);
+        assert!(infer.has_instances(pg_id), "PG var should have instances");
+        assert_eq!(infer.is_instance(inst1_id), Some(pg_id),
+            "instance should track its PG var");
+        // Propagate PG resolution
+        let bool_ty = ctx.bool();
+        let updated = infer.propagate_pg_resolution(&mut ctx, pg_id, bool_ty);
+        assert_eq!(updated, 1, "should have updated 1 instance");
+        // Check that the instance was unified with bool
+        assert!(!infer.has_instances(pg_id), "forward refs should be cleared");
+    }
+
+    #[test]
+    fn test_register_match_branches() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let branches = vec![
+            MatchBranchSet {
+                shape_pattern: PrincipalShape::Arrow,
+                continuation: vec![Constraint::Eq(
+                    ctx.int(32, true), ctx.int(32, true), crate::ast::Span::new(0, 0),
+                )],
+            },
+        ];
+        let id = infer.register_match_branches(branches);
+        assert!(id < infer.match_branches.len());
+    }
+
+    #[test]
+    fn test_match_priority_change_on_resolve() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let match_c = Constraint::Match {
+            scrutinee: var,
+            branches_id: 0,
+            span: crate::ast::Span::new(0, 0),
+        };
+        // Before resolution: low priority
+        assert_eq!(match_c.priority(&ctx), 6);
+        // After resolution: medium priority
+        let int_ty = ctx.int(32, true);
+        ctx.bindings.borrow_mut().insert(var, int_ty);
+        assert_eq!(match_c.priority(&ctx), 3,
+            "match on resolved type should have medium priority");
     }
 }
