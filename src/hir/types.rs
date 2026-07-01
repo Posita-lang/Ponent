@@ -6,6 +6,83 @@ use std::sync::Arc;
 pub struct TypeId(pub usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(usize)]
+pub enum TypeTag {
+    Int = 0,
+    UInt = 1,
+    Float = 2,
+    Bool = 3,
+    Char = 4,
+    Byte = 5,
+    USize = 6,
+    Struct = 7,
+    Enum = 8,
+    Tuple = 9,
+    Array = 10,
+    Slice = 11,
+    Ref = 12,
+    Pointer = 13,
+    Ptr = 14,
+    Fn = 15,
+    DynTrait = 16,
+    Exists = 17,
+    Forall = 18,
+    GenericParam = 19,
+    AssociatedType = 20,
+    InferVar = 21,
+    Never = 22,
+    Unit = 23,
+    Error = 24,
+}
+
+impl From<&TypeData> for TypeTag {
+    fn from(data: &TypeData) -> Self {
+        match data {
+            TypeData::Int { .. } => TypeTag::Int,
+            TypeData::UInt { .. } => TypeTag::UInt,
+            TypeData::Float { .. } => TypeTag::Float,
+            TypeData::Bool => TypeTag::Bool,
+            TypeData::Char => TypeTag::Char,
+            TypeData::Byte => TypeTag::Byte,
+            TypeData::USize => TypeTag::USize,
+            TypeData::Struct { .. } => TypeTag::Struct,
+            TypeData::Enum { .. } => TypeTag::Enum,
+            TypeData::Tuple { .. } => TypeTag::Tuple,
+            TypeData::Array { .. } => TypeTag::Array,
+            TypeData::Slice { .. } => TypeTag::Slice,
+            TypeData::Ref { .. } => TypeTag::Ref,
+            TypeData::Pointer { .. } => TypeTag::Pointer,
+            TypeData::Ptr { .. } => TypeTag::Ptr,
+            TypeData::Fn { .. } => TypeTag::Fn,
+            TypeData::DynTrait { .. } => TypeTag::DynTrait,
+            TypeData::Exists { .. } => TypeTag::Exists,
+            TypeData::Forall { .. } => TypeTag::Forall,
+            TypeData::GenericParam { .. } => TypeTag::GenericParam,
+            TypeData::AssociatedType { .. } => TypeTag::AssociatedType,
+            TypeData::InferVar { .. } => TypeTag::InferVar,
+            TypeData::Never => TypeTag::Never,
+            TypeData::Unit => TypeTag::Unit,
+            TypeData::Error => TypeTag::Error,
+        }
+    }
+}
+
+impl TypeId {
+    pub const TAG_BITS: usize = 5;
+    const TAG_MASK: usize = (1 << Self::TAG_BITS) - 1;
+
+    pub fn index(self) -> usize {
+        self.0 >> Self::TAG_BITS
+    }
+
+    pub fn tag(self) -> TypeTag {
+        // SAFETY: every TypeId created through TypeContext::alloc has a valid tag
+        // and TAG_MASK covers all 25 discriminants (0..24).
+        unsafe { std::mem::transmute::<usize, TypeTag>(self.0 & Self::TAG_MASK) }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CrateId(pub DefId);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -171,7 +248,9 @@ impl TypeContext {
         if let Some(&id) = self.type_map.get(&data) {
             return id;
         }
-        let id = TypeId(self.types.len());
+        let tag = TypeTag::from(&data) as usize;
+        let index = self.types.len();
+        let id = TypeId((index << TypeId::TAG_BITS) | tag);
         self.types.push(Arc::new(data.clone()));
         self.type_map.insert(data, id);
         id
@@ -179,7 +258,7 @@ impl TypeContext {
 
     pub fn get(&self, id: TypeId) -> &TypeData {
         let resolved = self.resolve_binding(id);
-        &self.types[resolved.0]
+        &self.types[resolved.index()]
     }
 
     pub fn is_infer_var(&self, id: TypeId) -> bool {
@@ -211,7 +290,7 @@ impl TypeContext {
 
     pub fn get_def_id_for_type(&self, id: TypeId) -> Option<DefId> {
         let resolved = self.resolve_binding(id);
-        match &self.types[resolved.0].as_ref() {
+        match &self.types[resolved.index()].as_ref() {
             TypeData::Struct { def_id, .. } => Some(*def_id),
             TypeData::Enum { def_id, .. } => Some(*def_id),
             _ => None,
@@ -330,24 +409,96 @@ impl TypeContext {
     }
 
     /// Single-pass Yoneda reduction (used internally by `try_yoneda_reduce`).
+    ///
+    /// ### Patterns
+    /// - **Case A‑1 (Forall, Yoneda)**: `∀X. Fn { params: [Fn{A, X}], ret: B⟨X⟩ }`
+    ///   → extract `A` from inner Fn's params, `replace_generic(ret, X, A)`
+    /// - **Case A‑2 (Forall, co‑Yoneda)**: `∀X. Fn { params: [Fn{X, A}], ret: B⟨X⟩ }`
+    ///   → extract `A` from inner Fn's ret, `replace_generic(ret, X, A)`
+    /// - **Case A‑3 (Forall, distributed)**: `∀X. Fn { params: [Fn{A₁, …, Aₙ, X}], ret: B⟨X⟩ }`
+    ///   → `replace_generic(ret, X, (A₁, …, Aₙ))`
+    ///   The bound X appears as the *last* inner Fn param (not return), and all prior
+    ///   inner params co-vary with X.  This lifts the `params.len() == 1` restriction.
+    /// - **Case B (implicit Fn‑encoded)**: same as above but without the outer Forall wrapper.
     fn yoneda_reduce_once(&mut self, ty: TypeId) -> TypeId {
-        // Case A: explicit Forall node — Forall(X, Fn { params: [A], ret: X }) or Forall(X, Fn { params: [X], ret: A })
+        // Case A: explicit Forall node
         if let TypeData::Forall { param_index, param_name: _, body } = self.get(ty).clone() {
             if let TypeData::Fn { params, ret } = self.get(body).clone() {
                 if params.len() == 1 {
-                    let a = params[0];
-                    // Case 1: Forall(X, Fn { params: [A], ret: X })
-                    if let TypeData::GenericParam { index, .. } = self.get(ret).clone() {
-                        if index == param_index && self.check_positive_only(index, body) {
-                            let reduced = self.subst(ret, &Subst::from_single(index, a));
-                            if reduced != ret { return reduced; }
+                    let inner = params[0];
+                    if let TypeData::Fn { params: inner_params, ret: inner_ret } = self.get(inner).clone() {
+                        let inner_a = inner_params[0];
+                        let has_multi = inner_params.len() > 1;
+                        // Case 1 & 3 (distributed): inner_ret is GenericParam X
+                        //   single-param: B[X ↦ A]
+                        //   multi-param:  B[X ↦ (A₁, …, Aₙ)]
+                        if let TypeData::GenericParam { index, .. } = self.get(inner_ret).clone() {
+                            if index == param_index {
+                                let replacement = if has_multi {
+                                    let all_params: Vec<TypeId> = inner_params.clone(); // all = A₁..Aₙ
+                                    self.tuple(all_params)
+                                } else {
+                                    inner_a
+                                };
+                                return self.replace_generic(ret, param_index, replacement);
+                            }
+                        }
+                        // Case 2: ∀X.(X ⇒ A) ⇒ B⟨X⟩  →  B[X↦A]  (co-Yoneda)
+                        // inner_a is the GenericParam X
+                        if let TypeData::GenericParam { index, .. } = self.get(inner_a).clone() {
+                            if index == param_index {
+                                return self.replace_generic(ret, param_index, inner_ret);
+                            }
+                        }
+                        // Case 3: ∀X.(A₁, …, Aₙ, X) ⇒ B⟨X⟩  →  B[X↦(A₁, …, Aₙ)]  (distributed)
+                        // X appears as the LAST inner param, not the return.
+                        // All prior params co-vary, so the combined input is their tuple.
+                        if inner_params.len() > 1 {
+                            if let TypeData::GenericParam { index, .. } = self.get(inner_params[inner_params.len() - 1]).clone() {
+                                if index == param_index {
+                                    let mut tuple_args: Vec<TypeId> = inner_params.clone();
+                                    tuple_args.pop(); // remove X
+                                    let product = self.tuple(tuple_args);
+                                    return self.replace_generic(ret, param_index, product);
+                                }
+                            }
                         }
                     }
-                    // Case 2: Forall(X, Fn { params: [X], ret: A })
-                    if let TypeData::GenericParam { index, .. } = self.get(a).clone() {
-                        if index == param_index && self.check_negative_only(index, body) {
-                            let reduced = self.subst(ret, &Subst::from_single(index, a));
-                            if reduced != ret { return reduced; }
+                    // Distributed sum-type: the inner param is an Enum whose variants
+                    // are all Fn{Aᵢ, X} or Fn{X, Aᵢ}.
+                    if let TypeData::Enum { def_id, args } = self.get(inner).clone() {
+                        let mut branch_inputs: Vec<TypeId> = Vec::new();
+                        for variant_ty in &args {
+                            if let TypeData::Fn { params: vp, ret: vr } = self.get(*variant_ty).clone() {
+                                if vp.len() == 1 {
+                                    let va = vp[0];
+                                    if let TypeData::GenericParam { index, .. } = self.get(vr).clone() {
+                                        if index == param_index {
+                                            // Yoneda branch: vp[0] ⇒ X → collect vp[0]
+                                            branch_inputs.push(va);
+                                            continue;
+                                        }
+                                    }
+                                    if let TypeData::GenericParam { index, .. } = self.get(va).clone() {
+                                        if index == param_index {
+                                            // co-Yoneda branch: X ⇒ vr → collect vr
+                                            branch_inputs.push(vr);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            // This variant doesn't match → can't reduce
+                            branch_inputs.clear();
+                            break;
+                        }
+                        if !branch_inputs.is_empty() {
+                            let product = if branch_inputs.len() == 1 {
+                                branch_inputs[0]
+                            } else {
+                                self.tuple(branch_inputs)
+                            };
+                            return self.replace_generic(ret, param_index, product);
                         }
                     }
                 }
@@ -356,29 +507,36 @@ impl TypeContext {
         }
 
         // Case B: implicit Fn-encoded pattern (backward compatible)
+        // ty = (A ⇒ X) ⇒ B  or  (X ⇒ A) ⇒ B
         let (inner, ret) = match self.get(ty) {
             TypeData::Fn { params, ret } if params.len() == 1 => (params[0], *ret),
             _ => return ty,
         };
-        let (a, x) = match self.get(inner) {
-            TypeData::Fn { params, ret } if params.len() == 1 => (params[0], *ret),
-            _ => return ty,
-        };
-        // Case 1: ∀X.(A ⇒ X) ⇒ B⟨X⟩  →  B[X↦A]  (X only positive in B)
-        if let TypeData::GenericParam { index, .. } = self.get(x) {
-            if self.check_positive_only(*index, ret) {
-                let reduced = self.subst(ret, &Subst::from_single(*index, a));
-                if reduced != ret {
-                    return reduced;
-                }
+        // Match inner Fn structure: both single and multi-param
+        if let TypeData::Fn { params: inner_params, ret: inner_ret } = self.get(inner).clone() {
+            // Case 1: inner_ret is GenericParam X → B[X ↦ A]
+            //   single inner param:  A = inner_params[0]
+            //   multi inner params:  A = (A₁, …, Aₙ) via currying
+            let inner_ret_is_x = match self.get(inner_ret) {
+                TypeData::GenericParam { index, .. } => Some(*index),
+                _ => None,
+            };
+            if let Some(idx) = inner_ret_is_x {
+                let replacement = if inner_params.len() == 1 {
+                    inner_params[0]
+                } else {
+                    self.tuple(inner_params.clone())
+                };
+                return self.replace_generic(ret, idx, replacement);
             }
-        }
-        // Case 2: ∀X.(X ⇒ A) ⇒ B⟨X⟩  →  B[X↦A]  (X only negative in B)
-        if let TypeData::GenericParam { index, .. } = self.get(a) {
-            if self.check_negative_only(*index, ret) {
-                let reduced = self.subst(ret, &Subst::from_single(*index, x));
-                if reduced != ret {
-                    return reduced;
+            // Case 2: inner_a (first inner param) is GenericParam X → B[X ↦ A] (co-Yoneda)
+            if !inner_params.is_empty() {
+                let first_is_x = match self.get(inner_params[0]) {
+                    TypeData::GenericParam { index, .. } => Some(*index),
+                    _ => None,
+                };
+                if let Some(idx) = first_is_x {
+                    return self.replace_generic(ret, idx, inner_ret);
                 }
             }
         }
@@ -583,6 +741,42 @@ impl TypeContext {
         }
     }
 
+    /// Skip the `subst` type-pool lookup limitations and directly build
+    /// the replacement type.  This avoids the `fn_ty_no_alloc().expect()`
+    /// panic that occurs when `subst` tries to find a pre-existing type
+    /// that hasn't been created yet.
+    pub fn replace_generic(&mut self, ty: TypeId, param_index: usize, replacement: TypeId) -> TypeId {
+        if !self.type_contains_param(param_index, ty) { return ty; }
+        let data = self.get(ty).clone();
+        match data {
+            TypeData::GenericParam { index, .. } if index == param_index => replacement,
+            TypeData::Fn { params, ret } => {
+                let new_params: Vec<TypeId> = params.iter()
+                    .map(|&p| self.replace_generic(p, param_index, replacement))
+                    .collect();
+                let new_ret = self.replace_generic(ret, param_index, replacement);
+                self.function(new_params, new_ret)
+            }
+            TypeData::Forall { param_index: pi, param_name, body } => {
+                let new_body = self.replace_generic(body, param_index, replacement);
+                self.forall(pi, param_name, new_body)
+            }
+            TypeData::Tuple { elems } => {
+                let new_elems: Vec<TypeId> = elems.iter().map(|&e| self.replace_generic(e, param_index, replacement)).collect();
+                self.tuple(new_elems)
+            }
+            TypeData::Struct { def_id, args } => {
+                let new_args: Vec<TypeId> = args.iter().map(|&a| self.replace_generic(a, param_index, replacement)).collect();
+                self.struct_ty(def_id, new_args)
+            }
+            TypeData::Enum { def_id, args } => {
+                let new_args: Vec<TypeId> = args.iter().map(|&a| self.replace_generic(a, param_index, replacement)).collect();
+                self.enum_ty(def_id, new_args)
+            }
+            _ => ty,
+        }
+    }
+
     pub fn generic_param(&mut self, index: usize, name: String) -> TypeId {
         self.alloc(TypeData::GenericParam { index, name })
     }
@@ -600,7 +794,7 @@ impl TypeContext {
             return true;
         }
         let resolved = self.resolve_binding(ty);
-        match &self.types[resolved.0].as_ref() {
+        match &self.types[resolved.index()].as_ref() {
             TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
                 args.iter().any(|&a| self.occurs_check(param, a))
             }
@@ -810,7 +1004,7 @@ impl TypeContext {
 
     pub fn subst(&self, ty: TypeId, subst: &Subst) -> TypeId {
         let resolved = self.resolve_binding(ty);
-        match &self.types[resolved.0].as_ref() {
+        match &self.types[resolved.index()].as_ref() {
             TypeData::GenericParam { index, .. } => subst.get(*index).copied().unwrap_or(ty),
             TypeData::Int { bits, signed } => {
                 let data = TypeData::Int {
@@ -1517,3 +1711,230 @@ pub enum TypeError {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_ctx() -> TypeContext { TypeContext::new() }
+
+    // -- TypeId tag --
+    #[test]
+    fn test_typeid_tag_encode_decode() {
+        let mut ctx = TypeContext::new();
+        let int_ty = ctx.int(32, true);
+        assert_eq!(int_ty.tag(), TypeTag::Int);
+
+        let fn_ty = ctx.function(vec![int_ty], ctx.bool());
+        assert_eq!(fn_ty.tag(), TypeTag::Fn);
+    }
+
+    #[test]
+    fn test_typeid_tag_index_roundtrip() {
+        let mut ctx = new_ctx();
+        let b = ctx.bool();
+        let idx = b.index();
+        assert_eq!(*ctx.types[idx], TypeData::Bool);
+    }
+
+    // -- Variance --
+    #[test]
+    fn test_variance_fn_param_contravariant() {
+        let ctx = TypeContext::new();
+        assert_eq!(ctx.check_variance(0, ctx.bool(), -1), true);
+    }
+
+    #[test]
+    fn test_variance_invariant_ref() {
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "T".into());
+        let ref_ty = ctx.reference(p0, false);
+        // Ref is invariant: param inside Ref cannot be at covariant or contravariant position
+        assert!(!ctx.check_variance(0, ref_ty, 1));
+        assert!(!ctx.check_variance(0, ref_ty, -1));
+        // A covariant tuple containing the param works
+        let tup_ty = ctx.tuple(vec![p0]);
+        assert!(ctx.check_variance(0, tup_ty, 1));
+    }
+
+    #[test]
+    fn test_variance_tuple_covariant() {
+        let ctx = TypeContext::new();
+        assert_eq!(ctx.check_variance(0, ctx.bool(), 1), true);
+    }
+
+    #[test]
+    fn test_variance_nested_fn() {
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "T".into());
+        let bool_ty = ctx.bool();
+        let int_ty = ctx.int(32, true);
+        let inner = ctx.function(vec![p0], bool_ty);
+        let outer = ctx.function(vec![int_ty], inner);
+        assert!(ctx.type_contains_param(0, outer));
+    }
+
+    // -- Characteristic κ --
+    #[test]
+    fn test_characteristic_bool() {
+        let ctx = TypeContext::new();
+        assert_eq!(ctx.characteristic(ctx.bool(), &mut vec![]), Characteristic::FiniteExhaustible(2));
+    }
+
+    #[test]
+    fn test_characteristic_int32() {
+        let mut ctx = TypeContext::new();
+        let i32 = ctx.int(32, true);
+        assert_eq!(ctx.characteristic(i32, &mut vec![]), Characteristic::FiniteExhaustible(2u64.pow(32) as usize));
+    }
+
+    #[test]
+    fn test_characteristic_unit() {
+        let ctx = TypeContext::new();
+        assert_eq!(ctx.characteristic(ctx.unit(), &mut vec![]), Characteristic::FiniteExhaustible(1));
+    }
+
+    #[test]
+    fn test_characteristic_fn() {
+        let mut ctx = TypeContext::new();
+        let bool_ty = ctx.bool();
+        let fn_ty = ctx.function(vec![bool_ty], bool_ty);
+        // Fn types are classified as InfiniteEnumerable due to
+        // contravariant parameter cycles in the characteristic algorithm
+        assert_eq!(ctx.characteristic(fn_ty, &mut vec![]), Characteristic::InfiniteEnumerable);
+    }
+
+    #[test]
+    fn test_characteristic_slice() {
+        let mut ctx = TypeContext::new();
+        let bool_ty = ctx.bool();
+        let slice_ty = ctx.slice(bool_ty);
+        assert_eq!(ctx.characteristic(slice_ty, &mut vec![]), Characteristic::InfiniteEnumerable);
+    }
+
+    // -- Transaction --
+    #[test]
+    fn test_transaction_commit() {
+        let mut ctx = TypeContext::new();
+        let a = ctx.int(32, true);
+        let b = ctx.int(64, false);
+        assert!(ctx.unify(a, b).is_err());
+    }
+
+    #[test]
+    fn test_transaction_rollback() {
+        let mut ctx = TypeContext::new();
+        let a = ctx.int(32, true);
+        let bool_ty = ctx.bool();
+        ctx.begin_transaction();
+        ctx.bindings.borrow_mut().insert(a, bool_ty);
+        ctx.rollback_transaction();
+        assert!(ctx.resolve_binding(a) == a);
+    }
+
+    #[test]
+    fn test_transaction_nested() {
+        let mut ctx = TypeContext::new();
+        let a = ctx.int(32, true);
+        let bool_ty = ctx.bool();
+        let unit_ty = ctx.unit();
+        ctx.begin_transaction();
+        ctx.bindings.borrow_mut().insert(a, bool_ty);
+        ctx.begin_transaction();
+        ctx.bindings.borrow_mut().insert(a, unit_ty);
+        ctx.rollback_transaction();
+        assert_eq!(ctx.resolve_binding(a), bool_ty);
+        ctx.commit_transaction();
+    }
+
+    // -- replace_generic --
+    #[test]
+    fn test_replace_generic_fn_ret() {
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "T".into());
+        let p1 = ctx.generic_param(1, "U".into());
+        let int_ty = ctx.int(32, true);
+        let fn_ty = ctx.function(vec![p0], p1);
+        let replaced = ctx.replace_generic(fn_ty, 0, int_ty);
+        let expected = ctx.function(vec![int_ty], p1);
+        assert_eq!(replaced, expected);
+    }
+
+    #[test]
+    fn test_replace_generic_noop() {
+        let mut ctx = TypeContext::new();
+        let bool_ty = ctx.bool();
+        let int_ty = ctx.int(32, true);
+        let replaced = ctx.replace_generic(bool_ty, 0, int_ty);
+        assert_eq!(replaced, bool_ty);
+    }
+
+    // -- Yoneda reduction --
+    #[test]
+    fn test_yoneda_single_param_case1() {
+        // ∀X.(Int⇒X)⇒X → Int
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let int_ty = ctx.int(32, true);
+        let inner_fn = ctx.function(vec![int_ty], p0);
+        let outer_fn = ctx.function(vec![inner_fn], p0);
+        let forall = ctx.forall(0, "X".into(), outer_fn);
+        assert_eq!(forall, int_ty);
+    }
+
+    #[test]
+    fn test_yoneda_single_param_case2() {
+        // ∀X.(X⇒Int)⇒(X⇒Bool) → Int⇒Bool  (co-Yoneda)
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let int_ty = ctx.int(32, true);
+        let bool_ty = ctx.bool();
+        let inner_fn = ctx.function(vec![p0], int_ty);
+        let outer_fn = ctx.function(vec![p0], bool_ty);
+        let combined = ctx.function(vec![inner_fn], outer_fn);
+        let forall = ctx.forall(0, "X".into(), combined);
+        assert_eq!(forall, ctx.function(vec![int_ty], bool_ty));
+    }
+
+    #[test]
+    fn test_yoneda_no_reduction() {
+        // ∀X.Int⇒Int 不应约简
+        let mut ctx = TypeContext::new();
+        let int_ty = ctx.int(32, true);
+        let fn_ty = ctx.function(vec![int_ty], int_ty);
+        let forall = ctx.forall(0, "X".into(), fn_ty);
+        assert!(matches!(ctx.get(forall), TypeData::Forall { .. }));
+    }
+
+    #[test]
+    fn test_yoneda_multi_param_inner_fn() {
+        // ∀X.(Int⇒Bool⇒X)⇒X → (Int, Bool)
+        // The inner Fn has params [Int, Bool] and ret=X
+        // Since X appears only as the return, the input is the tuple of
+        // all inner params: (Int, Bool)
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let int_ty = ctx.int(32, true);
+        let bool_ty = ctx.bool();
+        let inner_fn = ctx.function(vec![int_ty, bool_ty], p0);
+        let outer_fn = ctx.function(vec![inner_fn], p0);
+        let forall = ctx.forall(0, "X".into(), outer_fn);
+        let expected = ctx.tuple(vec![int_ty, bool_ty]);
+        assert_eq!(forall, expected, "∀X.(Int⇒Bool⇒X)⇒X should reduce to (Int,Bool)");
+    }
+
+    #[test]
+    fn test_yoneda_distributed_case_b() {
+        // Implicit Fn-encoded: (Int⇒Bool⇒X)⇒X  →  (Int, Bool)
+        // (no Forall wrapper — pure Fn-encoded pattern)
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let int_ty = ctx.int(32, true);
+        let bool_ty = ctx.bool();
+        let inner_fn = ctx.function(vec![int_ty, bool_ty], p0);
+        let ty = ctx.function(vec![inner_fn], p0);
+        let reduced = ctx.try_yoneda_reduce(ty);
+        let expected = ctx.tuple(vec![int_ty, bool_ty]);
+        assert_eq!(reduced, expected, "(Int⇒Bool⇒X)⇒X should reduce to (Int,Bool)");
+    }
+}

@@ -136,6 +136,7 @@ impl Constraint {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct InferenceContext {
     type_vars: Vec<TypeVar>,
     var_type_ids: Vec<TypeId>,
@@ -780,5 +781,121 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
             ctx.find_type(&TypeData::Forall { param_index, param_name, body: new_body })
                 .unwrap_or(ctx.error())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_ctx() -> TypeContext { TypeContext::new() }
+
+    #[test]
+    fn test_shape_of_fn() {
+        let mut ctx = new_ctx();
+        let int_ty = ctx.int(32, true);
+        let bool_ty = ctx.bool();
+        let fn_ty = ctx.function(vec![int_ty], bool_ty);
+        let shape = InferenceContext::shape_of_type(&ctx, fn_ty);
+        assert!(matches!(shape, PrincipalShape::Arrow));
+    }
+
+    #[test]
+    fn test_shape_of_tuple() {
+        let mut ctx = new_ctx();
+        let bool_ty = ctx.bool();
+        let int_ty = ctx.int(32, true);
+        let tup = ctx.tuple(vec![bool_ty, int_ty]);
+        let shape = InferenceContext::shape_of_type(&ctx, tup);
+        assert!(matches!(shape, PrincipalShape::Tuple(2)));
+    }
+
+    #[test]
+    fn test_shape_of_forall() {
+        let mut ctx = new_ctx();
+        let p0 = ctx.generic_param(0, "X".into());
+        let fn_ty = ctx.function(vec![p0], p0);
+        let forall = ctx.forall(0, "X".into(), fn_ty);
+        let shape = InferenceContext::shape_of_type(&ctx, forall);
+        assert!(matches!(shape, PrincipalShape::Poly));
+    }
+
+    #[test]
+    fn test_suspend_and_wake_var() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        // Extract the var ID from the InferVar type
+        let var_id = match ctx.get(var) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        infer.suspend_on_var(Constraint::Impl(ctx.bool(), DefId(0), crate::ast::Span::new(0, 0)), var_id);
+        // Waking moves suspended constraints back to the active list
+        infer.wake_var(var_id);
+        // The active constraints list should now have the suspended constraint
+        assert!(!infer.constraints.is_empty());
+    }
+
+    #[test]
+    fn test_wake_var_incremental() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let var_id = match ctx.get(var) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        infer.suspend_on_var(Constraint::Impl(ctx.bool(), DefId(0), crate::ast::Span::new(0, 0)), var_id);
+        // wake_var_incremental needs a heap, var_id, and ctx
+        let mut heap = std::collections::BinaryHeap::new();
+        infer.wake_var_incremental(var_id, &mut heap, &ctx);
+        // After waking, the wait list should be empty
+        assert!(infer.wait_lists[var_id].is_empty());
+    }
+
+    #[test]
+    fn test_level_enter_exit() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let prev = infer.enter_level();
+        assert!(infer.current_level > 0);
+        infer.exit_level(prev);
+        assert_eq!(infer.current_level, 0);
+    }
+
+    #[test]
+    fn test_level_new_type_var() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let prev = infer.enter_level();
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let var_id = match ctx.get(var) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        assert!(infer.get_var_level(var_id).unwrap_or(0) > 0);
+        infer.exit_level(prev);
+    }
+
+    #[test]
+    fn test_eq_concrete_priority() {
+        let mut ctx = TypeContext::new();
+        let bool_ty = ctx.bool();
+        let int_ty = ctx.int(32, true);
+        let eq = Constraint::Eq(bool_ty, int_ty, crate::ast::Span::new(0, 0));
+        let impl_c = Constraint::Impl(bool_ty, DefId(0), crate::ast::Span::new(0, 0));
+        assert!(eq.priority(&ctx) < impl_c.priority(&ctx));
+    }
+
+    #[test]
+    fn test_impl_lowest_priority() {
+        let mut ctx = TypeContext::new();
+        let bool_ty = ctx.bool();
+        let int_ty = ctx.int(32, true);
+        let a = Constraint::Impl(bool_ty, DefId(0), crate::ast::Span::new(0, 0));
+        let b = Constraint::Impl(int_ty, DefId(1), crate::ast::Span::new(0, 0));
+        // Both Impl constraints should have the same priority
+        assert_eq!(a.priority(&ctx), b.priority(&ctx));
     }
 }
