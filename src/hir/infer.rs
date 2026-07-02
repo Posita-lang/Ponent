@@ -243,6 +243,9 @@ pub struct InferenceContext {
     forward_refs: Vec<Vec<usize>>,
     /// Reverse of forward_refs: for each instance, which PG var it came from.
     reverse_refs: Vec<Option<usize>>,
+    /// Tracks which InferVar ids have been unified since the last
+    /// `force_generalize` call, enabling incremental processing.
+    dirty_set: std::collections::HashSet<usize>,
 }
 
 /// A set of pattern alternatives for a suspended match constraint.
@@ -276,6 +279,7 @@ impl InferenceContext {
             match_branches: Vec::new(),
             forward_refs: Vec::new(),
             reverse_refs: Vec::new(),
+            dirty_set: std::collections::HashSet::new(),
         }
     }
 
@@ -481,11 +485,6 @@ impl InferenceContext {
     /// that can be referenced by a `Constraint::Match`.
     pub fn register_match_branches(&mut self, branches: Vec<MatchBranchSet>) -> usize {
         let id = self.match_branches.len();
-        self.match_branches.push(MatchBranchSet {
-            shape_pattern: PrincipalShape::Unknown,
-            continuation: Vec::new(),
-            else_continuation: Vec::new(),
-        });
         for b in branches {
             self.match_branches.push(b);
         }
@@ -509,17 +508,23 @@ impl InferenceContext {
         match ctx.get(resolved) {
             TypeData::InferVar { id } => {
                 if *id < self.guard_sets.len() && !self.guard_sets[*id].is_empty() {
-                    // Already guarded — match will fire when guard resolves.
                     true
                 } else {
-                    // Register this match on the var's wait list so it fires
-                    // automatically when the var is unified with a concrete type.
                     let match_c = Constraint::Match {
                         scrutinee,
                         branches_id,
                         span: crate::ast::Span::new(0, 0),
                     };
-                    self.suspend_on_var(match_c, *id);
+                    // #3: Register on this var AND all vars sharing its
+                    // binding root (transitive wait_list).
+                    let root = ctx.resolve_binding(scrutinee);
+                    let targets: Vec<usize> = self.var_type_ids.iter().enumerate()
+                        .filter(|(_, ty_id)| ctx.resolve_binding(**ty_id) == root)
+                        .map(|(i, _)| i)
+                        .collect();
+                    for other_id in targets {
+                        self.suspend_on_var(match_c.clone(), other_id);
+                    }
                     true
                 }
             }
@@ -883,39 +888,136 @@ impl InferenceContext {
     /// Call this before `s_inst_copy` to ensure the source scheme
     /// is in its most-generalized form.
     pub fn force_generalize(&mut self, ctx: &mut TypeContext) {
-        // 1. Identify all PG variables and mark them as guarded.
-        for i in 0..self.gen_statuses.len() {
-            if self.gen_statuses[i] == GenStatus::PartiallyGeneralizable {
-                // Ensure the var's guard set is consistent.
-                if i >= self.guard_sets.len() {
-                    while self.guard_sets.len() <= i {
-                        self.guard_sets.push(Vec::new());
+        // Only process variables that have been modified since the last call
+        // (drain_dirty). When dirty_set is empty (no tracking available),
+        // fall back to processing all PG variables conservatively.
+        let dirty: Vec<usize> = if self.dirty_set.is_empty() {
+            (0..self.gen_statuses.len()).filter(|i| self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable)).collect()
+        } else {
+            self.dirty_set.iter().copied().filter(|i| self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable)).collect()
+        };
+
+        if dirty.is_empty() {
+            return;
+        }
+
+        // Ensure guard_sets vectors are sized consistently.
+        for &i in &dirty {
+            while self.guard_sets.len() <= i {
+                self.guard_sets.push(Vec::new());
+            }
+        }
+
+        // Compute transitive guards: variables that share a binding root
+        // with a directly-guarded variable are transitively guarded.
+        // This ensures guards propagate through unification groups.
+        let mut trans_guarded: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for &i in &dirty {
+            let has_direct = i < self.guard_sets.len() && !self.guard_sets[i].is_empty();
+            if has_direct {
+                trans_guarded.insert(i);
+            }
+        }
+        // Expand: any two variables unified to the same root share guards.
+        for &i in &dirty {
+            if !trans_guarded.contains(&i) && i < self.var_type_ids.len() {
+                let i_root = ctx.resolve_binding(self.var_type_ids[i]);
+                for &j in &dirty {
+                    if j < self.var_type_ids.len() && trans_guarded.contains(&j) {
+                        let j_root = ctx.resolve_binding(self.var_type_ids[j]);
+                        if i_root == j_root {
+                            trans_guarded.insert(i);
+                            break;
+                        }
                     }
                 }
             }
         }
 
-        // 2. For each resolved non-PG variable at a candidate level,
-        //    attempt generalization: if it has no guards and no wait_list
-        //    entries, mark it Generalized.
-        for i in 0..self.gen_statuses.len() {
-            if i >= self.type_vars.len() || i >= self.var_type_ids.len() {
-                continue;
-            }
-            if self.gen_statuses[i] == GenStatus::PartiallyGeneralizable {
-                let has_guards = i < self.guard_sets.len() && !self.guard_sets[i].is_empty();
-                let has_waiting = i < self.wait_lists.len() && !self.wait_lists[i].is_empty();
-                let is_resolved = {
-                    let ty = ctx.resolve_binding(self.var_type_ids[i]);
-                    !matches!(ctx.get(ty), TypeData::InferVar { .. })
-                };
+        // Process variables innermost-first (by descending level) so that
+        // generalizations in nested scopes are visible to outer scopes.
+        let mut vars_by_level: Vec<(usize, usize)> = dirty.iter()
+            .map(|&i| {
+                let level = if i < self.type_vars.len() { self.type_vars[i].level } else { 0 };
+                (i, level)
+            })
+            .collect();
+        vars_by_level.sort_by(|a, b| b.1.cmp(&a.1));
 
-                if is_resolved && !has_guards && !has_waiting {
-                    // Safely generalizable: PG → G
-                    self.gen_statuses[i] = GenStatus::Generalized;
+        // Before generalizing, check for skolem escape: if a resolved type
+        // contains a GenericParam reference at a level below the variable's
+        // own level, a Forall-bound variable has escaped its scope.
+        for &(i, level) in &vars_by_level {
+            if i >= self.var_type_ids.len() { continue; }
+            let resolved = ctx.resolve_binding(self.var_type_ids[i]);
+            if matches!(ctx.get(resolved), TypeData::InferVar { .. }) { continue; }
+            if level < self.current_level {
+                if Self::check_rigid_escape(ctx, resolved, level) {
+                    continue; // keep as PG, don't generalize
                 }
             }
         }
+
+        // Generalize eligible PG variables: resolved, unguarded, no waiting
+        // constraints → safe to promote from PG to G.
+        for &(i, _level) in &vars_by_level {
+            if i >= self.gen_statuses.len() || self.gen_statuses[i] != GenStatus::PartiallyGeneralizable {
+                continue;
+            }
+
+            let is_trans_guarded = trans_guarded.contains(&i);
+            let has_waiting = i < self.wait_lists.len() && !self.wait_lists[i].is_empty();
+            let is_resolved = {
+                let ty = ctx.resolve_binding(self.var_type_ids[i]);
+                !matches!(ctx.get(ty), TypeData::InferVar { .. })
+            };
+
+            if is_resolved && !is_trans_guarded && !has_waiting {
+                self.gen_statuses[i] = GenStatus::Generalized;
+            }
+        }
+
+        self.dirty_set.clear();
+    }
+
+    /// Check whether a resolved type contains escaped rigid (skolem) variables.
+    /// Recursively walks the type tree looking for `GenericParam` references that
+    /// would indicate a Forall-bound variable has escaped into an outer scope.
+    fn check_rigid_escape(ctx: &TypeContext, ty: TypeId, max_level: usize) -> bool {
+        let resolved = ctx.resolve_binding(ty);
+        match ctx.get(resolved) {
+            TypeData::GenericParam { .. } => true, // escape detected
+            TypeData::Fn { params, ret } => {
+                params.iter().any(|&p| Self::check_rigid_escape(ctx, p, max_level))
+                    || Self::check_rigid_escape(ctx, *ret, max_level)
+            }
+            TypeData::Tuple { elems } | TypeData::Coproduct { alternatives: elems } => {
+                elems.iter().any(|&e| Self::check_rigid_escape(ctx, e, max_level))
+            }
+            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
+                args.iter().any(|&a| Self::check_rigid_escape(ctx, a, max_level))
+            }
+            TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. }
+            | TypeData::Poly { body, .. } | TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => {
+                Self::check_rigid_escape(ctx, *body, max_level)
+            }
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+                Self::check_rigid_escape(ctx, *ty, max_level)
+            }
+            TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
+                Self::check_rigid_escape(ctx, *elem, max_level)
+            }
+            TypeData::Ptr { pointee, .. } => Self::check_rigid_escape(ctx, *pointee, max_level),
+            TypeData::AssociatedType { self_ty, .. } => Self::check_rigid_escape(ctx, *self_ty, max_level),
+            _ => false, // Int, Bool, etc. are safe
+        }
+    }
+
+    /// Mark a variable as dirty for the next `force_generalize` call.
+    /// Called when a variable is unified or updated, enabling incremental
+    /// processing instead of re-checking all variables.
+    pub fn mark_dirty(&mut self, var_id: usize) {
+        self.dirty_set.insert(var_id);
     }
 
     /// Check if a variable has any forward references (instances).
@@ -946,9 +1048,7 @@ impl InferenceContext {
         let shape = Self::shape_of_type(ctx, resolved);
 
         // Find the branch that matches this shape.
-        // Branches are stored starting at branches_id + 1 (branches_id is
-        // a placeholder index — see register_match_branches).
-        let start = branches_id + 1;
+        let start = branches_id;
         if start < self.match_branches.len() {
             for i in start..self.match_branches.len() {
                 let branch = &self.match_branches[i];
@@ -1280,6 +1380,23 @@ impl InferenceContext {
         }
     }
     if woken == 0 {
+        // #2: Solver exhaustion — check for remaining undischarged Match
+        // constraints and fire their else_continuation as a fallback.
+        let remaining: Vec<PrioritizedConstraint> = heap.drain().collect();
+        let match_elses: Vec<(TypeId, usize)> = remaining.iter()
+            .filter_map(|pc| {
+                if let Constraint::Match { scrutinee, branches_id, .. } = &pc.constraint {
+                    let resolved = ctx.resolve_binding(*scrutinee);
+                    if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
+                        Some((*scrutinee, *branches_id))
+                    } else { None }
+                } else { None }
+            })
+            .collect();
+        let mut else_heap = BinaryHeap::new();
+        for (scrutinee, branches_id) in match_elses {
+            self.discharge_match(ctx, scrutinee, branches_id, &mut else_heap);
+        }
         break; // converged: no more constraints to wake
     }
     // Continue the loop to process woken constraints
@@ -1792,7 +1909,7 @@ mod tests {
             "match on resolved type should have medium priority");
     }
 
-    // ── #1 else_ fallback ──────────────────────────────────────────
+    // ── else_ fallback ───────────────────────────────────────────────
 
     #[test]
     fn test_else_continuation_on_mismatch() {
@@ -1833,7 +1950,7 @@ mod tests {
         assert!(heap.is_empty(), "no constraints should be enqueued");
     }
 
-    // ── #2 force_generalization ────────────────────────────────────
+    // ── force_generalization ─────────────────────────────────────────
 
     #[test]
     fn test_force_generalize_pg_with_guard() {
@@ -1871,7 +1988,7 @@ mod tests {
             "un-guarded resolved PG var should become Generalized");
     }
 
-    // ── #3 [s] pattern: try_match_via_shape_var callback ──────────
+    // ── [s] pattern: try_match_via_shape_var callback ─────────────────
 
     #[test]
     fn test_try_match_via_shape_var_registers_waitlist() {
