@@ -630,34 +630,40 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 }
             }
             Expr::PolyUnbox { expr, scheme: _, span } => {
-                // Infer the expression type; expect it to be a Poly.
                 let (hir_expr, outer_ty) = self.infer_expr(expr)?;
                 let resolved = self.checker.ctx.resolve_binding(outer_ty);
                 match self.checker.ctx.get(resolved).clone() {
                     TypeData::Poly { quantifiers, body } => {
-                        // Instantiate the polytype: replace each GenericParam with a fresh InferVar.
-                        let mut subst_map: Vec<(usize, TypeId)> = Vec::new();
-                        for (idx, _name) in &quantifiers {
-                            let fresh = self.checker.infer.new_type_var(
-                                self.checker.ctx,
-                                crate::hir::infer::TypeVariableKind::Any,
-                            );
-                            subst_map.push((*idx, fresh));
-                        }
-                        let mut result_ty = body;
-                        // Apply substitution from inside out (reverse order)
+                        // Instantiate the polytype: replace each GenericParam with a fresh InferVar,
+                        // then return a ROOT InferVar unified with the constructed type,
+                        // so unification can propagate through the InferVar.
+                        let subst_map: Vec<(usize, TypeId)> = quantifiers.iter()
+                            .map(|(idx, _name)| {
+                                let fresh = self.checker.infer.new_type_var(
+                                    self.checker.ctx,
+                                    crate::hir::infer::TypeVariableKind::Any,
+                                );
+                                (*idx, fresh)
+                            })
+                            .collect();
+                        let mut inst_ty = body;
                         for (idx, fresh_ty) in &subst_map {
-                            result_ty = self.checker.ctx.replace_generic(result_ty, *idx, *fresh_ty);
+                            inst_ty = self.checker.ctx.replace_generic(inst_ty, *idx, *fresh_ty);
                         }
-                        Ok((HirExpr::PolyUnbox { expr: Box::new(hir_expr), ty: result_ty, span: *span }, result_ty))
+                        // Create a root InferVar and unify it with the instantiated type,
+                        // so the result behaves as an InferVar for unification purposes.
+                        let root = self.checker.infer.new_type_var(
+                            self.checker.ctx,
+                            crate::hir::infer::TypeVariableKind::Any,
+                        );
+                        self.checker.ctx.unify(root, inst_ty).ok();
+                        Ok((HirExpr::PolyUnbox { expr: Box::new(hir_expr), ty: root, span: *span }, root))
                     }
                     TypeData::InferVar { id: _ } => {
-                        // The poly type is not yet known.  Create a fresh InferVar for the result.
                         let result_ty = self.checker.infer.new_type_var(
                             self.checker.ctx,
                             crate::hir::infer::TypeVariableKind::Any,
                         );
-                        // Full suspended matching will be added in Phase 5.
                         Ok((HirExpr::PolyUnbox { expr: Box::new(hir_expr), ty: result_ty, span: *span }, result_ty))
                     }
                     other => {

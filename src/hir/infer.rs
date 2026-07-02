@@ -654,8 +654,7 @@ impl InferenceContext {
         ctx: &TypeContext,
         ty: TypeId,
     ) -> Option<PrincipalShape> {
-        let z3_path = "/home/cero/z3/z3-4.14.0-x64-glibc-2.35/bin/z3";
-        let solver = SmtSolver::new(z3_path);
+        let solver = SmtSolver::new("z3");
 
         // ── 1. Collect all resolved bindings ─────────────────────
         let mut bindings: std::collections::HashMap<usize, TypeId> =
