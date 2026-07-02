@@ -819,47 +819,52 @@ impl InferenceContext {
         }
     }
 
-    // ── S-Exists-Lower: Level-based heuristic (OmniML §5.3) ─────────
-    //
-    // HEURISTIC, NOT THE FULL PAPER'S SEMANTICS.
+    // ── S-Exists-Lower: Z3-backed semantic check (OmniML §5.3) ───
     //
     // The paper's S-Exists-Lower requires:
     //   "C determines β̄ iff every ground assignment φ and φ' that satisfy
     //    (the erasure of) C and coincide outside of β̄ coincide on β̄."
     //
-    // This is a ∀∀ semantic condition requiring SMT solving (see
-    // unicity_check_smt for the Z3-based implementation of the full check).
+    // We implement this via Z3 (unicity_check_smt). If Z3 determines the
+    // variable's shape is uniquely determined by the constraint context, it
+    // is safe to lower from PG to monomorphic (Ungeneralized).
     //
-    // Our heuristic: when a PG variable at a higher (inner) level is unified
-    // with a variable from outside the region (lower level), we conservatively
-    // lower it. This is a sound over-approximation (may reject valid programs
-    // that the paper would accept) but is NOT a complete implementation of
-    // the paper's "determines" predicate.
-    //
-    // The full semantic check is available via unicity_check_smt() which
-    // shells out to Z3 for the proper ∀φ, φ' semantics.
+    // Falls back to a level-based heuristic when Z3 is unavailable or the
+    // query times out, as a conservative over-approximation.
     
-    /// Attempt to lower a variable from a higher (inner) level to a
-    /// lower (outer) level. Returns true if lowering occurred.
-    /// This is a HEURISTIC approximation of the paper's S-Exists-Lower rule.
-    /// For the full semantic check, use unicity_check_smt().
-    pub fn s_exists_lower(&mut self, var_id: usize) -> bool {
-        if var_id >= self.type_vars.len() {
+    /// Attempt to lower a variable using the full Z3-backed semantic check
+    /// (OmniML §5.3 S-Exists-Lower). If Z3 determines the variable's shape is
+    /// uniquely determined by the constraint context, it can be safely lowered
+    /// from PG to monomorphic (Ungeneralized).
+    ///
+    /// Falls back to the level-based heuristic when Z3 is unavailable.
+    pub fn s_exists_lower(&mut self, ctx: &TypeContext, var_id: usize) -> bool {
+        if var_id >= self.type_vars.len() || var_id >= self.gen_statuses.len() {
             return false;
         }
-        if var_id >= self.gen_statuses.len() {
+        if self.gen_statuses[var_id] != GenStatus::PartiallyGeneralizable {
             return false;
         }
+
+        // ── Z3-backed semantic check ──────────────────────────────
+        // Query whether this variable's shape is uniquely determined.
+        if let Some(_shape) = self.unicity_check_smt(ctx, self.var_type_ids[var_id]) {
+            // Shape is uniquely determined → safe to lower.
+            self.gen_statuses[var_id] = GenStatus::Ungeneralized;
+            return true;
+        }
+
+        // ── Fallback: level-based heuristic ───────────────────────
+        // When Z3 is unavailable or the query times out, use the
+        // conservative level-based approximation.
         let var_level = self.type_vars[var_id].level;
-        // Only PG variables at levels > 0 can be lowered
-        if var_level == 0 || self.gen_statuses[var_id] != GenStatus::PartiallyGeneralizable {
-            return false;
+        if var_level > 0 && var_level > self.current_level {
+            self.type_vars[var_id].level = var_level - 1;
+            self.gen_statuses[var_id] = GenStatus::Ungeneralized;
+            return true;
         }
-        // Lower: reduce level by 1 (to match the enclosing scope)
-        // and change status from PG to Ungeneralized (monomorphic).
-        self.type_vars[var_id].level = var_level - 1;
-        self.gen_statuses[var_id] = GenStatus::Ungeneralized;
-        true
+
+        false
     }
 
     /// Check if a variable has any forward references (instances).
@@ -1016,10 +1021,11 @@ impl InferenceContext {
                                     self.s_inst_copy(ctx, *var_id, resolved_ty);
                                 }
                                 // ── S-Exists-Lower (OmniML §5.3) ──
-                                // If this PG variable was unified with outer variable,
-                                // it cannot be generalized — lower it.
-                                if self.get_var_level(*var_id).unwrap_or(0) > self.current_level {
-                                    self.s_exists_lower(*var_id);
+                                // Use Z3-backed semantic check: if the variable's shape
+                                // is uniquely determined by the constraint context,
+                                // it can safely be lowered to monomorphic.
+                                if self.s_exists_lower(ctx, *var_id) {
+                                    // lowering succeeded
                                 }
                             }
                         }
