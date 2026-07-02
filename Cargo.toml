@@ -10,3 +10,4 @@ indexmap = "2.14.0"
 logos = "0.16.1"
 miette = "7.6.0"
 rustc-hash = "2.1.2"
+z3 = { version = "0.20.2", features = ["vendored"] }

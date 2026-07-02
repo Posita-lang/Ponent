@@ -680,13 +680,8 @@ impl InferenceContext {
             }
         }
 
-        // ── 3. Build the combined solver context ─────────────────
-        let mut solver_ctx = String::new();
-        solver_ctx.push_str(&solver.encode_bindings(ctx, &bindings));
-        solver_ctx.push_str(&solver.encode_eq_constraints(ctx, &eq_pairs));
-
-        // ── 4. Check unicity via Z3 ──────────────────────────────
-        solver.check_unicity(ctx, ty, &solver_ctx)
+        // ── 3. Check unicity via Z3 ──────────────────────────────
+        solver.check_unicity(ctx, ty, &bindings, &eq_pairs)
     }
 
     // ── OmniML: Incremental Instantiation ────────────────────────
