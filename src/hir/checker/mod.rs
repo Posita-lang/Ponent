@@ -959,6 +959,7 @@ impl<'a> TypeChecker<'a> {
                         }
                     }
                     let self_ty = &for_type; // The original AST type for Self
+                    let auto_deref = attributes.iter().any(|a| a.name == "auto_deref");
                     let mut method_infos = Vec::new();
                     for m in methods {
                         let param_tys = m.params.iter()
@@ -978,7 +979,7 @@ impl<'a> TypeChecker<'a> {
                             param_tys,
                             ret_ty,
                             span: m.span,
-                            has_auto_deref: false, // @auto_deref not yet supported
+                            has_auto_deref: auto_deref,
                         });
                     }
                     self.trait_env.add_inherent_methods(for_def_id, method_infos);

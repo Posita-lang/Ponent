@@ -362,6 +362,14 @@ impl SymbolTable {
         Some(binding.def_id)
     }
 
+    /// Find all traits that define an associated type with the given name.
+    pub fn lookup_traits_by_assoc_type_name(&self, name: &str) -> Vec<DefId> {
+        self.trait_defs.iter()
+            .filter(|(_, b)| b.associated_types.iter().any(|(n, _)| n == name))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     pub fn lookup_field(&self, def_id: DefId, name: &str) -> Option<TypeId> {
         let binding = self.type_defs.get(&def_id)?;
         if let TypeKind::Struct = binding.kind {
