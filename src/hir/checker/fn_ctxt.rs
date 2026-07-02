@@ -597,6 +597,76 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let ty = self.block_type(&hir_stmts);
                 Ok((HirExpr::Block(hir_stmts, ty, *span), ty))
             }
+            Expr::PolyBox { expr, scheme: _, span } => {
+                // Infer the inner expression type.
+                let (hir_expr, inner_ty) = self.infer_expr(expr)?;
+                let resolved = self.checker.ctx.resolve_binding(inner_ty);
+                match self.checker.ctx.get(resolved).clone() {
+                    TypeData::Forall { param_index, param_name, body } => {
+                        // Wrap in Poly — extract quantifier info, reconstruct.
+                        let quantifiers = vec![(param_index, param_name)];
+                        // Peel any nested Forall layers.
+                        let mut all_q = quantifiers;
+                        let mut inner_body = body;
+                        loop {
+                            match self.checker.ctx.get(self.checker.ctx.resolve_binding(inner_body)).clone() {
+                                TypeData::Forall { param_index: pi, param_name: pn, body: b } => {
+                                    all_q.push((pi, pn));
+                                    inner_body = b;
+                                }
+                                _ => break,
+                            }
+                        }
+                        let poly_ty = self.checker.ctx.poly(all_q, inner_body);
+                        Ok((HirExpr::PolyBox { expr: Box::new(hir_expr), ty: poly_ty, span: *span }, poly_ty))
+                    }
+                    other => {
+                        // Not polymorphic — try to box the entire Forall-like structure
+                        // or emit an error if the type isn't quantifiable.
+                        let msg = format!("poly(...) requires a polymorphic expression, found non-polymorphic type {:?}", other);
+                        self.checker.diagnostics.push(Diagnostic::error(msg).with_span(*span));
+                        Ok((HirExpr::Error(*span), self.checker.ctx.error()))
+                    }
+                }
+            }
+            Expr::PolyUnbox { expr, scheme: _, span } => {
+                // Infer the expression type; expect it to be a Poly.
+                let (hir_expr, outer_ty) = self.infer_expr(expr)?;
+                let resolved = self.checker.ctx.resolve_binding(outer_ty);
+                match self.checker.ctx.get(resolved).clone() {
+                    TypeData::Poly { quantifiers, body } => {
+                        // Instantiate the polytype: replace each GenericParam with a fresh InferVar.
+                        let mut subst_map: Vec<(usize, TypeId)> = Vec::new();
+                        for (idx, _name) in &quantifiers {
+                            let fresh = self.checker.infer.new_type_var(
+                                self.checker.ctx,
+                                crate::hir::infer::TypeVariableKind::Any,
+                            );
+                            subst_map.push((*idx, fresh));
+                        }
+                        let mut result_ty = body;
+                        // Apply substitution from inside out (reverse order)
+                        for (idx, fresh_ty) in &subst_map {
+                            result_ty = self.checker.ctx.replace_generic(result_ty, *idx, *fresh_ty);
+                        }
+                        Ok((HirExpr::PolyUnbox { expr: Box::new(hir_expr), ty: result_ty, span: *span }, result_ty))
+                    }
+                    TypeData::InferVar { id: _ } => {
+                        // The poly type is not yet known.  Create a fresh InferVar for the result.
+                        let result_ty = self.checker.infer.new_type_var(
+                            self.checker.ctx,
+                            crate::hir::infer::TypeVariableKind::Any,
+                        );
+                        // Full suspended matching will be added in Phase 5.
+                        Ok((HirExpr::PolyUnbox { expr: Box::new(hir_expr), ty: result_ty, span: *span }, result_ty))
+                    }
+                    other => {
+                        let msg = format!("unbox(expr) requires a polytype, found {:?}", other);
+                        self.checker.diagnostics.push(Diagnostic::error(msg).with_span(*span));
+                        Ok((HirExpr::Error(*span), self.checker.ctx.error()))
+                    }
+                }
+            }
             Expr::Error(span) => Ok((HirExpr::Error(*span), self.checker.ctx.error())),
         }
     }

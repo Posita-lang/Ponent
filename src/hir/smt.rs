@@ -51,7 +51,7 @@ impl SmtSolver {
                 TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
                     PrincipalShape::Constructor(args.len())
                 }
-                TypeData::Forall { .. } | TypeData::Exists { .. } => PrincipalShape::Poly,
+                TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } => PrincipalShape::Poly,
                 _ => PrincipalShape::Unknown,
             };
             return Some(shape);
@@ -226,7 +226,8 @@ impl SmtSolver {
                 // Simplified: just use tuple2 for any structure
                 "type-unknown".into()
             }
-            TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. } => {
+            TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. }
+            | TypeData::Poly { body, .. } => {
                 let b = self.type_to_smt_term(ctx, *body);
                 format!("(type-poly {})", b)
             }

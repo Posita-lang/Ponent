@@ -36,6 +36,7 @@ pub enum TypeTag {
     Coproduct = 25,
     Mu = 26,
     Nu = 27,
+    Poly = 28,
 }
 
 impl From<&TypeData> for TypeTag {
@@ -66,6 +67,7 @@ impl From<&TypeData> for TypeTag {
             TypeData::Coproduct { .. } => TypeTag::Coproduct,
             TypeData::Mu { .. } => TypeTag::Mu,
             TypeData::Nu { .. } => TypeTag::Nu,
+            TypeData::Poly { .. } => TypeTag::Poly,
             TypeData::Never => TypeTag::Never,
             TypeData::Unit => TypeTag::Unit,
             TypeData::Error => TypeTag::Error,
@@ -185,6 +187,14 @@ pub enum TypeData {
     Nu {
         param_index: usize,
         param_name: String,
+        body: TypeId,
+    },
+    /// A polytype: `[∀ᾱ. τ]` — a boxed first-class polymorphic type.
+    /// `quantifiers` lists the universally quantified variables as (index, name) pairs.
+    /// `body` is the inner type, referencing quantifiers via `GenericParam`.
+    /// See OmniML §3.1 (O'Brien, Rémy & Scherer).
+    Poly {
+        quantifiers: Vec<(usize, String)>,
         body: TypeId,
     },
     Never,
@@ -418,6 +428,13 @@ impl TypeContext {
 
     pub fn function(&mut self, params: Vec<TypeId>, ret: TypeId) -> TypeId {
         self.alloc(TypeData::Fn { params, ret })
+    }
+
+    /// Allocate a polytype `[∀ᾱ. τ]` — a boxed first-class polymorphic type.
+    /// `quantifiers` are (index, name) pairs for universally quantified variables.
+    /// `body` references them via `GenericParam`.
+    pub fn poly(&mut self, quantifiers: Vec<(usize, String)>, body: TypeId) -> TypeId {
+        self.alloc(TypeData::Poly { quantifiers, body })
     }
 
     /// Apply Yoneda reduction if this type matches the pattern
@@ -708,7 +725,8 @@ impl TypeContext {
                 vec![VarianceEdge { target: *pointee, sign: 0 }]
             }
             TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. }
-            | TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => {
+            | TypeData::Mu { body, .. } | TypeData::Nu { body, .. }
+            | TypeData::Poly { body, .. } => {
                 vec![VarianceEdge { target: *body, sign: 1 }]
             }
             TypeData::Coproduct { alternatives } => {
@@ -748,6 +766,9 @@ impl TypeContext {
             TypeData::Ptr { pointee, .. } => self.type_contains_param(param, *pointee),
             TypeData::AssociatedType { self_ty, .. } => {
                 self.type_contains_param(param, *self_ty)
+            }
+            TypeData::Poly { body, .. } => {
+                self.type_contains_param(param, *body)
             }
             TypeData::Exists { base, .. } => {
                 self.type_contains_param(param, *base)
@@ -835,6 +856,10 @@ impl TypeContext {
                 if new_alts.len() == 1 { new_alts[0] }
                 else { self.alloc(TypeData::Coproduct { alternatives: new_alts }) }
             }
+            TypeData::Poly { quantifiers, body } => {
+                let new_body = self.replace_generic(body, param_index, replacement);
+                self.poly(quantifiers, new_body)
+            }
             _ => ty,
         }
     }
@@ -875,6 +900,7 @@ impl TypeContext {
                 params.iter().any(|&p| self.occurs_check(param, p))
                     || self.occurs_check(param, *ret)
             }
+            TypeData::Poly { body, .. } => self.occurs_check(param, *body),
             TypeData::Exists { base, .. } => self.occurs_check(param, *base),
             TypeData::Forall { body, .. }
             | TypeData::Mu { body, .. }
@@ -1149,6 +1175,11 @@ impl TypeContext {
                 self.fn_ty_no_alloc(new_params, new_ret)
                     .expect("function type should exist")
             }
+            TypeData::Poly { quantifiers, body } => {
+                let new_body = self.subst(*body, subst);
+                self.find_type(&TypeData::Poly { quantifiers: quantifiers.clone(), body: new_body })
+                    .unwrap_or(ty)
+            }
             TypeData::DynTrait { .. } => ty,
             TypeData::Forall { param_index, param_name, body } => {
                 let new_body = self.subst(*body, subst);
@@ -1336,6 +1367,7 @@ impl TypeContext {
             }
             TypeData::AssociatedType { self_ty, .. } => 1 + self.type_constructor_depth(*self_ty),
             TypeData::Exists { base, .. } => 1 + self.type_constructor_depth(*base),
+            TypeData::Poly { quantifiers: _, body } => 1 + self.type_constructor_depth(*body),
             TypeData::Forall { body, .. } | TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => 1 + self.type_constructor_depth(*body),
             TypeData::DynTrait { .. } => 1,
             TypeData::Int { .. } | TypeData::UInt { .. } | TypeData::Float { .. }
@@ -1374,6 +1406,10 @@ impl TypeContext {
 
     pub fn is_exists(&self, ty: TypeId) -> bool {
         matches!(self.get(ty), TypeData::Exists { .. })
+    }
+
+    pub fn is_poly(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Poly { .. })
     }
 
     pub fn is_generic_param(&self, ty: TypeId) -> bool {
@@ -1732,7 +1768,8 @@ impl TypeContext {
                     Characteristic::FiniteExhaustible(total)
                 }
             }
-            TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. } => {
+            TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. }
+            | TypeData::Poly { body, .. } => {
                 self.characteristic_with_variance(*body, visited, has_non_covariant_path)
             }
             // DynTrait and AssociatedType: covariant containers but the concrete

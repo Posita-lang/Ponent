@@ -160,6 +160,7 @@ fn collect_generic_params_rec(ty: TypeId, ctx: &TypeContext, set: &mut std::coll
         }
         TypeData::AssociatedType { self_ty, .. } => collect_generic_params_rec(*self_ty, ctx, set),
         TypeData::Exists { base, .. } => collect_generic_params_rec(*base, ctx, set),
+        TypeData::Poly { body, .. } => collect_generic_params_rec(*body, ctx, set),
         _ => {}
     }
 }
@@ -228,6 +229,13 @@ fn collect_bare_generic_params(ty: TypeId, ctx: &TypeContext) -> std::collection
                 set.insert(*index);
             } else {
                 set.extend(collect_bare_generic_params(*base, ctx));
+            }
+        }
+        TypeData::Poly { body, .. } => {
+            if let TypeData::GenericParam { index, .. } = ctx.get(*body) {
+                set.insert(*index);
+            } else {
+                set.extend(collect_bare_generic_params(*body, ctx));
             }
         }
         _ => {}

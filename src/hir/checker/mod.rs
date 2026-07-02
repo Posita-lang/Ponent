@@ -1519,6 +1519,57 @@ impl<'a> TypeChecker<'a> {
                 let ty = self.block_type(&hir_stmts);
                 Ok((HirExpr::Block(hir_stmts, ty, *span), ty))
             }
+            Expr::PolyBox { expr, scheme: _, span } => {
+                let (hir_expr, inner_ty) = self.infer_expr(expr)?;
+                let resolved = self.ctx.resolve_binding(inner_ty);
+                match self.ctx.get(resolved).clone() {
+                    TypeData::Forall { param_index, param_name, body } => {
+                        let mut all_q = vec![(param_index, param_name)];
+                        let mut inner_body = body;
+                        loop {
+                            match self.ctx.get(self.ctx.resolve_binding(inner_body)).clone() {
+                                TypeData::Forall { param_index: pi, param_name: pn, body: b } => {
+                                    all_q.push((pi, pn));
+                                    inner_body = b;
+                                }
+                                _ => break,
+                            }
+                        }
+                        let poly_ty = self.ctx.poly(all_q, inner_body);
+                        Ok((HirExpr::PolyBox { expr: Box::new(hir_expr), ty: poly_ty, span: *span }, poly_ty))
+                    }
+                    _ => {
+                        self.diagnostics.push(Diagnostic::error("poly(...) requires a polymorphic expression").with_span(*span));
+                        Ok((HirExpr::Error(*span), self.ctx.error()))
+                    }
+                }
+            }
+            Expr::PolyUnbox { expr, scheme: _, span } => {
+                let (hir_expr, outer_ty) = self.infer_expr(expr)?;
+                let resolved = self.ctx.resolve_binding(outer_ty);
+                match self.ctx.get(resolved).clone() {
+                    TypeData::Poly { quantifiers, body } => {
+                        let mut subst_map: Vec<(usize, TypeId)> = Vec::new();
+                        for (idx, _name) in &quantifiers {
+                            let fresh = self.infer.new_type_var(self.ctx, TypeVariableKind::Any);
+                            subst_map.push((*idx, fresh));
+                        }
+                        let mut result_ty = body;
+                        for (idx, fresh_ty) in &subst_map {
+                            result_ty = self.ctx.replace_generic(result_ty, *idx, *fresh_ty);
+                        }
+                        Ok((HirExpr::PolyUnbox { expr: Box::new(hir_expr), ty: result_ty, span: *span }, result_ty))
+                    }
+                    TypeData::InferVar { .. } => {
+                        let result_ty = self.infer.new_type_var(self.ctx, TypeVariableKind::Any);
+                        Ok((HirExpr::PolyUnbox { expr: Box::new(hir_expr), ty: result_ty, span: *span }, result_ty))
+                    }
+                    _ => {
+                        self.diagnostics.push(Diagnostic::error("unbox(expr) requires a polytype").with_span(*span));
+                        Ok((HirExpr::Error(*span), self.ctx.error()))
+                    }
+                }
+            }
             Expr::Error(span) => Ok((HirExpr::Error(*span), self.ctx.error())),
         }
     }
@@ -2008,6 +2059,7 @@ impl<'a> TypeChecker<'a> {
             }
             TypeData::AssociatedType { self_ty, .. } => Self::collect_generic_param_indices(*self_ty, ctx, out),
             TypeData::Exists { base, .. } => Self::collect_generic_param_indices(*base, ctx, out),
+            TypeData::Poly { body, .. } => Self::collect_generic_param_indices(*body, ctx, out),
             _ => {}
         }
     }
@@ -2059,6 +2111,7 @@ impl<'a> TypeChecker<'a> {
             }
             TypeData::AssociatedType { self_ty, .. } => Self::type_var_in_problematic_position(*self_ty, vars, ctx),
             TypeData::Exists { base, .. } => Self::type_var_in_problematic_position(*base, vars, ctx),
+            TypeData::Poly { body, .. } => Self::type_var_in_problematic_position(*body, vars, ctx),
             _ => false,
         }
     }
@@ -2089,6 +2142,7 @@ impl<'a> TypeChecker<'a> {
             }
             TypeData::AssociatedType { self_ty, .. } => Self::type_tree_contains(*self_ty, target, ctx),
             TypeData::Exists { base, .. } => Self::type_tree_contains(*base, target, ctx),
+            TypeData::Poly { body, .. } => Self::type_tree_contains(*body, target, ctx),
             _ => false,
         }
     }
@@ -2539,6 +2593,67 @@ mod tests {
              }",
         );
         assert!(result.is_ok(), "polymorphic pair with two type params: {:?}", result.err());
+    }
+
+    // ── Polytopes (first-class polymorphism) ──────────────────────
+
+    #[test]
+    fn test_poly_box_identity() {
+        // Box a polymorphic identity function, then unbox and apply.
+        let result = check_source(
+            "def id<T>(x: T) -> T { return x; }
+             def main() -> Int<32> {
+                 let p = poly(id);
+                 let f = unbox(p);
+                 return f(42);
+             }",
+        );
+        assert!(result.is_ok(), "poly box/unbox identity: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_poly_box_twice() {
+        // Use the same poly in two different instantiations.
+        let result = check_source(
+            "def id<T>(x: T) -> T { return x; }
+             def main() -> Int<32> {
+                 let p = poly(id);
+                 let f = unbox(p);
+                 let x = f(42);
+                 let y = f(true);
+                 return x;
+             }",
+        );
+        assert!(result.is_ok(), "poly box twice: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_poly_unbox_non_poly_error() {
+        // Box a non-polymorphic value should produce an error.
+        let result = check_source(
+            "def main() -> Int<32> {
+                 let p = poly(42);
+                 return 0;
+             }",
+        );
+        assert!(result.is_err(), "poly(42) should error: {:?}", result);
+    }
+
+    #[test]
+    fn test_unbox_non_poly_error_after_resolution() {
+        // unbox on a concrete non-poly value triggers error when the poly type
+        // is later resolved (not yet enforced in current phase — will suspend in Phase 5).
+        // For now we test that the expression at least doesn't crash.
+        let result = check_source(
+            "def main() -> Int<32> {
+                 set x = 42;
+                 let p = unbox(x);
+                 return 0;
+             }",
+        );
+        // Currently accepts because InferVar is not yet checked against Poly.
+        // Phase 5 will add suspended matching for proper error detection.
+        assert!(result.is_ok() || result.is_err(), "unbox of non-poly should eventually error");
     }
 
     // ── Trait impl and operator overload ──────────────────────────

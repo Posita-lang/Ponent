@@ -242,6 +242,8 @@ impl<'source> Parser<'source> {
             Token::Trunc => Some("trunc".into()),
             Token::Ceil => Some("ceil".into()),
             Token::Floor => Some("floor".into()),
+            Token::Poly => Some("poly".into()),
+            Token::Unbox => Some("unbox".into()),
             Token::Propagates => Some("propagates".into()),
             Token::Overrides => Some("overrides".into()),
             _ => None,
@@ -2754,6 +2756,30 @@ impl<'source> Parser<'source> {
                 let end = self.span().end;
                 Ok(Expr::Await {
                     expr: Box::new(expr),
+                    span: Span::new(start, end),
+                })
+            }
+            Ok(Token::Poly) => {
+                self.advance().ok();
+                self.expect(Token::LParen)?;
+                let expr = self.parse_expr()?;
+                self.expect(Token::RParen)?;
+                let end = self.span().end;
+                Ok(Expr::PolyBox {
+                    expr: Box::new(expr),
+                    scheme: None,
+                    span: Span::new(start, end),
+                })
+            }
+            Ok(Token::Unbox) => {
+                self.advance().ok();
+                self.expect(Token::LParen)?;
+                let expr = self.parse_expr()?;
+                self.expect(Token::RParen)?;
+                let end = self.span().end;
+                Ok(Expr::PolyUnbox {
+                    expr: Box::new(expr),
+                    scheme: None,
                     span: Span::new(start, end),
                 })
             }

@@ -946,6 +946,14 @@ impl<'a> NameResolver<'a> {
                 self.exit_scope();
                 last_ty
             }
+            Expr::PolyBox { expr, .. } => {
+                self.resolve_expr(expr);
+                Some(self.ctx.error())
+            }
+            Expr::PolyUnbox { expr, .. } => {
+                self.resolve_expr(expr);
+                Some(self.ctx.error())
+            }
             Expr::Error(..) => Some(self.ctx.error()),
         }
     }

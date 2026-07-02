@@ -187,6 +187,20 @@ pub enum Expr {
         span: Span,
     },
     Block(Vec<Stmt>, Span),
+    /// `poly(expr)` — implicit poly box, or `poly : Scheme(expr)` — explicit.
+    PolyBox {
+        expr: Box<Expr>,
+        /// Optional scheme: `forall T1, T2, ... . body`
+        scheme: Option<TypeScheme>,
+        span: Span,
+    },
+    /// `unbox(expr)` — implicit poly unbox, or `unbox : Scheme(expr)` — explicit.
+    PolyUnbox {
+        expr: Box<Expr>,
+        /// Optional expected result scheme type.
+        scheme: Option<TypeScheme>,
+        span: Span,
+    },
     Error(Span),
 }
 
@@ -517,6 +531,14 @@ pub enum Type {
     Error(Span),
 }
 
+/// A polymorphic type scheme: `forall T1, T2, ... . body`
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeScheme {
+    pub quantifiers: Vec<(Span, String)>,
+    pub body: Box<Type>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     Wildcard(Span),
@@ -666,6 +688,8 @@ impl Expr {
             Expr::IfLet { span, .. } => *span,
             Expr::Match { span, .. } => *span,
             Expr::Block(_, span) => *span,
+            Expr::PolyBox { span, .. } => *span,
+            Expr::PolyUnbox { span, .. } => *span,
             Expr::Error(span) => *span,
         }
     }

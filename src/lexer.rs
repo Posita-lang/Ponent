@@ -422,6 +422,10 @@ pub enum Token {
     Propagates,
     #[token("overrides")]
     Overrides,
+    #[token("poly")]
+    Poly,
+    #[token("unbox")]
+    Unbox,
 
     #[regex("[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),

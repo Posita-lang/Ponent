@@ -301,6 +301,18 @@ pub enum HirExpr {
         span: Span,
     },
     Block(Vec<HirStmt>, TypeId, Span),
+    PolyBox {
+        expr: Box<HirExpr>,
+        /// The boxed polytype `[∀ᾱ. τ]` — a `TypeData::Poly` node.
+        ty: TypeId,
+        span: Span,
+    },
+    PolyUnbox {
+        expr: Box<HirExpr>,
+        /// The instantiated monotype `τ` (after unboxing).
+        ty: TypeId,
+        span: Span,
+    },
     Error(Span),
 }
 
@@ -379,6 +391,8 @@ impl HirExpr {
             HirExpr::IfLet { ty, .. } => *ty,
             HirExpr::Match { ty, .. } => *ty,
             HirExpr::Block(_, ty, _) => *ty,
+            HirExpr::PolyBox { ty, .. } => *ty,
+            HirExpr::PolyUnbox { ty, .. } => *ty,
             HirExpr::Error(_) => unreachable!("Error expression has no type"),
         }
     }
@@ -411,6 +425,8 @@ impl HirExpr {
             HirExpr::IfLet { span, .. } => *span,
             HirExpr::Match { span, .. } => *span,
             HirExpr::Block(_, _, span) => *span,
+            HirExpr::PolyBox { span, .. } => *span,
+            HirExpr::PolyUnbox { span, .. } => *span,
             HirExpr::Error(span) => *span,
         }
     }

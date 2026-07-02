@@ -430,7 +430,7 @@ impl InferenceContext {
             TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
                 PrincipalShape::Constructor(args.len())
             }
-            TypeData::Forall { .. } | TypeData::Exists { .. } => PrincipalShape::Poly,
+            TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } => PrincipalShape::Poly,
             TypeData::InferVar { .. } | TypeData::GenericParam { .. } => PrincipalShape::Var,
             _ => PrincipalShape::Unknown,
         }
@@ -504,27 +504,15 @@ impl InferenceContext {
         let resolved = ctx.resolve_binding(scrutinee);
         match ctx.get(resolved) {
             TypeData::InferVar { id } => {
-                // Try to find shape variables associated with this InferVar
-                // by checking if the variable is guarded by a shape var.
-                // If so, register a callback.
                 if *id < self.guard_sets.len() && !self.guard_sets[*id].is_empty() {
-                    // Registered a guard — the match will be handled when
-                    // the shape variable resolves.
                     true
                 } else {
-                    // No shape variables yet — cannot handle via shape var.
                     false
                 }
             }
             _ => {
-                // Already concrete — discharge via shape
-                let shape = self.shape_vars.get(ShapeVarId(0));
-                if let Some(_) = shape {
-                    self.discharge_match(ctx, scrutinee, branches_id, heap);
-                    true
-                } else {
-                    false
-                }
+                self.discharge_match(ctx, scrutinee, branches_id, heap);
+                true
             }
         }
     }
@@ -1391,7 +1379,8 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
         | TypeData::USize
         | TypeData::Never
         | TypeData::Unit
-        | TypeData::Error => ty,
+        | TypeData::Error
+        | TypeData::Poly { .. } => ty,
         TypeData::GenericParam { .. } => ty,
         TypeData::Struct { def_id, args } => {
             let new_args: Vec<TypeId> = args

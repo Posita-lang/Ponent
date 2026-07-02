@@ -416,7 +416,8 @@ pub fn type_data_to_shape(data: &TypeData) -> TypeShape {
         TypeData::Forall { .. }
         | TypeData::Exists { .. }
         | TypeData::Mu { .. }
-        | TypeData::Nu { .. } => TypeShape::Poly,
+        | TypeData::Nu { .. }
+        | TypeData::Poly { .. } => TypeShape::Poly,
         TypeData::Coproduct { alternatives } => TypeShape::Tuple(alternatives.len()),
         _ => TypeShape::Unknown,
     }
