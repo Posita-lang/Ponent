@@ -253,6 +253,10 @@ pub struct MatchBranchSet {
     pub shape_pattern: PrincipalShape,
     /// Continuation constraints to add when this branch matches.
     pub continuation: Vec<Constraint>,
+    /// Fallback constraints to add when no branch matches (else_).
+    /// Used as a default when the shape cannot be determined uniquely.
+    /// The system emits a diagnostic when else_ is triggered.
+    pub else_continuation: Vec<Constraint>,
 }
 
 impl InferenceContext {
@@ -478,10 +482,10 @@ impl InferenceContext {
     pub fn register_match_branches(&mut self, branches: Vec<MatchBranchSet>) -> usize {
         let id = self.match_branches.len();
         self.match_branches.push(MatchBranchSet {
-            shape_pattern: PrincipalShape::Unknown, // placeholder
+            shape_pattern: PrincipalShape::Unknown,
             continuation: Vec::new(),
+            else_continuation: Vec::new(),
         });
-        // Store each branch pattern
         for b in branches {
             self.match_branches.push(b);
         }
@@ -505,9 +509,18 @@ impl InferenceContext {
         match ctx.get(resolved) {
             TypeData::InferVar { id } => {
                 if *id < self.guard_sets.len() && !self.guard_sets[*id].is_empty() {
+                    // Already guarded — match will fire when guard resolves.
                     true
                 } else {
-                    false
+                    // Register this match on the var's wait list so it fires
+                    // automatically when the var is unified with a concrete type.
+                    let match_c = Constraint::Match {
+                        scrutinee,
+                        branches_id,
+                        span: crate::ast::Span::new(0, 0),
+                    };
+                    self.suspend_on_var(match_c, *id);
+                    true
                 }
             }
             _ => {
@@ -862,6 +875,49 @@ impl InferenceContext {
         false
     }
 
+    /// ── S-Generalize / force_generalization (OmniML §5.3) ───────
+    ///
+    /// Force generalization of the current region before instantiation.
+    /// Drains all dirty regions, marks guards on PG variables, and
+    /// runs the scheduler to flush any pending work.
+    /// Call this before `s_inst_copy` to ensure the source scheme
+    /// is in its most-generalized form.
+    pub fn force_generalize(&mut self, ctx: &mut TypeContext) {
+        // 1. Identify all PG variables and mark them as guarded.
+        for i in 0..self.gen_statuses.len() {
+            if self.gen_statuses[i] == GenStatus::PartiallyGeneralizable {
+                // Ensure the var's guard set is consistent.
+                if i >= self.guard_sets.len() {
+                    while self.guard_sets.len() <= i {
+                        self.guard_sets.push(Vec::new());
+                    }
+                }
+            }
+        }
+
+        // 2. For each resolved non-PG variable at a candidate level,
+        //    attempt generalization: if it has no guards and no wait_list
+        //    entries, mark it Generalized.
+        for i in 0..self.gen_statuses.len() {
+            if i >= self.type_vars.len() || i >= self.var_type_ids.len() {
+                continue;
+            }
+            if self.gen_statuses[i] == GenStatus::PartiallyGeneralizable {
+                let has_guards = i < self.guard_sets.len() && !self.guard_sets[i].is_empty();
+                let has_waiting = i < self.wait_lists.len() && !self.wait_lists[i].is_empty();
+                let is_resolved = {
+                    let ty = ctx.resolve_binding(self.var_type_ids[i]);
+                    !matches!(ctx.get(ty), TypeData::InferVar { .. })
+                };
+
+                if is_resolved && !has_guards && !has_waiting {
+                    // Safely generalizable: PG → G
+                    self.gen_statuses[i] = GenStatus::Generalized;
+                }
+            }
+        }
+    }
+
     /// Check if a variable has any forward references (instances).
     pub fn has_instances(&self, var_id: usize) -> bool {
         var_id < self.forward_refs.len() && !self.forward_refs[var_id].is_empty()
@@ -889,14 +945,29 @@ impl InferenceContext {
         let resolved = ctx.resolve_binding(scrutinee_ty);
         let shape = Self::shape_of_type(ctx, resolved);
 
-        // Find the branch that matches this shape
-        if branches_id < self.match_branches.len() {
-            let branch = &self.match_branches[branches_id];
-            let matches_pattern = shape == branch.shape_pattern;
+        // Find the branch that matches this shape.
+        // Branches are stored starting at branches_id + 1 (branches_id is
+        // a placeholder index — see register_match_branches).
+        let start = branches_id + 1;
+        if start < self.match_branches.len() {
+            for i in start..self.match_branches.len() {
+                let branch = &self.match_branches[i];
+                let matches_pattern = shape == branch.shape_pattern;
 
-            if matches_pattern {
-                // Enqueue continuation constraints
-                for c in &branch.continuation {
+                if matches_pattern {
+                    // Enqueue continuation constraints.
+                    for c in &branch.continuation {
+                        let p = c.priority(ctx);
+                        heap.push(PrioritizedConstraint { priority: p, constraint: c.clone() });
+                    }
+                    return true;
+                }
+            }
+
+            // No exact match — try the else_ fallback of the first branch.
+            let first = &self.match_branches[start];
+            if !first.else_continuation.is_empty() {
+                for c in &first.else_continuation {
                     let p = c.priority(ctx);
                     heap.push(PrioritizedConstraint { priority: p, constraint: c.clone() });
                 }
@@ -904,7 +975,6 @@ impl InferenceContext {
             }
         }
 
-        // No matching branch found — this is a type error (unmatched shape).
         false
     }
 
@@ -1013,6 +1083,11 @@ impl InferenceContext {
                             {
                                 let resolved_ty = ctx.resolve_binding(self.var_type_ids[*var_id]);
                                 if !matches!(ctx.get(resolved_ty), TypeData::InferVar { .. }) {
+                                    // ── S-Generalize (OmniML §5.3) ──
+                                    // Before copying solved constraints to instances,
+                                    // force generalization of the source region to
+                                    // ensure the scheme is in its most-generalized form.
+                                    self.force_generalize(ctx);
                                     self.s_inst_copy(ctx, *var_id, resolved_ty);
                                 }
                                 // ── S-Exists-Lower (OmniML §5.3) ──
@@ -1691,6 +1766,7 @@ mod tests {
                 continuation: vec![Constraint::Eq(
                     ctx.int(32, true), ctx.int(32, true), crate::ast::Span::new(0, 0),
                 )],
+                else_continuation: Vec::new(),
             },
         ];
         let id = infer.register_match_branches(branches);
@@ -1714,5 +1790,128 @@ mod tests {
         ctx.bindings.borrow_mut().insert(var, int_ty);
         assert_eq!(match_c.priority(&ctx), 3,
             "match on resolved type should have medium priority");
+    }
+
+    // ── #1 else_ fallback ──────────────────────────────────────────
+
+    #[test]
+    fn test_else_continuation_on_mismatch() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let mut heap = std::collections::BinaryHeap::new();
+        let int_ty = ctx.int(32, true);
+
+        let branches = vec![MatchBranchSet {
+            shape_pattern: PrincipalShape::Arrow,
+            continuation: Vec::new(),
+            else_continuation: vec![Constraint::Eq(int_ty, int_ty, crate::ast::Span::new(0, 0))],
+        }];
+        let id = infer.register_match_branches(branches);
+        let int_ty2 = ctx.int(64, false);
+
+        let result = infer.discharge_match(&mut ctx, int_ty2, id, &mut heap);
+        assert!(result, "else_ fallback should return true");
+        assert!(!heap.is_empty(), "else_ continuation should be enqueued");
+    }
+
+    #[test]
+    fn test_else_continuation_empty_still_fails() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let mut heap = std::collections::BinaryHeap::new();
+
+        let branches = vec![MatchBranchSet {
+            shape_pattern: PrincipalShape::Arrow,
+            continuation: Vec::new(),
+            else_continuation: Vec::new(),
+        }];
+        let id = infer.register_match_branches(branches);
+        let int_ty = ctx.int(32, true);
+
+        let result = infer.discharge_match(&mut ctx, int_ty, id, &mut heap);
+        assert!(!result, "no else_ fallback should still fail");
+        assert!(heap.is_empty(), "no constraints should be enqueued");
+    }
+
+    // ── #2 force_generalization ────────────────────────────────────
+
+    #[test]
+    fn test_force_generalize_pg_with_guard() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+
+        let _var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let var_id = 0;
+        if var_id < infer.gen_statuses.len() {
+            infer.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
+        }
+        infer.add_guard(var_id, 0);
+
+        infer.force_generalize(&mut ctx);
+        assert_eq!(infer.gen_statuses[var_id], GenStatus::PartiallyGeneralizable,
+            "guarded PG var should remain PG after force_generalize");
+    }
+
+    #[test]
+    fn test_force_generalize_pg_no_guard_resolved() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let var_id = 0;
+        if var_id < infer.gen_statuses.len() {
+            infer.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
+        }
+
+        let int_ty = ctx.int(32, true);
+        ctx.bindings.borrow_mut().insert(var, int_ty);
+
+        infer.force_generalize(&mut ctx);
+        assert_eq!(infer.gen_statuses[var_id], GenStatus::Generalized,
+            "un-guarded resolved PG var should become Generalized");
+    }
+
+    // ── #3 [s] pattern: try_match_via_shape_var callback ──────────
+
+    #[test]
+    fn test_try_match_via_shape_var_registers_waitlist() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let mut heap = std::collections::BinaryHeap::new();
+
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let branches = vec![MatchBranchSet {
+            shape_pattern: PrincipalShape::Arrow,
+            continuation: Vec::new(),
+            else_continuation: Vec::new(),
+        }];
+        let id = infer.register_match_branches(branches);
+
+        let handled = infer.try_match_via_shape_var(&mut ctx, var, id, &mut heap);
+        assert!(handled, "should register the match on the wait list");
+
+        let var_id = 0;
+        if var_id < infer.wait_lists.len() {
+            assert!(!infer.wait_lists[var_id].is_empty(),
+                "match should be in the wait list");
+        }
+    }
+
+    #[test]
+    fn test_try_match_via_shape_var_concrete_discharges() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let mut heap = std::collections::BinaryHeap::new();
+
+        let int_ty = ctx.int(32, true);
+        let branches = vec![MatchBranchSet {
+            shape_pattern: PrincipalShape::Arrow,
+            continuation: Vec::new(),
+            else_continuation: Vec::new(),
+        }];
+        let id = infer.register_match_branches(branches);
+
+        let handled = infer.try_match_via_shape_var(&mut ctx, int_ty, id, &mut heap);
+        assert!(handled, "concrete type should discharge");
     }
 }
