@@ -78,10 +78,12 @@ impl<'source> Parser<'source> {
             Ok(tok) => Err(Diagnostic::error(format!("expected {:?}, found {:?}", expected, tok))
                 .with_code("E001")
                 .with_help(format!("expected `{:?}` but saw `{:?}` — check for missing or extra tokens", expected, tok))
+                .with_suggestion(format!("try adding `{:?}` before the `{:?}`", expected, tok))
                 .with_span(self.span(),)),
             Err(()) => Err(Diagnostic::error("unexpected end of file")
                 .with_code("E002")
                 .with_help("the source file ends before the expected token — check for unclosed blocks or missing items")
+                .with_suggestion("check that all `{`, `(`, and `[` are properly closed, and that the file is not truncated")
                 .with_span(self.span(),)),
         }
     }
@@ -113,6 +115,7 @@ impl<'source> Parser<'source> {
                     self.diagnostics.push(Diagnostic::error(format!("unexpected token during error recovery: {:?}", tok))
                         .with_code("E003")
                         .with_help("the parser skipped this token while trying to recover from a previous error — check the error above first")
+                        .with_suggestion("fix the previous error first; this token was skipped automatically")
                         .with_span(self.span(),));
                 }
             }
@@ -324,6 +327,7 @@ impl<'source> Parser<'source> {
                             ))
                             .with_code("E004")
                             .with_help("`comptime` must be followed by `def` (to declare a comptime function) or `{` (to start a comptime block)")
+                            .with_suggestion("try `comptime def name(...) { ... }` for a comptime function, or `comptime { ... }` for a comptime block")
                             .with_span(self.span(),))
                     }
                 }
@@ -359,6 +363,7 @@ impl<'source> Parser<'source> {
                 Err(Diagnostic::error(format!("unexpected token at top level: {:?}", tok))
                     .with_code("E003")
                     .with_help("only items (`def`, `type`, `trait`, `import`, `edition`, `constraint`, `extern`, `impl`, `comptime`, `async`) are allowed at the top level")
+                    .with_suggestion("move this token inside a function body, or start a new top-level declaration")
                     .with_span(self.span(),))
             }
         }
@@ -376,6 +381,7 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error("unexpected end of file in attribute")
                     .with_code("E002")
                     .with_help("attributes must have a name — e.g. `@deprecated` or `@cfg(...)`")
+                    .with_suggestion("add an attribute name after `@`, or remove the `@` if this is not an attribute")
                     .with_span(self.span(),));
             }
         };
@@ -435,12 +441,14 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error(format!("expected function name, found {:?}", tok))
                     .with_code("E004")
                     .with_help("a function name must follow `def` — use a valid identifier")
+                    .with_suggestion("use a valid identifier like `my_function` — keywords cannot be used as function names")
                     .with_span(self.span(),));
             }
             Err(()) => {
                 return Err(Diagnostic::error("unexpected end of file in function definition")
                     .with_code("E002")
                     .with_help("function definition is incomplete — expected a name after `def`")
+                    .with_suggestion("add a function name after `def`, e.g. `def main() { ... }`")
                     .with_span(self.span(),));
             }
         };
@@ -538,6 +546,7 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error("expected trait name")
                     .with_code("E004")
                     .with_help("`trait` must be followed by a name — e.g. `trait Display { ... }`")
+                    .with_suggestion("add a trait name after `trait`, e.g. `trait MyTrait { def foo(&self); }`")
                     .with_span(self.span(),));
             }
         };
@@ -559,6 +568,7 @@ impl<'source> Parser<'source> {
                                 return Err(Diagnostic::error("expected associated type name")
                                     .with_code("E004")
                                     .with_help("`type` in a trait body must be followed by a name — e.g. `type Output;`")
+                                    .with_suggestion("add an associated type name, e.g. `type Output;` or `type Item = Int<32>;`")
                                     .with_span(self.span(),));
                             }
                         };
@@ -583,6 +593,7 @@ impl<'source> Parser<'source> {
                                 return Err(Diagnostic::error("expected method name")
                                     .with_code("E004")
                                     .with_help("`def` in a trait body must be followed by a method name")
+                                    .with_suggestion("add a method name after `def`, e.g. `def method_name(&self) -> Int<32>;`")
                                     .with_span(self.span(),));
                             }
                         };
@@ -628,6 +639,7 @@ impl<'source> Parser<'source> {
                         return Err(Diagnostic::error("expected 'type' or 'def' in trait body")
                             .with_code("E004")
                             .with_help("trait bodies can contain `type` (associated types) or `def` (method signatures)")
+                            .with_suggestion("use `type AssocType;` for an associated type or `def method(&self);` for a method")
                             .with_span(self.span(),));
                     }
                 }
@@ -653,6 +665,7 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error("expected constraint name")
                     .with_code("E004")
                     .with_help("`constraint` must be followed by a name — e.g. `constraint MyConstraint { ... }`")
+                    .with_suggestion("add a name after `constraint`, e.g. `constraint MyConstraint { TraitA + TraitB }`")
                     .with_span(self.span(),));
             }
         };
@@ -688,7 +701,8 @@ impl<'source> Parser<'source> {
                     return Err(Diagnostic::error("expected type parameter name")
                         .with_code("E004")
                         .with_help("type parameters must have a name — e.g. `<T>` or `<K, V>`")
-                        .with_span(self.span(),));
+                        .with_suggestion("use a valid identifier like `T` or `Item` for the type parameter")
+                    .with_span(self.span(),));
                 }
             };
             let mut bounds = Vec::new();
@@ -719,7 +733,8 @@ impl<'source> Parser<'source> {
                     return Err(Diagnostic::error("expected ',' or '>'")
                         .with_code("E004")
                         .with_help("type parameter lists use `<T, U>` syntax — separate parameters with `,` and close with `>`")
-                        .with_span(self.span(),));
+                        .with_suggestion("add `>` to close the type parameter list, or `,` to add another parameter")
+                    .with_span(self.span(),));
                 }
             }
         }
@@ -763,12 +778,14 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error(format!("expected parameter name, found {:?}", tok))
                     .with_code("E004")
                     .with_help("parameters must have a name — e.g. `def foo(x: Int<32>)`")
+                    .with_suggestion("use a valid identifier like `x` or `value` for the parameter")
                     .with_span(self.span(),));
             }
             Err(()) => {
                 return Err(Diagnostic::error("unexpected end of file in parameter list")
                     .with_code("E002")
                     .with_help("parameter list is incomplete — expected a parameter name or `)`")
+                    .with_suggestion("close the parameter list with `)` or add more parameters")
                     .with_span(self.span(),));
             }
         };
@@ -815,6 +832,7 @@ impl<'source> Parser<'source> {
                             return Err(Diagnostic::error("expected '=>' after on_timeout")
                                 .with_code("E004")
                                 .with_help("`ensures on_timeout` must be followed by `=> <expression>`")
+                                .with_suggestion("add `=> <expression>` after `on_timeout`")
                                 .with_span(self.span(),));
                         }
                         target = EnsuresTarget::OnTimeout;
@@ -827,6 +845,7 @@ impl<'source> Parser<'source> {
                             return Err(Diagnostic::error("expected '=>' after on_cancel")
                                 .with_code("E004")
                                 .with_help("`ensures on_cancel` must be followed by `=> <expression>`")
+                                .with_suggestion("add `=> <expression>` after `on_cancel`")
                                 .with_span(self.span(),));
                         }
                         target = EnsuresTarget::OnCancel;
@@ -849,6 +868,7 @@ impl<'source> Parser<'source> {
                                     return Err(Diagnostic::error("expected '=>' after on Ok(...)")
                                         .with_code("E004")
                                         .with_help("`ensures on Ok(...)` must be followed by `=> <expression>`")
+                                        .with_suggestion("add `=> <expression>` after `on Ok(pat)`")
                                         .with_span(self.span(),));
                                 }
                                 target = EnsuresTarget::OnOk(pat);
@@ -868,6 +888,7 @@ impl<'source> Parser<'source> {
                                     return Err(Diagnostic::error("expected '=>' after on Err(...)")
                                         .with_code("E004")
                                         .with_help("`ensures on Err(...)` must be followed by `=> <expression>`")
+                                        .with_suggestion("add `=> <expression>` after `on Err(pat)`")
                                         .with_span(self.span(),));
                                 }
                                 target = EnsuresTarget::OnErr(pat);
@@ -876,6 +897,7 @@ impl<'source> Parser<'source> {
                                 return Err(Diagnostic::error("expected 'Ok' or 'Err' after 'on'")
                                     .with_code("E004")
                                     .with_help("`ensures on` must be followed by `Ok(...)` or `Err(...)`")
+                                    .with_suggestion("try `ensures on Ok(result) => result != 0` or `ensures on Err(e) => e != 0`")
                                     .with_span(self.span(),));
                             }
                         }
@@ -922,6 +944,7 @@ impl<'source> Parser<'source> {
                 ))
                 .with_code("E006")
                 .with_help("the parser reached its recursion limit — the type/structure may be deeply nested or self-referential")
+                .with_suggestion("try breaking up deeply nested structures, or use less complex type expressions")
                 .with_span(self.span(),));
         }
         let result = self.parse_type_inner();
@@ -991,9 +1014,10 @@ impl<'source> Parser<'source> {
                     Ok(Token::Ident(n)) => n,
                     _ => {
                         return Err(Diagnostic::error("expected identifier after exists")
-                        .with_code("E004")
-                        .with_help("`exists` must be followed by a bound variable name — e.g. `exists n: T invariant ...`")
-                        .with_span(self.span(),));
+                            .with_code("E004")
+                            .with_help("`exists` must be followed by a bound variable name — e.g. `exists n: T invariant ...`")
+                            .with_suggestion("add a bound variable name, e.g. `exists n: Int<32> invariant n > 0`")
+                            .with_span(self.span(),));
                     }
                 };
                 self.expect(Token::Colon)?;
@@ -1029,6 +1053,7 @@ impl<'source> Parser<'source> {
                             return Err(Diagnostic::error("expected identifier after '::'")
                                 .with_code("E004")
                                 .with_help("`::` must be followed by an identifier — e.g. `std::collections::HashMap`")
+                                .with_suggestion("add an identifier after `::`, e.g. `MyModule::MyType`")
                                 .with_span(self.span(),));
                         }
                     }
@@ -1059,6 +1084,7 @@ impl<'source> Parser<'source> {
                                     return Err(Diagnostic::error("expected ',' or '>' in type parameters")
                                         .with_code("E004")
                                         .with_help("generic type parameters use `<T, U>` syntax — separate with `,` and close with `>`")
+                                        .with_suggestion("add `>` to close the generic type, or `,` to add another type argument")
                                         .with_span(self.span(),));
                                 }
                             }
@@ -1096,6 +1122,7 @@ impl<'source> Parser<'source> {
                                     return Err(Diagnostic::error("expected ',' or ')' in tuple type")
                                         .with_code("E004")
                                         .with_help("tuple types use `(T, U)` syntax — separate with `,` and close with `)`")
+                                        .with_suggestion("add `)` to close the tuple type, or `,` to add another element")
                                         .with_span(self.span(),));
                                 }
                             }
@@ -1111,10 +1138,12 @@ impl<'source> Parser<'source> {
                 Ok(tok) => Err(Diagnostic::error(format!("expected type, found {:?}", tok))
                     .with_code("E004")
                     .with_help("expected a valid type expression — try `Int<32>`, `&T`, `[T]`, `(A, B)`, etc.")
+                    .with_suggestion("use a type name like `Int<32>`, `Bool`, or `String`")
                     .with_span(self.span(),)),
                 Err(()) => Err(Diagnostic::error("unexpected end of file in type")
                     .with_code("E002")
                     .with_help("type expression is incomplete — check for missing type arguments or brackets")
+                    .with_suggestion("check for unclosed `<`, `[`, `(`, or `&` in the type expression")
                     .with_span(self.span(),)),
             },
         }
@@ -1130,6 +1159,7 @@ impl<'source> Parser<'source> {
                 ))
                 .with_code("E006")
                 .with_help("the parser reached its recursion limit — the type/structure may be deeply nested or self-referential")
+                .with_suggestion("try breaking up deeply nested structures, or use less complex type expressions")
                 .with_span(self.span(),));
         }
         let result = self.parse_block_inner();
@@ -1168,6 +1198,7 @@ impl<'source> Parser<'source> {
                 ))
                 .with_code("E006")
                 .with_help("the parser reached its recursion limit — the type/structure may be deeply nested or self-referential")
+                .with_suggestion("try breaking up deeply nested structures, or use less complex type expressions")
                 .with_span(self.span(),));
         }
         let result = self.parse_stmt_inner();
@@ -1291,6 +1322,7 @@ impl<'source> Parser<'source> {
         Err(Diagnostic::error("expected variable definition after ghost")
             .with_code("E004")
             .with_help("`ghost` must be followed by a variable definition — e.g. `ghost set x = 0;`")
+            .with_suggestion("add a variable definition: `ghost set <name> = <value>;`")
             .with_span(self.span(),))
     }
 
@@ -1352,12 +1384,14 @@ impl<'source> Parser<'source> {
                     return Err(Diagnostic::error(format!("expected variable name, found {:?}", tok))
                         .with_code("E004")
                         .with_help("a variable name must follow `set` or `let` — use a valid identifier")
+                        .with_suggestion("use a valid identifier like `x` or `counter` for the variable name")
                         .with_span(self.span(),));
                 }
                 Err(()) => {
                     return Err(Diagnostic::error("unexpected end of file in variable definition")
                         .with_code("E002")
                         .with_help("variable definition is incomplete — expected a name or pattern after `set`/`let`")
+                        .with_suggestion("add a variable name after `set`/`let`, e.g. `set x = 42;`")
                         .with_span(self.span(),));
                 }
             };
@@ -1682,6 +1716,7 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error("expected identifier for scope_cleanup")
                     .with_code("E004")
                     .with_help("`scope_cleanup` must be followed by `@<name>` — e.g. `scope_cleanup @cleanup { ... }`")
+                    .with_suggestion("use `scope_cleanup @identifier { body }` syntax")
                     .with_span(self.span(),));
             }
         };
@@ -1723,6 +1758,7 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error("expected identifier for trigger")
                     .with_code("E004")
                     .with_help("`trigger` must be followed by `@<name>` — e.g. `trigger @cleanup;`")
+                    .with_suggestion("use `trigger @identifier;` syntax")
                     .with_span(self.span(),));
             }
         };
@@ -1744,12 +1780,14 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error(format!("expected edition string, found {:?}", tok))
                     .with_code("E004")
                     .with_help("`edition = \"<version>\"` expects a string literal — e.g. `edition = \"2024\"`")
+                    .with_suggestion("use a string literal like `\"2024\"` for the edition")
                     .with_span(self.span(),));
             }
             Err(()) => {
                 return Err(Diagnostic::error("unexpected end of file in edition declaration")
                     .with_code("E002")
                     .with_help("`edition = \"<version>\"` declaration is incomplete — expected a string literal after `=`")
+                    .with_suggestion("add a string literal after `=`, e.g. `edition = \"2024\";`")
                     .with_span(self.span(),));
             }
         };
@@ -1770,6 +1808,7 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error("wildcard import is prohibited: `import *` is illegal")
                     .with_code("E005")
                     .with_help("explicit imports improve clarity and maintainability — list the items you need, or use `import path` for the module itself")
+                    .with_suggestion("use named imports: `import path::Item` or `from path import { Item1, Item2 }`")
                     .with_span(self.span(),));
             }
             Ok(Token::Ident(part)) => path.push(part),
@@ -1777,6 +1816,7 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error("expected module path")
                     .with_code("E004")
                     .with_help("after `import` or `from`, provide a module path — e.g. `import std::collections`")
+                    .with_suggestion("add a module path like `std::collections` or `my_module`")
                     .with_span(self.span(),));
             }
         }
@@ -1787,6 +1827,7 @@ impl<'source> Parser<'source> {
                     return Err(Diagnostic::error("wildcard import is prohibited: `import *` is illegal")
                     .with_code("E005")
                     .with_help("explicit imports improve clarity and maintainability — list the items you need, or use `import path` for the module itself")
+                    .with_suggestion("use named imports: `import path::Item` or `from path import { Item1, Item2 }`")
                     .with_span(self.span(),));
                 }
                 Ok(Token::Ident(part)) => path.push(part),
@@ -1794,6 +1835,7 @@ impl<'source> Parser<'source> {
                     return Err(Diagnostic::error("expected identifier after '::'")
                         .with_code("E004")
                         .with_help("`::` must be followed by an identifier — e.g. `std::collections::HashMap`")
+                        .with_suggestion("add an identifier after `::`, e.g. `MyModule::MyType`")
                         .with_span(self.span(),));
                 }
             }
@@ -1811,6 +1853,7 @@ impl<'source> Parser<'source> {
                         return Err(Diagnostic::error("wildcard import is prohibited: `import *` is illegal")
                     .with_code("E005")
                     .with_help("explicit imports improve clarity and maintainability — list the items you need, or use `import path` for the module itself")
+                    .with_suggestion("use named imports: `import path::Item` or `from path import { Item1, Item2 }`")
                     .with_span(self.span(),));
                     }
                     Ok(Token::Ident(item)) => item,
@@ -1818,6 +1861,7 @@ impl<'source> Parser<'source> {
                         return Err(Diagnostic::error("expected import item name")
                             .with_code("E004")
                             .with_help("import items must be identifiers — e.g. `import std::{HashMap, HashSet}`")
+                            .with_suggestion("list specific item names: `import path::{Item1, Item2}`")
                             .with_span(self.span(),));
                     }
                 });
@@ -1836,6 +1880,7 @@ impl<'source> Parser<'source> {
                         return Err(Diagnostic::error("expected alias name")
                             .with_code("E004")
                             .with_help("`as` must be followed by an alias name — e.g. `import path as alias`")
+                            .with_suggestion("add an alias name after `as`, e.g. `import path as MyAlias`")
                             .with_span(self.span(),));
                     }
                 }
@@ -1861,6 +1906,7 @@ impl<'source> Parser<'source> {
                         return Err(Diagnostic::error("wildcard import is prohibited: `import *` is illegal")
                     .with_code("E005")
                     .with_help("explicit imports improve clarity and maintainability — list the items you need, or use `import path` for the module itself")
+                    .with_suggestion("use named imports: `import path::Item` or `from path import { Item1, Item2 }`")
                     .with_span(self.span(),));
                     }
                     Ok(Token::Ident(item)) => items.push(item),
@@ -1868,6 +1914,7 @@ impl<'source> Parser<'source> {
                         return Err(Diagnostic::error("expected import item name")
                             .with_code("E004")
                             .with_help("after `from <path> import`, list the items to import — e.g. `from std import { HashMap }`")
+                            .with_suggestion("list specific item names inside `{ }`: `from path import { Item }`")
                             .with_span(self.span(),));
                     }
                 }
@@ -1883,6 +1930,7 @@ impl<'source> Parser<'source> {
                         return Err(Diagnostic::error("expected ',' or '}' in import list")
                         .with_code("E004")
                         .with_help("import items are separated by commas and enclosed in braces — e.g. `{ A, B }`")
+                        .with_suggestion("add `}` to close the import list, or `,` to add another item")
                         .with_span(self.span(),));
                     }
                 }
@@ -1899,6 +1947,7 @@ impl<'source> Parser<'source> {
                     return Err(Diagnostic::error("expected alias name")
                         .with_code("E004")
                         .with_help("`as` must be followed by an alias name — e.g. `import path as alias`")
+                        .with_suggestion("add an alias name after `as`, e.g. `import path as MyAlias`")
                         .with_span(self.span(),));
                 }
             }
@@ -1924,6 +1973,7 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error("expected ABI string after 'extern'")
                     .with_code("E004")
                     .with_help("`extern` must be followed by an ABI string — e.g. `extern \"C\"`")
+                    .with_suggestion("add an ABI string like `\"C\"` after `extern`")
                     .with_span(self.span(),));
             }
         };
@@ -1934,6 +1984,7 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error("expected function name")
                     .with_code("E004")
                     .with_help("after `extern \"<ABI>\" def`, a function name is expected")
+                    .with_suggestion("add a function name after `def`, e.g. `extern \"C\" def my_function()`")
                     .with_span(self.span(),));
             }
         };
@@ -1988,6 +2039,7 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error("expected type name")
                     .with_code("E004")
                     .with_help("after `type`, a type name (identifier) is expected — e.g. `type MyType = ...`")
+                    .with_suggestion("add a type name after `type`, e.g. `type MyType = Int<32>;`")
                     .with_span(self.span(),));
             }
         };
@@ -2018,6 +2070,7 @@ impl<'source> Parser<'source> {
                                 return Err(Diagnostic::error("expected field name")
                                     .with_code("E004")
                                     .with_help("struct fields must have a name — e.g. `name: String`")
+                                    .with_suggestion("add a field name like `name`, `age`, or `value`")
                                     .with_span(self.span(),));
                             }
                         };
@@ -2069,6 +2122,7 @@ impl<'source> Parser<'source> {
                                 return Err(Diagnostic::error("expected variant name")
                                     .with_code("E004")
                                     .with_help("enum variants must have a name — e.g. `enum { A, B }`")
+                                    .with_suggestion("add a variant name like `VariantA`, `None`, or `Some`")
                                     .with_span(self.span(),));
                             }
                         };
@@ -2104,6 +2158,7 @@ impl<'source> Parser<'source> {
                                 return Err(Diagnostic::error("expected string for missing_match")
                                     .with_code("E004")
                                     .with_help("`missing_match` expects a string literal — e.g. `with missing_match = \"message\"`")
+                                    .with_suggestion("use a string literal like `\"not all variants covered\"`")
                                     .with_span(self.span(),));
                             }
                         };
@@ -2202,6 +2257,7 @@ impl<'source> Parser<'source> {
                                     return Err(Diagnostic::error("expected overflow policy (wrap, saturate, trap)")
                                         .with_code("E007")
                                         .with_help("`overflow` policy must be one of: `wrap`, `saturate`, or `trap`")
+                                        .with_suggestion("use one of: `wrap`, `saturate`, or `trap`")
                                         .with_span(self.span(),));
                                 }
                             };
@@ -2283,6 +2339,7 @@ impl<'source> Parser<'source> {
                     return Err(Diagnostic::error("expected trait name")
                         .with_code("E004")
                         .with_help("expected a trait name in `impl ... for Type` — e.g. `impl Display for MyType { ... }`")
+                        .with_suggestion("add a trait name: `impl TraitName for MyType { ... }`")
                         .with_span(self.span(),));
                 }
             });
@@ -2341,12 +2398,14 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error(format!("expected method name, found {:?}", tok))
                     .with_code("E004")
                     .with_help("a method name must follow `def` in an impl block")
+                    .with_suggestion("use a valid identifier like `my_method` for the method name")
                     .with_span(self.span(),));
             }
             Err(()) => {
                 return Err(Diagnostic::error("unexpected end of file in method definition")
                     .with_code("E002")
                     .with_help("method definition is incomplete — expected a name after `def`")
+                    .with_suggestion("add a method name after `def`, e.g. `def process(&mut self) { ... }`")
                     .with_span(self.span(),));
             }
         };
@@ -2432,6 +2491,7 @@ impl<'source> Parser<'source> {
             _ => Err(Diagnostic::error("expected 'self'")
                 .with_code("E004")
                 .with_help("method parameters must start with `self`, `&self`, or `&mut self`")
+                .with_suggestion("try `self`, `&self`, or `&mut self` as the first parameter")
                 .with_span(self.span(),)),
         }
     }
@@ -2446,6 +2506,7 @@ impl<'source> Parser<'source> {
                 ))
                 .with_code("E006")
                 .with_help("the parser reached its recursion limit — the type/structure may be deeply nested or self-referential")
+                .with_suggestion("try breaking up deeply nested structures, or use less complex type expressions")
                 .with_span(self.span(),));
         }
         let result = self.parse_pattern_inner();
@@ -2461,6 +2522,7 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error("unexpected end of file in pattern")
                     .with_code("E002")
                     .with_help("pattern is incomplete — expected a pattern expression (literal, variable, `_`, etc.)")
+                    .with_suggestion("add a pattern like `x`, `_`, `42`, or `Some(val)`")
                     .with_span(self.span(),));
             }
         };
@@ -2501,6 +2563,7 @@ impl<'source> Parser<'source> {
                                 return Err(Diagnostic::error("expected field name")
                                     .with_code("E004")
                                     .with_help("pattern fields must have a name — e.g. `Point { x, y }`")
+                                    .with_suggestion("add a field name like `x`, `name`, or `value`")
                                     .with_span(self.span(),));
                             }
                         };
@@ -2544,6 +2607,7 @@ impl<'source> Parser<'source> {
                             return Err(Diagnostic::error("expected variant name")
                                 .with_code("E004")
                                 .with_help("expected a variant name after `::` in enum pattern")
+                                .with_suggestion("add a variant name after `::`, e.g. `Option::Some(val)`")
                                 .with_span(self.span(),));
                         }
                     });
@@ -2588,6 +2652,7 @@ impl<'source> Parser<'source> {
             _ => Err(Diagnostic::error("expected pattern")
                 .with_code("E004")
                 .with_help("expected a valid pattern — try a literal, variable name, `_`, struct pattern, or tuple pattern")
+                .with_suggestion("try `x`, `_`, `42`, `true`, `Point { x, y }`, or `Some(val)`")
                 .with_span(self.span(),)),
         }
     }
@@ -2606,6 +2671,7 @@ impl<'source> Parser<'source> {
                 ))
                 .with_code("E006")
                 .with_help("the parser reached its recursion limit — the type/structure may be deeply nested or self-referential")
+                .with_suggestion("try breaking up deeply nested structures, or use less complex type expressions")
                 .with_span(self.span(),));
         }
         let result = self.parse_expr_bp_inner(min_bp);
@@ -2963,6 +3029,7 @@ impl<'source> Parser<'source> {
             _ => Err(Diagnostic::error("expected expression")
                 .with_code("E007")
                 .with_help("expected a valid expression — try a literal, variable, `if`, `match`, `|...| { }` closure, or prefix operator")
+                .with_suggestion("try `42`, `true`, `x`, `if cond { a } else { b }`, or `|x| { x + 1 }`")
                 .with_span(self.span(),)),
         }
     }
@@ -2981,12 +3048,14 @@ impl<'source> Parser<'source> {
                     return Err(Diagnostic::error(format!("expected parameter name, found {:?}", tok))
                         .with_code("E004")
                         .with_help("closure parameters must have a name — e.g. `|x, y| { ... }`")
+                        .with_suggestion("use a valid identifier like `x`, `acc`, or `item` for the closure parameter")
                         .with_span(self.span(),));
                 }
                 Err(()) => {
                     return Err(Diagnostic::error("unexpected end of file in closure")
                         .with_code("E002")
                         .with_help("closure definition is incomplete — expected `| ... | { ... }`")
+                        .with_suggestion("close the closure with `| { body }` or add parameters: `|x, y| { ... }`")
                         .with_span(self.span(),));
                 }
             };
@@ -3044,6 +3113,7 @@ impl<'source> Parser<'source> {
                 return Err(Diagnostic::error("expected identifier after '::'")
                     .with_code("E004")
                     .with_help("`::` must be followed by an identifier — e.g. `std::collections::HashMap`")
+                    .with_suggestion("add an identifier after `::`, e.g. `MyModule::MyType`")
                     .with_span(self.span(),));
             }
         }
@@ -3105,12 +3175,14 @@ impl<'source> Parser<'source> {
                     return Err(Diagnostic::error(format!("expected field name, found {:?}", tok))
                         .with_code("E004")
                         .with_help("struct literal fields must have a name — e.g. `Point { x = 1, y = 2 }`")
+                        .with_suggestion("add a field name followed by `= <value>`, e.g. `field = value`")
                         .with_span(self.span(),));
                 }
                 Err(()) => {
                     return Err(Diagnostic::error("unexpected end of file in struct literal")
                         .with_code("E002")
                         .with_help("struct literal is incomplete — expected a field name or `}`")
+                        .with_suggestion("close the struct with `}` or add more fields")
                         .with_span(self.span(),));
                 }
             };
@@ -3246,6 +3318,7 @@ impl<'source> Parser<'source> {
                     Err(Diagnostic::error("unexpected !")
                         .with_code("E007")
                         .with_help("`!` as a postfix operator is only used for comptime calls — e.g. `func!()`")
+                        .with_suggestion("use `func!()` for comptime calls, or remove the `!`")
                         .with_span(self.span(),))
                 }
             }
@@ -3470,6 +3543,7 @@ impl<'source> Parser<'source> {
                     Err(Diagnostic::error("expected field name after '.'")
                         .with_code("E004")
                         .with_help("`.` must be followed by a field name — e.g. `object.field`")
+                        .with_suggestion("add a field name after `.`, or remove the `.`")
                         .with_span(self.span(),))
                 }
             }
@@ -3485,6 +3559,7 @@ impl<'source> Parser<'source> {
                     Err(Diagnostic::error("expected attribute name after '''")
                         .with_code("E004")
                         .with_help("`'` must be followed by an attribute name — e.g. `object'attr`")
+                        .with_suggestion("add an attribute name after `'`, or remove the `'`")
                         .with_span(self.span(),))
                 }
             }
@@ -3508,6 +3583,7 @@ impl<'source> Parser<'source> {
                                 return Err(Diagnostic::error("expected binding name after 'as'")
                                     .with_code("E004")
                                     .with_help("`as` in a catch pattern must be followed by a binding name — e.g. `|NetworkError as e|`")
+                                    .with_suggestion("add a capture variable name after `as`, like `|Pattern as var_name|`")
                                     .with_span(self.span(),));
                             }
                         }
@@ -3560,6 +3636,9 @@ impl<'source> Parser<'source> {
         if let Some(tok) = self.pending.last() {
             return Some(tok.clone());
         }
+        // Ensure the current token is consumed into peeked, so the cloned lexer
+        // is positioned at the *following* token rather than re-reading the same one.
+        self.peek();
         let mut lexer = self.lexer.clone();
         loop {
             match lexer.next() {
