@@ -55,7 +55,7 @@ impl<'source> Parser<'source> {
         if self.peeked.is_none() {
             self.peeked = Some(self.next_token());
         }
-        self.peeked.as_ref().unwrap()
+        self.peeked.as_ref().expect("peek called before next_token")
     }
 
     fn advance(&mut self) -> Result<Token, ()> {
@@ -793,7 +793,7 @@ impl<'source> Parser<'source> {
 
     fn parse_contract(&mut self) -> Result<Contract, Diagnostic> {
         let start = self.span().start;
-        match self.advance().unwrap() {
+        match self.advance().map_err(|_| Diagnostic { message: "unexpected token".into(), span: Span::new(0, 0) })? {
             Token::Requires => {
                 let expr = self.parse_expr()?;
                 let end = self.span().end;
@@ -1215,7 +1215,7 @@ impl<'source> Parser<'source> {
                         | Ok(Token::StarEq)
                         | Ok(Token::SlashEq)
                 ) {
-                    let op_token = self.advance().unwrap();
+                    let op_token = self.advance().map_err(|_| Diagnostic { message: "unexpected token".into(), span: Span::new(0, 0) })?;
                     let op = match op_token {
                         Token::Assign => None,
                         Token::PlusEq => Some(BinOp::Add),
@@ -1293,7 +1293,7 @@ impl<'source> Parser<'source> {
 
     fn parse_variable_def(&mut self) -> Result<Stmt, Diagnostic> {
         let start = self.span().start;
-        let kind = match self.advance().unwrap() {
+        let kind = match self.advance().map_err(|_| Diagnostic { message: "unexpected token".into(), span: Span::new(0, 0) })? {
             Token::Set => VariableKind::Set,
             Token::Let => VariableKind::Let,
             _ => unreachable!(),
@@ -2132,7 +2132,7 @@ impl<'source> Parser<'source> {
             self.advance().ok();
             match self.peek() {
                 Ok(Token::Ident(_)) | Ok(Token::Default) | Ok(Token::NoDefault) => {
-                    let tok = self.advance().unwrap();
+                    let tok = self.advance().map_err(|_| Diagnostic { message: "unexpected token".into(), span: Span::new(0, 0) })?;
                     match tok {
                         Token::Ident(ref s) if s.as_str() == "overflow" => {
                             self.expect(Token::Assign)?;
@@ -2498,7 +2498,7 @@ impl<'source> Parser<'source> {
                     } else {
                         None
                     };
-                    let variant = path.pop().unwrap();
+                    let variant = path.pop().expect("Enum pattern must have a variant");
                     let end = self.span().end;
                     Ok(Pattern::Enum {
                         path,
@@ -2700,7 +2700,7 @@ impl<'source> Parser<'source> {
                         | Some(Token::RBrace)
                 );
                 if is_operator_arg {
-                    let op_tok = self.advance().unwrap();
+                    let op_tok = self.advance().map_err(|_| Diagnostic { message: "unexpected token".into(), span: Span::new(0, 0) })?;
                     let op_name = match op_tok {
                         Token::Plus => "+".to_string(),
                         Token::Minus => "-".to_string(),
@@ -2712,7 +2712,7 @@ impl<'source> Parser<'source> {
                     let end = self.span().end;
                     Ok(Expr::Ident(op_name, Span::new(start, end)))
                 } else {
-                    match self.advance().unwrap() {
+                    match self.advance().map_err(|_| Diagnostic { message: "unexpected token".into(), span: Span::new(0, 0) })? {
                         Token::Minus => {
                             let expr = self.parse_prefix()?;
                             let end = self.span().end;
@@ -2991,12 +2991,12 @@ impl<'source> Parser<'source> {
             Ok(Token::LBrace) if !restrict => self.parse_struct_lit(path, start),
             Ok(Token::LParen) => {
                 if path.len() >= 2 {
-                    let variant = path.pop().unwrap();
+                    let variant = path.pop().expect("Enum pattern must have a variant");
                     self.parse_enum_lit(path, variant, start)
                 } else {
                     self.parse_call(
                         Expr::Ident(
-                            path.into_iter().next().unwrap(),
+                            path.into_iter().next().expect("expected at least one path segment"),
                             Span::new(start, self.span().start),
                         ),
                         start,
@@ -3005,7 +3005,7 @@ impl<'source> Parser<'source> {
             }
             _ => {
                 if path.len() >= 2 {
-                    let variant = path.pop().unwrap();
+                    let variant = path.pop().expect("Enum pattern must have a variant");
                     let end = self.span().end;
                     Ok(Expr::EnumLit {
                         path,
@@ -3015,7 +3015,7 @@ impl<'source> Parser<'source> {
                     })
                 } else {
                     Ok(Expr::Ident(
-                        path.into_iter().next().unwrap(),
+                        path.into_iter().next().expect("expected at least one path segment"),
                         Span::new(start, self.span().end),
                     ))
                 }
@@ -3107,7 +3107,7 @@ impl<'source> Parser<'source> {
 
     fn parse_literal(&mut self) -> Result<Expr, Diagnostic> {
         let start = self.span().start;
-        let token = self.advance().unwrap();
+        let token = self.advance().map_err(|_| Diagnostic { message: "unexpected token".into(), span: Span::new(0, 0) })?;
         let end = self.span().end;
         let span = Span::new(start, end);
         match token {

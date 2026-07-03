@@ -329,7 +329,7 @@ impl<'a> TypeChecker<'a> {
                         CtxKind::Loop => "loop",
                         CtxKind::While => "while",
                         CtxKind::For => "for",
-                        _ => unreachable!(),
+                        _ => panic!("find_continue_target: unexpected context kind {:?}", frame.kind),
                     };
                     return Some((frame.span, kind_str));
                 }
@@ -928,7 +928,7 @@ impl<'a> TypeChecker<'a> {
                     Stmt::ImplBlock { span, trait_path, for_type, methods, attributes, .. } => {
                         (trait_path, for_type, methods, *span, attributes)
                     }
-                    _ => unreachable!(),
+                    _ => panic!("check_stmt: expected ImplBlock, got {:?}", stmt),
                 };
                 if trait_path.is_some() {
                     // Trait impl blocks are already handled by the resolver;

@@ -3,6 +3,9 @@ use crate::hir::types::*;
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+
+static Z3_WARNED: OnceLock<bool> = OnceLock::new();
 
 /// SMT-LIB2-based unicity checker using Z3.
 ///
@@ -198,13 +201,22 @@ impl SmtSolver {
         if smt.is_empty() {
             return None;
         }
-        let mut child = Command::new(&self.z3_path)
+        let mut child = match Command::new(&self.z3_path)
             .arg("-in")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .ok()?;
+        {
+            Ok(c) => c,
+            Err(e) => {
+                Z3_WARNED.get_or_init(|| {
+                    eprintln!("warning: Z3 ({}) not found: {}; unicity check uses fallback heuristic", self.z3_path, e);
+                    true
+                });
+                return None;
+            }
+        };
 
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(smt.as_bytes()).ok()?;
