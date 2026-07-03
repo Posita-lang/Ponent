@@ -270,6 +270,9 @@ impl DiagnosticEmitter for PlainEmitter {
         let code_str = diag.code.as_deref().unwrap_or("?");
         let span_str = diag.span.map(|s| format!(" at {}", s)).unwrap_or_default();
         eprintln!("[{} {}] {}{}", code_str, level_str, diag.message, span_str);
+        for (label_span, label_text) in &diag.labels {
+            eprintln!("  --> {}: {}", label_span, label_text);
+        }
         if let Some(help) = &diag.help {
             eprintln!("  help: {}", help);
         }
@@ -312,6 +315,15 @@ impl DiagnosticEmitter for ColoredEmitter {
             diag.message,
             span_str
         );
+        for (label_span, label_text) in &diag.labels {
+            eprintln!(
+                "  {}--> {}: {}{}",
+                DiagnosticLevel::ansi_color_for_level(DiagnosticLevel::Help),
+                label_span,
+                label_text,
+                DiagnosticLevel::ansi_reset()
+            );
+        }
         if let Some(help) = &diag.help {
             eprintln!(
                 "{}help: {}{}",
