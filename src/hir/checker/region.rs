@@ -77,7 +77,7 @@ impl RegionTree {
     /// Iterate all frames from current region up to root.
     /// Returns frames in reverse order (innermost first), which is the
     /// same behavior as the old `loop_stack.iter().rev()`.
-    pub fn iter_frames_rev(&self) -> RegionFrameIter {
+    pub fn iter_frames_rev(&self) -> RegionFrameIter<'_> {
         RegionFrameIter { tree: self, current: Some(self.current), frame_idx: None }
     }
 
