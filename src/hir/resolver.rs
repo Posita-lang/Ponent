@@ -1185,6 +1185,14 @@ impl<'a> NameResolver<'a> {
                 self.ctx
                     .exists(name.clone(), base_ty, invariant.as_ref().clone())
             }
+            Type::WhereShorthand { base, invariant, span } => {
+                // Desugar `type T = Base where value > 0` into `exists _where_N: Base invariant _where_N > 0`.
+                let name = format!("_where_{}", span.start);
+                let mut inv = invariant.as_ref().clone();
+                replace_ident_in_expr(&mut inv, "value", &name);
+                let base_ty = self.resolve_type_expr(base);
+                self.ctx.exists(name, base_ty, inv)
+            }
             Type::Literal(expr, ..) => self.resolve_expr(expr).unwrap_or(self.ctx.error()),
             Type::Never(..) => self.ctx.never(),
             Type::Union(tys, ..) => self.ctx.error(),
@@ -1330,4 +1338,115 @@ impl<'a> NameResolver<'a> {
         &self.diagnostics
     }
 }
-// Use crate-level module instead
+
+/// Recursively rename `Ident(old_name)` → `Ident(new_name)` in an expression tree.
+fn replace_ident_in_expr(expr: &mut Expr, old_name: &str, new_name: &str) {
+    match expr {
+        Expr::Ident(name, _) if name == old_name => *name = new_name.to_string(),
+        Expr::UnaryOp { expr: e, .. }
+        | Expr::Move(e, _)
+        | Expr::Await { expr: e, .. }
+        | Expr::Try { expr: e, .. }
+        | Expr::LeaveWith { expr: e, .. }
+        | Expr::PolyBox { expr: e, .. }
+        | Expr::PolyUnbox { expr: e, .. }
+        | Expr::TypeAnnotated { expr: e, .. } => replace_ident_in_expr(e, old_name, new_name),
+        Expr::BinaryOp { left, right, .. } => {
+            replace_ident_in_expr(left, old_name, new_name);
+            replace_ident_in_expr(right, old_name, new_name);
+        }
+        Expr::Call { callee, args, .. } => {
+            replace_ident_in_expr(callee, old_name, new_name);
+            for arg in args { replace_ident_in_expr(arg, old_name, new_name); }
+        }
+        Expr::Index { base, index, .. } => {
+            replace_ident_in_expr(base, old_name, new_name);
+            replace_ident_in_expr(index, old_name, new_name);
+        }
+        Expr::FieldAccess { base, .. } | Expr::AttrAccess { base, .. }
+        | Expr::Cast { expr: base, .. } => replace_ident_in_expr(base, old_name, new_name),
+        Expr::Range { start, end, .. } => {
+            if let Some(e) = start { replace_ident_in_expr(e, old_name, new_name); }
+            if let Some(e) = end { replace_ident_in_expr(e, old_name, new_name); }
+        }
+        Expr::StructLit { fields, .. } => {
+            for (_, e) in fields { replace_ident_in_expr(e, old_name, new_name); }
+        }
+        Expr::EnumLit { payload, .. } => {
+            if let Some(e) = payload { replace_ident_in_expr(e, old_name, new_name); }
+        }
+        Expr::Tuple(exprs, _) | Expr::Array(exprs, _) => {
+            for e in exprs { replace_ident_in_expr(e, old_name, new_name); }
+        }
+        Expr::If { cond, then_branch, else_branch, .. }
+        | Expr::IfLet { scrutinee: cond, then_branch, else_branch, .. } => {
+            replace_ident_in_expr(cond, old_name, new_name);
+            // `where` invariants are single expressions, not blocks, but be safe
+        }
+        Expr::Match { scrutinee, arms, .. } => {
+            replace_ident_in_expr(scrutinee, old_name, new_name);
+            for arm in arms { replace_ident_in_expr(&mut arm.body, old_name, new_name); }
+        }
+        Expr::Block(stmts, _) | Expr::Closure { body: stmts, .. } => {
+            for s in stmts { replace_ident_in_stmt(s, old_name, new_name); }
+        }
+        Expr::Catch { expr: e, branches, .. } => {
+            replace_ident_in_expr(e, old_name, new_name);
+            for b in branches {
+                for s in &mut b.body { replace_ident_in_stmt(s, old_name, new_name); }
+            }
+        }
+        Expr::UnsafeBlock { body, .. } => {
+            for s in body { replace_ident_in_stmt(s, old_name, new_name); }
+        }
+        _ => {}
+    }
+}
+
+/// Recursively rename `Ident(old_name)` → `Ident(new_name)` in a statement tree.
+fn replace_ident_in_stmt(stmt: &mut Stmt, old_name: &str, new_name: &str) {
+    match stmt {
+        Stmt::VariableDef { value, .. } => {
+            if let Some(e) = value { replace_ident_in_expr(e, old_name, new_name); }
+        }
+        Stmt::Assign { target, value, .. } => {
+            replace_ident_in_expr(target, old_name, new_name);
+            replace_ident_in_expr(value, old_name, new_name);
+        }
+        Stmt::Return { value, .. } => {
+            if let Some(e) = value { replace_ident_in_expr(e, old_name, new_name); }
+        }
+        Stmt::Expression(expr) => replace_ident_in_expr(expr, old_name, new_name),
+        Stmt::If { cond, then_branch, else_branch, .. }
+        | Stmt::IfLet { scrutinee: cond, then_branch, else_branch, .. } => {
+            replace_ident_in_expr(cond, old_name, new_name);
+            for s in then_branch { replace_ident_in_stmt(s, old_name, new_name); }
+            if let Some(b) = else_branch { for s in b { replace_ident_in_stmt(s, old_name, new_name); } }
+        }
+        Stmt::While { cond, body, .. }
+        | Stmt::WhileLet { scrutinee: cond, body, .. } => {
+            replace_ident_in_expr(cond, old_name, new_name);
+            for s in body { replace_ident_in_stmt(s, old_name, new_name); }
+        }
+        Stmt::For { iterable, body, .. } => {
+            replace_ident_in_expr(iterable, old_name, new_name);
+            for s in body { replace_ident_in_stmt(s, old_name, new_name); }
+        }
+        Stmt::Loop { body, .. } => {
+            for s in body { replace_ident_in_stmt(s, old_name, new_name); }
+        }
+        Stmt::ScopeCleanup { body, .. } => {
+            for s in body { replace_ident_in_stmt(s, old_name, new_name); }
+        }
+        Stmt::Unsafe { body, .. } | Stmt::Isolate { body, .. } => {
+            for s in body { replace_ident_in_stmt(s, old_name, new_name); }
+        }
+        Stmt::ComptimeBlock { body, .. } => {
+            for s in body { replace_ident_in_stmt(s, old_name, new_name); }
+        }
+        Stmt::GhostVariableDef { inner, .. } => {
+            replace_ident_in_stmt(inner, old_name, new_name);
+        }
+        _ => {}
+    }
+}

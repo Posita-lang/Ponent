@@ -89,6 +89,7 @@ impl<'source> Parser<'source> {
     }
 
     fn synchronize(&mut self) {
+        let mut reported = false;
         loop {
             match self.peek() {
                 Ok(Token::Semicolon) | Ok(Token::RBrace) => {
@@ -112,11 +113,14 @@ impl<'source> Parser<'source> {
                 Err(()) => return,
                 _ => {
                     let tok = self.advance().ok();
-                    self.diagnostics.push(Diagnostic::error(format!("unexpected token during error recovery: {:?}", tok))
-                        .with_code("E003")
-                        .with_help("the parser skipped this token while trying to recover from a previous error — check the error above first")
-                        .with_suggestion("fix the previous error first; this token was skipped automatically")
-                        .with_span(self.span(),));
+                    if !reported {
+                        reported = true;
+                        self.diagnostics.push(Diagnostic::error(format!("unexpected token during error recovery: {:?}", tok))
+                            .with_code("E003")
+                            .with_help("the parser skipped this token while trying to recover from a previous error — check the error above first")
+                            .with_suggestion("fix the previous error first; this token was skipped automatically")
+                            .with_span(self.span(),));
+                    }
                 }
             }
         }
@@ -2195,16 +2199,12 @@ impl<'source> Parser<'source> {
 
         if matches!(self.peek(), Ok(Token::Where)) {
             self.advance().ok();
-            let mut invariant = self.parse_expr()?;
-            // Replace free occurrences of `value` (the shorthand binding name)
-            // with the actual exists-variable name, so the semantic phase
-            // can resolve it correctly (SYNTAX.md: Type‑level Constraint Shorthand).
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static WHERE_COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let name = format!("_where_{}", WHERE_COUNTER.fetch_add(1, Ordering::Relaxed));
-            Self::replace_ident_in_expr(&mut invariant, "value", &name);
-            ty = Type::Exists {
-                name,
+            let invariant = self.parse_expr()?;
+            // Semantic shorthand: `type T = Base where value > 0` desugars to
+            // `type T = exists _where_N: Base invariant _where_N > 0`.
+            // The parser preserves `value` as-is; desugaring happens in the
+            // resolver / checker phase.
+            ty = Type::WhereShorthand {
                 base: Box::new(ty),
                 invariant: Box::new(invariant),
                 span: Span::new(start, self.span().end),
@@ -3649,127 +3649,6 @@ impl<'source> Parser<'source> {
         }
     }
 
-    /// Recursively replace all `Ident(old_name)` in an expression with `Ident(new_name)`.
-    fn replace_ident_in_expr(expr: &mut Expr, old_name: &str, new_name: &str) {
-        match expr {
-            Expr::Ident(name, _) if name == old_name => *name = new_name.to_string(),
-            Expr::Ident(..) | Expr::Path(..) => {},
-            Expr::TypeAnnotated { expr: e, .. }
-            | Expr::UnaryOp { expr: e, .. }
-            | Expr::Move(e, _)
-            | Expr::Await { expr: e, .. }
-            | Expr::Try { expr: e, .. }
-            | Expr::LeaveWith { expr: e, .. }
-            | Expr::PolyBox { expr: e, .. }
-            | Expr::PolyUnbox { expr: e, .. } => Self::replace_ident_in_expr(e, old_name, new_name),
-            Expr::BinaryOp { left, right, .. } => {
-                Self::replace_ident_in_expr(left, old_name, new_name);
-                Self::replace_ident_in_expr(right, old_name, new_name);
-            }
-            Expr::Call { callee, args, .. } => {
-                Self::replace_ident_in_expr(callee, old_name, new_name);
-                for arg in args { Self::replace_ident_in_expr(arg, old_name, new_name); }
-            }
-            Expr::Index { base, index, .. } => {
-                Self::replace_ident_in_expr(base, old_name, new_name);
-                Self::replace_ident_in_expr(index, old_name, new_name);
-            }
-            Expr::FieldAccess { base, .. } | Expr::AttrAccess { base, .. }
-            | Expr::Cast { expr: base, .. } => {
-                Self::replace_ident_in_expr(base, old_name, new_name);
-            }
-            Expr::Range { start, end, .. } => {
-                if let Some(e) = start { Self::replace_ident_in_expr(e, old_name, new_name); }
-                if let Some(e) = end { Self::replace_ident_in_expr(e, old_name, new_name); }
-            }
-            Expr::StructLit { fields, .. } => {
-                for (_, e) in fields { Self::replace_ident_in_expr(e, old_name, new_name); }
-            }
-            Expr::EnumLit { payload, .. } => {
-                if let Some(e) = payload { Self::replace_ident_in_expr(e, old_name, new_name); }
-            }
-            Expr::Tuple(exprs, _) | Expr::Array(exprs, _) => {
-                for e in exprs { Self::replace_ident_in_expr(e, old_name, new_name); }
-            }
-            Expr::Closure { body, .. } => {
-                for s in body { Self::replace_ident_in_stmt(s, old_name, new_name); }
-            }
-            Expr::UnsafeBlock { body, .. } => {
-                for s in body { Self::replace_ident_in_stmt(s, old_name, new_name); }
-            }
-            Expr::Catch { expr: e, branches, .. } => {
-                Self::replace_ident_in_expr(e, old_name, new_name);
-                for b in branches {
-                    for s in &mut b.body { Self::replace_ident_in_stmt(s, old_name, new_name); }
-                }
-            }
-            Expr::If { cond, then_branch, else_branch, .. }
-            | Expr::IfLet { scrutinee: cond, then_branch, else_branch, .. } => {
-                Self::replace_ident_in_expr(cond, old_name, new_name);
-                for s in then_branch { Self::replace_ident_in_stmt(s, old_name, new_name); }
-                if let Some(b) = else_branch { for s in b { Self::replace_ident_in_stmt(s, old_name, new_name); } }
-            }
-            Expr::Match { scrutinee, arms, .. } => {
-                Self::replace_ident_in_expr(scrutinee, old_name, new_name);
-                for arm in arms { Self::replace_ident_in_expr(&mut arm.body, old_name, new_name); }
-            }
-            Expr::Block(stmts, _) => {
-                for s in stmts { Self::replace_ident_in_stmt(s, old_name, new_name); }
-            }
-            Expr::Literal(..) | Expr::Error(..) => {}
-        }
-    }
-
-    /// Recursively replace `Ident(old_name)` in a statement with `Ident(new_name)`.
-    fn replace_ident_in_stmt(stmt: &mut Stmt, old_name: &str, new_name: &str) {
-        match stmt {
-            Stmt::VariableDef { value, .. } => {
-                if let Some(e) = value { Self::replace_ident_in_expr(e, old_name, new_name); }
-            }
-            Stmt::Assign { target, value, .. } => {
-                Self::replace_ident_in_expr(target, old_name, new_name);
-                Self::replace_ident_in_expr(value, old_name, new_name);
-            }
-            Stmt::Return { value, .. } => {
-                if let Some(e) = value { Self::replace_ident_in_expr(e, old_name, new_name); }
-            }
-            Stmt::Expression(expr) => {
-                Self::replace_ident_in_expr(expr, old_name, new_name);
-            }
-            Stmt::If { cond, then_branch, else_branch, .. }
-            | Stmt::IfLet { scrutinee: cond, then_branch, else_branch, .. } => {
-                Self::replace_ident_in_expr(cond, old_name, new_name);
-                for s in then_branch { Self::replace_ident_in_stmt(s, old_name, new_name); }
-                if let Some(b) = else_branch { for s in b { Self::replace_ident_in_stmt(s, old_name, new_name); } }
-            }
-            Stmt::While { cond, body, .. }
-            | Stmt::WhileLet { scrutinee: cond, body, .. } => {
-                Self::replace_ident_in_expr(cond, old_name, new_name);
-                for s in body { Self::replace_ident_in_stmt(s, old_name, new_name); }
-            }
-            Stmt::For { iterable, body, .. } => {
-                Self::replace_ident_in_expr(iterable, old_name, new_name);
-                for s in body { Self::replace_ident_in_stmt(s, old_name, new_name); }
-            }
-            Stmt::Loop { body, .. } => {
-                for s in body { Self::replace_ident_in_stmt(s, old_name, new_name); }
-            }
-            Stmt::ScopeCleanup { body, .. } => {
-                for s in body { Self::replace_ident_in_stmt(s, old_name, new_name); }
-            }
-            Stmt::Unsafe { body, .. } | Stmt::Isolate { body, .. } => {
-                for s in body { Self::replace_ident_in_stmt(s, old_name, new_name); }
-            }
-            Stmt::ComptimeBlock { body, .. } => {
-                for s in body { Self::replace_ident_in_stmt(s, old_name, new_name); }
-            }
-            Stmt::GhostVariableDef { inner, .. } => {
-                Self::replace_ident_in_stmt(inner, old_name, new_name);
-            }
-            _ => {}
-        }
-    }
-
     fn parse_if_expr(&mut self) -> Result<Expr, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
@@ -4559,8 +4438,7 @@ mod tests {
             } => {
                 assert!(matches!(
                     ty,
-                    Type::Exists {
-                        name,
+                    Type::WhereShorthand {
                         base,
                         invariant,
                         ..

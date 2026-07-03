@@ -529,6 +529,13 @@ pub enum Type {
         invariant: Box<Expr>,
         span: Span,
     },
+    /// Shorthand `type T = Base where value > 0` — the parser produces this instead of
+    /// doing semantic name generation. A later desugaring pass rewrites it to `Exists`.
+    WhereShorthand {
+        base: Box<Type>,
+        invariant: Box<Expr>,
+        span: Span,
+    },
     Literal(Box<Expr>, Span),
     Never(Span),
     Union(Vec<Type>, Span),
@@ -620,6 +627,7 @@ impl Type {
             | Type::Projection(_, _, span)
             | Type::DynTrait(_, span)
             | Type::Exists { span, .. }
+            | Type::WhereShorthand { span, .. }
             | Type::Literal(_, span)
             | Type::Never(span)
             | Type::Union(_, span)
