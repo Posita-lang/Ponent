@@ -763,6 +763,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             "Int" => return Ok(self.checker.ctx.int(self.checker.extract_int_from_type(&args[0]).unwrap_or(32), true)),
                             "UInt" => return Ok(self.checker.ctx.int(self.checker.extract_int_from_type(&args[0]).unwrap_or(32), false)),
                             "Float" => return Ok(self.checker.ctx.float(self.checker.extract_int_from_type(&args[0]).unwrap_or(64))),
+                            "Rational" => {
+                                let p = self.checker.extract_int_from_type(&args[0]).ok_or_else(|| {
+                                    Diagnostic::error("Rational requires a compile-time constant integer bit count for the integer part").with_span(*span)
+                                })?;
+                                let q = self.checker.extract_int_from_type(&args[1]).ok_or_else(|| {
+                                    Diagnostic::error("Rational requires a compile-time constant integer bit count for the fractional part").with_span(*span)
+                                })?;
+                                if p == 0 || p > 64 || q == 0 || q > 64 {
+                                    return Err(Diagnostic::error("Rational bit counts must be 1..64").with_span(*span));
+                                }
+                                return Ok(self.checker.ctx.rational(p, q));
+                            }
                             _ => {}
                         }
                     }

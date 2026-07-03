@@ -37,6 +37,7 @@ pub enum TypeTag {
     Mu = 26,
     Nu = 27,
     Poly = 28,
+    Rational = 29,
 }
 
 impl From<&TypeData> for TypeTag {
@@ -68,6 +69,7 @@ impl From<&TypeData> for TypeTag {
             TypeData::Mu { .. } => TypeTag::Mu,
             TypeData::Nu { .. } => TypeTag::Nu,
             TypeData::Poly { .. } => TypeTag::Poly,
+            TypeData::Rational { .. } => TypeTag::Rational,
             TypeData::Never => TypeTag::Never,
             TypeData::Unit => TypeTag::Unit,
             TypeData::Error => TypeTag::Error,
@@ -196,6 +198,14 @@ pub enum TypeData {
     Poly {
         quantifiers: Vec<(usize, String)>,
         body: TypeId,
+    },
+    /// Fixed-precision rational type: `Rational<p, q>`.
+    /// `int_bits` = number of integer bits (p), `frac_bits` = number of fractional bits (q).
+    /// Arithmetic is exact over the rational domain for contracts.
+    /// Default overflow policy is `saturate`.
+    Rational {
+        int_bits: u8,
+        frac_bits: u8,
     },
     Never,
     Unit,
@@ -435,6 +445,10 @@ impl TypeContext {
     /// `body` references them via `GenericParam`.
     pub fn poly(&mut self, quantifiers: Vec<(usize, String)>, body: TypeId) -> TypeId {
         self.alloc(TypeData::Poly { quantifiers, body })
+    }
+
+    pub fn rational(&mut self, int_bits: u8, frac_bits: u8) -> TypeId {
+        self.alloc(TypeData::Rational { int_bits, frac_bits })
     }
 
     /// Apply Yoneda reduction if this type matches the pattern
@@ -910,6 +924,7 @@ impl TypeContext {
             TypeData::Int { .. }
             | TypeData::UInt { .. }
             | TypeData::Float { .. }
+            | TypeData::Rational { .. }
             | TypeData::Bool
             | TypeData::Char
             | TypeData::Byte
@@ -1090,6 +1105,10 @@ impl TypeContext {
                 },
             ) => *s1 == *s2 && *b1 == *b2,
             (TypeData::Float { bits: b1 }, TypeData::Float { bits: b2 }) => *b1 == *b2,
+            (
+                TypeData::Rational { int_bits: p1, frac_bits: q1 },
+                TypeData::Rational { int_bits: p2, frac_bits: q2 },
+            ) => *p1 == *p2 && *q1 == *q2,
             _ => false,
         }
     }
@@ -1276,9 +1295,13 @@ impl TypeContext {
         })
     }
 
+    fn rational_ty_no_alloc(&self, int_bits: u8, frac_bits: u8) -> Option<TypeId> {
+        self.find_type(&TypeData::Rational { int_bits, frac_bits })
+    }
+
     pub fn is_numeric(&self, ty: TypeId) -> bool {
         match self.get(ty) {
-            TypeData::Int { .. } | TypeData::UInt { .. } | TypeData::Float { .. } => true,
+            TypeData::Int { .. } | TypeData::UInt { .. } | TypeData::Float { .. } | TypeData::Rational { .. } => true,
             _ => false,
         }
     }
@@ -1371,6 +1394,7 @@ impl TypeContext {
             TypeData::Forall { body, .. } | TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => 1 + self.type_constructor_depth(*body),
             TypeData::DynTrait { .. } => 1,
             TypeData::Int { .. } | TypeData::UInt { .. } | TypeData::Float { .. }
+            | TypeData::Rational { .. }
             | TypeData::Bool | TypeData::Char | TypeData::Byte | TypeData::USize
             | TypeData::Never | TypeData::Unit | TypeData::Error => 1,
         }
@@ -1410,6 +1434,24 @@ impl TypeContext {
 
     pub fn is_poly(&self, ty: TypeId) -> bool {
         matches!(self.get(ty), TypeData::Poly { .. })
+    }
+
+    pub fn is_rational(&self, ty: TypeId) -> bool {
+        matches!(self.get(ty), TypeData::Rational { .. })
+    }
+
+    pub fn bits_of_rational_int(&self, ty: TypeId) -> Option<u8> {
+        match self.get(ty) {
+            TypeData::Rational { int_bits, .. } => Some(*int_bits),
+            _ => None,
+        }
+    }
+
+    pub fn bits_of_rational_frac(&self, ty: TypeId) -> Option<u8> {
+        match self.get(ty) {
+            TypeData::Rational { frac_bits, .. } => Some(*frac_bits),
+            _ => None,
+        }
     }
 
     pub fn is_generic_param(&self, ty: TypeId) -> bool {
@@ -1667,6 +1709,15 @@ impl TypeContext {
             TypeData::Float { .. } | TypeData::USize => {
                 // Floats and usize have very large but finite domains
                 Characteristic::FiniteExhaustible(usize::MAX)
+            }
+            TypeData::Rational { int_bits, frac_bits } => {
+                // Rational<p,q> has 2^(p+q) representable values
+                let total_bits = *int_bits as u32 + *frac_bits as u32;
+                if total_bits >= 16 {
+                    Characteristic::FiniteExhaustible(usize::MAX)
+                } else {
+                    Characteristic::FiniteExhaustible(1usize << total_bits)
+                }
             }
             TypeData::Bool => Characteristic::FiniteExhaustible(2),
             TypeData::Char => Characteristic::FiniteExhaustible(256),

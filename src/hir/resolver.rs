@@ -1047,7 +1047,7 @@ impl<'a> NameResolver<'a> {
                         "USize" => self.ctx.usize(),
                         "Unit" => self.ctx.unit(),
                         "Never" => self.ctx.never(),
-                        "Int" | "UInt" | "Float" => {
+                        "Int" | "UInt" | "Float" | "Rational" => {
                             // These require type arguments; handled in Type::Generic
                             self.ctx.error()
                         }
@@ -1077,6 +1077,11 @@ impl<'a> NameResolver<'a> {
                             "Float" => {
                                 let bits = self.extract_int_from_type(&args[0]).unwrap_or(64);
                                 return self.ctx.float(bits);
+                            }
+                            "Rational" => {
+                                let p = self.extract_int_from_type(&args[0]).unwrap_or(16);
+                                let q = self.extract_int_from_type(&args[1]).unwrap_or(16);
+                                return self.ctx.rational(p, q);
                             }
                             _ => {}
                         }

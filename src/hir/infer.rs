@@ -451,6 +451,7 @@ impl InferenceContext {
                 PrincipalShape::Constructor(args.len())
             }
             TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } => PrincipalShape::Poly,
+            TypeData::Rational { .. } => PrincipalShape::Unknown,
             TypeData::InferVar { .. } | TypeData::GenericParam { .. } => PrincipalShape::Var,
             _ => PrincipalShape::Unknown,
         }
@@ -1470,7 +1471,7 @@ impl InferenceContext {
                 TypeVariableKind::Integer => {
                     if !matches!(
                         data,
-                        TypeData::Int { .. } | TypeData::UInt { .. } | TypeData::USize
+                        TypeData::Int { .. } | TypeData::UInt { .. } | TypeData::USize | TypeData::Rational { .. }
                     ) {
                         return Err(TypeError::Mismatch {
                             expected: ty_id,
@@ -1503,6 +1504,7 @@ impl InferenceContext {
                         TypeData::Int { .. }
                             | TypeData::UInt { .. }
                             | TypeData::Float { .. }
+                            | TypeData::Rational { .. }
                             | TypeData::USize
                     ) {
                         return Err(TypeError::Mismatch {
@@ -1618,6 +1620,7 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
         TypeData::Int { .. }
         | TypeData::UInt { .. }
         | TypeData::Float { .. }
+        | TypeData::Rational { .. }
         | TypeData::Bool
         | TypeData::Char
         | TypeData::Byte

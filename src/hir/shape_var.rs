@@ -418,6 +418,7 @@ pub fn type_data_to_shape(data: &TypeData) -> TypeShape {
         | TypeData::Mu { .. }
         | TypeData::Nu { .. }
         | TypeData::Poly { .. } => TypeShape::Poly,
+        TypeData::Rational { .. } => TypeShape::Unknown,
         TypeData::Coproduct { alternatives } => TypeShape::Tuple(alternatives.len()),
         _ => TypeShape::Unknown,
     }

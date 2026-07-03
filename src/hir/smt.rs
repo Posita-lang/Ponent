@@ -94,7 +94,8 @@ impl SmtSolver {
         smt.push_str("(declare-fun type-fn (Type Type) Type)\n");
         smt.push_str("(declare-fun type-tuple2 (Type Type) Type)\n");
         smt.push_str("(declare-fun type-struct (Int Type) Type)\n");
-        smt.push_str("(declare-fun type-poly (Type) Type)\n\n");
+        smt.push_str("(declare-fun type-poly (Type) Type)\n");
+        smt.push_str("(declare-fun type-rational (Int Int) Type)\n\n");
 
         // ── 4. Shape-of function ────────────────────────────────
         smt.push_str("(declare-fun shape-of (Type) Int)\n\n");
@@ -110,7 +111,8 @@ impl SmtSolver {
         smt.push_str("(assert (forall ((a Type) (b Type)) (= (shape-of (type-fn a b)) SHAPE_ARROW)))\n");
         smt.push_str("(assert (forall ((a Type) (b Type)) (= (shape-of (type-tuple2 a b)) SHAPE_TUPLE)))\n");
         smt.push_str("(assert (forall ((tag Int) (a Type)) (= (shape-of (type-struct tag a)) SHAPE_CONSTRUCTOR)))\n");
-        smt.push_str("(assert (forall ((a Type)) (= (shape-of (type-poly a)) SHAPE_POLY)))\n\n");
+        smt.push_str("(assert (forall ((a Type)) (= (shape-of (type-poly a)) SHAPE_POLY)))\n");
+        smt.push_str("(assert (forall ((p Int) (q Int)) (= (shape-of (type-rational p q)) SHAPE_UNKNOWN)))\n\n");
 
         // ── 6. Inference variable ──────────────────────────────
         smt.push_str(&format!("(declare-const iv_{} Type)\n", var_id));
@@ -193,6 +195,9 @@ impl SmtSolver {
                 format!("(type-poly {})", b)
             }
             TypeData::InferVar { id } => format!("iv_{}", id),
+            TypeData::Rational { int_bits, frac_bits } => {
+                format!("(type-rational {} {})", int_bits, frac_bits)
+            }
             _ => "type-unknown".into(),
         }
     }

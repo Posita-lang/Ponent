@@ -105,6 +105,35 @@ pub fn register_builtins(
             .ok();
     }
 
+    // Register built-in Rational<p,q> types with arithmetic trait impls.
+    // Rational supports Add, Sub, Mul, Div, Rem, Eq, Ord (Lt, Gt, Le, Ge, Neq).
+    // Bitwise operations (BitAnd, BitOr, BitXor, Shl, Shr, And, Or) are NOT applicable.
+    let rational_arith_traits = [
+        add_id, sub_id, mul_id, div_id, rem_id,
+        eq_id, neq_id, lt_id, gt_id, le_id, ge_id,
+    ];
+    for &(p, q) in &[(8,8), (16,16), (32,16), (32,32)] {
+        let rty = ctx.rational(p, q);
+        for &trait_id in &rational_arith_traits {
+            trait_env
+                .add_impl(
+                    ImplCandidate {
+                        trait_id,
+                        for_type: rty,
+                        methods: vec![],
+                        assoc_tys: vec![],
+                        has_auto_deref: false,
+                        context: vec![],
+                        span: Span::new(0, 0),
+                    },
+                    symbols,
+                    ctx,
+                    false,
+                )
+                .ok();
+        }
+    }
+
     // Register standard library types: Result, Option, Future
 
     // Result<T, E>

@@ -3342,7 +3342,46 @@ mod tests {
         assert!(discharged.is_some());
         assert!(checker.guarantee_chain.current().is_none());
     }
+
+    // ── Rational<p,q> tests ────────────────────────────────────────
+
+    #[test]
+    fn test_rational_type_syntax() {
+        let result = check_source(
+            r#"edition = "2026";
+def main() -> Rational<16,16> {
+    return 0: Rational<16,16>;
+}"#
+        );
+        assert!(result.is_ok(), "Rational<16,16> should type-check: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_rational_arithmetic() {
+        let result = check_source(
+            r#"edition = "2026";
+def main() -> Rational<16,16> {
+    set a: Rational<16,16> = 1: Rational<16,16>;
+    set b: Rational<16,16> = 2: Rational<16,16>;
+    set c = a + b;
+    return c;
+}"#
+        );
+        assert!(result.is_ok(), "Rational arithmetic should type-check: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_rational_type_mismatch() {
+        let result = check_source(
+            r#"edition = "2026";
+def main() -> Rational<16,8> {
+    return 0: Rational<8,16>;
+}"#
+        );
+        assert!(result.is_err(), "Rational<16,8> and Rational<8,16> should NOT unify");
+    }
 }
+
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
