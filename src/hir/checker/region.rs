@@ -91,9 +91,15 @@ impl RegionTree {
         self.regions[self.current.0].dirty
     }
 
-    /// Clear the dirty flag on the current region.
-    fn clean_region(&mut self) {
-        self.regions[self.current.0].dirty = false;
+    /// Collect levels of all dirty regions for generalization.
+    /// Returns levels sorted descending (innermost first).
+    fn collect_dirty_levels(&self) -> Vec<usize> {
+        let mut levels: Vec<usize> = self.regions.iter()
+            .filter(|r| r.dirty)
+            .map(|r| r.id)
+            .collect();
+        levels.sort_by(|a, b| b.cmp(a)); // innermost first
+        levels
     }
 }
 

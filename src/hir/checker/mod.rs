@@ -268,6 +268,8 @@ impl<'a> TypeChecker<'a> {
 
     fn exit_inference_scope(&mut self) -> Result<(), DiagnosticCollector> {
         let mut current = mem::replace(&mut self.infer, self.infer_stack.pop().unwrap_or_default());
+        // Wire RegionTree dirty levels into inference context for generation-based generalization.
+        current.region_dirty_levels = self.region_tree.collect_dirty_levels();
         if let Err(err) = current.solve(self.ctx, self.trait_env, self.symbols) {
             let diag = Diagnostic::error(format!("type inference error: {:?}", err))
                 .with_span(Span::new(0, 0));
@@ -3422,6 +3424,17 @@ impl RegionTree {
     /// same behavior as the old `loop_stack.iter().rev()`.
     fn iter_frames_rev(&self) -> RegionFrameIter {
         RegionFrameIter { tree: self, current: Some(self.current), frame_idx: None }
+    }
+
+    /// Collect levels of all dirty regions for generalization.
+    /// Returns levels sorted descending (innermost first).
+    fn collect_dirty_levels(&self) -> Vec<usize> {
+        let mut levels: Vec<usize> = self.regions.iter()
+            .filter(|r| r.dirty)
+            .map(|r| r.id)
+            .collect();
+        levels.sort_by(|a, b| b.cmp(a));
+        levels
     }
 }
 

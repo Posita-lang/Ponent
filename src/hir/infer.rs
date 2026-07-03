@@ -254,6 +254,8 @@ pub struct InferenceContext {
     /// Tracks which InferVar ids have been unified since the last
     /// `force_generalize` call, enabling incremental processing.
     dirty_set: std::collections::HashSet<usize>,
+    /// Dirty region levels from TypeChecker's RegionTree.
+    pub region_dirty_levels: Vec<usize>,
 }
 
 /// A set of pattern alternatives for a suspended match constraint.
@@ -288,6 +290,7 @@ impl InferenceContext {
             forward_refs: Vec::new(),
             reverse_refs: Vec::new(),
             dirty_set: std::collections::HashSet::new(),
+            region_dirty_levels: Vec::new(),
         }
     }
 
@@ -889,52 +892,88 @@ impl InferenceContext {
         false
     }
 
-    /// ── S-Generalize / force_generalization (OmniML §5.3) ───────
+    /// ── S-Generalize / update_and_generalize_generation (OmniML §5.3) ──
     ///
-    /// Force generalization of the current region before instantiation.
-    /// Drains all dirty regions, marks guards on PG variables, and
-    /// runs the scheduler to flush any pending work.
-    /// Call this before `s_inst_copy` to ensure the source scheme
-    /// is in its most-generalized form.
+    /// Drains all dirty regions, collects guarded roots, and generalizes
+    /// PG variables that are no longer guarded or referenced.
+    ///
+    /// The optional `target_var_id` restricts processing to just the region
+    /// containing that variable (for targeted generalization before instantiation).
     pub fn force_generalize(&mut self, ctx: &mut TypeContext) {
-        // Only process variables that have been modified since the last call
-        // (drain_dirty). When dirty_set is empty (no tracking available),
-        // fall back to processing all PG variables conservatively.
-        let dirty: Vec<usize> = if self.dirty_set.is_empty() {
-            (0..self.gen_statuses.len()).filter(|i| self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable)).collect()
+        self.force_generalize_for_regions(ctx, &[], None)
+    }
+
+    /// Full generation-based generalization.  `dirty_levels` lists region
+    /// levels that have been marked dirty.  `target_var_id` (if set) limits
+    /// processing to the region containing that specific variable.
+    pub fn force_generalize_for_regions(
+        &mut self,
+        ctx: &mut TypeContext,
+        dirty_levels: &[usize],
+        target_var: Option<usize>,
+    ) {
+        // Collect PG variables from dirty_set or dirty_levels.
+        let dirty: Vec<usize> = if let Some(tv) = target_var {
+            // Targeted: only process the region containing `tv`.
+            let level = self.type_vars.get(tv).map(|v| v.level).unwrap_or(0);
+            (0..self.gen_statuses.len())
+                .filter(|i| {
+                    self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable)
+                        && self.type_vars.get(*i).map(|v| v.level == level).unwrap_or(false)
+                })
+                .collect()
+        } else if !self.dirty_set.is_empty() {
+            self.dirty_set.iter().copied()
+                .filter(|i| self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable))
+                .collect()
+        } else if !self.region_dirty_levels.is_empty() {
+            let dl: std::collections::HashSet<usize> = self.region_dirty_levels.iter().copied().collect();
+            (0..self.gen_statuses.len())
+                .filter(|i| {
+                    self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable)
+                        && self.type_vars.get(*i).map(|v| dl.contains(&v.level)).unwrap_or(false)
+                })
+                .collect()
+        } else if !dirty_levels.is_empty() {
+            // Use provided dirty levels (from RegionTree).
+            let dl: std::collections::HashSet<usize> = dirty_levels.iter().copied().collect();
+            (0..self.gen_statuses.len())
+                .filter(|i| {
+                    self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable)
+                        && self.type_vars.get(*i).map(|v| dl.contains(&v.level)).unwrap_or(false)
+                })
+                .collect()
         } else {
-            self.dirty_set.iter().copied().filter(|i| self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable)).collect()
+            // Fallback: process all PG variables.
+            (0..self.gen_statuses.len())
+                .filter(|i| self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable))
+                .collect()
         };
 
         if dirty.is_empty() {
             return;
         }
 
-        // Ensure guard_sets vectors are sized consistently.
+        // Ensure guard_sets consistency.
         for &i in &dirty {
             while self.guard_sets.len() <= i {
                 self.guard_sets.push(Vec::new());
             }
         }
 
-        // Compute transitive guards: variables that share a binding root
-        // with a directly-guarded variable are transitively guarded.
-        // This ensures guards propagate through unification groups.
+        // Compute transitive guards via binding-root sharing.
         let mut trans_guarded: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for &i in &dirty {
-            let has_direct = i < self.guard_sets.len() && !self.guard_sets[i].is_empty();
-            if has_direct {
+            if i < self.guard_sets.len() && !self.guard_sets[i].is_empty() {
                 trans_guarded.insert(i);
             }
         }
-        // Expand: any two variables unified to the same root share guards.
         for &i in &dirty {
             if !trans_guarded.contains(&i) && i < self.var_type_ids.len() {
                 let i_root = ctx.resolve_binding(self.var_type_ids[i]);
                 for &j in &dirty {
                     if j < self.var_type_ids.len() && trans_guarded.contains(&j) {
-                        let j_root = ctx.resolve_binding(self.var_type_ids[j]);
-                        if i_root == j_root {
+                        if ctx.resolve_binding(self.var_type_ids[j]) == i_root {
                             trans_guarded.insert(i);
                             break;
                         }
@@ -943,50 +982,46 @@ impl InferenceContext {
             }
         }
 
-        // Process variables innermost-first (by descending level) so that
-        // generalizations in nested scopes are visible to outer scopes.
+        // Process innermost-first (highest level first = most nested first).
         let mut vars_by_level: Vec<(usize, usize)> = dirty.iter()
-            .map(|&i| {
-                let level = if i < self.type_vars.len() { self.type_vars[i].level } else { 0 };
-                (i, level)
-            })
+            .map(|&i| (i, self.type_vars.get(i).map(|v| v.level).unwrap_or(0)))
             .collect();
         vars_by_level.sort_by(|a, b| b.1.cmp(&a.1));
 
-        // Before generalizing, check for skolem escape: if a resolved type
-        // contains a GenericParam reference at a level below the variable's
-        // own level, a Forall-bound variable has escaped its scope.
+        // Rigid scope check per generation.
         for &(i, level) in &vars_by_level {
             if i >= self.var_type_ids.len() { continue; }
             let resolved = ctx.resolve_binding(self.var_type_ids[i]);
             if matches!(ctx.get(resolved), TypeData::InferVar { .. }) { continue; }
             if level < self.current_level {
                 if Self::check_rigid_escape(ctx, resolved, level) {
-                    continue; // keep as PG, don't generalize
+                    continue;
                 }
             }
         }
 
-        // Generalize eligible PG variables: resolved, unguarded, no waiting
-        // constraints → safe to promote from PG to G.
+        // Generalize eligible PG → G in level order (generation order).
         for &(i, _level) in &vars_by_level {
             if i >= self.gen_statuses.len() || self.gen_statuses[i] != GenStatus::PartiallyGeneralizable {
                 continue;
             }
-
             let is_trans_guarded = trans_guarded.contains(&i);
             let has_waiting = i < self.wait_lists.len() && !self.wait_lists[i].is_empty();
             let is_resolved = {
                 let ty = ctx.resolve_binding(self.var_type_ids[i]);
                 !matches!(ctx.get(ty), TypeData::InferVar { .. })
             };
-
             if is_resolved && !is_trans_guarded && !has_waiting {
                 self.gen_statuses[i] = GenStatus::Generalized;
             }
         }
 
-        self.dirty_set.clear();
+        // Update dirty_set: remove only the processed levels.
+        if dirty_levels.is_empty() && target_var.is_none() {
+            self.dirty_set.clear();
+        } else {
+            self.dirty_set.retain(|i| !dirty.contains(i));
+        }
     }
 
     /// Check whether a resolved type contains escaped rigid (skolem) variables.
