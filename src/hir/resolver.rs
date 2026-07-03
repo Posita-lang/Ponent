@@ -135,6 +135,8 @@ impl<'a> NameResolver<'a> {
                     is_comptime: *is_comptime,
                     is_async: *is_async,
                     is_pure: self.has_pure_attribute(attributes),
+                    is_ieee_contracts: self.has_ieee_contracts_attribute(attributes),
+                    hints: self.extract_hints(attributes),
                     contracts: contracts.clone(),
                     attributes: attributes.clone(),
                 };
@@ -412,6 +414,8 @@ impl<'a> NameResolver<'a> {
                     is_comptime: false,
                     is_async: false,
                     is_pure: false,
+                    is_ieee_contracts: self.has_ieee_contracts_attribute(attributes),
+                    hints: self.extract_hints(attributes),
                     contracts: Vec::new(),
                     attributes: attributes.clone(),
                 };
@@ -1238,6 +1242,17 @@ impl<'a> NameResolver<'a> {
 
     fn has_pure_attribute(&self, attributes: &[Attribute]) -> bool {
         attributes.iter().any(|attr| attr.name == "pure")
+    }
+
+    fn has_ieee_contracts_attribute(&self, attributes: &[Attribute]) -> bool {
+        attributes.iter().any(|attr| attr.name == "ieee_contracts")
+    }
+
+    fn extract_hints(&self, attributes: &[Attribute]) -> Vec<Expr> {
+        attributes.iter()
+            .filter(|attr| attr.name == "hint")
+            .flat_map(|attr| attr.args.clone())
+            .collect()
     }
 
     fn literal_type(&mut self, lit: &Literal) -> TypeId {

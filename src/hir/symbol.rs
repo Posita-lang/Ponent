@@ -54,7 +54,9 @@ pub struct FunctionBinding {
     pub is_comptime: bool,
     pub is_async: bool,
     pub is_pure: bool,
+    pub is_ieee_contracts: bool,
     pub contracts: Vec<Contract>,
+    pub hints: Vec<Expr>,
     pub attributes: Vec<Attribute>,
 }
 

@@ -33,6 +33,8 @@ pub enum HirStmt {
         finally: Option<Vec<HirStmt>>,
         is_comptime: bool,
         is_async: bool,
+        is_ieee_contracts: bool,
+        hints: Vec<Expr>,
     },
     TypeDef {
         span: Span,

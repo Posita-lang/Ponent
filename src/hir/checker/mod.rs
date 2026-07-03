@@ -638,6 +638,11 @@ impl<'a> TypeChecker<'a> {
                     finally: finally_hir,
                     is_comptime: *is_comptime,
                     is_async: *is_async,
+                    is_ieee_contracts: attributes.iter().any(|a| a.name == "ieee_contracts"),
+                    hints: attributes.iter()
+                        .filter(|a| a.name == "hint")
+                        .flat_map(|a| a.args.clone())
+                        .collect(),
                 })
             }
             Stmt::Expression(expr) => {
