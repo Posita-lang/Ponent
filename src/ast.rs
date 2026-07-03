@@ -137,6 +137,10 @@ pub enum Expr {
         span: Span,
     },
     Move(Box<Expr>, Span),
+    /// Multi-segment path: `Module::Type::item`. Preserves `::` semantics,
+    /// distinct from FieldAccess (`.`). Used for associated fn calls,
+    /// enum variant construction, etc.
+    Path(Vec<String>, Span),
     Tuple(Vec<Expr>, Span),
     Array(Vec<Expr>, Span),
     Closure {
@@ -422,8 +426,8 @@ pub struct TypeParam {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeDefinition {
-    Struct(Vec<StructField>),
-    Enum(Vec<EnumVariant>, Option<String>),
+    Struct(Vec<StructField>, Vec<TypeModifier>),
+    Enum(Vec<EnumVariant>, Option<String>, Vec<TypeModifier>),
     TraitDef {
         methods: Vec<TraitMethod>,
         associated_types: Vec<AssociatedType>,
@@ -675,6 +679,7 @@ impl Expr {
             Expr::Range { span, .. } => *span,
             Expr::StructLit { span, .. } => *span,
             Expr::EnumLit { span, .. } => *span,
+            Expr::Path(_, span) => *span,
             Expr::Move(_, span) => *span,
             Expr::Tuple(_, span) => *span,
             Expr::Array(_, span) => *span,

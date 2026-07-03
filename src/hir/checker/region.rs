@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RegionId(usize);
+pub struct RegionId(pub usize);
 
 #[derive(Debug, Clone)]
 pub struct Region {
@@ -19,13 +19,13 @@ pub struct Region {
 /// per-region, supporting nonlinear let-polymorphism scope management.
 #[derive(Debug, Clone)]
 pub struct RegionTree {
-    regions: Vec<Region>,
-    root: RegionId,
-    current: RegionId,
+    pub regions: Vec<Region>,
+    pub root: RegionId,
+    pub current: RegionId,
 }
 
 impl RegionTree {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let root = Region {
             id: 0,
             parent: None,
@@ -41,19 +41,19 @@ impl RegionTree {
         }
     }
 
-    fn current_frames(&self) -> &[CtxFrame] {
+    pub fn current_frames(&self) -> &[CtxFrame] {
         &self.regions[self.current.0].frames
     }
 
-    fn push_frame(&mut self, frame: CtxFrame) {
+    pub fn push_frame(&mut self, frame: CtxFrame) {
         self.regions[self.current.0].frames.push(frame);
     }
 
-    fn pop_frame(&mut self) -> Option<CtxFrame> {
+    pub fn pop_frame(&mut self) -> Option<CtxFrame> {
         self.regions[self.current.0].frames.pop()
     }
 
-    fn enter_region(&mut self) -> RegionId {
+    pub fn enter_region(&mut self) -> RegionId {
         let new_id = RegionId(self.regions.len());
         self.regions.push(Region {
             id: new_id.0,
@@ -68,7 +68,7 @@ impl RegionTree {
         old
     }
 
-    fn exit_region(&mut self) {
+    pub fn exit_region(&mut self) {
         if let Some(parent) = self.regions[self.current.0].parent {
             self.current = parent;
         }
@@ -77,23 +77,23 @@ impl RegionTree {
     /// Iterate all frames from current region up to root.
     /// Returns frames in reverse order (innermost first), which is the
     /// same behavior as the old `loop_stack.iter().rev()`.
-    fn iter_frames_rev(&self) -> RegionFrameIter {
+    pub fn iter_frames_rev(&self) -> RegionFrameIter {
         RegionFrameIter { tree: self, current: Some(self.current), frame_idx: None }
     }
 
     /// Mark the current region as dirty (a unification variable was bound).
-    fn mark_dirty(&mut self) {
+    pub fn mark_dirty(&mut self) {
         self.regions[self.current.0].dirty = true;
     }
 
     /// Check whether the current region is dirty.
-    fn is_dirty(&self) -> bool {
+    pub fn is_dirty(&self) -> bool {
         self.regions[self.current.0].dirty
     }
 
     /// Collect levels of all dirty regions for generalization.
     /// Returns levels sorted descending (innermost first).
-    fn collect_dirty_levels(&self) -> Vec<usize> {
+    pub fn collect_dirty_levels(&self) -> Vec<usize> {
         let mut levels: Vec<usize> = self.regions.iter()
             .filter(|r| r.dirty)
             .map(|r| r.id)
@@ -128,8 +128,3 @@ impl<'a> Iterator for RegionFrameIter<'a> {
         }
     }
 }
-
-/// A SCAP-style guarantee describing the state transition from function entry
-/// to function exit.  Following Feng & Shao (2006) §4, a guarantee `g` is a
-/// relation `State → State → Prop`.  In Posita we track this at the type level
-/// as an ordered pair of the ensures-condition (postcondition) and the frame

@@ -673,6 +673,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     }
                 }
             }
+            Expr::Path(path, span) => {
+                self.checker.diagnostics.push(
+                    Diagnostic::error(format!("unresolved path: {}", path.join("::"))).with_span(*span));
+                Ok((HirExpr::Error(*span), self.checker.ctx.error()))
+            }
             Expr::Error(span) => Ok((HirExpr::Error(*span), self.checker.ctx.error())),
         }
     }
@@ -1046,7 +1051,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 for pat in before { hir_before.push(self.check_pattern(pat, elem_ty)?); }
                 let hir_slice = slice.as_ref().map(|pat| {
                     let slice_ty = self.checker.ctx.slice(elem_ty);
-                    Ok(Box::new(self.check_pattern(pat, slice_ty)?))
+                    let pat: HirPattern = self.check_pattern(pat, slice_ty)?;
+                    Ok(Box::new(pat))
                 }).transpose()?;
                 let mut hir_after = Vec::new();
                 for pat in after { hir_after.push(self.check_pattern(pat, elem_ty)?); }

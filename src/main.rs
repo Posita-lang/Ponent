@@ -86,7 +86,8 @@ fn main() {
                 }
                 Err(diagnostics) => {
                     for diag in diagnostics {
-                        eprintln!("error at {}: {}", diag.span, diag.message);
+                        let span_str = diag.span.map(|s| format!("{}", s)).unwrap_or_default();
+                        eprintln!("error: {} [at {}]", diag.message, span_str);
                     }
                     process::exit(1);
                 }

@@ -191,8 +191,8 @@ impl<'a> NameResolver<'a> {
                 self.resolution_map.type_def_ids.insert(name.clone(), def_id);
                 let type_params = params.clone();
                 let kind = match definition {
-                    TypeDefinition::Struct(_) => TypeKind::Struct,
-                    TypeDefinition::Enum(_, _) => TypeKind::Enum,
+                    TypeDefinition::Struct(_, _) => TypeKind::Struct,
+                    TypeDefinition::Enum(_, _, _) => TypeKind::Enum,
                     TypeDefinition::Alias(_, _) => TypeKind::Alias,
                     TypeDefinition::TraitDef { .. } => TypeKind::Trait,
                     TypeDefinition::ImplBlock { .. } => TypeKind::Impl,
@@ -209,7 +209,7 @@ impl<'a> NameResolver<'a> {
                 let exhaustive = attributes.iter().any(|a| a.name == "exhaustive");
 
                 match definition {
-                    TypeDefinition::Struct(fields_def) => {
+                    TypeDefinition::Struct(fields_def, _) => {
                         fields = fields_def
                             .iter()
                             .map(|f| {
@@ -223,7 +223,7 @@ impl<'a> NameResolver<'a> {
                             })
                             .collect();
                     }
-                    TypeDefinition::Enum(variants_def, mm) => {
+                    TypeDefinition::Enum(variants_def, mm, _) => {
                         variants = variants_def.clone();
                         missing_match = mm.clone();
                     }
@@ -956,6 +956,11 @@ impl<'a> NameResolver<'a> {
             }
             Expr::PolyUnbox { expr, .. } => {
                 self.resolve_expr(expr);
+                Some(self.ctx.error())
+            }
+            Expr::Path(path, _) => {
+                self.diagnostics.push(
+                    Diagnostic::error(format!("unresolved path: {}", path.join("::"))).with_span(Span::new(0, 0)));
                 Some(self.ctx.error())
             }
             Expr::Error(..) => Some(self.ctx.error()),

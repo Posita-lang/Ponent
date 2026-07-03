@@ -501,6 +501,7 @@ impl TypeContext {
             if let TypeData::Fn { params, ret } = self.get(body).clone() {
                 let pi = param_index;
                 let mut branch_replacements: Vec<TypeId> = Vec::new();
+                let mut is_coyoneda = false;
                 for branch in params {
                     // Peel outer Forall layers (∀Z⃗ₖ).
                     let mut inner_quantifiers: Vec<(usize, String)> = Vec::new();
@@ -545,13 +546,13 @@ impl TypeContext {
                         }
                         // Process co-Yoneda case
                         if coyoneda_match {
+                            is_coyoneda = true;
                             // The branch is X ⇒ A where A = inner_ret (not a param).
                             // When ips.len() == 1, X is the only param and A = inner_ret.
-                            // When ips.len() > 1, the branch is X ⇒ A₁ ⇒ ... ⇒ Aⱼ
-                            // and the replacement is the return of the branch itself.
+                            // When ips.len() > 1, the branch is X ⇒ A₁ ⇒ ... ⇒ Aⱼ ⇒ ir,
+                            // and the replacement is A₁ ⇒ (A₂ ⇒ ... ⇒ (Aⱼ ⇒ ir)).
                             let replacement = if ips.len() <= 1 { ir }
-                                else if ips.len() == 2 { ips[1] }
-                                else { self.tuple(ips[1..].to_vec()) };
+                                else { self.function(ips[1..].to_vec(), ir) };
                             let repl = if inner_quantifiers.is_empty() { replacement }
                                 else {
                                     let mut w = replacement;
@@ -568,18 +569,27 @@ impl TypeContext {
                     // Σₖ is the categorical coproduct (sum type), NOT a product.
                     // For ∀X.(A₁⇒X)⇒(A₂⇒X)⇒X  →  A₁ + A₂
                     let sigma = self.coproduct(branch_replacements);
-                    // Wrap with μX only when the branch product(s) depend on X
-                    // (Pistone & Tranchini 2022 §2, eq.3):
-                    //   ∀X.(A⟨X⟩⇒X)⇒B⟨X⟩  →  B⟨X↦μX.A⟨X⟩⟩
-                    // When A⟨X⟩ = Int (no X), no Mu needed:
+                    // Wrap with μX/νX only when the branch product(s) depend on X
+                    // (Pistone & Tranchini 2022 §2, eq.3 & eq.4):
+                    //   Yoneda (A⟨X⟩⇒X):    B⟨X⟩ → B⟨X↦μX.A⟨X⟩⟩
+                    //   co-Yoneda (X⇒A⟨X⟩): B⟨X⟩ → B⟨X↦νX.A⟨X⟩⟩
+                    // When A⟨X⟩ = Int (no X), no fixpoint needed:
                     //   ∀X.(Int⇒X)⇒B⟨X⟩  →  B⟨X↦Int⟩
-                    let needs_mu = self.type_contains_param(pi, sigma);
-                    let replacement = if needs_mu {
-                        self.alloc(TypeData::Mu {
-                            param_index: pi,
-                            param_name: "X".into(),
-                            body: sigma,
-                        })
+                    let needs_fix = self.type_contains_param(pi, sigma);
+                    let replacement = if needs_fix {
+                        if is_coyoneda {
+                            self.alloc(TypeData::Nu {
+                                param_index: pi,
+                                param_name: "X".into(),
+                                body: sigma,
+                            })
+                        } else {
+                            self.alloc(TypeData::Mu {
+                                param_index: pi,
+                                param_name: "X".into(),
+                                body: sigma,
+                            })
+                        }
                     } else { sigma };
                     return self.replace_generic(ret, pi, replacement);
                 }
@@ -2180,5 +2190,31 @@ mod tests {
         let reduced = ctx.try_yoneda_reduce(ty);
         let expected = ctx.tuple(vec![int_ty, bool_ty]);
         assert_eq!(reduced, expected, "(Int⇒Bool⇒X)⇒X should reduce to (Int,Bool)");
+    }
+
+    #[test]
+    fn test_coyoneda_multi_param_preserves_return() {
+        // co-Yoneda: ∀X.(X ⇒ Int ⇒ Float) ⇒ X
+        //   ips = [X(pi), Int], ir = Float
+        //   Correct: replacement = Int → Float = Fn(Int, Float)
+        //   Bug:     replacement = Int (drops Float!)
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let int_ty = ctx.int(32, true);
+        let float_ty = ctx.float(64);
+        // branch: X ⇒ Int → Float
+        let branch = ctx.function(vec![int_ty], float_ty);
+        // outer: X ⇒ branch  →  but co-Yoneda needs X as FIRST param
+        let outer_fn = ctx.function(vec![p0, branch], p0); // p0 is ret, but it doesn't matter
+        // Actually build the right shape: ∀X.(X ⇒ Int → Float) ⇒ X
+        // The branch param list is [X, Int] with ret=Float
+        let inner_fn = ctx.function(vec![p0, int_ty], float_ty);
+        let outer = ctx.function(vec![inner_fn], p0);
+        let forall = ctx.forall(0, "X".into(), outer);
+        let reduced = ctx.try_yoneda_reduce(forall);
+        // Expected: Int → Float
+        let expected = ctx.function(vec![int_ty], float_ty);
+        assert_eq!(reduced, expected,
+            "∀X.(X⇒Int⇒Float)⇒X should reduce to Int→Float, not lose Float");
     }
 }
