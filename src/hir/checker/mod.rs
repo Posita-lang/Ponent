@@ -1823,11 +1823,18 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// Placeholder for future `Sized` requirement checking.
-    /// Currently allows all types without error, as Posita does not yet have a `Sized` trait.
-    fn require_type_sized(&self, _ty: TypeId, _span: Span) {
-        // Reserved for future use: `self.require_trait_bound(ty, Sized, span)`
-        // For now, all types are considered "sized" by default.
+    /// Check that a type satisfies the `Sized` bound.
+    /// Concrete types are implicitly `Sized`.  Type parameters are assumed
+    /// sized by default (the standard conservative choice).  Unresolved
+    /// infer vars get a deferred `Impl` constraint.
+    fn require_type_sized(&mut self, ty: TypeId, span: Span) {
+        let resolved = self.ctx.resolve_binding(ty);
+        match self.ctx.get(resolved) {
+            TypeData::InferVar { .. } => {
+                self.add_constraint(Constraint::Impl(ty, DefId(0), span));
+            }
+            _ => {} // concrete types and generic params: assumed Sized
+        }
     }
 
     fn check_result_type(&self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {

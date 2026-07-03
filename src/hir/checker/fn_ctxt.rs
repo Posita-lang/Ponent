@@ -853,9 +853,37 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 Ok(ty)
             }
             Type::Never(_) => Ok(self.checker.ctx.never()),
-            Type::Union(_, span) => {
-                self.checker.diagnostics.push(Diagnostic::error("union types are not yet implemented").with_span(*span));
-                Ok(self.checker.ctx.error())
+            Type::Union(tys, span) => {
+                let resolved: Vec<TypeId> = tys.iter()
+                    .map(|t| self.resolve_type(t))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if resolved.len() == 1 {
+                    Ok(resolved[0])
+                } else if resolved.is_empty() {
+                    Ok(self.checker.ctx.never())
+                } else {
+                    // Combine all resolved types into a Coproduct (sum type),
+                    // representing the union of all variants.
+                    let mut alternatives = Vec::new();
+                    for ty in resolved {
+                        match self.checker.ctx.get(ty) {
+                            TypeData::Enum { args, .. } => alternatives.push(ty),
+                            TypeData::Coproduct { alternatives: alts } => {
+                                alternatives.extend(alts.clone());
+                            }
+                            TypeData::Never => {} // ignore
+                            _ => alternatives.push(ty),
+                        }
+                    }
+                    // Deduplicate alternatives
+                    alternatives.sort_by_key(|t| t.0);
+                    alternatives.dedup();
+                    if alternatives.len() == 1 {
+                        Ok(alternatives[0])
+                    } else {
+                        Ok(self.checker.ctx.coproduct(alternatives))
+                    }
+                }
             }
             Type::Error(_) => Ok(self.checker.ctx.error()),
         }

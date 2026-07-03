@@ -139,6 +139,13 @@ pub enum Constraint {
         instantiation_ty: TypeId,
         span: Span,
     },
+    /// OmniML let-constraint: `let x = λα.∃ᾱ. C₁ in C₂`
+    Let {
+        expr_var: String,
+        def_constraint: Box<Constraint>,
+        body_constraint: Box<Constraint>,
+        span: Span,
+    },
 }
 
 impl Constraint {
@@ -178,6 +185,7 @@ impl Constraint {
             Constraint::Exists { .. } => 2, // exists: medium-high priority
             Constraint::Forall { .. } => 6, // forall: low priority (skolem)
             Constraint::Instance { .. } => 1, // instance: high priority
+            Constraint::Let { .. } => 2, // let: medium-high priority
         }
     }
 }
@@ -417,6 +425,7 @@ impl InferenceContext {
                 let r = ctx.resolve_binding(*instantiation_ty);
                 if let TypeData::InferVar { id } = ctx.get(r) { Some(*id) } else { None }
             }
+            Constraint::Let { .. } => None, // structural — no single infer var
         }
     }
 
@@ -1168,6 +1177,11 @@ impl InferenceContext {
                             ctx.unify(*a, *b)?;
                         }
 
+                        // Mark dirty for drain_dirty tracking.
+                        for var_id in [a_var_id, b_var_id].iter().flatten() {
+                            self.mark_dirty(*var_id);
+                        }
+
                         // Incremental wake-up: if a variable was just resolved,
                         // immediately enqueue its suspended constraints.
                         for var_id in [a_var_id, b_var_id].iter().flatten() {
@@ -1326,13 +1340,17 @@ impl InferenceContext {
                 heap.push(PrioritizedConstraint { priority: p, constraint: inner });
             }
             Constraint::Instance { expr_var, instantiation_ty, span: _ } => {
-                // OmniML: instantiate a generalised scheme.
-                // Look up the scheme and unify with the instantiation type.
-                // For now, treat as Eq(InferVar, instantiation_ty) if the
-                // expression is unresolved.
                 let p = Constraint::Eq(*instantiation_ty, *instantiation_ty, crate::ast::Span::new(0, 0)).priority(ctx);
                 let ic = Constraint::Eq(*instantiation_ty, *instantiation_ty, crate::ast::Span::new(0, 0));
                 heap.push(PrioritizedConstraint { priority: p, constraint: ic });
+            }
+            Constraint::Let { expr_var: _, def_constraint, body_constraint, span: _ } => {
+                let prev_level = self.enter_level();
+                let def_p = def_constraint.priority(ctx);
+                heap.push(PrioritizedConstraint { priority: def_p, constraint: def_constraint.as_ref().clone() });
+                let body_p = body_constraint.priority(ctx).max(4);
+                heap.push(PrioritizedConstraint { priority: body_p, constraint: body_constraint.as_ref().clone() });
+                self.exit_level(prev_level);
             }
         }
     }
@@ -2030,5 +2048,21 @@ mod tests {
 
         let handled = infer.try_match_via_shape_var(&mut ctx, int_ty, id, &mut heap);
         assert!(handled, "concrete type should discharge");
+    }
+
+    #[test]
+    fn test_let_constraint_priority() {
+        let c = Constraint::Let {
+            expr_var: "x".into(),
+            def_constraint: Box::new(Constraint::Eq(
+                TypeId(0), TypeId(1), crate::ast::Span::new(0, 0),
+            )),
+            body_constraint: Box::new(Constraint::Eq(
+                TypeId(0), TypeId(0), crate::ast::Span::new(0, 0),
+            )),
+            span: crate::ast::Span::new(0, 0),
+        };
+        let ctx = TypeContext::new();
+        assert_eq!(c.priority(&ctx), 2, "Let should have medium-high priority");
     }
 }
