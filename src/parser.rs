@@ -126,7 +126,6 @@ impl Parser {
             | Ok(Token::Minus)
             | Ok(Token::Plus)
             | Ok(Token::Bang)
-            | Ok(Token::LParen)
             | Ok(Token::LBracket)
             | Ok(Token::If)
             | Ok(Token::Match) => true,
@@ -1062,6 +1061,60 @@ impl Parser {
     fn parse_type_inner(&mut self) -> Result<Type, Diagnostic> {
         let start = self.span().start;
         match self.peek() {
+            Ok(Token::Lt) => {
+                // Qualified path / projection: `<ImplType as TraitPath>::AssocName`
+                self.advance().ok();
+                let impl_type = Box::new(self.parse_type()?);
+                self.expect(Token::As)?;
+                let trait_path = Box::new(self.parse_type()?);
+                self.expect_gt()?;
+                self.expect(Token::ColonColon)?;
+                let assoc_name = match self.advance() {
+                    Ok(Token::Ident(name)) => name,
+                    _ => {
+                        return Err(Diagnostic::error("expected associated type name after `::`")
+                            .with_code("E004")
+                            .with_help("qualified paths use `<Type as Trait>::AssocType` syntax")
+                            .with_suggestion("add the associated type name after `::`, e.g. `<T as Display>::Output`")
+                            .with_span(self.span(),));
+                    }
+                };
+                let end = self.span().end;
+                Ok(Type::Projection {
+                    impl_type,
+                    trait_path,
+                    assoc_name,
+                    span: Span::new(start, end),
+                })
+            }
+            Ok(Token::Shl) => {
+                // Nested projection starts with `<<`: `<<A as Trait1>::X as Trait2>::Y`
+                // The lexer merged `<<` into Shl; push one `Lt` back and treat as `<`.
+                self.advance().ok();
+                self.pending.push(Token::Lt);
+                let impl_type = Box::new(self.parse_type()?);
+                self.expect(Token::As)?;
+                let trait_path = Box::new(self.parse_type()?);
+                self.expect_gt()?;
+                self.expect(Token::ColonColon)?;
+                let assoc_name = match self.advance() {
+                    Ok(Token::Ident(name)) => name,
+                    _ => {
+                        return Err(Diagnostic::error("expected associated type name after `::`")
+                            .with_code("E004")
+                            .with_help("qualified paths use `<Type as Trait>::AssocType` syntax")
+                            .with_suggestion("add the associated type name after `::`, e.g. `<T as Display>::Output`")
+                            .with_span(self.span(),));
+                    }
+                };
+                let end = self.span().end;
+                Ok(Type::Projection {
+                    impl_type,
+                    trait_path,
+                    assoc_name,
+                    span: Span::new(start, end),
+                })
+            }
             Ok(Token::Ampersand) => {
                 self.advance().ok();
                 let mutable = matches!(self.peek(), Ok(Token::Mut));
@@ -1178,13 +1231,35 @@ impl Parser {
                                 .unwrap_or(false);
                             // Rustc-style pre-check: if the token definitively starts a const
                             // expression, parse it directly without any type-first attempt.
-                            let arg = if self.check_const_arg() {
+                            let arg = if matches!(self.peek(), Ok(Token::Ident(_)))
+                                && matches!(self.peek_next(), Some(Token::Assign))
+                            {
+                                // Named argument: `name = value`
+                                let name = match self.advance() {
+                                    Ok(Token::Ident(n)) => n,
+                                    _ => unreachable!(),
+                                };
+                                self.advance().ok(); // consume =
+                                let value = if self.check_const_arg() {
+                                    // Const expression value: `name = true`, `name = 42`
+                                    let expr = self.with_restrictions(
+                                        ParseRestrictions::NO_COMPARISON,
+                                        |this| this.parse_expr(),
+                                    )?;
+                                    let span = expr.span();
+                                    Type::Expr(Box::new(expr), span)
+                                } else {
+                                    // Type value: `name = UInt<16>`
+                                    self.parse_type()?
+                                };
+                                GenericArg::Named(name, value)
+                            } else if self.check_const_arg() {
                                 let expr = self.with_restrictions(
                                     ParseRestrictions::NO_COMPARISON,
                                     |this| this.parse_expr(),
                                 )?;
                                 let span = expr.span();
-                                Type::Expr(Box::new(expr), span)
+                                GenericArg::Positional(Type::Expr(Box::new(expr), span))
                             } else {
                                 // Ambiguous case (typically an Ident that could be a type name
                                 // or a const variable). Try type first, backtrack if an
@@ -1225,9 +1300,9 @@ impl Parser {
                                                 |this| this.parse_expr(),
                                             )?;
                                             let span = expr.span();
-                                            Type::Expr(Box::new(expr), span)
+                                            GenericArg::Positional(Type::Expr(Box::new(expr), span))
                                         } else {
-                                            ty
+                                            GenericArg::Positional(ty)
                                         }
                                     }
                                     Err(_) => {
@@ -1239,7 +1314,7 @@ impl Parser {
                                             |this| this.parse_expr(),
                                         )?;
                                         let span = expr.span();
-                                        Type::Expr(Box::new(expr), span)
+                                        GenericArg::Positional(Type::Expr(Box::new(expr), span))
                                     }
                                 }
                             };
@@ -1273,10 +1348,9 @@ impl Parser {
                     }
                 }
                 Ok(Token::LParen) => {
-                    if matches!(self.peek(), Ok(Token::RParen)) {
+                    let params = if matches!(self.peek(), Ok(Token::RParen)) {
                         self.advance().ok();
-                        let end = self.span().end;
-                        Ok(Type::Tuple(Vec::new(), Span::new(start, end)))
+                        Vec::new()
                     } else {
                         let mut types = Vec::new();
                         loop {
@@ -1299,8 +1373,21 @@ impl Parser {
                                 }
                             }
                         }
+                        types
+                    };
+                    // `(A, B) -> C` is a function type; `(A, B)` alone is a tuple.
+                    if matches!(self.peek(), Ok(Token::Arrow)) {
+                        self.advance().ok();
+                        let ret = Box::new(self.parse_type()?);
                         let end = self.span().end;
-                        Ok(Type::Tuple(types, Span::new(start, end)))
+                        Ok(Type::Function {
+                            params,
+                            ret,
+                            span: Span::new(start, end),
+                        })
+                    } else {
+                        let end = self.span().end;
+                        Ok(Type::Tuple(params, Span::new(start, end)))
                     }
                 }
                 Ok(Token::Bang) => {
@@ -4795,7 +4882,7 @@ mod tests {
                 } => {
                     assert_eq!(args.len(), 2, "generic should have 2 args: Int and Val>>2");
                     assert!(
-                        matches!(&args[1], Type::Expr(..)),
+                        matches!(&args[1], GenericArg::Positional(Type::Expr(..))),
                         "second arg should be Type::Expr (Val >> 2), got {:?}",
                         args[1]
                     );
@@ -4837,6 +4924,137 @@ mod tests {
     #[test]
     fn test_const_expr_int_literal_sub() {
         let program = check_parse("def main() { set x: Foo<Int, 10 - 3> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    // --- Function type tests ---
+
+    #[test]
+    fn test_fn_type_zero_params() {
+        let program = check_parse("def main() { set f: () -> Int<32> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_fn_type_one_param() {
+        let program = check_parse("def main() { set f: (Int<32>) -> Bool = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_fn_type_two_params() {
+        let program = check_parse("def main() { set f: (Int<32>, Bool) -> Result<(), Error> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_fn_type_in_generic() {
+        let program = check_parse("def main() { set f: Option<(Int<32>) -> Bool> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_fn_type_as_type_alias() {
+        let src = "type Callback = (Int<32>) -> Bool;";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_fn_type_nested() {
+        // Higher-order function type: a function that returns a function
+        let program = check_parse("def main() { set f: ((Int<32>) -> Bool) -> Int<32> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_tuple_not_confused_with_fn_type() {
+        // Without `->`, `(A, B)` must remain a tuple type
+        let program = check_parse("def main() { set x: (Int<32>, Bool) = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_fn_type_as_param() {
+        // Function type used as parameter type
+        let src = "def map(f: (Int<32>) -> Int<32>) -> Int<32> { return 0; }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+    }
+
+    // --- Projection type tests ---
+
+    #[test]
+    fn test_projection_type() {
+        // `<ImplType as TraitPath>::AssocType`
+        let program = check_parse(
+            "def main() { set x: <Int<32> as Add<Int<32>>>::Output = 0; }",
+        );
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_projection_type_in_fn_param() {
+        let src =
+            "def serialize<T>(value: &T, stream: &mut S) where T: Serialize, T::Format: Display { }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_projection_type_in_type_alias() {
+        let src = "type ItemType = <Vec<Int<32>> as Iterator>::Item;";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_projection_type_nested() {
+        // Nested projection: <<A as Trait1>::Assoc1 as Trait2>::Assoc2
+        let program = check_parse(
+            "def main() { set x: <<A as Trait1>::Assoc1 as Trait2>::Assoc2 = 0; }",
+        );
+        assert_eq!(program.items.len(), 1);
+    }
+
+    // --- Named generic argument tests ---
+
+    #[test]
+    fn test_named_generic_arg_single() {
+        // Single named parameter: Ptr<pointee = Int<32>>
+        let program = check_parse("def main() { set p: Ptr<pointee = Int<32>> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_named_generic_arg_multiple() {
+        // Multiple named parameters with mixed order
+        let program =
+            check_parse("def main() { set p: Ptr<size = UInt<16>, pointee = T> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_named_generic_arg_mixed() {
+        // Positional + named (positional should come first)
+        let program =
+            check_parse("def main() { set x: SomeType<Int<32>, flag = true> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_named_generic_arg_nested_type() {
+        // Named arg value is itself a complex type
+        let program = check_parse(
+            "def main() { set p: Ptr<pointee = Vec<Int<32>>> = 0; }",
+        );
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_positional_generic_args_still_work() {
+        // Verify that plain positional args (without names) still parse correctly
+        let program = check_parse("def main() { set x: HashMap<Int<32>, Bool> = 0; }");
         assert_eq!(program.items.len(), 1);
     }
 }

@@ -1100,20 +1100,20 @@ impl<'a> NameResolver<'a> {
                     if path.len() == 1 {
                         match path[0].as_str() {
                             "Int" => {
-                                let bits = self.extract_int_from_type(&args[0]).unwrap_or(32);
+                                let bits = self.extract_int_from_type(args[0].ty()).unwrap_or(32);
                                 return self.ctx.int(bits, true);
                             }
                             "UInt" => {
-                                let bits = self.extract_int_from_type(&args[0]).unwrap_or(32);
+                                let bits = self.extract_int_from_type(args[0].ty()).unwrap_or(32);
                                 return self.ctx.int(bits, false);
                             }
                             "Float" => {
-                                let bits = self.extract_int_from_type(&args[0]).unwrap_or(64);
+                                let bits = self.extract_int_from_type(args[0].ty()).unwrap_or(64);
                                 return self.ctx.float(bits);
                             }
                             "Rational" => {
-                                let p = self.extract_int_from_type(&args[0]).unwrap_or(16);
-                                let q = self.extract_int_from_type(&args[1]).unwrap_or(16);
+                                let p = self.extract_int_from_type(args[0].ty()).unwrap_or(16);
+                                let q = self.extract_int_from_type(args[1].ty()).unwrap_or(16);
                                 return self.ctx.rational(p, q);
                             }
                             _ => {}
@@ -1125,7 +1125,7 @@ impl<'a> NameResolver<'a> {
                     let binding = self.symbols.lookup_type_by_def_id(def_id).cloned();
                     if let Some(binding) = binding {
                         let arg_tys: Vec<TypeId> =
-                            args.iter().map(|a| self.resolve_type_expr(a)).collect();
+                            args.iter().map(|a| self.resolve_type_expr(a.ty())).collect();
                         match binding.kind {
                             TypeKind::Struct => self.ctx.struct_ty(def_id, arg_tys),
                             TypeKind::Enum => self.ctx.enum_ty(def_id, arg_tys),
@@ -1182,8 +1182,9 @@ impl<'a> NameResolver<'a> {
                 let ret_ty = self.resolve_type_expr(ret);
                 self.ctx.function(param_tys, ret_ty)
             }
-            Type::Projection(base, name, span) => {
-                let _base_ty = self.resolve_type_expr(base);
+            Type::Projection { impl_type, trait_path, assoc_name: name, span } => {
+                let _impl_ty = self.resolve_type_expr(impl_type);
+                let _trait_ty = self.resolve_type_expr(trait_path);
                 self.ctx.error()
             }
             Type::DynTrait(traits, ..) => {

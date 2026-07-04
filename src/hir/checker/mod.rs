@@ -2713,7 +2713,7 @@ impl<'a> TypeChecker<'a> {
     fn resolve_trait_path(&self, bound: &Type) -> Option<DefId> {
         let name = match bound {
             Type::Path(path, _) => path.first()?,
-            Type::Generic(base, _, _) => match base.as_ref() {
+            Type::Generic(base, ..) => match base.as_ref() {
                 Type::Path(path, _) => path.first()?,
                 _ => return None,
             },

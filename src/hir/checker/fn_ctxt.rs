@@ -1357,26 +1357,26 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         match path[0].as_str() {
                             "Int" => {
                                 return Ok(self.checker.ctx.int(
-                                    self.checker.extract_int_from_type(&args[0]).unwrap_or(32),
+                                    self.checker.extract_int_from_type(args[0].ty()).unwrap_or(32),
                                     true,
                                 ));
                             }
                             "UInt" => {
                                 return Ok(self.checker.ctx.int(
-                                    self.checker.extract_int_from_type(&args[0]).unwrap_or(32),
+                                    self.checker.extract_int_from_type(args[0].ty()).unwrap_or(32),
                                     false,
                                 ));
                             }
                             "Float" => {
                                 return Ok(self.checker.ctx.float(
-                                    self.checker.extract_int_from_type(&args[0]).unwrap_or(64),
+                                    self.checker.extract_int_from_type(args[0].ty()).unwrap_or(64),
                                 ));
                             }
                             "Rational" => {
-                                let p = self.checker.extract_int_from_type(&args[0]).ok_or_else(|| {
+                                let p = self.checker.extract_int_from_type(args[0].ty()).ok_or_else(|| {
                                     Diagnostic::error("Rational requires a compile-time constant integer bit count for the integer part").with_span(*span)
                                 })?;
-                                let q = self.checker.extract_int_from_type(&args[1]).ok_or_else(|| {
+                                let q = self.checker.extract_int_from_type(args[1].ty()).ok_or_else(|| {
                                     Diagnostic::error("Rational requires a compile-time constant integer bit count for the fractional part").with_span(*span)
                                 })?;
                                 if p == 0 || p > 64 || q == 0 || q > 64 {
@@ -1395,7 +1395,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let expanded = self.expand_base_type(base_ty, *span)?;
                 let mut arg_tys = Vec::new();
                 for arg in args {
-                    arg_tys.push(self.resolve_type(arg)?);
+                    arg_tys.push(self.resolve_type(arg.ty())?);
                 }
                 match self.checker.ctx.get(expanded) {
                     TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } => {
@@ -1467,8 +1467,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let ret_ty = self.resolve_type(ret)?;
                 Ok(self.checker.ctx.function(param_tys, ret_ty))
             }
-            Type::Projection(base, name, span) => {
-                let base_ty = self.resolve_type(base)?;
+            Type::Projection { impl_type, trait_path, assoc_name: name, span } => {
+                let _impl_ty = self.resolve_type(impl_type)?;
+                let _trait_ty = self.resolve_type(trait_path)?;
                 let candidates = self.checker.symbols.lookup_traits_by_assoc_type_name(name);
                 match candidates.len() {
                     0 => {
@@ -1484,7 +1485,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     1 => Ok(self
                         .checker
                         .ctx
-                        .associated_type(candidates[0], name.clone(), base_ty)),
+                        .associated_type(candidates[0], name.clone(), _impl_ty)),
                     _ => {
                         self.checker.diagnostics.push(
                             Diagnostic::error(format!(

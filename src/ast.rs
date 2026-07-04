@@ -524,10 +524,25 @@ pub struct ImplMethod {
     pub span: Span,
 }
 
+/// A single generic argument, either positional (`T`) or named (`size = T`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum GenericArg {
+    Positional(Type),
+    Named(String, Type),
+}
+
+impl GenericArg {
+    pub fn ty(&self) -> &Type {
+        match self {
+            GenericArg::Positional(ty) | GenericArg::Named(_, ty) => ty,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     Path(Vec<String>, Span),
-    Generic(Box<Type>, Vec<Type>, Span),
+    Generic(Box<Type>, Vec<GenericArg>, Span),
     Reference(Box<Type>, bool, Span),
     Pointer(Box<Type>, Span),
     Slice(Box<Type>, Span),
@@ -538,7 +553,13 @@ pub enum Type {
         ret: Box<Type>,
         span: Span,
     },
-    Projection(Box<Type>, String, Span),
+    /// Qualified path projection: `<ImplType as TraitPath>::AssocName`
+    Projection {
+        impl_type: Box<Type>,
+        trait_path: Box<Type>,
+        assoc_name: String,
+        span: Span,
+    },
     DynTrait(Vec<Type>, Span),
     Exists {
         name: String,
@@ -644,7 +665,7 @@ impl Type {
             | Type::Array(_, _, span)
             | Type::Tuple(_, span)
             | Type::Function { span, .. }
-            | Type::Projection(_, _, span)
+            | Type::Projection { span, .. }
             | Type::DynTrait(_, span)
             | Type::Exists { span, .. }
             | Type::WhereShorthand { span, .. }
