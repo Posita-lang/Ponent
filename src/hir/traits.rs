@@ -44,7 +44,10 @@ pub struct TraitEnv {
 
 impl TraitEnv {
     pub fn new() -> Self {
-        TraitEnv { impls: Vec::new(), inherent_methods: HashMap::default() }
+        TraitEnv {
+            impls: Vec::new(),
+            inherent_methods: HashMap::default(),
+        }
     }
 
     pub fn add_impl(
@@ -111,9 +114,7 @@ impl TraitEnv {
             let trait_crate = symbols
                 .lookup_trait_by_def_id(candidate.trait_id)
                 .map(|b| b.crate_id);
-            let type_crate = symbols
-                .lookup_type_by_def_id(def_id)
-                .map(|b| b.crate_id);
+            let type_crate = symbols.lookup_type_by_def_id(def_id).map(|b| b.crate_id);
 
             let local = symbols.local_crate_id;
 
@@ -141,21 +142,35 @@ fn collect_generic_params(ty: TypeId, ctx: &TypeContext) -> std::collections::Ha
     set
 }
 
-fn collect_generic_params_rec(ty: TypeId, ctx: &TypeContext, set: &mut std::collections::HashSet<usize>) {
+fn collect_generic_params_rec(
+    ty: TypeId,
+    ctx: &TypeContext,
+    set: &mut std::collections::HashSet<usize>,
+) {
     match ctx.get(ty) {
-        TypeData::GenericParam { index, .. } => { set.insert(*index); }
+        TypeData::GenericParam { index, .. } => {
+            set.insert(*index);
+        }
         TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
-            for a in args { collect_generic_params_rec(*a, ctx, set); }
+            for a in args {
+                collect_generic_params_rec(*a, ctx, set);
+            }
         }
         TypeData::Tuple { elems } => {
-            for e in elems { collect_generic_params_rec(*e, ctx, set); }
+            for e in elems {
+                collect_generic_params_rec(*e, ctx, set);
+            }
         }
         TypeData::Array { elem, .. } => collect_generic_params_rec(*elem, ctx, set),
         TypeData::Slice { elem } => collect_generic_params_rec(*elem, ctx, set),
-        TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => collect_generic_params_rec(*ty, ctx, set),
+        TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+            collect_generic_params_rec(*ty, ctx, set)
+        }
         TypeData::Ptr { pointee, .. } => collect_generic_params_rec(*pointee, ctx, set),
         TypeData::Fn { params, ret } => {
-            for p in params { collect_generic_params_rec(*p, ctx, set); }
+            for p in params {
+                collect_generic_params_rec(*p, ctx, set);
+            }
             collect_generic_params_rec(*ret, ctx, set);
         }
         TypeData::AssociatedType { self_ty, .. } => collect_generic_params_rec(*self_ty, ctx, set),
@@ -170,7 +185,9 @@ fn collect_generic_params_rec(ty: TypeId, ctx: &TypeContext, set: &mut std::coll
 fn collect_bare_generic_params(ty: TypeId, ctx: &TypeContext) -> std::collections::HashSet<usize> {
     let mut set = std::collections::HashSet::new();
     match ctx.get(ty) {
-        TypeData::GenericParam { index, .. } => { set.insert(*index); }
+        TypeData::GenericParam { index, .. } => {
+            set.insert(*index);
+        }
         TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
             for a in args {
                 if let TypeData::GenericParam { index, .. } = ctx.get(*a) {
@@ -314,15 +331,20 @@ impl TraitEnv {
 
     /// Register resolved inherent methods for a type.
     pub fn add_inherent_methods(&mut self, for_type: DefId, methods: Vec<MethodInfo>) {
-        self.inherent_methods.entry(for_type).or_default().extend(methods);
+        self.inherent_methods
+            .entry(for_type)
+            .or_default()
+            .extend(methods);
     }
 
     /// Look up inherent methods registered for a type.
     pub fn lookup_inherent_methods(&self, ty: TypeId, ctx: &TypeContext) -> &[MethodInfo] {
         match ctx.get(ty) {
-            TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } => {
-                self.inherent_methods.get(def_id).map(|v| v.as_slice()).unwrap_or(&[])
-            }
+            TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } => self
+                .inherent_methods
+                .get(def_id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
             _ => &[],
         }
     }

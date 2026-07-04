@@ -448,7 +448,10 @@ impl TypeContext {
     }
 
     pub fn rational(&mut self, int_bits: u8, frac_bits: u8) -> TypeId {
-        self.alloc(TypeData::Rational { int_bits, frac_bits })
+        self.alloc(TypeData::Rational {
+            int_bits,
+            frac_bits,
+        })
     }
 
     /// Apply Yoneda reduction if this type matches the pattern
@@ -497,7 +500,12 @@ impl TypeContext {
     /// μX/νX fixpoints are elided when X does not appear in B⟨X⟩ (common case).
     fn yoneda_reduce_once(&mut self, ty: TypeId) -> TypeId {
         // ── Case A: explicit Forall node ──────────────────────────────
-        if let TypeData::Forall { param_index, param_name: _, body } = self.get(ty).clone() {
+        if let TypeData::Forall {
+            param_index,
+            param_name: _,
+            body,
+        } = self.get(ty).clone()
+        {
             if let TypeData::Fn { params, ret } = self.get(body).clone() {
                 let pi = param_index;
                 let mut branch_replacements: Vec<TypeId> = Vec::new();
@@ -508,14 +516,22 @@ impl TypeContext {
                     let mut inner = branch;
                     loop {
                         match self.get(inner).clone() {
-                            TypeData::Forall { param_index: fi, param_name: fn_, body: b } => {
+                            TypeData::Forall {
+                                param_index: fi,
+                                param_name: fn_,
+                                body: b,
+                            } => {
                                 inner_quantifiers.push((fi, fn_));
                                 inner = b;
                             }
                             _ => break,
                         }
                     }
-                    if let TypeData::Fn { params: ips, ret: ir } = self.get(inner).clone() {
+                    if let TypeData::Fn {
+                        params: ips,
+                        ret: ir,
+                    } = self.get(inner).clone()
+                    {
                         // Check ≡_X (Yoneda): ir = GenericParam(pi)
                         let yoneda_match = match self.get(ir) {
                             TypeData::GenericParam { index, .. } if *index == pi => true,
@@ -527,21 +543,32 @@ impl TypeContext {
                                 TypeData::GenericParam { index, .. } if *index == pi => true,
                                 _ => false,
                             }
-                        } else { false };
+                        } else {
+                            false
+                        };
                         // Process Yoneda case
                         if yoneda_match {
-                            let product = if ips.len() == 1 { ips[0] }
-                                else { self.tuple(ips.clone()) };
-                            let repl = if inner_quantifiers.is_empty() { product }
-                                else {
-                                    let mut w = product;
-                                    for (eq, en) in &inner_quantifiers {
-                                        w = self.exists(en.clone(), w,
-                                            crate::ast::Expr::Literal(crate::ast::Literal::Bool(true),
-                                                crate::ast::Span::new(0, 0)));
-                                    }
-                                    w
-                                };
+                            let product = if ips.len() == 1 {
+                                ips[0]
+                            } else {
+                                self.tuple(ips.clone())
+                            };
+                            let repl = if inner_quantifiers.is_empty() {
+                                product
+                            } else {
+                                let mut w = product;
+                                for (eq, en) in &inner_quantifiers {
+                                    w = self.exists(
+                                        en.clone(),
+                                        w,
+                                        crate::ast::Expr::Literal(
+                                            crate::ast::Literal::Bool(true),
+                                            crate::ast::Span::new(0, 0),
+                                        ),
+                                    );
+                                }
+                                w
+                            };
                             branch_replacements.push(repl);
                         }
                         // Process co-Yoneda case
@@ -551,16 +578,20 @@ impl TypeContext {
                             // When ips.len() == 1, X is the only param and A = inner_ret.
                             // When ips.len() > 1, the branch is X ⇒ A₁ ⇒ ... ⇒ Aⱼ ⇒ ir,
                             // and the replacement is A₁ ⇒ (A₂ ⇒ ... ⇒ (Aⱼ ⇒ ir)).
-                            let replacement = if ips.len() <= 1 { ir }
-                                else { self.function(ips[1..].to_vec(), ir) };
-                            let repl = if inner_quantifiers.is_empty() { replacement }
-                                else {
-                                    let mut w = replacement;
-                                    for (_eq, en) in &inner_quantifiers {
-                                        w = self.forall(*_eq, en.clone(), w);
-                                    }
-                                    w
-                                };
+                            let replacement = if ips.len() <= 1 {
+                                ir
+                            } else {
+                                self.function(ips[1..].to_vec(), ir)
+                            };
+                            let repl = if inner_quantifiers.is_empty() {
+                                replacement
+                            } else {
+                                let mut w = replacement;
+                                for (_eq, en) in &inner_quantifiers {
+                                    w = self.forall(*_eq, en.clone(), w);
+                                }
+                                w
+                            };
                             branch_replacements.push(repl);
                         }
                     }
@@ -590,7 +621,9 @@ impl TypeContext {
                                 body: sigma,
                             })
                         }
-                    } else { sigma };
+                    } else {
+                        sigma
+                    };
                     return self.replace_generic(ret, pi, replacement);
                 }
             }
@@ -602,15 +635,22 @@ impl TypeContext {
             TypeData::Fn { params, ret } if params.len() == 1 => (params[0], *ret),
             _ => return ty,
         };
-        if let TypeData::Fn { params: inner_params, ret: inner_ret } = self.get(inner).clone() {
+        if let TypeData::Fn {
+            params: inner_params,
+            ret: inner_ret,
+        } = self.get(inner).clone()
+        {
             // ≡_X (Yoneda): inner_ret is GenericParam X
             let yoneda_idx = match self.get(inner_ret) {
                 TypeData::GenericParam { index, .. } => Some(*index),
                 _ => None,
             };
             if let Some(idx) = yoneda_idx {
-                let replacement = if inner_params.len() == 1 { inner_params[0] }
-                    else { self.tuple(inner_params.clone()) };
+                let replacement = if inner_params.len() == 1 {
+                    inner_params[0]
+                } else {
+                    self.tuple(inner_params.clone())
+                };
                 return self.replace_generic(ret, idx, replacement);
             }
             // ≡_X (co-Yoneda): first inner param is GenericParam X
@@ -684,7 +724,12 @@ impl TypeContext {
                 match edge.sign {
                     -1 => {
                         // Contravariant: flip cumulative sign
-                        if !self.check_variance_with_sign(param, edge.target, expected_sign, -cumulative_sign) {
+                        if !self.check_variance_with_sign(
+                            param,
+                            edge.target,
+                            expected_sign,
+                            -cumulative_sign,
+                        ) {
                             return false;
                         }
                     }
@@ -694,7 +739,12 @@ impl TypeContext {
                     }
                     _ => {
                         // Covariant: keep cumulative sign
-                        if !self.check_variance_with_sign(param, edge.target, expected_sign, cumulative_sign) {
+                        if !self.check_variance_with_sign(
+                            param,
+                            edge.target,
+                            expected_sign,
+                            cumulative_sign,
+                        ) {
                             return false;
                         }
                     }
@@ -727,37 +777,64 @@ impl TypeContext {
     fn compute_variance_edges(&self, ty: TypeId) -> Vec<VarianceEdge> {
         match self.get(ty) {
             TypeData::Fn { params, ret } => {
-                let mut edges: Vec<VarianceEdge> = params.iter()
-                    .map(|&p| VarianceEdge { target: p, sign: -1 })
+                let mut edges: Vec<VarianceEdge> = params
+                    .iter()
+                    .map(|&p| VarianceEdge {
+                        target: p,
+                        sign: -1,
+                    })
                     .collect();
-                edges.push(VarianceEdge { target: *ret, sign: 1 });
+                edges.push(VarianceEdge {
+                    target: *ret,
+                    sign: 1,
+                });
                 edges
             }
-            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
-                args.iter().map(|&a| VarianceEdge { target: a, sign: 1 }).collect()
-            }
-            TypeData::Tuple { elems } => {
-                elems.iter().map(|&e| VarianceEdge { target: e, sign: 1 }).collect()
-            }
+            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => args
+                .iter()
+                .map(|&a| VarianceEdge { target: a, sign: 1 })
+                .collect(),
+            TypeData::Tuple { elems } => elems
+                .iter()
+                .map(|&e| VarianceEdge { target: e, sign: 1 })
+                .collect(),
             TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
-                vec![VarianceEdge { target: *elem, sign: 1 }]
+                vec![VarianceEdge {
+                    target: *elem,
+                    sign: 1,
+                }]
             }
             TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
-                vec![VarianceEdge { target: *ty, sign: 0 }]
+                vec![VarianceEdge {
+                    target: *ty,
+                    sign: 0,
+                }]
             }
             TypeData::Ptr { pointee, .. } => {
-                vec![VarianceEdge { target: *pointee, sign: 0 }]
+                vec![VarianceEdge {
+                    target: *pointee,
+                    sign: 0,
+                }]
             }
-            TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. }
-            | TypeData::Mu { body, .. } | TypeData::Nu { body, .. }
+            TypeData::Forall { body, .. }
+            | TypeData::Exists { base: body, .. }
+            | TypeData::Mu { body, .. }
+            | TypeData::Nu { body, .. }
             | TypeData::Poly { body, .. } => {
-                vec![VarianceEdge { target: *body, sign: 1 }]
+                vec![VarianceEdge {
+                    target: *body,
+                    sign: 1,
+                }]
             }
-            TypeData::Coproduct { alternatives } => {
-                alternatives.iter().map(|&a| VarianceEdge { target: a, sign: 1 }).collect()
-            }
+            TypeData::Coproduct { alternatives } => alternatives
+                .iter()
+                .map(|&a| VarianceEdge { target: a, sign: 1 })
+                .collect(),
             TypeData::AssociatedType { self_ty, .. } => {
-                vec![VarianceEdge { target: *self_ty, sign: 1 }]
+                vec![VarianceEdge {
+                    target: *self_ty,
+                    sign: 1,
+                }]
             }
             // Leaves: no edges (GenericParam, primitives, etc.)
             _ => Vec::new(),
@@ -770,17 +847,15 @@ impl TypeContext {
             TypeData::GenericParam { index, .. } => *index == param,
             TypeData::Fn { params, ret } => {
                 params.iter().any(|&p| self.type_contains_param(param, p))
-                || self.type_contains_param(param, *ret)
+                    || self.type_contains_param(param, *ret)
             }
             TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
                 args.iter().any(|&a| self.type_contains_param(param, a))
             }
-            TypeData::Tuple { elems } => {
-                elems.iter().any(|&e| self.type_contains_param(param, e))
-            }
-            TypeData::Coproduct { alternatives } => {
-                alternatives.iter().any(|&a| self.type_contains_param(param, a))
-            }
+            TypeData::Tuple { elems } => elems.iter().any(|&e| self.type_contains_param(param, e)),
+            TypeData::Coproduct { alternatives } => alternatives
+                .iter()
+                .any(|&a| self.type_contains_param(param, a)),
             TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
                 self.type_contains_param(param, *elem)
             }
@@ -788,15 +863,9 @@ impl TypeContext {
                 self.type_contains_param(param, *ty)
             }
             TypeData::Ptr { pointee, .. } => self.type_contains_param(param, *pointee),
-            TypeData::AssociatedType { self_ty, .. } => {
-                self.type_contains_param(param, *self_ty)
-            }
-            TypeData::Poly { body, .. } => {
-                self.type_contains_param(param, *body)
-            }
-            TypeData::Exists { base, .. } => {
-                self.type_contains_param(param, *base)
-            }
+            TypeData::AssociatedType { self_ty, .. } => self.type_contains_param(param, *self_ty),
+            TypeData::Poly { body, .. } => self.type_contains_param(param, *body),
+            TypeData::Exists { base, .. } => self.type_contains_param(param, *base),
             TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => {
                 self.type_contains_param(param, *body)
             }
@@ -828,57 +897,98 @@ impl TypeContext {
         // ∀X.(A ⇒ X) ⇒ B⟨X⟩  →  B[X↦A]   (X only positive in body)
         // ∀X.(X ⇒ A) ⇒ B⟨X⟩  →  B[X↦A]   (X only negative in body)
         let reduced = self.try_yoneda_reduce(id);
-        if reduced != id {
-            reduced
-        } else {
-            id
-        }
+        if reduced != id { reduced } else { id }
     }
 
     /// Skip the `subst` type-pool lookup limitations and directly build
     /// the replacement type.  This avoids the `fn_ty_no_alloc().expect()`
     /// panic that occurs when `subst` tries to find a pre-existing type
     /// that hasn't been created yet.
-    pub fn replace_generic(&mut self, ty: TypeId, param_index: usize, replacement: TypeId) -> TypeId {
-        if !self.type_contains_param(param_index, ty) { return ty; }
+    pub fn replace_generic(
+        &mut self,
+        ty: TypeId,
+        param_index: usize,
+        replacement: TypeId,
+    ) -> TypeId {
+        if !self.type_contains_param(param_index, ty) {
+            return ty;
+        }
         let data = self.get(ty).clone();
         match data {
             TypeData::GenericParam { index, .. } if index == param_index => replacement,
             TypeData::Fn { params, ret } => {
-                let new_params: Vec<TypeId> = params.iter()
+                let new_params: Vec<TypeId> = params
+                    .iter()
                     .map(|&p| self.replace_generic(p, param_index, replacement))
                     .collect();
                 let new_ret = self.replace_generic(ret, param_index, replacement);
                 self.function(new_params, new_ret)
             }
-            TypeData::Forall { param_index: pi, param_name, body } => {
+            TypeData::Forall {
+                param_index: pi,
+                param_name,
+                body,
+            } => {
                 let new_body = self.replace_generic(body, param_index, replacement);
                 self.forall(pi, param_name, new_body)
             }
-            TypeData::Mu { param_index: pi, param_name, body } => {
+            TypeData::Mu {
+                param_index: pi,
+                param_name,
+                body,
+            } => {
                 let new_body = self.replace_generic(body, param_index, replacement);
-                self.alloc(TypeData::Mu { param_index: pi, param_name, body: new_body })
+                self.alloc(TypeData::Mu {
+                    param_index: pi,
+                    param_name,
+                    body: new_body,
+                })
             }
-            TypeData::Nu { param_index: pi, param_name, body } => {
+            TypeData::Nu {
+                param_index: pi,
+                param_name,
+                body,
+            } => {
                 let new_body = self.replace_generic(body, param_index, replacement);
-                self.alloc(TypeData::Nu { param_index: pi, param_name, body: new_body })
+                self.alloc(TypeData::Nu {
+                    param_index: pi,
+                    param_name,
+                    body: new_body,
+                })
             }
             TypeData::Tuple { elems } => {
-                let new_elems: Vec<TypeId> = elems.iter().map(|&e| self.replace_generic(e, param_index, replacement)).collect();
+                let new_elems: Vec<TypeId> = elems
+                    .iter()
+                    .map(|&e| self.replace_generic(e, param_index, replacement))
+                    .collect();
                 self.tuple(new_elems)
             }
             TypeData::Struct { def_id, args } => {
-                let new_args: Vec<TypeId> = args.iter().map(|&a| self.replace_generic(a, param_index, replacement)).collect();
+                let new_args: Vec<TypeId> = args
+                    .iter()
+                    .map(|&a| self.replace_generic(a, param_index, replacement))
+                    .collect();
                 self.struct_ty(def_id, new_args)
             }
             TypeData::Enum { def_id, args } => {
-                let new_args: Vec<TypeId> = args.iter().map(|&a| self.replace_generic(a, param_index, replacement)).collect();
+                let new_args: Vec<TypeId> = args
+                    .iter()
+                    .map(|&a| self.replace_generic(a, param_index, replacement))
+                    .collect();
                 self.enum_ty(def_id, new_args)
             }
             TypeData::Coproduct { alternatives } => {
-                let new_alts: Vec<TypeId> = alternatives.iter().map(|&a| self.replace_generic(a, param_index, replacement)).collect();
-                if new_alts.len() == 1 { new_alts[0] }
-                else { self.alloc(TypeData::Coproduct { alternatives: new_alts }) }
+                let new_alts: Vec<TypeId> = alternatives
+                    .iter()
+                    .map(|&a| self.replace_generic(a, param_index, replacement))
+                    .collect();
+                if new_alts.len() == 1 {
+                    new_alts[0]
+                } else {
+                    self.alloc(TypeData::Coproduct {
+                        alternatives: new_alts,
+                    })
+                }
             }
             TypeData::Poly { quantifiers, body } => {
                 let new_body = self.replace_generic(body, param_index, replacement);
@@ -1101,7 +1211,10 @@ impl TypeContext {
             (TypeData::Tuple { elems: e1 }, TypeData::Tuple { elems: e2 }) => {
                 e1.len() == e2.len() && e1.iter().zip(e2.iter()).all(|(a, b)| self.subtype(*a, *b))
             }
-            (TypeData::Coproduct { alternatives: a1 }, TypeData::Coproduct { alternatives: a2 }) => {
+            (
+                TypeData::Coproduct { alternatives: a1 },
+                TypeData::Coproduct { alternatives: a2 },
+            ) => {
                 a1.len() == a2.len() && a1.iter().zip(a2.iter()).all(|(a, b)| self.subtype(*a, *b))
             }
             (
@@ -1116,8 +1229,14 @@ impl TypeContext {
             ) => *s1 == *s2 && *b1 == *b2,
             (TypeData::Float { bits: b1 }, TypeData::Float { bits: b2 }) => *b1 == *b2,
             (
-                TypeData::Rational { int_bits: p1, frac_bits: q1 },
-                TypeData::Rational { int_bits: p2, frac_bits: q2 },
+                TypeData::Rational {
+                    int_bits: p1,
+                    frac_bits: q1,
+                },
+                TypeData::Rational {
+                    int_bits: p2,
+                    frac_bits: q2,
+                },
             ) => *p1 == *p2 && *q1 == *q2,
             _ => false,
         }
@@ -1206,24 +1325,51 @@ impl TypeContext {
             }
             TypeData::Poly { quantifiers, body } => {
                 let new_body = self.subst(*body, subst);
-                self.find_type(&TypeData::Poly { quantifiers: quantifiers.clone(), body: new_body })
-                    .unwrap_or(ty)
+                self.find_type(&TypeData::Poly {
+                    quantifiers: quantifiers.clone(),
+                    body: new_body,
+                })
+                .unwrap_or(ty)
             }
             TypeData::DynTrait { .. } => ty,
-            TypeData::Forall { param_index, param_name, body } => {
+            TypeData::Forall {
+                param_index,
+                param_name,
+                body,
+            } => {
                 let new_body = self.subst(*body, subst);
-                self.find_type(&TypeData::Forall { param_index: *param_index, param_name: param_name.clone(), body: new_body })
-                    .unwrap_or(ty)
+                self.find_type(&TypeData::Forall {
+                    param_index: *param_index,
+                    param_name: param_name.clone(),
+                    body: new_body,
+                })
+                .unwrap_or(ty)
             }
-            TypeData::Mu { param_index, param_name, body } => {
+            TypeData::Mu {
+                param_index,
+                param_name,
+                body,
+            } => {
                 let new_body = self.subst(*body, subst);
-                self.find_type(&TypeData::Mu { param_index: *param_index, param_name: param_name.clone(), body: new_body })
-                    .unwrap_or(ty)
+                self.find_type(&TypeData::Mu {
+                    param_index: *param_index,
+                    param_name: param_name.clone(),
+                    body: new_body,
+                })
+                .unwrap_or(ty)
             }
-            TypeData::Nu { param_index, param_name, body } => {
+            TypeData::Nu {
+                param_index,
+                param_name,
+                body,
+            } => {
                 let new_body = self.subst(*body, subst);
-                self.find_type(&TypeData::Nu { param_index: *param_index, param_name: param_name.clone(), body: new_body })
-                    .unwrap_or(ty)
+                self.find_type(&TypeData::Nu {
+                    param_index: *param_index,
+                    param_name: param_name.clone(),
+                    body: new_body,
+                })
+                .unwrap_or(ty)
             }
             TypeData::Exists { name, base } => {
                 let new_base = self.subst(*base, subst);
@@ -1231,7 +1377,8 @@ impl TypeContext {
                     .expect("exists type should exist")
             }
             TypeData::Coproduct { alternatives } => {
-                let new_alts: Vec<TypeId> = alternatives.iter().map(|&a| self.subst(a, subst)).collect();
+                let new_alts: Vec<TypeId> =
+                    alternatives.iter().map(|&a| self.subst(a, subst)).collect();
                 self.coproduct_ty_no_alloc(new_alts)
                     .expect("coproduct type should exist")
             }
@@ -1306,12 +1453,18 @@ impl TypeContext {
     }
 
     fn rational_ty_no_alloc(&self, int_bits: u8, frac_bits: u8) -> Option<TypeId> {
-        self.find_type(&TypeData::Rational { int_bits, frac_bits })
+        self.find_type(&TypeData::Rational {
+            int_bits,
+            frac_bits,
+        })
     }
 
     pub fn is_numeric(&self, ty: TypeId) -> bool {
         match self.get(ty) {
-            TypeData::Int { .. } | TypeData::UInt { .. } | TypeData::Float { .. } | TypeData::Rational { .. } => true,
+            TypeData::Int { .. }
+            | TypeData::UInt { .. }
+            | TypeData::Float { .. }
+            | TypeData::Rational { .. } => true,
             _ => false,
         }
     }
@@ -1385,28 +1538,57 @@ impl TypeContext {
         match self.get(ty) {
             TypeData::GenericParam { .. } | TypeData::InferVar { .. } => 0,
             TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
-                1 + args.iter().map(|a| self.type_constructor_depth(*a)).max().unwrap_or(0)
+                1 + args
+                    .iter()
+                    .map(|a| self.type_constructor_depth(*a))
+                    .max()
+                    .unwrap_or(0)
             }
-            TypeData::Tuple { elems } | TypeData::Coproduct { alternatives: elems } => {
-                1 + elems.iter().map(|e| self.type_constructor_depth(*e)).max().unwrap_or(0)
+            TypeData::Tuple { elems }
+            | TypeData::Coproduct {
+                alternatives: elems,
+            } => {
+                1 + elems
+                    .iter()
+                    .map(|e| self.type_constructor_depth(*e))
+                    .max()
+                    .unwrap_or(0)
             }
             TypeData::Array { elem, .. } => 1 + self.type_constructor_depth(*elem),
             TypeData::Slice { elem } => 1 + self.type_constructor_depth(*elem),
-            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => 1 + self.type_constructor_depth(*ty),
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+                1 + self.type_constructor_depth(*ty)
+            }
             TypeData::Ptr { pointee, .. } => 1 + self.type_constructor_depth(*pointee),
             TypeData::Fn { params, ret } => {
-                1 + params.iter().map(|p| self.type_constructor_depth(*p)).max().unwrap_or(0)
+                1 + params
+                    .iter()
+                    .map(|p| self.type_constructor_depth(*p))
+                    .max()
+                    .unwrap_or(0)
                     .max(self.type_constructor_depth(*ret))
             }
             TypeData::AssociatedType { self_ty, .. } => 1 + self.type_constructor_depth(*self_ty),
             TypeData::Exists { base, .. } => 1 + self.type_constructor_depth(*base),
-            TypeData::Poly { quantifiers: _, body } => 1 + self.type_constructor_depth(*body),
-            TypeData::Forall { body, .. } | TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => 1 + self.type_constructor_depth(*body),
+            TypeData::Poly {
+                quantifiers: _,
+                body,
+            } => 1 + self.type_constructor_depth(*body),
+            TypeData::Forall { body, .. }
+            | TypeData::Mu { body, .. }
+            | TypeData::Nu { body, .. } => 1 + self.type_constructor_depth(*body),
             TypeData::DynTrait { .. } => 1,
-            TypeData::Int { .. } | TypeData::UInt { .. } | TypeData::Float { .. }
+            TypeData::Int { .. }
+            | TypeData::UInt { .. }
+            | TypeData::Float { .. }
             | TypeData::Rational { .. }
-            | TypeData::Bool | TypeData::Char | TypeData::Byte | TypeData::USize
-            | TypeData::Never | TypeData::Unit | TypeData::Error => 1,
+            | TypeData::Bool
+            | TypeData::Char
+            | TypeData::Byte
+            | TypeData::USize
+            | TypeData::Never
+            | TypeData::Unit
+            | TypeData::Error => 1,
         }
     }
 
@@ -1680,7 +1862,7 @@ impl TypeContext {
         // If ty is already on the current DFS path, we've found a cycle.
         if visited.contains(&ty) {
             return if has_non_covariant_path {
-                Characteristic::Undecidable      // κ=∞
+                Characteristic::Undecidable // κ=∞
             } else {
                 Characteristic::InfiniteEnumerable // κ=1
             };
@@ -1720,7 +1902,10 @@ impl TypeContext {
                 // Floats and usize have very large but finite domains
                 Characteristic::FiniteExhaustible(usize::MAX)
             }
-            TypeData::Rational { int_bits, frac_bits } => {
+            TypeData::Rational {
+                int_bits,
+                frac_bits,
+            } => {
                 // Rational<p,q> has 2^(p+q) representable values
                 let total_bits = *int_bits as u32 + *frac_bits as u32;
                 if total_bits >= 16 {
@@ -1780,7 +1965,8 @@ impl TypeContext {
                 }
             }
             // Slice/Ref/Pointer/Ptr: invariant containers — mark path as non-covariant
-            TypeData::Slice { elem } | TypeData::Ref { ty: elem, .. }
+            TypeData::Slice { elem }
+            | TypeData::Ref { ty: elem, .. }
             | TypeData::Pointer { ty: elem }
             | TypeData::Ptr { pointee: elem, .. } => {
                 let _ = self.characteristic_with_variance(*elem, visited, true);
@@ -1790,7 +1976,9 @@ impl TypeContext {
             // Fn ret: covariant → keep existing flag
             TypeData::Fn { params, ret } => {
                 for &p in params {
-                    if self.characteristic_with_variance(p, visited, true) == Characteristic::Undecidable {
+                    if self.characteristic_with_variance(p, visited, true)
+                        == Characteristic::Undecidable
+                    {
                         return Characteristic::Undecidable;
                     }
                 }
@@ -1799,9 +1987,7 @@ impl TypeContext {
                     _ => Characteristic::InfiniteEnumerable,
                 }
             }
-            TypeData::GenericParam { .. } => {
-                Characteristic::FiniteExhaustible(usize::MAX)
-            }
+            TypeData::GenericParam { .. } => Characteristic::FiniteExhaustible(usize::MAX),
             // Mu/Nu: treat as covariant recursive type
             // (The body has already been handled above.)
             TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => {
@@ -1829,22 +2015,19 @@ impl TypeContext {
                     Characteristic::FiniteExhaustible(total)
                 }
             }
-            TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. }
+            TypeData::Forall { body, .. }
+            | TypeData::Exists { base: body, .. }
             | TypeData::Poly { body, .. } => {
                 self.characteristic_with_variance(*body, visited, has_non_covariant_path)
             }
             // DynTrait and AssociatedType: covariant containers but the concrete
             // implementation is unknown — conservatively return InfiniteEnumerable.
             // For AssociatedType, the self_ty variance propagates to the associated type.
-            TypeData::DynTrait { .. } => {
-                Characteristic::InfiniteEnumerable
-            }
+            TypeData::DynTrait { .. } => Characteristic::InfiniteEnumerable,
             TypeData::AssociatedType { self_ty, .. } => {
                 self.characteristic_with_variance(*self_ty, visited, has_non_covariant_path)
             }
-            TypeData::InferVar { .. } => {
-                Characteristic::FiniteExhaustible(usize::MAX)
-            }
+            TypeData::InferVar { .. } => Characteristic::FiniteExhaustible(usize::MAX),
         }
     }
 }
@@ -1941,13 +2124,13 @@ pub enum TypeError {
     },
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn new_ctx() -> TypeContext { TypeContext::new() }
+    fn new_ctx() -> TypeContext {
+        TypeContext::new()
+    }
 
     // -- TypeId tag --
     #[test]
@@ -2009,20 +2192,29 @@ mod tests {
     #[test]
     fn test_characteristic_bool() {
         let ctx = TypeContext::new();
-        assert_eq!(ctx.characteristic(ctx.bool(), &mut vec![]), Characteristic::FiniteExhaustible(2));
+        assert_eq!(
+            ctx.characteristic(ctx.bool(), &mut vec![]),
+            Characteristic::FiniteExhaustible(2)
+        );
     }
 
     #[test]
     fn test_characteristic_int32() {
         let mut ctx = TypeContext::new();
         let i32 = ctx.int(32, true);
-        assert_eq!(ctx.characteristic(i32, &mut vec![]), Characteristic::FiniteExhaustible(2u64.pow(32) as usize));
+        assert_eq!(
+            ctx.characteristic(i32, &mut vec![]),
+            Characteristic::FiniteExhaustible(2u64.pow(32) as usize)
+        );
     }
 
     #[test]
     fn test_characteristic_unit() {
         let ctx = TypeContext::new();
-        assert_eq!(ctx.characteristic(ctx.unit(), &mut vec![]), Characteristic::FiniteExhaustible(1));
+        assert_eq!(
+            ctx.characteristic(ctx.unit(), &mut vec![]),
+            Characteristic::FiniteExhaustible(1)
+        );
     }
 
     #[test]
@@ -2032,7 +2224,10 @@ mod tests {
         let fn_ty = ctx.function(vec![bool_ty], bool_ty);
         // Fn types are classified as InfiniteEnumerable due to
         // contravariant parameter cycles in the characteristic algorithm
-        assert_eq!(ctx.characteristic(fn_ty, &mut vec![]), Characteristic::InfiniteEnumerable);
+        assert_eq!(
+            ctx.characteristic(fn_ty, &mut vec![]),
+            Characteristic::InfiniteEnumerable
+        );
     }
 
     #[test]
@@ -2040,7 +2235,10 @@ mod tests {
         let mut ctx = TypeContext::new();
         let bool_ty = ctx.bool();
         let slice_ty = ctx.slice(bool_ty);
-        assert_eq!(ctx.characteristic(slice_ty, &mut vec![]), Characteristic::InfiniteEnumerable);
+        assert_eq!(
+            ctx.characteristic(slice_ty, &mut vec![]),
+            Characteristic::InfiniteEnumerable
+        );
     }
 
     #[test]
@@ -2062,8 +2260,11 @@ mod tests {
         // (recursive type with only covariant cycles)
         let mut visited = Vec::new();
         let kappa = ctx.characteristic(ty, &mut visited);
-        assert_eq!(kappa, Characteristic::InfiniteEnumerable,
-            "recursive stream type should be InfiniteEnumerable");
+        assert_eq!(
+            kappa,
+            Characteristic::InfiniteEnumerable,
+            "recursive stream type should be InfiniteEnumerable"
+        );
     }
 
     // -- Transaction --
@@ -2147,8 +2348,11 @@ mod tests {
         let outer_fn = ctx.function(vec![p0], bool_ty);
         let combined = ctx.function(vec![inner_fn], outer_fn);
         let forall = ctx.forall(0, "X".into(), combined);
-        assert_eq!(forall, ctx.function(vec![int_ty], bool_ty),
-            "∀X.(X⇒Int)⇒(X⇒Bool) should reduce to Int⇒Bool");
+        assert_eq!(
+            forall,
+            ctx.function(vec![int_ty], bool_ty),
+            "∀X.(X⇒Int)⇒(X⇒Bool) should reduce to Int⇒Bool"
+        );
     }
 
     #[test]
@@ -2174,7 +2378,10 @@ mod tests {
         let outer_fn = ctx.function(vec![inner_fn], p0);
         let forall = ctx.forall(0, "X".into(), outer_fn);
         let expected = ctx.tuple(vec![int_ty, bool_ty]);
-        assert_eq!(forall, expected, "∀X.(Int⇒Bool⇒X)⇒X should reduce to (Int,Bool)");
+        assert_eq!(
+            forall, expected,
+            "∀X.(Int⇒Bool⇒X)⇒X should reduce to (Int,Bool)"
+        );
     }
 
     #[test]
@@ -2189,7 +2396,10 @@ mod tests {
         let ty = ctx.function(vec![inner_fn], p0);
         let reduced = ctx.try_yoneda_reduce(ty);
         let expected = ctx.tuple(vec![int_ty, bool_ty]);
-        assert_eq!(reduced, expected, "(Int⇒Bool⇒X)⇒X should reduce to (Int,Bool)");
+        assert_eq!(
+            reduced, expected,
+            "(Int⇒Bool⇒X)⇒X should reduce to (Int,Bool)"
+        );
     }
 
     #[test]
@@ -2214,7 +2424,9 @@ mod tests {
         let reduced = ctx.try_yoneda_reduce(forall);
         // Expected: Int → Float
         let expected = ctx.function(vec![int_ty], float_ty);
-        assert_eq!(reduced, expected,
-            "∀X.(X⇒Int⇒Float)⇒X should reduce to Int→Float, not lose Float");
+        assert_eq!(
+            reduced, expected,
+            "∀X.(X⇒Int⇒Float)⇒X should reduce to Int→Float, not lose Float"
+        );
     }
 }

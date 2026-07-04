@@ -84,7 +84,8 @@ impl<'a> NameResolver<'a> {
     pub fn resolve_program(
         &mut self,
         program: &Program,
-    ) -> Result<(SymbolTable, TraitEnv, DiagnosticCollector, ResolutionMap), DiagnosticCollector> {
+    ) -> Result<(SymbolTable, TraitEnv, DiagnosticCollector, ResolutionMap), DiagnosticCollector>
+    {
         for item in &program.items {
             self.resolve_item(item);
         }
@@ -96,7 +97,12 @@ impl<'a> NameResolver<'a> {
                 std::mem::replace(&mut self.symbols, SymbolTable::new(self.local_crate_id));
             let trait_env = std::mem::replace(&mut self.trait_env, TraitEnv::new());
             let resolution_map = std::mem::take(&mut self.resolution_map);
-            Ok((symbols, trait_env, std::mem::take(&mut self.diagnostics), resolution_map))
+            Ok((
+                symbols,
+                trait_env,
+                std::mem::take(&mut self.diagnostics),
+                resolution_map,
+            ))
         }
     }
 
@@ -159,7 +165,9 @@ impl<'a> NameResolver<'a> {
                         span: param.span,
                         def_id: self.allocate_def_id(),
                     };
-                    self.resolution_map.variable_types.insert(param.name.clone(), ty);
+                    self.resolution_map
+                        .variable_types
+                        .insert(param.name.clone(), ty);
                     if let Err(diag) =
                         self.symbols
                             .insert_variable(param.name.clone(), binding, param.span)
@@ -188,7 +196,9 @@ impl<'a> NameResolver<'a> {
             } => {
                 let def_id = self.allocate_def_id();
                 // Register type name in the resolution map for the type checker
-                self.resolution_map.type_def_ids.insert(name.clone(), def_id);
+                self.resolution_map
+                    .type_def_ids
+                    .insert(name.clone(), def_id);
                 let type_params = params.clone();
                 let kind = match definition {
                     TypeDefinition::Struct(_, _) => TypeKind::Struct,
@@ -326,7 +336,9 @@ impl<'a> NameResolver<'a> {
                 // since `impl<T: Bar>` implicitly constrains T.
                 for tp in type_params {
                     if !tp.bounds.is_empty() {
-                        if let Some(ty_id) = self.current_impl_type_params.as_ref()
+                        if let Some(ty_id) = self
+                            .current_impl_type_params
+                            .as_ref()
                             .and_then(|m| m.get(&tp.name))
                         {
                             context.push(*ty_id);
@@ -356,8 +368,9 @@ impl<'a> NameResolver<'a> {
                         context,
                         span: *span,
                     };
-                    if let Err(err) = self.trait_env
-                        .add_impl(candidate, &self.symbols, self.ctx, false)
+                    if let Err(err) =
+                        self.trait_env
+                            .add_impl(candidate, &self.symbols, self.ctx, false)
                     {
                         // Convert OrphanError to a diagnostic for proper error reporting
                         self.diagnostics.push(
@@ -365,7 +378,7 @@ impl<'a> NameResolver<'a> {
                                 "impl for trait on type violates termination rules: {}",
                                 err
                             ))
-                            .with_span(*span)
+                            .with_span(*span),
                         );
                     }
                 }
@@ -468,7 +481,9 @@ impl<'a> NameResolver<'a> {
                         def_id: self.allocate_def_id(),
                     };
                     // Pre-populate resolution map for the type checker
-                    self.resolution_map.variable_types.insert(name.clone(), ty_id);
+                    self.resolution_map
+                        .variable_types
+                        .insert(name.clone(), ty_id);
                     if let Err(diag) = self.symbols.insert_variable(name.clone(), binding, *span) {
                         self.diagnostics.push(diag);
                     }
@@ -802,7 +817,9 @@ impl<'a> NameResolver<'a> {
                         span: param.span,
                         def_id: self.allocate_def_id(),
                     };
-                    self.resolution_map.variable_types.insert(param.name.clone(), ty);
+                    self.resolution_map
+                        .variable_types
+                        .insert(param.name.clone(), ty);
                     if let Err(diag) =
                         self.symbols
                             .insert_variable(param.name.clone(), binding, param.span)
@@ -965,7 +982,9 @@ impl<'a> NameResolver<'a> {
             }
             Expr::Path(path, _) => {
                 self.diagnostics.push(
-                    Diagnostic::error(format!("unresolved path: {}", path.join("::"))).with_span(Span::new(0, 0)));
+                    Diagnostic::error(format!("unresolved path: {}", path.join("::")))
+                        .with_span(Span::new(0, 0)),
+                );
                 Some(self.ctx.error())
             }
             Expr::Error(..) => Some(self.ctx.error()),
@@ -1190,7 +1209,11 @@ impl<'a> NameResolver<'a> {
                 self.ctx
                     .exists(name.clone(), base_ty, invariant.as_ref().clone())
             }
-            Type::WhereShorthand { base, invariant, span } => {
+            Type::WhereShorthand {
+                base,
+                invariant,
+                span,
+            } => {
                 // Desugar `type T = Base where value > 0` into `exists _where_N: Base invariant _where_N > 0`.
                 let name = format!("_where_{}", span.start);
                 let mut inv = invariant.as_ref().clone();
@@ -1271,7 +1294,8 @@ impl<'a> NameResolver<'a> {
     }
 
     fn extract_hints(&self, attributes: &[Attribute]) -> Vec<Expr> {
-        attributes.iter()
+        attributes
+            .iter()
             .filter(|attr| attr.name == "hint")
             .flat_map(|attr| attr.args.clone())
             .collect()
@@ -1366,47 +1390,82 @@ fn replace_ident_in_expr(expr: &mut Expr, old_name: &str, new_name: &str) {
         }
         Expr::Call { callee, args, .. } => {
             replace_ident_in_expr(callee, old_name, new_name);
-            for arg in args { replace_ident_in_expr(arg, old_name, new_name); }
+            for arg in args {
+                replace_ident_in_expr(arg, old_name, new_name);
+            }
         }
         Expr::Index { base, index, .. } => {
             replace_ident_in_expr(base, old_name, new_name);
             replace_ident_in_expr(index, old_name, new_name);
         }
-        Expr::FieldAccess { base, .. } | Expr::AttrAccess { base, .. }
+        Expr::FieldAccess { base, .. }
+        | Expr::AttrAccess { base, .. }
         | Expr::Cast { expr: base, .. } => replace_ident_in_expr(base, old_name, new_name),
         Expr::Range { start, end, .. } => {
-            if let Some(e) = start { replace_ident_in_expr(e, old_name, new_name); }
-            if let Some(e) = end { replace_ident_in_expr(e, old_name, new_name); }
+            if let Some(e) = start {
+                replace_ident_in_expr(e, old_name, new_name);
+            }
+            if let Some(e) = end {
+                replace_ident_in_expr(e, old_name, new_name);
+            }
         }
         Expr::StructLit { fields, .. } => {
-            for (_, e) in fields { replace_ident_in_expr(e, old_name, new_name); }
+            for (_, e) in fields {
+                replace_ident_in_expr(e, old_name, new_name);
+            }
         }
         Expr::EnumLit { payload, .. } => {
-            if let Some(e) = payload { replace_ident_in_expr(e, old_name, new_name); }
+            if let Some(e) = payload {
+                replace_ident_in_expr(e, old_name, new_name);
+            }
         }
         Expr::Tuple(exprs, _) | Expr::Array(exprs, _) => {
-            for e in exprs { replace_ident_in_expr(e, old_name, new_name); }
+            for e in exprs {
+                replace_ident_in_expr(e, old_name, new_name);
+            }
         }
-        Expr::If { cond, then_branch, else_branch, .. }
-        | Expr::IfLet { scrutinee: cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        }
+        | Expr::IfLet {
+            scrutinee: cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             replace_ident_in_expr(cond, old_name, new_name);
             // `where` invariants are single expressions, not blocks, but be safe
         }
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             replace_ident_in_expr(scrutinee, old_name, new_name);
-            for arm in arms { replace_ident_in_expr(&mut arm.body, old_name, new_name); }
+            for arm in arms {
+                replace_ident_in_expr(&mut arm.body, old_name, new_name);
+            }
         }
         Expr::Block(stmts, _) | Expr::Closure { body: stmts, .. } => {
-            for s in stmts { replace_ident_in_stmt(s, old_name, new_name); }
+            for s in stmts {
+                replace_ident_in_stmt(s, old_name, new_name);
+            }
         }
-        Expr::Catch { expr: e, branches, .. } => {
+        Expr::Catch {
+            expr: e, branches, ..
+        } => {
             replace_ident_in_expr(e, old_name, new_name);
             for b in branches {
-                for s in &mut b.body { replace_ident_in_stmt(s, old_name, new_name); }
+                for s in &mut b.body {
+                    replace_ident_in_stmt(s, old_name, new_name);
+                }
             }
         }
         Expr::UnsafeBlock { body, .. } => {
-            for s in body { replace_ident_in_stmt(s, old_name, new_name); }
+            for s in body {
+                replace_ident_in_stmt(s, old_name, new_name);
+            }
         }
         _ => {}
     }
@@ -1416,42 +1475,78 @@ fn replace_ident_in_expr(expr: &mut Expr, old_name: &str, new_name: &str) {
 fn replace_ident_in_stmt(stmt: &mut Stmt, old_name: &str, new_name: &str) {
     match stmt {
         Stmt::VariableDef { value, .. } => {
-            if let Some(e) = value { replace_ident_in_expr(e, old_name, new_name); }
+            if let Some(e) = value {
+                replace_ident_in_expr(e, old_name, new_name);
+            }
         }
         Stmt::Assign { target, value, .. } => {
             replace_ident_in_expr(target, old_name, new_name);
             replace_ident_in_expr(value, old_name, new_name);
         }
         Stmt::Return { value, .. } => {
-            if let Some(e) = value { replace_ident_in_expr(e, old_name, new_name); }
+            if let Some(e) = value {
+                replace_ident_in_expr(e, old_name, new_name);
+            }
         }
         Stmt::Expression(expr) => replace_ident_in_expr(expr, old_name, new_name),
-        Stmt::If { cond, then_branch, else_branch, .. }
-        | Stmt::IfLet { scrutinee: cond, then_branch, else_branch, .. } => {
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        }
+        | Stmt::IfLet {
+            scrutinee: cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             replace_ident_in_expr(cond, old_name, new_name);
-            for s in then_branch { replace_ident_in_stmt(s, old_name, new_name); }
-            if let Some(b) = else_branch { for s in b { replace_ident_in_stmt(s, old_name, new_name); } }
+            for s in then_branch {
+                replace_ident_in_stmt(s, old_name, new_name);
+            }
+            if let Some(b) = else_branch {
+                for s in b {
+                    replace_ident_in_stmt(s, old_name, new_name);
+                }
+            }
         }
         Stmt::While { cond, body, .. }
-        | Stmt::WhileLet { scrutinee: cond, body, .. } => {
+        | Stmt::WhileLet {
+            scrutinee: cond,
+            body,
+            ..
+        } => {
             replace_ident_in_expr(cond, old_name, new_name);
-            for s in body { replace_ident_in_stmt(s, old_name, new_name); }
+            for s in body {
+                replace_ident_in_stmt(s, old_name, new_name);
+            }
         }
         Stmt::For { iterable, body, .. } => {
             replace_ident_in_expr(iterable, old_name, new_name);
-            for s in body { replace_ident_in_stmt(s, old_name, new_name); }
+            for s in body {
+                replace_ident_in_stmt(s, old_name, new_name);
+            }
         }
         Stmt::Loop { body, .. } => {
-            for s in body { replace_ident_in_stmt(s, old_name, new_name); }
+            for s in body {
+                replace_ident_in_stmt(s, old_name, new_name);
+            }
         }
         Stmt::ScopeCleanup { body, .. } => {
-            for s in body { replace_ident_in_stmt(s, old_name, new_name); }
+            for s in body {
+                replace_ident_in_stmt(s, old_name, new_name);
+            }
         }
         Stmt::Unsafe { body, .. } | Stmt::Isolate { body, .. } => {
-            for s in body { replace_ident_in_stmt(s, old_name, new_name); }
+            for s in body {
+                replace_ident_in_stmt(s, old_name, new_name);
+            }
         }
         Stmt::ComptimeBlock { body, .. } => {
-            for s in body { replace_ident_in_stmt(s, old_name, new_name); }
+            for s in body {
+                replace_ident_in_stmt(s, old_name, new_name);
+            }
         }
         Stmt::GhostVariableDef { inner, .. } => {
             replace_ident_in_stmt(inner, old_name, new_name);

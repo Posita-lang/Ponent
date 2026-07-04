@@ -12,7 +12,11 @@ pub(crate) fn levenshtein_distance(a: &str, b: &str) -> usize {
     for i in 1..=a_len {
         curr[0] = i;
         for j in 1..=b_len {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                0
+            } else {
+                1
+            };
             curr[j] = std::cmp::min(
                 std::cmp::min(curr[j - 1] + 1, prev[j] + 1),
                 prev[j - 1] + cost,
@@ -52,10 +56,19 @@ pub(crate) fn is_valid_lvalue(expr: &Expr) -> bool {
         Expr::Ident(_, _) => true,
         Expr::FieldAccess { .. } => true,
         Expr::Index { .. } => true,
-        Expr::UnaryOp { op: UnaryOp::Deref, .. } => true,
-        Expr::UnaryOp { op: UnaryOp::Ref, expr, .. } | Expr::UnaryOp { op: UnaryOp::RefMut, expr, .. } => {
-            is_valid_lvalue(expr)
+        Expr::UnaryOp {
+            op: UnaryOp::Deref, ..
+        } => true,
+        Expr::UnaryOp {
+            op: UnaryOp::Ref,
+            expr,
+            ..
         }
+        | Expr::UnaryOp {
+            op: UnaryOp::RefMut,
+            expr,
+            ..
+        } => is_valid_lvalue(expr),
         _ => false,
     }
 }

@@ -366,7 +366,8 @@ impl SymbolTable {
 
     /// Find all traits that define an associated type with the given name.
     pub fn lookup_traits_by_assoc_type_name(&self, name: &str) -> Vec<DefId> {
-        self.trait_defs.iter()
+        self.trait_defs
+            .iter()
             .filter(|(_, b)| b.associated_types.iter().any(|(n, _)| n == name))
             .map(|(id, _)| *id)
             .collect()

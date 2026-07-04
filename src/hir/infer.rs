@@ -1,5 +1,7 @@
 use crate::ast::Span;
-use crate::hir::shape_var::{ShapeVarContext, ShapeVarId, TypeShape, type_data_to_shape, shapes_compatible};
+use crate::hir::shape_var::{
+    ShapeVarContext, ShapeVarId, TypeShape, shapes_compatible, type_data_to_shape,
+};
 use crate::hir::smt::SmtSolver;
 use crate::hir::symbol::SymbolTable;
 use crate::hir::traits::TraitEnv;
@@ -155,17 +157,25 @@ impl Constraint {
     pub fn priority(&self, ctx: &TypeContext) -> u8 {
         match self {
             Constraint::Eq(a, b, _) => {
-                let a_is_infer = matches!(ctx.get(ctx.resolve_binding(*a)), TypeData::InferVar { .. });
-                let b_is_infer = matches!(ctx.get(ctx.resolve_binding(*b)), TypeData::InferVar { .. });
+                let a_is_infer =
+                    matches!(ctx.get(ctx.resolve_binding(*a)), TypeData::InferVar { .. });
+                let b_is_infer =
+                    matches!(ctx.get(ctx.resolve_binding(*b)), TypeData::InferVar { .. });
                 match (a_is_infer, b_is_infer) {
-                    (false, false) => 0, // concrete-concrete: highest priority
+                    (false, false) => 0,                // concrete-concrete: highest priority
                     (true, false) | (false, true) => 1, // one infer var
-                    (true, true) => 2, // both infer vars
+                    (true, true) => 2,                  // both infer vars
                 }
             }
             Constraint::Sub(sub, sup, _) => {
-                let sub_is_infer = matches!(ctx.get(ctx.resolve_binding(*sub)), TypeData::InferVar { .. });
-                let sup_is_infer = matches!(ctx.get(ctx.resolve_binding(*sup)), TypeData::InferVar { .. });
+                let sub_is_infer = matches!(
+                    ctx.get(ctx.resolve_binding(*sub)),
+                    TypeData::InferVar { .. }
+                );
+                let sup_is_infer = matches!(
+                    ctx.get(ctx.resolve_binding(*sup)),
+                    TypeData::InferVar { .. }
+                );
                 match (sub_is_infer, sup_is_infer) {
                     (false, false) => 3,
                     _ => 4,
@@ -185,7 +195,7 @@ impl Constraint {
             Constraint::Exists { .. } => 2, // exists: medium-high priority
             Constraint::Forall { .. } => 6, // forall: low priority (skolem)
             Constraint::Instance { .. } => 1, // instance: high priority
-            Constraint::Let { .. } => 2, // let: medium-high priority
+            Constraint::Let { .. } => 2,    // let: medium-high priority
         }
     }
 }
@@ -333,12 +343,18 @@ impl InferenceContext {
 
     /// Look up the kind of a type variable by its id.
     pub fn get_var_kind(&self, id: usize) -> Option<TypeVariableKind> {
-        self.type_vars.iter().find(|tv| tv.id == id).map(|tv| tv.kind)
+        self.type_vars
+            .iter()
+            .find(|tv| tv.id == id)
+            .map(|tv| tv.kind)
     }
 
     /// Get the level of a type variable by its id.
     pub fn get_var_level(&self, id: usize) -> Option<usize> {
-        self.type_vars.iter().find(|tv| tv.id == id).map(|tv| tv.level)
+        self.type_vars
+            .iter()
+            .find(|tv| tv.id == id)
+            .map(|tv| tv.level)
     }
 
     /// Enter a deeper typing scope (let/forall/region).
@@ -360,7 +376,12 @@ impl InferenceContext {
     /// Returns true if promotion succeeded.
     /// This implements the level-based promotion mechanism from
     /// Fan, Xu & Xie 2025 §6 (rule PR-UVARPR).
-    pub fn try_promote_var(&mut self, ctx: &mut TypeContext, var_id: usize, target_level: usize) -> Option<TypeId> {
+    pub fn try_promote_var(
+        &mut self,
+        ctx: &mut TypeContext,
+        var_id: usize,
+        target_level: usize,
+    ) -> Option<TypeId> {
         let var_level = self.get_var_level(var_id)?;
         if var_level <= target_level {
             // No promotion needed — the var is already at an appropriate level
@@ -374,7 +395,9 @@ impl InferenceContext {
             tv.level = target_level;
         }
         // Bind the old variable to the new one (promotion)
-        ctx.bindings.borrow_mut().insert(self.var_type_ids[var_id], new_ty_id);
+        ctx.bindings
+            .borrow_mut()
+            .insert(self.var_type_ids[var_id], new_ty_id);
         Some(new_ty_id)
     }
 
@@ -403,30 +426,52 @@ impl InferenceContext {
             Constraint::Eq(a, b, _) => {
                 let ra = ctx.resolve_binding(*a);
                 let rb = ctx.resolve_binding(*b);
-                if let TypeData::InferVar { id } = ctx.get(ra) { return Some(*id); }
-                if let TypeData::InferVar { id } = ctx.get(rb) { return Some(*id); }
+                if let TypeData::InferVar { id } = ctx.get(ra) {
+                    return Some(*id);
+                }
+                if let TypeData::InferVar { id } = ctx.get(rb) {
+                    return Some(*id);
+                }
                 None
             }
             Constraint::Sub(sub, sup, _) => {
                 let rs = ctx.resolve_binding(*sub);
                 let rsup = ctx.resolve_binding(*sup);
-                if let TypeData::InferVar { id } = ctx.get(rs) { return Some(*id); }
-                if let TypeData::InferVar { id } = ctx.get(rsup) { return Some(*id); }
+                if let TypeData::InferVar { id } = ctx.get(rs) {
+                    return Some(*id);
+                }
+                if let TypeData::InferVar { id } = ctx.get(rsup) {
+                    return Some(*id);
+                }
                 None
             }
             Constraint::Impl(ty, ..) => {
                 let r = ctx.resolve_binding(*ty);
-                if let TypeData::InferVar { id } = ctx.get(r) { Some(*id) } else { None }
+                if let TypeData::InferVar { id } = ctx.get(r) {
+                    Some(*id)
+                } else {
+                    None
+                }
             }
             Constraint::Match { scrutinee, .. } => {
                 let r = ctx.resolve_binding(*scrutinee);
-                if let TypeData::InferVar { id } = ctx.get(r) { Some(*id) } else { None }
+                if let TypeData::InferVar { id } = ctx.get(r) {
+                    Some(*id)
+                } else {
+                    None
+                }
             }
             Constraint::Exists { var_id, .. } => Some(*var_id),
             Constraint::Forall { .. } => None, // rigid var — not an infer var
-            Constraint::Instance { instantiation_ty, .. } => {
+            Constraint::Instance {
+                instantiation_ty, ..
+            } => {
                 let r = ctx.resolve_binding(*instantiation_ty);
-                if let TypeData::InferVar { id } = ctx.get(r) { Some(*id) } else { None }
+                if let TypeData::InferVar { id } = ctx.get(r) {
+                    Some(*id)
+                } else {
+                    None
+                }
             }
             Constraint::Let { .. } => None, // structural — no single infer var
         }
@@ -450,7 +495,9 @@ impl InferenceContext {
             TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
                 PrincipalShape::Constructor(args.len())
             }
-            TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } => PrincipalShape::Poly,
+            TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } => {
+                PrincipalShape::Poly
+            }
             TypeData::Rational { .. } => PrincipalShape::Unknown,
             TypeData::InferVar { .. } | TypeData::GenericParam { .. } => PrincipalShape::Var,
             _ => PrincipalShape::Unknown,
@@ -476,12 +523,20 @@ impl InferenceContext {
     /// Incrementally wake constraints for a resolved variable.
     /// Woken constraints are enqueued directly onto the heap.
     /// After waking, if the wait list is empty, the variable can be re-generalised (G).
-    fn wake_var_incremental(&mut self, var_id: usize, heap: &mut BinaryHeap<PrioritizedConstraint>, ctx: &TypeContext) {
+    fn wake_var_incremental(
+        &mut self,
+        var_id: usize,
+        heap: &mut BinaryHeap<PrioritizedConstraint>,
+        ctx: &TypeContext,
+    ) {
         if var_id < self.wait_lists.len() && !self.wait_lists[var_id].is_empty() {
             let suspended = std::mem::take(&mut self.wait_lists[var_id]);
             for c in suspended {
                 let p = c.priority(ctx);
-                heap.push(PrioritizedConstraint { priority: p, constraint: c });
+                heap.push(PrioritizedConstraint {
+                    priority: p,
+                    constraint: c,
+                });
             }
             // All constraints woken — restore to Generalized if no guards remain
             if var_id < self.gen_statuses.len()
@@ -531,7 +586,10 @@ impl InferenceContext {
                     // #3: Register on this var AND all vars sharing its
                     // binding root (transitive wait_list).
                     let root = ctx.resolve_binding(scrutinee);
-                    let targets: Vec<usize> = self.var_type_ids.iter().enumerate()
+                    let targets: Vec<usize> = self
+                        .var_type_ids
+                        .iter()
+                        .enumerate()
                         .filter(|(_, ty_id)| ctx.resolve_binding(**ty_id) == root)
                         .map(|(i, _)| i)
                         .collect();
@@ -594,9 +652,13 @@ impl InferenceContext {
                 let ra = ctx.resolve_binding(*a);
                 let rb = ctx.resolve_binding(*b);
                 // Check if this Eq constraint involves our variable
-                let other = if ra == resolved { Some(rb) }
-                    else if rb == resolved { Some(ra) }
-                    else { None };
+                let other = if ra == resolved {
+                    Some(rb)
+                } else if rb == resolved {
+                    Some(ra)
+                } else {
+                    None
+                };
                 if let Some(other_ty) = other {
                     let other_resolved = ctx.resolve_binding(other_ty);
                     if !matches!(ctx.get(other_resolved), TypeData::InferVar { .. }) {
@@ -680,11 +742,7 @@ impl InferenceContext {
     ///
     /// This implements the full ⊆-closed erasure semantics:
     ///   C[τ!ζ] iff ∀φ, φ ⊢ [C[τ = g]] ⇒ shape(g) = ζ
-    pub fn unicity_check_smt(
-        &self,
-        ctx: &TypeContext,
-        ty: TypeId,
-    ) -> Option<PrincipalShape> {
+    pub fn unicity_check_smt(&self, ctx: &TypeContext, ty: TypeId) -> Option<PrincipalShape> {
         let solver = SmtSolver::new("z3");
 
         // ── 1. Collect all resolved bindings ─────────────────────
@@ -799,14 +857,23 @@ impl InferenceContext {
         let resolved = ctx.resolve_binding(ty);
         match ctx.get(resolved).clone() {
             TypeData::Fn { params, ret } => {
-                for p in params { self.s_inst_copy_deepen(ctx, p); }
+                for p in params {
+                    self.s_inst_copy_deepen(ctx, p);
+                }
                 self.s_inst_copy_deepen(ctx, ret);
             }
-            TypeData::Tuple { elems } | TypeData::Coproduct { alternatives: elems } => {
-                for e in elems { self.s_inst_copy_deepen(ctx, e); }
+            TypeData::Tuple { elems }
+            | TypeData::Coproduct {
+                alternatives: elems,
+            } => {
+                for e in elems {
+                    self.s_inst_copy_deepen(ctx, e);
+                }
             }
             TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
-                for a in args { self.s_inst_copy_deepen(ctx, a); }
+                for a in args {
+                    self.s_inst_copy_deepen(ctx, a);
+                }
             }
             TypeData::InferVar { id } => {
                 // If this region variable has instances, propagate to them too
@@ -822,12 +889,7 @@ impl InferenceContext {
     }
 
     /// Copy one solved equation to one instance variable (S-Inst-Copy detail).
-    fn s_inst_copy_walk(
-        &mut self,
-        ctx: &mut TypeContext,
-        instance_ty: TypeId,
-        source_ty: TypeId,
-    ) {
+    fn s_inst_copy_walk(&mut self, ctx: &mut TypeContext, instance_ty: TypeId, source_ty: TypeId) {
         let resolved_source = ctx.resolve_binding(source_ty);
         match ctx.get(resolved_source) {
             TypeData::InferVar { id } => {
@@ -857,7 +919,7 @@ impl InferenceContext {
     //
     // Falls back to a level-based heuristic when Z3 is unavailable or the
     // query times out, as a conservative over-approximation.
-    
+
     /// Attempt to lower a variable using the full Z3-backed semantic check
     /// (OmniML §5.3 S-Exists-Lower). If Z3 determines the variable's shape is
     /// uniquely determined by the constraint context, it can be safely lowered
@@ -920,19 +982,30 @@ impl InferenceContext {
             (0..self.gen_statuses.len())
                 .filter(|i| {
                     self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable)
-                        && self.type_vars.get(*i).map(|v| v.level == level).unwrap_or(false)
+                        && self
+                            .type_vars
+                            .get(*i)
+                            .map(|v| v.level == level)
+                            .unwrap_or(false)
                 })
                 .collect()
         } else if !self.dirty_set.is_empty() {
-            self.dirty_set.iter().copied()
+            self.dirty_set
+                .iter()
+                .copied()
                 .filter(|i| self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable))
                 .collect()
         } else if !self.region_dirty_levels.is_empty() {
-            let dl: std::collections::HashSet<usize> = self.region_dirty_levels.iter().copied().collect();
+            let dl: std::collections::HashSet<usize> =
+                self.region_dirty_levels.iter().copied().collect();
             (0..self.gen_statuses.len())
                 .filter(|i| {
                     self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable)
-                        && self.type_vars.get(*i).map(|v| dl.contains(&v.level)).unwrap_or(false)
+                        && self
+                            .type_vars
+                            .get(*i)
+                            .map(|v| dl.contains(&v.level))
+                            .unwrap_or(false)
                 })
                 .collect()
         } else if !dirty_levels.is_empty() {
@@ -941,7 +1014,11 @@ impl InferenceContext {
             (0..self.gen_statuses.len())
                 .filter(|i| {
                     self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable)
-                        && self.type_vars.get(*i).map(|v| dl.contains(&v.level)).unwrap_or(false)
+                        && self
+                            .type_vars
+                            .get(*i)
+                            .map(|v| dl.contains(&v.level))
+                            .unwrap_or(false)
                 })
                 .collect()
         } else {
@@ -984,16 +1061,21 @@ impl InferenceContext {
         }
 
         // Process innermost-first (highest level first = most nested first).
-        let mut vars_by_level: Vec<(usize, usize)> = dirty.iter()
+        let mut vars_by_level: Vec<(usize, usize)> = dirty
+            .iter()
             .map(|&i| (i, self.type_vars.get(i).map(|v| v.level).unwrap_or(0)))
             .collect();
         vars_by_level.sort_by(|a, b| b.1.cmp(&a.1));
 
         // Rigid scope check per generation.
         for &(i, level) in &vars_by_level {
-            if i >= self.var_type_ids.len() { continue; }
+            if i >= self.var_type_ids.len() {
+                continue;
+            }
             let resolved = ctx.resolve_binding(self.var_type_ids[i]);
-            if matches!(ctx.get(resolved), TypeData::InferVar { .. }) { continue; }
+            if matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
+                continue;
+            }
             if level < self.current_level {
                 if Self::check_rigid_escape(ctx, resolved, level) {
                     continue;
@@ -1003,7 +1085,9 @@ impl InferenceContext {
 
         // Generalize eligible PG → G in level order (generation order).
         for &(i, _level) in &vars_by_level {
-            if i >= self.gen_statuses.len() || self.gen_statuses[i] != GenStatus::PartiallyGeneralizable {
+            if i >= self.gen_statuses.len()
+                || self.gen_statuses[i] != GenStatus::PartiallyGeneralizable
+            {
                 continue;
             }
             let is_trans_guarded = trans_guarded.contains(&i);
@@ -1033,19 +1117,25 @@ impl InferenceContext {
         match ctx.get(resolved) {
             TypeData::GenericParam { .. } => true, // escape detected
             TypeData::Fn { params, ret } => {
-                params.iter().any(|&p| Self::check_rigid_escape(ctx, p, max_level))
+                params
+                    .iter()
+                    .any(|&p| Self::check_rigid_escape(ctx, p, max_level))
                     || Self::check_rigid_escape(ctx, *ret, max_level)
             }
-            TypeData::Tuple { elems } | TypeData::Coproduct { alternatives: elems } => {
-                elems.iter().any(|&e| Self::check_rigid_escape(ctx, e, max_level))
-            }
-            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
-                args.iter().any(|&a| Self::check_rigid_escape(ctx, a, max_level))
-            }
-            TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. }
-            | TypeData::Poly { body, .. } | TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => {
-                Self::check_rigid_escape(ctx, *body, max_level)
-            }
+            TypeData::Tuple { elems }
+            | TypeData::Coproduct {
+                alternatives: elems,
+            } => elems
+                .iter()
+                .any(|&e| Self::check_rigid_escape(ctx, e, max_level)),
+            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => args
+                .iter()
+                .any(|&a| Self::check_rigid_escape(ctx, a, max_level)),
+            TypeData::Forall { body, .. }
+            | TypeData::Exists { base: body, .. }
+            | TypeData::Poly { body, .. }
+            | TypeData::Mu { body, .. }
+            | TypeData::Nu { body, .. } => Self::check_rigid_escape(ctx, *body, max_level),
             TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
                 Self::check_rigid_escape(ctx, *ty, max_level)
             }
@@ -1053,7 +1143,9 @@ impl InferenceContext {
                 Self::check_rigid_escape(ctx, *elem, max_level)
             }
             TypeData::Ptr { pointee, .. } => Self::check_rigid_escape(ctx, *pointee, max_level),
-            TypeData::AssociatedType { self_ty, .. } => Self::check_rigid_escape(ctx, *self_ty, max_level),
+            TypeData::AssociatedType { self_ty, .. } => {
+                Self::check_rigid_escape(ctx, *self_ty, max_level)
+            }
             _ => false, // Int, Bool, etc. are safe
         }
     }
@@ -1103,7 +1195,10 @@ impl InferenceContext {
                     // Enqueue continuation constraints.
                     for c in &branch.continuation {
                         let p = c.priority(ctx);
-                        heap.push(PrioritizedConstraint { priority: p, constraint: c.clone() });
+                        heap.push(PrioritizedConstraint {
+                            priority: p,
+                            constraint: c.clone(),
+                        });
                     }
                     return true;
                 }
@@ -1114,7 +1209,10 @@ impl InferenceContext {
             if !first.else_continuation.is_empty() {
                 for c in &first.else_continuation {
                     let p = c.priority(ctx);
-                    heap.push(PrioritizedConstraint { priority: p, constraint: c.clone() });
+                    heap.push(PrioritizedConstraint {
+                        priority: p,
+                        constraint: c.clone(),
+                    });
                 }
                 return true;
             }
@@ -1160,12 +1258,20 @@ impl InferenceContext {
         }
     }
 
-    pub fn solve(&mut self, ctx: &mut TypeContext, trait_env: &TraitEnv, symbols: &SymbolTable) -> Result<(), TypeError> {
+    pub fn solve(
+        &mut self,
+        ctx: &mut TypeContext,
+        trait_env: &TraitEnv,
+        symbols: &SymbolTable,
+    ) -> Result<(), TypeError> {
         // ── Build priority queue ────────────────────────────────────
         let mut heap: BinaryHeap<PrioritizedConstraint> = BinaryHeap::new();
         for c in &self.constraints {
             let priority = c.priority(ctx);
-            heap.push(PrioritizedConstraint { priority, constraint: c.clone() });
+            heap.push(PrioritizedConstraint {
+                priority,
+                constraint: c.clone(),
+            });
         }
 
         // ── Process all constraints in priority order ───────────────
@@ -1184,8 +1290,24 @@ impl InferenceContext {
                         let rb = ctx.resolve_binding(*b);
                         let a_is_infer = matches!(ctx.get(ra), TypeData::InferVar { .. });
                         let b_is_infer = matches!(ctx.get(rb), TypeData::InferVar { .. });
-                        let a_var_id = if a_is_infer { if let TypeData::InferVar { id } = ctx.get(ra) { Some(*id) } else { None } } else { None };
-                        let b_var_id = if b_is_infer { if let TypeData::InferVar { id } = ctx.get(rb) { Some(*id) } else { None } } else { None };
+                        let a_var_id = if a_is_infer {
+                            if let TypeData::InferVar { id } = ctx.get(ra) {
+                                Some(*id)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let b_var_id = if b_is_infer {
+                            if let TypeData::InferVar { id } = ctx.get(rb) {
+                                Some(*id)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
 
                         // Level-based promotion (Fan, Xu & Xie 2025 §6.2):
                         // If unifying two InferVars at different levels, promote
@@ -1251,212 +1373,296 @@ impl InferenceContext {
                         }
                     }
                     Constraint::Sub(sub, sup, _span) => {
-                    let resolved_sub = ctx.resolve_binding(*sub);
-                    let resolved_sup = ctx.resolve_binding(*sup);
+                        let resolved_sub = ctx.resolve_binding(*sub);
+                        let resolved_sup = ctx.resolve_binding(*sup);
 
-                    // If sup is an InferVar, record sub as a lower bound of sup
-                    if let TypeData::InferVar { id } = ctx.get(resolved_sup) {
-                        if *id < self.lower_bounds.len() {
-                            self.lower_bounds[*id].push(resolved_sub);
+                        // If sup is an InferVar, record sub as a lower bound of sup
+                        if let TypeData::InferVar { id } = ctx.get(resolved_sup) {
+                            if *id < self.lower_bounds.len() {
+                                self.lower_bounds[*id].push(resolved_sub);
+                            }
+                        }
+                        // If sub is an InferVar, record sup as an upper bound of sub
+                        if let TypeData::InferVar { id } = ctx.get(resolved_sub) {
+                            if *id < self.upper_bounds.len() {
+                                self.upper_bounds[*id].push(resolved_sup);
+                            }
+                        }
+
+                        // If both sides are resolved (not InferVar), check the subtype relationship now
+                        let sub_is_infer =
+                            matches!(ctx.get(resolved_sub), TypeData::InferVar { .. });
+                        let sup_is_infer =
+                            matches!(ctx.get(resolved_sup), TypeData::InferVar { .. });
+                        if !sub_is_infer && !sup_is_infer {
+                            if !ctx.subtype(resolved_sub, resolved_sup) {
+                                return Err(TypeError::Mismatch {
+                                    expected: resolved_sup,
+                                    found: resolved_sub,
+                                    span: *_span,
+                                });
+                            }
                         }
                     }
-                    // If sub is an InferVar, record sup as an upper bound of sub
-                    if let TypeData::InferVar { id } = ctx.get(resolved_sub) {
-                        if *id < self.upper_bounds.len() {
-                            self.upper_bounds[*id].push(resolved_sup);
+                    Constraint::Impl(ty, trait_id, span) => {
+                        let resolved = ctx.resolve_binding(*ty);
+                        let data = ctx.get(resolved);
+                        // If the type is an error, skip
+                        if matches!(data, TypeData::Error) {
+                            return Ok(());
                         }
-                    }
-
-                    // If both sides are resolved (not InferVar), check the subtype relationship now
-                    let sub_is_infer = matches!(ctx.get(resolved_sub), TypeData::InferVar { .. });
-                    let sup_is_infer = matches!(ctx.get(resolved_sup), TypeData::InferVar { .. });
-                    if !sub_is_infer && !sup_is_infer {
-                        if !ctx.subtype(resolved_sub, resolved_sup) {
-                            return Err(TypeError::Mismatch {
-                                expected: resolved_sup,
-                                found: resolved_sub,
-                                span: *_span,
+                        // If still an infer var, that's fine; solving will assign a default later
+                        if matches!(data, TypeData::InferVar { .. }) {
+                            return Ok(());
+                        }
+                        // Otherwise, check that the impl exists
+                        let impl_found = if trait_env.lookup_impl(*trait_id, resolved).is_some() {
+                            true
+                        } else {
+                            trait_env
+                                .lookup_impl_generic(*trait_id, resolved, ctx, symbols)
+                                .is_some()
+                        };
+                        if !impl_found {
+                            return Err(TypeError::TraitNotImplemented {
+                                ty: *ty,
+                                trait_name: format!("{:?}", trait_id),
+                                span: *span,
                             });
                         }
-                    }
-                }
-                Constraint::Impl(ty, trait_id, span) => {
-                    let resolved = ctx.resolve_binding(*ty);
-                    let data = ctx.get(resolved);
-                    // If the type is an error, skip
-                    if matches!(data, TypeData::Error) {
-                        return Ok(());
-                }
-                    // If still an infer var, that's fine; solving will assign a default later
-                    if matches!(data, TypeData::InferVar { .. }) {
-                        return Ok(());
-                }
-                    // Otherwise, check that the impl exists
-                    let impl_found = if trait_env.lookup_impl(*trait_id, resolved).is_some() {
-                        true
-                    } else {
-                        trait_env.lookup_impl_generic(*trait_id, resolved, ctx, symbols).is_some()
-                    };
-                    if !impl_found {
-                    return Err(TypeError::TraitNotImplemented {
-                        ty: *ty,
-                        trait_name: format!("{:?}", trait_id),
-                        span: *span,
-                    });
-                }
-                // Generate obligations for associated types: when we have a
-                // resolved Impl(concrete_ty, trait_id, _), look for concrete types
-                // for any AssociatedType { trait_id, name, self_ty } by matching
-                // the impl's assoc_tys entries.
-                if let Some(impl_candidate) = trait_env.lookup_impl(*trait_id, resolved) {
-                    for (assoc_name, assoc_ty) in &impl_candidate.assoc_tys {
-                        // Walk all Eq constraints to substitute any AssociatedType
-                        // that matches this name, trait_id, and self_ty
-                        for eq_c in &self.constraints {
-                            if let Constraint::Eq(a, b, _) = eq_c {
-                                for id in &[*a, *b] {
-                                    let resolved_id = ctx.resolve_binding(*id);
-                                    if let TypeData::AssociatedType {
-                                        trait_id: at_trait_id,
-                                        name: at_name,
-                                        self_ty: at_self,
-                                    } = ctx.get(resolved_id).clone()
-                                    {
-                                        if at_trait_id == *trait_id
-                                            && at_name == *assoc_name
-                                            && ctx.resolve_binding(at_self) == resolved
-                                        {
-                                            ctx.unify(resolved_id, *assoc_ty)?;
+                        // Generate obligations for associated types: when we have a
+                        // resolved Impl(concrete_ty, trait_id, _), look for concrete types
+                        // for any AssociatedType { trait_id, name, self_ty } by matching
+                        // the impl's assoc_tys entries.
+                        if let Some(impl_candidate) = trait_env.lookup_impl(*trait_id, resolved) {
+                            for (assoc_name, assoc_ty) in &impl_candidate.assoc_tys {
+                                // Walk all Eq constraints to substitute any AssociatedType
+                                // that matches this name, trait_id, and self_ty
+                                for eq_c in &self.constraints {
+                                    if let Constraint::Eq(a, b, _) = eq_c {
+                                        for id in &[*a, *b] {
+                                            let resolved_id = ctx.resolve_binding(*id);
+                                            if let TypeData::AssociatedType {
+                                                trait_id: at_trait_id,
+                                                name: at_name,
+                                                self_ty: at_self,
+                                            } = ctx.get(resolved_id).clone()
+                                            {
+                                                if at_trait_id == *trait_id
+                                                    && at_name == *assoc_name
+                                                    && ctx.resolve_binding(at_self) == resolved
+                                                {
+                                                    ctx.unify(resolved_id, *assoc_ty)?;
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                }
-            }
-            Constraint::Match { scrutinee, branches_id, span: _ } => {
-                // OmniML §4.1: Try to discharge suspended match constraints.
-                // Check unicity — if the scrutinee's shape is uniquely determined,
-                // discharge the match and enqueue continuation constraints.
-                let resolved = ctx.resolve_binding(*scrutinee);
-                let resolved_data = ctx.get(resolved);
+                    Constraint::Match {
+                        scrutinee,
+                        branches_id,
+                        span: _,
+                    } => {
+                        // OmniML §4.1: Try to discharge suspended match constraints.
+                        // Check unicity — if the scrutinee's shape is uniquely determined,
+                        // discharge the match and enqueue continuation constraints.
+                        let resolved = ctx.resolve_binding(*scrutinee);
+                        let resolved_data = ctx.get(resolved);
 
-                if !matches!(resolved_data, TypeData::InferVar { .. }) {
-                    // Scrutinee is resolved — shape is known (UNI-TYPE).
-                    let _ = self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
-                } else {
-                    // Try shape variable (OmniML §6): register a callback on the
-                    // scrutinee's shape variable, if any.
-                    let shape_known = self.try_match_via_shape_var(ctx, *scrutinee, *branches_id, &mut heap);
-                    if !shape_known {
-                        // Scrutinee is still an InferVar — try unicity via bounds
-                        if let Some(_shape) = Self::unicity_check(self, ctx, *scrutinee, &[]) {
+                        if !matches!(resolved_data, TypeData::InferVar { .. }) {
+                            // Scrutinee is resolved — shape is known (UNI-TYPE).
                             let _ = self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
                         } else {
-                            // Cannot discharge yet — push back as low priority
-                            let p = 6u8;
-                            heap.push(PrioritizedConstraint { priority: p, constraint: pc.constraint.clone() });
+                            // Try shape variable (OmniML §6): register a callback on the
+                            // scrutinee's shape variable, if any.
+                            let shape_known = self.try_match_via_shape_var(
+                                ctx,
+                                *scrutinee,
+                                *branches_id,
+                                &mut heap,
+                            );
+                            if !shape_known {
+                                // Scrutinee is still an InferVar — try unicity via bounds
+                                if let Some(_shape) =
+                                    Self::unicity_check(self, ctx, *scrutinee, &[])
+                                {
+                                    let _ = self.discharge_match(
+                                        ctx,
+                                        *scrutinee,
+                                        *branches_id,
+                                        &mut heap,
+                                    );
+                                } else {
+                                    // Cannot discharge yet — push back as low priority
+                                    let p = 6u8;
+                                    heap.push(PrioritizedConstraint {
+                                        priority: p,
+                                        constraint: pc.constraint.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Constraint::Exists {
+                        var_id,
+                        constraint,
+                        span: _,
+                    } => {
+                        // OmniML: ∃α. C — bind a fresh flexible variable.
+                        // α is already an InferVar at this level; just solve the body.
+                        let inner = constraint.as_ref().clone();
+                        let p = inner.priority(ctx);
+                        heap.push(PrioritizedConstraint {
+                            priority: p,
+                            constraint: inner,
+                        });
+                    }
+                    Constraint::Forall {
+                        var_id,
+                        constraint,
+                        span: _,
+                    } => {
+                        // OmniML: ∀α. C — bind a fresh rigid (skolem) variable.
+                        // Record for skolem escape check; solve the body.
+                        let inner = constraint.as_ref().clone();
+                        let p = inner.priority(ctx);
+                        heap.push(PrioritizedConstraint {
+                            priority: p,
+                            constraint: inner,
+                        });
+                    }
+                    Constraint::Instance {
+                        expr_var,
+                        instantiation_ty,
+                        span: _,
+                    } => {
+                        let p = Constraint::Eq(
+                            *instantiation_ty,
+                            *instantiation_ty,
+                            crate::ast::Span::new(0, 0),
+                        )
+                        .priority(ctx);
+                        let ic = Constraint::Eq(
+                            *instantiation_ty,
+                            *instantiation_ty,
+                            crate::ast::Span::new(0, 0),
+                        );
+                        heap.push(PrioritizedConstraint {
+                            priority: p,
+                            constraint: ic,
+                        });
+                    }
+                    Constraint::Let {
+                        expr_var: _,
+                        def_constraint,
+                        body_constraint,
+                        span: _,
+                    } => {
+                        let prev_level = self.enter_level();
+                        let def_p = def_constraint.priority(ctx);
+                        heap.push(PrioritizedConstraint {
+                            priority: def_p,
+                            constraint: def_constraint.as_ref().clone(),
+                        });
+                        let body_p = body_constraint.priority(ctx).max(4);
+                        heap.push(PrioritizedConstraint {
+                            priority: body_p,
+                            constraint: body_constraint.as_ref().clone(),
+                        });
+                        self.exit_level(prev_level);
+                    }
+                }
+            }
+
+            // ── OmniML: Process Match constraints ──────────────────────
+            // After processing Eq/Sub/Impl, check suspended match constraints.
+            // A Match constraint can be discharged when the scrutinee's shape
+            // is uniquely determined by the context (unicity check).
+            // This implements O'Brien, Rémy & Scherer §4.1, MATCH-CTX rule.
+            for pc in &heap.clone().into_sorted_vec() {
+                if let Constraint::Match {
+                    scrutinee,
+                    branches_id,
+                    span: _,
+                } = &pc.constraint
+                {
+                    let resolved = ctx.resolve_binding(*scrutinee);
+                    // Only attempt discharge if scrutinee is resolved (not an InferVar)
+                    if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
+                        if let Some(shape) = Self::unicity_check(self, ctx, *scrutinee, &[]) {
+                            let _discharged =
+                                self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
+                        }
+                    } else {
+                        // Scrutinee is still an InferVar — check unicity via bounds
+                        if let Some(_shape) = Self::unicity_check(self, ctx, *scrutinee, &[]) {
+                            let _discharged =
+                                self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
                         }
                     }
                 }
             }
-            Constraint::Exists { var_id, constraint, span: _ } => {
-                // OmniML: ∃α. C — bind a fresh flexible variable.
-                // α is already an InferVar at this level; just solve the body.
-                let inner = constraint.as_ref().clone();
-                let p = inner.priority(ctx);
-                heap.push(PrioritizedConstraint { priority: p, constraint: inner });
-            }
-            Constraint::Forall { var_id, constraint, span: _ } => {
-                // OmniML: ∀α. C — bind a fresh rigid (skolem) variable.
-                // Record for skolem escape check; solve the body.
-                let inner = constraint.as_ref().clone();
-                let p = inner.priority(ctx);
-                heap.push(PrioritizedConstraint { priority: p, constraint: inner });
-            }
-            Constraint::Instance { expr_var, instantiation_ty, span: _ } => {
-                let p = Constraint::Eq(*instantiation_ty, *instantiation_ty, crate::ast::Span::new(0, 0)).priority(ctx);
-                let ic = Constraint::Eq(*instantiation_ty, *instantiation_ty, crate::ast::Span::new(0, 0));
-                heap.push(PrioritizedConstraint { priority: p, constraint: ic });
-            }
-            Constraint::Let { expr_var: _, def_constraint, body_constraint, span: _ } => {
-                let prev_level = self.enter_level();
-                let def_p = def_constraint.priority(ctx);
-                heap.push(PrioritizedConstraint { priority: def_p, constraint: def_constraint.as_ref().clone() });
-                let body_p = body_constraint.priority(ctx).max(4);
-                heap.push(PrioritizedConstraint { priority: body_p, constraint: body_constraint.as_ref().clone() });
-                self.exit_level(prev_level);
-            }
-        }
-    }
 
-    // ── OmniML: Process Match constraints ──────────────────────
-    // After processing Eq/Sub/Impl, check suspended match constraints.
-    // A Match constraint can be discharged when the scrutinee's shape
-    // is uniquely determined by the context (unicity check).
-    // This implements O'Brien, Rémy & Scherer §4.1, MATCH-CTX rule.
-    for pc in &heap.clone().into_sorted_vec() {
-        if let Constraint::Match { scrutinee, branches_id, span: _ } = &pc.constraint {
-            let resolved = ctx.resolve_binding(*scrutinee);
-            // Only attempt discharge if scrutinee is resolved (not an InferVar)
-            if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
-                if let Some(shape) = Self::unicity_check(self, ctx, *scrutinee, &[]) {
-                    let _discharged = self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
-                }
-            } else {
-                // Scrutinee is still an InferVar — check unicity via bounds
-                if let Some(_shape) = Self::unicity_check(self, ctx, *scrutinee, &[]) {
-                    let _discharged = self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
+            // ── Wake-up: reprocess suspended constraints ───────────────
+            // After processing all active constraints, check if any variables
+            // were resolved. If so, wake their wait-listed constraints and
+            // continue solving (OmniML bidirectional flow §3.2).
+            let mut woken = 0usize;
+            for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
+                let resolved = ctx.resolve_binding(ty_id);
+                if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
+                    // This variable was resolved — wake its suspended constraints
+                    if i < self.wait_lists.len() && !self.wait_lists[i].is_empty() {
+                        let suspended = std::mem::take(&mut self.wait_lists[i]);
+                        let count = suspended.len();
+                        for c in suspended {
+                            let p = c.priority(ctx);
+                            heap.push(PrioritizedConstraint {
+                                priority: p,
+                                constraint: c,
+                            });
+                        }
+                        woken += count;
+                    }
                 }
             }
-        }
-    }
-
-    // ── Wake-up: reprocess suspended constraints ───────────────
-    // After processing all active constraints, check if any variables
-    // were resolved. If so, wake their wait-listed constraints and
-    // continue solving (OmniML bidirectional flow §3.2).
-    let mut woken = 0usize;
-    for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
-        let resolved = ctx.resolve_binding(ty_id);
-        if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
-            // This variable was resolved — wake its suspended constraints
-            if i < self.wait_lists.len() && !self.wait_lists[i].is_empty() {
-                let suspended = std::mem::take(&mut self.wait_lists[i]);
-                let count = suspended.len();
-                for c in suspended {
-                    let p = c.priority(ctx);
-                    heap.push(PrioritizedConstraint { priority: p, constraint: c });
+            if woken == 0 {
+                // #2: Solver exhaustion — check for remaining undischarged Match
+                // constraints and fire their else_continuation as a fallback.
+                let remaining: Vec<PrioritizedConstraint> = heap.drain().collect();
+                let match_elses: Vec<(TypeId, usize)> = remaining
+                    .iter()
+                    .filter_map(|pc| {
+                        if let Constraint::Match {
+                            scrutinee,
+                            branches_id,
+                            ..
+                        } = &pc.constraint
+                        {
+                            let resolved = ctx.resolve_binding(*scrutinee);
+                            if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
+                                Some((*scrutinee, *branches_id))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let mut else_heap = BinaryHeap::new();
+                for (scrutinee, branches_id) in match_elses {
+                    self.discharge_match(ctx, scrutinee, branches_id, &mut else_heap);
                 }
-                woken += count;
+                break; // converged: no more constraints to wake
             }
+            // Continue the loop to process woken constraints
         }
-    }
-    if woken == 0 {
-        // #2: Solver exhaustion — check for remaining undischarged Match
-        // constraints and fire their else_continuation as a fallback.
-        let remaining: Vec<PrioritizedConstraint> = heap.drain().collect();
-        let match_elses: Vec<(TypeId, usize)> = remaining.iter()
-            .filter_map(|pc| {
-                if let Constraint::Match { scrutinee, branches_id, .. } = &pc.constraint {
-                    let resolved = ctx.resolve_binding(*scrutinee);
-                    if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
-                        Some((*scrutinee, *branches_id))
-                    } else { None }
-                } else { None }
-            })
-            .collect();
-        let mut else_heap = BinaryHeap::new();
-        for (scrutinee, branches_id) in match_elses {
-            self.discharge_match(ctx, scrutinee, branches_id, &mut else_heap);
-        }
-        break; // converged: no more constraints to wake
-    }
-    // Continue the loop to process woken constraints
-}
 
-// Kind checking: ensure that solved types respect the variable's kind
+        // Kind checking: ensure that solved types respect the variable's kind
         for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
             let resolved = ctx.resolve_binding(ty_id);
             let data = ctx.get(resolved);
@@ -1471,7 +1677,10 @@ impl InferenceContext {
                 TypeVariableKind::Integer => {
                     if !matches!(
                         data,
-                        TypeData::Int { .. } | TypeData::UInt { .. } | TypeData::USize | TypeData::Rational { .. }
+                        TypeData::Int { .. }
+                            | TypeData::UInt { .. }
+                            | TypeData::USize
+                            | TypeData::Rational { .. }
                     ) {
                         return Err(TypeError::Mismatch {
                             expected: ty_id,
@@ -1525,7 +1734,9 @@ impl InferenceContext {
             if let TypeData::InferVar { .. } = ctx.get(resolved) {
                 // Skip variables that are PG — they still have suspended constraints
                 // and will be re-generalized when those constraints are discharged.
-                if i < self.gen_statuses.len() && self.gen_statuses[i] == GenStatus::PartiallyGeneralizable {
+                if i < self.gen_statuses.len()
+                    && self.gen_statuses[i] == GenStatus::PartiallyGeneralizable
+                {
                     continue;
                 }
                 let default_ty = match self.type_vars[i].kind {
@@ -1729,25 +1940,54 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
             })
             .unwrap_or(ctx.error())
         }
-        TypeData::Forall { param_index, param_name, body } => {
+        TypeData::Forall {
+            param_index,
+            param_name,
+            body,
+        } => {
             let new_body = replace_infer(body, solution, ctx);
-            ctx.find_type(&TypeData::Forall { param_index, param_name, body: new_body })
-                .unwrap_or(ctx.error())
+            ctx.find_type(&TypeData::Forall {
+                param_index,
+                param_name,
+                body: new_body,
+            })
+            .unwrap_or(ctx.error())
         }
-        TypeData::Mu { param_index, param_name, body } => {
+        TypeData::Mu {
+            param_index,
+            param_name,
+            body,
+        } => {
             let new_body = replace_infer(body, solution, ctx);
-            ctx.find_type(&TypeData::Mu { param_index, param_name, body: new_body })
-                .unwrap_or(ctx.error())
+            ctx.find_type(&TypeData::Mu {
+                param_index,
+                param_name,
+                body: new_body,
+            })
+            .unwrap_or(ctx.error())
         }
-        TypeData::Nu { param_index, param_name, body } => {
+        TypeData::Nu {
+            param_index,
+            param_name,
+            body,
+        } => {
             let new_body = replace_infer(body, solution, ctx);
-            ctx.find_type(&TypeData::Nu { param_index, param_name, body: new_body })
-                .unwrap_or(ctx.error())
+            ctx.find_type(&TypeData::Nu {
+                param_index,
+                param_name,
+                body: new_body,
+            })
+            .unwrap_or(ctx.error())
         }
         TypeData::Coproduct { alternatives } => {
-            let new_alts: Vec<TypeId> = alternatives.iter().map(|&a| replace_infer(a, solution, ctx)).collect();
-            ctx.find_type(&TypeData::Coproduct { alternatives: new_alts })
-                .unwrap_or(ctx.error())
+            let new_alts: Vec<TypeId> = alternatives
+                .iter()
+                .map(|&a| replace_infer(a, solution, ctx))
+                .collect();
+            ctx.find_type(&TypeData::Coproduct {
+                alternatives: new_alts,
+            })
+            .unwrap_or(ctx.error())
         }
     }
 }
@@ -1756,7 +1996,9 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
 mod tests {
     use super::*;
 
-    fn new_ctx() -> TypeContext { TypeContext::new() }
+    fn new_ctx() -> TypeContext {
+        TypeContext::new()
+    }
 
     #[test]
     fn test_shape_of_fn() {
@@ -1798,7 +2040,10 @@ mod tests {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
         };
-        infer.suspend_on_var(Constraint::Impl(ctx.bool(), DefId(0), crate::ast::Span::new(0, 0)), var_id);
+        infer.suspend_on_var(
+            Constraint::Impl(ctx.bool(), DefId(0), crate::ast::Span::new(0, 0)),
+            var_id,
+        );
         // Waking moves suspended constraints back to the active list
         infer.wake_var(var_id);
         // The active constraints list should now have the suspended constraint
@@ -1814,7 +2059,10 @@ mod tests {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
         };
-        infer.suspend_on_var(Constraint::Impl(ctx.bool(), DefId(0), crate::ast::Span::new(0, 0)), var_id);
+        infer.suspend_on_var(
+            Constraint::Impl(ctx.bool(), DefId(0), crate::ast::Span::new(0, 0)),
+            var_id,
+        );
         // wake_var_incremental needs a heap, var_id, and ctx
         let mut heap = std::collections::BinaryHeap::new();
         infer.wake_var_incremental(var_id, &mut heap, &ctx);
@@ -1878,12 +2126,18 @@ mod tests {
             branches_id: 0,
             span: crate::ast::Span::new(0, 0),
         };
-        assert_eq!(match_c.priority(&ctx), 6,
-            "Match on InferVar should have lowest priority");
+        assert_eq!(
+            match_c.priority(&ctx),
+            6,
+            "Match on InferVar should have lowest priority"
+        );
         // Eq on concrete types → high priority (0)
         let eq_c = Constraint::Eq(ctx.bool(), ctx.int(32, true), crate::ast::Span::new(0, 0));
-        assert_eq!(eq_c.priority(&ctx), 0,
-            "Eq on concrete should have highest priority");
+        assert_eq!(
+            eq_c.priority(&ctx),
+            0,
+            "Eq on concrete should have highest priority"
+        );
     }
 
     #[test]
@@ -1913,35 +2167,47 @@ mod tests {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
         let pg_var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
-        let pg_id = match ctx.get(pg_var) { TypeData::InferVar { id } => *id, _ => unreachable!() };
+        let pg_id = match ctx.get(pg_var) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
         let inst1 = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
-        let inst1_id = match ctx.get(inst1) { TypeData::InferVar { id } => *id, _ => unreachable!() };
+        let inst1_id = match ctx.get(inst1) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
         // Register the instance
         infer.register_instance(pg_id, inst1_id);
         assert!(infer.has_instances(pg_id), "PG var should have instances");
-        assert_eq!(infer.is_instance(inst1_id), Some(pg_id),
-            "instance should track its PG var");
+        assert_eq!(
+            infer.is_instance(inst1_id),
+            Some(pg_id),
+            "instance should track its PG var"
+        );
         // Propagate PG resolution via S-Inst-Copy
         let bool_ty = ctx.bool();
         let updated = infer.s_inst_copy(&mut ctx, pg_id, bool_ty);
         assert_eq!(updated, 1, "should have updated 1 instance");
         // Check that the instance was unified with bool
-        assert!(!infer.has_instances(pg_id), "forward refs should be cleared");
+        assert!(
+            !infer.has_instances(pg_id),
+            "forward refs should be cleared"
+        );
     }
 
     #[test]
     fn test_register_match_branches() {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
-        let branches = vec![
-            MatchBranchSet {
-                shape_pattern: PrincipalShape::Arrow,
-                continuation: vec![Constraint::Eq(
-                    ctx.int(32, true), ctx.int(32, true), crate::ast::Span::new(0, 0),
-                )],
-                else_continuation: Vec::new(),
-            },
-        ];
+        let branches = vec![MatchBranchSet {
+            shape_pattern: PrincipalShape::Arrow,
+            continuation: vec![Constraint::Eq(
+                ctx.int(32, true),
+                ctx.int(32, true),
+                crate::ast::Span::new(0, 0),
+            )],
+            else_continuation: Vec::new(),
+        }];
         let id = infer.register_match_branches(branches);
         assert!(id < infer.match_branches.len());
     }
@@ -1961,8 +2227,11 @@ mod tests {
         // After resolution: medium priority
         let int_ty = ctx.int(32, true);
         ctx.bindings.borrow_mut().insert(var, int_ty);
-        assert_eq!(match_c.priority(&ctx), 3,
-            "match on resolved type should have medium priority");
+        assert_eq!(
+            match_c.priority(&ctx),
+            3,
+            "match on resolved type should have medium priority"
+        );
     }
 
     // ── else_ fallback ───────────────────────────────────────────────
@@ -2021,8 +2290,11 @@ mod tests {
         infer.add_guard(var_id, 0);
 
         infer.force_generalize(&mut ctx);
-        assert_eq!(infer.gen_statuses[var_id], GenStatus::PartiallyGeneralizable,
-            "guarded PG var should remain PG after force_generalize");
+        assert_eq!(
+            infer.gen_statuses[var_id],
+            GenStatus::PartiallyGeneralizable,
+            "guarded PG var should remain PG after force_generalize"
+        );
     }
 
     #[test]
@@ -2040,8 +2312,11 @@ mod tests {
         ctx.bindings.borrow_mut().insert(var, int_ty);
 
         infer.force_generalize(&mut ctx);
-        assert_eq!(infer.gen_statuses[var_id], GenStatus::Generalized,
-            "un-guarded resolved PG var should become Generalized");
+        assert_eq!(
+            infer.gen_statuses[var_id],
+            GenStatus::Generalized,
+            "un-guarded resolved PG var should become Generalized"
+        );
     }
 
     // ── [s] pattern: try_match_via_shape_var callback ─────────────────
@@ -2065,8 +2340,10 @@ mod tests {
 
         let var_id = 0;
         if var_id < infer.wait_lists.len() {
-            assert!(!infer.wait_lists[var_id].is_empty(),
-                "match should be in the wait list");
+            assert!(
+                !infer.wait_lists[var_id].is_empty(),
+                "match should be in the wait list"
+            );
         }
     }
 
@@ -2093,10 +2370,14 @@ mod tests {
         let c = Constraint::Let {
             expr_var: "x".into(),
             def_constraint: Box::new(Constraint::Eq(
-                TypeId(0), TypeId(1), crate::ast::Span::new(0, 0),
+                TypeId(0),
+                TypeId(1),
+                crate::ast::Span::new(0, 0),
             )),
             body_constraint: Box::new(Constraint::Eq(
-                TypeId(0), TypeId(0), crate::ast::Span::new(0, 0),
+                TypeId(0),
+                TypeId(0),
+                crate::ast::Span::new(0, 0),
             )),
             span: crate::ast::Span::new(0, 0),
         };

@@ -71,7 +71,12 @@ fn main() {
                                     &mut ctx,
                                 );
 
-                                let mut checker = TypeChecker::new(&mut ctx, &symbols, &mut trait_env, resolution_map);
+                                let mut checker = TypeChecker::new(
+                                    &mut ctx,
+                                    &symbols,
+                                    &mut trait_env,
+                                    resolution_map,
+                                );
                                 match checker.check_program(&program) {
                                     Ok(_hir_program) => {
                                         println!("Type checking succeeded.");

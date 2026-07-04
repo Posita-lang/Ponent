@@ -108,8 +108,12 @@ impl SmtSolver {
         smt.push_str("(assert (= (shape-of type-never) SHAPE_UNKNOWN))\n");
         smt.push_str("(assert (= (shape-of type-char) SHAPE_UNKNOWN))\n");
         smt.push_str("(assert (= (shape-of type-byte) SHAPE_UNKNOWN))\n");
-        smt.push_str("(assert (forall ((a Type) (b Type)) (= (shape-of (type-fn a b)) SHAPE_ARROW)))\n");
-        smt.push_str("(assert (forall ((a Type) (b Type)) (= (shape-of (type-tuple2 a b)) SHAPE_TUPLE)))\n");
+        smt.push_str(
+            "(assert (forall ((a Type) (b Type)) (= (shape-of (type-fn a b)) SHAPE_ARROW)))\n",
+        );
+        smt.push_str(
+            "(assert (forall ((a Type) (b Type)) (= (shape-of (type-tuple2 a b)) SHAPE_TUPLE)))\n",
+        );
         smt.push_str("(assert (forall ((tag Int) (a Type)) (= (shape-of (type-struct tag a)) SHAPE_CONSTRUCTOR)))\n");
         smt.push_str("(assert (forall ((a Type)) (= (shape-of (type-poly a)) SHAPE_POLY)))\n");
         smt.push_str("(assert (forall ((p Int) (q Int)) (= (shape-of (type-rational p q)) SHAPE_UNKNOWN)))\n\n");
@@ -157,8 +161,11 @@ impl SmtSolver {
         let resolved = ctx.resolve_binding(ty);
         match ctx.get(resolved) {
             TypeData::Int { bits, .. } => {
-                if *bits == 32 { "type-int32".into() }
-                else { "type-int64".into() }
+                if *bits == 32 {
+                    "type-int32".into()
+                } else {
+                    "type-int64".into()
+                }
             }
             TypeData::UInt { .. } => "type-int64".into(),
             TypeData::Bool => "type-bool".into(),
@@ -181,21 +188,29 @@ impl SmtSolver {
                 }
             }
             TypeData::Tuple { elems } => {
-                if elems.is_empty() { "type-unit".into() }
-                else if elems.len() == 1 { Self::type_to_smt_term(ctx, elems[0]) }
-                else {
+                if elems.is_empty() {
+                    "type-unit".into()
+                } else if elems.len() == 1 {
+                    Self::type_to_smt_term(ctx, elems[0])
+                } else {
                     let a = Self::type_to_smt_term(ctx, elems[0]);
                     let b = Self::type_to_smt_term(ctx, elems[1]);
                     format!("(type-tuple2 {} {})", a, b)
                 }
             }
-            TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. }
-            | TypeData::Poly { body, .. } | TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => {
+            TypeData::Forall { body, .. }
+            | TypeData::Exists { base: body, .. }
+            | TypeData::Poly { body, .. }
+            | TypeData::Mu { body, .. }
+            | TypeData::Nu { body, .. } => {
                 let b = Self::type_to_smt_term(ctx, *body);
                 format!("(type-poly {})", b)
             }
             TypeData::InferVar { id } => format!("iv_{}", id),
-            TypeData::Rational { int_bits, frac_bits } => {
+            TypeData::Rational {
+                int_bits,
+                frac_bits,
+            } => {
                 format!("(type-rational {} {})", int_bits, frac_bits)
             }
             _ => "type-unknown".into(),

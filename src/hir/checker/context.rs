@@ -13,7 +13,12 @@ impl<'a, 'tcx> ScopeGuard<'a, 'tcx> {
     pub(crate) fn new(checker: &'tcx mut TypeChecker<'a>) -> Self {
         let old_function = checker.current_function;
         let old_return = checker.current_return_type;
-        ScopeGuard { checker, old_function, old_return, should_restore: true }
+        ScopeGuard {
+            checker,
+            old_function,
+            old_return,
+            should_restore: true,
+        }
     }
 
     pub(crate) fn defuse(mut self) {
@@ -66,7 +71,10 @@ impl<'a> TypeChecker<'a> {
     /// Find the innermost break target (Loop, While, For, LabeledBlock).
     /// Returns the target's span and optional label.
     /// If `label` is Some, only match same-named LabeledBlock.
-    pub(crate) fn find_break_target<'b>(&self, label: Option<&'b str>) -> Option<(Span, Option<&'b str>)> {
+    pub(crate) fn find_break_target<'b>(
+        &self,
+        label: Option<&'b str>,
+    ) -> Option<(Span, Option<&'b str>)> {
         for frame in self.region_tree.iter_frames_rev() {
             match &frame.kind {
                 CtxKind::Loop | CtxKind::While | CtxKind::For => {
@@ -91,7 +99,10 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Find the innermost continue target (only Loop, While, For).
-    pub(crate) fn find_continue_target<'b>(&self, label: Option<&'b str>) -> Option<(Span, &'b str)> {
+    pub(crate) fn find_continue_target<'b>(
+        &self,
+        label: Option<&'b str>,
+    ) -> Option<(Span, &'b str)> {
         for frame in self.region_tree.iter_frames_rev() {
             match &frame.kind {
                 CtxKind::Loop | CtxKind::While | CtxKind::For => {
@@ -102,7 +113,10 @@ impl<'a> TypeChecker<'a> {
                         CtxKind::Loop => "loop",
                         CtxKind::While => "while",
                         CtxKind::For => "for",
-                        _ => panic!("find_continue_target: unexpected context kind {:?}", frame.kind),
+                        _ => panic!(
+                            "find_continue_target: unexpected context kind {:?}",
+                            frame.kind
+                        ),
                     };
                     return Some((frame.span, kind_str));
                 }

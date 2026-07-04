@@ -118,12 +118,18 @@ impl Parser {
     fn check_const_arg(&mut self) -> bool {
         match self.peek() {
             Ok(Token::FloatLiteral(_))
-            | Ok(Token::True) | Ok(Token::False)
-            | Ok(Token::CharLiteral(_)) | Ok(Token::StringLiteral(_))
+            | Ok(Token::True)
+            | Ok(Token::False)
+            | Ok(Token::CharLiteral(_))
+            | Ok(Token::StringLiteral(_))
             | Ok(Token::ByteStringLiteral(_))
-            | Ok(Token::Minus) | Ok(Token::Plus) | Ok(Token::Bang)
-            | Ok(Token::LParen) | Ok(Token::LBracket)
-            | Ok(Token::If) | Ok(Token::Match) => true,
+            | Ok(Token::Minus)
+            | Ok(Token::Plus)
+            | Ok(Token::Bang)
+            | Ok(Token::LParen)
+            | Ok(Token::LBracket)
+            | Ok(Token::If)
+            | Ok(Token::Match) => true,
             Ok(Token::Ident(_)) => matches!(self.peek_next(), Some(Token::LParen)),
             _ => false,
         }
@@ -147,7 +153,7 @@ impl Parser {
             }
             _ => Err(Diagnostic::error("expected '>'")
                 .with_code("E004")
-                .with_span(self.span(),)),
+                .with_span(self.span())),
         }
     }
 
@@ -528,11 +534,17 @@ impl Parser {
                     .with_span(self.span(),));
             }
             Err(()) => {
-                return Err(Diagnostic::error("unexpected end of file in function definition")
-                    .with_code("E002")
-                    .with_help("function definition is incomplete — expected a name after `def`")
-                    .with_suggestion("add a function name after `def`, e.g. `def main() { ... }`")
-                    .with_span(self.span(),));
+                return Err(
+                    Diagnostic::error("unexpected end of file in function definition")
+                        .with_code("E002")
+                        .with_help(
+                            "function definition is incomplete — expected a name after `def`",
+                        )
+                        .with_suggestion(
+                            "add a function name after `def`, e.g. `def main() { ... }`",
+                        )
+                        .with_span(self.span()),
+                );
             }
         };
         let type_params = if self
@@ -629,8 +641,10 @@ impl Parser {
                 return Err(Diagnostic::error("expected trait name")
                     .with_code("E004")
                     .with_help("`trait` must be followed by a name — e.g. `trait Display { ... }`")
-                    .with_suggestion("add a trait name after `trait`, e.g. `trait MyTrait { def foo(&self); }`")
-                    .with_span(self.span(),));
+                    .with_suggestion(
+                        "add a trait name after `trait`, e.g. `trait MyTrait { def foo(&self); }`",
+                    )
+                    .with_span(self.span()));
             }
         };
         let mut methods = Vec::new();
@@ -784,8 +798,10 @@ impl Parser {
                     return Err(Diagnostic::error("expected type parameter name")
                         .with_code("E004")
                         .with_help("type parameters must have a name — e.g. `<T>` or `<K, V>`")
-                        .with_suggestion("use a valid identifier like `T` or `Item` for the type parameter")
-                    .with_span(self.span(),));
+                        .with_suggestion(
+                            "use a valid identifier like `T` or `Item` for the type parameter",
+                        )
+                        .with_span(self.span()));
                 }
             };
             let mut bounds = Vec::new();
@@ -858,18 +874,26 @@ impl Parser {
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
             Ok(tok) => {
-                return Err(Diagnostic::error(format!("expected parameter name, found {:?}", tok))
-                    .with_code("E004")
-                    .with_help("parameters must have a name — e.g. `def foo(x: Int<32>)`")
-                    .with_suggestion("use a valid identifier like `x` or `value` for the parameter")
-                    .with_span(self.span(),));
+                return Err(
+                    Diagnostic::error(format!("expected parameter name, found {:?}", tok))
+                        .with_code("E004")
+                        .with_help("parameters must have a name — e.g. `def foo(x: Int<32>)`")
+                        .with_suggestion(
+                            "use a valid identifier like `x` or `value` for the parameter",
+                        )
+                        .with_span(self.span()),
+                );
             }
             Err(()) => {
-                return Err(Diagnostic::error("unexpected end of file in parameter list")
-                    .with_code("E002")
-                    .with_help("parameter list is incomplete — expected a parameter name or `)`")
-                    .with_suggestion("close the parameter list with `)` or add more parameters")
-                    .with_span(self.span(),));
+                return Err(
+                    Diagnostic::error("unexpected end of file in parameter list")
+                        .with_code("E002")
+                        .with_help(
+                            "parameter list is incomplete — expected a parameter name or `)`",
+                        )
+                        .with_suggestion("close the parameter list with `)` or add more parameters")
+                        .with_span(self.span()),
+                );
             }
         };
         let ty = if matches!(self.peek(), Ok(Token::Colon)) {
@@ -1467,11 +1491,15 @@ impl Parser {
                 span: Span::new(start, end),
             });
         }
-        Err(Diagnostic::error("expected variable definition after ghost")
-            .with_code("E004")
-            .with_help("`ghost` must be followed by a variable definition — e.g. `ghost set x = 0;`")
-            .with_suggestion("add a variable definition: `ghost set <name> = <value>;`")
-            .with_span(self.span(),))
+        Err(
+            Diagnostic::error("expected variable definition after ghost")
+                .with_code("E004")
+                .with_help(
+                    "`ghost` must be followed by a variable definition — e.g. `ghost set x = 0;`",
+                )
+                .with_suggestion("add a variable definition: `ghost set <name> = <value>;`")
+                .with_span(self.span()),
+        )
     }
 
     fn parse_isolate_block(&mut self) -> Result<Stmt, Diagnostic> {
@@ -1489,10 +1517,12 @@ impl Parser {
 
     fn parse_variable_def(&mut self) -> Result<Stmt, Diagnostic> {
         let start = self.span().start;
-        let kind = match self.advance().map_err(|_| Diagnostic::error("unexpected token")
-            .with_code("E003")
-            .with_help("expected `set` or `let` to begin a variable definition")
-            .with_span(Span::new(0, 0)))? {
+        let kind = match self.advance().map_err(|_| {
+            Diagnostic::error("unexpected token")
+                .with_code("E003")
+                .with_help("expected `set` or `let` to begin a variable definition")
+                .with_span(Span::new(0, 0))
+        })? {
             Token::Set => VariableKind::Set,
             Token::Let => VariableKind::Let,
             _ => unreachable!(),
@@ -1529,11 +1559,18 @@ impl Parser {
             let ident = match self.advance() {
                 Ok(Token::Ident(name)) => name,
                 Ok(tok) => {
-                    return Err(Diagnostic::error(format!("expected variable name, found {:?}", tok))
-                        .with_code("E004")
-                        .with_help("a variable name must follow `set` or `let` — use a valid identifier")
-                        .with_suggestion("use a valid identifier like `x` or `counter` for the variable name")
-                        .with_span(self.span(),));
+                    return Err(Diagnostic::error(format!(
+                        "expected variable name, found {:?}",
+                        tok
+                    ))
+                    .with_code("E004")
+                    .with_help(
+                        "a variable name must follow `set` or `let` — use a valid identifier",
+                    )
+                    .with_suggestion(
+                        "use a valid identifier like `x` or `counter` for the variable name",
+                    )
+                    .with_span(self.span()));
                 }
                 Err(()) => {
                     return Err(Diagnostic::error("unexpected end of file in variable definition")
@@ -1878,10 +1915,12 @@ impl Parser {
                 overrides = true;
             }
         } else if matches!(self.peek(), Ok(Token::Overrides)) {
-            return Err(Diagnostic::error("`overrides` must be used together with `propagates`")
-                .with_code("E004")
-                .with_suggestion("use both modifiers: `propagates overrides`")
-                .with_span(self.span(),));
+            return Err(
+                Diagnostic::error("`overrides` must be used together with `propagates`")
+                    .with_code("E004")
+                    .with_suggestion("use both modifiers: `propagates overrides`")
+                    .with_span(self.span()),
+            );
         }
         self.expect(Token::LBrace)?;
         let body = self.parse_block()?;
@@ -1907,7 +1946,7 @@ impl Parser {
                     .with_code("E004")
                     .with_help("`trigger` must be followed by `@<name>` — e.g. `trigger @cleanup;`")
                     .with_suggestion("use `trigger @identifier;` syntax")
-                    .with_span(self.span(),));
+                    .with_span(self.span()));
             }
         };
         self.expect(Token::Semicolon)?;
@@ -2094,9 +2133,13 @@ impl Parser {
                 _ => {
                     return Err(Diagnostic::error("expected alias name")
                         .with_code("E004")
-                        .with_help("`as` must be followed by an alias name — e.g. `import path as alias`")
-                        .with_suggestion("add an alias name after `as`, e.g. `import path as MyAlias`")
-                        .with_span(self.span(),));
+                        .with_help(
+                            "`as` must be followed by an alias name — e.g. `import path as alias`",
+                        )
+                        .with_suggestion(
+                            "add an alias name after `as`, e.g. `import path as MyAlias`",
+                        )
+                        .with_span(self.span()));
                 }
             }
         } else {
@@ -2122,7 +2165,7 @@ impl Parser {
                     .with_code("E004")
                     .with_help("`extern` must be followed by an ABI string — e.g. `extern \"C\"`")
                     .with_suggestion("add an ABI string like `\"C\"` after `extern`")
-                    .with_span(self.span(),));
+                    .with_span(self.span()));
             }
         };
         self.expect(Token::Def)?;
@@ -2132,8 +2175,10 @@ impl Parser {
                 return Err(Diagnostic::error("expected function name")
                     .with_code("E004")
                     .with_help("after `extern \"<ABI>\" def`, a function name is expected")
-                    .with_suggestion("add a function name after `def`, e.g. `extern \"C\" def my_function()`")
-                    .with_span(self.span(),));
+                    .with_suggestion(
+                        "add a function name after `def`, e.g. `extern \"C\" def my_function()`",
+                    )
+                    .with_span(self.span()));
             }
         };
         self.expect(Token::LParen)?;
@@ -2217,9 +2262,13 @@ impl Parser {
                             _ => {
                                 return Err(Diagnostic::error("expected field name")
                                     .with_code("E004")
-                                    .with_help("struct fields must have a name — e.g. `name: String`")
-                                    .with_suggestion("add a field name like `name`, `age`, or `value`")
-                                    .with_span(self.span(),));
+                                    .with_help(
+                                        "struct fields must have a name — e.g. `name: String`",
+                                    )
+                                    .with_suggestion(
+                                        "add a field name like `name`, `age`, or `value`",
+                                    )
+                                    .with_span(self.span()));
                             }
                         };
                         self.expect(Token::Colon)?;
@@ -2269,9 +2318,13 @@ impl Parser {
                             _ => {
                                 return Err(Diagnostic::error("expected variant name")
                                     .with_code("E004")
-                                    .with_help("enum variants must have a name — e.g. `enum { A, B }`")
-                                    .with_suggestion("add a variant name like `VariantA`, `None`, or `Some`")
-                                    .with_span(self.span(),));
+                                    .with_help(
+                                        "enum variants must have a name — e.g. `enum { A, B }`",
+                                    )
+                                    .with_suggestion(
+                                        "add a variant name like `VariantA`, `None`, or `Some`",
+                                    )
+                                    .with_span(self.span()));
                             }
                         };
                         let payload = if matches!(self.peek(), Ok(Token::LParen)) {
@@ -2568,18 +2621,26 @@ impl Parser {
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
             Ok(tok) => {
-                return Err(Diagnostic::error(format!("expected method name, found {:?}", tok))
-                    .with_code("E004")
-                    .with_help("a method name must follow `def` in an impl block")
-                    .with_suggestion("use a valid identifier like `my_method` for the method name")
-                    .with_span(self.span(),));
+                return Err(
+                    Diagnostic::error(format!("expected method name, found {:?}", tok))
+                        .with_code("E004")
+                        .with_help("a method name must follow `def` in an impl block")
+                        .with_suggestion(
+                            "use a valid identifier like `my_method` for the method name",
+                        )
+                        .with_span(self.span()),
+                );
             }
             Err(()) => {
-                return Err(Diagnostic::error("unexpected end of file in method definition")
-                    .with_code("E002")
-                    .with_help("method definition is incomplete — expected a name after `def`")
-                    .with_suggestion("add a method name after `def`, e.g. `def process(&mut self) { ... }`")
-                    .with_span(self.span(),));
+                return Err(
+                    Diagnostic::error("unexpected end of file in method definition")
+                        .with_code("E002")
+                        .with_help("method definition is incomplete — expected a name after `def`")
+                        .with_suggestion(
+                            "add a method name after `def`, e.g. `def process(&mut self) { ... }`",
+                        )
+                        .with_span(self.span()),
+                );
             }
         };
         self.expect(Token::LParen)?;
@@ -2665,7 +2726,7 @@ impl Parser {
                 .with_code("E004")
                 .with_help("method parameters must start with `self`, `&self`, or `&mut self`")
                 .with_suggestion("try `self`, `&self`, or `&mut self` as the first parameter")
-                .with_span(self.span(),)),
+                .with_span(self.span())),
         }
     }
 
@@ -3346,9 +3407,11 @@ impl Parser {
             } else {
                 return Err(Diagnostic::error("expected identifier after '::'")
                     .with_code("E004")
-                    .with_help("`::` must be followed by an identifier — e.g. `std::collections::HashMap`")
+                    .with_help(
+                        "`::` must be followed by an identifier — e.g. `std::collections::HashMap`",
+                    )
                     .with_suggestion("add an identifier after `::`, e.g. `MyModule::MyType`")
-                    .with_span(self.span(),));
+                    .with_span(self.span()));
             }
         }
         let restrict = self
@@ -3368,7 +3431,9 @@ impl Parser {
                 } else {
                     self.parse_call(
                         Expr::Ident(
-                            path.into_iter().next().expect("expected at least one path segment"),
+                            path.into_iter()
+                                .next()
+                                .expect("expected at least one path segment"),
                             Span::new(start, self.span().start),
                         ),
                         start,
@@ -3387,7 +3452,9 @@ impl Parser {
                     })
                 } else {
                     Ok(Expr::Ident(
-                        path.into_iter().next().expect("expected at least one path segment"),
+                        path.into_iter()
+                            .next()
+                            .expect("expected at least one path segment"),
                         Span::new(start, self.span().end),
                     ))
                 }
@@ -3413,11 +3480,15 @@ impl Parser {
                         .with_span(self.span(),));
                 }
                 Err(()) => {
-                    return Err(Diagnostic::error("unexpected end of file in struct literal")
-                        .with_code("E002")
-                        .with_help("struct literal is incomplete — expected a field name or `}`")
-                        .with_suggestion("close the struct with `}` or add more fields")
-                        .with_span(self.span(),));
+                    return Err(
+                        Diagnostic::error("unexpected end of file in struct literal")
+                            .with_code("E002")
+                            .with_help(
+                                "struct literal is incomplete — expected a field name or `}`",
+                            )
+                            .with_suggestion("close the struct with `}` or add more fields")
+                            .with_span(self.span()),
+                    );
                 }
             };
             self.expect(Token::Assign)?;
@@ -3481,10 +3552,12 @@ impl Parser {
 
     fn parse_literal(&mut self) -> Result<Expr, Diagnostic> {
         let start = self.span().start;
-        let token = self.advance().map_err(|_| Diagnostic::error("unexpected token")
-            .with_code("E003")
-            .with_help("expected a literal value (number, string, char, bool, or byte string)")
-            .with_span(Span::new(0, 0)))?;
+        let token = self.advance().map_err(|_| {
+            Diagnostic::error("unexpected token")
+                .with_code("E003")
+                .with_help("expected a literal value (number, string, char, bool, or byte string)")
+                .with_span(Span::new(0, 0))
+        })?;
         let end = self.span().end;
         let span = Span::new(start, end);
         match token {
@@ -3526,7 +3599,8 @@ impl Parser {
         let start = self.span().start;
         match self.peek() {
             Ok(Token::Bang) => {
-                if matches!(lhs, Expr::Ident(..) | Expr::Path(..)) && matches!(self.peek_next(), Some(Token::LParen))
+                if matches!(lhs, Expr::Ident(..) | Expr::Path(..))
+                    && matches!(self.peek_next(), Some(Token::LParen))
                 {
                     self.advance().ok();
                     self.advance().ok();
@@ -3778,7 +3852,7 @@ impl Parser {
                         .with_code("E004")
                         .with_help("`.` must be followed by a field name — e.g. `object.field`")
                         .with_suggestion("add a field name after `.`, or remove the `.`")
-                        .with_span(self.span(),))
+                        .with_span(self.span()))
                 }
             }
             Ok(Token::Apostrophe) => {
@@ -3794,7 +3868,7 @@ impl Parser {
                         .with_code("E004")
                         .with_help("`'` must be followed by an attribute name — e.g. `object'attr`")
                         .with_suggestion("add an attribute name after `'`, or remove the `'`")
-                        .with_span(self.span(),))
+                        .with_span(self.span()))
                 }
             }
             Ok(Token::Catch) => {
@@ -3876,7 +3950,9 @@ impl Parser {
         // If peeked is Some, advance() consumed the cursor one step.
         // The next token in the buffer is at cursor + offset.
         let offset = if self.peeked.is_some() { 0 } else { 0 };
-        self.tokens.get(self.cursor + offset).map(|st| st.token.clone())
+        self.tokens
+            .get(self.cursor + offset)
+            .map(|st| st.token.clone())
     }
 
     fn parse_if_expr(&mut self) -> Result<Expr, Diagnostic> {
@@ -4713,10 +4789,16 @@ mod tests {
         // Verify the second generic arg is Type::Expr, not split into separate args
         match &program.items[0] {
             Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
-                Stmt::VariableDef { ty: Some(Type::Generic(_, args, _)), .. } => {
+                Stmt::VariableDef {
+                    ty: Some(Type::Generic(_, args, _)),
+                    ..
+                } => {
                     assert_eq!(args.len(), 2, "generic should have 2 args: Int and Val>>2");
-                    assert!(matches!(&args[1], Type::Expr(..)),
-                        "second arg should be Type::Expr (Val >> 2), got {:?}", args[1]);
+                    assert!(
+                        matches!(&args[1], Type::Expr(..)),
+                        "second arg should be Type::Expr (Val >> 2), got {:?}",
+                        args[1]
+                    );
                 }
                 _ => panic!("expected VariableDef with type annotation"),
             },
@@ -4729,11 +4811,15 @@ mod tests {
         // Combined: Vec<Vec<Int<32>>> (>> split by expect_gt) and
         // a separate type with a right-shift expression arg.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let src = "def main() { set x: Vec<Vec<Int<32>>> = 0; set y: Array<Int, Count >> 4> = 0; }";
+            let src =
+                "def main() { set x: Vec<Vec<Int<32>>> = 0; set y: Array<Int, Count >> 4> = 0; }";
             let mut parser = Parser::new(src);
             parser.parse_program()
         }));
-        assert!(result.is_ok(), "nested generics + const expr with >> should parse");
+        assert!(
+            result.is_ok(),
+            "nested generics + const expr with >> should parse"
+        );
     }
 
     #[test]

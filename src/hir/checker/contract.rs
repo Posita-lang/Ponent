@@ -27,7 +27,11 @@ impl Guarantee {
 
     /// The identity guarantee: S = S′ (no effect).
     pub fn identity(frame: Option<TypeId>) -> Self {
-        Guarantee { pre: None, post: None, frame }
+        Guarantee {
+            pre: None,
+            post: None,
+            frame,
+        }
     }
 }
 
@@ -96,4 +100,3 @@ impl GuaranteeChain {
         }
     }
 }
-

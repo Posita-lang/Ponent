@@ -1,7 +1,7 @@
 use crate::ast::Program;
+use crate::diagnostics::Diagnostic;
 use crate::lexer::Token;
 use crate::parser::Parser;
-use crate::diagnostics::Diagnostic;
 use logos::Logos;
 use std::path::{Path, PathBuf};
 
@@ -108,12 +108,7 @@ impl VfsNode {
         for result in lexer {
             match result {
                 Ok(token) => tokens.push(token),
-                Err(()) => {
-                    return Err(VfsError::Lex(format!(
-                        "invalid token in '{}'",
-                        self.name
-                    )))
-                }
+                Err(()) => return Err(VfsError::Lex(format!("invalid token in '{}'", self.name))),
             }
         }
         self.tokens = Some(tokens);
@@ -140,9 +135,7 @@ impl VfsNode {
     /// Return the absolute virtual path in the VFS tree.
     /// Panics if `abs_path` was not set during construction.
     pub fn absolute_path(&self) -> &str {
-        self.abs_path
-            .as_deref()
-            .unwrap_or("<unknown>")
+        self.abs_path.as_deref().unwrap_or("<unknown>")
     }
 
     /// Recursively scan a real directory and build a VFS tree from it.

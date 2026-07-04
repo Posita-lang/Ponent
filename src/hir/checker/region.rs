@@ -78,7 +78,11 @@ impl RegionTree {
     /// Returns frames in reverse order (innermost first), which is the
     /// same behavior as the old `loop_stack.iter().rev()`.
     pub fn iter_frames_rev(&self) -> RegionFrameIter<'_> {
-        RegionFrameIter { tree: self, current: Some(self.current), frame_idx: None }
+        RegionFrameIter {
+            tree: self,
+            current: Some(self.current),
+            frame_idx: None,
+        }
     }
 
     /// Mark the current region as dirty (a unification variable was bound).
@@ -94,7 +98,9 @@ impl RegionTree {
     /// Collect levels of all dirty regions for generalization.
     /// Returns levels sorted descending (innermost first).
     pub fn collect_dirty_levels(&self) -> Vec<usize> {
-        let mut levels: Vec<usize> = self.regions.iter()
+        let mut levels: Vec<usize> = self
+            .regions
+            .iter()
             .filter(|r| r.dirty)
             .map(|r| r.id)
             .collect();

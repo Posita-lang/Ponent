@@ -109,10 +109,9 @@ pub fn register_builtins(
     // Rational supports Add, Sub, Mul, Div, Rem, Eq, Ord (Lt, Gt, Le, Ge, Neq).
     // Bitwise operations (BitAnd, BitOr, BitXor, Shl, Shr, And, Or) are NOT applicable.
     let rational_arith_traits = [
-        add_id, sub_id, mul_id, div_id, rem_id,
-        eq_id, neq_id, lt_id, gt_id, le_id, ge_id,
+        add_id, sub_id, mul_id, div_id, rem_id, eq_id, neq_id, lt_id, gt_id, le_id, ge_id,
     ];
-    for &(p, q) in &[(8,8), (16,16), (32,16), (32,32)] {
+    for &(p, q) in &[(8, 8), (16, 16), (32, 16), (32, 32)] {
         let rty = ctx.rational(p, q);
         for &trait_id in &rational_arith_traits {
             trait_env
@@ -174,7 +173,9 @@ pub fn register_builtins(
             missing_match: None,
             exhaustive: false,
         };
-        symbols.insert_type("Result".to_string(), binding, Span::new(0, 0)).ok();
+        symbols
+            .insert_type("Result".to_string(), binding, Span::new(0, 0))
+            .ok();
     }
 
     // Option<T>
@@ -210,7 +211,9 @@ pub fn register_builtins(
             missing_match: None,
             exhaustive: false,
         };
-        symbols.insert_type("Option".to_string(), binding, Span::new(0, 0)).ok();
+        symbols
+            .insert_type("Option".to_string(), binding, Span::new(0, 0))
+            .ok();
     }
 
     // Future<T>
@@ -241,7 +244,9 @@ pub fn register_builtins(
             missing_match: None,
             exhaustive: false,
         };
-        symbols.insert_type("Future".to_string(), binding, Span::new(0, 0)).ok();
+        symbols
+            .insert_type("Future".to_string(), binding, Span::new(0, 0))
+            .ok();
     }
 
     // Register standard traits for error suggestions and future use
