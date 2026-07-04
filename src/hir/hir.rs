@@ -316,6 +316,15 @@ pub enum HirExpr {
         ty: TypeId,
         span: Span,
     },
+    /// Quantified expression: `forall i in 0..n: body` or `exists i in range: body`.
+    Quantified {
+        quantifier: crate::ast::Quantifier,
+        binder: String,
+        range: Box<HirExpr>,
+        body: Box<HirExpr>,
+        ty: TypeId,
+        span: Span,
+    },
     Error(Span),
 }
 
@@ -396,6 +405,7 @@ impl HirExpr {
             HirExpr::Block(_, ty, _) => *ty,
             HirExpr::PolyBox { ty, .. } => *ty,
             HirExpr::PolyUnbox { ty, .. } => *ty,
+            HirExpr::Quantified { ty, .. } => *ty,
             HirExpr::Error(_) => unreachable!("Error expression has no type"),
         }
     }
@@ -430,6 +440,7 @@ impl HirExpr {
             HirExpr::Block(_, _, span) => *span,
             HirExpr::PolyBox { span, .. } => *span,
             HirExpr::PolyUnbox { span, .. } => *span,
+            HirExpr::Quantified { span, .. } => *span,
             HirExpr::Error(span) => *span,
         }
     }
