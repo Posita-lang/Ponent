@@ -750,22 +750,6 @@ impl<'a> TypeChecker<'a> {
                     let impl_method_names: HashSet<String> = methods.iter().map(|m| m.name.clone()).collect();
                     let self_ty = &for_type;
 
-                    fn resolve_self_ty(ty: &Type, self_ty: &Type) -> Type {
-                        match ty {
-                            Type::Path(p, s) if p.len() == 1 && (p[0] == "Self" || p[0] == "self") => self_ty.clone(),
-                            Type::Reference(inner, mutable, s) => Type::Reference(
-                                Box::new(resolve_self_ty(inner, self_ty)),
-                                *mutable,
-                                *s,
-                            ),
-                            Type::Pointer(inner, s) => Type::Pointer(
-                                Box::new(resolve_self_ty(inner, self_ty)),
-                                *s,
-                            ),
-                            other => other.clone(),
-                        }
-                    }
-
                     for (tm_name, _tm_sig) in &trait_binding.methods {
                         if !impl_method_names.contains(tm_name) {
                             self.diagnostics.push(
@@ -794,13 +778,13 @@ impl<'a> TypeChecker<'a> {
                         let param_tys = m.params.iter()
                             .map(|p| {
                                 if let Some(ty) = &p.ty {
-                                    let resolved = resolve_self_ty(ty, self_ty);
+                                    let resolved = self.resolve_self_ty(ty, self_ty);
                                     self.resolve_type(&resolved)
                                 } else { Ok(self.ctx.error()) }
                             })
                             .collect::<Result<Vec<_>, _>>()?;
                         let ret_ty = {
-                            let resolved = resolve_self_ty(&m.return_type, self_ty);
+                            let resolved = self.resolve_self_ty(&m.return_type, self_ty);
                             self.resolve_type(&resolved)?
                         };
 
@@ -880,21 +864,6 @@ impl<'a> TypeChecker<'a> {
                         }
                     };
                     // Resolve method param/return types, replacing `Self` with for_type
-                    fn resolve_self_ty(ty: &Type, self_ty: &Type) -> Type {
-                        match ty {
-                            Type::Path(p, s) if p.len() == 1 && (p[0] == "Self" || p[0] == "self") => self_ty.clone(),
-                            Type::Reference(inner, mutable, s) => Type::Reference(
-                                Box::new(resolve_self_ty(inner, self_ty)),
-                                *mutable,
-                                *s,
-                            ),
-                            Type::Pointer(inner, s) => Type::Pointer(
-                                Box::new(resolve_self_ty(inner, self_ty)),
-                                *s,
-                            ),
-                            other => other.clone(),
-                        }
-                    }
                     let self_ty = &for_type; // The original AST type for Self
                     let auto_deref = attributes.iter().any(|a| a.name == "auto_deref");
                     let mut method_infos = Vec::new();
@@ -902,13 +871,13 @@ impl<'a> TypeChecker<'a> {
                         let param_tys = m.params.iter()
                             .map(|p| {
                                 if let Some(ty) = &p.ty {
-                                    let resolved = resolve_self_ty(ty, self_ty);
+                                    let resolved = self.resolve_self_ty(ty, self_ty);
                                     self.resolve_type(&resolved)
                                 } else { Ok(self.ctx.error()) }
                             })
                             .collect::<Result<Vec<_>, _>>()?;
                         let ret_ty = {
-                            let resolved = resolve_self_ty(&m.return_type, self_ty);
+                            let resolved = self.resolve_self_ty(&m.return_type, self_ty);
                             self.resolve_type(&resolved)?
                         };
                         method_infos.push(crate::hir::traits::MethodInfo {
@@ -1631,6 +1600,24 @@ impl<'a> TypeChecker<'a> {
     fn resolve_type(&mut self, ty: &Type) -> Result<TypeId, Diagnostic> {
         let mut fc = FnCtxt::new(self);
         fc.resolve_type(ty)
+    }
+
+    /// Recursively replace `Self` / `self` occurrences in a type with the
+    /// concrete `self_ty` (the type being implemented for).
+    fn resolve_self_ty(&self, ty: &Type, self_ty: &Type) -> Type {
+        match ty {
+            Type::Path(p, s) if p.len() == 1 && (p[0] == "Self" || p[0] == "self") => self_ty.clone(),
+            Type::Reference(inner, mutable, s) => Type::Reference(
+                Box::new(self.resolve_self_ty(inner, self_ty)),
+                *mutable,
+                *s,
+            ),
+            Type::Pointer(inner, s) => Type::Pointer(
+                Box::new(self.resolve_self_ty(inner, self_ty)),
+                *s,
+            ),
+            other => other.clone(),
+        }
     }
 
     fn expand_base_type(&mut self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
