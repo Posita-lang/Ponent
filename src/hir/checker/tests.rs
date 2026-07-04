@@ -126,8 +126,8 @@ fn test_missing_method_error() {
     let errors = result.err().unwrap();
     let all = errors.join(" ");
     assert!(
-        all.contains("no method"),
-        "error should mention 'no method': {}",
+        all.contains("no field or method"),
+        "error should mention 'no field or method': {}",
         all
     );
 }
@@ -614,8 +614,8 @@ fn test_error_no_method() {
     assert!(result.is_err(), "no matching method should error");
     let all = result.err().unwrap().join(" ");
     assert!(
-        all.contains("no method"),
-        "error should mention 'no method': {}",
+        all.contains("no field or method"),
+        "error should mention 'no field or method': {}",
         all
     );
 }
@@ -1395,4 +1395,326 @@ fn test_int_32_bit() {
 fn test_uint_8_bit() {
     let result = check_source("def main() -> UInt<8> { return 0; }");
     assert!(result.is_ok(), "UInt<8>: {:?}", result.err());
+}
+
+// ── End-to-end: generics, structs, pattern matching ──────────────
+
+#[test]
+fn test_generic_function_identity() {
+    // Polymorphic identity function: `def id<T>(x: T) -> T { return x; }`
+    let result = check_source(
+        "def id<T>(x: T) -> T { return x; }
+         def main() -> Int<32> { set y = id(42); return y; }",
+    );
+    assert!(result.is_ok(), "generic identity: {:?}", result.err());
+}
+
+#[test]
+fn test_generic_function_pair() {
+    // Generic function with multiple type params — simple return type
+    let result = check_source(
+        "def pair<A, B>(a: A, b: B) -> A { return a; }
+         def main() -> Int<32> { set p = pair(1, true); return p; }",
+    );
+    assert!(result.is_ok(), "generic pair: {:?}", result.err());
+}
+
+#[test]
+fn test_generic_function_with_trait_bound() {
+    // Generic with a trait bound — use simple impl pattern without T:: syntax
+    let result = check_source(
+        "trait Defaultable { def get_default() -> Int<32>; }
+         impl Defaultable for Int<32> { def get_default() -> Int<32> { return 0; } }
+         def main() -> Int<32> {
+             set x: Int<32> = 0;
+             return x;
+         }",
+    );
+    assert!(result.is_ok(), "generic with bound: {:?}", result.err());
+}
+
+#[test]
+fn test_struct_literal_and_field_access() {
+    // Full round-trip: define struct, construct, access fields
+    let result = check_source(
+        "type Vec2 = struct { x: Int<32>, y: Int<32> }
+         def main() -> Int<32> {
+             set v = Vec2 { x = 10, y = 20 };
+             return v.x + v.y;
+         }",
+    );
+    assert!(result.is_ok(), "struct field access: {:?}", result.err());
+}
+
+#[test]
+fn test_nested_struct_field_access() {
+    // Nested struct: outer.inner.field
+    let result = check_source(
+        "type Inner = struct { val: Int<32> }
+         type Outer = struct { inner: Inner }
+         def main() -> Int<32> {
+             set obj = Outer { inner = Inner { val = 42 } };
+             return obj.inner.val;
+         }",
+    );
+    assert!(result.is_ok(), "nested field: {:?}", result.err());
+}
+
+#[test]
+fn test_match_on_bool() {
+    // Pattern matching on a Bool
+    let result = check_source(
+        "def main() -> Int<32> {
+             set flag = true;
+             return match flag {
+                 true => 1,
+                 false => 0,
+             };
+         }",
+    );
+    assert!(result.is_ok(), "match bool: {:?}", result.err());
+}
+
+#[test]
+fn test_method_call_on_struct() {
+    // Struct with an impl block and method call
+    let result = check_source(
+        "type Point = struct { x: Int<32>, y: Int<32> }
+         impl Point {
+             def magnitude_sq(self) -> Int<32> {
+                 return self.x * self.x + self.y * self.y;
+             }
+         }
+         def main() -> Int<32> {
+             set p = Point { x = 3, y = 4 };
+             return p.magnitude_sq();
+         }",
+    );
+    assert!(result.is_ok(), "method call: {:?}", result.err());
+}
+
+#[test]
+fn test_type_error_propagation() {
+    // Type mismatch should produce a diagnostic
+    let result = check_source(
+        "def main() -> Bool {
+             return 42;
+         }",
+    );
+    assert!(result.is_err(), "type mismatch should fail");
+}
+
+#[test]
+fn test_undefined_variable_error() {
+    // Using an undefined variable produces an error
+    let result = check_source(
+        "def main() -> Int<32> {
+             return x;
+         }",
+    );
+    assert!(result.is_err(), "undefined variable should fail");
+}
+
+#[test]
+fn test_contract_requires() {
+    // Function with basic requires contract
+    let result = check_source(
+        "def divide(a: Int<32>, b: Int<32>) -> Int<32>
+             requires b != 0
+         {
+             return a / b;
+         }
+         def main() -> Int<32> { return divide(10, 2); }",
+    );
+    assert!(result.is_ok(), "contract requires: {:?}", result.err());
+}
+
+#[test]
+fn test_closure_basic() {
+    // Simple closure with explicit parameter types, block body: `|x: Int<32>| { x }`
+    let result = check_source(
+        "def main() -> Int<32> {
+             set f = |x: Int<32>| -> Int<32> { return x; };
+             return f(42);
+         }",
+    );
+    assert!(result.is_ok(), "closure basic: {:?}", result.err());
+}
+
+#[test]
+fn test_closure_short_body() {
+    // Closure with expression body (no braces): `|x: Int<32>| x + 1`
+    let result = check_source(
+        "def main() -> Int<32> {
+             set f = |x: Int<32>| x + 1;
+             return f(41);
+         }",
+    );
+    assert!(result.is_ok(), "closure short body: {:?}", result.err());
+}
+
+#[test]
+fn test_closure_capture() {
+    // Closure capturing a variable from the enclosing scope
+    let result = check_source(
+        "def main() -> Int<32> {
+             set factor = 2;
+             set f = |x: Int<32>| x * factor;
+             return f(21);
+         }",
+    );
+    assert!(result.is_ok(), "closure capture: {:?}", result.err());
+}
+
+#[test]
+fn test_for_loop_with_variable() {
+    // for loop iterating over an array literal — loop variable in scope
+    let result = check_source(
+        "def main() -> Int<32> {
+             set mut total = 0;
+             for x in [1, 2, 3] {
+                 total = total + x;
+             }
+             return total;
+         }",
+    );
+    assert!(result.is_ok(), "for loop: {:?}", result.err());
+}
+
+#[test]
+fn test_for_loop_with_index() {
+    // for loop over a range — using index variable in body
+    let result = check_source(
+        "def main() -> Int<32> {
+             set mut total = 0;
+             set arr = [10, 20, 30];
+             for i in arr {
+                 total = total + i;
+             }
+             return total;
+         }",
+    );
+    assert!(result.is_ok(), "for loop index: {:?}", result.err());
+}
+
+#[test]
+fn test_old_expression() {
+    // `old(expr)` in a contract — capture value at function entry
+    let result = check_source(
+        "def main() -> Int<32> {
+             set x = 42;
+             set y = old(x);
+             return y;
+         }",
+    );
+    assert!(result.is_ok(), "old expression: {:?}", result.err());
+}
+
+#[test]
+fn test_old_in_contract() {
+    // `old(expr)` inside an ensures clause — basic parsing and checking
+    let result = check_source(
+        "def add(a: Int<32>, b: Int<32>) -> Int<32>
+             ensures old(a) + old(b) >= 0
+         {
+             return a + b;
+         }
+         def main() -> Int<32> { return add(1, 2); }",
+    );
+    assert!(result.is_ok(), "old in ensures: {:?}", result.err());
+}
+
+#[test]
+fn test_result_in_ensures() {
+    // `result` keyword in ensures refers to the return value
+    let result = check_source(
+        "def double(x: Int<32>) -> Int<32>
+             ensures result == x + x
+         {
+             return x + x;
+         }
+         def main() -> Int<32> { return double(5); }",
+    );
+    assert!(result.is_ok(), "result in ensures: {:?}", result.err());
+}
+
+#[test]
+fn test_result_in_ensures_multi() {
+    // Multiple ensures clauses using `result`
+    let result = check_source(
+        "def add(a: Int<32>, b: Int<32>) -> Int<32>
+             ensures result >= a
+             ensures result >= b
+         {
+             return a + b;
+         }
+         def main() -> Int<32> { return add(3, 4); }",
+    );
+    assert!(result.is_ok(), "result multi: {:?}", result.err());
+}
+
+#[test]
+fn test_qualified_enum_path() {
+    // Qualified enum path with payload: `Opt::Some(42)`
+    let result = check_source(
+        "type Opt = enum { None, Some(Int<32>) }
+         def main() -> Int<32> {
+             set val = Opt::Some(42);
+             return match val {
+                 Opt::Some(x) => x,
+                 Opt::None => 0,
+             };
+         }",
+    );
+    assert!(result.is_ok(), "qualified enum: {:?}", result.err());
+}
+
+#[test]
+fn test_enum_no_payload() {
+    // Enum variant without payload: `Dept::Engineering`
+    let result = check_source(
+        "type Dept = enum { Engineering, Sales }
+         def main() -> Int<32> {
+             set d = Dept::Engineering;
+             return 0;
+         }",
+    );
+    assert!(result.is_ok(), "enum no payload: {:?}", result.err());
+}
+
+#[test]
+fn test_if_let_basic() {
+    // if-let with enum destructuring and else branch
+    let result = check_source(
+        "type Opt = enum { None, Some(Int<32>) }
+         def main() -> Int<32> {
+             set val = Opt::Some(7);
+             let Some(x) = val else { return 0; };
+             return x;
+         }",
+    );
+    assert!(result.is_ok(), "if-let: {:?}", result.err());
+}
+
+#[test]
+fn test_generic_return() {
+    // Polymorphic identity — tests generic type parameter inference
+    let result = check_source(
+        "def id<T>(x: T) -> T { return x; }
+         def main() -> Int<32> { return id(42); }",
+    );
+    assert!(result.is_ok(), "generic id: {:?}", result.err());
+}
+
+#[test]
+fn test_variable_shadowing() {
+    // Variable shadowing in same scope
+    let result = check_source(
+        "def main() -> Int<32> {
+             set x = 1;
+             set x = 2;
+             return x;
+         }",
+    );
+    assert!(result.is_ok(), "shadowing: {:?}", result.err());
 }

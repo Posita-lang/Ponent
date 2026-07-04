@@ -683,6 +683,9 @@ impl<'a> NameResolver<'a> {
                     Some(ty)
                 } else if let Some(_ty_binding) = self.symbols.lookup_type(name) {
                     None
+                } else if name == "result" {
+                    // `result` in `ensures` clauses is resolved by the checker.
+                    None
                 } else {
                     self.diagnostics.push(
                         Diagnostic::error(format!("undefined name: {}", name)).with_span(*span),
@@ -980,6 +983,10 @@ impl<'a> NameResolver<'a> {
                 self.resolve_expr(expr);
                 Some(self.ctx.error())
             }
+            Expr::Old(expr, _) => {
+                self.resolve_expr(expr);
+                None
+            }
             Expr::Path(path, _) => {
                 self.diagnostics.push(
                     Diagnostic::error(format!("unresolved path: {}", path.join("::")))
@@ -1116,6 +1123,14 @@ impl<'a> NameResolver<'a> {
                                 let q = self.extract_int_from_type(args[1].ty()).unwrap_or(16);
                                 return self.ctx.rational(p, q);
                             }
+                            "Ptr" => {
+                                let size = args.get(0).map(|a| self.resolve_type_expr(a.ty())).unwrap_or(self.ctx.usize());
+                                let pointee = args.get(1).map(|a| self.resolve_type_expr(a.ty())).unwrap_or(self.ctx.error());
+                                return self.ctx.ptr(size, pointee);
+                            }
+                            "USize" => {
+                                return self.ctx.usize();
+                            }
                             _ => {}
                         }
                     }
@@ -1149,7 +1164,7 @@ impl<'a> NameResolver<'a> {
                     self.ctx.error()
                 }
             }
-            Type::Reference(ty, mutable, ..) => {
+            Type::Reference { inner: ty, mutable, .. } => {
                 let inner = self.resolve_type_expr(ty);
                 self.ctx.reference(inner, *mutable)
             }
@@ -1384,6 +1399,7 @@ fn replace_ident_in_expr(expr: &mut Expr, old_name: &str, new_name: &str) {
         | Expr::LeaveWith { expr: e, .. }
         | Expr::PolyBox { expr: e, .. }
         | Expr::PolyUnbox { expr: e, .. }
+        | Expr::Old(e, _)
         | Expr::TypeAnnotated { expr: e, .. } => replace_ident_in_expr(e, old_name, new_name),
         Expr::BinaryOp { left, right, .. } => {
             replace_ident_in_expr(left, old_name, new_name);

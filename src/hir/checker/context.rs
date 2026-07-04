@@ -55,6 +55,20 @@ impl<'a> TypeChecker<'a> {
             return Err(mem::take(&mut self.diagnostics));
         }
         let _solution = current.finalize(self.ctx);
+
+        // ── Check for unresolved constraints ─────────────────────────
+        let unresolved = current.check_unresolved(self.ctx);
+        for msg in &unresolved {
+            self.diagnostics.push(
+                Diagnostic::error(msg)
+                    .with_code("E030")
+                    .with_span(Span::new(0, 0)),
+            );
+        }
+        if !unresolved.is_empty() {
+            return Err(mem::take(&mut self.diagnostics));
+        }
+
         Ok(())
     }
 

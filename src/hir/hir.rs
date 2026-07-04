@@ -325,6 +325,12 @@ pub enum HirExpr {
         ty: TypeId,
         span: Span,
     },
+    /// `old(expr)` — captures the value of `expr` at function entry.
+    Old {
+        expr: Box<HirExpr>,
+        ty: TypeId,
+        span: Span,
+    },
     Error(Span),
 }
 
@@ -411,6 +417,7 @@ impl HirExpr {
             HirExpr::PolyBox { ty, .. } => *ty,
             HirExpr::PolyUnbox { ty, .. } => *ty,
             HirExpr::Quantified { ty, .. } => *ty,
+            HirExpr::Old { ty, .. } => *ty,
             HirExpr::Error(_) => unreachable!("Error expression has no type"),
         }
     }
@@ -446,6 +453,7 @@ impl HirExpr {
             HirExpr::PolyBox { span, .. } => *span,
             HirExpr::PolyUnbox { span, .. } => *span,
             HirExpr::Quantified { span, .. } => *span,
+            HirExpr::Old { span, .. } => *span,
             HirExpr::Error(span) => *span,
         }
     }

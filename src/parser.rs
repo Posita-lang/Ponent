@@ -788,23 +788,37 @@ impl Parser {
     }
 
     fn parse_type_params(&mut self) -> Result<Vec<TypeParam>, Diagnostic> {
-        self.advance().ok();
+        self.advance().ok(); // consume <
         let mut p = Vec::new();
         loop {
-            let n = match self.advance() {
-                Ok(Token::Ident(name)) => name,
-                _ => {
-                    return Err(Diagnostic::error("expected type parameter name")
-                        .with_code("E004")
-                        .with_help("type parameters must have a name — e.g. `<T>` or `<K, V>`")
-                        .with_suggestion(
-                            "use a valid identifier like `T` or `Item` for the type parameter",
-                        )
-                        .with_span(self.span()));
+            let (name, is_lifetime) = if matches!(self.peek(), Ok(Token::Apostrophe)) {
+                self.advance().ok();
+                match self.advance() {
+                    Ok(Token::Ident(name)) => (format!("'{}", name), true),
+                    _ => {
+                        return Err(Diagnostic::error("expected lifetime name after `'`")
+                            .with_code("E004")
+                            .with_help("lifetime parameters use `'name` syntax — e.g. `<'a, 'b, T>`")
+                            .with_suggestion("add a lifetime name after `'`, e.g. `<'a>` or `<'a, T>`")
+                            .with_span(self.span()));
+                    }
+                }
+            } else {
+                match self.advance() {
+                    Ok(Token::Ident(name)) => (name, false),
+                    _ => {
+                        return Err(Diagnostic::error("expected type parameter name")
+                            .with_code("E004")
+                            .with_help("type parameters must have a name — e.g. `<T>` or `<K, V>`")
+                            .with_suggestion(
+                                "use a valid identifier like `T` or `Item` for the type parameter",
+                            )
+                            .with_span(self.span()));
+                    }
                 }
             };
             let mut bounds = Vec::new();
-            if matches!(self.peek(), Ok(Token::Colon)) {
+            if !is_lifetime && matches!(self.peek(), Ok(Token::Colon)) {
                 self.advance().ok();
                 loop {
                     bounds.push(self.parse_type()?);
@@ -815,8 +829,9 @@ impl Parser {
                 }
             }
             p.push(TypeParam {
-                name: n,
+                name,
                 bounds,
+                is_lifetime,
                 span: Span::new(self.span().start, self.span().end),
             });
             match self.peek() {
@@ -1117,17 +1132,33 @@ impl Parser {
             }
             Ok(Token::Ampersand) => {
                 self.advance().ok();
+                let lifetime = if matches!(self.peek(), Ok(Token::Apostrophe)) {
+                    self.advance().ok();
+                    match self.advance() {
+                        Ok(Token::Ident(name)) => Some(name),
+                        _ => {
+                            return Err(Diagnostic::error("expected lifetime name after `'`")
+                                .with_code("E004")
+                                .with_help("lifetimes use `'name` syntax — e.g. `&'a T`")
+                                .with_suggestion("add a lifetime name after `'`, e.g. `&'a mut T`")
+                                .with_span(self.span(),));
+                        }
+                    }
+                } else {
+                    None
+                };
                 let mutable = matches!(self.peek(), Ok(Token::Mut));
                 if mutable {
                     self.advance().ok();
                 }
                 let ty = self.parse_type()?;
                 let end = self.span().end;
-                Ok(Type::Reference(
-                    Box::new(ty),
+                Ok(Type::Reference {
+                    inner: Box::new(ty),
                     mutable,
-                    Span::new(start, end),
-                ))
+                    lifetime,
+                    span: Span::new(start, end),
+                })
             }
             Ok(Token::Star) => {
                 self.advance().ok();
@@ -1226,9 +1257,6 @@ impl Parser {
                             let cp_cursor = self.cursor;
                             let cp_peeked = self.peeked.clone();
                             let cp_pending = self.pending.clone();
-                            let started_as_int = self.tokens.get(cp_cursor)
-                                .map(|st| matches!(st.token, Token::IntLiteral(_)))
-                                .unwrap_or(false);
                             // Rustc-style pre-check: if the token definitively starts a const
                             // expression, parse it directly without any type-first attempt.
                             let arg = if matches!(self.peek(), Ok(Token::Ident(_)))
@@ -1283,7 +1311,7 @@ impl Parser {
                                                 | Some(Token::LParen) | Some(Token::LBracket)
                                                 | Some(Token::Minus) | Some(Token::Plus)
                                                 | Some(Token::Bang) | Some(Token::Tilde));
-                                        let next_is_expr_op = (!started_as_int && next_is_shr)
+                                        let next_is_expr_op = next_is_shr
                                             || matches!(self.peek(),
                                                 Ok(Token::Plus) | Ok(Token::Minus)
                                                 | Ok(Token::Star) | Ok(Token::Slash) | Ok(Token::Percent)
@@ -1393,6 +1421,21 @@ impl Parser {
                 Ok(Token::Bang) => {
                     let end = self.span().end;
                     Ok(Type::Never(Span::new(start, end)))
+                }
+                Ok(Token::Apostrophe) => {
+                    // Lifetime argument in generic context: `Foo<'a>`
+                    // Parse `'name` as a placeholder path; the type checker
+                    // will resolve or reject it.
+                    self.advance().ok();
+                    match self.advance() {
+                        Ok(Token::Ident(name)) => {
+                            let end = self.span().end;
+                            Ok(Type::Path(vec![format!("'{}", name)], Span::new(start, end)))
+                        }
+                        _ => Err(Diagnostic::error("expected lifetime name after `'`")
+                            .with_code("E004")
+                            .with_span(self.span())),
+                    }
                 }
                 Ok(tok) => Err(Diagnostic::error(format!("expected type, found {:?}", tok))
                     .with_code("E004")
@@ -2780,7 +2823,8 @@ impl Parser {
 
     fn parse_self_param(&mut self) -> Result<Param, Diagnostic> {
         let start = self.span().start;
-        let mutable = if matches!(self.peek(), Ok(Token::Ampersand)) {
+        let has_ampersand = matches!(self.peek(), Ok(Token::Ampersand));
+        let mutable = if has_ampersand {
             self.advance().ok();
             let m = matches!(self.peek(), Ok(Token::Mut));
             if m {
@@ -2793,12 +2837,13 @@ impl Parser {
         match self.advance() {
             Ok(Token::Ident(s)) if s == "self" => {
                 let end = self.span().end;
-                let ty = if mutable {
-                    Type::Reference(
-                        Box::new(Type::Path(vec!["Self".into()], Span::new(start, end))),
-                        true,
-                        Span::new(start, end),
-                    )
+                let ty: Type = if has_ampersand {
+                    Type::Reference {
+                        inner: Box::new(Type::Path(vec!["Self".into()], Span::new(start, end))),
+                        mutable,
+                        lifetime: None,
+                        span: Span::new(start, end),
+                    }
                 } else {
                     Type::Path(vec!["Self".into()], Span::new(start, end))
                 };
@@ -3250,6 +3295,15 @@ impl Parser {
                     span: Span::new(start, end),
                 })
             }
+            Ok(Token::Old) => {
+                // `old(expr)` — capture value at function entry for contracts
+                self.advance().ok();
+                self.expect(Token::LParen)?;
+                let expr = self.parse_expr()?;
+                self.expect(Token::RParen)?;
+                let end = self.span().end;
+                Ok(Expr::Old(Box::new(expr), Span::new(start, end)))
+            }
             Ok(Token::Bang) => {
                 self.advance().ok();
                 let expr = self.parse_prefix()?;
@@ -3466,10 +3520,16 @@ impl Parser {
         } else {
             None
         };
-        self.expect(Token::LBrace)?;
-        let body =
-            self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block())?;
-        self.expect(Token::RBrace)?;
+        let body = if matches!(self.peek(), Ok(Token::LBrace)) {
+            self.advance().ok();
+            let stmts = self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block())?;
+            self.expect(Token::RBrace)?;
+            stmts
+        } else {
+            // Single-expression body: `|x| expr`
+            let expr = self.parse_expr()?;
+            vec![Stmt::Expression(expr)]
+        };
         let end = self.span().end;
         Ok(Expr::Closure {
             params,
@@ -3507,11 +3567,13 @@ impl Parser {
         match self.peek() {
             Ok(Token::LBrace) if !restrict => self.parse_struct_lit(path, start),
             Ok(Token::LParen) => {
-                // Multi-segment path + ( → associated function call, NOT EnumLit.
-                // Parser can't distinguish Enum::Variant(...) from Type::fn(...) without
-                // a symbol table, so we conservatively build a path chain and let the
-                // semantic phase decide (SYNTAX.md: Complete Example).
-                if path.len() >= 2 {
+                // Two-segment path + ( → enum variant construction: `Opt::Some(42)`
+                if path.len() == 2 {
+                    let variant = path[1].clone();
+                    let enum_path = vec![path[0].clone()];
+                    self.parse_enum_lit(enum_path, variant, start)
+                } else if path.len() >= 2 {
+                    // Longer path + ( → associated function call: `module::Type::method(args)`
                     let span = Span::new(start, self.span().end);
                     let callee = Expr::Path(path, span);
                     self.parse_call(callee, start)
@@ -5055,6 +5117,94 @@ mod tests {
     fn test_positional_generic_args_still_work() {
         // Verify that plain positional args (without names) still parse correctly
         let program = check_parse("def main() { set x: HashMap<Int<32>, Bool> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    // --- Lifetime annotation tests ---
+
+    #[test]
+    fn test_lifetime_on_ref() {
+        // `&'a T` in variable type
+        let program = check_parse("def main() { set x: &'a Int<32> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_lifetime_on_ref_mut() {
+        // `&'a mut T`
+        let program = check_parse("def main() { set x: &'a mut Int<32> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_ref_without_lifetime_still_works() {
+        // `&T` without lifetime is still valid
+        let program = check_parse("def main() { set x: &Int<32> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_lifetime_on_fn_param() {
+        // Lifetime in function parameter type
+        let src = "def process(x: &'a Int<32>, y: &'a Int<32>) -> &'a Int<32> { return x; }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_lifetime_nested_ref() {
+        // Nested references with lifetimes: `&'a &'b mut T`
+        let program = check_parse("def main() { set x: &'a &'b mut Int<32> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    // --- Lifetime parameter declaration tests ---
+
+    #[test]
+    fn test_lifetime_param_on_fn() {
+        // `def foo<'a>(x: &'a Int<32>)`
+        let src = "def foo<'a>(x: &'a Int<32>) -> &'a Int<32> { return x; }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_lifetime_param_mixed() {
+        // Mixed lifetime and type params: `def bar<'a, T>(x: &'a T)`
+        let src = "def bar<'a, T>(x: &'a T) -> &'a T { return x; }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_lifetime_param_multi() {
+        // Multiple lifetime params: `def baz<'a, 'b>(x: &'a Int<32>, y: &'b Bool)`
+        let src = "def baz<'a, 'b>(x: &'a Int<32>, y: &'b Bool) -> &'a Int<32> { return x; }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_lifetime_param_on_type_alias() {
+        // Lifetime param on type alias: `type Ref<'a> = &'a Int<32>`
+        let src = "type Ref<'a> = &'a Int<32>;";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_lifetime_param_on_impl() {
+        // Lifetime param on impl block
+        let src = "impl<'a> Foo for &'a Bar { }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_type_params_still_work() {
+        // Plain type params still work
+        let src = "def id<T>(x: T) -> T { return x; }";
+        let program = check_parse(src);
         assert_eq!(program.items.len(), 1);
     }
 }

@@ -325,6 +325,19 @@ impl<'a> TypeChecker<'a> {
                 guard.checker.enter_inference_scope();
                 guard.checker.push_ctx(CtxKind::Function, *span, None);
 
+                // Pre-populate the local variable cache with function parameters
+                // and `result` so that ensures clauses can reference them.
+                for p in &hir_params {
+                    guard
+                        .checker
+                        .local_variable_types
+                        .insert(p.name.clone(), p.ty);
+                }
+                guard
+                    .checker
+                    .local_variable_types
+                    .insert("result".to_string(), return_ty);
+
                 // SCAP: collect ensures conditions into the guarantee chain.
                 // Each `ensures` becomes a postcondition that must hold at return.
                 for contract in contracts {
@@ -337,15 +350,6 @@ impl<'a> TypeChecker<'a> {
                         guard.checker.guarantee_chain.push(g);
                     }
                 }
-                // Pre-populate the local variable cache with function parameters,
-                // since the resolver already popped the parameter scope.
-                for p in &hir_params {
-                    guard
-                        .checker
-                        .local_variable_types
-                        .insert(p.name.clone(), p.ty);
-                }
-
                 // Generate where-clause constraints as Impl(clause_ty, trait_id)
                 // so the solver can verify trait bounds on generic parameters.
                 if let Some(wc) = where_clause {
@@ -1157,1065 +1161,10 @@ impl<'a> TypeChecker<'a> {
         fc.check_block(stmts)
     }
 
+
     fn infer_expr(&mut self, expr: &Expr) -> Result<(HirExpr, TypeId), Diagnostic> {
-        match expr {
-            Expr::Literal(lit, span) => {
-                let kind = match lit {
-                    Literal::Int(_) => TypeVariableKind::Integer,
-                    Literal::Float(_) => TypeVariableKind::Float,
-                    Literal::Bool(_) => TypeVariableKind::Bool,
-                    Literal::Char(_) | Literal::String(_) | Literal::ByteString(_) => {
-                        TypeVariableKind::Any
-                    }
-                };
-                let ty = self.new_infer_var(kind);
-                Ok((HirExpr::Literal(lit.clone(), ty, *span), ty))
-            }
-            Expr::Ident(name, span) => {
-                // Check the local variable type cache first (set by VariableDef)
-                if let Some(&ty) = self.local_variable_types.get(name) {
-                    Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
-                } else if let Some(&ty) = self.resolution_map.variable_types.get(name) {
-                    // Fall back to the name resolver's pre-resolved types
-                    self.local_variable_types.insert(name.clone(), ty);
-                    Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
-                } else if let Some(binding) = self.symbols.lookup_variable(name, *span) {
-                    Ok((HirExpr::Ident(name.clone(), binding.ty, *span), binding.ty))
-                } else if let Some(func) = self.symbols.lookup_function(name) {
-                    let sig = &func.signature;
-                    // Construct the function type: Fn(params..., ret)
-                    let mut fn_ty = self
-                        .ctx
-                        .function(sig.params.iter().map(|p| p.ty).collect(), sig.return_type);
-                    // If the function has type parameters, wrap with Forall:
-                    // def foo<T, U>(x: T, y: U) → Forall(0, "T", Forall(1, "U", Fn(...)))
-                    if !sig.type_params.is_empty() {
-                        for (i, tp) in sig.type_params.iter().enumerate().rev() {
-                            fn_ty = self.ctx.forall(i, tp.name.clone(), fn_ty);
-                        }
-                    }
-                    Ok((HirExpr::Ident(name.clone(), fn_ty, *span), fn_ty))
-                } else {
-                    self.diagnostics.push(
-                        Diagnostic::error(format!("undefined name: {}", name)).with_span(*span),
-                    );
-                    Ok((HirExpr::Error(*span), self.ctx.error()))
-                }
-            }
-            Expr::TypeAnnotated { expr, ty, span } => {
-                let expected = self.resolve_type(ty)?;
-                let hir =
-                    self.check_expr(expr, Expectation::HasType(expected), TypingContext::None)?;
-                Ok((
-                    HirExpr::TypeAnnotated {
-                        expr: Box::new(hir),
-                        ty: expected,
-                        span: *span,
-                    },
-                    expected,
-                ))
-            }
-            Expr::BinaryOp {
-                left,
-                op,
-                right,
-                span,
-            } => {
-                let result_ty = match op {
-                    BinOp::Eq
-                    | BinOp::Neq
-                    | BinOp::Lt
-                    | BinOp::Gt
-                    | BinOp::Le
-                    | BinOp::Ge
-                    | BinOp::And
-                    | BinOp::Or => self.ctx.bool(),
-                    _ => self.new_infer_var(TypeVariableKind::Numeric),
-                };
-                let (left_hir, left_ty) = self.infer_expr(left)?;
-                let (right_hir, right_ty) = self.infer_expr(right)?;
-                self.unify_with(left_ty, right_ty, *span, TypingContext::None)?;
-                if let Ok(Some(trait_id)) = self.get_trait_id_for_binop(*op, *span) {
-                    self.add_constraint(Constraint::Impl(left_ty, trait_id, *span));
-                    self.add_constraint(Constraint::Impl(right_ty, trait_id, *span));
-                }
-                if !matches!(
-                    op,
-                    BinOp::Eq
-                        | BinOp::Neq
-                        | BinOp::Lt
-                        | BinOp::Gt
-                        | BinOp::Le
-                        | BinOp::Ge
-                        | BinOp::And
-                        | BinOp::Or
-                ) {
-                    self.add_constraint(Constraint::Eq(result_ty, left_ty, *span));
-                }
-                Ok((
-                    HirExpr::BinaryOp {
-                        left: Box::new(left_hir),
-                        op: *op,
-                        right: Box::new(right_hir),
-                        ty: result_ty,
-                        span: *span,
-                    },
-                    result_ty,
-                ))
-            }
-            Expr::UnaryOp { op, expr, span } => {
-                let (hir, ty) = self.infer_expr(expr)?;
-                let result_ty = match op {
-                    UnaryOp::Neg | UnaryOp::BitNot => ty,
-                    UnaryOp::Not => self.ctx.bool(),
-                    UnaryOp::Deref => self
-                        .ctx
-                        .pointee_of_ref(ty)
-                        .or_else(|| self.ctx.pointee_of_pointer(ty))
-                        .unwrap_or(self.ctx.error()),
-                    UnaryOp::Ref | UnaryOp::RefMut => {
-                        let mutable = matches!(op, UnaryOp::RefMut);
-                        self.ctx.reference(ty, mutable)
-                    }
-                };
-                Ok((
-                    HirExpr::UnaryOp {
-                        op: *op,
-                        expr: Box::new(hir),
-                        ty: result_ty,
-                        span: *span,
-                    },
-                    result_ty,
-                ))
-            }
-            Expr::Call {
-                callee,
-                args,
-                comptime,
-                span,
-            } => {
-                // Check if this is a method call (x.foo()) rather than a free function call
-                if let Expr::FieldAccess { base, field, .. } = callee.as_ref() {
-                    let (base_hir, base_ty) = self.infer_expr(base)?;
-                    if let Some((param_tys, ret_ty)) = self.lookup_method(base_ty, field) {
-                        // Adjust: method calls pass `self` as the first arg implicitly,
-                        // so the param list from the declaration includes self.
-                        // We treat `base` as the receiver and check remaining args.
-                        let explicit_param_tys = if param_tys.len() > 1 {
-                            &param_tys[1..] // skip self
-                        } else {
-                            &[] // no explicit params besides self
-                        };
-                        if explicit_param_tys.len() != args.len() {
-                            self.diagnostics.push(
-                                Diagnostic::error(format!(
-                                    "wrong number of arguments: expected {}, found {}",
-                                    explicit_param_tys.len(),
-                                    args.len()
-                                ))
-                                .with_span(*span),
-                            );
-                        }
-                        let mut hir_args = Vec::new();
-                        for (i, arg) in args.iter().enumerate() {
-                            let expected = explicit_param_tys
-                                .get(i)
-                                .copied()
-                                .unwrap_or(self.ctx.error());
-                            let hir_arg = self.check_expr(
-                                arg,
-                                Expectation::HasType(expected),
-                                TypingContext::Argument {
-                                    index: i,
-                                    total: args.len(),
-                                },
-                            )?;
-                            hir_args.push(hir_arg);
-                        }
-                        // Build the HIR: the callee is the field access; we keep it as-is
-                        let callee_hir = HirExpr::FieldAccess {
-                            base: Box::new(base_hir),
-                            field: field.clone(),
-                            ty: ret_ty,
-                            span: *span,
-                        };
-                        return Ok((
-                            HirExpr::Call {
-                                callee: Box::new(callee_hir),
-                                args: hir_args,
-                                comptime: *comptime,
-                                ty: ret_ty,
-                                span: *span,
-                            },
-                            ret_ty,
-                        ));
-                    } else {
-                        // Method not found — collect available method names for a helpful error
-                        let mut method_names: Vec<String> = Vec::new();
-                        for ty in self.autoderef_chain(base_ty) {
-                            for cand in self.trait_env.lookup_impls_for_type(ty) {
-                                for m in &cand.methods {
-                                    if !method_names.contains(&m.name) {
-                                        method_names.push(m.name.clone());
-                                    }
-                                }
-                            }
-                        }
-                        let mut diag = Diagnostic::error(format!(
-                            "no method named `{}` found for type",
-                            field
-                        ))
-                        .with_code("E011")
-                        .with_span(*span);
-                        if !method_names.is_empty() {
-                            diag = diag.with_suggestion(format!(
-                                "available methods: {}",
-                                method_names.join(", ")
-                            ));
-                        }
-                        self.diagnostics.push(diag);
-                        return Ok((HirExpr::Error(*span), self.ctx.error()));
-                    }
-                }
-
-                let (callee_hir, callee_ty) = self.infer_expr(callee)?;
-
-                // Try local type argument synthesis first: detect polymorphic functions
-                // whose parameter types contain GenericParam (type variables that need
-                // to be inferred from argument types).
-                match self.try_synthesize_type_args(
-                    &callee_hir,
-                    callee_ty,
-                    args,
-                    *comptime,
-                    None,
-                    *span,
-                ) {
-                    Ok(Some(result)) => return Ok(result),
-                    Ok(None) => { /* not polymorphic, fall through */ }
-                    Err(diag) => {
-                        self.diagnostics.push(diag);
-                        return Ok((HirExpr::Error(*span), self.ctx.error()));
-                    }
-                }
-
-                // Normal (non-polymorphic) function call — peel any Forall wrapping
-                let inner_call_ty = {
-                    let mut t = callee_ty;
-                    loop {
-                        match self.ctx.get(t) {
-                            TypeData::Forall { body, .. } => t = *body,
-                            _ => break,
-                        }
-                    }
-                    t
-                };
-                if let Some(params) = self.ctx.params_of_fn(inner_call_ty) {
-                    let param_tys = params.to_vec();
-                    let ret_ty = self
-                        .ctx
-                        .ret_of_fn(inner_call_ty)
-                        .unwrap_or(self.ctx.error());
-                    if param_tys.len() != args.len() {
-                        self.diagnostics.push(
-                            Diagnostic::error(format!(
-                                "wrong number of arguments: expected {}, found {}",
-                                param_tys.len(),
-                                args.len()
-                            ))
-                            .with_span(*span),
-                        );
-                    }
-                    let mut hir_args = Vec::new();
-                    for (i, arg) in args.iter().enumerate() {
-                        let expected = param_tys.get(i).copied().unwrap_or(self.ctx.error());
-                        let hir_arg = self.check_expr(
-                            arg,
-                            Expectation::HasType(expected),
-                            TypingContext::Argument {
-                                index: i,
-                                total: args.len(),
-                            },
-                        )?;
-                        hir_args.push(hir_arg);
-                    }
-                    Ok((
-                        HirExpr::Call {
-                            callee: Box::new(callee_hir),
-                            args: hir_args,
-                            comptime: *comptime,
-                            ty: ret_ty,
-                            span: *span,
-                        },
-                        ret_ty,
-                    ))
-                } else {
-                    self.diagnostics.push(
-                        Diagnostic::error("called expression is not a function").with_span(*span),
-                    );
-                    Ok((HirExpr::Error(*span), self.ctx.error()))
-                }
-            }
-            Expr::Index { base, index, span } => {
-                let (base_hir, base_ty) = self.infer_expr(base)?;
-                let (index_hir, index_ty) = self.infer_expr(index)?;
-                let elem_ty = self
-                    .ctx
-                    .elem_of_slice(base_ty)
-                    .or_else(|| self.ctx.elem_of_array(base_ty))
-                    .unwrap_or_else(|| {
-                        self.diagnostics.push(
-                            Diagnostic::error("indexing on non-array/non-slice type")
-                                .with_span(*span),
-                        );
-                        self.ctx.error()
-                    });
-                if !self.ctx.is_integer(index_ty) && !self.ctx.is_usize(index_ty) {
-                    self.diagnostics.push(
-                        Diagnostic::error("index must be an integer")
-                            .with_code("E030")
-                            .with_span(*span)
-                            .with_label(index.span(), format!("got {:?}", self.ctx.get(index_ty))),
-                    );
-                }
-                Ok((
-                    HirExpr::Index {
-                        base: Box::new(base_hir),
-                        index: Box::new(index_hir),
-                        ty: elem_ty,
-                        span: *span,
-                    },
-                    elem_ty,
-                ))
-            }
-            Expr::FieldAccess { base, field, span } => {
-                let (base_hir, base_ty) = self.infer_expr(base)?;
-                let field_ty = self.lookup_field(base_ty, field, *span)?;
-                Ok((
-                    HirExpr::FieldAccess {
-                        base: Box::new(base_hir),
-                        field: field.clone(),
-                        ty: field_ty,
-                        span: *span,
-                    },
-                    field_ty,
-                ))
-            }
-            Expr::AttrAccess { base, attr, span } => {
-                let (base_hir, base_ty) = self.infer_expr(base)?;
-                let attr_ty = self.lookup_attr(base_ty, attr, *span)?;
-                Ok((
-                    HirExpr::AttrAccess {
-                        base: Box::new(base_hir),
-                        attr: attr.clone(),
-                        ty: attr_ty,
-                        span: *span,
-                    },
-                    attr_ty,
-                ))
-            }
-            Expr::Cast {
-                expr,
-                ty,
-                safe,
-                rounding,
-                span,
-            } => {
-                let (hir, actual_ty) = self.infer_expr(expr)?;
-                let target_ty = self.resolve_type(ty)?;
-                let cast_ty = self.check_cast(actual_ty, target_ty, *safe, *span)?;
-                Ok((
-                    HirExpr::Cast {
-                        expr: Box::new(hir),
-                        ty: cast_ty,
-                        safe: *safe,
-                        rounding: *rounding,
-                        span: *span,
-                    },
-                    cast_ty,
-                ))
-            }
-            Expr::Range {
-                start,
-                end,
-                inclusive,
-                span,
-            } => {
-                let start_hir = start
-                    .as_ref()
-                    .map(|s| self.infer_expr(s).map(|(h, _)| h))
-                    .transpose()?;
-                let end_hir = end
-                    .as_ref()
-                    .map(|e| self.infer_expr(e).map(|(h, _)| h))
-                    .transpose()?;
-                let int_ty = self.ctx.int(32, true);
-                let ty = self.ctx.tuple(vec![int_ty, int_ty]);
-                Ok((
-                    HirExpr::Range {
-                        start: start_hir.map(Box::new),
-                        end: end_hir.map(Box::new),
-                        inclusive: *inclusive,
-                        ty,
-                        span: *span,
-                    },
-                    ty,
-                ))
-            }
-            Expr::StructLit { path, fields, span } => {
-                let resolved_ty = self.resolve_type(&Type::Path(path.clone(), *span))?;
-                let (def_id, args) = self.resolve_type_to_struct_or_enum(resolved_ty, *span)?;
-                let binding = self
-                    .symbols
-                    .lookup_type_by_def_id(def_id)
-                    .ok_or_else(|| Diagnostic::error("struct not found").with_span(*span))?;
-                if !matches!(binding.kind, TypeKind::Struct) {
-                    return Err(Diagnostic::error("not a struct type").with_span(*span));
-                }
-                let struct_ty = self.ctx.struct_ty(def_id, args.clone());
-                let mut subst = Subst::new();
-                for (i, _param) in binding.params.iter().enumerate() {
-                    if let Some(&arg) = args.get(i) {
-                        subst.insert(i, arg);
-                    }
-                }
-                let mut hir_fields = Vec::new();
-                for (name, value) in fields {
-                    let field_def =
-                        binding
-                            .fields
-                            .iter()
-                            .find(|f| f.name == *name)
-                            .ok_or_else(|| {
-                                let field_names: Vec<String> =
-                                    binding.fields.iter().map(|f| f.name.clone()).collect();
-                                let mut diag = Diagnostic::error(format!(
-                                    "field '{}' not found in struct",
-                                    name
-                                ))
-                                .with_code("E010")
-                                .with_span(*span)
-                                .with_suggestion(format!(
-                                    "available fields: {}",
-                                    field_names.join(", ")
-                                ));
-                                if let Some(suggestion) =
-                                    did_you_mean_suggestion(name, &field_names)
-                                {
-                                    diag = diag.with_suggestion(suggestion);
-                                }
-                                diag
-                            })?;
-                    let field_ty = self.ctx.subst(field_def.ty, &subst);
-                    let hir = self.check_expr(
-                        value,
-                        Expectation::HasType(field_ty),
-                        TypingContext::StructFieldInit,
-                    )?;
-                    self.unify_with(field_ty, hir.ty(), *span, TypingContext::StructFieldInit)?;
-                    hir_fields.push((name.clone(), Box::new(hir)));
-                }
-                Ok((
-                    HirExpr::StructLit {
-                        path: path.clone(),
-                        fields: hir_fields,
-                        ty: struct_ty,
-                        span: *span,
-                    },
-                    struct_ty,
-                ))
-            }
-            Expr::EnumLit {
-                path,
-                variant,
-                payload,
-                span,
-            } => {
-                let resolved_ty = self.resolve_type(&Type::Path(path.clone(), *span))?;
-                let (def_id, args) = self.resolve_type_to_struct_or_enum(resolved_ty, *span)?;
-                let binding = self
-                    .symbols
-                    .lookup_type_by_def_id(def_id)
-                    .ok_or_else(|| Diagnostic::error("enum not found").with_span(*span))?;
-                if !matches!(binding.kind, TypeKind::Enum) {
-                    return Err(Diagnostic::error("not an enum type").with_span(*span));
-                }
-                let enum_ty = self.ctx.enum_ty(def_id, args.clone());
-                let mut subst = Subst::new();
-                for (i, _param) in binding.params.iter().enumerate() {
-                    if let Some(&arg) = args.get(i) {
-                        subst.insert(i, arg);
-                    }
-                }
-                let variant_def = binding
-                    .variants
-                    .iter()
-                    .find(|v| v.name == *variant)
-                    .ok_or_else(|| {
-                        Diagnostic::error(format!("variant '{}' not found", variant))
-                            .with_span(*span)
-                    })?;
-                let payload_ty = variant_def
-                    .payload
-                    .as_ref()
-                    .map(|ty| self.resolve_type(ty))
-                    .transpose()?
-                    .unwrap_or(self.ctx.error());
-                let payload_hir = if let Some(payload) = payload {
-                    let hir = self.check_expr(
-                        payload,
-                        Expectation::HasType(payload_ty),
-                        TypingContext::StructFieldInit,
-                    )?;
-                    self.unify_with(payload_ty, hir.ty(), *span, TypingContext::StructFieldInit)?;
-                    Some(Box::new(hir))
-                } else {
-                    None
-                };
-                Ok((
-                    HirExpr::EnumLit {
-                        path: path.clone(),
-                        variant: variant.clone(),
-                        payload: payload_hir,
-                        ty: enum_ty,
-                        span: *span,
-                    },
-                    enum_ty,
-                ))
-            }
-            Expr::Move(expr, span) => {
-                let (hir, ty) = self.infer_expr(expr)?;
-                Ok((HirExpr::Move(Box::new(hir), ty, *span), ty))
-            }
-            Expr::Tuple(exprs, span) => {
-                let mut hirs = Vec::new();
-                let mut types = Vec::new();
-                for e in exprs {
-                    let (hir, ty) = self.infer_expr(e)?;
-                    hirs.push(hir);
-                    types.push(ty);
-                }
-                let ty = self.ctx.tuple(types);
-                Ok((HirExpr::Tuple(hirs, ty, *span), ty))
-            }
-            Expr::Array(exprs, span) => {
-                let mut hirs = Vec::new();
-                let mut elem_ty = None;
-                for e in exprs {
-                    let (hir, ty) = self.infer_expr(e)?;
-                    if let Some(et) = elem_ty {
-                        self.unify_with(et, ty, *span, TypingContext::None)?;
-                    } else {
-                        elem_ty = Some(ty);
-                    }
-                    hirs.push(hir);
-                }
-                let ty = self
-                    .ctx
-                    .array(elem_ty.unwrap_or(self.ctx.error()), exprs.len() as u64);
-                Ok((HirExpr::Array(hirs, ty, *span), ty))
-            }
-            Expr::Closure {
-                params,
-                return_type,
-                captures,
-                body,
-                span,
-            } => {
-                let mut hir_params = Vec::new();
-                let mut param_tys = Vec::new();
-                for param in params {
-                    let ty = param
-                        .ty
-                        .as_ref()
-                        .map(|t| self.resolve_type(t))
-                        .unwrap_or(Ok(self.ctx.error()))?;
-                    hir_params.push(HirParam {
-                        name: param.name.clone(),
-                        ty,
-                        default: None,
-                        span: param.span,
-                    });
-                    param_tys.push(ty);
-                }
-                self.push_ctx(CtxKind::Closure, *span, None);
-                let body_hir = self.check_block(body)?;
-                let body_ty = self.block_type(&body_hir);
-                self.pop_ctx();
-                let ret_ty = match return_type {
-                    Some(ty) => {
-                        let declared = self.resolve_type(ty)?;
-                        self.unify_with(declared, body_ty, *span, TypingContext::ClosureBody)?;
-                        declared
-                    }
-                    None => body_ty,
-                };
-                let ty = self.ctx.function(param_tys, ret_ty);
-                Ok((
-                    HirExpr::Closure {
-                        params: hir_params,
-                        return_type: ret_ty,
-                        captures: captures.clone(),
-                        body: body_hir,
-                        ty,
-                        span: *span,
-                    },
-                    ty,
-                ))
-            }
-            Expr::Try { expr, span } => {
-                let (hir, ty) = self.infer_expr(expr)?;
-                let ok_ty = self.check_result_type(ty, *span)?;
-                Ok((
-                    HirExpr::Try {
-                        expr: Box::new(hir),
-                        ty: ok_ty,
-                        span: *span,
-                    },
-                    ok_ty,
-                ))
-            }
-            Expr::UnsafeBlock { body, span } => {
-                let body_hir = self.check_block(body)?;
-                let ty = self.ctx.unit();
-                Ok((
-                    HirExpr::UnsafeBlock {
-                        body: body_hir,
-                        ty,
-                        span: *span,
-                    },
-                    ty,
-                ))
-            }
-            Expr::Catch {
-                expr,
-                branches,
-                span,
-            } => {
-                let (expr_hir, expr_ty) = self.infer_expr(expr)?;
-                let (ok_ty, error_ty) = self.extract_result_types(expr_ty, *span)?;
-                let mut hir_branches = Vec::new();
-                for branch in branches {
-                    let pattern_hir = self.check_pattern(&branch.pattern, error_ty)?;
-                    let body_hir = self.check_block(&branch.body)?;
-                    hir_branches.push(HirCatchBranch {
-                        pattern: pattern_hir,
-                        bind: branch.bind.clone(),
-                        body: body_hir,
-                        span: branch.span,
-                    });
-                }
-                Ok((
-                    HirExpr::Catch {
-                        expr: Box::new(expr_hir),
-                        branches: hir_branches,
-                        ty: ok_ty,
-                        span: *span,
-                    },
-                    ok_ty,
-                ))
-            }
-            Expr::LeaveWith { expr, span } => {
-                let (hir, err_ty) = self.infer_expr(expr)?;
-                // Validate that the error type matches the function's error type
-                if let Some(ret_ty) = self.current_return_type {
-                    if let Ok((_, error_ty)) = self.extract_result_types(ret_ty, *span) {
-                        self.unify_with(error_ty, err_ty, *span, TypingContext::None)?;
-                    }
-                }
-                let never = self.ctx.never();
-                Ok((
-                    HirExpr::LeaveWith {
-                        expr: Box::new(hir),
-                        ty: never,
-                        span: *span,
-                    },
-                    never,
-                ))
-            }
-            Expr::Await { expr, span } => {
-                let (hir, ty) = self.infer_expr(expr)?;
-                let future_ty = self.check_future_type(ty, *span)?;
-                Ok((
-                    HirExpr::Await {
-                        expr: Box::new(hir),
-                        ty: future_ty,
-                        span: *span,
-                    },
-                    future_ty,
-                ))
-            }
-            Expr::If {
-                cond,
-                then_branch,
-                else_branch,
-                is_expression,
-                span,
-            } => {
-                let (cond_hir, cond_ty) = self.infer_expr(cond)?;
-                let cond_is_bool = self.ctx.is_bool(cond_ty)
-                    || matches!(self.ctx.get(cond_ty), TypeData::InferVar { id }
-                        if self.infer.get_var_kind(*id) == Some(TypeVariableKind::Bool));
-                if !cond_is_bool {
-                    self.diagnostics.push(
-                        Diagnostic::error("if condition must be boolean")
-                            .with_code("E004")
-                            .with_span(*span)
-                            .with_label(cond.span(), format!("got {:?}", self.ctx.get(cond_ty))),
-                    );
-                }
-                let then_hir = self.check_block(then_branch)?;
-                let then_ty = self.block_type(&then_hir);
-                let else_hir = else_branch
-                    .as_ref()
-                    .map(|b| self.check_block(b))
-                    .transpose()?;
-                let else_ty = else_hir
-                    .as_ref()
-                    .map(|h| self.block_type(h))
-                    .unwrap_or(self.ctx.unit());
-                // Divergence detection: if both branches end in `return`, the result is never
-                let then_returns = then_hir
-                    .last()
-                    .map_or(false, |s| matches!(s, HirStmt::Return { .. }));
-                let else_returns = else_hir
-                    .as_ref()
-                    .and_then(|h| h.last())
-                    .map_or(false, |s| matches!(s, HirStmt::Return { .. }));
-                let both_diverge = then_returns && else_returns;
-                if *is_expression && !both_diverge {
-                    if then_ty != else_ty {
-                        self.ctx.unify(then_ty, else_ty).ok();
-                    }
-                }
-                let result_ty = if *is_expression {
-                    then_ty
-                } else if both_diverge {
-                    self.ctx.never()
-                } else {
-                    self.ctx.unit()
-                };
-                Ok((
-                    HirExpr::If {
-                        cond: Box::new(cond_hir),
-                        then_branch: then_hir,
-                        else_branch: else_hir,
-                        is_expression: *is_expression,
-                        ty: result_ty,
-                        span: *span,
-                    },
-                    result_ty,
-                ))
-            }
-            Expr::IfLet {
-                pattern,
-                scrutinee,
-                then_branch,
-                else_branch,
-                span,
-            } => {
-                let (scrut_hir, scrut_ty) = self.infer_expr(scrutinee)?;
-                let pattern_hir = self.check_pattern(pattern, scrut_ty)?;
-                let then_hir = self.check_block(then_branch)?;
-                let else_hir = else_branch
-                    .as_ref()
-                    .map(|b| self.check_block(b))
-                    .transpose()?;
-                let ty = self.ctx.unit();
-                Ok((
-                    HirExpr::IfLet {
-                        pattern: pattern_hir,
-                        scrutinee: Box::new(scrut_hir),
-                        then_branch: then_hir,
-                        else_branch: else_hir,
-                        ty,
-                        span: *span,
-                    },
-                    ty,
-                ))
-            }
-            Expr::Match {
-                scrutinee,
-                arms,
-                span,
-            } => {
-                let (scrut_hir, scrut_ty) = self.infer_expr(scrutinee)?;
-                let mut hir_arms = Vec::new();
-                let mut arm_ty = None;
-                for arm in arms {
-                    let pattern_hir = self.check_pattern(&arm.pattern, scrut_ty)?;
-                    let guard_hir = arm
-                        .guard
-                        .as_ref()
-                        .map(|g| {
-                            self.infer_expr(g).map(|(h, ty)| {
-                                if !self.ctx.is_bool(ty) {
-                                    self.diagnostics.push(
-                                        Diagnostic::error("match guard must be boolean")
-                                            .with_span(arm.span),
-                                    );
-                                }
-                                Box::new(h)
-                            })
-                        })
-                        .transpose()?;
-                    let (body_hir, body_ty) = self.infer_expr(&arm.body)?;
-                    if let Some(prev) = arm_ty {
-                        self.unify_with(prev, body_ty, arm.span, TypingContext::None)?;
-                    } else {
-                        arm_ty = Some(body_ty);
-                    }
-                    hir_arms.push(HirMatchArm {
-                        pattern: pattern_hir,
-                        guard: guard_hir,
-                        body: Box::new(body_hir),
-                        span: arm.span,
-                    });
-                }
-                let result_ty = arm_ty.unwrap_or(self.ctx.unit());
-
-                // ── Exhaustiveness check ────────────────────────────
-                // Check that all enum variants or finite values are covered
-                // by the match arms (unless `_` wildcard present).
-                // Use resolve_binding to see through any InferVar bindings.
-                let resolved_scrut_ty = self.ctx.resolve_binding(scrut_ty);
-                let has_wildcard = hir_arms
-                    .iter()
-                    .any(|a| matches!(a.pattern, HirPattern::Wildcard(_)));
-
-                if !has_wildcard {
-                    // Enumerate checked variants/patterns from all arms
-                    let mut covered_variants: Vec<String> = Vec::new();
-                    for arm in &hir_arms {
-                        match &arm.pattern {
-                            HirPattern::Enum { variant, .. } => {
-                                if !covered_variants.contains(variant) {
-                                    covered_variants.push(variant.clone());
-                                }
-                            }
-                            HirPattern::Or(patterns, _) => {
-                                for p in patterns {
-                                    if let HirPattern::Enum { variant, .. } = p {
-                                        if !covered_variants.contains(variant) {
-                                            covered_variants.push(variant.clone());
-                                        }
-                                    }
-                                }
-                            }
-                            HirPattern::Literal(expr, _) => {
-                                if let HirExpr::Literal(lit, _, _) = expr.as_ref() {
-                                    let lit_key = format!("{:?}", lit);
-                                    if !covered_variants.contains(&lit_key) {
-                                        covered_variants.push(lit_key);
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    // Path A: type has explicit enum variants
-                    if let Some(binding) = self.lookup_type_binding(resolved_scrut_ty) {
-                        let total_variants = binding.variants.len();
-                        if total_variants > 0 && covered_variants.len() < total_variants {
-                            let msg = binding.missing_match.clone().unwrap_or_else(|| {
-                                format!(
-                                    "non-exhaustive match: covered {}/{} variants; add missing arms or a `_` wildcard",
-                                    covered_variants.len(),
-                                    total_variants,
-                                )
-                            });
-                            self.diagnostics
-                                .push(Diagnostic::error(msg).with_span(*span));
-                        }
-                        // Path A.2: @exhaustive forbids wildcard
-                        if binding.exhaustive && has_wildcard && total_variants > 0 {
-                            self.diagnostics.push(
-                                Diagnostic::error(
-                                    "`@exhaustive` enum does not allow `_` wildcard; list all variants explicitly"
-                                ).with_span(*span)
-                            );
-                        }
-                    }
-
-                    // Path B: small finite type with literal patterns (Bool, etc.)
-                    // Use characteristic κ after resolving inference variables.
-                    // For InferVars, also check the variable kind directly
-                    // (characteristic returns usize::MAX for unresolved infer vars).
-                    let mut visited = Vec::new();
-                    let char = self.ctx.characteristic(resolved_scrut_ty, &mut visited);
-                    let total_count_from_char = match char {
-                        Characteristic::FiniteExhaustible(n) => Some(n),
-                        _ => None,
-                    };
-                    let inferred_count: Option<usize> = match self.ctx.get(resolved_scrut_ty) {
-                        TypeData::InferVar { id } => match self.infer.get_var_kind(*id) {
-                            Some(TypeVariableKind::Bool) => Some(2),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    // inferred_count takes priority over characteristic for unresolved vars
-                    let total_count = inferred_count.or(total_count_from_char);
-                    match total_count {
-                        Some(n) if n <= 256 && covered_variants.len() < (n as usize) => {
-                            let msg = format!(
-                                "non-exhaustive match: covered {}/{} possible values; add more arms or a `_` wildcard",
-                                covered_variants.len(),
-                                n,
-                            );
-                            self.diagnostics
-                                .push(Diagnostic::error(msg).with_span(*span));
-                        }
-                        _ => {}
-                    }
-                }
-
-                Ok((
-                    HirExpr::Match {
-                        scrutinee: Box::new(scrut_hir),
-                        arms: hir_arms,
-                        ty: result_ty,
-                        span: *span,
-                    },
-                    result_ty,
-                ))
-            }
-            Expr::Block(stmts, span) => {
-                let hir_stmts = self.check_block(stmts)?;
-                let ty = self.block_type(&hir_stmts);
-                Ok((HirExpr::Block(hir_stmts, ty, *span), ty))
-            }
-            Expr::Quantified {
-                quantifier,
-                binder,
-                range,
-                body,
-                span,
-            } => {
-                let (range_hir, _range_ty) = self.infer_expr(range)?;
-                let (body_hir, _body_ty) = self.infer_expr(body)?;
-                let bool_ty = self.ctx.bool();
-                Ok((
-                    HirExpr::Quantified {
-                        quantifier: *quantifier,
-                        binder: binder.clone(),
-                        range: Box::new(range_hir),
-                        body: Box::new(body_hir),
-                        ty: bool_ty,
-                        span: *span,
-                    },
-                    bool_ty,
-                ))
-            }
-            Expr::PolyBox {
-                expr,
-                scheme: _,
-                span,
-            } => {
-                let (hir_expr, inner_ty) = self.infer_expr(expr)?;
-                let resolved = self.ctx.resolve_binding(inner_ty);
-                match self.ctx.get(resolved).clone() {
-                    TypeData::Forall {
-                        param_index,
-                        param_name,
-                        body,
-                    } => {
-                        let mut all_q = vec![(param_index, param_name)];
-                        let mut inner_body = body;
-                        loop {
-                            match self.ctx.get(self.ctx.resolve_binding(inner_body)).clone() {
-                                TypeData::Forall {
-                                    param_index: pi,
-                                    param_name: pn,
-                                    body: b,
-                                } => {
-                                    all_q.push((pi, pn));
-                                    inner_body = b;
-                                }
-                                _ => break,
-                            }
-                        }
-                        let poly_ty = self.ctx.poly(all_q, inner_body);
-                        Ok((
-                            HirExpr::PolyBox {
-                                expr: Box::new(hir_expr),
-                                ty: poly_ty,
-                                span: *span,
-                            },
-                            poly_ty,
-                        ))
-                    }
-                    _ => {
-                        self.diagnostics.push(
-                            Diagnostic::error("poly(...) requires a polymorphic expression")
-                                .with_span(*span),
-                        );
-                        Ok((HirExpr::Error(*span), self.ctx.error()))
-                    }
-                }
-            }
-            Expr::PolyUnbox {
-                expr,
-                scheme: _,
-                span,
-            } => {
-                let (hir_expr, outer_ty) = self.infer_expr(expr)?;
-                let resolved = self.ctx.resolve_binding(outer_ty);
-                match self.ctx.get(resolved).clone() {
-                    TypeData::Poly { quantifiers, body } => {
-                        let subst_map: Vec<(usize, TypeId)> = quantifiers
-                            .iter()
-                            .map(|(idx, _name)| {
-                                let fresh =
-                                    self.infer.new_type_var(self.ctx, TypeVariableKind::Any);
-                                (*idx, fresh)
-                            })
-                            .collect();
-                        let mut inst_ty = body;
-                        for (idx, fresh_ty) in &subst_map {
-                            inst_ty = self.ctx.replace_generic(inst_ty, *idx, *fresh_ty);
-                        }
-                        // Root InferVar unified with instantiated type for proper propagation.
-                        let root = self.infer.new_type_var(self.ctx, TypeVariableKind::Any);
-                        self.ctx.unify(root, inst_ty).ok();
-                        Ok((
-                            HirExpr::PolyUnbox {
-                                expr: Box::new(hir_expr),
-                                ty: root,
-                                span: *span,
-                            },
-                            root,
-                        ))
-                    }
-                    TypeData::InferVar { .. } => {
-                        let result_ty = self.infer.new_type_var(self.ctx, TypeVariableKind::Any);
-                        Ok((
-                            HirExpr::PolyUnbox {
-                                expr: Box::new(hir_expr),
-                                ty: result_ty,
-                                span: *span,
-                            },
-                            result_ty,
-                        ))
-                    }
-                    _ => {
-                        self.diagnostics.push(
-                            Diagnostic::error("unbox(expr) requires a polytype").with_span(*span),
-                        );
-                        Ok((HirExpr::Error(*span), self.ctx.error()))
-                    }
-                }
-            }
-            Expr::Path(path, span) => {
-                self.diagnostics.push(
-                    Diagnostic::error(format!("unresolved path: {}", path.join("::")))
-                        .with_span(*span),
-                );
-                Ok((HirExpr::Error(*span), self.ctx.error()))
-            }
-            Expr::Error(span) => Ok((HirExpr::Error(*span), self.ctx.error())),
-        }
+        let mut fc = FnCtxt::new(self);
+        fc.infer_expr(expr)
     }
 
     fn check_expr(
@@ -2224,145 +1173,9 @@ impl<'a> TypeChecker<'a> {
         expected: Expectation,
         ctx: TypingContext,
     ) -> Result<HirExpr, Diagnostic> {
-        match expr {
-            Expr::Literal(_lit, span) => {
-                let (hir, ty) = self.infer_expr(expr)?;
-                if let Expectation::HasType(expected_ty) = expected {
-                    self.unify_with(expected_ty, ty, *span, TypingContext::None)?;
-                }
-                Ok(hir)
-            }
-            Expr::Ident(_, _) | Expr::TypeAnnotated { .. } => {
-                let (hir, ty) = self.infer_expr(expr)?;
-                if let Expectation::HasType(expected_ty) = expected {
-                    self.unify_with(expected_ty, ty, expr.span(), TypingContext::None)?;
-                }
-                Ok(hir)
-            }
-            Expr::If {
-                cond,
-                then_branch,
-                else_branch,
-                is_expression,
-                span,
-            } => {
-                if !*is_expression {
-                    return Err(
-                        Diagnostic::error("statement `if` used in check context").with_span(*span)
-                    );
-                }
-                let (cond_hir, cond_ty) = self.infer_expr(cond)?;
-                let cond_is_bool = self.ctx.is_bool(cond_ty)
-                    || matches!(self.ctx.get(cond_ty), TypeData::InferVar { id }
-                        if self.infer.get_var_kind(*id) == Some(TypeVariableKind::Bool));
-                if !cond_is_bool {
-                    self.diagnostics.push(
-                        Diagnostic::error("if condition must be boolean")
-                            .with_code("E004")
-                            .with_span(*span)
-                            .with_label(cond.span(), format!("got {:?}", self.ctx.get(cond_ty))),
-                    );
-                }
-                let then_hir = self.check_block(then_branch)?;
-                let then_ty = self.block_type(&then_hir);
-                let else_hir = else_branch
-                    .as_ref()
-                    .map(|b| self.check_block(b))
-                    .transpose()?;
-                let else_ty = else_hir
-                    .as_ref()
-                    .map(|h| self.block_type(h))
-                    .unwrap_or(self.ctx.unit());
-                let expected_ty = match expected {
-                    Expectation::HasType(ty) | Expectation::CastableToType(ty) => ty,
-                    Expectation::None => self.new_infer_var(TypeVariableKind::Unconstrained),
-                };
-                self.unify_with(expected_ty, then_ty, *span, TypingContext::None)?;
-                self.unify_with(expected_ty, else_ty, *span, TypingContext::None)?;
-                Ok(HirExpr::If {
-                    cond: Box::new(cond_hir),
-                    then_branch: then_hir,
-                    else_branch: else_hir,
-                    is_expression: true,
-                    ty: expected_ty,
-                    span: *span,
-                })
-            }
-            Expr::Match {
-                scrutinee,
-                arms,
-                span,
-            } => {
-                let (scrut_hir, scrut_ty) = self.infer_expr(scrutinee)?;
-                let mut hir_arms = Vec::new();
-                for arm in arms {
-                    let pattern_hir = self.check_pattern(&arm.pattern, scrut_ty)?;
-                    let guard_hir = arm
-                        .guard
-                        .as_ref()
-                        .map(|g| {
-                            self.infer_expr(g).map(|(h, ty)| {
-                                if !self.ctx.is_bool(ty) {
-                                    self.diagnostics.push(
-                                        Diagnostic::error("match guard must be boolean")
-                                            .with_span(arm.span),
-                                    );
-                                }
-                                Box::new(h)
-                            })
-                        })
-                        .transpose()?;
-                    let body_hir = self.check_expr(&arm.body, expected, TypingContext::None)?;
-                    hir_arms.push(HirMatchArm {
-                        pattern: pattern_hir,
-                        guard: guard_hir,
-                        body: Box::new(body_hir),
-                        span: arm.span,
-                    });
-                }
-                let expected_ty = match expected {
-                    Expectation::HasType(ty) | Expectation::CastableToType(ty) => ty,
-                    Expectation::None => {
-                        let last_arm = hir_arms
-                            .last()
-                            .map(|a| a.body.ty())
-                            .unwrap_or(self.ctx.unit());
-                        last_arm
-                    }
-                };
-                Ok(HirExpr::Match {
-                    scrutinee: Box::new(scrut_hir),
-                    arms: hir_arms,
-                    ty: expected_ty,
-                    span: *span,
-                })
-            }
-            Expr::Block(stmts, span) => {
-                let hir_stmts = self.check_block(stmts)?;
-                let ty = self.block_type(&hir_stmts);
-                let expected_ty = match expected {
-                    Expectation::HasType(expected_ty) => {
-                        self.unify_with(expected_ty, ty, *span, TypingContext::None)?;
-                        expected_ty
-                    }
-                    Expectation::CastableToType(expected_ty) => {
-                        self.unify_with(expected_ty, ty, *span, TypingContext::None)?;
-                        expected_ty
-                    }
-                    Expectation::None => ty,
-                };
-                Ok(HirExpr::Block(hir_stmts, expected_ty, *span))
-            }
-            _ => {
-                let (hir, ty) = self.infer_expr(expr)?;
-                if let Expectation::HasType(expected_ty) = expected {
-                    self.unify_with(expected_ty, ty, expr.span(), TypingContext::None)?;
-                }
-                Ok(hir)
-            }
-        }
+        let mut fc = FnCtxt::new(self);
+        fc.check_expr(expr, expected, ctx)
     }
-
     fn check_pattern(
         &mut self,
         pattern: &Pattern,
@@ -2384,11 +1197,53 @@ impl<'a> TypeChecker<'a> {
             Type::Path(p, s) if p.len() == 1 && (p[0] == "Self" || p[0] == "self") => {
                 self_ty.clone()
             }
-            Type::Reference(inner, mutable, s) => {
-                Type::Reference(Box::new(self.resolve_self_ty(inner, self_ty)), *mutable, *s)
+            Type::Reference { inner, mutable, span: s, .. } => {
+                Type::Reference {
+                    inner: Box::new(self.resolve_self_ty(inner, self_ty)),
+                    mutable: *mutable,
+                    lifetime: None,
+                    span: *s,
+                }
             }
             Type::Pointer(inner, s) => {
                 Type::Pointer(Box::new(self.resolve_self_ty(inner, self_ty)), *s)
+            }
+            Type::Generic(base, args, span) => {
+                let new_base = self.resolve_self_ty(base, self_ty);
+                let new_args: Vec<GenericArg> = args.iter().map(|a| {
+                    match a {
+                        GenericArg::Positional(t) => GenericArg::Positional(self.resolve_self_ty(t, self_ty)),
+                        GenericArg::Named(n, t) => GenericArg::Named(n.clone(), self.resolve_self_ty(t, self_ty)),
+                    }
+                }).collect();
+                Type::Generic(Box::new(new_base), new_args, *span)
+            }
+            Type::Tuple(tys, span) => {
+                Type::Tuple(tys.iter().map(|t| self.resolve_self_ty(t, self_ty)).collect(), *span)
+            }
+            Type::Slice(inner, span) => {
+                Type::Slice(Box::new(self.resolve_self_ty(inner, self_ty)), *span)
+            }
+            Type::Array(inner, size, span) => {
+                Type::Array(Box::new(self.resolve_self_ty(inner, self_ty)), size.clone(), *span)
+            }
+            Type::DynTrait(traits, span) => {
+                Type::DynTrait(traits.iter().map(|t| self.resolve_self_ty(t, self_ty)).collect(), *span)
+            }
+            Type::Function { params, ret, span } => {
+                Type::Function {
+                    params: params.iter().map(|p| self.resolve_self_ty(p, self_ty)).collect(),
+                    ret: Box::new(self.resolve_self_ty(ret, self_ty)),
+                    span: *span,
+                }
+            }
+            Type::Projection { impl_type, trait_path, assoc_name, span } => {
+                Type::Projection {
+                    impl_type: Box::new(self.resolve_self_ty(impl_type, self_ty)),
+                    trait_path: Box::new(self.resolve_self_ty(trait_path, self_ty)),
+                    assoc_name: assoc_name.clone(),
+                    span: *span,
+                }
             }
             other => other.clone(),
         }
@@ -2552,9 +1407,30 @@ impl<'a> TypeChecker<'a> {
         span: Span,
     ) -> Result<TypeId, Diagnostic> {
         self.unify_with(left, right, span, TypingContext::None)?;
+
+        // Helper: check if a type is or may become numeric (handles InferVar).
+        let is_or_may_be_numeric = |ty: TypeId| -> bool {
+            self.ctx.is_numeric(ty)
+                || matches!(self.ctx.get(ty), TypeData::InferVar { id }
+                    if self.infer.get_var_kind(*id) == Some(TypeVariableKind::Numeric)
+                        || self.infer.get_var_kind(*id) == Some(TypeVariableKind::Integer)
+                        || self.infer.get_var_kind(*id) == Some(TypeVariableKind::Float))
+        };
+        let is_or_may_be_integer = |ty: TypeId| -> bool {
+            self.ctx.is_integer(ty)
+                || matches!(self.ctx.get(ty), TypeData::InferVar { id }
+                    if self.infer.get_var_kind(*id) == Some(TypeVariableKind::Integer)
+                        || self.infer.get_var_kind(*id) == Some(TypeVariableKind::Numeric))
+        };
+        let is_or_may_be_bool = |ty: TypeId| -> bool {
+            self.ctx.is_bool(ty)
+                || matches!(self.ctx.get(ty), TypeData::InferVar { id }
+                    if self.infer.get_var_kind(*id) == Some(TypeVariableKind::Bool))
+        };
+
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
-                if self.ctx.is_numeric(left) =>
+                if is_or_may_be_numeric(left) =>
             {
                 Ok(left)
             }
@@ -2567,20 +1443,20 @@ impl<'a> TypeChecker<'a> {
             | BinOp::AddTrap
             | BinOp::SubTrap
             | BinOp::MulTrap
-                if self.ctx.is_integer(left) =>
+                if is_or_may_be_integer(left) =>
             {
                 Ok(left)
             }
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
-                if self.ctx.is_integer(left) =>
+                if is_or_may_be_integer(left) =>
             {
                 Ok(left)
             }
             BinOp::Eq | BinOp::Neq => Ok(self.ctx.bool()),
-            BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge if self.ctx.is_numeric(left) => {
+            BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge if is_or_may_be_numeric(left) => {
                 Ok(self.ctx.bool())
             }
-            BinOp::And | BinOp::Or if self.ctx.is_bool(left) => {
+            BinOp::And | BinOp::Or if is_or_may_be_bool(left) => {
                 self.unify_with(left, right, span, TypingContext::None)?;
                 Ok(self.ctx.bool())
             }
@@ -3195,7 +2071,9 @@ impl<'a> TypeChecker<'a> {
                         return value.ty();
                     }
                 }
-                HirStmt::Return { value: None, .. } => return self.ctx.never(),
+                HirStmt::Return { value: None, .. }
+                | HirStmt::Leave { .. }
+                | HirStmt::Continue { .. } => return self.ctx.never(),
                 _ => {}
             }
         }

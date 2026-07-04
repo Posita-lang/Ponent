@@ -1815,6 +1815,26 @@ impl InferenceContext {
     ) -> TypeId {
         replace_infer(ty, solution, ctx)
     }
+
+    /// Check for inference variables that remain unresolved and were
+    /// defaulted to `error` (unconstrained/any kind). Returns a list of
+    /// diagnostic messages describing the ambiguous variables.
+    pub fn check_unresolved(&self, ctx: &TypeContext) -> Vec<String> {
+        let mut results = Vec::new();
+        for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
+            let resolved = ctx.resolve_binding(ty_id);
+            if matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
+                if i < self.type_vars.len() {
+                    // Only report `Any` — `Unconstrained` is defaulted to error
+                    // by the solver as a normal fallback, not an ambiguity.
+                    if self.type_vars[i].kind == TypeVariableKind::Any {
+                        results.push(format!("unresolved type variable #{} (Any)", i));
+                    }
+                }
+            }
+        }
+        results
+    }
 }
 
 impl Default for InferenceContext {

@@ -221,6 +221,9 @@ pub enum Expr {
         body: Box<Expr>,
         span: Span,
     },
+    /// `old(expr)` — captures the value of `expr` at function entry.
+    /// Used in `ensures` clauses: `ensures *x == old(*x) + 1`.
+    Old(Box<Expr>, Span),
     Error(Span),
 }
 
@@ -438,6 +441,7 @@ pub struct Param {
 pub struct TypeParam {
     pub name: String,
     pub bounds: Vec<Type>,
+    pub is_lifetime: bool,
     pub span: Span,
 }
 
@@ -543,7 +547,12 @@ impl GenericArg {
 pub enum Type {
     Path(Vec<String>, Span),
     Generic(Box<Type>, Vec<GenericArg>, Span),
-    Reference(Box<Type>, bool, Span),
+    Reference {
+        inner: Box<Type>,
+        mutable: bool,
+        lifetime: Option<String>,
+        span: Span,
+    },
     Pointer(Box<Type>, Span),
     Slice(Box<Type>, Span),
     Array(Box<Type>, Box<Expr>, Span),
@@ -659,7 +668,7 @@ impl Type {
     pub fn span(&self) -> Span {
         match self {
             Type::Path(_, span)
-            | Type::Reference(_, _, span)
+            | Type::Reference { span, .. }
             | Type::Pointer(_, span)
             | Type::Slice(_, span)
             | Type::Array(_, _, span)
@@ -746,6 +755,7 @@ impl Expr {
             Expr::PolyBox { span, .. } => *span,
             Expr::PolyUnbox { span, .. } => *span,
             Expr::Quantified { span, .. } => *span,
+            Expr::Old(_, span) => *span,
             Expr::Error(span) => *span,
         }
     }

@@ -274,6 +274,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         // Adjust: method calls pass `self` as the first arg implicitly,
                         // so the param list from the declaration includes self.
                         // We treat `base` as the receiver and check remaining args.
+                        // Unify the receiver type with the `self` parameter type.
+                        if !param_tys.is_empty() {
+                            let self_param_ty = param_tys[0];
+                            // Try direct unification first (self = MyType, receiver = MyType)
+                            let mut unified = self.unify_with(self_param_ty, base_ty, *span, TypingContext::None).is_ok();
+                            if !unified {
+                                // If self param is a ref and receiver is a value, auto-ref
+                                if let TypeData::Ref { ty: inner_ref, .. } = self.checker.ctx.get(self_param_ty) {
+                                    let ref_base = self.checker.ctx.reference(base_ty, false);
+                                    unified = self.unify_with(self_param_ty, ref_base, *span, TypingContext::None).is_ok();
+                                }
+                            }
+                        }
                         let explicit_param_tys = if param_tys.len() > 1 {
                             &param_tys[1..] // skip self
                         } else {
@@ -471,16 +484,34 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
             Expr::FieldAccess { base, field, span } => {
                 let (base_hir, base_ty) = self.infer_expr(base)?;
-                let field_ty = self.checker.lookup_field(base_ty, field, *span)?;
-                Ok((
-                    HirExpr::FieldAccess {
-                        base: Box::new(base_hir),
-                        field: field.clone(),
-                        ty: field_ty,
-                        span: *span,
-                    },
-                    field_ty,
-                ))
+                // Try to resolve as a struct field first
+                if let Ok(field_ty) = self.checker.lookup_field(base_ty, field, *span) {
+                    return Ok((
+                        HirExpr::FieldAccess {
+                            base: Box::new(base_hir),
+                            field: field.clone(),
+                            ty: field_ty,
+                            span: *span,
+                        },
+                        field_ty,
+                    ));
+                }
+                // If not a field, try as a method via autoderef
+                if let Some((param_tys, ret_ty)) = self.checker.lookup_method(base_ty, field) {
+                    // Full function type including self parameter: fn(&Obj) -> RetTy
+                    let fn_ty = self.checker.ctx.function(param_tys, ret_ty);
+                    return Ok((
+                        HirExpr::FieldAccess {
+                            base: Box::new(base_hir),
+                            field: field.clone(),
+                            ty: fn_ty,
+                            span: *span,
+                        },
+                        fn_ty,
+                    ));
+                }
+                Err(Diagnostic::error(format!("no field or method '{}' on this type", field))
+                    .with_span(*span))
             }
             Expr::AttrAccess { base, attr, span } => {
                 let (base_hir, base_ty) = self.infer_expr(base)?;
@@ -717,7 +748,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         .ty
                         .as_ref()
                         .map(|t| self.resolve_type(t))
-                        .unwrap_or(Ok(self.checker.ctx.error()))?;
+                        .unwrap_or_else(|| Ok(self.new_infer_var(TypeVariableKind::Any)))?;
                     hir_params.push(HirParam {
                         name: param.name.clone(),
                         ty,
@@ -870,22 +901,24 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     .as_ref()
                     .map(|h| self.block_type(h))
                     .unwrap_or(self.checker.ctx.unit());
-                // Divergence detection: if both branches end in `return`, the result is never
-                let then_returns = then_hir
+                // Divergence detection: if both branches end in return/leave/continue, result is never
+                let then_diverges = then_hir
                     .last()
-                    .map_or(false, |s| matches!(s, HirStmt::Return { .. }));
-                let else_returns = else_hir
+                    .map_or(false, |s| matches!(s, HirStmt::Return { .. } | HirStmt::Leave { .. } | HirStmt::Continue { .. }));
+                let else_diverges = else_hir
                     .as_ref()
                     .and_then(|h| h.last())
-                    .map_or(false, |s| matches!(s, HirStmt::Return { .. }));
-                let both_diverge = then_returns && else_returns;
+                    .map_or(false, |s| matches!(s, HirStmt::Return { .. } | HirStmt::Leave { .. } | HirStmt::Continue { .. }));
+                let both_diverge = then_diverges && else_diverges;
                 if *is_expression && !both_diverge {
                     if then_ty != else_ty {
                         self.checker.ctx.unify(then_ty, else_ty).ok();
                     }
                 }
                 let result_ty = if *is_expression {
-                    then_ty
+                    if then_diverges { else_ty }
+                    else if else_diverges { then_ty }
+                    else { then_ty }
                 } else if both_diverge {
                     self.checker.ctx.never()
                 } else {
@@ -1173,6 +1206,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     }
                 }
             }
+            Expr::Old(expr, span) => {
+                // `old(expr)` captures the value at function entry.
+                // Infer the inner expression's type and wrap it.
+                let (hir, ty) = self.infer_expr(expr)?;
+                Ok((
+                    HirExpr::Old {
+                        expr: Box::new(hir),
+                        ty,
+                        span: *span,
+                    },
+                    ty,
+                ))
+            }
             Expr::PolyUnbox {
                 expr,
                 scheme: _,
@@ -1250,19 +1296,57 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     /// Check expression against a known type (bidirectional).
+    ///
+    /// First infers the expression's type, then unifies it with the
+    /// expected type when one is provided (e.g. annotated variable
+    /// declarations, function argument checking).
     pub fn check_expr(
         &mut self,
         expr: &Expr,
         expected: Expectation,
         ctx: TypingContext,
     ) -> Result<HirExpr, Diagnostic> {
-        self.check_expr(expr, expected, ctx)
+        // For Call expressions, propagate expected type for better type arg synthesis.
+        if let Expr::Call {
+            callee,
+            args: call_args,
+            comptime,
+            span,
+        } = expr
+        {
+            let expected_ty = match expected {
+                Expectation::HasType(ty) => Some(ty),
+                _ => None,
+            };
+            let (callee_hir, callee_ty) = self.infer_expr(callee)?;
+            // Try type argument synthesis with the expected return type hint.
+            if let Ok(Some((hir, _))) = self.checker.try_synthesize_type_args(
+                &callee_hir,
+                callee_ty,
+                call_args,
+                *comptime,
+                expected_ty,
+                *span,
+            ) {
+                return Ok(hir);
+            }
+            // Fall through to normal call handling via infer_expr.
+        }
+        let (hir, ty) = self.infer_expr(expr)?;
+        if let Expectation::HasType(expected_ty) = expected {
+            self.unify_with(expected_ty, ty, hir.span(), ctx)?;
+        }
+        Ok(hir)
     }
 
     /// Resolve a syntactic type to a TypeId — actual implementation.
     pub fn resolve_type(&mut self, ty: &Type) -> Result<TypeId, Diagnostic> {
         match ty {
             Type::Path(path, span) => {
+                // Lifetime parsed as placeholder path `["'a"]` — skip resolution.
+                if path.len() == 1 && path[0].starts_with('\'') {
+                    return Ok(self.checker.ctx.unit());
+                }
                 if let Ok(def_id) = self.checker.resolve_def_id(path) {
                     // Check if this is a generic type parameter (sentinel from resolve_def_id)
                     if def_id == DefId(usize::MAX - 1) {
@@ -1356,29 +1440,28 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     if path.len() == 1 {
                         match path[0].as_str() {
                             "Int" => {
-                                return Ok(self.checker.ctx.int(
-                                    self.checker.extract_int_from_type(args[0].ty()).unwrap_or(32),
-                                    true,
-                                ));
+                                let width = args.get(0)
+                                    .and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
+                                    .unwrap_or(32);
+                                return Ok(self.checker.ctx.int(width, true));
                             }
                             "UInt" => {
-                                return Ok(self.checker.ctx.int(
-                                    self.checker.extract_int_from_type(args[0].ty()).unwrap_or(32),
-                                    false,
-                                ));
+                                let width = args.get(0)
+                                    .and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
+                                    .unwrap_or(32);
+                                return Ok(self.checker.ctx.int(width, false));
                             }
                             "Float" => {
-                                return Ok(self.checker.ctx.float(
-                                    self.checker.extract_int_from_type(args[0].ty()).unwrap_or(64),
-                                ));
+                                let width = args.get(0)
+                                    .and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
+                                    .unwrap_or(64);
+                                return Ok(self.checker.ctx.float(width));
                             }
                             "Rational" => {
-                                let p = self.checker.extract_int_from_type(args[0].ty()).ok_or_else(|| {
-                                    Diagnostic::error("Rational requires a compile-time constant integer bit count for the integer part").with_span(*span)
-                                })?;
-                                let q = self.checker.extract_int_from_type(args[1].ty()).ok_or_else(|| {
-                                    Diagnostic::error("Rational requires a compile-time constant integer bit count for the fractional part").with_span(*span)
-                                })?;
+                                let p = args.get(0).and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
+                                    .ok_or_else(|| Diagnostic::error("Rational requires a compile-time constant integer bit count for the integer part").with_span(*span))?;
+                                let q = args.get(1).and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
+                                    .ok_or_else(|| Diagnostic::error("Rational requires a compile-time constant integer bit count for the fractional part").with_span(*span))?;
                                 if p == 0 || p > 64 || q == 0 || q > 64 {
                                     return Err(Diagnostic::error(
                                         "Rational bit counts must be 1..64",
@@ -1386,6 +1469,26 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                     .with_span(*span));
                                 }
                                 return Ok(self.checker.ctx.rational(p, q));
+                            }
+                            "Ptr" => {
+                                let mut size = self.checker.ctx.usize();
+                                let mut pointee = self.checker.ctx.error();
+                                for arg in args {
+                                    let ty = self.resolve_type(arg.ty())?;
+                                    match arg {
+                                        GenericArg::Named(name, _) if name == "size" => size = ty,
+                                        GenericArg::Named(name, _) if name == "pointee" => pointee = ty,
+                                        GenericArg::Positional(_) => {
+                                            if self.checker.ctx.is_error(pointee) { pointee = ty; }
+                                            else { size = ty; }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                return Ok(self.checker.ctx.ptr(size, pointee));
+                            }
+                            "USize" => {
+                                return Ok(self.checker.ctx.usize());
                             }
                             _ => {}
                         }
@@ -1429,7 +1532,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     ),
                 }
             }
-            Type::Reference(ty, mutable, _) => {
+            Type::Reference { inner: ty, mutable, .. } => {
                 let inner = self.resolve_type(ty)?;
                 Ok(self.checker.ctx.reference(inner, *mutable))
             }
@@ -1664,6 +1767,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             if (self.ctx().is_numeric(from) && self.ctx().is_numeric(to))
                 || (self.ctx().is_reference(from) && self.ctx().is_pointer(to))
                 || (self.ctx().is_pointer(from) && self.ctx().is_reference(to))
+                || (self.ctx().is_integer(from) && self.ctx().is_pointer(to))
+                || (self.ctx().is_pointer(from) && self.ctx().is_integer(to))
             {
                 Ok(to)
             } else if self.ctx().is_reference(from) && self.ctx().is_integer(to) {
@@ -1711,6 +1816,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     /// Check a pattern against an expected type.
     pub fn check_pattern(
+        &mut self,
+        pattern: &Pattern,
+        expected_ty: TypeId,
+    ) -> Result<HirPattern, Diagnostic> {
+        let hir = self.check_pattern_inner(pattern, expected_ty)?;
+        // Automatically register all pattern-bound variables into local scope
+        register_pattern_bindings(&mut self.checker.local_variable_types, &hir);
+        Ok(hir)
+    }
+
+    /// Inner pattern check, without side-effect variable registration.
+    fn check_pattern_inner(
         &mut self,
         pattern: &Pattern,
         expected_ty: TypeId,
@@ -1840,7 +1957,21 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 inner,
                 span,
             } => {
-                let def_id = self.checker.resolve_def_id(path)?;
+                let def_id = if path.is_empty() {
+                    // Bare variant like `Some(x)` — infer enum from expected type
+                    let resolved = self.checker.ctx.resolve_binding(expected_ty);
+                    match self.checker.ctx.get(resolved) {
+                        TypeData::Enum { def_id, .. } => *def_id,
+                        _ => {
+                            return Err(Diagnostic::error(
+                                "cannot infer enum type from bare variant pattern; use qualified path like `Opt::Some(x)`",
+                            )
+                            .with_span(*span));
+                        }
+                    }
+                } else {
+                    self.checker.resolve_def_id(path)?
+                };
                 let binding = self
                     .checker
                     .symbols
@@ -1899,6 +2030,50 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 }
 
+/// Walk a checked pattern and register every `HirPattern::Ident` binding
+/// into `local_variable_types` so the body of if-let / while-let / for / match
+/// can reference the bound variable.
+pub(super) fn register_pattern_bindings(
+    local_variable_types: &mut HashMap<String, TypeId>,
+    pattern: &HirPattern,
+) {
+    match pattern {
+        HirPattern::Ident(name, ty, _) => {
+            local_variable_types.insert(name.clone(), *ty);
+        }
+        HirPattern::Tuple(patterns, _) => {
+            for p in patterns {
+                register_pattern_bindings(local_variable_types, p);
+            }
+        }
+        HirPattern::Slice(before, rest, after, _) => {
+            for p in before {
+                register_pattern_bindings(local_variable_types, p);
+            }
+            if let Some(p) = rest {
+                register_pattern_bindings(local_variable_types, p);
+            }
+            for p in after {
+                register_pattern_bindings(local_variable_types, p);
+            }
+        }
+        HirPattern::Struct { fields, .. } => {
+            for (_, p) in fields {
+                register_pattern_bindings(local_variable_types, p);
+            }
+        }
+        HirPattern::Enum { inner: Some(p), .. } => {
+            register_pattern_bindings(local_variable_types, p);
+        }
+        HirPattern::Or(patterns, _) => {
+            for p in patterns {
+                register_pattern_bindings(local_variable_types, p);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Recursively rename `Ident(old_name)` → `Ident(new_name)` in an expression tree.
 fn replace_ident_in_expr(expr: &mut Expr, old_name: &str, new_name: &str) {
     match expr {
@@ -1910,6 +2085,7 @@ fn replace_ident_in_expr(expr: &mut Expr, old_name: &str, new_name: &str) {
         | Expr::LeaveWith { expr: e, .. }
         | Expr::PolyBox { expr: e, .. }
         | Expr::PolyUnbox { expr: e, .. }
+        | Expr::Old(e, _)
         | Expr::TypeAnnotated { expr: e, .. } => replace_ident_in_expr(e, old_name, new_name),
         Expr::BinaryOp { left, right, .. } => {
             replace_ident_in_expr(left, old_name, new_name);

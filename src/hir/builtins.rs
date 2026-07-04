@@ -141,11 +141,13 @@ pub fn register_builtins(
         let result_t = TypeParam {
             name: "T".to_string(),
             bounds: vec![],
+            is_lifetime: false,
             span: Span::new(0, 0),
         };
         let result_e = TypeParam {
             name: "E".to_string(),
             bounds: vec![],
+            is_lifetime: false,
             span: Span::new(0, 0),
         };
         let ok_variant = EnumVariant {
@@ -184,6 +186,7 @@ pub fn register_builtins(
         let option_t = TypeParam {
             name: "T".to_string(),
             bounds: vec![],
+            is_lifetime: false,
             span: Span::new(0, 0),
         };
         let none_variant = EnumVariant {
@@ -222,6 +225,7 @@ pub fn register_builtins(
         let future_t = TypeParam {
             name: "T".to_string(),
             bounds: vec![],
+            is_lifetime: false,
             span: Span::new(0, 0),
         };
         let output_variant = EnumVariant {
