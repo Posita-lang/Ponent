@@ -413,6 +413,7 @@ pub enum Stmt {
         trait_path: Option<Vec<String>>,
         for_type: Type,
         methods: Vec<ImplMethod>,
+        associated_types: Vec<AssociatedType>,
         where_clause: Option<WhereClause>,
         type_params: Vec<TypeParam>,
     },

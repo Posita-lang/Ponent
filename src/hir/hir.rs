@@ -165,6 +165,7 @@ pub enum HirStmt {
         trait_path: Option<Vec<String>>,
         for_type: TypeId,
         methods: Vec<ImplMethod>,
+        associated_types: Vec<AssociatedType>,
     },
     Error,
 }

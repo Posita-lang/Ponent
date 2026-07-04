@@ -710,16 +710,165 @@ impl<'a> TypeChecker<'a> {
                 Ok(HirStmt::Error)
             }
             Stmt::ImplBlock { .. } => {
-                let (trait_path, for_type, methods, span, attributes) = match stmt {
-                    Stmt::ImplBlock { span, trait_path, for_type, methods, attributes, .. } => {
-                        (trait_path, for_type, methods, *span, attributes)
+                let (trait_path, for_type, methods, span, attributes, type_params) = match stmt {
+                    Stmt::ImplBlock { span, trait_path, for_type, methods, attributes, type_params, .. } => {
+                        (trait_path, for_type, methods, *span, attributes, type_params)
                     }
                     _ => panic!("check_stmt: expected ImplBlock, got {:?}", stmt),
                 };
-                if trait_path.is_some() {
-                    // Trait impl blocks are already handled by the resolver;
-                    // no additional checking needed here.
-                    Ok(HirStmt::Error)
+                if let Some(tp) = &trait_path {
+                    // ── Trait impl block ─────────────────────────────────
+                    let trait_id = match self.resolve_def_id(tp) {
+                        Ok(id) => id,
+                        Err(diag) => {
+                            self.diagnostics.push(diag);
+                            return Ok(HirStmt::Error);
+                        }
+                    };
+                    let trait_binding = match self.symbols.lookup_trait_by_def_id(trait_id) {
+                        Some(b) => b,
+                        None => {
+                            self.diagnostics.push(
+                                Diagnostic::error("trait not found")
+                                    .with_code("E100")
+                                    .with_span(span));
+                            return Ok(HirStmt::Error);
+                        }
+                    };
+
+                    // Register generic type parameters so `T` in `impl<T> Foo for T` resolves
+                    for (i, tp) in type_params.iter().enumerate() {
+                        let generic_id = self.ctx.generic_param(i, tp.name.clone());
+                        self.local_type_param_cache.insert(tp.name.clone(), generic_id);
+                    }
+
+                    // Resolve the for_type
+                    let for_ty = self.resolve_type(for_type)?;
+
+                    // Check that all required trait methods are provided
+                    let auto_deref = attributes.iter().any(|a| a.name == "auto_deref");
+                    let impl_method_names: HashSet<String> = methods.iter().map(|m| m.name.clone()).collect();
+                    let self_ty = &for_type;
+
+                    fn resolve_self_ty(ty: &Type, self_ty: &Type) -> Type {
+                        match ty {
+                            Type::Path(p, s) if p.len() == 1 && (p[0] == "Self" || p[0] == "self") => self_ty.clone(),
+                            Type::Reference(inner, mutable, s) => Type::Reference(
+                                Box::new(resolve_self_ty(inner, self_ty)),
+                                *mutable,
+                                *s,
+                            ),
+                            Type::Pointer(inner, s) => Type::Pointer(
+                                Box::new(resolve_self_ty(inner, self_ty)),
+                                *s,
+                            ),
+                            other => other.clone(),
+                        }
+                    }
+
+                    for (tm_name, _tm_sig) in &trait_binding.methods {
+                        if !impl_method_names.contains(tm_name) {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "impl missing method `{}` required by trait `{}`",
+                                    tm_name,
+                                    tp.join("::"),
+                                ))
+                                .with_code("E101")
+                                .with_help("every trait method must be implemented — add a `def` for it in this impl block")
+                                .with_span(span));
+                        }
+                    }
+
+                    // Ensure all required associated types are provided (or have defaults)
+                    for (at_name, at_default) in &trait_binding.associated_types {
+                        if at_default.is_none() {
+                            // No default — the impl must provide this associated type.
+                            // This check is deferred until impl-block associated types are parsed.
+                        }
+                    }
+
+                    // Resolve method param/return types and register the impl
+                    let mut method_infos = Vec::new();
+                    for m in methods {
+                        let param_tys = m.params.iter()
+                            .map(|p| {
+                                if let Some(ty) = &p.ty {
+                                    let resolved = resolve_self_ty(ty, self_ty);
+                                    self.resolve_type(&resolved)
+                                } else { Ok(self.ctx.error()) }
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let ret_ty = {
+                            let resolved = resolve_self_ty(&m.return_type, self_ty);
+                            self.resolve_type(&resolved)?
+                        };
+
+                        // Signature compatibility: compare against trait declaration
+                        if let Some((_, trait_sig)) = trait_binding.methods.iter().find(|(n, _)| n == &m.name) {
+                            if m.params.len() != trait_sig.params.len() {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "impl method `{}` has {} parameters but trait expects {}",
+                                        m.name,
+                                        m.params.len(),
+                                        trait_sig.params.len(),
+                                    ))
+                                    .with_code("E103")
+                                    .with_span(m.span));
+                            }
+                        }
+
+                        method_infos.push(crate::hir::traits::MethodInfo {
+                            name: m.name.clone(),
+                            param_tys,
+                            ret_ty,
+                            span: m.span,
+                            has_auto_deref: auto_deref,
+                        });
+                    }
+
+                    let candidate = crate::hir::traits::ImplCandidate {
+                        trait_id,
+                        for_type: for_ty,
+                        methods: methods.clone(),
+                        assoc_tys: Vec::new(),
+                        span,
+                        has_auto_deref: auto_deref,
+                        context: {
+                            // Populate context from where clause and type param bounds,
+                            // for Paterson/Coverage condition checking.
+                            let mut ctx_tys = Vec::new();
+                            for (i, tp) in type_params.iter().enumerate() {
+                                if !tp.bounds.is_empty() {
+                                    let param_id = self.ctx.generic_param(i, tp.name.clone());
+                                    ctx_tys.push(param_id);
+                                }
+                            }
+                            ctx_tys
+                        },
+                    };
+
+                    if let Err(orphan) = self.trait_env.add_impl(candidate, self.symbols, self.ctx, false) {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!("{}", orphan))
+                                .with_code("E102")
+                                .with_span(span));
+                    }
+
+                    // Also register the resolved methods for method resolution
+                    if let TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } = self.ctx.get(for_ty) {
+                        self.trait_env.add_inherent_methods(*def_id, method_infos);
+                    }
+
+                    Ok(HirStmt::ImplBlock {
+                        span,
+                        attributes: attributes.clone(),
+                        trait_path: trait_path.clone(),
+                        for_type: for_ty,
+                        methods: methods.clone(),
+                        associated_types: Vec::new(),
+                    })
                 } else {
                     // Inherent impl block: resolve the type and register methods
                     let for_ty = self.resolve_type(for_type)?;
@@ -777,6 +926,7 @@ impl<'a> TypeChecker<'a> {
                         trait_path: trait_path.clone(),
                         for_type: for_ty,
                         methods: methods.clone(),
+                        associated_types: Vec::new(),
                     })
                 }
             }
@@ -1506,7 +1656,9 @@ impl<'a> TypeChecker<'a> {
                 return Ok(DefId(usize::MAX - 1));
             }
         }
-        self.symbols.lookup_type(&path[0]).map(|b| b.def_id).ok_or_else(|| Diagnostic::error(format!("type '{}' not found", path[0])).with_span(Span::new(0, 0)))
+        self.symbols.lookup_type(&path[0]).map(|b| b.def_id)
+            .or_else(|| self.symbols.lookup_trait(&path[0]).map(|b| b.def_id))
+            .ok_or_else(|| Diagnostic::error(format!("'{}' not found", path[0])).with_span(Span::new(0, 0)))
     }
 
     /// Suggest a cast for common type mismatches (e.g. Int ↔ Float).

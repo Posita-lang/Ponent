@@ -2368,11 +2368,33 @@ impl<'source> Parser<'source> {
         };
         self.expect(Token::LBrace)?;
         let mut methods = Vec::new();
+        let mut associated_types = Vec::new();
         loop {
             if matches!(self.peek(), Ok(Token::RBrace)) {
                 break;
             }
-            methods.push(self.parse_impl_method()?);
+            if matches!(self.peek(), Ok(Token::Type)) {
+                self.advance().ok();
+                let assoc_name = match self.advance() {
+                    Ok(Token::Ident(n)) => n,
+                    _ => {
+                        return Err(Diagnostic::error("expected associated type name")
+                            .with_code("E004")
+                            .with_help("`type` in an impl block must be followed by a name — e.g. `type Output = Int<32>;`")
+                            .with_span(self.span(),));
+                    }
+                };
+                self.expect(Token::Assign)?;
+                let assoc_ty = self.parse_type()?;
+                self.expect(Token::Semicolon)?;
+                associated_types.push(AssociatedType {
+                    name: assoc_name,
+                    default: Some(assoc_ty),
+                    span: Span::new(start, self.span().end),
+                });
+            } else {
+                methods.push(self.parse_impl_method()?);
+            }
         }
         self.expect(Token::RBrace)?;
         let end = self.span().end;
@@ -2382,6 +2404,7 @@ impl<'source> Parser<'source> {
             trait_path,
             for_type,
             methods,
+            associated_types,
             where_clause,
             type_params,
         })
