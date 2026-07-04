@@ -1,8 +1,9 @@
 use crate::ast::Program;
 use crate::lexer::Token;
 use crate::parser::Parser;
+use crate::diagnostics::Diagnostic;
 use logos::Logos;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Kind of a VFS node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,16 +16,20 @@ pub enum VfsNodeKind {
 
 /// A node in the virtual file system tree.
 /// Each node can lazily load its source text, tokens, and AST.
+/// Nodes form a tree via `children`; parent relationships are tracked by
+/// `parent_id` rather than an owned `parent` pointer, avoiding recursive
+/// cloning of the entire ancestor chain.
 #[derive(Debug, Clone)]
 pub struct VfsNode {
     pub kind: VfsNodeKind,
     pub name: String,
     pub id: usize,
-    pub parent: Option<Box<VfsNode>>,
     pub src: Option<String>,
     pub tokens: Option<Vec<Token>>,
     pub ast: Option<Program>,
     pub children: Option<Vec<VfsNode>>,
+    /// Absolute virtual path in the VFS tree (e.g. `/src/main.ps`).
+    pub abs_path: Option<String>,
     /// Absolute filesystem path this node maps to (if backed by a real file).
     pub fs_path: Option<String>,
 }
@@ -35,20 +40,21 @@ pub enum VfsError {
     Io(String),
     Lex(String),
     Parse(String),
+    Diagnostics(Vec<Diagnostic>),
 }
 
 impl VfsNode {
     /// Create a new file node.
-    pub fn new_file(id: usize, name: &str, parent: Option<Box<VfsNode>>) -> Self {
+    pub fn new_file(id: usize, name: &str) -> Self {
         VfsNode {
             kind: VfsNodeKind::File,
             name: name.to_string(),
             id,
-            parent,
             src: None,
             tokens: None,
             ast: None,
             children: None,
+            abs_path: None,
             fs_path: None,
         }
     }
@@ -59,11 +65,11 @@ impl VfsNode {
             kind,
             name: name.to_string(),
             id,
-            parent: None,
             src: None,
             tokens: None,
             ast: None,
             children: Some(Vec::new()),
+            abs_path: None,
             fs_path: None,
         }
     }
@@ -127,41 +133,32 @@ impl VfsNode {
                 self.ast = Some(program);
                 Ok(())
             }
-            Err(diags) => {
-                let msg = diags
-                    .into_iter()
-                    .map(|d| format!("{}", d.message))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                Err(VfsError::Parse(msg))
-            }
+            Err(diags) => Err(VfsError::Diagnostics(diags)),
         }
     }
 
-    /// Compute the absolute path in the VFS tree (e.g. `/src/main.ps`).
-    pub fn absolute_path(&self) -> String {
-        let mut segments = Vec::new();
-        segments.push(self.name.clone());
-        let mut current = &self.parent;
-        while let Some(parent) = current {
-            segments.push(parent.name.clone());
-            current = &parent.parent;
-        }
-        segments.reverse();
-        format!("/{}", segments.join("/"))
+    /// Return the absolute virtual path in the VFS tree.
+    /// Panics if `abs_path` was not set during construction.
+    pub fn absolute_path(&self) -> &str {
+        self.abs_path
+            .as_deref()
+            .unwrap_or("<unknown>")
     }
 
     /// Recursively scan a real directory and build a VFS tree from it.
-    pub fn scan_fs(root: &std::path::Path, id_counter: &mut usize) -> Result<VfsNode, VfsError> {
+    /// `prefix` is the virtual path prefix accumulated from ancestors.
+    pub fn scan_fs(root: &Path, id_counter: &mut usize) -> Result<VfsNode, VfsError> {
         let name = root
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| root.to_string_lossy().to_string());
+        let abs_path = root.to_string_lossy().to_string();
 
         if root.is_dir() {
             let mut node = VfsNode::new_dir(*id_counter, &name, VfsNodeKind::Directory);
             *id_counter += 1;
-            node.fs_path = Some(root.to_string_lossy().to_string());
+            node.fs_path = Some(abs_path.clone());
+            node.abs_path = Some(abs_path);
 
             let mut children = Vec::new();
             let entries = std::fs::read_dir(root)
@@ -186,26 +183,15 @@ impl VfsNode {
                 let mut child = if path.is_dir() {
                     Self::scan_fs(&path, id_counter)?
                 } else if path.extension().map_or(false, |ext| ext == "ps") {
-                    let mut f = VfsNode::new_file(*id_counter, &child_name, None);
+                    let mut f = VfsNode::new_file(*id_counter, &child_name);
                     *id_counter += 1;
-                    f.fs_path = Some(path.to_string_lossy().to_string());
-                    f.kind = VfsNodeKind::File;
+                    let child_abs = path.to_string_lossy().to_string();
+                    f.abs_path = Some(child_abs.clone());
+                    f.fs_path = Some(child_abs);
                     f
                 } else {
                     continue; // skip non-.ps files
                 };
-
-                child.parent = Some(Box::new(VfsNode {
-                    kind: node.kind,
-                    name: node.name.clone(),
-                    id: node.id,
-                    parent: None,
-                    src: None,
-                    tokens: None,
-                    ast: None,
-                    children: None,
-                    fs_path: node.fs_path.clone(),
-                }));
 
                 children.push(child);
             }
@@ -213,9 +199,10 @@ impl VfsNode {
             node.children = Some(children);
             Ok(node)
         } else {
-            let mut node = VfsNode::new_file(*id_counter, &name, None);
+            let mut node = VfsNode::new_file(*id_counter, &name);
             *id_counter += 1;
-            node.fs_path = Some(root.to_string_lossy().to_string());
+            node.abs_path = Some(abs_path.clone());
+            node.fs_path = Some(abs_path);
             Ok(node)
         }
     }
@@ -223,6 +210,7 @@ impl VfsNode {
 
 impl std::fmt::Display for VfsNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({:?})", self.name, self.kind)
+        let path = self.absolute_path();
+        write!(f, "{} ({:?})", path, self.kind)
     }
 }
