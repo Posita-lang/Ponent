@@ -1202,6 +1202,7 @@ impl<'a> NameResolver<'a> {
             Type::Never(..) => self.ctx.never(),
             Type::Union(tys, ..) => self.ctx.error(),
             Type::Error(..) => self.ctx.error(),
+            Type::Expr(expr, ..) => self.resolve_expr(expr).unwrap_or(self.ctx.error()),
         }
     }
 

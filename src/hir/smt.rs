@@ -19,13 +19,13 @@ static Z3_WARNED: OnceLock<bool> = OnceLock::new();
 /// binary, add `z3 = { version = "0.20.2", features = ["vendored"] }`
 /// to Cargo.toml and replace this module's internals with the z3 crate API.
 pub struct SmtSolver {
-    z3_path: String,
+    solver_path: String,
 }
 
 impl SmtSolver {
-    pub fn new(z3_path: &str) -> Self {
+    pub fn new(solver_path: &str) -> Self {
         SmtSolver {
-            z3_path: z3_path.to_string(),
+            solver_path: solver_path.to_string(),
         }
     }
 
@@ -206,7 +206,7 @@ impl SmtSolver {
         if smt.is_empty() {
             return None;
         }
-        let mut child = match Command::new(&self.z3_path)
+        let mut child = match Command::new(&self.solver_path)
             .arg("-in")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -216,7 +216,7 @@ impl SmtSolver {
             Ok(c) => c,
             Err(e) => {
                 Z3_WARNED.get_or_init(|| {
-                    eprintln!("warning: Z3 ({}) not found: {}; unicity check uses fallback heuristic", self.z3_path, e);
+                    eprintln!("warning: SMT solver ({}) not found: {}; unicity check uses fallback heuristic", self.solver_path, e);
                     true
                 });
                 return None;

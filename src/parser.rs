@@ -11,11 +11,28 @@ bitflags! {
         const ALLOW_TYPE_PARAMS = 1 << 1;
         const STMT_EXPR         = 1 << 2;
         const VALUE_BLOCK       = 1 << 3;
+        /// When set, comparison operators (>, >=, <, <=, ==, !=) are
+        /// treated as expression terminators rather than infix operators.
+        /// Used inside generic argument parsing so that a const expression
+        /// like `Val >> 2` does not consume the closing `>`.
+        const NO_COMPARISON     = 1 << 4;
     }
 }
 
-pub struct Parser<'source> {
-    lexer: logos::Lexer<'source, Token>,
+/// A fully-buffered token: the token itself plus its source span.
+/// All tokens are lexed upfront into a `Vec<SpannedToken>`, avoiding
+/// the lifetime coupling of `logos::Lexer` and enabling arbitrary
+/// lookahead without cloning the lexer state. This mirrors the
+/// `TokenCursor` / `TokenStream` architecture used by rustc.
+#[derive(Debug, Clone)]
+struct SpannedToken {
+    token: Token,
+    span: Span,
+}
+
+pub struct Parser {
+    tokens: Vec<SpannedToken>,
+    cursor: usize,
     peeked: Option<Result<Token, ()>>,
     pending: Vec<Token>,
     pub diagnostics: Vec<Diagnostic>,
@@ -26,10 +43,26 @@ pub struct Parser<'source> {
 
 // Local Diagnostic removed — using crate::diagnostics::Diagnostic
 
-impl<'source> Parser<'source> {
-    pub fn new(source: &'source str) -> Self {
+impl Parser {
+    pub fn new(source: &str) -> Self {
+        // Lex all tokens upfront into a buffer.
+        let mut tokens = Vec::new();
+        let mut lexer = Token::lexer(source);
+        loop {
+            let (token, span_range) = match lexer.next() {
+                Some(Ok(Token::WhitespaceOrComment)) => continue,
+                Some(Ok(token)) => (token, lexer.span()),
+                Some(Err(())) => continue,
+                None => break,
+            };
+            tokens.push(SpannedToken {
+                token,
+                span: Span::new(span_range.start, span_range.end),
+            });
+        }
         Parser {
-            lexer: Token::lexer(source),
+            tokens,
+            cursor: 0,
             peeked: None,
             pending: Vec::new(),
             diagnostics: Vec::new(),
@@ -40,16 +73,16 @@ impl<'source> Parser<'source> {
     }
 
     fn next_token(&mut self) -> Result<Token, ()> {
+        // Check the pending stack first (e.g. Shr-split Gt).
         if let Some(tok) = self.pending.pop() {
             return Ok(tok);
         }
-        loop {
-            match self.lexer.next() {
-                Some(Ok(Token::WhitespaceOrComment)) => continue,
-                Some(Ok(other)) => return Ok(other),
-                Some(Err(())) => return Err(()),
-                None => return Err(()),
-            }
+        if self.cursor < self.tokens.len() {
+            let st = &self.tokens[self.cursor];
+            self.cursor += 1;
+            Ok(st.token.clone())
+        } else {
+            Err(())
         }
     }
 
@@ -68,8 +101,54 @@ impl<'source> Parser<'source> {
     }
 
     fn span(&self) -> Span {
-        let range = self.lexer.span();
-        Span::new(range.start, range.end)
+        if self.cursor > 0 && self.cursor - 1 < self.tokens.len() {
+            self.tokens[self.cursor - 1].span
+        } else if self.cursor < self.tokens.len() {
+            self.tokens[self.cursor].span
+        } else if !self.tokens.is_empty() {
+            self.tokens[self.tokens.len() - 1].span
+        } else {
+            Span::new(0, 0)
+        }
+    }
+
+    /// Rustc-style pre-check: does the current token definitively start a
+    /// const generic argument rather than a type? When true, the generic arg
+    /// loop parses directly as an expression without any type-first attempt.
+    fn check_const_arg(&mut self) -> bool {
+        match self.peek() {
+            Ok(Token::FloatLiteral(_))
+            | Ok(Token::True) | Ok(Token::False)
+            | Ok(Token::CharLiteral(_)) | Ok(Token::StringLiteral(_))
+            | Ok(Token::ByteStringLiteral(_))
+            | Ok(Token::Minus) | Ok(Token::Plus) | Ok(Token::Bang)
+            | Ok(Token::LParen) | Ok(Token::LBracket)
+            | Ok(Token::If) | Ok(Token::Match) => true,
+            Ok(Token::Ident(_)) => matches!(self.peek_next(), Some(Token::LParen)),
+            _ => false,
+        }
+    }
+
+    /// Consume `>` potentially by splitting `>>` into two `>` tokens.
+    /// This mirrors rustc's `break_and_eat` approach: in generic contexts,
+    /// `>>` is ambiguous — it could be a right-shift or two closing angle brackets.
+    /// `expect_gt()` greedily treats it as the latter, pushing the second `>`
+    /// onto the pending stack for the outer generic level.
+    fn expect_gt(&mut self) -> Result<(), Diagnostic> {
+        match self.peek() {
+            Ok(Token::Gt) => {
+                self.advance().ok();
+                Ok(())
+            }
+            Ok(Token::Shr) => {
+                self.advance().ok();
+                self.pending.push(Token::Gt);
+                Ok(())
+            }
+            _ => Err(Diagnostic::error("expected '>'")
+                .with_code("E004")
+                .with_span(self.span(),)),
+        }
     }
 
     fn expect(&mut self, expected: Token) -> Result<Token, Diagnostic> {
@@ -729,8 +808,8 @@ impl<'source> Parser<'source> {
                 Ok(Token::Comma) => {
                     self.advance().ok();
                 }
-                Ok(Token::Gt) => {
-                    self.advance().ok();
+                Ok(Token::Gt) | Ok(Token::Shr) => {
+                    self.expect_gt()?;
                     break;
                 }
                 _ => {
@@ -1065,23 +1144,88 @@ impl<'source> Parser<'source> {
                         self.advance().ok();
                         let mut args = Vec::new();
                         loop {
-                            let arg = self.parse_type()?;
+                            // Save state BEFORE check_const_arg / parse_type,
+                            // since both may advance the cursor via peek().
+                            let cp_cursor = self.cursor;
+                            let cp_peeked = self.peeked.clone();
+                            let cp_pending = self.pending.clone();
+                            let started_as_int = self.tokens.get(cp_cursor)
+                                .map(|st| matches!(st.token, Token::IntLiteral(_)))
+                                .unwrap_or(false);
+                            // Rustc-style pre-check: if the token definitively starts a const
+                            // expression, parse it directly without any type-first attempt.
+                            let arg = if self.check_const_arg() {
+                                let expr = self.with_restrictions(
+                                    ParseRestrictions::NO_COMPARISON,
+                                    |this| this.parse_expr(),
+                                )?;
+                                let span = expr.span();
+                                Type::Expr(Box::new(expr), span)
+                            } else {
+                                // Ambiguous case (typically an Ident that could be a type name
+                                // or a const variable). Try type first, backtrack if an
+                                // expression-only operator follows.
+                                match self.parse_type() {
+                                    Ok(ty) => {
+                                        // Only backtrack on Shr after Ident if the token
+                                        // AFTER Shr could start an expression. This avoids
+                                        // false positives on nested generic closing `>>`
+                                        // like `Bar<Baz>>` where `Baz` is an Ident followed
+                                        // by two closing brackets, not a right-shift.
+                                        let next_is_shr = matches!(self.peek(), Ok(Token::Shr))
+                                            && matches!(self.peek_next(),
+                                                Some(Token::IntLiteral(_))
+                                                | Some(Token::FloatLiteral(_))
+                                                | Some(Token::True) | Some(Token::False)
+                                                | Some(Token::CharLiteral(_))
+                                                | Some(Token::StringLiteral(_))
+                                                | Some(Token::ByteStringLiteral(_))
+                                                | Some(Token::Ident(_))
+                                                | Some(Token::LParen) | Some(Token::LBracket)
+                                                | Some(Token::Minus) | Some(Token::Plus)
+                                                | Some(Token::Bang) | Some(Token::Tilde));
+                                        let next_is_expr_op = (!started_as_int && next_is_shr)
+                                            || matches!(self.peek(),
+                                                Ok(Token::Plus) | Ok(Token::Minus)
+                                                | Ok(Token::Star) | Ok(Token::Slash) | Ok(Token::Percent)
+                                                | Ok(Token::Shl) | Ok(Token::Ampersand)
+                                                | Ok(Token::Pipe) | Ok(Token::Caret)
+                                                | Ok(Token::LParen) | Ok(Token::LBracket)
+                                                | Ok(Token::Dot) | Ok(Token::Apostrophe));
+                                        if next_is_expr_op {
+                                            self.cursor = cp_cursor;
+                                            self.peeked = cp_peeked;
+                                            self.pending = cp_pending;
+                                            let expr = self.with_restrictions(
+                                                ParseRestrictions::NO_COMPARISON,
+                                                |this| this.parse_expr(),
+                                            )?;
+                                            let span = expr.span();
+                                            Type::Expr(Box::new(expr), span)
+                                        } else {
+                                            ty
+                                        }
+                                    }
+                                    Err(_) => {
+                                        self.cursor = cp_cursor;
+                                        self.peeked = cp_peeked;
+                                        self.pending = cp_pending;
+                                        let expr = self.with_restrictions(
+                                            ParseRestrictions::NO_COMPARISON,
+                                            |this| this.parse_expr(),
+                                        )?;
+                                        let span = expr.span();
+                                        Type::Expr(Box::new(expr), span)
+                                    }
+                                }
+                            };
                             args.push(arg);
                             match self.peek() {
                                 Ok(Token::Comma) => {
                                     self.advance().ok();
                                 }
-                                Ok(Token::Gt) => {
-                                    self.advance().ok();
-                                    break;
-                                }
-                                Ok(Token::Shr) => {
-                                    // `>>` is lexed as one Shr token, but in generic
-                                    // type context it means two closing `>`.
-                                    // Consume the Shr and push back one `Gt` so the
-                                    // outer generic level also gets its closing bracket.
-                                    self.advance().ok();
-                                    self.pending.push(Token::Gt);
+                                Ok(Token::Gt) | Ok(Token::Shr) => {
+                                    self.expect_gt()?;
                                     break;
                                 }
                                 _ => {
@@ -2729,6 +2873,23 @@ impl<'source> Parser<'source> {
                 if lbp < min_bp {
                     break;
                 }
+                // When NO_COMPARISON is active, skip comparison operators
+                // (>, >=, <, <=, ==, !=) so they don't consume the closing
+                // `>` of a generic in const expressions like `Val >> 2>`.
+                if self.restrictions.contains(ParseRestrictions::NO_COMPARISON) {
+                    let is_compare = matches!(
+                        token_opt,
+                        Some(Token::Gt)
+                            | Some(Token::Ge)
+                            | Some(Token::Lt)
+                            | Some(Token::Le)
+                            | Some(Token::EqEq)
+                            | Some(Token::Neq)
+                    );
+                    if is_compare {
+                        break;
+                    }
+                }
                 lhs = self.parse_infix(lhs, lbp)?;
             } else {
                 break;
@@ -3709,17 +3870,13 @@ impl<'source> Parser<'source> {
         if let Some(tok) = self.pending.last() {
             return Some(tok.clone());
         }
-        // Ensure the current token is consumed into peeked, so the cloned lexer
-        // is positioned at the *following* token rather than re-reading the same one.
+        // Ensure the current token is consumed into peeked, so the cursor
+        // is at the *following* token rather than re-reading the same one.
         self.peek();
-        let mut lexer = self.lexer.clone();
-        loop {
-            match lexer.next() {
-                Some(Ok(Token::WhitespaceOrComment)) => continue,
-                Some(Ok(tok)) => return Some(tok),
-                _ => return None,
-            }
-        }
+        // If peeked is Some, advance() consumed the cursor one step.
+        // The next token in the buffer is at cursor + offset.
+        let offset = if self.peeked.is_some() { 0 } else { 0 };
+        self.tokens.get(self.cursor + offset).map(|st| st.token.clone())
     }
 
     fn parse_if_expr(&mut self) -> Result<Expr, Diagnostic> {
@@ -4521,5 +4678,79 @@ mod tests {
             }
             _ => panic!("expected TypeDef with where clause"),
         }
+    }
+
+    // ── Nested generics and >> disambiguation ─────────────────────
+
+    #[test]
+    fn test_nested_generics_double_gt() {
+        let program = check_parse("def main() { set x: Vec<Vec<Int<32>>> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_nested_generics_triple() {
+        let program = check_parse("def main() { set x: Map<String<Int<8>>, Vec<Int<32>>> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_const_expr_generic_arg() {
+        // Array size as a simple expression: `[Int<32>; N + 1]`
+        let src = "def main() { set arr: [Int<32>; 10] = 0; }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_nested_generics_with_shr_expr() {
+        // `>>` as right-shift inside a const generic argument:
+        //   Foo<Int, Val >> 2>
+        // The >> must be consumed by the expression parser as a right-shift,
+        // NOT split into two > by expect_gt.
+        let program = check_parse("def main() { set x: Foo<Int, Val >> 2> = 0; }");
+        assert_eq!(program.items.len(), 1);
+        // Verify the second generic arg is Type::Expr, not split into separate args
+        match &program.items[0] {
+            Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+                Stmt::VariableDef { ty: Some(Type::Generic(_, args, _)), .. } => {
+                    assert_eq!(args.len(), 2, "generic should have 2 args: Int and Val>>2");
+                    assert!(matches!(&args[1], Type::Expr(..)),
+                        "second arg should be Type::Expr (Val >> 2), got {:?}", args[1]);
+                }
+                _ => panic!("expected VariableDef with type annotation"),
+            },
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_generic_right_shift_expr() {
+        // Combined: Vec<Vec<Int<32>>> (>> split by expect_gt) and
+        // a separate type with a right-shift expression arg.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let src = "def main() { set x: Vec<Vec<Int<32>>> = 0; set y: Array<Int, Count >> 4> = 0; }";
+            let mut parser = Parser::new(src);
+            parser.parse_program()
+        }));
+        assert!(result.is_ok(), "nested generics + const expr with >> should parse");
+    }
+
+    #[test]
+    fn test_const_expr_int_literal_arith() {
+        let program = check_parse("def main() { set x: Foo<Int, 5 + 3> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_bitwidth_not_confused_with_expr() {
+        let program = check_parse("def main() { set x: Int<32> = 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_const_expr_int_literal_sub() {
+        let program = check_parse("def main() { set x: Foo<Int, 10 - 3> = 0; }");
+        assert_eq!(program.items.len(), 1);
     }
 }

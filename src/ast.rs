@@ -556,6 +556,9 @@ pub enum Type {
     Literal(Box<Expr>, Span),
     Never(Span),
     Union(Vec<Type>, Span),
+    /// A constant expression where a type is expected, e.g. array sizes
+    /// `[Int<32>; N + 1]` or generic const args `<Array<Int, N>>`.
+    Expr(Box<Expr>, Span),
     Error(Span),
 }
 
@@ -648,6 +651,7 @@ impl Type {
             | Type::Literal(_, span)
             | Type::Never(span)
             | Type::Union(_, span)
+            | Type::Expr(_, span)
             | Type::Error(span) => *span,
             Type::Generic(_, _, span) => *span,
         }
