@@ -389,10 +389,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     hir_params.push(HirParam { name: param.name.clone(), ty, default: None, span: param.span });
                     param_tys.push(ty);
                 }
-                let ret_ty = return_type.as_ref().map(|t| self.resolve_type(t)).unwrap_or(Ok(self.checker.ctx.unit()))?;
                 self.checker.push_ctx(CtxKind::Closure, *span, None);
                 let body_hir = self.check_block(body)?;
+                let body_ty = self.block_type(&body_hir);
                 self.checker.pop_ctx();
+                let ret_ty = match return_type {
+                    Some(ty) => {
+                        let declared = self.resolve_type(ty)?;
+                        self.checker.unify_with(declared, body_ty, *span, TypingContext::ClosureBody)?;
+                        declared
+                    }
+                    None => body_ty,
+                };
                 let ty = self.checker.ctx.function(param_tys, ret_ty);
                 Ok((HirExpr::Closure { params: hir_params, return_type: ret_ty, captures: captures.clone(), body: body_hir, ty, span: *span }, ty))
             }

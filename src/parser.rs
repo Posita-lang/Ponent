@@ -2332,31 +2332,37 @@ impl<'source> Parser<'source> {
             self.advance().ok(); // consume `for`
             None
         } else if matches!(self.peek(), Ok(Token::Ident(_))) {
-            let mut path = Vec::new();
-            path.push(match self.advance() {
-                Ok(Token::Ident(name)) => name,
-                _ => {
-                    return Err(Diagnostic::error("expected trait name")
-                        .with_code("E004")
-                        .with_help("expected a trait name in `impl ... for Type` — e.g. `impl Display for MyType { ... }`")
-                        .with_suggestion("add a trait name: `impl TraitName for MyType { ... }`")
-                        .with_span(self.span(),));
-                }
-            });
-            while matches!(self.peek(), Ok(Token::ColonColon)) {
-                self.advance().ok();
+            // Peek ahead: if followed by `{` or `where`, this is an inherent impl
+            // `impl TypeName { ... }`, not a trait impl `impl Trait for Type`.
+            if matches!(self.peek_next(), Some(Token::LBrace) | Some(Token::Where)) {
+                None
+            } else {
+                let mut path = Vec::new();
                 path.push(match self.advance() {
-                    Ok(Token::Ident(part)) => part,
+                    Ok(Token::Ident(name)) => name,
                     _ => {
-                        return Err(Diagnostic::error("expected identifier after '::'")
+                        return Err(Diagnostic::error("expected trait name")
                             .with_code("E004")
-                            .with_help("`::` must be followed by an identifier — e.g. `std::collections::HashMap`")
+                            .with_help("expected a trait name in `impl ... for Type` — e.g. `impl Display for MyType { ... }`")
+                            .with_suggestion("add a trait name: `impl TraitName for MyType { ... }`")
                             .with_span(self.span(),));
                     }
                 });
+                while matches!(self.peek(), Ok(Token::ColonColon)) {
+                    self.advance().ok();
+                    path.push(match self.advance() {
+                        Ok(Token::Ident(part)) => part,
+                        _ => {
+                            return Err(Diagnostic::error("expected identifier after '::'")
+                                .with_code("E004")
+                                .with_help("`::` must be followed by an identifier — e.g. `std::collections::HashMap`")
+                                .with_span(self.span(),));
+                        }
+                    });
+                }
+                self.expect(Token::For)?;
+                Some(path)
             }
-            self.expect(Token::For)?;
-            Some(path)
         } else {
             None
         };
