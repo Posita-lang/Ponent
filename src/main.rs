@@ -17,6 +17,7 @@ mod lexer;
 mod parser;
 mod vfs;
 
+use crate::diagnostics::Diagnostic;
 use clap::Parser;
 use hir::checker::TypeChecker;
 use hir::resolver::NameResolver;
@@ -24,6 +25,14 @@ use hir::types::{CrateId, DefId, TypeContext};
 use logos::Logos;
 use std::fs;
 use std::process;
+
+fn emit_error_diags(diags: &[Diagnostic]) {
+    for diag in diags {
+        if diag.is_error() {
+            eprintln!("{}", diag);
+        }
+    }
+}
 
 fn main() {
     let cli = cli::Cli::parse();
@@ -68,27 +77,20 @@ fn main() {
                                         println!("Type checking succeeded.");
                                     }
                                     Err(errors) => {
-                                        for err in errors.into_inner() {
-                                            eprintln!("type error: {:?}", err);
-                                        }
+                                        emit_error_diags(&errors.into_inner());
                                         process::exit(1);
                                     }
                                 }
                             }
                             Err(errors) => {
-                                for diag in errors.into_inner() {
-                                    eprintln!("error: {:?}", diag);
-                                }
+                                emit_error_diags(&errors.into_inner());
                                 process::exit(1);
                             }
                         }
                     }
                 }
                 Err(diagnostics) => {
-                    for diag in diagnostics {
-                        let span_str = diag.span.map(|s| format!("{}", s)).unwrap_or_default();
-                        eprintln!("error: {} [at {}]", diag.message, span_str);
-                    }
+                    emit_error_diags(&diagnostics);
                     process::exit(1);
                 }
             }
