@@ -2253,7 +2253,12 @@ impl<'a> TypeChecker<'a> {
 
     fn extract_int_from_type(&self, ty: &Type) -> Option<u8> {
         if let Type::Literal(expr, _) = ty {
-            if let Expr::Literal(Literal::Int(val), _) = expr.as_ref() { return Some(*val as u8); }
+            if let Expr::Literal(Literal::Int(val), _) = expr.as_ref() {
+                if *val > 64 {
+                    return None; // reject out-of-range bit widths silently
+                }
+                return Some(*val as u8);
+            }
         }
         None
     }

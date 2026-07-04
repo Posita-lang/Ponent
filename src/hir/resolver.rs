@@ -1223,6 +1223,9 @@ impl<'a> NameResolver<'a> {
         match ty {
             Type::Literal(expr, _) => {
                 if let Expr::Literal(Literal::Int(val), _) = expr.as_ref() {
+                    if *val > 64 {
+                        return None;
+                    }
                     Some(*val as u8)
                 } else {
                     None
