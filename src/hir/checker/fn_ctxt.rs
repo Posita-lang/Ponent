@@ -597,6 +597,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let ty = self.block_type(&hir_stmts);
                 Ok((HirExpr::Block(hir_stmts, ty, *span), ty))
             }
+            Expr::Quantified { quantifier: _, binder: _, range, body, span } => {
+                let _range_hir = self.infer_expr(range)?;
+                let _body_hir = self.infer_expr(body)?;
+                let bool_ty = self.checker.ctx.bool();
+                Ok((HirExpr::Error(*span), bool_ty))
+            }
             Expr::PolyBox { expr, scheme: _, span } => {
                 // Infer the inner expression type.
                 let (hir_expr, inner_ty) = self.infer_expr(expr)?;

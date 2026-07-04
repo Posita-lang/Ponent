@@ -3026,6 +3026,50 @@ impl<'source> Parser<'source> {
                     Ok(expr)
                 }
             }
+            Ok(Token::Forall) | Ok(Token::Exists) => {
+                let quantifier = match self.advance().map_err(|_| unreachable!())? {
+                    Token::Forall => Quantifier::Forall,
+                    Token::Exists => Quantifier::Exists,
+                    _ => unreachable!(),
+                };
+                let binder = match self.advance() {
+                    Ok(Token::Ident(name)) => name,
+                    Ok(tok) => {
+                        return Err(Diagnostic::error(format!(
+                            "expected binder name after {:?}, found {:?}",
+                            quantifier, tok
+                        ))
+                        .with_code("E004")
+                        .with_help(format!(
+                            "`{:?}` must be followed by a binder variable and `in <range>`",
+                            quantifier
+                        ))
+                        .with_suggestion("try `forall i in 0..n: arr[i] > 0`")
+                        .with_span(self.span(),));
+                    }
+                    Err(()) => {
+                        return Err(Diagnostic::error(format!(
+                            "unexpected end of file after {:?}",
+                            quantifier
+                        ))
+                        .with_code("E002")
+                        .with_help("quantified expression is incomplete")
+                        .with_span(self.span(),));
+                    }
+                };
+                self.expect(Token::In)?;
+                let range = self.parse_expr()?;
+                self.expect(Token::Colon)?;
+                let body = self.parse_expr()?;
+                let end = self.span().end;
+                Ok(Expr::Quantified {
+                    quantifier,
+                    binder,
+                    range: Box::new(range),
+                    body: Box::new(body),
+                    span: Span::new(start, end),
+                })
+            }
             _ => Err(Diagnostic::error("expected expression")
                 .with_code("E007")
                 .with_help("expected a valid expression — try a literal, variable, `if`, `match`, `|...| { }` closure, or prefix operator")

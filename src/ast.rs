@@ -71,6 +71,13 @@ pub enum Rounding {
     Floor,
 }
 
+/// Quantifier kind for `forall` / `exists` expressions in contracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quantifier {
+    Forall,
+    Exists,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Literal, Span),
@@ -203,6 +210,15 @@ pub enum Expr {
         expr: Box<Expr>,
         /// Optional expected result scheme type.
         scheme: Option<TypeScheme>,
+        span: Span,
+    },
+    /// Quantified expression: `forall i in 0..n: body` or `exists i in range: body`.
+    /// Used in contract position (`requires forall i in 0..arr'len: arr[i] > 0`).
+    Quantified {
+        quantifier: Quantifier,
+        binder: String,
+        range: Box<Expr>,
+        body: Box<Expr>,
         span: Span,
     },
     Error(Span),
@@ -703,6 +719,7 @@ impl Expr {
             Expr::Block(_, span) => *span,
             Expr::PolyBox { span, .. } => *span,
             Expr::PolyUnbox { span, .. } => *span,
+            Expr::Quantified { span, .. } => *span,
             Expr::Error(span) => *span,
         }
     }

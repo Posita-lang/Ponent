@@ -1308,6 +1308,12 @@ impl<'a> TypeChecker<'a> {
                 let ty = self.block_type(&hir_stmts);
                 Ok((HirExpr::Block(hir_stmts, ty, *span), ty))
             }
+            Expr::Quantified { quantifier: _, binder: _, range, body, span } => {
+                let _range_hir = self.infer_expr(range)?;
+                let _body_hir = self.infer_expr(body)?;
+                let bool_ty = self.ctx.bool();
+                Ok((HirExpr::Error(*span), bool_ty))
+            }
             Expr::PolyBox { expr, scheme: _, span } => {
                 let (hir_expr, inner_ty) = self.infer_expr(expr)?;
                 let resolved = self.ctx.resolve_binding(inner_ty);

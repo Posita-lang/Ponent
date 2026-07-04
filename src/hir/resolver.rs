@@ -950,6 +950,11 @@ impl<'a> NameResolver<'a> {
                 self.exit_scope();
                 last_ty
             }
+            Expr::Quantified { range, body, .. } => {
+                self.resolve_expr(range);
+                self.resolve_expr(body);
+                Some(self.ctx.error())
+            }
             Expr::PolyBox { expr, .. } => {
                 self.resolve_expr(expr);
                 Some(self.ctx.error())
