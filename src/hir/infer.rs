@@ -543,9 +543,10 @@ impl InferenceContext {
         match ctx.get(resolved) {
             TypeData::Fn { params, .. } => PrincipalShape::Arrow,
             TypeData::Tuple { elems } => PrincipalShape::Tuple(elems.len()),
-            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
+            TypeData::App { args, .. } => {
                 PrincipalShape::Constructor(args.len())
             }
+            TypeData::Struct { .. } | TypeData::Enum { .. } => PrincipalShape::Constructor(0),
             TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } => {
                 PrincipalShape::Poly
             }
@@ -928,7 +929,7 @@ impl InferenceContext {
                     self.s_inst_copy_deepen(ctx, e);
                 }
             }
-            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
+            TypeData::App { args, .. } => {
                 for a in args {
                     self.s_inst_copy_deepen(ctx, a);
                 }
@@ -1186,7 +1187,7 @@ impl InferenceContext {
             } => elems
                 .iter()
                 .any(|&e| Self::check_rigid_escape(ctx, e, max_level)),
-            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => args
+            TypeData::App { args, .. } => args
                 .iter()
                 .any(|&a| Self::check_rigid_escape(ctx, a, max_level)),
             TypeData::Forall { body, .. }
@@ -1927,27 +1928,15 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
         | TypeData::Error
         | TypeData::Poly { .. } => ty,
         TypeData::GenericParam { .. } => ty,
-        TypeData::Struct { def_id, args } => {
+        TypeData::Struct { def_id } => ty,  // zero-arg, nothing to replace
+        TypeData::Enum { def_id } => ty,    // zero-arg, nothing to replace
+        TypeData::App { def_id, args } => {
             let new_args: Vec<TypeId> = args
                 .iter()
                 .map(|&a| replace_infer(a, solution, ctx))
                 .collect();
-            ctx.find_type(&TypeData::Struct {
-                def_id,
-                args: new_args,
-            })
-            .unwrap_or(ctx.error())
-        }
-        TypeData::Enum { def_id, args } => {
-            let new_args: Vec<TypeId> = args
-                .iter()
-                .map(|&a| replace_infer(a, solution, ctx))
-                .collect();
-            ctx.find_type(&TypeData::Enum {
-                def_id,
-                args: new_args,
-            })
-            .unwrap_or(ctx.error())
+            ctx.find_type(&TypeData::App { def_id, args: new_args })
+                .unwrap_or(ctx.error())
         }
         TypeData::Tuple { elems } => {
             let new_elems: Vec<TypeId> = elems

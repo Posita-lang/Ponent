@@ -39,6 +39,10 @@ pub enum TypeTag {
     Nu = 27,
     Poly = 28,
     Rational = 29,
+    /// Generic type application: `App(def_id, [args])` — a unified representation
+    /// for parameterized types (struct, enum, or other type constructors applied
+    /// to their type arguments).  Inspired by Vix-lang's `TypeKind::App`.
+    App = 30,
 }
 
 impl From<&TypeData> for TypeTag {
@@ -71,6 +75,7 @@ impl From<&TypeData> for TypeTag {
             TypeData::Nu { .. } => TypeTag::Nu,
             TypeData::Poly { .. } => TypeTag::Poly,
             TypeData::Rational { .. } => TypeTag::Rational,
+            TypeData::App { .. } => TypeTag::App,
             TypeData::Never => TypeTag::Never,
             TypeData::Unit => TypeTag::Unit,
             TypeData::Error => TypeTag::Error,
@@ -114,11 +119,9 @@ pub enum TypeData {
     USize,
     Struct {
         def_id: DefId,
-        args: Vec<TypeId>,
     },
     Enum {
         def_id: DefId,
-        args: Vec<TypeId>,
     },
     Tuple {
         elems: Vec<TypeId>,
@@ -207,6 +210,14 @@ pub enum TypeData {
     Rational {
         int_bits: u8,
         frac_bits: u8,
+    },
+    /// Generic type application: `App(def_id, [args, ...])`.
+    /// A unified representation for parameterized types — the type constructor
+    /// identified by `def_id` (a struct, enum, or other named type) applied
+    /// to its type arguments.  Inspired by Vix-lang's `TypeKind::App`.
+    App {
+        def_id: DefId,
+        args: Vec<TypeId>,
     },
     Never,
     Unit,
@@ -329,7 +340,6 @@ impl TypeContext {
         // Str type: represented as a zero-sized struct with a sentinel DefId.
         ctx.builtin_str = ctx.alloc(TypeData::Struct {
             def_id: DefId(usize::MAX),
-            args: vec![],
         });
         // &Str = Ref { ty: Str, mutable: false }
         ctx.builtin_str_ref = ctx.reference(ctx.builtin_str, false);
@@ -402,6 +412,7 @@ impl TypeContext {
         match &self.types[resolved.index()].as_ref() {
             TypeData::Struct { def_id, .. } => Some(*def_id),
             TypeData::Enum { def_id, .. } => Some(*def_id),
+            TypeData::App { def_id, .. } => Some(*def_id),
             _ => None,
         }
     }
@@ -459,13 +470,21 @@ impl TypeContext {
     }
 
     pub fn struct_ty(&mut self, def_id: DefId, args: Vec<TypeId>) -> TypeId {
-        let id = self.alloc(TypeData::Struct { def_id, args });
+        let id = if args.is_empty() {
+            self.alloc(TypeData::Struct { def_id })
+        } else {
+            self.alloc(TypeData::App { def_id, args })
+        };
         self.def_id_to_type_id.insert(def_id, id);
         id
     }
 
     pub fn enum_ty(&mut self, def_id: DefId, args: Vec<TypeId>) -> TypeId {
-        let id = self.alloc(TypeData::Enum { def_id, args });
+        let id = if args.is_empty() {
+            self.alloc(TypeData::Enum { def_id })
+        } else {
+            self.alloc(TypeData::App { def_id, args })
+        };
         self.def_id_to_type_id.insert(def_id, id);
         id
     }
@@ -858,7 +877,7 @@ impl TypeContext {
                 });
                 edges
             }
-            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => args
+            TypeData::App { args, .. } => args
                 .iter()
                 .map(|&a| VarianceEdge { target: a, sign: 1 })
                 .collect(),
@@ -917,7 +936,7 @@ impl TypeContext {
                 params.iter().any(|&p| self.type_contains_param(param, p))
                     || self.type_contains_param(param, *ret)
             }
-            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
+            TypeData::App { args, .. } => {
                 args.iter().any(|&a| self.type_contains_param(param, a))
             }
             TypeData::Tuple { elems } => elems.iter().any(|&e| self.type_contains_param(param, e)),
@@ -1031,19 +1050,12 @@ impl TypeContext {
                     .collect();
                 self.tuple(new_elems)
             }
-            TypeData::Struct { def_id, args } => {
+            TypeData::App { def_id, args } => {
                 let new_args: Vec<TypeId> = args
                     .iter()
                     .map(|&a| self.replace_generic(a, param_index, replacement))
                     .collect();
-                self.struct_ty(def_id, new_args)
-            }
-            TypeData::Enum { def_id, args } => {
-                let new_args: Vec<TypeId> = args
-                    .iter()
-                    .map(|&a| self.replace_generic(a, param_index, replacement))
-                    .collect();
-                self.enum_ty(def_id, new_args)
+                self.alloc(TypeData::App { def_id, args: new_args })
             }
             TypeData::Coproduct { alternatives } => {
                 let new_alts: Vec<TypeId> = alternatives
@@ -1084,9 +1096,10 @@ impl TypeContext {
         }
         let resolved = self.resolve_binding(ty);
         match &self.types[resolved.index()].as_ref() {
-            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
+            TypeData::App { args, .. } => {
                 args.iter().any(|&a| self.occurs_check(param, a))
             }
+            TypeData::Struct { .. } | TypeData::Enum { .. } => false,
             TypeData::Tuple { elems } => elems.iter().any(|&e| self.occurs_check(param, e)),
             TypeData::Coproduct { alternatives } => {
                 alternatives.iter().any(|&a| self.occurs_check(param, a))
@@ -1242,31 +1255,31 @@ impl TypeContext {
 
             // ── Compound types: same variant, recursive sub-component unification ──
 
-            // Struct: same def_id, same args length, unify args pairwise (invariant).
+            // Struct: same def_id (zero-arg only)
             (
-                TypeData::Struct {
-                    def_id: d1,
-                    args: a1,
-                },
-                TypeData::Struct {
-                    def_id: d2,
-                    args: a2,
-                },
-            ) if d1 == d2 && a1.len() == a2.len() => {
-                for (t1, t2) in a1.iter().zip(a2.iter()) {
-                    self.unify_internal(*t1, *t2, Variance::Invariant)?;
-                }
+                TypeData::Struct { def_id: d1 },
+                TypeData::Struct { def_id: d2 },
+            ) if d1 == d2 => {
                 self.bindings.borrow_mut().insert(a, b);
                 Ok(b)
             }
 
-            // Enum: same as Struct
+            // Enum: same def_id (zero-arg only)
             (
-                TypeData::Enum {
+                TypeData::Enum { def_id: d1 },
+                TypeData::Enum { def_id: d2 },
+            ) if d1 == d2 => {
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // App: same def_id, same args length, unify args pairwise (invariant).
+            (
+                TypeData::App {
                     def_id: d1,
                     args: a1,
                 },
-                TypeData::Enum {
+                TypeData::App {
                     def_id: d2,
                     args: a2,
                 },
@@ -1700,14 +1713,9 @@ impl TypeContext {
             | TypeData::Never
             | TypeData::Unit
             | TypeData::Error => ty,
-            TypeData::Struct { def_id, args } => {
+            TypeData::App { def_id, args } => {
                 let new_args: Vec<TypeId> = args.iter().map(|&a| self.subst(a, subst)).collect();
-                self.struct_ty_no_alloc(*def_id, new_args)
-                    .unwrap_or(self.error())
-            }
-            TypeData::Enum { def_id, args } => {
-                let new_args: Vec<TypeId> = args.iter().map(|&a| self.subst(a, subst)).collect();
-                self.enum_ty_no_alloc(*def_id, new_args)
+                self.find_type(&TypeData::App { def_id: *def_id, args: new_args })
                     .unwrap_or(self.error())
             }
             TypeData::Tuple { elems } => {
@@ -1821,11 +1829,11 @@ impl TypeContext {
     }
 
     fn struct_ty_no_alloc(&self, def_id: DefId, args: Vec<TypeId>) -> Option<TypeId> {
-        self.find_type(&TypeData::Struct { def_id, args })
+        self.find_type(&TypeData::App { def_id, args })
     }
 
     fn enum_ty_no_alloc(&self, def_id: DefId, args: Vec<TypeId>) -> Option<TypeId> {
-        self.find_type(&TypeData::Enum { def_id, args })
+        self.find_type(&TypeData::App { def_id, args })
     }
 
     fn tuple_ty_no_alloc(&self, elems: Vec<TypeId>) -> Option<TypeId> {
@@ -1962,13 +1970,14 @@ impl TypeContext {
     pub fn type_constructor_depth(&self, ty: TypeId) -> usize {
         match self.get(ty) {
             TypeData::GenericParam { .. } | TypeData::InferVar { .. } => 0,
-            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
+            TypeData::App { args, .. } => {
                 1 + args
                     .iter()
                     .map(|a| self.type_constructor_depth(*a))
                     .max()
                     .unwrap_or(0)
             }
+            TypeData::Struct { .. } | TypeData::Enum { .. } => 1,
             TypeData::Tuple { elems }
             | TypeData::Coproduct {
                 alternatives: elems,
@@ -2365,7 +2374,7 @@ impl TypeContext {
                     Characteristic::FiniteExhaustible(total)
                 }
             }
-            TypeData::Struct { def_id: _, args } | TypeData::Enum { def_id: _, args } => {
+            TypeData::App { args, .. } => {
                 let mut has_infinite = false;
                 for &arg in args {
                     match self.characteristic_with_variance(arg, visited, has_non_covariant_path) {
@@ -2379,6 +2388,9 @@ impl TypeContext {
                 } else {
                     Characteristic::FiniteExhaustible(usize::MAX)
                 }
+            }
+            TypeData::Struct { .. } | TypeData::Enum { .. } => {
+                Characteristic::FiniteExhaustible(usize::MAX)
             }
             TypeData::Array { elem, size } => {
                 match self.characteristic_with_variance(*elem, visited, has_non_covariant_path) {

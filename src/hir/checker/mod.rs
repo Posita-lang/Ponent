@@ -1171,7 +1171,7 @@ impl<'a> TypeChecker<'a> {
                     }
 
                     // Also register the resolved methods for method resolution
-                    if let TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } =
+                    if let TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } | TypeData::App { def_id, .. } =
                         self.ctx.get(for_ty)
                     {
                         self.trait_env.add_inherent_methods(*def_id, method_infos);
@@ -1189,7 +1189,7 @@ impl<'a> TypeChecker<'a> {
                     // Inherent impl block: resolve the type and register methods
                     let for_ty = self.resolve_type(for_type)?;
                     let for_def_id = match self.ctx.get(for_ty) {
-                        TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } => *def_id,
+                        TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } | TypeData::App { def_id, .. } => *def_id,
                         _ => {
                             self.diagnostics.push(
                                 Diagnostic::error("inherent impl on non-struct/enum type")
@@ -1349,9 +1349,8 @@ impl<'a> TypeChecker<'a> {
     ) -> Result<(DefId, Vec<TypeId>), Diagnostic> {
         let resolved = self.ctx.resolve_binding(ty);
         match self.ctx.get(resolved) {
-            TypeData::Struct { def_id, args } | TypeData::Enum { def_id, args } => {
-                Ok((*def_id, args.clone()))
-            }
+            TypeData::App { def_id, args } => Ok((*def_id, args.clone())),
+            TypeData::Struct { def_id } | TypeData::Enum { def_id } => Ok((*def_id, vec![])),
             TypeData::Error => Err(Diagnostic::error("type error").with_span(span)),
             _ => Err(Diagnostic::error("expected struct or enum type").with_span(span)),
         }
@@ -1637,7 +1636,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn extract_ok_type(&self, ty: TypeId) -> Option<TypeId> {
-        if let TypeData::Enum { def_id: did, args } = self.ctx.get(ty) {
+        if let TypeData::App { def_id: did, args } = self.ctx.get(ty) {
             if let Some(result_id) = self.known_def_id("Result") {
                 if *did == result_id && args.len() == 2 {
                     return Some(args[0]);
@@ -1656,7 +1655,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn extract_result_types(&self, ty: TypeId, span: Span) -> Result<(TypeId, TypeId), Diagnostic> {
-        if let TypeData::Enum { def_id: did, args } = self.ctx.get(ty) {
+        if let TypeData::App { def_id: did, args } = self.ctx.get(ty) {
             if let Some(result_id) = self.known_def_id("Result") {
                 if *did == result_id && args.len() == 2 {
                     return Ok((args[0], args[1]));
@@ -1895,7 +1894,7 @@ impl<'a> TypeChecker<'a> {
     fn collect_generic_param_indices(ty: TypeId, ctx: &TypeContext, out: &mut Vec<usize>) {
         match ctx.get(ty) {
             TypeData::GenericParam { index, .. } => out.push(*index),
-            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
+            TypeData::App { args, .. } => {
                 for &a in args {
                     Self::collect_generic_param_indices(a, ctx, out);
                 }
@@ -1964,7 +1963,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 false
             }
-            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => args
+            TypeData::App { args, .. } => args
                 .iter()
                 .any(|&a| Self::type_var_in_problematic_position(a, vars, ctx)),
             TypeData::Tuple { elems } => elems
@@ -1991,7 +1990,7 @@ impl<'a> TypeChecker<'a> {
             return true;
         }
         match ctx.get(resolved) {
-            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => args
+            TypeData::App { args, .. } => args
                 .iter()
                 .any(|&a| Self::type_tree_contains(a, target, ctx)),
             TypeData::Tuple { elems } => elems
@@ -2024,27 +2023,49 @@ impl<'a> TypeChecker<'a> {
         let mut all_field_names: Vec<String> = Vec::new();
 
         // Try direct lookup first
-        if let TypeData::Struct { def_id, args } = self.ctx.get(ty) {
-            let binding = self
-                .symbols
-                .lookup_type_by_def_id(*def_id)
-                .ok_or_else(|| Diagnostic::error("struct definition not found").with_span(span))?;
-            all_field_names.extend(binding.fields.iter().map(|f| f.name.clone()));
-            if let Some(field) = binding.fields.iter().find(|f| f.name == name) {
-                let mut subst = Subst::new();
-                for (i, _param) in binding.params.iter().enumerate() {
-                    if let Some(&arg) = args.get(i) {
-                        subst.insert(i, arg);
-                    }
+        {
+            let data = self.ctx.get(ty);
+            let def_id = match data {
+                TypeData::App { def_id, .. } | TypeData::Struct { def_id } | TypeData::Enum { def_id } => {
+                    Some(*def_id)
                 }
-                return Ok(self.ctx.subst(field.ty, &subst));
+                _ => None,
+            };
+            if let Some(def_id) = def_id {
+                let args: &[TypeId] = match data {
+                    TypeData::App { args, .. } => args.as_slice(),
+                    _ => &[],
+                };
+                let binding = self
+                    .symbols
+                    .lookup_type_by_def_id(def_id)
+                    .ok_or_else(|| Diagnostic::error("struct definition not found").with_span(span))?;
+                all_field_names.extend(binding.fields.iter().map(|f| f.name.clone()));
+                if let Some(field) = binding.fields.iter().find(|f| f.name == name) {
+                    let mut subst = Subst::new();
+                    for (i, _param) in binding.params.iter().enumerate() {
+                        if let Some(&arg) = args.get(i) {
+                            subst.insert(i, arg);
+                        }
+                    }
+                    return Ok(self.ctx.subst(field.ty, &subst));
+                }
             }
         }
 
         // Walk autoderef chain, skipping the original type (already tried)
         for deref_ty in self.autoderef_chain(ty).skip(1) {
-            if let TypeData::Struct { def_id, args } = self.ctx.get(deref_ty) {
-                let binding = self.symbols.lookup_type_by_def_id(*def_id).ok_or_else(|| {
+            let data = self.ctx.get(deref_ty);
+            let def_id = match data {
+                TypeData::App { def_id, .. } | TypeData::Struct { def_id } | TypeData::Enum { def_id } => Some(*def_id),
+                _ => None,
+            };
+            if let Some(def_id) = def_id {
+                let args: &[TypeId] = match data {
+                    TypeData::App { args, .. } => args.as_slice(),
+                    _ => &[],
+                };
+                let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| {
                     Diagnostic::error("struct definition not found").with_span(span)
                 })?;
                 all_field_names.extend(binding.fields.iter().map(|f| f.name.clone()));
@@ -2151,7 +2172,7 @@ impl<'a> TypeChecker<'a> {
     ) -> Result<Option<Expr>, Diagnostic> {
         let resolved = self.ctx.resolve_binding(ty_id);
         let def_id = match self.ctx.get(resolved) {
-            TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } => Some(*def_id),
+            TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } | TypeData::App { def_id, .. } => Some(*def_id),
             _ => None,
         };
         if let Some(def_id) = def_id {
@@ -2248,7 +2269,7 @@ impl<'a> TypeChecker<'a> {
     fn lookup_type_binding(&self, ty: TypeId) -> Option<TypeBinding> {
         let resolved = self.ctx.resolve_binding(ty);
         match self.ctx.get(resolved) {
-            TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } => {
+            TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } | TypeData::App { def_id, .. } => {
                 self.symbols.lookup_type_by_def_id(*def_id).cloned()
             }
             _ => None,

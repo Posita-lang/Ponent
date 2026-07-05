@@ -1502,7 +1502,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     arg_tys.push(self.resolve_type(arg.ty())?);
                 }
                 match self.checker.ctx.get(expanded) {
-                    TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } => {
+                    TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } | TypeData::App { def_id, .. } => {
                         let binding = self
                             .checker
                             .symbols
@@ -1671,7 +1671,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     let mut alternatives = Vec::new();
                     for ty in resolved {
                         match self.checker.ctx.get(ty) {
-                            TypeData::Enum { args, .. } => alternatives.push(ty),
+                            TypeData::Enum { .. } => alternatives.push(ty),
                             TypeData::Coproduct { alternatives: alts } => {
                                 alternatives.extend(alts.clone());
                             }

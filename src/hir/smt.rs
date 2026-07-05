@@ -99,9 +99,10 @@ impl SmtSolver {
             return Some(match ctx.get(resolved) {
                 TypeData::Fn { .. } => PrincipalShape::Arrow,
                 TypeData::Tuple { elems } => PrincipalShape::Tuple(elems.len()),
-                TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
+                TypeData::App { args, .. } => {
                     PrincipalShape::Constructor(args.len())
                 }
+                TypeData::Struct { .. } | TypeData::Enum { .. } => PrincipalShape::Constructor(0),
                 TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } => {
                     PrincipalShape::Poly
                 }
@@ -345,17 +346,8 @@ impl SmtSolver {
                     "type-unknown".into()
                 }
             }
-            TypeData::Struct { def_id, args } => {
+            TypeData::App { def_id, args } => {
                 // Encode as (type-struct def_id first_arg) for the first arg
-                if let Some(&arg) = args.first() {
-                    let a = Self::type_to_smt_term(ctx, arg);
-                    format!("(type-struct {} {})", def_id.0, a)
-                } else {
-                    format!("(type-struct {} type-unit)", def_id.0)
-                }
-            }
-            TypeData::Enum { def_id, args } => {
-                // Same encoding as Struct
                 if let Some(&arg) = args.first() {
                     let a = Self::type_to_smt_term(ctx, arg);
                     format!("(type-struct {} {})", def_id.0, a)
@@ -374,6 +366,10 @@ impl SmtSolver {
             TypeData::GenericParam { .. } => "type-unknown".into(),
             TypeData::Float { bits } => {
                 if *bits == 32 { "type-float32".into() } else { "type-float64".into() }
+            }
+            TypeData::Struct { .. }
+            | TypeData::Enum { .. } => {
+                "type-unknown".to_string()
             }
         }
     }
