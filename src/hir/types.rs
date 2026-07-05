@@ -93,7 +93,7 @@ impl TypeId {
 
     pub fn tag(self) -> TypeTag {
         // SAFETY: every TypeId created through TypeContext::alloc has a valid tag
-        // and TAG_MASK covers all 25 discriminants (0..24).
+        // and TAG_MASK covers all 31 discriminants (0..30).
         unsafe { std::mem::transmute::<usize, TypeTag>(self.0 & Self::TAG_MASK) }
     }
 }
@@ -293,8 +293,8 @@ pub struct TypeContext {
     pub builtin_str: TypeId,
     /// Built-in reference to string slice `&Str` — a `Ref { ty: Str, mutable: false }`.
     pub builtin_str_ref: TypeId,
-    /// Cache for variance check results: (param_index, TypeId, expected_sign) → bool.
-    variance_cache: RefCell<HashMap<(usize, TypeId, isize), bool>>,
+    /// Cache for variance check results: (param_index, TypeId, expected_sign, cumulative_sign) → bool.
+    variance_cache: RefCell<HashMap<(usize, TypeId, isize, isize), bool>>,
     /// Pre-computed variance-annotated outgoing edges for each TypeId.
     /// Built lazily on first variance check, then reused.
     variance_edges: RefCell<HashMap<TypeId, Vec<VarianceEdge>>>,
@@ -306,6 +306,8 @@ pub struct TypeContext {
     /// self-referential types.  Keyed by (a, b, variance_tag) where
     /// variance_tag = 0 for Invariant, 1 for Covariant, 2 for Contravariant.
     unify_seen: RefCell<HashSet<(TypeId, TypeId, u8)>>,
+    /// Cache for κ(A) characteristic results.  Cleared when bindings change.
+    kappa_cache: RefCell<HashMap<TypeId, Characteristic>>,
 }
 
 impl TypeContext {
@@ -329,6 +331,7 @@ impl TypeContext {
             variance_edges: RefCell::new(HashMap::default()),
             transaction_stack: RefCell::new(Vec::new()),
             unify_seen: RefCell::new(HashSet::default()),
+            kappa_cache: RefCell::new(HashMap::default()),
         };
         ctx.builtin_unit = ctx.alloc(TypeData::Unit);
         ctx.builtin_never = ctx.alloc(TypeData::Never);
@@ -372,14 +375,23 @@ impl TypeContext {
     }
 
     pub(crate) fn resolve_binding(&self, id: TypeId) -> TypeId {
+        // Safety: guard against infinite loops from circular bindings.
+        const MAX_CHAIN_DEPTH: usize = 10_000;
+
         // First pass: follow the binding chain to the root with a single
         // immutable borrow.  This is a simple linked-list traversal through
         // the bindings map until we reach an unbound TypeId.
         let root = {
             let bindings = self.bindings.borrow();
             let mut current = id;
+            let mut depth = 0;
             while let Some(&next) = bindings.get(&current) {
                 current = next;
+                depth += 1;
+                if depth > MAX_CHAIN_DEPTH {
+                    // Cycle detected — break and return what we have.
+                    break;
+                }
             }
             current
         };
@@ -390,10 +402,15 @@ impl TypeContext {
         if root != id {
             let mut bindings = self.bindings.borrow_mut();
             let mut current = id;
+            let mut depth = 0;
             while current != root {
                 if let Some(&next) = bindings.get(&current) {
                     bindings.insert(current, root);
                     current = next;
+                    depth += 1;
+                    if depth > MAX_CHAIN_DEPTH {
+                        break;
+                    }
                 } else {
                     break;
                 }
@@ -786,7 +803,7 @@ impl TypeContext {
         cumulative_sign: isize,
     ) -> bool {
         // Check cache first
-        let cache_key = (param, ty, expected_sign);
+        let cache_key = (param, ty, expected_sign, cumulative_sign);
         if let Some(&cached) = self.variance_cache.borrow().get(&cache_key) {
             return cached;
         }
@@ -879,7 +896,7 @@ impl TypeContext {
             }
             TypeData::App { args, .. } => args
                 .iter()
-                .map(|&a| VarianceEdge { target: a, sign: 1 })
+                .map(|&a| VarianceEdge { target: a, sign: 0 })  // invariant — nominal types have invariant params
                 .collect(),
             TypeData::Tuple { elems } => elems
                 .iter()
@@ -1350,9 +1367,15 @@ impl TypeContext {
                 Ok(b)
             }
 
-            // Ref: pointee is COVARIANT.  MUTABILITY:
+            // Ref: pointee is INVARIANT (per compute_variance_edges signing it sign: 0).
+            // MUTABILITY:
             // - &mut T <: &T allowed in Covariant direction (borrow shortening)
             // - &T <: &mut T NEVER allowed
+            //
+            // NOTE on mutable subtyping: this language permits &mut T <: &T in
+            // covariant contexts (a "borrow shortening" rule).  This is NOT the
+            // same as Rust's semantics where &mut T is invariant; it is a
+            // deliberate design choice to support safe temporary reborrowing.
             (
                 TypeData::Ref {
                     ty: t1,
@@ -1375,15 +1398,17 @@ impl TypeContext {
                         span: crate::ast::Span::new(0, 0),
                     });
                 }
-                let ty_variance = variance.xform(Variance::Covariant);
+                let ty_variance = variance.xform(Variance::Invariant);
                 self.unify_internal(*t1, *t2, ty_variance)?;
                 self.bindings.borrow_mut().insert(a, b);
                 Ok(b)
             }
 
-            // Pointer: COVARIANT
+            // Pointer: INVARIANT (per compute_variance_edges signing it sign: 0).
+            // While some languages treat raw pointers as covariant, this design
+            // conservatively marks them invariant for type safety.
             (TypeData::Pointer { ty: t1 }, TypeData::Pointer { ty: t2 }) => {
-                let ty_variance = variance.xform(Variance::Covariant);
+                let ty_variance = variance.xform(Variance::Invariant);
                 self.unify_internal(*t1, *t2, ty_variance)?;
                 self.bindings.borrow_mut().insert(a, b);
                 Ok(b)
@@ -1589,6 +1614,8 @@ impl TypeContext {
     /// Commit the current transaction: discard the snapshot.
     pub fn commit_transaction(&self) {
         self.transaction_stack.borrow_mut().pop();
+        // κ cache may be invalidated by binding changes across transaction boundaries.
+        self.kappa_cache.borrow_mut().clear();
     }
 
     /// Rollback the current transaction: restore bindings from snapshot.
@@ -1598,6 +1625,7 @@ impl TypeContext {
             *self.bindings.borrow_mut() = snapshot;
         }
         self.unify_seen.borrow_mut().clear();
+        self.kappa_cache.borrow_mut().clear();
     }
 
     pub fn subtype(&self, sub: TypeId, sup: TypeId) -> bool {
@@ -1623,12 +1651,22 @@ impl TypeContext {
                     mutable: m2,
                 },
             ) => {
+                // Aligned with unify_internal_impl's Ref handling:
+                // - &mut T <: &T allowed (borrow shortening), invariant inner type
+                // - &T <: &mut T NEVER allowed
+                // - same mutability → invariant inner type
                 if *m1 == *m2 {
-                    self.subtype(*t1, *t2)
+                    *t1 == *t2  // same mutability, invariant
+                } else if *m1 == true && *m2 == false {
+                    *t1 == *t2  // &mut T <: &T, invariant
                 } else {
-                    false
+                    false       // &T <: &mut T: never allowed
                 }
             }
+            (
+                TypeData::Pointer { ty: t1 },
+                TypeData::Pointer { ty: t2 },
+            ) => *t1 == *t2,  // invariant — exact equality required
             (
                 TypeData::Fn {
                     params: p1,
@@ -1642,7 +1680,7 @@ impl TypeContext {
                 if p1.len() != p2.len() {
                     return false;
                 }
-                p1.iter().zip(p2.iter()).all(|(a, b)| self.subtype(*a, *b))
+                p1.iter().zip(p2.iter()).all(|(a, b)| self.subtype(*b, *a))
                     && self.subtype(*r1, *r2)
             }
             (TypeData::Array { elem: e1, size: s1 }, TypeData::Array { elem: e2, size: s2 }) => {
@@ -1687,25 +1725,15 @@ impl TypeContext {
         self.type_map.get(data).copied()
     }
 
-    pub fn subst(&self, ty: TypeId, subst: &Subst) -> TypeId {
+    pub fn subst(&mut self, ty: TypeId, subst: &Subst) -> TypeId {
         let resolved = self.resolve_binding(ty);
-        match &self.types[resolved.index()].as_ref() {
+        // Clone the data to avoid borrow conflicts when calling self.subst() recursively.
+        let data = self.types[resolved.index()].clone();
+        match &*data {
             TypeData::GenericParam { index, .. } => subst.get(*index).copied().unwrap_or(ty),
-            TypeData::Int { bits, signed } => {
-                let data = TypeData::Int {
-                    bits: *bits,
-                    signed: *signed,
-                };
-                self.find_type(&data).unwrap_or(self.error())
-            }
-            TypeData::UInt { bits } => {
-                let data = TypeData::UInt { bits: *bits };
-                self.find_type(&data).unwrap_or(self.error())
-            }
-            TypeData::Float { bits } => {
-                let data = TypeData::Float { bits: *bits };
-                self.find_type(&data).unwrap_or(self.error())
-            }
+            TypeData::Int { bits, signed } => self.int(*bits, *signed),
+            TypeData::UInt { bits } => self.uint(*bits),
+            TypeData::Float { bits } => self.float(*bits),
             TypeData::Bool
             | TypeData::Char
             | TypeData::Byte
@@ -1715,114 +1743,83 @@ impl TypeContext {
             | TypeData::Error => ty,
             TypeData::App { def_id, args } => {
                 let new_args: Vec<TypeId> = args.iter().map(|&a| self.subst(a, subst)).collect();
-                self.find_type(&TypeData::App { def_id: *def_id, args: new_args })
-                    .unwrap_or(self.error())
+                self.alloc(TypeData::App { def_id: *def_id, args: new_args })
             }
             TypeData::Tuple { elems } => {
                 let new_elems: Vec<TypeId> = elems.iter().map(|&e| self.subst(e, subst)).collect();
-                self.tuple_ty_no_alloc(new_elems)
-                    .unwrap_or(self.error())
+                self.tuple(new_elems)
             }
             TypeData::Array { elem, size } => {
                 let new_elem = self.subst(*elem, subst);
-                self.array_ty_no_alloc(new_elem, *size)
-                    .unwrap_or(self.error())
+                self.array(new_elem, *size)
             }
             TypeData::Slice { elem } => {
                 let new_elem = self.subst(*elem, subst);
-                self.slice_ty_no_alloc(new_elem)
-                    .unwrap_or(self.error())
+                self.slice(new_elem)
             }
             TypeData::Ref { ty, mutable } => {
                 let new_ty = self.subst(*ty, subst);
-                self.ref_ty_no_alloc(new_ty, *mutable)
-                    .unwrap_or(self.error())
+                self.reference(new_ty, *mutable)
             }
             TypeData::Pointer { ty } => {
                 let new_ty = self.subst(*ty, subst);
-                self.pointer_ty_no_alloc(new_ty)
-                    .unwrap_or(self.error())
+                self.pointer(new_ty)
             }
             TypeData::Ptr { size, pointee } => {
                 let new_size = self.subst(*size, subst);
                 let new_pointee = self.subst(*pointee, subst);
-                self.ptr_ty_no_alloc(new_size, new_pointee)
-                    .unwrap_or(self.error())
+                self.ptr(new_size, new_pointee)
             }
             TypeData::Fn { params, ret } => {
                 let new_params: Vec<TypeId> =
                     params.iter().map(|&p| self.subst(p, subst)).collect();
                 let new_ret = self.subst(*ret, subst);
-                self.fn_ty_no_alloc(new_params, new_ret)
-                    .unwrap_or(self.error())
+                self.function(new_params, new_ret)
             }
             TypeData::Poly { quantifiers, body } => {
                 let new_body = self.subst(*body, subst);
-                self.find_type(&TypeData::Poly {
-                    quantifiers: quantifiers.clone(),
-                    body: new_body,
-                })
-                .unwrap_or(ty)
+                self.poly(quantifiers.clone(), new_body)
             }
             TypeData::DynTrait { .. } => ty,
-            TypeData::Forall {
-                param_index,
-                param_name,
-                body,
-            } => {
+            TypeData::Forall { param_index, param_name, body } => {
                 let new_body = self.subst(*body, subst);
-                self.find_type(&TypeData::Forall {
+                self.alloc(TypeData::Forall {
                     param_index: *param_index,
                     param_name: param_name.clone(),
                     body: new_body,
                 })
-                .unwrap_or(ty)
             }
-            TypeData::Mu {
-                param_index,
-                param_name,
-                body,
-            } => {
+            TypeData::Mu { param_index, param_name, body } => {
                 let new_body = self.subst(*body, subst);
-                self.find_type(&TypeData::Mu {
+                self.alloc(TypeData::Mu {
                     param_index: *param_index,
                     param_name: param_name.clone(),
                     body: new_body,
                 })
-                .unwrap_or(ty)
             }
-            TypeData::Nu {
-                param_index,
-                param_name,
-                body,
-            } => {
+            TypeData::Nu { param_index, param_name, body } => {
                 let new_body = self.subst(*body, subst);
-                self.find_type(&TypeData::Nu {
+                self.alloc(TypeData::Nu {
                     param_index: *param_index,
                     param_name: param_name.clone(),
                     body: new_body,
                 })
-                .unwrap_or(ty)
             }
             TypeData::Exists { name, base } => {
                 let new_base = self.subst(*base, subst);
-                self.exists_ty_no_alloc(name.clone(), new_base)
-                    .unwrap_or(self.error())
+                self.alloc(TypeData::Exists {
+                    name: name.clone(),
+                    base: new_base,
+                })
             }
             TypeData::Coproduct { alternatives } => {
                 let new_alts: Vec<TypeId> =
                     alternatives.iter().map(|&a| self.subst(a, subst)).collect();
-                self.coproduct_ty_no_alloc(new_alts)
-                    .unwrap_or(self.error())
+                self.coproduct(new_alts)
             }
-            TypeData::AssociatedType {
-                trait_id,
-                name,
-                self_ty,
-            } => {
+            TypeData::AssociatedType { trait_id, name, self_ty } => {
                 let new_self = self.subst(*self_ty, subst);
-                self.associated_ty_no_alloc(*trait_id, name.clone(), new_self)
-                    .unwrap_or(self.error())
+                self.associated_type(*trait_id, name.clone(), new_self)
             }
             _ => ty,
         }
@@ -2250,97 +2247,297 @@ pub enum Characteristic {
     Undecidable,
 }
 
+/// A variance-annotated type graph used for κ(A) computation.
+/// Nodes are TypeIds; edges carry a variance sign (+1 covariant, -1 contravariant, 0 invariant).
+struct KappaGraph {
+    nodes: Vec<TypeId>,
+    /// (from_idx, to_idx, sign)
+    edges: Vec<(usize, usize, isize)>,
+}
+
 impl TypeContext {
     /// Compute the characteristic κ(A) of a type, used for exhaustiveness checking
     /// of match expressions.
     ///
-    /// Algorithm (Pistone & Tranchini 2022 §5):
-    /// 1. Treat the type tree as a directed graph with variance-annotated edges
-    ///    (covariant →, contravariant ⇒, invariant ↔).
-    /// 2. Add "axiom links" connecting matching GenericParam nodes.
-    /// 3. Detect cyclic paths through the graph.
-    /// 4. Acyclic → κ=0, cyclic only through covariant edges → κ=1, other → κ=∞.
-    ///
-    /// Uses KSP-style convergence detection (max 10 iterations) to handle
-    /// mutually recursive types where the characteristic may change across
-    /// successive rounds of refinement.
-    pub fn characteristic(&self, ty: TypeId, visited: &mut Vec<TypeId>) -> Characteristic {
-        const MAX_ITERATIONS: usize = 10;
-        let mut result = self.characteristic_with_variance(ty, visited, false);
-        for _iteration in 0..MAX_ITERATIONS {
-            let before = result;
-            // Re-run with the same visited to detect convergence:
-            // if the result stabilises, the cycle is resolved.
-            let mut re_visited = visited.clone();
-            result = self.characteristic_with_variance(ty, &mut re_visited, false);
-            if result == before {
-                break; // converged
+    /// Algorithm (Pistone & Tranchini 2022 §5) — global fixed-point iteration:
+    /// 1. Build the type graph G_A with variance edges and axiom links.
+    /// 2. Mark all "leaf" types (Bool, Int, …) as determined.
+    /// 3. Propagate: when every child of a node has κ fixed, compute the node's κ.
+    /// 4. Nodes that remain unmarked form cycles → classify by edge variance:
+    ///    all-covariant → InfiniteEnumerable (κ=1), else → Undecidable (κ=∞).
+    pub fn characteristic(&self, ty: TypeId) -> Characteristic {
+        // Check cache first.
+        if let Some(&cached) = self.kappa_cache.borrow().get(&ty) {
+            return cached;
+        }
+        let graph = self.build_kappa_graph(ty);
+        let result = self.solve_kappa(&graph);
+        // Cache the result.
+        self.kappa_cache.borrow_mut().insert(ty, result);
+        result
+    }
+
+    /// Build the type graph from root, collecting all reachable nodes,
+    /// variance edges, and axiom links for bound GenericParam occurrences.
+    fn build_kappa_graph(&self, root: TypeId) -> KappaGraph {
+        use std::collections::HashSet as Set;
+
+        let mut nodes: Vec<TypeId> = Vec::new();
+        let mut edges: Vec<(usize, usize, isize)> = Vec::new();
+        let mut node_map: HashMap<TypeId, usize> = HashMap::default();
+        let mut visited: Set<TypeId> = Set::default();
+        // Stack of active binder scopes: (param_index, binder_node_idx)
+        let mut binder_stack: Vec<(usize, usize)> = Vec::new();
+        // GenericParam occurrences grouped by (param_index, binder_node_idx).
+        // Each entry collects all occurrences of a specific variable bound by a specific binder.
+        let mut param_occurrences: HashMap<(usize, usize), Vec<usize>> = HashMap::default();
+
+        // Recursive traversal.
+        fn traverse(
+            ty: TypeId,
+            ctx: &TypeContext,
+            nodes: &mut Vec<TypeId>,
+            edges: &mut Vec<(usize, usize, isize)>,
+            node_map: &mut HashMap<TypeId, usize>,
+            visited: &mut Set<TypeId>,
+            binder_stack: &mut Vec<(usize, usize)>,
+            param_occurrences: &mut HashMap<(usize, usize), Vec<usize>>,
+        ) -> usize {
+            if let Some(&idx) = node_map.get(&ty) {
+                return idx;
             }
-            *visited = re_visited;
+            let idx = nodes.len();
+            nodes.push(ty);
+            node_map.insert(ty, idx);
+            visited.insert(ty);
+
+            let data = ctx.get(ty);
+            match data {
+                TypeData::GenericParam { index, .. } => {
+                    // Check if this GPIO is bound by an active binder.
+                    if let Some(&(pi, binder_idx)) =
+                        binder_stack.iter().rev().find(|(p, _)| *p == *index)
+                    {
+                        param_occurrences
+                            .entry((pi, binder_idx))
+                            .or_default()
+                            .push(idx);
+                        // Add a self-loop to mark this GPIO as bound.
+                        // This prevents leaf_kappa from resolving it immediately
+                        // and ensures the binder's fixed-point cycle is detected.
+                        edges.push((idx, idx, 1));
+                    }
+                }
+                TypeData::Forall { param_index, body, .. }
+                | TypeData::Mu { param_index, body, .. }
+                | TypeData::Nu { param_index, body, .. } => {
+                    // Push binder FIRST, then traverse body so GenericParam
+                    // occurrences register with the correct binder scope.
+                    binder_stack.push((*param_index, idx));
+                    let body_idx = traverse(
+                        *body,
+                        ctx,
+                        nodes,
+                        edges,
+                        node_map,
+                        visited,
+                        binder_stack,
+                        param_occurrences,
+                    );
+                    // Binder → body (covariant)
+                    edges.push((idx, body_idx, 1));
+                    binder_stack.pop();
+                }
+                TypeData::Poly { quantifiers, body } => {
+                    // Push all quantifier indices as binders for the body.
+                    for &(pi, _) in quantifiers {
+                        binder_stack.push((pi, idx));
+                    }
+                    let body_idx = traverse(
+                        *body,
+                        ctx,
+                        nodes,
+                        edges,
+                        node_map,
+                        visited,
+                        binder_stack,
+                        param_occurrences,
+                    );
+                    for _ in quantifiers {
+                        binder_stack.pop();
+                    }
+                    // Poly → body (covariant)
+                    edges.push((idx, body_idx, 1));
+                }
+                TypeData::Exists { base: body, .. } => {
+                    // Not introducing a binder for GenericParam — treat body as covariant child.
+                    let body_idx = traverse(
+                        *body,
+                        ctx,
+                        nodes,
+                        edges,
+                        node_map,
+                        visited,
+                        binder_stack,
+                        param_occurrences,
+                    );
+                    edges.push((idx, body_idx, 1));
+                }
+                _ => {
+                    // Generic case: emit variance edges for all children.
+                    let variance_edges = ctx.compute_variance_edges(ty);
+                    for ve in &variance_edges {
+                        let child_idx = traverse(
+                            ve.target,
+                            ctx,
+                            nodes,
+                            edges,
+                            node_map,
+                            visited,
+                            binder_stack,
+                            param_occurrences,
+                        );
+                        edges.push((idx, child_idx, ve.sign));
+                    }
+                }
+            }
+            idx
         }
-        result
+
+        traverse(
+            root,
+            self,
+            &mut nodes,
+            &mut edges,
+            &mut node_map,
+            &mut visited,
+            &mut binder_stack,
+            &mut param_occurrences,
+        );
+
+        // Build axiom links: for each (variable, binder), connect all GPIO occurrences
+        // pairwise as bidirectional covariant edges so they participate in the fixed-point solver.
+        for (_key, occurrences) in &param_occurrences {
+            for i in 0..occurrences.len() {
+                for j in (i + 1)..occurrences.len() {
+                    let a = occurrences[i];
+                    let b = occurrences[j];
+                    edges.push((a, b, 1)); // a → b (covariant)
+                    edges.push((b, a, 1)); // b → a (covariant)
+                }
+            }
+        }
+
+        KappaGraph {
+            nodes,
+            edges,
+        }
     }
 
-    /// Compute κ with scoped (remove+recover) visited tracking.
-    /// When backtracking, `ty` is popped from `visited` so sibling
-    /// branches can traverse through it independently.
-    /// This follows the KSP `remove`+`recover` pattern — temporary
-    /// modification with guaranteed restoration.
-    fn characteristic_with_variance(
-        &self,
-        ty: TypeId,
-        visited: &mut Vec<TypeId>,
-        has_non_covariant_path: bool,
-    ) -> Characteristic {
-        // ── Cycle detection (before push) ──────────────────────────
-        // If ty is already on the current DFS path, we've found a cycle.
-        if visited.contains(&ty) {
-            return if has_non_covariant_path {
-                Characteristic::Undecidable // κ=∞
-            } else {
-                Characteristic::InfiniteEnumerable // κ=1
-            };
+    /// Solve κ for a graph using fixed-point iteration.
+    /// Returns the κ of the root node (graph.nodes[0]).
+    fn solve_kappa(&self, graph: &KappaGraph) -> Characteristic {
+        let n = graph.nodes.len();
+        // result[i] = None (unknown) or Some(κ)
+        let mut result: Vec<Option<Characteristic>> = vec![None; n];
+        // Maps TypeId → Characteristic for quick child lookup during combine.
+        let mut type_kappa: HashMap<TypeId, Characteristic> = HashMap::default();
+
+        let mut out_degree: Vec<usize> = vec![0; n];
+        for &(from, _to, _sign) in &graph.edges {
+            out_degree[from] += 1;
         }
-        // ── Mark (remove from available) ───────────────────────────
-        visited.push(ty);
 
-        // ── Recurse (compute) ──────────────────────────────────────
-        let result = self.characteristic_body(ty, visited, has_non_covariant_path);
+        // Determine initial κ for base-type leaf nodes (out_degree == 0).
+        let mut queue: Vec<usize> = Vec::new();
+        for i in 0..n {
+            if out_degree[i] == 0 {
+                let k = self.leaf_kappa(graph.nodes[i]);
+                result[i] = Some(k);
+                type_kappa.insert(graph.nodes[i], k);
+                queue.push(i);
+            }
+        }
 
-        // ── Recover (restore to available) ─────────────────────────
-        visited.pop();
+        // Build reverse adjacency: for each node, which nodes have an edge TO it?
+        let mut reverse_edges: Vec<Vec<(usize, isize)>> = vec![Vec::new(); n];
+        for &(from, to, sign) in &graph.edges {
+            reverse_edges[to].push((from, sign));
+        }
 
-        result
+        // Track how many outgoing edges are still unresolved for each node.
+        let mut unresolved_count: Vec<usize> = out_degree.clone();
+
+        // BFS-based propagation: pop determined nodes and check their predecessors.
+        while let Some(determined) = queue.pop() {
+            let det_kappa = result[determined].unwrap();
+
+            // Check all predecessors (nodes that depend on `determined`).
+            for &(pred, _sign) in &reverse_edges[determined] {
+                if result[pred].is_some() {
+                    continue;
+                }
+                unresolved_count[pred] = unresolved_count[pred].saturating_sub(1);
+                if unresolved_count[pred] == 0 {
+                    let k = self.combine_kappa(
+                        graph.nodes[pred],
+                        &type_kappa,
+                    );
+                    result[pred] = Some(k);
+                    type_kappa.insert(graph.nodes[pred], k);
+                    queue.push(pred);
+                }
+            }
+        }
+
+        // After propagation, check for remaining undetermined nodes (cycles).
+        let undetermined: Vec<usize> = (0..n).filter(|i| result[*i].is_none()).collect();
+
+        if undetermined.is_empty() {
+            return result[0].unwrap();
+        }
+
+        // Phase 2: classify remaining cycle(s).  Check edge variance.
+        use std::collections::HashSet as Set;
+        let undetermined_set: Set<usize> = undetermined.iter().copied().collect();
+        let mut has_non_covariant = false;
+
+        for &(from, to, sign) in &graph.edges {
+            // Only consider edges where BOTH ends are in the remaining subgraph.
+            if undetermined_set.contains(&from) && undetermined_set.contains(&to) {
+                if sign != 1 {
+                    has_non_covariant = true;
+                    break;
+                }
+            }
+        }
+
+        if has_non_covariant {
+            for &i in &undetermined {
+                result[i] = Some(Characteristic::Undecidable);
+            }
+        } else {
+            for &i in &undetermined {
+                result[i] = Some(Characteristic::InfiniteEnumerable);
+            }
+        }
+
+        result[0].unwrap()
     }
 
-    /// The actual computation body, called after push and before pop.
-    /// All recursive calls go through `characteristic_with_variance`
-    /// so each level has proper scoping.
-    fn characteristic_body(
-        &self,
-        ty: TypeId,
-        visited: &mut Vec<TypeId>,
-        has_non_covariant_path: bool,
-    ) -> Characteristic {
+    /// Return the κ of a leaf type (no outgoing edges).
+    fn leaf_kappa(&self, ty: TypeId) -> Characteristic {
+        // Does NOT go through `characteristic_body` — this is the base case.
         let data = self.get(ty);
         match data {
-            TypeData::Int { bits, .. } => {
-                let count = 1usize << bits;
-                Characteristic::FiniteExhaustible(count)
-            }
-            TypeData::UInt { bits } => {
-                let count = 1usize << bits;
-                Characteristic::FiniteExhaustible(count)
-            }
+            TypeData::Int { bits, .. } => Characteristic::FiniteExhaustible(1usize << bits),
+            TypeData::UInt { bits } => Characteristic::FiniteExhaustible(1usize << bits),
             TypeData::Float { .. } | TypeData::USize => {
-                // Floats and usize have very large but finite domains
                 Characteristic::FiniteExhaustible(usize::MAX)
             }
             TypeData::Rational {
-                int_bits,
-                frac_bits,
+                int_bits, frac_bits, ..
             } => {
-                // Rational<p,q> has 2^(p+q) representable values
                 let total_bits = *int_bits as u32 + *frac_bits as u32;
                 if total_bits >= 16 {
                     Characteristic::FiniteExhaustible(usize::MAX)
@@ -2354,117 +2551,125 @@ impl TypeContext {
             TypeData::Unit => Characteristic::FiniteExhaustible(1),
             TypeData::Never => Characteristic::FiniteExhaustible(0),
             TypeData::Error => Characteristic::FiniteExhaustible(0),
+            TypeData::GenericParam { .. } => {
+                // GenericParam with no axiom links → unknown but finite.
+                // (If it HAS axiom links, it'll be part of a cycle and get
+                //  classified during Phase 2.)
+                Characteristic::FiniteExhaustible(usize::MAX)
+            }
+            TypeData::Struct { .. } | TypeData::Enum { .. } => {
+                Characteristic::FiniteExhaustible(usize::MAX)
+            }
+            TypeData::InferVar { .. } => Characteristic::FiniteExhaustible(usize::MAX),
+            TypeData::DynTrait { .. } => Characteristic::InfiniteEnumerable,
+
+            // The following types are NOT leaf types in practice because they
+            // have outgoing edges.  This arm is a fallback.
+            _ => Characteristic::FiniteExhaustible(usize::MAX),
+        }
+    }
+
+    /// Combine children κ values into a node's κ, given the type constructor.
+    /// Called when all of a node's outgoing edges point to determined nodes.
+    /// Combine children κ values into a node's κ, given the type constructor.
+    /// Called when all of a node's outgoing edges point to determined nodes.
+    /// `kappa_map` maps child TypeId → determined Characteristic.
+    fn combine_kappa(
+        &self,
+        ty: TypeId,
+        kappa_map: &HashMap<TypeId, Characteristic>,
+    ) -> Characteristic {
+        /// Helper: look up a child's κ — must be resolved at this point.
+        fn ck(ctx: &TypeContext, child: TypeId, map: &HashMap<TypeId, Characteristic>) -> Characteristic {
+            *map.get(&child).expect("child kappa not resolved: graph construction missed a dependency edge")
+        }
+
+        let data = self.get(ty);
+        match data {
             TypeData::Tuple { elems } => {
                 let mut total = 1usize;
                 let mut has_infinite = false;
-                for &elem in elems {
-                    match self.characteristic_with_variance(elem, visited, has_non_covariant_path) {
-                        Characteristic::FiniteExhaustible(n) => {
-                            total = total.saturating_mul(n);
-                        }
-                        Characteristic::InfiniteEnumerable => {
-                            has_infinite = true;
-                        }
+                for &e in elems {
+                    match ck(self, e, kappa_map) {
+                        Characteristic::FiniteExhaustible(n) => total = total.saturating_mul(n),
+                        Characteristic::InfiniteEnumerable => has_infinite = true,
                         Characteristic::Undecidable => return Characteristic::Undecidable,
                     }
                 }
-                if has_infinite {
-                    Characteristic::InfiniteEnumerable
-                } else {
-                    Characteristic::FiniteExhaustible(total)
-                }
+                if has_infinite { Characteristic::InfiniteEnumerable }
+                else { Characteristic::FiniteExhaustible(total) }
             }
             TypeData::App { args, .. } => {
                 let mut has_infinite = false;
-                for &arg in args {
-                    match self.characteristic_with_variance(arg, visited, has_non_covariant_path) {
+                for &a in args {
+                    match ck(self, a, kappa_map) {
                         Characteristic::FiniteExhaustible(_) => {}
                         Characteristic::InfiniteEnumerable => has_infinite = true,
                         Characteristic::Undecidable => return Characteristic::Undecidable,
                     }
                 }
-                if has_infinite {
-                    Characteristic::InfiniteEnumerable
-                } else {
-                    Characteristic::FiniteExhaustible(usize::MAX)
-                }
-            }
-            TypeData::Struct { .. } | TypeData::Enum { .. } => {
-                Characteristic::FiniteExhaustible(usize::MAX)
+                if has_infinite { Characteristic::InfiniteEnumerable }
+                else { Characteristic::FiniteExhaustible(usize::MAX) }
             }
             TypeData::Array { elem, size } => {
-                match self.characteristic_with_variance(*elem, visited, has_non_covariant_path) {
-                    Characteristic::FiniteExhaustible(n) => {
-                        Characteristic::FiniteExhaustible(n.saturating_pow(*size as u32))
-                    }
+                match ck(self, *elem, kappa_map) {
+                    Characteristic::FiniteExhaustible(n) =>
+                        Characteristic::FiniteExhaustible(n.saturating_pow(*size as u32)),
                     Characteristic::InfiniteEnumerable => Characteristic::InfiniteEnumerable,
                     Characteristic::Undecidable => Characteristic::Undecidable,
                 }
             }
-            // Slice/Ref/Pointer/Ptr: invariant containers — mark path as non-covariant
-            TypeData::Slice { elem }
-            | TypeData::Ref { ty: elem, .. }
-            | TypeData::Pointer { ty: elem }
-            | TypeData::Ptr { pointee: elem, .. } => {
-                let _ = self.characteristic_with_variance(*elem, visited, true);
-                Characteristic::InfiniteEnumerable
-            }
-            // Fn params: contravariant → mark path as non-covariant
-            // Fn ret: covariant → keep existing flag
+            TypeData::Slice { .. }
+            | TypeData::Ref { .. }
+            | TypeData::Pointer { .. }
+            | TypeData::Ptr { .. } => Characteristic::InfiniteEnumerable,
             TypeData::Fn { params, ret } => {
+                let mut domain_product = 1usize;
+                let mut domain_infinite = false;
                 for &p in params {
-                    if self.characteristic_with_variance(p, visited, true)
-                        == Characteristic::Undecidable
-                    {
-                        return Characteristic::Undecidable;
-                    }
-                }
-                match self.characteristic_with_variance(*ret, visited, has_non_covariant_path) {
-                    Characteristic::Undecidable => Characteristic::Undecidable,
-                    _ => Characteristic::InfiniteEnumerable,
-                }
-            }
-            TypeData::GenericParam { .. } => Characteristic::FiniteExhaustible(usize::MAX),
-            // Mu/Nu: treat as covariant recursive type
-            // (The body has already been handled above.)
-            TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => {
-                // Already handled above — this is a safety fallback.
-                Characteristic::FiniteExhaustible(usize::MAX)
-            }
-            // Coproduct: characteristic is the sum of alternatives.
-            TypeData::Coproduct { alternatives } => {
-                let mut total = 0usize;
-                let mut has_infinite = false;
-                for &alt in alternatives {
-                    match self.characteristic_with_variance(alt, visited, has_non_covariant_path) {
-                        Characteristic::FiniteExhaustible(n) => {
-                            total = total.saturating_add(n);
-                        }
-                        Characteristic::InfiniteEnumerable => {
-                            has_infinite = true;
-                        }
+                    match ck(self, p, kappa_map) {
+                        Characteristic::FiniteExhaustible(n) => domain_product = domain_product.saturating_mul(n),
+                        Characteristic::InfiniteEnumerable => domain_infinite = true,
                         Characteristic::Undecidable => return Characteristic::Undecidable,
                     }
                 }
-                if has_infinite {
-                    Characteristic::InfiniteEnumerable
-                } else {
-                    Characteristic::FiniteExhaustible(total)
+                match ck(self, *ret, kappa_map) {
+                    Characteristic::Undecidable => Characteristic::Undecidable,
+                    Characteristic::FiniteExhaustible(c) => {
+                        if domain_product == 0 { Characteristic::FiniteExhaustible(1) }
+                        else if domain_infinite {
+                            if c == 0 { Characteristic::FiniteExhaustible(0) }
+                            else if c == 1 { Characteristic::FiniteExhaustible(1) }
+                            else { Characteristic::InfiniteEnumerable }
+                        } else {
+                            Characteristic::FiniteExhaustible(c.saturating_pow(domain_product as u32))
+                        }
+                    }
+                    Characteristic::InfiniteEnumerable => {
+                        if domain_product == 0 { Characteristic::FiniteExhaustible(1) }
+                        else { Characteristic::InfiniteEnumerable }
+                    }
                 }
+            }
+            TypeData::Coproduct { alternatives } => {
+                let mut total = 0usize;
+                let mut has_infinite = false;
+                for &a in alternatives {
+                    match ck(self, a, kappa_map) {
+                        Characteristic::FiniteExhaustible(n) => total = total.saturating_add(n),
+                        Characteristic::InfiniteEnumerable => has_infinite = true,
+                        Characteristic::Undecidable => return Characteristic::Undecidable,
+                    }
+                }
+                if has_infinite { Characteristic::InfiniteEnumerable }
+                else { Characteristic::FiniteExhaustible(total) }
             }
             TypeData::Forall { body, .. }
             | TypeData::Exists { base: body, .. }
-            | TypeData::Poly { body, .. } => {
-                self.characteristic_with_variance(*body, visited, has_non_covariant_path)
-            }
-            // DynTrait and AssociatedType: covariant containers but the concrete
-            // implementation is unknown — conservatively return InfiniteEnumerable.
-            // For AssociatedType, the self_ty variance propagates to the associated type.
-            TypeData::DynTrait { .. } => Characteristic::InfiniteEnumerable,
-            TypeData::AssociatedType { self_ty, .. } => {
-                self.characteristic_with_variance(*self_ty, visited, has_non_covariant_path)
-            }
-            TypeData::InferVar { .. } => Characteristic::FiniteExhaustible(usize::MAX),
+            | TypeData::Poly { body, .. } => ck(self, *body, kappa_map),
+            TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => ck(self, *body, kappa_map),
+            TypeData::AssociatedType { self_ty, .. } => ck(self, *self_ty, kappa_map),
+            _ => Characteristic::FiniteExhaustible(usize::MAX),
         }
     }
 }
@@ -2630,7 +2835,7 @@ mod tests {
     fn test_characteristic_bool() {
         let ctx = TypeContext::new();
         assert_eq!(
-            ctx.characteristic(ctx.bool(), &mut vec![]),
+            ctx.characteristic(ctx.bool()),
             Characteristic::FiniteExhaustible(2)
         );
     }
@@ -2640,7 +2845,7 @@ mod tests {
         let mut ctx = TypeContext::new();
         let i32 = ctx.int(32, true);
         assert_eq!(
-            ctx.characteristic(i32, &mut vec![]),
+            ctx.characteristic(i32),
             Characteristic::FiniteExhaustible(2u64.pow(32) as usize)
         );
     }
@@ -2649,7 +2854,7 @@ mod tests {
     fn test_characteristic_unit() {
         let ctx = TypeContext::new();
         assert_eq!(
-            ctx.characteristic(ctx.unit(), &mut vec![]),
+            ctx.characteristic(ctx.unit()),
             Characteristic::FiniteExhaustible(1)
         );
     }
@@ -2659,11 +2864,10 @@ mod tests {
         let mut ctx = TypeContext::new();
         let bool_ty = ctx.bool();
         let fn_ty = ctx.function(vec![bool_ty], bool_ty);
-        // Fn types are classified as InfiniteEnumerable due to
-        // contravariant parameter cycles in the characteristic algorithm
+        // Bool → Bool has 2^2 = 4 inhabitants.
         assert_eq!(
-            ctx.characteristic(fn_ty, &mut vec![]),
-            Characteristic::InfiniteEnumerable
+            ctx.characteristic(fn_ty),
+            Characteristic::FiniteExhaustible(4)
         );
     }
 
@@ -2673,7 +2877,7 @@ mod tests {
         let bool_ty = ctx.bool();
         let slice_ty = ctx.slice(bool_ty);
         assert_eq!(
-            ctx.characteristic(slice_ty, &mut vec![]),
+            ctx.characteristic(slice_ty),
             Characteristic::InfiniteEnumerable
         );
     }
@@ -2693,14 +2897,14 @@ mod tests {
             ctx.function(vec![tup], p0)
         };
         let ty = ctx.forall(0, "X".into(), body);
-        // KSP iteration should converge and detect InfiniteEnumerable
-        // (recursive type with only covariant cycles)
-        let mut visited = Vec::new();
-        let kappa = ctx.characteristic(ty, &mut visited);
+        // With axiom links connecting GPIO occurrences as bidirectional edges,
+        // the remaining cycle includes a contravariant edge (Fn param → Tuple),
+        // so the result is Undecidable.
+        let kappa = ctx.characteristic(ty);
         assert_eq!(
             kappa,
-            Characteristic::InfiniteEnumerable,
-            "recursive stream type should be InfiniteEnumerable"
+            Characteristic::Undecidable,
+            "recursive stream type with contravariant path should be Undecidable"
         );
     }
 

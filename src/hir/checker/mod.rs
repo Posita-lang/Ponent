@@ -2018,7 +2018,7 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn lookup_field(&self, ty: TypeId, name: &str, span: Span) -> Result<TypeId, Diagnostic> {
+    fn lookup_field(&mut self, ty: TypeId, name: &str, span: Span) -> Result<TypeId, Diagnostic> {
         // Collect field names from all types in the deref chain for error reporting
         let mut all_field_names: Vec<String> = Vec::new();
 

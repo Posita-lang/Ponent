@@ -1073,11 +1073,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     // Use characteristic κ after resolving inference variables.
                     // For InferVars, also check the variable kind directly
                     // (characteristic returns usize::MAX for unresolved infer vars).
-                    let mut visited = Vec::new();
                     let char = self
                         .checker
                         .ctx
-                        .characteristic(resolved_scrut_ty, &mut visited);
+                        .characteristic(resolved_scrut_ty);
                     let total_count_from_char = match char {
                         Characteristic::FiniteExhaustible(n) => Some(n),
                         _ => None,
