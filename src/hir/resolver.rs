@@ -423,6 +423,9 @@ impl<'a> NameResolver<'a> {
                     }
                 }
 
+                // Clear impl type params so they don't leak into subsequent statements.
+                self.current_impl_type_params = None;
+
                 self.exit_scope();
             }
             Stmt::Import {
@@ -437,6 +440,12 @@ impl<'a> NameResolver<'a> {
                     items: items.clone(),
                     span: *span,
                 });
+                // Resolve the import path against the symbol table and register
+                // the imported symbols in the current scope.
+                let resolved = self.resolve_import_path(path, items, alias, *span);
+                if let Err(diag) = resolved {
+                    self.diagnostics.push(diag);
+                }
             }
             Stmt::Edition(..) => {}
             Stmt::Constraint { name, bounds, span } => {
@@ -533,7 +542,12 @@ impl<'a> NameResolver<'a> {
                 // `set auto<T> = expr` — register each capture name as a type
                 // in the resolution map so that comptime code can reference it.
                 for cap in type_captures {
-                    let placeholder = self.ctx.error();
+                    // Placeholder entry: the checker overwrites this with the inferred
+                    // type after evaluating the expression.  We seed it with error()
+                    // so that if the checker doesn't override it (e.g. due to a bug),
+                    // the capture name resolves to Error at the use site, triggering
+                    // a downstream compile error instead of silent miscompilation.
+                    let _placeholder = self.ctx.error();
                     self.resolution_map
                         .type_def_ids
                         .insert(cap.name.clone(), DefId(usize::MAX));
@@ -1515,6 +1529,84 @@ impl<'a> NameResolver<'a> {
             }
             other => other.clone(),
         }
+    }
+
+    /// Resolve an import path against the symbol table and register aliases
+    /// in the current scope.  Supports:
+    ///   `import path::to::item;`           → alias = last segment
+    ///   `import path::to::item as alias;`  → alias = explicit name
+    ///   `from path::to import { a, b };`   → each item by explicit name
+    fn resolve_import_path(
+        &mut self,
+        path: &[String],
+        items: &Option<Vec<String>>,
+        alias: &Option<String>,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let import_name = alias.as_ref().or_else(|| path.last()).cloned();
+
+        // First try to resolve as a type.
+        if let Some(def_id) = self.symbols.lookup_type_by_path(path) {
+            if let Some(name) = &import_name {
+                self.resolution_map
+                    .type_def_ids
+                    .insert(name.clone(), def_id);
+                if let Some(binding) = self.symbols.lookup_type_by_def_id(def_id).cloned() {
+                    self.symbols.insert_type(name.clone(), binding, span).ok();
+                }
+            }
+            // `from path import { items }`
+            if let Some(item_list) = items {
+                for item in item_list {
+                    let item_path = [item.clone()];
+                    if let Some(item_def_id) = self.symbols.lookup_type_by_path(&item_path) {
+                        self.resolution_map
+                            .type_def_ids
+                            .insert(item.clone(), item_def_id);
+                        if let Some(binding) =
+                            self.symbols.lookup_type_by_def_id(item_def_id).cloned()
+                        {
+                            self.symbols
+                                .insert_type(item.clone(), binding, span)
+                                .ok();
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // Try as a trait.
+        if path.len() == 1 {
+            if let Some(trait_binding) = self.symbols.lookup_trait(&path[0]).cloned() {
+                if let Some(name) = &import_name {
+                    self.symbols
+                        .insert_trait(name.clone(), trait_binding, span)
+                        .ok();
+                }
+                return Ok(());
+            }
+        }
+
+        // Try as a function.
+        if path.len() == 1 {
+            if let Some(func_binding) = self.symbols.lookup_function(&path[0]).cloned() {
+                if let Some(name) = &import_name {
+                    if let Err(diag) =
+                        self.symbols.insert_function(name.clone(), func_binding, span)
+                    {
+                        self.diagnostics.push(diag);
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        Err(Diagnostic::error(format!(
+            "cannot resolve import `{}`",
+            path.join("::"),
+        ))
+        .with_span(span))
     }
 }
 

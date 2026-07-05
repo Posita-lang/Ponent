@@ -407,8 +407,14 @@ impl<'a> TypeChecker<'a> {
                 let exit_res = guard.checker.exit_inference_scope();
                 guard.defuse();
 
-                if let Err(_err) = exit_res {
-                    return Err(Diagnostic::error("inference failure").with_span(*span));
+                if let Err(diags) = exit_res {
+                    let details: Vec<String> =
+                        diags.iter().map(|d| d.message.clone()).collect();
+                    return Err(Diagnostic::error(format!(
+                        "inference failure: {}",
+                        details.join("; ")
+                    ))
+                    .with_span(*span));
                 }
 
                 if let Some(ref body_stmts) = body_hir {
@@ -942,12 +948,63 @@ impl<'a> TypeChecker<'a> {
                 // Trait definitions are handled by the resolver; skip silently.
                 Ok(HirStmt::Error)
             }
-            Stmt::Import { .. } | Stmt::ExternFunction { .. } | Stmt::Constraint { .. } => {
-                self.diagnostics.push(
-                    Diagnostic::error("top-level item not yet supported in type checker")
-                        .with_span(stmt.span()),
-                );
-                Ok(HirStmt::Error)
+            Stmt::Import {
+                path,
+                items,
+                alias,
+                span,
+            } => {
+                // Imports are already resolved by the NameResolver and registered
+                // in the resolution map. The checker just passes them through.
+                Ok(HirStmt::Import {
+                    path: path.clone(),
+                    items: items.clone(),
+                    alias: alias.clone(),
+                    span: *span,
+                })
+            }
+            Stmt::ExternFunction {
+                abi,
+                name,
+                params,
+                return_type,
+                span,
+                attributes,
+            } => {
+                let ret_ty = self.resolve_type(return_type)?;
+                let mut hir_params = Vec::new();
+                for p in params {
+                    let p_ty = if let Some(ref ty) = p.ty {
+                        self.resolve_type(ty)?
+                    } else {
+                        self.new_infer_var(TypeVariableKind::Unconstrained)
+                    };
+                    hir_params.push(HirParam {
+                        name: p.name.clone(),
+                        ty: p_ty,
+                        default: p.default.clone(),
+                        span: p.span,
+                    });
+                }
+                Ok(HirStmt::ExternFunction {
+                    abi: abi.clone(),
+                    name: name.clone(),
+                    params: hir_params,
+                    return_type: ret_ty,
+                    span: *span,
+                    attributes: attributes.clone(),
+                })
+            }
+            Stmt::Constraint { name, bounds, span } => {
+                let resolved_bounds: Vec<TypeId> = bounds
+                    .iter()
+                    .map(|b| self.resolve_type(b))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(HirStmt::Constraint {
+                    name: name.clone(),
+                    bounds: resolved_bounds,
+                    span: *span,
+                })
             }
             Stmt::ImplBlock { .. } => {
                 let (trait_path, for_type, methods, span, attributes, type_params) = match stmt {
@@ -1043,7 +1100,8 @@ impl<'a> TypeChecker<'a> {
                                     let resolved = self.resolve_self_ty(ty, self_ty);
                                     self.resolve_type(&resolved)
                                 } else {
-                                    Ok(self.ctx.error())
+                                    // Bare `self`, `&self`, `&mut self` params: resolve to `for_ty`
+                                    Ok(for_ty)
                                 }
                             })
                             .collect::<Result<Vec<_>, _>>()?;
@@ -1153,7 +1211,8 @@ impl<'a> TypeChecker<'a> {
                                     let resolved = self.resolve_self_ty(ty, self_ty);
                                     self.resolve_type(&resolved)
                                 } else {
-                                    Ok(self.ctx.error())
+                                    // Bare `self`, `&self`, `&mut self` params: resolve to `for_ty`
+                                    Ok(for_ty)
                                 }
                             })
                             .collect::<Result<Vec<_>, _>>()?;

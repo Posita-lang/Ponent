@@ -266,6 +266,10 @@ pub struct InferenceContext {
     dirty_set: std::collections::HashSet<usize>,
     /// Dirty region levels from TypeChecker's RegionTree.
     pub region_dirty_levels: Vec<usize>,
+    /// Per-InferenceContext resolution table (TypeOrVar pattern).
+    resolutions: Vec<Option<TypeId>>,
+    /// Local bindings for GenericParam indices during instantiation.
+    generic_param_bindings: HashMap<usize, TypeId>,
 }
 
 /// A set of pattern alternatives for a suspended match constraint.
@@ -301,6 +305,8 @@ impl InferenceContext {
             reverse_refs: Vec::new(),
             dirty_set: std::collections::HashSet::new(),
             region_dirty_levels: Vec::new(),
+            resolutions: Vec::new(),
+            generic_param_bindings: HashMap::default(),
         }
     }
 
@@ -308,6 +314,9 @@ impl InferenceContext {
         let id = self.next_var_id;
         self.next_var_id += 1;
         let ty_id = ctx.alloc_infer_var(id);
+        if id >= self.resolutions.len() {
+            self.resolutions.resize(id + 1, None);
+        }
         self.type_vars.push(TypeVar {
             id,
             kind,
@@ -339,6 +348,46 @@ impl InferenceContext {
             self.reverse_refs.push(None);
         }
         ty_id
+    }
+
+    /// Resolve a TypeId through inference variable bindings (TypeOrVar pattern).
+    /// Follows the chain of resolutions until a concrete type is found.
+    pub fn resolve(&self, ty: TypeId, ctx: &TypeContext) -> TypeId {
+        let mut current = ty;
+        loop {
+            match ctx.get(current) {
+                TypeData::InferVar { id } => {
+                    if *id < self.resolutions.len() {
+                        if let Some(resolved) = self.resolutions[*id] {
+                            if resolved == current { return current; }
+                            current = resolved;
+                            continue;
+                        }
+                    }
+                    return current;
+                }
+                _ => return current,
+            }
+        }
+    }
+
+    /// Unify with local InferVar resolution (TypeOrVar pattern).
+    /// Records resolutions in `self.resolutions` instead of global bindings.
+    pub fn unify(&mut self, a: TypeId, b: TypeId, ctx: &mut TypeContext) -> Result<TypeId, TypeError> {
+        let ra = self.resolve(a, ctx);
+        let rb = self.resolve(b, ctx);
+        if ra == rb { return Ok(ra); }
+        match (ctx.get(ra), ctx.get(rb)) {
+            (TypeData::InferVar { id }, _) if *id < self.resolutions.len() => {
+                self.resolutions[*id] = Some(rb);
+                Ok(rb)
+            }
+            (_, TypeData::InferVar { id }) if *id < self.resolutions.len() => {
+                self.resolutions[*id] = Some(ra);
+                Ok(ra)
+            }
+            _ => ctx.unify(ra, rb),
+        }
     }
 
     /// Look up the kind of a type variable by its id.
@@ -395,9 +444,9 @@ impl InferenceContext {
             tv.level = target_level;
         }
         // Bind the old variable to the new one (promotion)
-        ctx.bindings
-            .borrow_mut()
-            .insert(self.var_type_ids[var_id], new_ty_id);
+        if var_id < self.resolutions.len() {
+            self.resolutions[var_id] = Some(new_ty_id);
+        }
         Some(new_ty_id)
     }
 
@@ -2613,8 +2662,8 @@ mod tests {
         // Promote to level 0
         let promoted = infer.try_promote_var(&mut ctx, var_id, 0);
         assert!(promoted.is_some(), "promotion should succeed");
-        // The old var should now be bound to the promoted var
-        let resolved = ctx.resolve_binding(var);
+        // The old var should now be bound to the promoted var (via infer.resolve)
+        let resolved = infer.resolve(var, &ctx);
         assert!(
             matches!(ctx.get(resolved), TypeData::InferVar { id } if *id != var_id),
             "original var should be bound to a new InferVar"

@@ -38,12 +38,17 @@ impl<'a, 'tcx> Drop for ScopeGuard<'a, 'tcx> {
 
 impl<'a> TypeChecker<'a> {
     /// Save the current inference context and push a fresh one.
+    /// Also saves TypeContext bindings so the nested scope's resolution
+    /// can be rolled back on exit (TypeOrVar isolation pattern).
     pub(crate) fn enter_inference_scope(&mut self) {
+        self.ctx.begin_transaction();
         let old = mem::replace(&mut self.infer, InferenceContext::new());
         self.infer_stack.push(old);
     }
 
     /// Pop the inference context, solve its constraints, and finalize.
+    /// On exit, rolls back TypeContext bindings so the nested scope's
+    /// infer var resolutions don't leak into the enclosing scope.
     pub(crate) fn exit_inference_scope(&mut self) -> Result<(), DiagnosticCollector> {
         let mut current = mem::replace(&mut self.infer, self.infer_stack.pop().unwrap_or_default());
         // Wire RegionTree dirty levels into inference context for generation-based generalization.
@@ -52,6 +57,7 @@ impl<'a> TypeChecker<'a> {
             let diag = Diagnostic::error(format!("type inference error: {:?}", err))
                 .with_span(Span::new(0, 0));
             self.diagnostics.push(diag);
+            self.ctx.rollback_transaction();
             return Err(mem::take(&mut self.diagnostics));
         }
         let _solution = current.finalize(self.ctx);
@@ -65,7 +71,13 @@ impl<'a> TypeChecker<'a> {
                     .with_span(Span::new(0, 0)),
             );
         }
-        if !unresolved.is_empty() {
+        let has_errors = !unresolved.is_empty();
+
+        // Roll back TypeContext bindings — the nested scope's InferVar
+        // resolutions are stored in `current.resolutions` which is dropped.
+        self.ctx.rollback_transaction();
+
+        if has_errors {
             return Err(mem::take(&mut self.diagnostics));
         }
 
