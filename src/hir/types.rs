@@ -278,6 +278,10 @@ pub struct TypeContext {
     pub builtin_char: TypeId,
     pub builtin_byte: TypeId,
     pub builtin_usize: TypeId,
+    /// Built-in string slice type `Str`.
+    pub builtin_str: TypeId,
+    /// Built-in reference to string slice `&Str` — a `Ref { ty: Str, mutable: false }`.
+    pub builtin_str_ref: TypeId,
     /// Cache for variance check results: (param_index, TypeId, expected_sign) → bool.
     variance_cache: RefCell<HashMap<(usize, TypeId, isize), bool>>,
     /// Pre-computed variance-annotated outgoing edges for each TypeId.
@@ -308,6 +312,8 @@ impl TypeContext {
             builtin_char: TypeId(0),
             builtin_byte: TypeId(0),
             builtin_usize: TypeId(0),
+            builtin_str: TypeId(0),
+            builtin_str_ref: TypeId(0),
             variance_cache: RefCell::new(HashMap::default()),
             variance_edges: RefCell::new(HashMap::default()),
             transaction_stack: RefCell::new(Vec::new()),
@@ -320,6 +326,13 @@ impl TypeContext {
         ctx.builtin_char = ctx.alloc(TypeData::Char);
         ctx.builtin_byte = ctx.alloc(TypeData::Byte);
         ctx.builtin_usize = ctx.alloc(TypeData::USize);
+        // Str type: represented as a zero-sized struct with a sentinel DefId.
+        ctx.builtin_str = ctx.alloc(TypeData::Struct {
+            def_id: DefId(usize::MAX),
+            args: vec![],
+        });
+        // &Str = Ref { ty: Str, mutable: false }
+        ctx.builtin_str_ref = ctx.reference(ctx.builtin_str, false);
         ctx
     }
 
@@ -349,21 +362,34 @@ impl TypeContext {
     }
 
     pub(crate) fn resolve_binding(&self, id: TypeId) -> TypeId {
-        let mut current = id;
-        loop {
-            let bound = self.bindings.borrow().get(&current).copied();
-            match bound {
-                Some(next) => current = next,
-                None => break,
+        // First pass: follow the binding chain to the root with a single
+        // immutable borrow.  This is a simple linked-list traversal through
+        // the bindings map until we reach an unbound TypeId.
+        let root = {
+            let bindings = self.bindings.borrow();
+            let mut current = id;
+            while let Some(&next) = bindings.get(&current) {
+                current = next;
+            }
+            current
+        };
+
+        // Second pass: path compression.  Point every node along the chain
+        // directly to the root so that future lookups are O(1) instead of
+        // O(depth).  Uses a single mutable borrow for all updates.
+        if root != id {
+            let mut bindings = self.bindings.borrow_mut();
+            let mut current = id;
+            while current != root {
+                if let Some(&next) = bindings.get(&current) {
+                    bindings.insert(current, root);
+                    current = next;
+                } else {
+                    break;
+                }
             }
         }
-        let root = current;
-        let mut cur = id;
-        while cur != root {
-            let next = self.bindings.borrow().get(&cur).copied().unwrap();
-            self.bindings.borrow_mut().insert(cur, root);
-            cur = next;
-        }
+
         root
     }
 
@@ -414,6 +440,10 @@ impl TypeContext {
 
     pub fn usize(&self) -> TypeId {
         self.builtin_usize
+    }
+
+    pub fn str_ref(&self) -> TypeId {
+        self.builtin_str_ref
     }
 
     pub fn unit(&self) -> TypeId {

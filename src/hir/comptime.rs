@@ -620,118 +620,156 @@ impl<'a> ComptimeEvalContext<'a> {
 /// Reflect on a type and produce a comptime representation of its metadata.
 /// Returns a structured HirExpr tuple: (kind_name: &str, fields...)
 /// For composite types, includes field/variant details from the symbol table.
-fn reflect_type_info(&self, type_id: TypeId, _span: Span) -> ComptimeValue {
-    let unit_ty = self.checker.ctx.unit();
-    let str_lit = |s: &str| HirExpr::Literal(Literal::String(s.into()), unit_ty, Span::new(0, 0));
-    let int_lit = |n: i64| HirExpr::Literal(Literal::Int(n), unit_ty, Span::new(0, 0));
-    let bool_lit = |b: bool| HirExpr::Literal(Literal::Bool(b), unit_ty, Span::new(0, 0));
+fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
+    let ctx = &mut self.checker.ctx;
+    let unit_ty = ctx.unit();
+    let usize_ty = ctx.usize();
+    let bool_ty = ctx.bool();
+    let str_ty = ctx.str_ref(); // &Str — proper type for comptime string labels
+    // Build a single reusable tuple type for (kind_str, ...) pairs.
+    let info_ty = ctx.unit(); // Simplified: all info tuples share unit type.
 
-    match self.checker.ctx.get(type_id) {
+    // Helper closures — use the correct type per literal kind.
+    let str_lit = |s: &str| HirExpr::Literal(Literal::String(s.into()), str_ty, Span::new(0, 0));
+    let int_lit = |n: i64| HirExpr::Literal(Literal::Int(n), usize_ty, Span::new(0, 0));
+    let bool_lit = |b: bool| HirExpr::Literal(Literal::Bool(b), bool_ty, Span::new(0, 0));
+
+    // Build a proper tuple type for (kind, field...) info tuples.
+    let info_tup_ty = |elems: &[HirExpr]| {
+        let elem_tys: Vec<TypeId> = elems.iter().map(|e| match e {
+            HirExpr::Literal(Literal::String(..), _, _) => str_ty,
+            HirExpr::Literal(Literal::Int(..), _, _) => usize_ty,
+            HirExpr::Literal(Literal::Bool(..), _, _) => bool_ty,
+            HirExpr::Tuple(.., ty, _) => *ty,
+            _ => unit_ty,
+        }).collect();
+        if elem_tys.is_empty() { unit_ty } else { ctx.tuple(elem_tys) }
+    };
+
+    /// Resolve an AST type expression to a DefId, handling simple paths
+    /// and generic type names like `Int<32>` (returns the base type's DefId).
+    fn resolve_ast_type_def_id(ty: &Type, resolution_map: &ResolutionMap, symbols: &SymbolTable) -> Option<i64> {
+        match ty {
+            Type::Path(path, _) => {
+                if let Some(&did) = resolution_map.type_def_ids.get(&path[0]) {
+                    return Some(did.0 as i64);
+                }
+                if let Some(did) = symbols.lookup_type_by_path(path) {
+                    return Some(did.0 as i64);
+                }
+                None
+            }
+            Type::Generic(base, _args, _) => {
+                if let Type::Path(path, _) = base.as_ref() {
+                    if let Some(&did) = resolution_map.type_def_ids.get(&path[0]) {
+                        return Some(did.0 as i64);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    let make_info = |elems: Vec<HirExpr>| -> ComptimeValue {
+        let ty = info_tup_ty(&elems);
+        ComptimeValue::Value(HirExpr::Tuple(elems, ty, Span::new(0, 0)))
+    };
+
+    let make_nested_info = |label: HirExpr, inner: HirExpr| -> ComptimeValue {
+        let ty = info_tup_ty(&[label.clone(), inner.clone()]);
+        ComptimeValue::Value(HirExpr::Tuple(vec![label, inner], ty, Span::new(0, 0)))
+    };
+
+    match ctx.get(type_id) {
         TypeData::Int { bits, signed } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
-                str_lit("Int"),
-                int_lit(*bits as i64),
-                bool_lit(*signed),
-            ], unit_ty, Span::new(0, 0)))
+            make_info(vec![str_lit("Int"), int_lit(*bits as i64), bool_lit(*signed)])
         }
         TypeData::UInt { bits } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
-                str_lit("UInt"),
-                int_lit(*bits as i64),
-            ], unit_ty, Span::new(0, 0)))
+            make_info(vec![str_lit("UInt"), int_lit(*bits as i64)])
         }
         TypeData::Float { bits } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
-                str_lit("Float"),
-                int_lit(*bits as i64),
-            ], unit_ty, Span::new(0, 0)))
+            make_info(vec![str_lit("Float"), int_lit(*bits as i64)])
         }
-        TypeData::Bool => {
-            ComptimeValue::Value(str_lit("Bool"))
-        }
-        TypeData::Char => {
-            ComptimeValue::Value(str_lit("Char"))
-        }
-        TypeData::Byte => {
-            ComptimeValue::Value(str_lit("Byte"))
-        }
-        TypeData::USize => {
-            ComptimeValue::Value(str_lit("USize"))
-        }
-        TypeData::Unit => {
-            ComptimeValue::Value(str_lit("Unit"))
-        }
-        TypeData::Never => {
-            ComptimeValue::Value(str_lit("Never"))
-        }
+        TypeData::Bool => ComptimeValue::Value(str_lit("Bool")),
+        TypeData::Char => ComptimeValue::Value(str_lit("Char")),
+        TypeData::Byte => ComptimeValue::Value(str_lit("Byte")),
+        TypeData::USize => ComptimeValue::Value(str_lit("USize")),
+        TypeData::Unit => ComptimeValue::Value(str_lit("Unit")),
+        TypeData::Never => ComptimeValue::Value(str_lit("Never")),
         TypeData::Struct { def_id, .. } => {
-            // Return: ("Struct", def_id, arg_count, [("field_name", field_ty_id), ...])
             let mut fields_tuple = Vec::new();
             if let Some(binding) = self.checker.symbols.lookup_type_by_def_id(*def_id) {
                 for field in &binding.fields {
-                    fields_tuple.push(HirExpr::Tuple(vec![
+                    let field_info = make_info(vec![
                         str_lit(&field.name),
                         int_lit(field.ty.0 as i64),
-                        str_lit(&format!("{:?}", self.checker.ctx.get(field.ty))),
-                    ], unit_ty, Span::new(0, 0)));
+                        str_lit(&format!("{:?}", ctx.get(field.ty))),
+                    ]);
+                    if let ComptimeValue::Value(hir) = field_info {
+                        fields_tuple.push(hir);
+                    }
                 }
             }
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            let fields_ty = ctx.tuple(
+                fields_tuple.iter().map(|f| match f {
+                    HirExpr::Tuple(.., ty, _) => *ty,
+                    _ => unit_ty,
+                }).collect()
+            );
+            make_info(vec![
                 str_lit("Struct"),
                 int_lit(def_id.0 as i64),
                 int_lit(fields_tuple.len() as i64),
-                HirExpr::Tuple(fields_tuple, unit_ty, Span::new(0, 0)),
-            ], unit_ty, Span::new(0, 0)))
+                HirExpr::Tuple(fields_tuple, fields_ty, Span::new(0, 0)),
+            ])
         }
         TypeData::Enum { def_id, .. } => {
-            // Return: ("Enum", def_id, arg_count, [("variant_name", payload_ty_id_or_0), ...])
             let mut variants_tuple = Vec::new();
             if let Some(binding) = self.checker.symbols.lookup_type_by_def_id(*def_id) {
                 for variant in &binding.variants {
-                    let payload_id = match &variant.payload {
-                        Some(Type::Path(path, _)) => {
-                            if let Some(&did) = self.checker.resolution_map.type_def_ids.get(&path[0]) {
-                                did.0 as i64
-                            } else {
-                                0i64
-                            }
-                        }
-                        _ => 0i64,
-                    };
-                    variants_tuple.push(HirExpr::Tuple(vec![
+                    let payload_id = resolve_ast_type_def_id(
+                        &variant.payload.as_ref().unwrap_or(&Type::Error(Span::new(0, 0))),
+                        &self.checker.resolution_map,
+                        self.checker.symbols,
+                    ).unwrap_or(0);
+                    let is_none = variant.payload.is_none();
+                    let vinfo = make_info(vec![
                         str_lit(&variant.name),
-                        int_lit(payload_id),
-                    ], unit_ty, Span::new(0, 0)));
+                        int_lit(if is_none { -1i64 } else { payload_id }),
+                    ]);
+                    if let ComptimeValue::Value(hir) = vinfo {
+                        variants_tuple.push(hir);
+                    }
                 }
             }
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            let vars_ty = ctx.tuple(
+                variants_tuple.iter().map(|f| match f {
+                    HirExpr::Tuple(.., ty, _) => *ty,
+                    _ => unit_ty,
+                }).collect()
+            );
+            make_info(vec![
                 str_lit("Enum"),
                 int_lit(def_id.0 as i64),
                 int_lit(variants_tuple.len() as i64),
-                HirExpr::Tuple(variants_tuple, unit_ty, Span::new(0, 0)),
-            ], unit_ty, Span::new(0, 0)))
+                HirExpr::Tuple(variants_tuple, vars_ty, Span::new(0, 0)),
+            ])
         }
         TypeData::Tuple { elems } => {
-            // Return: ("Tuple", [elem_ty_id, ...])
             let elem_ids: Vec<HirExpr> = elems.iter().map(|e| int_lit(e.0 as i64)).collect();
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            let ids_ty = ctx.tuple(elems.iter().map(|_| usize_ty).collect());
+            make_info(vec![
                 str_lit("Tuple"),
                 int_lit(elems.len() as i64),
-                HirExpr::Tuple(elem_ids, unit_ty, Span::new(0, 0)),
-            ], unit_ty, Span::new(0, 0)))
+                HirExpr::Tuple(elem_ids, ids_ty, Span::new(0, 0)),
+            ])
         }
         TypeData::Array { elem, size } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
-                str_lit("Array"),
-                int_lit(elem.0 as i64),
-                int_lit(*size as i64),
-            ], unit_ty, Span::new(0, 0)))
+            make_info(vec![str_lit("Array"), int_lit(elem.0 as i64), int_lit(*size as i64)])
         }
         TypeData::Slice { elem } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
-                str_lit("Slice"),
-                int_lit(elem.0 as i64),
-            ], unit_ty, Span::new(0, 0)))
+            make_info(vec![str_lit("Slice"), int_lit(elem.0 as i64)])
         }
         TypeData::Fn { params, ret } => {
             // Return: ("Fn", param_count, [param_ty_id, ...], ret_ty_id)

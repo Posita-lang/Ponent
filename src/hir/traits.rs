@@ -53,6 +53,11 @@ impl TraitEnv {
         }
     }
 
+    /// Return all registered impl candidates.
+    pub fn all_impls(&self) -> &[ImplCandidate] {
+        &self.impls
+    }
+
     pub fn add_impl(
         &mut self,
         candidate: ImplCandidate,

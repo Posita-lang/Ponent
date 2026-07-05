@@ -1706,7 +1706,8 @@ impl<'a> TypeChecker<'a> {
     fn try_deref_trait_step(&self, ty: TypeId) -> Option<TypeId> {
         let deref_trait_id = self.symbols.lookup_trait("Deref").map(|b| b.def_id)?;
         let candidates = self.trait_env.lookup_impls_for_type(ty);
-        for cand in candidates {
+        // Check Deref first
+        for cand in &candidates {
             if cand.trait_id == deref_trait_id && cand.has_auto_deref {
                 if let Some(target_ty) = cand
                     .assoc_tys
@@ -1715,6 +1716,21 @@ impl<'a> TypeChecker<'a> {
                     .map(|(_, ty)| *ty)
                 {
                     return Some(target_ty);
+                }
+            }
+        }
+        // Also try DerefMut: same Target as Deref
+        let deref_mut_id = self.symbols.lookup_trait("DerefMut").map(|b| b.def_id);
+        if let Some(deref_mut_id) = deref_mut_id {
+            for cand in &candidates {
+                if cand.trait_id == deref_mut_id && cand.has_auto_deref {
+                    if let Some(target_ty) = self.trait_env.lookup_impl(deref_trait_id, ty)
+                        .and_then(|dc| dc.assoc_tys.iter()
+                            .find(|(name, _)| name == "Target")
+                            .map(|(_, ty)| *ty))
+                    {
+                        return Some(target_ty);
+                    }
                 }
             }
         }
@@ -2063,21 +2079,50 @@ impl<'a> TypeChecker<'a> {
     /// Look up a method by name on a type, walking the autoderef chain.
     /// Returns `(param_types, return_type)` if found.
     fn lookup_method(&mut self, ty: TypeId, name: &str) -> Option<(Vec<TypeId>, TypeId)> {
-        for current_ty in self.autoderef_chain(ty) {
-            // Check inherent methods first (registered via `impl Type { ... }`)
+        // Collect autoderef chain first to avoid borrow conflicts with self.ctx.
+        let chain: Vec<TypeId> = self.autoderef_chain(ty).collect();
+        // Pre-collect all unique trait IDs.
+        let all_trait_ids: Vec<DefId> = {
+            let mut seen = std::collections::HashSet::new();
+            self.trait_env.all_impls()
+                .iter()
+                .filter(|c| seen.insert(c.trait_id))
+                .map(|c| c.trait_id)
+                .collect()
+        };
+
+        for current_ty in chain {
+            // Check inherent methods first.
             for method in self.trait_env.lookup_inherent_methods(current_ty, self.ctx) {
                 if method.name == name {
                     return Some((method.param_tys.clone(), method.ret_ty));
                 }
             }
 
-            // Collect trait impl methods with matching name, using pre-resolved
-            // method signatures (resolved at impl registration time so that
-            // generic params like `T` in `impl<T> Vec<T>` are properly handled).
+            // Check trait impl methods via exact match.
             for cand in self.trait_env.lookup_impls_for_type(current_ty) {
                 for method in &cand.resolved_methods {
                     if method.name == name {
                         return Some((method.param_tys.clone(), method.ret_ty));
+                    }
+                }
+            }
+
+            // Fallback: try generic impl matching for every trait.
+            for &trait_id in &all_trait_ids {
+                if let Some((cand, subst)) =
+                    self.trait_env.lookup_impl_generic(trait_id, current_ty, self.ctx, self.symbols)
+                {
+                    for method in &cand.resolved_methods {
+                        if method.name == name {
+                            let param_tys: Vec<TypeId> = method
+                                .param_tys
+                                .iter()
+                                .map(|&p| self.ctx.subst(p, &subst))
+                                .collect();
+                            let ret_ty = self.ctx.subst(method.ret_ty, &subst);
+                            return Some((param_tys, ret_ty));
+                        }
                     }
                 }
             }

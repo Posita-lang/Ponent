@@ -105,6 +105,14 @@ impl SmtSolver {
                 TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } => {
                     PrincipalShape::Poly
                 }
+                TypeData::Int { .. }
+                | TypeData::UInt { .. }
+                | TypeData::Float { .. }
+                | TypeData::Bool
+                | TypeData::Char
+                | TypeData::Byte
+                | TypeData::USize
+                | TypeData::Rational { .. } => PrincipalShape::Scalar,
                 _ => PrincipalShape::Unknown,
             });
         }
@@ -128,11 +136,13 @@ impl SmtSolver {
         smt.push_str("(declare-const SHAPE_TUPLE Int)\n");
         smt.push_str("(declare-const SHAPE_CONSTRUCTOR Int)\n");
         smt.push_str("(declare-const SHAPE_POLY Int)\n");
+        smt.push_str("(declare-const SHAPE_SCALAR Int)\n");
         smt.push_str("(assert (= SHAPE_UNKNOWN 0))\n");
         smt.push_str("(assert (= SHAPE_ARROW 1))\n");
         smt.push_str("(assert (= SHAPE_TUPLE 2))\n");
         smt.push_str("(assert (= SHAPE_CONSTRUCTOR 3))\n");
-        smt.push_str("(assert (= SHAPE_POLY 4))\n\n");
+        smt.push_str("(assert (= SHAPE_POLY 4))\n");
+        smt.push_str("(assert (= SHAPE_SCALAR 5))\n\n");
 
         // ── 3. Type constructor functions ────────────────────────
         smt.push_str("(declare-fun type-int32 () Type)\n");
@@ -146,28 +156,47 @@ impl SmtSolver {
         smt.push_str("(declare-fun type-tuple2 (Type Type) Type)\n");
         smt.push_str("(declare-fun type-struct (Int Type) Type)\n");
         smt.push_str("(declare-fun type-poly (Type) Type)\n");
-        smt.push_str("(declare-fun type-rational (Int Int) Type)\n\n");
+        smt.push_str("(declare-fun type-rational (Int Int) Type)\n");
+        smt.push_str("(declare-fun type-ref (Type Bool) Type)\n");
+        smt.push_str("(declare-fun type-ptr (Type Type) Type)\n");
+        smt.push_str("(declare-fun type-slice (Type) Type)\n");
+        smt.push_str("(declare-fun type-array (Type Int) Type)\n");
+        smt.push_str("(declare-fun type-coproduct (Type Type) Type)\n");
+        smt.push_str("(declare-fun type-pointer (Type) Type)\n");
+        smt.push_str("(declare-fun type-float32 () Type)\n");
+        smt.push_str("(declare-fun type-float64 () Type)\n");
+        smt.push_str("(declare-fun type-dyn-trait (Int) Type)\n\n");
 
-        // ── 4. Shape-of function ────────────────────────────────
-        smt.push_str("(declare-fun shape-of (Type) Int)\n\n");
+        // ── 4. Shape-of and arity-of functions ────────────────────
+        smt.push_str("(declare-fun shape-of (Type) Int)\n");
+        smt.push_str("(declare-fun arity-of (Type) Int)\n\n");
 
-        // ── 5. Shape axioms ──────────────────────────────────────
-        smt.push_str("(assert (= (shape-of type-int32) SHAPE_UNKNOWN))\n");
-        smt.push_str("(assert (= (shape-of type-int64) SHAPE_UNKNOWN))\n");
-        smt.push_str("(assert (= (shape-of type-bool) SHAPE_UNKNOWN))\n");
+        // ── 5. Shape and arity axioms ────────────────────────────
+        smt.push_str("(assert (= (shape-of type-int32) SHAPE_SCALAR))\n");
+        smt.push_str("(assert (= (shape-of type-int64) SHAPE_SCALAR))\n");
+        smt.push_str("(assert (= (shape-of type-bool) SHAPE_SCALAR))\n");
         smt.push_str("(assert (= (shape-of type-unit) SHAPE_UNKNOWN))\n");
         smt.push_str("(assert (= (shape-of type-never) SHAPE_UNKNOWN))\n");
-        smt.push_str("(assert (= (shape-of type-char) SHAPE_UNKNOWN))\n");
-        smt.push_str("(assert (= (shape-of type-byte) SHAPE_UNKNOWN))\n");
+        smt.push_str("(assert (= (shape-of type-char) SHAPE_SCALAR))\n");
+        smt.push_str("(assert (= (shape-of type-byte) SHAPE_SCALAR))\n");
+        smt.push_str("(assert (= (shape-of type-float32) SHAPE_SCALAR))\n");
+        smt.push_str("(assert (= (shape-of type-float64) SHAPE_SCALAR))\n");
         smt.push_str(
-            "(assert (forall ((a Type) (b Type)) (= (shape-of (type-fn a b)) SHAPE_ARROW)))\n",
+            "(assert (forall ((a Type) (b Type)) (and (= (shape-of (type-fn a b)) SHAPE_ARROW) (= (arity-of (type-fn a b)) 2))))\n",
         );
         smt.push_str(
-            "(assert (forall ((a Type) (b Type)) (= (shape-of (type-tuple2 a b)) SHAPE_TUPLE)))\n",
+            "(assert (forall ((a Type) (b Type)) (and (= (shape-of (type-tuple2 a b)) SHAPE_TUPLE) (= (arity-of (type-tuple2 a b)) 2))))\n",
         );
-        smt.push_str("(assert (forall ((tag Int) (a Type)) (= (shape-of (type-struct tag a)) SHAPE_CONSTRUCTOR)))\n");
+        smt.push_str("(assert (forall ((tag Int) (a Type)) (and (= (shape-of (type-struct tag a)) SHAPE_CONSTRUCTOR) (= (arity-of (type-struct tag a)) 1))))\n");
         smt.push_str("(assert (forall ((a Type)) (= (shape-of (type-poly a)) SHAPE_POLY)))\n");
-        smt.push_str("(assert (forall ((p Int) (q Int)) (= (shape-of (type-rational p q)) SHAPE_UNKNOWN)))\n\n");
+        smt.push_str("(assert (forall ((p Int) (q Int)) (= (shape-of (type-rational p q)) SHAPE_SCALAR)))\n");
+        smt.push_str("(assert (forall ((a Type) (m Bool)) (and (= (shape-of (type-ref a m)) SHAPE_CONSTRUCTOR) (= (arity-of (type-ref a m)) 1))))\n");
+        smt.push_str("(assert (forall ((s Type) (p Type)) (and (= (shape-of (type-ptr s p)) SHAPE_CONSTRUCTOR) (= (arity-of (type-ptr s p)) 2))))\n");
+        smt.push_str("(assert (forall ((a Type)) (and (= (shape-of (type-slice a)) SHAPE_CONSTRUCTOR) (= (arity-of (type-slice a)) 1))))\n");
+        smt.push_str("(assert (forall ((a Type) (n Int)) (and (= (shape-of (type-array a n)) SHAPE_CONSTRUCTOR) (= (arity-of (type-array a n)) 1))))\n");
+        smt.push_str("(assert (forall ((a Type) (b Type)) (and (= (shape-of (type-coproduct a b)) SHAPE_CONSTRUCTOR) (= (arity-of (type-coproduct a b)) 2))))\n");
+        smt.push_str("(assert (forall ((a Type)) (and (= (shape-of (type-pointer a)) SHAPE_CONSTRUCTOR) (= (arity-of (type-pointer a)) 1))))\n");
+        smt.push_str("(assert (forall ((tag Int)) (= (shape-of (type-dyn-trait tag)) SHAPE_CONSTRUCTOR)))\n\n");
 
         // ── 6. Inference variable ──────────────────────────────
         smt.push_str(&format!("(declare-const iv_{} Type)\n", var_id));
@@ -186,6 +215,7 @@ impl SmtSolver {
         // ── 9. Push/assert/pop for each candidate shape ──────────
         let shape_names = [
             ("SHAPE_UNKNOWN", PrincipalShape::Unknown),
+            ("SHAPE_SCALAR", PrincipalShape::Scalar),
             ("SHAPE_ARROW", PrincipalShape::Arrow),
             ("SHAPE_TUPLE", PrincipalShape::Tuple(2)),
             ("SHAPE_CONSTRUCTOR", PrincipalShape::Constructor(0)),
@@ -203,8 +233,25 @@ impl SmtSolver {
         }
 
         // ── 10. Query Z3 ─────────────────────────────────────────
-        let output = self.call_z3(&smt)?;
-        Self::parse_unicity_results(&output, &shape_names)
+        let output = self.call_z3(&smt);
+        match output {
+            SmtResult::Sat(result) => Self::parse_unicity_results(&result, &shape_names),
+            SmtResult::Unsat => {
+                // Unsat: Z3 proved that no model satisfies the constraints.
+                // The target variable has no possible shape, which means
+                // the constraints are contradictory.  We cannot determine
+                // a unique shape — return None.
+                None
+            }
+            SmtResult::Timeout => {
+                // Timed out — conservatively return Unknown to avoid false positives.
+                Some(PrincipalShape::Unknown)
+            }
+            SmtResult::Error(_) => {
+                // Z3 not available or error — fall back to heuristic.
+                Some(PrincipalShape::Unknown)
+            }
+        }
     }
 
     /// Convert a TypeId to an SMT-LIB2 term.
@@ -264,13 +311,91 @@ impl SmtSolver {
             } => {
                 format!("(type-rational {} {})", int_bits, frac_bits)
             }
-            _ => "type-unknown".into(),
+            TypeData::USize => "type-int64".into(),
+            TypeData::Ref { ty, mutable } => {
+                let inner = Self::type_to_smt_term(ctx, *ty);
+                let m = if *mutable { "true" } else { "false" };
+                format!("(type-ref {} {})", inner, m)
+            }
+            TypeData::Pointer { ty } => {
+                let inner = Self::type_to_smt_term(ctx, *ty);
+                format!("(type-pointer {})", inner)
+            }
+            TypeData::Ptr { size, pointee } => {
+                let s = Self::type_to_smt_term(ctx, *size);
+                let p = Self::type_to_smt_term(ctx, *pointee);
+                format!("(type-ptr {} {})", s, p)
+            }
+            TypeData::Slice { elem } => {
+                let e = Self::type_to_smt_term(ctx, *elem);
+                format!("(type-slice {})", e)
+            }
+            TypeData::Array { elem, size } => {
+                let e = Self::type_to_smt_term(ctx, *elem);
+                format!("(type-array {} {})", e, size)
+            }
+            TypeData::Coproduct { alternatives } => {
+                if alternatives.len() == 2 {
+                    let a = Self::type_to_smt_term(ctx, alternatives[0]);
+                    let b = Self::type_to_smt_term(ctx, alternatives[1]);
+                    format!("(type-coproduct {} {})", a, b)
+                } else if alternatives.len() == 1 {
+                    Self::type_to_smt_term(ctx, alternatives[0])
+                } else {
+                    "type-unknown".into()
+                }
+            }
+            TypeData::Struct { def_id, args } => {
+                // Encode as (type-struct def_id first_arg) for the first arg
+                if let Some(&arg) = args.first() {
+                    let a = Self::type_to_smt_term(ctx, arg);
+                    format!("(type-struct {} {})", def_id.0, a)
+                } else {
+                    format!("(type-struct {} type-unit)", def_id.0)
+                }
+            }
+            TypeData::Enum { def_id, args } => {
+                // Same encoding as Struct
+                if let Some(&arg) = args.first() {
+                    let a = Self::type_to_smt_term(ctx, arg);
+                    format!("(type-struct {} {})", def_id.0, a)
+                } else {
+                    format!("(type-struct {} type-unit)", def_id.0)
+                }
+            }
+            TypeData::DynTrait { traits } => {
+                let tag = traits.first().map(|t| t.0 as i64).unwrap_or(0);
+                format!("(type-dyn-trait {})", tag)
+            }
+            TypeData::AssociatedType { self_ty, .. } => {
+                Self::type_to_smt_term(ctx, *self_ty)
+            }
+            TypeData::Error => "type-unknown".into(),
+            TypeData::GenericParam { .. } => "type-unknown".into(),
+            TypeData::Float { bits } => {
+                if *bits == 32 { "type-float32".into() } else { "type-float64".into() }
+            }
         }
     }
+}
 
-    fn call_z3(&self, smt: &str) -> Option<String> {
+/// Result of an SMT query.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SmtResult {
+    /// Z3 returned sat/unsat successfully.
+    Sat(String),
+    Unsat,
+    /// Z3 timed out — the query could not be resolved within the budget.
+    /// The caller should fall back to a conservative (safe) heuristic.
+    Timeout,
+    /// Z3 could not be started or the query failed for other reasons.
+    Error(String),
+}
+
+impl SmtSolver {
+    fn call_z3(&self, smt: &str) -> SmtResult {
         if smt.is_empty() {
-            return None;
+            return SmtResult::Error("empty query".into());
         }
         // Build the SMT query with timeout and memory limit baked in.
         let mut smt_with_limits = String::new();
@@ -288,7 +413,7 @@ impl SmtSolver {
             .arg("-in")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
         {
             Ok(c) => c,
@@ -297,29 +422,32 @@ impl SmtSolver {
                     eprintln!("warning: SMT solver ({}) not found: {}; unicity check uses fallback heuristic", self.solver_path, e);
                     true
                 });
-                return None;
+                return SmtResult::Error(format!("solver not found: {}", e));
             }
         };
 
         if let Some(mut stdin) = child.stdin.take() {
             if stdin.write_all(smt_with_limits.as_bytes()).is_err() {
                 let _ = child.kill();
-                return None;
+                return SmtResult::Error("stdin write failed".into());
             }
         }
 
-        // Wait with a timeout via `wait()` (no cross-platform alarm available).
         let output = match child.wait_with_output() {
             Ok(o) => o,
-            Err(_) => return None,
+            Err(e) => return SmtResult::Error(format!("wait failed: {}", e)),
         };
 
         if output.status.success() {
-            Some(String::from_utf8_lossy(&output.stdout).to_string())
+            SmtResult::Sat(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
-            // Timeout or error — Z3 returns exit code 1 on `(check-sat)` after timeout
-            // with "(error "timeout")" on stderr, which is expected and not a crash.
-            None
+            // Check stderr for timeout indicator.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("timeout") {
+                SmtResult::Timeout
+            } else {
+                SmtResult::Error(format!("z3 error: {}", stderr.trim()))
+            }
         }
     }
 

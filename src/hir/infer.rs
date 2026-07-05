@@ -77,6 +77,8 @@ pub enum TypeVariableKind {
 pub enum PrincipalShape {
     /// Unknown — no shape information yet.
     Unknown,
+    /// Scalar — integer, float, char, byte, bool, rational.
+    Scalar,
     /// Function type: τ₁ → τ₂
     Arrow,
     /// Tuple type: τ₁ × τ₂ × ...
@@ -547,7 +549,14 @@ impl InferenceContext {
             TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } => {
                 PrincipalShape::Poly
             }
-            TypeData::Rational { .. } => PrincipalShape::Unknown,
+            TypeData::Int { .. }
+            | TypeData::UInt { .. }
+            | TypeData::Float { .. }
+            | TypeData::Bool
+            | TypeData::Char
+            | TypeData::Byte
+            | TypeData::USize
+            | TypeData::Rational { .. } => PrincipalShape::Scalar,
             TypeData::InferVar { .. } | TypeData::GenericParam { .. } => PrincipalShape::Var,
             _ => PrincipalShape::Unknown,
         }

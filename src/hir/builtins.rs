@@ -329,4 +329,5 @@ pub fn register_builtins(
     insert_trait(symbols, "Into", &mut DefId(0));
     insert_trait(symbols, "Sized", &mut DefId(0));
     insert_trait(symbols, "Deref", &mut DefId(0));
+    insert_trait(symbols, "DerefMut", &mut DefId(0));
 }
