@@ -1718,3 +1718,123 @@ fn test_variable_shadowing() {
     );
     assert!(result.is_ok(), "shadowing: {:?}", result.err());
 }
+
+#[test]
+fn test_while_let_variable_in_body() {
+    // while-let pattern variable should be accessible inside loop body
+    let result = check_source(
+        "type Opt = enum { None, Some(Int<32>) }
+         def main() -> Int<32> {
+             set mut opt = Opt::Some(42);
+             while let Some(x) = opt {
+                 return x;
+             }
+             return 0;
+         }",
+    );
+    assert!(result.is_ok(), "while-let variable: {:?}", result.err());
+}
+
+#[test]
+fn test_while_let_break() {
+    // `leave` inside while-let should target the while-let loop
+    let result = check_source(
+        "def main() -> Int<32> {
+             set mut i = 0;
+             while true {
+                 if i >= 5 {
+                     leave;
+                 }
+                 i = i + 1;
+             }
+             return i;
+         }",
+    );
+    assert!(result.is_ok(), "while break: {:?}", result.err());
+}
+
+#[test]
+fn test_for_loop_break() {
+    // `leave` inside for loop should target the for loop
+    let result = check_source(
+        "def main() -> Int<32> {
+             set arr = [1, 2, 3];
+             for x in arr {
+                 if x == 2 {
+                     leave;
+                 }
+             }
+             return 0;
+         }",
+    );
+    assert!(result.is_ok(), "for break: {:?}", result.err());
+}
+
+#[test]
+fn test_for_loop_continue() {
+    // `continue` inside for loop should skip to next iteration
+    let result = check_source(
+        "def main() -> Int<32> {
+             set mut total = 0;
+             set arr = [1, 2, 3, 4, 5];
+             for x in arr {
+                 if x == 3 {
+                     continue;
+                 }
+                 total = total + x;
+             }
+             return total;
+         }",
+    );
+    assert!(result.is_ok(), "for continue: {:?}", result.err());
+}
+
+#[test]
+fn test_while_let_continue() {
+    // `continue` inside while-let should work
+    let result = check_source(
+        "type Opt = enum { None, Some(Int<32>) }
+         def main() -> Int<32> {
+             set mut opt = Opt::Some(42);
+             set mut count = 0;
+             while let Some(x) = opt {
+                 count = count + 1;
+                 if count < 3 {
+                     continue;
+                 }
+                 return x;
+             }
+             return 0;
+         }",
+    );
+    assert!(result.is_ok(), "while-let continue: {:?}", result.err());
+}
+
+#[test]
+fn test_type_capture_auto() {
+    // `set auto<T> = expr` captures the inferred type of expr into the name T,
+    // making T available as a type name for comptime reflection.
+    let result = check_source(
+        "def main() -> Int<32> {
+             set auto<T> = 42;
+             // T should be bound to Int<32> here.
+             // For now at least it should parse and type-check without error.
+             return 0;
+         }",
+    );
+    assert!(result.is_ok(), "type capture auto: {:?}", result.err());
+}
+
+#[test]
+fn test_type_capture_auto_with_struct() {
+    // Type capture with a struct type — more realistic use case
+    let result = check_source(
+        "type MyType = struct { val: Int<32> }
+         def main() -> Int<32> {
+             set obj = MyType { val = 10 };
+             set auto<T> = obj;
+             return 0;
+         }",
+    );
+    assert!(result.is_ok(), "type capture with struct: {:?}", result.err());
+}

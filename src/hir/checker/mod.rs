@@ -166,6 +166,7 @@ impl<'a> TypeChecker<'a> {
                 value,
                 else_branch,
                 span,
+                type_captures,
                 ..
             } => {
                 // 'set' does not support pattern destructuring
@@ -268,6 +269,26 @@ impl<'a> TypeChecker<'a> {
                     self.local_variable_types.insert(var_name.clone(), final_ty);
                 }
 
+                // `set auto<T> = expr` — bind captured type names to the inferred type.
+                // Each name in `type_captures` becomes available as a type alias in
+                // comptime reflection (e.g., `@typeInfo!(T)`).
+                if !type_captures.is_empty() {
+                    if let Some(capture) = type_captures.first() {
+                        self.local_type_param_cache
+                            .insert(capture.name.clone(), final_ty);
+                    }
+                    // Future: support multiple captures (T, N, L) with compile-time
+                    // constant extraction for non-type captures.
+                    if type_captures.len() > 1 {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "multiple type captures not yet supported; only the first name is bound",
+                            )
+                            .with_span(*span),
+                        );
+                    }
+                }
+
                 Ok(HirStmt::VariableDef {
                     kind: *kind,
                     mutable: *mutable,
@@ -277,6 +298,7 @@ impl<'a> TypeChecker<'a> {
                     value: value_hir.map(Box::new),
                     else_branch: else_hir,
                     span: *span,
+                    type_captures: type_captures.clone(),
                 })
             }
             Stmt::FunctionDef {
@@ -580,7 +602,9 @@ impl<'a> TypeChecker<'a> {
                     .as_ref()
                     .map(|dec| self.infer_expr(dec).map(|(h, _)| h))
                     .transpose()?;
+                self.push_ctx(CtxKind::While, *span, None);
                 let body_hir = self.check_block(body)?;
+                self.pop_ctx();
                 Ok(HirStmt::WhileLet {
                     pattern: pattern_hir,
                     scrutinee: Box::new(scrut_hir),
@@ -943,7 +967,11 @@ impl<'a> TypeChecker<'a> {
                         attributes,
                         type_params,
                     ),
-                    _ => panic!("check_stmt: expected ImplBlock, got {:?}", stmt),
+                    _ => {
+                        let msg = format!("check_stmt: expected ImplBlock, got {:?}", stmt);
+                        self.diagnostics.push(Diagnostic::error(&msg).with_span(stmt.span()));
+                        return Ok(HirStmt::Error);
+                    }
                 };
                 if let Some(tp) = &trait_path {
                     // ── Trait impl block ─────────────────────────────────
@@ -1055,6 +1083,7 @@ impl<'a> TypeChecker<'a> {
                         trait_id,
                         for_type: for_ty,
                         methods: methods.clone(),
+                        resolved_methods: method_infos.clone(),
                         assoc_tys: Vec::new(),
                         span,
                         has_auto_deref: auto_deref,
@@ -1986,30 +2015,15 @@ impl<'a> TypeChecker<'a> {
                 }
             }
 
-            // Collect trait impl methods with matching name, then resolve types
-            // outside the borrow of self.trait_env.
-            let mut pending: Vec<(Vec<crate::ast::Param>, crate::ast::Type)> = Vec::new();
+            // Collect trait impl methods with matching name, using pre-resolved
+            // method signatures (resolved at impl registration time so that
+            // generic params like `T` in `impl<T> Vec<T>` are properly handled).
             for cand in self.trait_env.lookup_impls_for_type(current_ty) {
-                for method in &cand.methods {
+                for method in &cand.resolved_methods {
                     if method.name == name {
-                        pending.push((method.params.clone(), method.return_type.clone()));
+                        return Some((method.param_tys.clone(), method.ret_ty));
                     }
                 }
-            }
-            for (params, return_type) in pending {
-                let mut param_tys = Vec::with_capacity(params.len());
-                for p in &params {
-                    if let Some(ref param_ty) = p.ty {
-                        match self.resolve_type(param_ty) {
-                            Ok(ty_id) => param_tys.push(ty_id),
-                            Err(_) => return None,
-                        }
-                    } else {
-                        param_tys.push(self.ctx.error());
-                    }
-                }
-                let ret_ty = self.resolve_type(&return_type).ok()?;
-                return Some((param_tys, ret_ty));
             }
         }
         None

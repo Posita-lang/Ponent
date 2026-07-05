@@ -48,11 +48,24 @@ impl Parser {
         // Lex all tokens upfront into a buffer.
         let mut tokens = Vec::new();
         let mut lexer = Token::lexer(source);
+        let mut diagnostics = Vec::new();
         loop {
             let (token, span_range) = match lexer.next() {
                 Some(Ok(Token::WhitespaceOrComment)) => continue,
                 Some(Ok(token)) => (token, lexer.span()),
-                Some(Err(())) => continue,
+                Some(Err(())) => {
+                    // Logos couldn't tokenize the current character.
+                    // Record its position and skip it by advancing the lexer.
+                    let bad_span = lexer.span();
+                    diagnostics.push(
+                        Diagnostic::error(format!(
+                            "unexpected character '{}'",
+                            &source[bad_span.start..bad_span.end.min(source.len())]
+                        ))
+                        .with_span(Span::new(bad_span.start, bad_span.end)),
+                    );
+                    continue;
+                }
                 None => break,
             };
             tokens.push(SpannedToken {
@@ -65,7 +78,7 @@ impl Parser {
             cursor: 0,
             peeked: None,
             pending: Vec::new(),
-            diagnostics: Vec::new(),
+            diagnostics,
             recursion_depth: 0,
             max_recursion_depth: 256,
             restrictions: ParseRestrictions::STMT_EXPR,
@@ -1688,6 +1701,7 @@ impl Parser {
         } else {
             let ident = match self.advance() {
                 Ok(Token::Ident(name)) => name,
+                Ok(Token::Auto) => "auto".to_string(),
                 Ok(tok) => {
                     return Err(Diagnostic::error(format!(
                         "expected variable name, found {:?}",
@@ -1718,6 +1732,20 @@ impl Parser {
         } else {
             None
         };
+
+        // `set auto<T, N> = expr` — type/const capture syntax.
+        // Parse `<T>` BEFORE the `= expr` part so the value expression parser
+        // sees the `=` as the next meaningful token.
+        let type_captures = if let Some(ref name_str) = name {
+            if name_str == "auto" && matches!(self.peek(), Ok(Token::Lt)) {
+                self.parse_type_capture_params()?
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         let value = if matches!(self.peek(), Ok(Token::Assign)) {
             self.advance().ok();
             Some(self.parse_expr()?)
@@ -1733,6 +1761,7 @@ impl Parser {
         } else {
             None
         };
+
         self.expect(Token::Semicolon)?;
         let end = self.span().end;
         Ok(Stmt::VariableDef {
@@ -1746,7 +1775,54 @@ impl Parser {
             span: Span::new(start, end),
             attributes: Vec::new(),
             doc: None,
+            type_captures,
         })
+    }
+
+    /// Parse `<T, N, L>` capture parameter list after `set auto`.
+    /// Unlike `parse_type_params`, capture params may include plain
+    /// identifiers (type captures) and compile-time constant captures.
+    fn parse_type_capture_params(&mut self) -> Result<Vec<TypeParam>, Diagnostic> {
+        self.advance().ok(); // consume <
+        let mut params = Vec::new();
+        loop {
+            match self.peek() {
+                Ok(Token::Gt) | Ok(Token::Shr) => {
+                    self.expect_gt()?;
+                    break;
+                }
+                Ok(Token::Ident(name)) => {
+                    let name = name.clone();
+                    self.advance().ok();
+                    // Each capture param is currently treated as a type parameter
+                    // (compile-time constant captures to be added in a future pass).
+                    params.push(TypeParam {
+                        name,
+                        bounds: vec![],
+                        is_lifetime: false,
+                        span: self.span(),
+                    });
+                    if matches!(self.peek(), Ok(Token::Comma)) {
+                        self.advance().ok();
+                    } else if matches!(self.peek(), Ok(Token::Gt) | Ok(Token::Shr)) {
+                        self.expect_gt()?;
+                        break;
+                    } else {
+                        return Err(Diagnostic::error(
+                            "expected `,` or `>` in capture parameter list",
+                        )
+                        .with_span(self.span()));
+                    }
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        "expected capture parameter name or `>` in `set auto<...>`",
+                    )
+                    .with_span(self.span()));
+                }
+            }
+        }
+        Ok(params)
     }
 
     fn parse_if_stmt(&mut self) -> Result<Stmt, Diagnostic> {
@@ -3383,24 +3459,24 @@ impl Parser {
                 self.advance().ok();
                 let end = self.span().end;
                 let value = if s.starts_with("0x") || s.starts_with("0X") {
-                    let num_part = &s[2..]
+                    let num_part = s[2..]
                         .split(|c: char| c == 'i' || c == 'u')
                         .next()
-                        .unwrap()
+                        .unwrap_or("0")
                         .replace('_', "");
                     i64::from_str_radix(&num_part, 16).unwrap_or(0)
                 } else if s.starts_with("0b") || s.starts_with("0B") {
-                    let num_part = &s[2..]
+                    let num_part = s[2..]
                         .split(|c: char| c == 'i' || c == 'u')
                         .next()
-                        .unwrap()
+                        .unwrap_or("0")
                         .replace('_', "");
                     i64::from_str_radix(&num_part, 2).unwrap_or(0)
                 } else {
                     let num_part = s
                         .split(|c: char| c == 'i' || c == 'u')
                         .next()
-                        .unwrap()
+                        .unwrap_or("0")
                         .replace('_', "");
                     num_part.parse::<i64>().unwrap_or(0)
                 };

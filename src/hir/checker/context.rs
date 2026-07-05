@@ -85,6 +85,7 @@ impl<'a> TypeChecker<'a> {
     /// Find the innermost break target (Loop, While, For, LabeledBlock).
     /// Returns the target's span and optional label.
     /// If `label` is Some, only match same-named LabeledBlock.
+    /// Stops at Closure/AsyncBlock boundaries to prevent cross-boundary breaks.
     pub(crate) fn find_break_target<'b>(
         &self,
         label: Option<&'b str>,
@@ -95,13 +96,17 @@ impl<'a> TypeChecker<'a> {
                     if label.is_none() {
                         return Some((frame.span, None));
                     }
+                    // With a label, only matching LabeledBlock is a valid target.
+                    continue;
                 }
                 CtxKind::LabeledBlock => {
                     if let Some(lbl) = label {
                         if frame.label.as_deref() == Some(lbl) {
                             return Some((frame.span, Some(lbl)));
                         }
+                        // Different label — skip, continue searching outward.
                     }
+                    // Without a label, LabeledBlock is not an implicit break target.
                 }
                 CtxKind::Closure | CtxKind::AsyncBlock => {
                     return None;
@@ -113,34 +118,31 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Find the innermost continue target (only Loop, While, For).
-    pub(crate) fn find_continue_target<'b>(
+    /// Posita's `continue` does not support labels; `label` is always None.
+    pub(crate) fn find_continue_target(
         &self,
-        label: Option<&'b str>,
-    ) -> Option<(Span, &'b str)> {
+        label: Option<&str>,
+    ) -> Option<(Span, &str)> {
         for frame in self.region_tree.iter_frames_rev() {
             match &frame.kind {
                 CtxKind::Loop | CtxKind::While | CtxKind::For => {
-                    if let Some(lbl) = label {
+                    // `continue` with a label is not valid in Posita.
+                    // If a label was provided, skip this loop and keep searching
+                    // (the caller will report "label not found").
+                    if label.is_some() {
                         continue;
                     }
                     let kind_str = match frame.kind {
                         CtxKind::Loop => "loop",
                         CtxKind::While => "while",
                         CtxKind::For => "for",
-                        _ => panic!(
-                            "find_continue_target: unexpected context kind {:?}",
-                            frame.kind
-                        ),
+                        _ => unreachable!(),
                     };
                     return Some((frame.span, kind_str));
                 }
                 CtxKind::LabeledBlock => {
-                    if let Some(lbl) = label {
-                        if frame.label.as_deref() == Some(lbl) {
-                            continue;
-                        }
-                        continue;
-                    }
+                    // `continue` cannot target LabeledBlock; skip.
+                    continue;
                 }
                 CtxKind::Closure | CtxKind::AsyncBlock => {
                     return None;

@@ -1255,18 +1255,15 @@ impl TypeContext {
                     bits: *bits,
                     signed: *signed,
                 };
-                self.find_type(&data)
-                    .expect("built-in Int type should exist")
+                self.find_type(&data).unwrap_or(self.error())
             }
             TypeData::UInt { bits } => {
                 let data = TypeData::UInt { bits: *bits };
-                self.find_type(&data)
-                    .expect("built-in UInt type should exist")
+                self.find_type(&data).unwrap_or(self.error())
             }
             TypeData::Float { bits } => {
                 let data = TypeData::Float { bits: *bits };
-                self.find_type(&data)
-                    .expect("built-in Float type should exist")
+                self.find_type(&data).unwrap_or(self.error())
             }
             TypeData::Bool
             | TypeData::Char
@@ -1278,50 +1275,50 @@ impl TypeContext {
             TypeData::Struct { def_id, args } => {
                 let new_args: Vec<TypeId> = args.iter().map(|&a| self.subst(a, subst)).collect();
                 self.struct_ty_no_alloc(*def_id, new_args)
-                    .expect("struct type should exist")
+                    .unwrap_or(self.error())
             }
             TypeData::Enum { def_id, args } => {
                 let new_args: Vec<TypeId> = args.iter().map(|&a| self.subst(a, subst)).collect();
                 self.enum_ty_no_alloc(*def_id, new_args)
-                    .expect("enum type should exist")
+                    .unwrap_or(self.error())
             }
             TypeData::Tuple { elems } => {
                 let new_elems: Vec<TypeId> = elems.iter().map(|&e| self.subst(e, subst)).collect();
                 self.tuple_ty_no_alloc(new_elems)
-                    .expect("tuple type should exist")
+                    .unwrap_or(self.error())
             }
             TypeData::Array { elem, size } => {
                 let new_elem = self.subst(*elem, subst);
                 self.array_ty_no_alloc(new_elem, *size)
-                    .expect("array type should exist")
+                    .unwrap_or(self.error())
             }
             TypeData::Slice { elem } => {
                 let new_elem = self.subst(*elem, subst);
                 self.slice_ty_no_alloc(new_elem)
-                    .expect("slice type should exist")
+                    .unwrap_or(self.error())
             }
             TypeData::Ref { ty, mutable } => {
                 let new_ty = self.subst(*ty, subst);
                 self.ref_ty_no_alloc(new_ty, *mutable)
-                    .expect("ref type should exist")
+                    .unwrap_or(self.error())
             }
             TypeData::Pointer { ty } => {
                 let new_ty = self.subst(*ty, subst);
                 self.pointer_ty_no_alloc(new_ty)
-                    .expect("pointer type should exist")
+                    .unwrap_or(self.error())
             }
             TypeData::Ptr { size, pointee } => {
                 let new_size = self.subst(*size, subst);
                 let new_pointee = self.subst(*pointee, subst);
                 self.ptr_ty_no_alloc(new_size, new_pointee)
-                    .expect("ptr type should exist")
+                    .unwrap_or(self.error())
             }
             TypeData::Fn { params, ret } => {
                 let new_params: Vec<TypeId> =
                     params.iter().map(|&p| self.subst(p, subst)).collect();
                 let new_ret = self.subst(*ret, subst);
                 self.fn_ty_no_alloc(new_params, new_ret)
-                    .expect("function type should exist")
+                    .unwrap_or(self.error())
             }
             TypeData::Poly { quantifiers, body } => {
                 let new_body = self.subst(*body, subst);
@@ -1374,13 +1371,13 @@ impl TypeContext {
             TypeData::Exists { name, base } => {
                 let new_base = self.subst(*base, subst);
                 self.exists_ty_no_alloc(name.clone(), new_base)
-                    .expect("exists type should exist")
+                    .unwrap_or(self.error())
             }
             TypeData::Coproduct { alternatives } => {
                 let new_alts: Vec<TypeId> =
                     alternatives.iter().map(|&a| self.subst(a, subst)).collect();
                 self.coproduct_ty_no_alloc(new_alts)
-                    .expect("coproduct type should exist")
+                    .unwrap_or(self.error())
             }
             TypeData::AssociatedType {
                 trait_id,
@@ -1389,7 +1386,7 @@ impl TypeContext {
             } => {
                 let new_self = self.subst(*self_ty, subst);
                 self.associated_ty_no_alloc(*trait_id, name.clone(), new_self)
-                    .expect("associated type should exist")
+                    .unwrap_or(self.error())
             }
             _ => ty,
         }

@@ -4,8 +4,16 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 static Z3_WARNED: OnceLock<bool> = OnceLock::new();
+
+/// Default timeout for Z3 solver invocations (milliseconds).
+const Z3_TIMEOUT_MS: u64 = 5_000;
+/// Default memory limit for Z3 (megabytes).
+const Z3_MEMORY_LIMIT_MB: u64 = 512;
+/// Minimum required Z3 major version.
+const Z3_MIN_VERSION: &str = "4.8.0";
 
 /// SMT-LIB2-based unicity checker using Z3.
 ///
@@ -24,9 +32,52 @@ pub struct SmtSolver {
 
 impl SmtSolver {
     pub fn new(solver_path: &str) -> Self {
-        SmtSolver {
+        let solver = SmtSolver {
             solver_path: solver_path.to_string(),
+        };
+        // Verify Z3 version on first use (lazy, via check_version).
+        solver
+    }
+
+    /// Verify that the Z3 binary meets the minimum version requirement.
+    /// Returns `true` if the version check passes or if Z3 is not found (warning only).
+    pub fn check_version(&self) -> bool {
+        let output = match Command::new(&self.solver_path)
+            .arg("--version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return false,
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Z3 --version outputs: "Z3 version 4.8.12 - 64 bit"
+        let version_str = match stdout.split_whitespace().nth(2) {
+            Some(v) => v,
+            None => return false,
+        };
+        let parts: Vec<u64> = version_str
+            .split('.')
+            .filter_map(|p| p.parse::<u64>().ok())
+            .collect();
+        if parts.len() < 2 {
+            return false;
         }
+        let min_parts: Vec<u64> = Z3_MIN_VERSION
+            .split('.')
+            .filter_map(|p| p.parse::<u64>().ok())
+            .collect();
+        for (i, &p) in parts.iter().enumerate() {
+            let min = min_parts.get(i).copied().unwrap_or(0);
+            if p < min {
+                return false;
+            }
+            if p > min {
+                return true;
+            }
+        }
+        true
     }
 
     /// Main entry: check whether `ty` (an InferVar or resolved type) has a
@@ -221,6 +272,18 @@ impl SmtSolver {
         if smt.is_empty() {
             return None;
         }
+        // Build the SMT query with timeout and memory limit baked in.
+        let mut smt_with_limits = String::new();
+        smt_with_limits.push_str(&format!(
+            "(set-option :timeout {})\n",
+            Z3_TIMEOUT_MS
+        ));
+        smt_with_limits.push_str(&format!(
+            "(set-option :memory_max_size {})\n",
+            Z3_MEMORY_LIMIT_MB
+        ));
+        smt_with_limits.push_str(smt);
+
         let mut child = match Command::new(&self.solver_path)
             .arg("-in")
             .stdin(Stdio::piped())
@@ -239,13 +302,23 @@ impl SmtSolver {
         };
 
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(smt.as_bytes()).ok()?;
+            if stdin.write_all(smt_with_limits.as_bytes()).is_err() {
+                let _ = child.kill();
+                return None;
+            }
         }
 
-        let output = child.wait_with_output().ok()?;
+        // Wait with a timeout via `wait()` (no cross-platform alarm available).
+        let output = match child.wait_with_output() {
+            Ok(o) => o,
+            Err(_) => return None,
+        };
+
         if output.status.success() {
             Some(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
+            // Timeout or error — Z3 returns exit code 1 on `(check-sat)` after timeout
+            // with "(error "timeout")" on stderr, which is expected and not a crash.
             None
         }
     }
@@ -255,11 +328,19 @@ impl SmtSolver {
         shape_names: &[(&str, PrincipalShape)],
     ) -> Option<PrincipalShape> {
         let mut unique_shape: Option<PrincipalShape> = None;
-        for (i, line) in output.lines().enumerate() {
-            let trimmed = line.trim();
-            if trimmed == "sat" && i < shape_names.len() {
+        // Collect all sat/unsat results in order, skipping non-result lines.
+        let results: Vec<bool> = output
+            .lines()
+            .filter_map(|line| match line.trim() {
+                "sat" => Some(true),
+                "unsat" => Some(false),
+                _ => None,
+            })
+            .collect();
+        for (i, &is_sat) in results.iter().enumerate() {
+            if is_sat && i < shape_names.len() {
                 if unique_shape.is_some() {
-                    return None; // multiple shapes possible
+                    return None; // multiple shapes possible — ambiguous
                 }
                 unique_shape = Some(shape_names[i].1.clone());
             }

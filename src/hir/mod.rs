@@ -8,6 +8,7 @@ mod smt;
 mod symbol;
 mod traits;
 mod types;
+pub mod visit;
 
 pub use checker::*;
 pub use comptime::*;

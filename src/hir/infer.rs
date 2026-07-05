@@ -1347,25 +1347,31 @@ impl InferenceContext {
                                 self.wake_var_incremental(*var_id, &mut heap, ctx);
                             }
                             // ── OmniML §5.2: Incremental instantiation ──
-                            // If this variable is PG and has instances,
-                            // propagate the resolution to all instances
-                            // via S-Inst-Copy.
+                            // S-Inst-Copy fires on the PG→G *transition*, not while
+                            // the var is still PG.  After wake_var_incremental clears
+                            // the wait list and sets the status to Generalized (no
+                            // guards remain), we propagate the resolved type to all
+                            // instances.  This avoids two bugs:
+                            //   1. Premature copy: s_inst_copy while still PG would
+                            //      clear forward_refs, dropping future refinements.
+                            //   2. Missed copy: if wake_var_incremental already set
+                            //      Generalized, the old PG guard was dead code.
                             if *var_id < self.gen_statuses.len()
-                                && self.gen_statuses[*var_id] == GenStatus::PartiallyGeneralizable
+                                && self.gen_statuses[*var_id] == GenStatus::Generalized
                             {
                                 let resolved_ty = ctx.resolve_binding(self.var_type_ids[*var_id]);
                                 if !matches!(ctx.get(resolved_ty), TypeData::InferVar { .. }) {
                                     // ── S-Generalize (OmniML §5.3) ──
-                                    // Before copying solved constraints to instances,
-                                    // force generalization of the source region to
-                                    // ensure the scheme is in its most-generalized form.
                                     self.force_generalize(ctx);
                                     self.s_inst_copy(ctx, *var_id, resolved_ty);
                                 }
-                                // ── S-Exists-Lower (OmniML §5.3) ──
-                                // Use Z3-backed semantic check: if the variable's shape
-                                // is uniquely determined by the constraint context,
-                                // it can safely be lowered to monomorphic.
+                            }
+                            // ── S-Exists-Lower (OmniML §5.3) ──
+                            // For vars that remain PG (still have guards/waiting),
+                            // try Z3-backed semantic lowering if uniquely determined.
+                            if *var_id < self.gen_statuses.len()
+                                && self.gen_statuses[*var_id] == GenStatus::PartiallyGeneralizable
+                            {
                                 if self.s_exists_lower(ctx, *var_id) {
                                     // lowering succeeded
                                 }
@@ -1380,12 +1386,14 @@ impl InferenceContext {
                         if let TypeData::InferVar { id } = ctx.get(resolved_sup) {
                             if *id < self.lower_bounds.len() {
                                 self.lower_bounds[*id].push(resolved_sub);
+                                self.mark_dirty(*id);
                             }
                         }
                         // If sub is an InferVar, record sup as an upper bound of sub
                         if let TypeData::InferVar { id } = ctx.get(resolved_sub) {
                             if *id < self.upper_bounds.len() {
                                 self.upper_bounds[*id].push(resolved_sup);
+                                self.mark_dirty(*id);
                             }
                         }
 
@@ -2403,5 +2411,576 @@ mod tests {
         };
         let ctx = TypeContext::new();
         assert_eq!(c.priority(&ctx), 2, "Let should have medium-high priority");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Shape Variable Tests
+    // ═══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_shape_var_new_and_resolve() {
+        let mut svc = ShapeVarContext::new();
+        let sva = svc.new_var(0);
+        assert_eq!(svc.resolve(sva), sva);
+        assert_eq!(svc.get(sva), None);
+        assert!(!svc.is_resolved(sva));
+
+        assert!(svc.try_set(sva, TypeShape::Arrow));
+        assert_eq!(svc.get(sva), Some(TypeShape::Arrow));
+        assert!(svc.is_resolved(sva));
+    }
+
+    #[test]
+    fn test_shape_var_try_set_idempotent() {
+        let mut svc = ShapeVarContext::new();
+        let sv = svc.new_var(1);
+        assert!(svc.try_set(sv, TypeShape::Tuple(2)));
+        // Setting the same shape again succeeds
+        assert!(svc.try_set(sv, TypeShape::Tuple(2)));
+        // Setting a different shape fails (mismatch)
+        assert!(!svc.try_set(sv, TypeShape::Arrow));
+        assert_eq!(svc.get(sv), Some(TypeShape::Tuple(2)));
+    }
+
+    #[test]
+    fn test_shape_var_try_set_fires_callback() {
+        let mut svc = ShapeVarContext::new();
+        let sv = svc.new_var(0);
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f = fired.clone();
+        svc.on_resolve(sv, move |_| { f.store(true, std::sync::atomic::Ordering::SeqCst); });
+        assert!(!fired.load(std::sync::atomic::Ordering::SeqCst), "callback should not fire before resolution");
+
+        assert!(svc.try_set(sv, TypeShape::Arrow));
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst), "callback should fire on resolution");
+    }
+
+    #[test]
+    fn test_shape_var_on_resolve_immediate() {
+        let mut svc = ShapeVarContext::new();
+        let sv = svc.new_var(0);
+        svc.try_set(sv, TypeShape::Poly);
+
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f = fired.clone();
+        svc.on_resolve(sv, move |_| { f.store(true, std::sync::atomic::Ordering::SeqCst); });
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst),
+            "on_resolve should fire immediately if already resolved");
+    }
+
+    #[test]
+    fn test_shape_var_unify_aliasing() {
+        let mut svc = ShapeVarContext::new();
+        let a = svc.new_var(0);
+        let b = svc.new_var(0);
+        assert_ne!(svc.resolve(a), svc.resolve(b));
+
+        svc.unify(a, b);
+        // After unify, both resolve to the same canonical id
+        assert_eq!(svc.resolve(a), svc.resolve(b));
+    }
+
+    #[test]
+    fn test_shape_var_unify_merges_waitlists() {
+        let mut svc = ShapeVarContext::new();
+        let a = svc.new_var(0);
+        let b = svc.new_var(0);
+
+        let fired_a = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_b = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fa = fired_a.clone();
+        let fb = fired_b.clone();
+        svc.on_resolve(a, move |_| { fa.store(true, std::sync::atomic::Ordering::SeqCst); });
+        svc.on_resolve(b, move |_| { fb.store(true, std::sync::atomic::Ordering::SeqCst); });
+
+        svc.unify(a, b);
+        // Resolve the unified target — both callbacks should fire
+        let target = svc.resolve(a);
+        svc.try_set(target, TypeShape::Arrow);
+        assert!(fired_a.load(std::sync::atomic::Ordering::SeqCst), "callback on a should fire");
+        assert!(fired_b.load(std::sync::atomic::Ordering::SeqCst), "callback on b should fire");
+    }
+
+    #[test]
+    fn test_shape_var_unify_propagates_resolved() {
+        let mut svc = ShapeVarContext::new();
+        let a = svc.new_var(0);
+        let b = svc.new_var(0);
+        svc.try_set(a, TypeShape::Constructor(1));
+
+        let fired_b = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fb = fired_b.clone();
+        svc.on_resolve(b, move |_| { fb.store(true, std::sync::atomic::Ordering::SeqCst); });
+
+        svc.unify(a, b);
+        assert!(fired_b.load(std::sync::atomic::Ordering::SeqCst),
+            "b's callback should fire when unified with resolved a");
+    }
+
+    #[test]
+    fn test_shape_var_get_level() {
+        let mut svc = ShapeVarContext::new();
+        let sv = svc.new_var(3);
+        assert_eq!(svc.get_level(sv), 3);
+    }
+
+    #[test]
+    fn test_shape_var_num_unresolved() {
+        let mut svc = ShapeVarContext::new();
+        let a = svc.new_var(0);
+        let b = svc.new_var(0);
+        let c = svc.new_var(0);
+        assert_eq!(svc.num_unresolved(), 3);
+        svc.try_set(a, TypeShape::Arrow);
+        assert_eq!(svc.num_unresolved(), 2);
+        svc.try_set(b, TypeShape::Tuple(1));
+        assert_eq!(svc.num_unresolved(), 1);
+        // c is still unresolved
+        assert!(!svc.is_resolved(c));
+    }
+
+    #[test]
+    fn test_shape_var_unresolved_above_level() {
+        let mut svc = ShapeVarContext::new();
+        let _l0 = svc.new_var(0);
+        let _l1 = svc.new_var(1);
+        let _l2 = svc.new_var(2);
+        let above1 = svc.unresolved_above_level(1);
+        assert_eq!(above1.len(), 1, "only level-2 var should be above level 1");
+        assert_eq!(svc.get_level(above1[0]), 2);
+    }
+
+    #[test]
+    fn test_shapes_compatible() {
+        assert!(shapes_compatible(TypeShape::Unknown, TypeShape::Arrow));
+        assert!(shapes_compatible(TypeShape::Arrow, TypeShape::Unknown));
+        assert!(shapes_compatible(TypeShape::Arrow, TypeShape::Arrow));
+        assert!(shapes_compatible(TypeShape::Tuple(3), TypeShape::Tuple(3)));
+        assert!(!shapes_compatible(TypeShape::Tuple(2), TypeShape::Tuple(3)));
+        assert!(shapes_compatible(TypeShape::Constructor(0), TypeShape::Constructor(5)));
+        assert!(!shapes_compatible(TypeShape::Arrow, TypeShape::Tuple(1)));
+        assert!(shapes_compatible(TypeShape::Poly, TypeShape::Poly));
+        assert!(!shapes_compatible(TypeShape::Poly, TypeShape::Arrow));
+    }
+
+    #[test]
+    fn test_type_data_to_shape_variants() {
+        let mut ctx = TypeContext::new();
+        // Fn → Arrow
+        let fn_ty = ctx.function(vec![ctx.bool()], ctx.bool());
+        assert_eq!(type_data_to_shape(ctx.get(fn_ty)), TypeShape::Arrow);
+        // Tuple(n) → Tuple(n)
+        let b = ctx.bool();
+        let i = ctx.int(32, true);
+        let tup = ctx.tuple(vec![b, i]);
+        assert_eq!(type_data_to_shape(ctx.get(tup)), TypeShape::Tuple(2));
+        // Struct → Constructor(n)
+        let b2 = ctx.bool();
+        let i2 = ctx.int(32, true);
+        let s = ctx.struct_ty(DefId(42), vec![b2, i2]);
+        assert_eq!(type_data_to_shape(ctx.get(s)), TypeShape::Constructor(2));
+        // Forall → Poly
+        let p0 = ctx.generic_param(0, "X".into());
+        let forall = ctx.forall(0, "X".into(), p0);
+        assert_eq!(type_data_to_shape(ctx.get(forall)), TypeShape::Poly);
+        // Int → Unknown (primitive)
+        let int32 = ctx.int(32, true);
+        assert_eq!(type_data_to_shape(ctx.get(int32)), TypeShape::Unknown);
+        // Bool → Unknown
+        let bool_ty = ctx.bool();
+        assert_eq!(type_data_to_shape(ctx.get(bool_ty)), TypeShape::Unknown);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Level-based Promotion Tests
+    // ═══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_try_promote_var_basic() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let _prev = infer.enter_level();
+        let _prev2 = infer.enter_level();
+        // Create a variable at the current deep level
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var_id = match ctx.get(var) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        let deep_level = infer.get_var_level(var_id).unwrap();
+        assert!(deep_level > 0, "var should be at a deep level");
+
+        // Promote to level 0
+        let promoted = infer.try_promote_var(&mut ctx, var_id, 0);
+        assert!(promoted.is_some(), "promotion should succeed");
+        // The old var should now be bound to the promoted var
+        let resolved = ctx.resolve_binding(var);
+        assert!(
+            matches!(ctx.get(resolved), TypeData::InferVar { id } if *id != var_id),
+            "original var should be bound to a new InferVar"
+        );
+    }
+
+    #[test]
+    fn test_try_promote_var_already_low() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        // Variable at level 0 (default)
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var_id = match ctx.get(var) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        // Try to promote to level 0 — no-op since already at level 0
+        let promoted = infer.try_promote_var(&mut ctx, var_id, 0);
+        assert!(promoted.is_some(), "should return the existing var");
+        let resolved = ctx.resolve_binding(var);
+        assert!(
+            matches!(ctx.get(resolved), TypeData::InferVar { id } if *id == var_id),
+            "should be unchanged"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Generalization (PG → G) Tests
+    // ═══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_force_generalize_pg_with_waitlist_stays_pg() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var_id = match ctx.get(var) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        // Set PG status and add a suspended constraint (wait list not empty)
+        if var_id < infer.gen_statuses.len() {
+            infer.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
+        }
+        let int32_1 = ctx.int(32, true);
+        infer.suspend_on_var(
+            Constraint::Eq(var, int32_1, crate::ast::Span::new(0, 0)),
+            var_id,
+        );
+
+        // Resolve the variable so it has a concrete type
+        let int64 = ctx.int(64, false);
+        ctx.bindings.borrow_mut().insert(var, int64);
+
+        infer.force_generalize(&mut ctx);
+        // Should remain PG because the wait list is not empty
+        assert_eq!(
+            infer.gen_statuses[var_id],
+            GenStatus::PartiallyGeneralizable,
+            "PG var with non-empty wait list should stay PG"
+        );
+    }
+
+    #[test]
+    fn test_force_generalize_dirty_set_triggers_generalization() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var_id = match ctx.get(var) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        infer.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
+        // Resolve the variable
+        ctx.bindings.borrow_mut().insert(var, ctx.bool());
+        // Mark dirty
+        infer.dirty_set.insert(var_id);
+
+        infer.force_generalize(&mut ctx);
+        assert_eq!(
+            infer.gen_statuses[var_id],
+            GenStatus::Generalized,
+            "resolved PG var in dirty set should become Generalized"
+        );
+    }
+
+    #[test]
+    fn test_force_generalize_for_regions() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let prev = infer.enter_level();
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var_id = match ctx.get(var) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        infer.exit_level(prev);
+        infer.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
+        let unit_ty = ctx.unit();
+        ctx.bindings.borrow_mut().insert(var, unit_ty);
+
+        // Use dirty_levels to trigger generalization
+        let level = infer.get_var_level(var_id).unwrap_or(0);
+        infer.force_generalize_for_regions(&mut ctx, &[level], None);
+        assert_eq!(
+            infer.gen_statuses[var_id],
+            GenStatus::Generalized,
+            "PG var in dirty level should generalize"
+        );
+    }
+
+    #[test]
+    fn test_rigid_escape_generic_param_detected() {
+        let mut ctx = TypeContext::new();
+        let gp = ctx.generic_param(0, "T".into());
+        let escaped = InferenceContext::check_rigid_escape(&ctx, gp, 0);
+        assert!(escaped, "GenericParam should be detected as escape");
+    }
+
+    #[test]
+    fn test_rigid_escape_concrete_not_detected() {
+        let mut ctx = TypeContext::new();
+        let int_ty = ctx.int(32, true);
+        let not_escaped = InferenceContext::check_rigid_escape(&ctx, int_ty, 0);
+        assert!(!not_escaped, "Int<32> is not an escape");
+    }
+
+    #[test]
+    fn test_rigid_escape_fn_with_gp_detected() {
+        let mut ctx = TypeContext::new();
+        let gp = ctx.generic_param(1, "U".into());
+        let fn_ty = ctx.function(vec![gp], gp);
+        let escaped = InferenceContext::check_rigid_escape(&ctx, fn_ty, 0);
+        assert!(escaped, "fn(U) -> U contains GenericParam escape");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // S-Inst-Copy Propagation Tests
+    // ═══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_s_inst_copy_deepen_follows_aliases() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let pg = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let pg_id = match ctx.get(pg) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        // Create an instance
+        let inst = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let inst_id = match ctx.get(inst) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        infer.register_instance(pg_id, inst_id);
+
+        // Resolve PG → fn(Int) → Bool
+        let int32_2 = ctx.int(32, true);
+        let bool_ty = ctx.bool();
+        let fn_ty = ctx.function(vec![int32_2], bool_ty);
+        ctx.bindings.borrow_mut().insert(pg, fn_ty);
+
+        // S-Inst-Copy propagates the PG resolution to instances
+        let resolved_pg = ctx.resolve_binding(pg);
+        let updated = infer.s_inst_copy(&mut ctx, pg_id, resolved_pg);
+        assert_eq!(updated, 1, "should have updated 1 instance");
+
+        let inst_resolved = ctx.resolve_binding(inst);
+        match ctx.get(inst_resolved) {
+            TypeData::Fn { params, ret } => {
+                assert_eq!(params.len(), 1, "instance should become a fn type");
+                let p0_resolved = ctx.resolve_binding(params[0]);
+                assert!(
+                    ctx.is_integer(p0_resolved),
+                    "param should be Int<32>"
+                );
+                assert!(ctx.is_bool(ctx.resolve_binding(*ret)), "return should be Bool");
+            }
+            other => panic!("instance should be fn type, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_s_inst_copy_pg_alias_resolved() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let pg = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let pg_id = match ctx.get(pg) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        let inst = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let inst_id = match ctx.get(inst) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        infer.register_instance(pg_id, inst_id);
+        let bool_ty = ctx.bool();
+        ctx.bindings.borrow_mut().insert(pg, bool_ty);
+        let resolved_pg = ctx.resolve_binding(pg);
+        let updated = infer.s_inst_copy(&mut ctx, pg_id, resolved_pg);
+        assert_eq!(updated, 1, "should have updated the instance");
+
+        let inst_resolved = ctx.resolve_binding(inst);
+        assert!(
+            ctx.is_bool(inst_resolved),
+            "instance should now be Bool"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // S-Exists-Lower Tests
+    // ═══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_s_exists_lower_concrete() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        // Enter a deeper level so the var's level > current_level
+        let prev = infer.enter_level();
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var_id = match ctx.get(var) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        // S-Exists-Lower requires PG status and level > current_level
+        infer.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
+        // exit_level so current_level drops below the var's level
+        infer.exit_level(prev);
+        let lowered = infer.s_exists_lower(&mut ctx, var_id);
+        assert!(lowered, "S-Exists-Lower should succeed");
+        assert_eq!(
+            infer.gen_statuses[var_id],
+            GenStatus::Ungeneralized,
+            "PG var should become Ungeneralized after S-Exists-Lower"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Integration: Complete Solve with Shape Variables
+    // ═══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_solve_eq_concrete_success() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let symbols = SymbolTable::new(crate::hir::types::CrateId(DefId(0)));
+        let trait_env = TraitEnv::new();
+
+        let a = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let b = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        // Add constraint: Eq(a, b)
+        infer.add_constraint(Constraint::Eq(a, b, crate::ast::Span::new(0, 0)));
+        // Unify a with Int<32>
+        let int_ty = ctx.int(32, true);
+        ctx.bindings.borrow_mut().insert(a, int_ty);
+
+        let result = infer.solve(&mut ctx, &trait_env, &symbols);
+        assert!(result.is_ok(), "solve should succeed");
+        // b should now be resolved to Int<32> too
+        let b_resolved = ctx.resolve_binding(b);
+        assert!(ctx.is_integer(b_resolved), "b should be Int<32>");
+    }
+
+    #[test]
+    fn test_solve_level_promotion() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let symbols = SymbolTable::new(crate::hir::types::CrateId(DefId(0)));
+        let trait_env = TraitEnv::new();
+
+        // Create a variable at a deeper level
+        let prev = infer.enter_level();
+        let deep_var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let shallow_var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        infer.exit_level(prev);
+
+        // Eq(deep, shallow) — should promote deep to shallow's level
+        infer.add_constraint(Constraint::Eq(deep_var, shallow_var, crate::ast::Span::new(0, 0)));
+        let bool_ty = ctx.bool();
+        ctx.bindings.borrow_mut().insert(shallow_var, bool_ty);
+
+        let result = infer.solve(&mut ctx, &trait_env, &symbols);
+        assert!(result.is_ok(), "level promotion solve should succeed");
+        let deep_resolved = ctx.resolve_binding(deep_var);
+        assert!(ctx.is_bool(deep_resolved), "deep var should resolve to Bool");
+    }
+
+    #[test]
+    fn test_try_match_via_shape_var_suspend_discharge_roundtrip() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+
+        // Register a match branch: Arrow → Eq(Int, Int)
+        let int32 = ctx.int(32, true);
+        let branches = vec![MatchBranchSet {
+            shape_pattern: PrincipalShape::Arrow,
+            continuation: vec![Constraint::Eq(
+                int32,
+                int32,
+                crate::ast::Span::new(0, 0),
+            )],
+            else_continuation: Vec::new(),
+        }];
+        let bid = infer.register_match_branches(branches);
+
+        // Create an infer var and try_match via shape var (should suspend)
+        let infer_var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var_id = match ctx.get(infer_var) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        let mut heap = std::collections::BinaryHeap::new();
+        let _handled = infer.try_match_via_shape_var(&mut ctx, infer_var, bid, &mut heap);
+        // try_match_via_shape_var always returns true (handled) but for an InferVar
+        // it should suspend on the wait list, not discharge
+        assert!(var_id < infer.wait_lists.len() && !infer.wait_lists[var_id].is_empty(),
+                "match should be suspended on the infer var's wait list");
+
+        // Now resolve the infer var to a concrete fn type and wake it
+        let fn_bool = ctx.bool();
+        let fn_ty = ctx.function(vec![fn_bool], fn_bool);
+        ctx.bindings.borrow_mut().insert(infer_var, fn_ty);
+        infer.wake_var_incremental(var_id, &mut heap, &ctx);
+
+        // The match should now be in the heap
+        assert!(!heap.is_empty(), "match should be woken and placed in heap");
+        let woken = heap.pop().unwrap();
+        assert!(matches!(woken.constraint, Constraint::Match { .. }),
+                "woken constraint should be Match");
+
+        // Discharge it directly
+        let fn_ty2 = ctx.function(vec![ctx.bool()], ctx.bool());
+        let discharged = infer.discharge_match(&mut ctx, fn_ty2, bid, &mut heap);
+        assert!(discharged, "match on fn type should discharge");
+        // The continuation Eq(int32, int32) should be in the heap now
+        assert!(!heap.is_empty(), "continuation constraints should be enqueued");
+    }
+
+    #[test]
+    fn test_force_generalize_after_solve_completes_pg() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+
+        // Create variables at deeper scope (simulating let-polymorphism)
+        let _prev = infer.enter_level();
+        let x = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let x_id = match ctx.get(x) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        assert!(infer.get_var_level(x_id).unwrap_or(0) > 0,
+                "x should be at a deeper level");
+
+        // Bind x to Int<32>
+        let int32 = ctx.int(32, true);
+        ctx.bindings.borrow_mut().insert(x, int32);
+
+        // Mark the variable PG and then force_generalize
+        infer.gen_statuses[x_id] = GenStatus::PartiallyGeneralizable;
+        infer.force_generalize(&mut ctx);
+
+        assert_eq!(
+            infer.gen_statuses[x_id],
+            GenStatus::Generalized,
+            "resolved PG var at inner scope should generalize"
+        );
     }
 }

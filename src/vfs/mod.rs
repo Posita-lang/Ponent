@@ -102,7 +102,7 @@ impl VfsNode {
             return Ok(());
         }
         self.ensure_src()?;
-        let src = self.src.as_ref().unwrap();
+        let src = self.src.as_ref().ok_or(VfsError::Io("source not loaded".to_string()))?;
         let lexer = Token::lexer(src);
         let mut tokens = Vec::new();
         for result in lexer {
@@ -121,7 +121,7 @@ impl VfsNode {
             return Ok(());
         }
         self.ensure_src()?;
-        let src = self.src.as_ref().unwrap().clone();
+        let src = self.src.as_ref().ok_or(VfsError::Io("source not loaded".to_string()))?.clone();
         let mut parser = Parser::new(&src);
         match parser.parse_program() {
             Ok(program) => {

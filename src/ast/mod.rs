@@ -1,3 +1,4 @@
+pub mod visit;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,6 +272,9 @@ pub enum Stmt {
         span: Span,
         attributes: Vec<Attribute>,
         doc: Option<String>,
+        /// Type/const captures: `set auto<T, N, L> = expr`.
+        /// Bound at comptime after inferring `expr`'s type.
+        type_captures: Vec<TypeParam>,
     },
     FunctionDef {
         span: Span,

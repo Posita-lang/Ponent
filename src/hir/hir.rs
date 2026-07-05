@@ -18,6 +18,9 @@ pub enum HirStmt {
         value: Option<Box<HirExpr>>,
         else_branch: Option<Vec<HirStmt>>,
         span: Span,
+        /// Type captures from `set auto<T> = expr` — stored as hint for
+        /// comptime reflection; the actual binding is in the resolution map.
+        type_captures: Vec<TypeParam>,
     },
     FunctionDef {
         span: Span,

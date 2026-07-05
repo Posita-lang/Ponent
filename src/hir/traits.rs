@@ -11,6 +11,9 @@ pub struct ImplCandidate {
     pub trait_id: DefId,
     pub for_type: TypeId,
     pub methods: Vec<crate::ast::ImplMethod>,
+    /// Pre-resolved method signatures (resolved during resolution using impl's
+    /// type param mapping, so generic params like `T` are properly handled).
+    pub resolved_methods: Vec<MethodInfo>,
     pub assoc_tys: Vec<(String, TypeId)>,
     pub span: Span,
     /// Whether this impl's method calls can be auto-deref'd through.

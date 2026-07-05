@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::ast::visit::replace_ident_in_expr;
 use crate::diagnostics::{Diagnostic, DiagnosticCollector, DiagnosticLevel};
 use crate::hir::symbol::*;
 use crate::hir::traits::{ImplCandidate, TraitEnv};
@@ -307,6 +308,7 @@ impl<'a> NameResolver<'a> {
                 trait_path,
                 for_type,
                 methods,
+                associated_types,
                 where_clause,
                 type_params,
                 ..
@@ -346,8 +348,6 @@ impl<'a> NameResolver<'a> {
                     }
                 }
 
-                self.current_impl_type_params = None;
-
                 self.enter_scope();
                 let binding = ImplBinding {
                     def_id: self.allocate_def_id(),
@@ -356,14 +356,54 @@ impl<'a> NameResolver<'a> {
                 };
                 self.symbols.insert_impl(binding, *span);
 
+                // Keep current_impl_type_params active so method body resolution
+                // can resolve type parameters like `T` in `impl<T> Foo for Bar { ... }`.
+                // It is cleared after the impl block is fully processed.
+
                 let has_auto_deref = attributes.iter().any(|a| a.name == "auto_deref");
+
+                // Pre-resolve method param types using the impl's type param mapping,
+                // so generic params like `T` are properly substituted in lookup_method.
+                let mut resolved_methods = Vec::new();
+                for method in methods {
+                    let mut param_tys = Vec::with_capacity(method.params.len());
+                    for p in &method.params {
+                        if let Some(ref param_ty) = p.ty {
+                            // Substitute `Self` with the concrete for_type AST before resolving,
+                            // since resolve_type_expr cannot resolve `Self` on its own.
+                            let resolved_ty = self.resolve_self_in_type(param_ty, for_type);
+                            param_tys.push(self.resolve_type_expr(&resolved_ty));
+                        } else {
+                            param_tys.push(self.ctx.error());
+                        }
+                    }
+                    let resolved_ret = self.resolve_self_in_type(&method.return_type, for_type);
+                    let ret_ty = self.resolve_type_expr(&resolved_ret);
+                    resolved_methods.push(crate::hir::traits::MethodInfo {
+                        name: method.name.clone(),
+                        param_tys,
+                        ret_ty,
+                        span: method.span,
+                        has_auto_deref,
+                    });
+                }
+
+                // Resolve associated types from the impl block.
+                let mut assoc_tys = Vec::new();
+                for at in associated_types {
+                    if let Some(ref default) = at.default {
+                        let resolved = self.resolve_type_expr(default);
+                        assoc_tys.push((at.name.clone(), resolved));
+                    }
+                }
 
                 if let Some(trait_id) = resolved_trait {
                     let candidate = ImplCandidate {
                         trait_id,
                         for_type: resolved_for,
                         methods: methods.clone(),
-                        assoc_tys: Vec::new(),
+                        resolved_methods,
+                        assoc_tys,
                         has_auto_deref,
                         context,
                         span: *span,
@@ -457,6 +497,7 @@ impl<'a> NameResolver<'a> {
                 value,
                 else_branch,
                 span,
+                type_captures,
                 ..
             } => {
                 if let Some(name) = name {
@@ -487,6 +528,35 @@ impl<'a> NameResolver<'a> {
                     if let Err(diag) = self.symbols.insert_variable(name.clone(), binding, *span) {
                         self.diagnostics.push(diag);
                     }
+                }
+
+                // `set auto<T> = expr` — register each capture name as a type
+                // in the resolution map so that comptime code can reference it.
+                for cap in type_captures {
+                    let placeholder = self.ctx.error();
+                    self.resolution_map
+                        .type_def_ids
+                        .insert(cap.name.clone(), DefId(usize::MAX));
+                    // The actual type binding will be updated by the checker
+                    // after inferring the expression's type.
+                    let binding = TypeBinding {
+                        def_id: DefId(usize::MAX),
+                        params: vec![],
+                        kind: TypeKind::Alias,
+                        span: *span,
+                        alias_ast: None,
+                        fields: vec![],
+                        variants: vec![],
+                        invariant: None,
+                        default_value: None,
+                        no_default: true,
+                        crate_id: self.local_crate_id,
+                        missing_match: None,
+                        exhaustive: false,
+                    };
+                    self.symbols
+                        .insert_type(cap.name.clone(), binding, *span)
+                        .ok();
                 }
 
                 if let Some(pattern) = pattern {
@@ -1386,188 +1456,65 @@ impl<'a> NameResolver<'a> {
     pub fn diagnostics(&self) -> &DiagnosticCollector {
         &self.diagnostics
     }
-}
 
-/// Recursively rename `Ident(old_name)` → `Ident(new_name)` in an expression tree.
-fn replace_ident_in_expr(expr: &mut Expr, old_name: &str, new_name: &str) {
-    match expr {
-        Expr::Ident(name, _) if name == old_name => *name = new_name.to_string(),
-        Expr::UnaryOp { expr: e, .. }
-        | Expr::Move(e, _)
-        | Expr::Await { expr: e, .. }
-        | Expr::Try { expr: e, .. }
-        | Expr::LeaveWith { expr: e, .. }
-        | Expr::PolyBox { expr: e, .. }
-        | Expr::PolyUnbox { expr: e, .. }
-        | Expr::Old(e, _)
-        | Expr::TypeAnnotated { expr: e, .. } => replace_ident_in_expr(e, old_name, new_name),
-        Expr::BinaryOp { left, right, .. } => {
-            replace_ident_in_expr(left, old_name, new_name);
-            replace_ident_in_expr(right, old_name, new_name);
-        }
-        Expr::Call { callee, args, .. } => {
-            replace_ident_in_expr(callee, old_name, new_name);
-            for arg in args {
-                replace_ident_in_expr(arg, old_name, new_name);
+    /// Recursively substitute `Self` in an AST type with `self_ty`.
+    /// Needed for resolving method signatures in impl blocks, where
+    /// `&self` desugars to `Self` which resolve_type_expr cannot handle.
+    fn resolve_self_in_type(&self, ty: &Type, self_ty: &Type) -> Type {
+        match ty {
+            Type::Path(p, s) if p.len() == 1 && (p[0] == "Self" || p[0] == "self") => {
+                self_ty.clone()
             }
-        }
-        Expr::Index { base, index, .. } => {
-            replace_ident_in_expr(base, old_name, new_name);
-            replace_ident_in_expr(index, old_name, new_name);
-        }
-        Expr::FieldAccess { base, .. }
-        | Expr::AttrAccess { base, .. }
-        | Expr::Cast { expr: base, .. } => replace_ident_in_expr(base, old_name, new_name),
-        Expr::Range { start, end, .. } => {
-            if let Some(e) = start {
-                replace_ident_in_expr(e, old_name, new_name);
-            }
-            if let Some(e) = end {
-                replace_ident_in_expr(e, old_name, new_name);
-            }
-        }
-        Expr::StructLit { fields, .. } => {
-            for (_, e) in fields {
-                replace_ident_in_expr(e, old_name, new_name);
-            }
-        }
-        Expr::EnumLit { payload, .. } => {
-            if let Some(e) = payload {
-                replace_ident_in_expr(e, old_name, new_name);
-            }
-        }
-        Expr::Tuple(exprs, _) | Expr::Array(exprs, _) => {
-            for e in exprs {
-                replace_ident_in_expr(e, old_name, new_name);
-            }
-        }
-        Expr::If {
-            cond,
-            then_branch,
-            else_branch,
-            ..
-        }
-        | Expr::IfLet {
-            scrutinee: cond,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            replace_ident_in_expr(cond, old_name, new_name);
-            // `where` invariants are single expressions, not blocks, but be safe
-        }
-        Expr::Match {
-            scrutinee, arms, ..
-        } => {
-            replace_ident_in_expr(scrutinee, old_name, new_name);
-            for arm in arms {
-                replace_ident_in_expr(&mut arm.body, old_name, new_name);
-            }
-        }
-        Expr::Block(stmts, _) | Expr::Closure { body: stmts, .. } => {
-            for s in stmts {
-                replace_ident_in_stmt(s, old_name, new_name);
-            }
-        }
-        Expr::Catch {
-            expr: e, branches, ..
-        } => {
-            replace_ident_in_expr(e, old_name, new_name);
-            for b in branches {
-                for s in &mut b.body {
-                    replace_ident_in_stmt(s, old_name, new_name);
+            Type::Reference { inner, mutable, span: s, .. } => {
+                Type::Reference {
+                    inner: Box::new(self.resolve_self_in_type(inner, self_ty)),
+                    mutable: *mutable,
+                    lifetime: None,
+                    span: *s,
                 }
             }
-        }
-        Expr::UnsafeBlock { body, .. } => {
-            for s in body {
-                replace_ident_in_stmt(s, old_name, new_name);
+            Type::Pointer(inner, s) => {
+                Type::Pointer(Box::new(self.resolve_self_in_type(inner, self_ty)), *s)
             }
+            Type::Generic(base, args, span) => {
+                let new_base = self.resolve_self_in_type(base, self_ty);
+                let new_args: Vec<GenericArg> = args.iter().map(|a| {
+                    match a {
+                        GenericArg::Positional(t) => GenericArg::Positional(self.resolve_self_in_type(t, self_ty)),
+                        GenericArg::Named(n, t) => GenericArg::Named(n.clone(), self.resolve_self_in_type(t, self_ty)),
+                    }
+                }).collect();
+                Type::Generic(Box::new(new_base), new_args, *span)
+            }
+            Type::Tuple(tys, span) => {
+                Type::Tuple(tys.iter().map(|t| self.resolve_self_in_type(t, self_ty)).collect(), *span)
+            }
+            Type::Slice(inner, span) => {
+                Type::Slice(Box::new(self.resolve_self_in_type(inner, self_ty)), *span)
+            }
+            Type::Array(inner, size, span) => {
+                Type::Array(Box::new(self.resolve_self_in_type(inner, self_ty)), size.clone(), *span)
+            }
+            Type::DynTrait(traits, span) => {
+                Type::DynTrait(traits.iter().map(|t| self.resolve_self_in_type(t, self_ty)).collect(), *span)
+            }
+            Type::Function { params, ret, span } => {
+                Type::Function {
+                    params: params.iter().map(|p| self.resolve_self_in_type(p, self_ty)).collect(),
+                    ret: Box::new(self.resolve_self_in_type(ret, self_ty)),
+                    span: *span,
+                }
+            }
+            Type::Projection { impl_type, trait_path, assoc_name, span } => {
+                Type::Projection {
+                    impl_type: Box::new(self.resolve_self_in_type(impl_type, self_ty)),
+                    trait_path: Box::new(self.resolve_self_in_type(trait_path, self_ty)),
+                    assoc_name: assoc_name.clone(),
+                    span: *span,
+                }
+            }
+            other => other.clone(),
         }
-        _ => {}
     }
 }
 
-/// Recursively rename `Ident(old_name)` → `Ident(new_name)` in a statement tree.
-fn replace_ident_in_stmt(stmt: &mut Stmt, old_name: &str, new_name: &str) {
-    match stmt {
-        Stmt::VariableDef { value, .. } => {
-            if let Some(e) = value {
-                replace_ident_in_expr(e, old_name, new_name);
-            }
-        }
-        Stmt::Assign { target, value, .. } => {
-            replace_ident_in_expr(target, old_name, new_name);
-            replace_ident_in_expr(value, old_name, new_name);
-        }
-        Stmt::Return { value, .. } => {
-            if let Some(e) = value {
-                replace_ident_in_expr(e, old_name, new_name);
-            }
-        }
-        Stmt::Expression(expr) => replace_ident_in_expr(expr, old_name, new_name),
-        Stmt::If {
-            cond,
-            then_branch,
-            else_branch,
-            ..
-        }
-        | Stmt::IfLet {
-            scrutinee: cond,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            replace_ident_in_expr(cond, old_name, new_name);
-            for s in then_branch {
-                replace_ident_in_stmt(s, old_name, new_name);
-            }
-            if let Some(b) = else_branch {
-                for s in b {
-                    replace_ident_in_stmt(s, old_name, new_name);
-                }
-            }
-        }
-        Stmt::While { cond, body, .. }
-        | Stmt::WhileLet {
-            scrutinee: cond,
-            body,
-            ..
-        } => {
-            replace_ident_in_expr(cond, old_name, new_name);
-            for s in body {
-                replace_ident_in_stmt(s, old_name, new_name);
-            }
-        }
-        Stmt::For { iterable, body, .. } => {
-            replace_ident_in_expr(iterable, old_name, new_name);
-            for s in body {
-                replace_ident_in_stmt(s, old_name, new_name);
-            }
-        }
-        Stmt::Loop { body, .. } => {
-            for s in body {
-                replace_ident_in_stmt(s, old_name, new_name);
-            }
-        }
-        Stmt::ScopeCleanup { body, .. } => {
-            for s in body {
-                replace_ident_in_stmt(s, old_name, new_name);
-            }
-        }
-        Stmt::Unsafe { body, .. } | Stmt::Isolate { body, .. } => {
-            for s in body {
-                replace_ident_in_stmt(s, old_name, new_name);
-            }
-        }
-        Stmt::ComptimeBlock { body, .. } => {
-            for s in body {
-                replace_ident_in_stmt(s, old_name, new_name);
-            }
-        }
-        Stmt::GhostVariableDef { inner, .. } => {
-            replace_ident_in_stmt(inner, old_name, new_name);
-        }
-        _ => {}
-    }
-}
