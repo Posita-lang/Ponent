@@ -1628,7 +1628,7 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn check_future_type(&self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
+    fn check_future_type(&mut self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
         if let Some(future_ty) = self.extract_future_type(ty) {
             Ok(future_ty)
         } else {
@@ -1647,15 +1647,12 @@ impl<'a> TypeChecker<'a> {
         None
     }
 
-    fn extract_future_type(&self, ty: TypeId) -> Option<TypeId> {
-        if let TypeData::Enum { def_id: did, args } = self.ctx.get(ty) {
-            if let Some(future_id) = self.known_def_id("Future") {
-                if *did == future_id && args.len() == 1 {
-                    return Some(args[0]);
-                }
-            }
-        }
-        None
+    fn extract_future_type(&mut self, ty: TypeId) -> Option<TypeId> {
+        // Use the trait-based associated type projection:
+        // resolve `<ty as Future>::Output`
+        let future_id = self.known_def_id("Future")?;
+        self.trait_env
+            .resolve_assoc_type(future_id, ty, "Output", self.ctx, self.symbols)
     }
 
     fn extract_result_types(&self, ty: TypeId, span: Span) -> Result<(TypeId, TypeId), Diagnostic> {

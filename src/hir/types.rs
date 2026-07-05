@@ -1,4 +1,5 @@
 use rustc_hash::FxHashMap as HashMap;
+use std::collections::HashSet;
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -225,7 +226,39 @@ pub struct TypeMeta {
 /// A variance-annotated edge in the type graph.
 /// Pre-computed so that variance propagation is a simple graph
 /// traversal over edges, not pattern-matching on TypeData each time.
-#[derive(Debug, Clone, Copy)]
+
+/// Variance for type unification: controls how subtyping propagates
+/// through compound types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Variance {
+    /// T <: U — the type is in a covariant position (e.g. function return, tuple element).
+    Covariant,
+    /// T :> U (i.e. U <: T) — the type is in a contravariant position (e.g. function parameter).
+    Contravariant,
+    /// T == U — strict equality required (default for unification).
+    Invariant,
+}
+
+impl Variance {
+    /// Transform variance when going through a position of `self` variance.
+    /// For example, if we are in an Invariant context and encounter a Covariant
+    /// position (Fn return), the result is Invariant * Covariant = Covariant.
+    /// If we are in a Covariant context and encounter a Contravariant position
+    /// (Fn parameter), the result is Covariant * Contravariant = Contravariant.
+    pub fn xform(self, position: Variance) -> Variance {
+        match (self, position) {
+            (Variance::Invariant, _) => position,
+            (Variance::Covariant, Variance::Covariant) => Variance::Covariant,
+            (Variance::Covariant, Variance::Contravariant) => Variance::Contravariant,
+            (Variance::Covariant, Variance::Invariant) => Variance::Invariant,
+            (Variance::Contravariant, Variance::Covariant) => Variance::Contravariant,
+            (Variance::Contravariant, Variance::Contravariant) => Variance::Covariant,
+            (Variance::Contravariant, Variance::Invariant) => Variance::Invariant,
+        }
+    }
+}
+
+#[derive(Clone)]
 struct VarianceEdge {
     target: TypeId,
     /// +1 = covariant, -1 = contravariant, 0 = invariant
@@ -254,6 +287,10 @@ pub struct TypeContext {
     /// Each entry captures bindings before an operation.
     /// On rollback, bindings are restored; on commit, snapshot is discarded.
     transaction_stack: RefCell<Vec<HashMap<TypeId, TypeId>>>,
+    /// Cache for unification with variance: prevents infinite recursion on
+    /// self-referential types.  Keyed by (a, b, variance_tag) where
+    /// variance_tag = 0 for Invariant, 1 for Covariant, 2 for Contravariant.
+    unify_seen: RefCell<HashSet<(TypeId, TypeId, u8)>>,
 }
 
 impl TypeContext {
@@ -274,6 +311,7 @@ impl TypeContext {
             variance_cache: RefCell::new(HashMap::default()),
             variance_edges: RefCell::new(HashMap::default()),
             transaction_stack: RefCell::new(Vec::new()),
+            unify_seen: RefCell::new(HashSet::default()),
         };
         ctx.builtin_unit = ctx.alloc(TypeData::Unit);
         ctx.builtin_never = ctx.alloc(TypeData::Never);
@@ -1060,7 +1098,10 @@ impl TypeContext {
         // ── Transaction: capture current bindings for rollback ──
         self.begin_transaction();
 
-        let result = self.unify_internal(a, b);
+        // Clear the seen-set before each top-level unification.
+        self.unify_seen.borrow_mut().clear();
+
+        let result = self.unify_internal(a, b, Variance::Invariant);
 
         // ── Commit or rollback ──
         match result {
@@ -1075,8 +1116,45 @@ impl TypeContext {
         }
     }
 
-    /// Internal unification (no transaction wrapping).
-    fn unify_internal(&self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
+    fn variance_tag(v: Variance) -> u8 {
+        match v {
+            Variance::Invariant => 0,
+            Variance::Covariant => 1,
+            Variance::Contravariant => 2,
+        }
+    }
+
+    /// Internal unification with variance-aware subtyping.
+    /// Recursively decomposes compound types and unifies sub-components
+    /// according to the given variance.
+    ///
+    /// Variance propagation rules:
+    /// - Invariant: all sub-components unified with Invariant (strict equality)
+    /// - Covariant (T <: U): sub-components in covariant positions keep Covariant,
+    ///   those in contravariant positions flip to Contravariant
+    /// - Contravariant (T :> U): sub-components in covariant positions flip to
+    ///   Contravariant, those in contravariant positions flip to Covariant
+    fn unify_internal(&self, a: TypeId, b: TypeId, variance: Variance) -> Result<TypeId, TypeError> {
+        // ── Caching: skip if we've already checked this (a, b, variance) pair ──
+        let tag = Self::variance_tag(variance);
+        let key = (a, b, tag);
+        if !self.unify_seen.borrow_mut().insert(key) {
+            // Already visited this pair — assume success to break cycles.
+            return Ok(a);
+        }
+
+        let result = self.unify_internal_impl(a, b, variance);
+
+        // On error, remove the cache entry so future attempts can retry.
+        if result.is_err() {
+            self.unify_seen.borrow_mut().remove(&key);
+        }
+        result
+    }
+
+    /// The actual unification logic, called by `unify_internal` which wraps
+    /// it with cache management.
+    fn unify_internal_impl(&self, a: TypeId, b: TypeId, variance: Variance) -> Result<TypeId, TypeError> {
         let data_a = self.get(a).clone();
         let data_b = self.get(b).clone();
 
@@ -1131,6 +1209,324 @@ impl TypeContext {
                 self.bindings.borrow_mut().insert(b, a);
                 Ok(a)
             }
+
+            // ── Compound types: same variant, recursive sub-component unification ──
+
+            // Struct: same def_id, same args length, unify args pairwise (invariant).
+            (
+                TypeData::Struct {
+                    def_id: d1,
+                    args: a1,
+                },
+                TypeData::Struct {
+                    def_id: d2,
+                    args: a2,
+                },
+            ) if d1 == d2 && a1.len() == a2.len() => {
+                for (t1, t2) in a1.iter().zip(a2.iter()) {
+                    self.unify_internal(*t1, *t2, Variance::Invariant)?;
+                }
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // Enum: same as Struct
+            (
+                TypeData::Enum {
+                    def_id: d1,
+                    args: a1,
+                },
+                TypeData::Enum {
+                    def_id: d2,
+                    args: a2,
+                },
+            ) if d1 == d2 && a1.len() == a2.len() => {
+                for (t1, t2) in a1.iter().zip(a2.iter()) {
+                    self.unify_internal(*t1, *t2, Variance::Invariant)?;
+                }
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // Tuple: same length, elements are COVARIANT
+            (
+                TypeData::Tuple { elems: e1 },
+                TypeData::Tuple { elems: e2 },
+            ) if e1.len() == e2.len() => {
+                let elem_variance = variance.xform(Variance::Covariant);
+                for (t1, t2) in e1.iter().zip(e2.iter()) {
+                    self.unify_internal(*t1, *t2, elem_variance)?;
+                }
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // Function: params are CONTRAVARIANT, return is COVARIANT
+            (
+                TypeData::Fn {
+                    params: p1,
+                    ret: r1,
+                },
+                TypeData::Fn {
+                    params: p2,
+                    ret: r2,
+                },
+            ) if p1.len() == p2.len() => {
+                let param_variance = variance.xform(Variance::Contravariant);
+                for (t1, t2) in p1.iter().zip(p2.iter()) {
+                    self.unify_internal(*t1, *t2, param_variance)?;
+                }
+                let ret_variance = variance.xform(Variance::Covariant);
+                self.unify_internal(*r1, *r2, ret_variance)?;
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // Array: same size, element is COVARIANT
+            (
+                TypeData::Array {
+                    elem: e1,
+                    size: s1,
+                },
+                TypeData::Array {
+                    elem: e2,
+                    size: s2,
+                },
+            ) if s1 == s2 => {
+                let elem_variance = variance.xform(Variance::Covariant);
+                self.unify_internal(*e1, *e2, elem_variance)?;
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // Slice: element is COVARIANT
+            (TypeData::Slice { elem: e1 }, TypeData::Slice { elem: e2 }) => {
+                let elem_variance = variance.xform(Variance::Covariant);
+                self.unify_internal(*e1, *e2, elem_variance)?;
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // Ref: pointee is COVARIANT.  MUTABILITY:
+            // - &mut T <: &T allowed in Covariant direction (borrow shortening)
+            // - &T <: &mut T NEVER allowed
+            (
+                TypeData::Ref {
+                    ty: t1,
+                    mutable: m1,
+                },
+                TypeData::Ref {
+                    ty: t2,
+                    mutable: m2,
+                },
+            ) => {
+                let allow_mutable_coerce = match variance {
+                    Variance::Invariant => *m1 == *m2,
+                    Variance::Covariant => !(*m1 == false && *m2 == true),
+                    Variance::Contravariant => !(*m2 == false && *m1 == true),
+                };
+                if !allow_mutable_coerce {
+                    return Err(TypeError::Mismatch {
+                        expected: b,
+                        found: a,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
+                let ty_variance = variance.xform(Variance::Covariant);
+                self.unify_internal(*t1, *t2, ty_variance)?;
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // Pointer: COVARIANT
+            (TypeData::Pointer { ty: t1 }, TypeData::Pointer { ty: t2 }) => {
+                let ty_variance = variance.xform(Variance::Covariant);
+                self.unify_internal(*t1, *t2, ty_variance)?;
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // Ptr: invariant for safety
+            (
+                TypeData::Ptr {
+                    size: s1,
+                    pointee: p1,
+                },
+                TypeData::Ptr {
+                    size: s2,
+                    pointee: p2,
+                },
+            ) => {
+                self.unify_internal(*s1, *s2, Variance::Invariant)?;
+                self.unify_internal(*p1, *p2, Variance::Invariant)?;
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // Coproduct: same length, alternatives COVARIANT
+            (
+                TypeData::Coproduct {
+                    alternatives: a1,
+                },
+                TypeData::Coproduct {
+                    alternatives: a2,
+                },
+            ) if a1.len() == a2.len() => {
+                let alt_variance = variance.xform(Variance::Covariant);
+                for (t1, t2) in a1.iter().zip(a2.iter()) {
+                    self.unify_internal(*t1, *t2, alt_variance)?;
+                }
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // Forall: same param_index + body is COVARIANT
+            (
+                TypeData::Forall {
+                    param_index: pi1,
+                    param_name: pn1,
+                    body: b1,
+                },
+                TypeData::Forall {
+                    param_index: pi2,
+                    param_name: pn2,
+                    body: b2,
+                },
+            ) if pi1 == pi2 && pn1 == pn2 => {
+                let body_variance = variance.xform(Variance::Covariant);
+                self.unify_internal(*b1, *b2, body_variance)?;
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // Exists: same name + base is COVARIANT
+            (
+                TypeData::Exists { name: n1, base: b1 },
+                TypeData::Exists { name: n2, base: b2 },
+            ) if n1 == n2 => {
+                let base_variance = variance.xform(Variance::Covariant);
+                self.unify_internal(*b1, *b2, base_variance)?;
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // Poly: same quantifiers list length + content + body is COVARIANT
+            (
+                TypeData::Poly {
+                    quantifiers: q1,
+                    body: b1,
+                },
+                TypeData::Poly {
+                    quantifiers: q2,
+                    body: b2,
+                },
+            ) if q1.len() == q2.len() && q1.iter().zip(q2.iter()).all(|(a, b)| a == b) => {
+                let body_variance = variance.xform(Variance::Covariant);
+                self.unify_internal(*b1, *b2, body_variance)?;
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // Mu: same param_index + body is COVARIANT
+            (
+                TypeData::Mu {
+                    param_index: pi1,
+                    param_name: pn1,
+                    body: b1,
+                },
+                TypeData::Mu {
+                    param_index: pi2,
+                    param_name: pn2,
+                    body: b2,
+                },
+            ) if pi1 == pi2 && pn1 == pn2 => {
+                let body_variance = variance.xform(Variance::Covariant);
+                self.unify_internal(*b1, *b2, body_variance)?;
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // Nu: same param_index + body is COVARIANT
+            (
+                TypeData::Nu {
+                    param_index: pi1,
+                    param_name: pn1,
+                    body: b1,
+                },
+                TypeData::Nu {
+                    param_index: pi2,
+                    param_name: pn2,
+                    body: b2,
+                },
+            ) if pi1 == pi2 && pn1 == pn2 => {
+                let body_variance = variance.xform(Variance::Covariant);
+                self.unify_internal(*b1, *b2, body_variance)?;
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // Rational: same int_bits and frac_bits (invariant)
+            (
+                TypeData::Rational {
+                    int_bits: i1,
+                    frac_bits: f1,
+                },
+                TypeData::Rational {
+                    int_bits: i2,
+                    frac_bits: f2,
+                },
+            ) if i1 == i2 && f1 == f2 => {
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // DynTrait: same trait list (invariant)
+            (
+                TypeData::DynTrait { traits: t1 },
+                TypeData::DynTrait { traits: t2 },
+            ) if t1 == t2 => {
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // AssociatedType: same trait_id + name, self_ty is COVARIANT
+            (
+                TypeData::AssociatedType {
+                    trait_id: ti1,
+                    name: n1,
+                    self_ty: s1,
+                },
+                TypeData::AssociatedType {
+                    trait_id: ti2,
+                    name: n2,
+                    self_ty: s2,
+                },
+            ) if ti1 == ti2 && n1 == n2 => {
+                let self_variance = variance.xform(Variance::Covariant);
+                self.unify_internal(*s1, *s2, self_variance)?;
+                self.bindings.borrow_mut().insert(a, b);
+                Ok(b)
+            }
+
+            // ── Under non-Invariant variance, try subtype fallback ──
+            _ if variance != Variance::Invariant => {
+                let (sub, sup) = match variance {
+                    Variance::Covariant => (a, b),
+                    Variance::Contravariant => (b, a),
+                    _ => unreachable!(),
+                };
+                if self.subtype(sub, sup) {
+                    self.bindings.borrow_mut().insert(a, b);
+                    Ok(b)
+                } else {
+                    Err(TypeError::Mismatch {
+                        expected: b,
+                        found: a,
+                        span: crate::ast::Span::new(0, 0),
+                    })
+                }
+            }
+
             _ => Err(TypeError::Mismatch {
                 expected: b,
                 found: a,
@@ -1153,10 +1549,12 @@ impl TypeContext {
     }
 
     /// Rollback the current transaction: restore bindings from snapshot.
+    /// Also clears the unification cache so subsequent attempts re-evaluate.
     pub fn rollback_transaction(&self) {
         if let Some(snapshot) = self.transaction_stack.borrow_mut().pop() {
             *self.bindings.borrow_mut() = snapshot;
         }
+        self.unify_seen.borrow_mut().clear();
     }
 
     pub fn subtype(&self, sub: TypeId, sup: TypeId) -> bool {

@@ -139,6 +139,9 @@ pub struct SymbolTable {
     trait_defs: HashMap<DefId, TraitBinding>,
     next_def_id: usize,
     pub local_crate_id: CrateId,
+    /// Maps fully-qualified type path (e.g. "std::collections::HashMap") to DefId.
+    /// Used to resolve multi-segment paths when no module hierarchy exists yet.
+    full_path_to_def_id: HashMap<String, DefId>,
 }
 
 impl SymbolTable {
@@ -151,6 +154,7 @@ impl SymbolTable {
             trait_defs: HashMap::default(),
             next_def_id: 0,
             local_crate_id,
+            full_path_to_def_id: HashMap::default(),
         }
     }
 
@@ -218,8 +222,19 @@ impl SymbolTable {
         }
         let def_id = binding.def_id;
         self.type_defs.insert(def_id, binding.clone());
-        scope.types.insert(name, binding);
+        scope.types.insert(name.clone(), binding);
+        // Also register the full path so multi-segment lookups can find it.
+        // For top-level types this is just the name itself; for module-qualified
+        // types the caller should use register_full_path to set the canonical path.
+        self.full_path_to_def_id.entry(name).or_insert(def_id);
         Ok(())
+    }
+
+    /// Register a fully-qualified type path (e.g. "std::collections::HashMap")
+    /// mapping to an already-inserted DefId.  Used by the resolver when it
+    /// encounters type definitions inside modules or when processing imports.
+    pub fn register_full_path(&mut self, full_path: String, def_id: DefId) {
+        self.full_path_to_def_id.entry(full_path).or_insert(def_id);
     }
 
     pub fn insert_trait(
@@ -348,6 +363,12 @@ impl SymbolTable {
         if path.is_empty() {
             return None;
         }
+        // Try the full path first (e.g. "std::collections::HashMap")
+        let full = path.join("::");
+        if let Some(&id) = self.full_path_to_def_id.get(&full) {
+            return Some(id);
+        }
+        // Fall back to single-segment lookup (compatibility with existing code)
         let name = &path[0];
         let binding = self.lookup_type(name)?;
         if path.len() == 1 {
@@ -357,6 +378,14 @@ impl SymbolTable {
     }
 
     pub fn lookup_trait_by_path(&self, path: &[String]) -> Option<DefId> {
+        // Try the full-path lookup first.
+        let full = path.join("::");
+        if let Some(&id) = self.full_path_to_def_id.get(&full) {
+            // Check if this DefId is actually a trait (by looking it up in trait_defs)
+            if self.trait_defs.contains_key(&id) {
+                return Some(id);
+            }
+        }
         if path.len() != 1 {
             return None;
         }

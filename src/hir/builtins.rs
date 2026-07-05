@@ -3,12 +3,33 @@ use crate::hir::symbol::{SymbolTable, TraitBinding, TypeBinding, TypeKind};
 use crate::hir::traits::{ImplCandidate, TraitEnv};
 use crate::hir::types::{DefId, TypeContext};
 
+/// Insert a trait with no associated types into the symbol table.
 fn insert_trait(symbols: &mut SymbolTable, name: &str, def_id: &mut DefId) {
     *def_id = symbols.allocate_def_id();
     let binding = TraitBinding {
         def_id: *def_id,
         methods: vec![],
         associated_types: vec![],
+        span: Span::new(0, 0),
+        crate_id: symbols.local_crate_id,
+    };
+    symbols
+        .insert_trait(name.to_string(), binding, Span::new(0, 0))
+        .ok();
+}
+
+/// Insert a trait with associated types into the symbol table.
+fn insert_trait_with_assoc_types(
+    symbols: &mut SymbolTable,
+    name: &str,
+    def_id: &mut DefId,
+    associated_types: Vec<(String, Option<Type>)>,
+) {
+    *def_id = symbols.allocate_def_id();
+    let binding = TraitBinding {
+        def_id: *def_id,
+        methods: vec![],
+        associated_types,
         span: Span::new(0, 0),
         crate_id: symbols.local_crate_id,
     };
@@ -108,8 +129,6 @@ pub fn register_builtins(
     }
 
     // Register built-in Rational<p,q> types with arithmetic trait impls.
-    // Rational supports Add, Sub, Mul, Div, Rem, Eq, Ord (Lt, Gt, Le, Ge, Neq).
-    // Bitwise operations (BitAnd, BitOr, BitXor, Shl, Shr, And, Or) are NOT applicable.
     let rational_arith_traits = [
         add_id, sub_id, mul_id, div_id, rem_id, eq_id, neq_id, lt_id, gt_id, le_id, ge_id,
     ];
@@ -136,7 +155,7 @@ pub fn register_builtins(
         }
     }
 
-    // Register standard library types: Result, Option, Future
+    // ── Standard library types: Result, Option ────────────────────────
 
     // Result<T, E>
     {
@@ -222,9 +241,24 @@ pub fn register_builtins(
             .ok();
     }
 
-    // Future<T>
+    // ── Future trait ──────────────────────────────────────────────────
+    //
+    // Future is a trait with an associated type `Output`.
+    //   trait Future {
+    //       type Output;
+    //   }
+    //
+    // async functions return `Future<T>` (a built-in enum type that serves
+    // as the concrete return type).  The trait is used by `await` to extract
+    // the Output type via projection: given `Future<T>`, `Future::Output = T`.
+    //
+    // The `Future<T>` enum with a single `Output(T)` variant stores the
+    // eventual value.  This mirrors Rust's design where `Future` is a trait
+    // and async fn returns `impl Future<Output = T>`.
+
+    // 1) Register the Future enum type (concrete return type of async fns)
+    let future_enum_def_id = symbols.allocate_def_id();
     {
-        let def_id = symbols.allocate_def_id();
         let future_t = TypeParam {
             name: "T".to_string(),
             bounds: vec![],
@@ -237,7 +271,7 @@ pub fn register_builtins(
             span: Span::new(0, 0),
         };
         let binding = TypeBinding {
-            def_id,
+            def_id: future_enum_def_id,
             params: vec![future_t],
             kind: TypeKind::Enum,
             span: Span::new(0, 0),
@@ -255,6 +289,40 @@ pub fn register_builtins(
             .insert_type("Future".to_string(), binding, Span::new(0, 0))
             .ok();
     }
+
+    // 2) Register the Future trait with associated type `Output`
+    let mut future_trait_id = DefId(0);
+    insert_trait_with_assoc_types(
+        symbols,
+        "Future",
+        &mut future_trait_id,
+        vec![("Output".to_string(), None)],
+    );
+
+    // 3) Register `impl Future for Future<T>` where `Output = T`.
+    //    This is the key bridge: for any concrete `Future<T>` type,
+    //    the `Output` associated type resolves to `T`.
+    //
+    //    We register a generic impl using a generic param index 0.
+    let future_output_ty = ctx.generic_param(0, "T".to_string());
+    let future_for_ty = ctx.enum_ty(future_enum_def_id, vec![future_output_ty]);
+    trait_env
+        .add_impl(
+            ImplCandidate {
+                trait_id: future_trait_id,
+                for_type: future_for_ty,
+                methods: vec![],
+                resolved_methods: vec![],
+                assoc_tys: vec![("Output".to_string(), future_output_ty)],
+                has_auto_deref: false,
+                context: vec![],
+                span: Span::new(0, 0),
+            },
+            symbols,
+            ctx,
+            true, // trusted — built-in impl
+        )
+        .ok();
 
     // Register standard traits for error suggestions and future use
     insert_trait(symbols, "From", &mut DefId(0));

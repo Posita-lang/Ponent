@@ -332,6 +332,40 @@ impl TraitEnv {
             .collect()
     }
 
+    /// Resolve an associated type projection: given a trait_id, self_ty, and
+    /// associated type name, find the concrete type from the impl.
+    ///
+    /// This performs the equivalent of `<SelfTy as Trait>::AssocName`.
+    /// It first tries exact match on `for_type`, then falls back to
+    /// `lookup_impl_generic` for generic impls.
+    pub fn resolve_assoc_type(
+        &self,
+        trait_id: DefId,
+        self_ty: TypeId,
+        assoc_name: &str,
+        ctx: &mut TypeContext,
+        symbols: &SymbolTable,
+    ) -> Option<TypeId> {
+        // Try exact match first
+        if let Some(cand) = self.lookup_impl(trait_id, self_ty) {
+            for (name, ty) in &cand.assoc_tys {
+                if name == assoc_name {
+                    return Some(ctx.resolve_binding(*ty));
+                }
+            }
+            return None;
+        }
+        // Fall back to generic impl lookup
+        let (cand, subst) = self.lookup_impl_generic(trait_id, self_ty, ctx, symbols)?;
+        for (name, ty) in &cand.assoc_tys {
+            if name == assoc_name {
+                let resolved = ctx.subst(*ty, &subst);
+                return Some(ctx.resolve_binding(resolved));
+            }
+        }
+        None
+    }
+
     /// Register resolved inherent methods for a type.
     pub fn add_inherent_methods(&mut self, for_type: DefId, methods: Vec<MethodInfo>) {
         self.inherent_methods

@@ -39,7 +39,7 @@ impl<'a, 'tcx> Drop for ScopeGuard<'a, 'tcx> {
 impl<'a> TypeChecker<'a> {
     /// Save the current inference context and push a fresh one.
     /// Also saves TypeContext bindings so the nested scope's resolution
-    /// can be rolled back on exit (TypeOrVar isolation pattern).
+    /// can be committed on exit rather than leaked incrementally.
     pub(crate) fn enter_inference_scope(&mut self) {
         self.ctx.begin_transaction();
         let old = mem::replace(&mut self.infer, InferenceContext::new());
@@ -73,9 +73,9 @@ impl<'a> TypeChecker<'a> {
         }
         let has_errors = !unresolved.is_empty();
 
-        // Roll back TypeContext bindings — the nested scope's InferVar
-        // resolutions are stored in `current.resolutions` which is dropped.
-        self.ctx.rollback_transaction();
+        // Commit TypeContext bindings — the nested scope's InferVar
+        // resolutions produced by finalize() are now stable.
+        self.ctx.commit_transaction();
 
         if has_errors {
             return Err(mem::take(&mut self.diagnostics));

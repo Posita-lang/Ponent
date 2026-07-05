@@ -56,6 +56,8 @@ pub struct NameResolver<'a> {
     current_impl_type_params: Option<HashMap<String, TypeId>>,
     /// Pre-resolved name resolutions for the type checker.
     resolution_map: ResolutionMap,
+    /// Current module path for registering full-qualified type paths.
+    module_path: Vec<String>,
 }
 
 struct ImportEntry {
@@ -79,6 +81,7 @@ impl<'a> NameResolver<'a> {
             local_crate_id,
             current_impl_type_params: None,
             resolution_map: ResolutionMap::default(),
+            module_path: Vec::new(),
         }
     }
 
@@ -268,6 +271,13 @@ impl<'a> NameResolver<'a> {
                 };
                 if let Err(diag) = self.symbols.insert_type(name.clone(), binding, *span) {
                     self.diagnostics.push(diag);
+                }
+                // Register the fully-qualified path for multi-segment resolution.
+                {
+                    let mut full_path = self.module_path.clone();
+                    full_path.push(name.clone());
+                    let full = full_path.join("::");
+                    self.symbols.register_full_path(full, def_id);
                 }
                 // Populate the resolution map for the type checker
                 if let Some(b) = self.symbols.lookup_type(&name) {
@@ -1554,6 +1564,9 @@ impl<'a> NameResolver<'a> {
                 if let Some(binding) = self.symbols.lookup_type_by_def_id(def_id).cloned() {
                     self.symbols.insert_type(name.clone(), binding, span).ok();
                 }
+                // Register the import's original full path for re-export resolution.
+                let full_path = path.join("::");
+                self.symbols.register_full_path(full_path, def_id);
             }
             // `from path import { items }`
             if let Some(item_list) = items {
@@ -1570,6 +1583,11 @@ impl<'a> NameResolver<'a> {
                                 .insert_type(item.clone(), binding, span)
                                 .ok();
                         }
+                        // Register the full path: path::to::item
+                        let mut full_item_path = path.to_vec();
+                        full_item_path.push(item.clone());
+                        self.symbols
+                            .register_full_path(full_item_path.join("::"), item_def_id);
                     }
                 }
             }
