@@ -3181,11 +3181,12 @@ impl Parser {
             Some(Token::StarWrap) | Some(Token::StarSaturate) | Some(Token::StarTrap) => {
                 Some((15, true))
             }
-            Some(Token::PlusWrap) | Some(Token::MinusWrap)
-            | Some(Token::PlusSaturate) | Some(Token::MinusSaturate)
-            | Some(Token::PlusTrap) | Some(Token::MinusTrap) => {
-                Some((13, true))
-            }
+            Some(Token::PlusWrap)
+            | Some(Token::MinusWrap)
+            | Some(Token::PlusSaturate)
+            | Some(Token::MinusSaturate)
+            | Some(Token::PlusTrap)
+            | Some(Token::MinusTrap) => Some((13, true)),
             // Bitwise: << >> (prec 3), & (prec 4), ^ (prec 5), | (prec 6)
             Some(Token::Shl) | Some(Token::Shr) => Some((12, true)),
             Some(Token::Ampersand) => Some((11, true)),

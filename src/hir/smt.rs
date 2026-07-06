@@ -99,8 +99,8 @@ impl SmtSolver {
             return Some(match ctx.get(resolved) {
                 TypeData::Fn { .. } => PrincipalShape::Arrow,
                 TypeData::Tuple { elems } => PrincipalShape::Tuple(elems.len()),
-                TypeData::App { args, .. } => PrincipalShape::Constructor(args.len()),
-                TypeData::Struct { .. } | TypeData::Enum { .. } => PrincipalShape::Constructor(0),
+                TypeData::Adt { args, .. } => PrincipalShape::Constructor(args.len()),
+                TypeData::Adt { .. } => PrincipalShape::Constructor(0),
                 TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } => {
                     PrincipalShape::Poly
                 }
@@ -346,7 +346,7 @@ impl SmtSolver {
                     "type-unknown".into()
                 }
             }
-            TypeData::App { def_id, args } => {
+            TypeData::Adt { def_id, args } => {
                 // Encode as (type-struct def_id first_arg) for the first arg
                 if let Some(&arg) = args.first() {
                     let a = Self::type_to_smt_term(ctx, arg);
@@ -369,7 +369,7 @@ impl SmtSolver {
                     "type-float64".into()
                 }
             }
-            TypeData::Struct { .. } | TypeData::Enum { .. } => "type-unknown".to_string(),
+            TypeData::Adt { .. } => "type-unknown".to_string(),
         }
     }
 }

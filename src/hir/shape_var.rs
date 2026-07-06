@@ -410,8 +410,8 @@ pub fn type_data_to_shape(data: &TypeData) -> TypeShape {
     match data {
         TypeData::Fn { .. } => TypeShape::Arrow,
         TypeData::Tuple { elems } => TypeShape::Tuple(elems.len()),
-        TypeData::App { args, .. } => TypeShape::Constructor(args.len()),
-        TypeData::Struct { .. } | TypeData::Enum { .. } => TypeShape::Constructor(0),
+        TypeData::Adt { args, .. } => TypeShape::Constructor(args.len()),
+        TypeData::Adt { .. } => TypeShape::Constructor(0),
         TypeData::Forall { .. }
         | TypeData::Exists { .. }
         | TypeData::Mu { .. }

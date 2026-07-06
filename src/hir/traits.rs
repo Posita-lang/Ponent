@@ -159,7 +159,7 @@ fn collect_generic_params_rec(
         TypeData::GenericParam { index, .. } => {
             set.insert(*index);
         }
-        TypeData::App { args, .. } => {
+        TypeData::Adt { args, .. } => {
             for a in args {
                 collect_generic_params_rec(*a, ctx, set);
             }
@@ -196,7 +196,7 @@ fn collect_bare_generic_params(ty: TypeId, ctx: &TypeContext) -> std::collection
         TypeData::GenericParam { index, .. } => {
             set.insert(*index);
         }
-        TypeData::App { args, .. } => {
+        TypeData::Adt { args, .. } => {
             for a in args {
                 if let TypeData::GenericParam { index, .. } = ctx.get(*a) {
                     set.insert(*index);
@@ -294,9 +294,9 @@ impl TraitEnv {
             }
             // Get the type binding for the candidate's for_type
             let def_id = match ctx.get(cand.for_type) {
-                TypeData::Struct { def_id, .. }
-                | TypeData::Enum { def_id, .. }
-                | TypeData::App { def_id, .. } => *def_id,
+                TypeData::Adt { def_id, .. }
+                | TypeData::Adt { def_id, .. }
+                | TypeData::Adt { def_id, .. } => *def_id,
                 _ => continue,
             };
             let binding = match symbols.lookup_type_by_def_id(def_id) {
@@ -384,9 +384,9 @@ impl TraitEnv {
     /// Look up inherent methods registered for a type.
     pub fn lookup_inherent_methods(&self, ty: TypeId, ctx: &TypeContext) -> &[MethodInfo] {
         match ctx.get(ty) {
-            TypeData::Struct { def_id, .. }
-            | TypeData::Enum { def_id, .. }
-            | TypeData::App { def_id, .. } => self
+            TypeData::Adt { def_id, .. }
+            | TypeData::Adt { def_id, .. }
+            | TypeData::Adt { def_id, .. } => self
                 .inherent_methods
                 .get(def_id)
                 .map(|v| v.as_slice())

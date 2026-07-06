@@ -1171,9 +1171,9 @@ impl<'a> TypeChecker<'a> {
                     }
 
                     // Also register the resolved methods for method resolution
-                    if let TypeData::Struct { def_id, .. }
-                    | TypeData::Enum { def_id, .. }
-                    | TypeData::App { def_id, .. } = self.ctx.get(for_ty)
+                    if let TypeData::Adt { def_id, .. }
+                    | TypeData::Adt { def_id, .. }
+                    | TypeData::Adt { def_id, .. } = self.ctx.get(for_ty)
                     {
                         self.trait_env.add_inherent_methods(*def_id, method_infos);
                     }
@@ -1190,9 +1190,9 @@ impl<'a> TypeChecker<'a> {
                     // Inherent impl block: resolve the type and register methods
                     let for_ty = self.resolve_type(for_type)?;
                     let for_def_id = match self.ctx.get(for_ty) {
-                        TypeData::Struct { def_id, .. }
-                        | TypeData::Enum { def_id, .. }
-                        | TypeData::App { def_id, .. } => *def_id,
+                        TypeData::Adt { def_id, .. }
+                        | TypeData::Adt { def_id, .. }
+                        | TypeData::Adt { def_id, .. } => *def_id,
                         _ => {
                             self.diagnostics.push(
                                 Diagnostic::error("inherent impl on non-struct/enum type")
@@ -1372,8 +1372,8 @@ impl<'a> TypeChecker<'a> {
     ) -> Result<(DefId, Vec<TypeId>), Diagnostic> {
         let resolved = self.ctx.resolve_binding(ty);
         match self.ctx.get(resolved) {
-            TypeData::App { def_id, args } => Ok((*def_id, args.clone())),
-            TypeData::Struct { def_id } | TypeData::Enum { def_id } => Ok((*def_id, vec![])),
+            TypeData::Adt { def_id, args } => Ok((*def_id, args.clone())),
+            TypeData::Adt { def_id, .. } | TypeData::Adt { def_id, .. } => Ok((*def_id, vec![])),
             TypeData::Error => Err(Diagnostic::error("type error").with_span(span)),
             _ => Err(Diagnostic::error("expected struct or enum type").with_span(span)),
         }
@@ -1659,7 +1659,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn extract_ok_type(&self, ty: TypeId) -> Option<TypeId> {
-        if let TypeData::App { def_id: did, args } = self.ctx.get(ty) {
+        if let TypeData::Adt { def_id: did, args } = self.ctx.get(ty) {
             if let Some(result_id) = self.known_def_id("Result") {
                 if *did == result_id && args.len() == 2 {
                     return Some(args[0]);
@@ -1678,7 +1678,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn extract_result_types(&self, ty: TypeId, span: Span) -> Result<(TypeId, TypeId), Diagnostic> {
-        if let TypeData::App { def_id: did, args } = self.ctx.get(ty) {
+        if let TypeData::Adt { def_id: did, args } = self.ctx.get(ty) {
             if let Some(result_id) = self.known_def_id("Result") {
                 if *did == result_id && args.len() == 2 {
                     return Ok((args[0], args[1]));
@@ -1922,7 +1922,7 @@ impl<'a> TypeChecker<'a> {
     fn collect_generic_param_indices(ty: TypeId, ctx: &TypeContext, out: &mut Vec<usize>) {
         match ctx.get(ty) {
             TypeData::GenericParam { index, .. } => out.push(*index),
-            TypeData::App { args, .. } => {
+            TypeData::Adt { args, .. } => {
                 for &a in args {
                     Self::collect_generic_param_indices(a, ctx, out);
                 }
@@ -1991,7 +1991,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 false
             }
-            TypeData::App { args, .. } => args
+            TypeData::Adt { args, .. } => args
                 .iter()
                 .any(|&a| Self::type_var_in_problematic_position(a, vars, ctx)),
             TypeData::Tuple { elems } => elems
@@ -2018,7 +2018,7 @@ impl<'a> TypeChecker<'a> {
             return true;
         }
         match ctx.get(resolved) {
-            TypeData::App { args, .. } => args
+            TypeData::Adt { args, .. } => args
                 .iter()
                 .any(|&a| Self::type_tree_contains(a, target, ctx)),
             TypeData::Tuple { elems } => elems
@@ -2054,14 +2054,14 @@ impl<'a> TypeChecker<'a> {
         {
             let data = self.ctx.get(ty);
             let def_id = match data {
-                TypeData::App { def_id, .. }
-                | TypeData::Struct { def_id }
-                | TypeData::Enum { def_id } => Some(*def_id),
+                TypeData::Adt { def_id, .. }
+                | TypeData::Adt { def_id, .. }
+                | TypeData::Adt { def_id, .. } => Some(*def_id),
                 _ => None,
             };
             if let Some(def_id) = def_id {
                 let args: &[TypeId] = match data {
-                    TypeData::App { args, .. } => args.as_slice(),
+                    TypeData::Adt { args, .. } => args.as_slice(),
                     _ => &[],
                 };
                 let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| {
@@ -2084,14 +2084,14 @@ impl<'a> TypeChecker<'a> {
         for deref_ty in self.autoderef_chain(ty).skip(1) {
             let data = self.ctx.get(deref_ty);
             let def_id = match data {
-                TypeData::App { def_id, .. }
-                | TypeData::Struct { def_id }
-                | TypeData::Enum { def_id } => Some(*def_id),
+                TypeData::Adt { def_id, .. }
+                | TypeData::Adt { def_id, .. }
+                | TypeData::Adt { def_id, .. } => Some(*def_id),
                 _ => None,
             };
             if let Some(def_id) = def_id {
                 let args: &[TypeId] = match data {
-                    TypeData::App { args, .. } => args.as_slice(),
+                    TypeData::Adt { args, .. } => args.as_slice(),
                     _ => &[],
                 };
                 let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| {
@@ -2203,9 +2203,9 @@ impl<'a> TypeChecker<'a> {
     ) -> Result<Option<Expr>, Diagnostic> {
         let resolved = self.ctx.resolve_binding(ty_id);
         let def_id = match self.ctx.get(resolved) {
-            TypeData::Struct { def_id, .. }
-            | TypeData::Enum { def_id, .. }
-            | TypeData::App { def_id, .. } => Some(*def_id),
+            TypeData::Adt { def_id, .. }
+            | TypeData::Adt { def_id, .. }
+            | TypeData::Adt { def_id, .. } => Some(*def_id),
             _ => None,
         };
         if let Some(def_id) = def_id {
@@ -2302,9 +2302,9 @@ impl<'a> TypeChecker<'a> {
     fn lookup_type_binding(&self, ty: TypeId) -> Option<TypeBinding> {
         let resolved = self.ctx.resolve_binding(ty);
         match self.ctx.get(resolved) {
-            TypeData::Struct { def_id, .. }
-            | TypeData::Enum { def_id, .. }
-            | TypeData::App { def_id, .. } => self.symbols.lookup_type_by_def_id(*def_id).cloned(),
+            TypeData::Adt { def_id, .. }
+            | TypeData::Adt { def_id, .. }
+            | TypeData::Adt { def_id, .. } => self.symbols.lookup_type_by_def_id(*def_id).cloned(),
             _ => None,
         }
     }

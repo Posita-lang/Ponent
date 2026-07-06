@@ -1528,9 +1528,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     arg_tys.push(self.resolve_type(arg.ty())?);
                 }
                 match self.checker.ctx.get(expanded) {
-                    TypeData::Struct { def_id, .. }
-                    | TypeData::Enum { def_id, .. }
-                    | TypeData::App { def_id, .. } => {
+                    TypeData::Adt { def_id, .. }
+                    | TypeData::Adt { def_id, .. }
+                    | TypeData::Adt { def_id, .. } => {
                         let binding = self
                             .checker
                             .symbols
@@ -1708,7 +1708,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     let mut alternatives = Vec::new();
                     for ty in resolved {
                         match self.checker.ctx.get(ty) {
-                            TypeData::Enum { .. } => alternatives.push(ty),
+                            TypeData::Adt { .. } => alternatives.push(ty),
                             TypeData::Coproduct { alternatives: alts } => {
                                 alternatives.extend(alts.clone());
                             }
@@ -1999,7 +1999,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     // Bare variant like `Some(x)` — infer enum from expected type
                     let resolved = self.checker.ctx.resolve_binding(expected_ty);
                     match self.checker.ctx.get(resolved) {
-                        TypeData::Enum { def_id, .. } => *def_id,
+                        TypeData::Adt { def_id, .. } => *def_id,
                         _ => {
                             return Err(Diagnostic::error(
                                 "cannot infer enum type from bare variant pattern; use qualified path like `Opt::Some(x)`",

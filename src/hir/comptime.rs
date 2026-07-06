@@ -697,7 +697,7 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
         TypeData::USize => ComptimeValue::Value(str_lit("USize")),
         TypeData::Unit => ComptimeValue::Value(str_lit("Unit")),
         TypeData::Never => ComptimeValue::Value(str_lit("Never")),
-        TypeData::Struct { def_id, .. } => {
+        TypeData::Adt { def_id, .. } => {
             let mut fields_tuple = Vec::new();
             if let Some(binding) = self.checker.symbols.lookup_type_by_def_id(*def_id) {
                 for field in &binding.fields {
@@ -724,7 +724,7 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
                 HirExpr::Tuple(fields_tuple, fields_ty, Span::new(0, 0)),
             ])
         }
-        TypeData::Enum { def_id, .. } => {
+        TypeData::Adt { def_id, .. } => {
             let mut variants_tuple = Vec::new();
             if let Some(binding) = self.checker.symbols.lookup_type_by_def_id(*def_id) {
                 for variant in &binding.variants {
@@ -928,7 +928,7 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
             TypeData::Array { elem, size } => {
                 self.estimate_type_size(*elem) * size
             }
-            TypeData::Struct { def_id, .. } => {
+            TypeData::Adt { def_id, .. } => {
                 // Compute struct size by summing field types (with alignment).
                 // Field types are already resolved to TypeId by the resolver.
                 if let Some(binding) = self.checker.symbols.lookup_type_by_def_id(*def_id) {
@@ -946,7 +946,7 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
                     PTR_SIZE * 4
                 }
             }
-            TypeData::Enum { def_id, .. } => {
+            TypeData::Adt { def_id, .. } => {
                 // Enum size = max variant payload + discriminant tag.
                 if let Some(binding) = self.checker.symbols.lookup_type_by_def_id(*def_id) {
                     let mut max_payload = 0u64;

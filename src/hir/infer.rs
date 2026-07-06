@@ -552,8 +552,8 @@ impl InferenceContext {
         match ctx.get(resolved) {
             TypeData::Fn { params, .. } => PrincipalShape::Arrow,
             TypeData::Tuple { elems } => PrincipalShape::Tuple(elems.len()),
-            TypeData::App { args, .. } => PrincipalShape::Constructor(args.len()),
-            TypeData::Struct { .. } | TypeData::Enum { .. } => PrincipalShape::Constructor(0),
+            TypeData::Adt { args, .. } => PrincipalShape::Constructor(args.len()),
+            TypeData::Adt { .. } => PrincipalShape::Constructor(0),
             TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } => {
                 PrincipalShape::Poly
             }
@@ -936,7 +936,7 @@ impl InferenceContext {
                     self.s_inst_copy_deepen(ctx, e);
                 }
             }
-            TypeData::App { args, .. } => {
+            TypeData::Adt { args, .. } => {
                 for a in args {
                     self.s_inst_copy_deepen(ctx, a);
                 }
@@ -1194,7 +1194,7 @@ impl InferenceContext {
             } => elems
                 .iter()
                 .any(|&e| Self::check_rigid_escape(ctx, e, max_level)),
-            TypeData::App { args, .. } => args
+            TypeData::Adt { args, .. } => args
                 .iter()
                 .any(|&a| Self::check_rigid_escape(ctx, a, max_level)),
             TypeData::Forall { body, .. }
@@ -1935,14 +1935,14 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
         | TypeData::Error
         | TypeData::Poly { .. } => ty,
         TypeData::GenericParam { .. } => ty,
-        TypeData::Struct { def_id } => ty, // zero-arg, nothing to replace
-        TypeData::Enum { def_id } => ty,   // zero-arg, nothing to replace
-        TypeData::App { def_id, args } => {
+        TypeData::Adt { def_id, .. } => ty, // zero-arg, nothing to replace
+        TypeData::Adt { def_id, .. } => ty, // zero-arg, nothing to replace
+        TypeData::Adt { def_id, args } => {
             let new_args: Vec<TypeId> = args
                 .iter()
                 .map(|&a| replace_infer(a, solution, ctx))
                 .collect();
-            ctx.find_type(&TypeData::App {
+            ctx.find_type(&TypeData::Adt {
                 def_id,
                 args: new_args,
             })

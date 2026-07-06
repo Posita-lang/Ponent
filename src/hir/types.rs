@@ -16,33 +16,31 @@ pub enum TypeTag {
     Char = 4,
     Byte = 5,
     USize = 6,
-    Struct = 7,
-    Enum = 8,
-    Tuple = 9,
-    Array = 10,
-    Slice = 11,
-    Ref = 12,
-    Pointer = 13,
-    Ptr = 14,
-    Fn = 15,
-    DynTrait = 16,
-    Exists = 17,
-    Forall = 18,
-    GenericParam = 19,
-    AssociatedType = 20,
-    InferVar = 21,
-    Never = 22,
-    Unit = 23,
-    Error = 24,
-    Coproduct = 25,
-    Mu = 26,
-    Nu = 27,
-    Poly = 28,
-    Rational = 29,
-    /// Generic type application: `App(def_id, [args])` — a unified representation
-    /// for parameterized types (struct, enum, or other type constructors applied
-    /// to their type arguments).  Inspired by Vix-lang's `TypeKind::App`.
-    App = 30,
+    Tuple = 7,
+    Array = 8,
+    Slice = 9,
+    Ref = 10,
+    Pointer = 11,
+    Ptr = 12,
+    Fn = 13,
+    DynTrait = 14,
+    Exists = 15,
+    Forall = 16,
+    GenericParam = 17,
+    AssociatedType = 18,
+    InferVar = 19,
+    Never = 20,
+    Unit = 21,
+    Error = 22,
+    Coproduct = 23,
+    Mu = 24,
+    Nu = 25,
+    Poly = 26,
+    Rational = 27,
+    /// Algebraic data type — a struct, enum, or other named type applied
+    /// to its generic arguments.  Follows rustc's single-`Adt` convention
+    /// rather than separate `Struct`/`Enum` variants.
+    Adt = 28,
 }
 
 impl From<&TypeData> for TypeTag {
@@ -55,8 +53,7 @@ impl From<&TypeData> for TypeTag {
             TypeData::Char => TypeTag::Char,
             TypeData::Byte => TypeTag::Byte,
             TypeData::USize => TypeTag::USize,
-            TypeData::Struct { .. } => TypeTag::Struct,
-            TypeData::Enum { .. } => TypeTag::Enum,
+            TypeData::Adt { .. } => TypeTag::Adt,
             TypeData::Tuple { .. } => TypeTag::Tuple,
             TypeData::Array { .. } => TypeTag::Array,
             TypeData::Slice { .. } => TypeTag::Slice,
@@ -75,7 +72,6 @@ impl From<&TypeData> for TypeTag {
             TypeData::Nu { .. } => TypeTag::Nu,
             TypeData::Poly { .. } => TypeTag::Poly,
             TypeData::Rational { .. } => TypeTag::Rational,
-            TypeData::App { .. } => TypeTag::App,
             TypeData::Never => TypeTag::Never,
             TypeData::Unit => TypeTag::Unit,
             TypeData::Error => TypeTag::Error,
@@ -117,11 +113,16 @@ pub enum TypeData {
     Char,
     Byte,
     USize,
-    Struct {
+    /// An algebraic data type (ADT): struct, enum, or other named type
+    /// applied to its generic arguments.  Rustc-style single variant for
+    /// all named types: `Adt(def_id, [args...])`.
+    /// When the type has no generic parameters, `args` is empty.
+    /// Examples:
+    ///   `String`          → Adt { def_id: StringDefId, args: [] }
+    ///   `Option<Int<32>>` → Adt { def_id: OptionDefId, args: [Int<32>] }
+    Adt {
         def_id: DefId,
-    },
-    Enum {
-        def_id: DefId,
+        args: Vec<TypeId>,
     },
     Tuple {
         elems: Vec<TypeId>,
@@ -210,14 +211,6 @@ pub enum TypeData {
     Rational {
         int_bits: u8,
         frac_bits: u8,
-    },
-    /// Generic type application: `App(def_id, [args, ...])`.
-    /// A unified representation for parameterized types — the type constructor
-    /// identified by `def_id` (a struct, enum, or other named type) applied
-    /// to its type arguments.  Inspired by Vix-lang's `TypeKind::App`.
-    App {
-        def_id: DefId,
-        args: Vec<TypeId>,
     },
     Never,
     Unit,
@@ -344,8 +337,9 @@ impl TypeContext {
         ctx.builtin_byte = ctx.alloc(TypeData::Byte);
         ctx.builtin_usize = ctx.alloc(TypeData::USize);
         // Str type: represented as a zero-sized struct with a sentinel DefId.
-        ctx.builtin_str = ctx.alloc(TypeData::Struct {
+        ctx.builtin_str = ctx.alloc(TypeData::Adt {
             def_id: DefId(usize::MAX),
+            args: vec![],
         });
         // &Str = Ref { ty: Str, mutable: false }
         ctx.builtin_str_ref = ctx.reference(ctx.builtin_str, false);
@@ -441,9 +435,7 @@ impl TypeContext {
     pub fn get_def_id_for_type(&self, id: TypeId) -> Option<DefId> {
         let resolved = self.resolve_binding(id);
         match &self.types[resolved.index()].as_ref() {
-            TypeData::Struct { def_id, .. } => Some(*def_id),
-            TypeData::Enum { def_id, .. } => Some(*def_id),
-            TypeData::App { def_id, .. } => Some(*def_id),
+            TypeData::Adt { def_id, .. } => Some(*def_id),
             _ => None,
         }
     }
@@ -501,21 +493,13 @@ impl TypeContext {
     }
 
     pub fn struct_ty(&mut self, def_id: DefId, args: Vec<TypeId>) -> TypeId {
-        let id = if args.is_empty() {
-            self.alloc(TypeData::Struct { def_id })
-        } else {
-            self.alloc(TypeData::App { def_id, args })
-        };
+        let id = self.alloc(TypeData::Adt { def_id, args });
         self.def_id_to_type_id.insert(def_id, id);
         id
     }
 
     pub fn enum_ty(&mut self, def_id: DefId, args: Vec<TypeId>) -> TypeId {
-        let id = if args.is_empty() {
-            self.alloc(TypeData::Enum { def_id })
-        } else {
-            self.alloc(TypeData::App { def_id, args })
-        };
+        let id = self.alloc(TypeData::Adt { def_id, args });
         self.def_id_to_type_id.insert(def_id, id);
         id
     }
@@ -918,7 +902,7 @@ impl TypeContext {
                 });
                 edges
             }
-            TypeData::App { args, .. } => args
+            TypeData::Adt { args, .. } => args
                 .iter()
                 .map(|&a| VarianceEdge { target: a, sign: 0 }) // invariant — nominal types have invariant params
                 .collect(),
@@ -977,7 +961,7 @@ impl TypeContext {
                 params.iter().any(|&p| self.type_contains_param(param, p))
                     || self.type_contains_param(param, *ret)
             }
-            TypeData::App { args, .. } => args.iter().any(|&a| self.type_contains_param(param, a)),
+            TypeData::Adt { args, .. } => args.iter().any(|&a| self.type_contains_param(param, a)),
             TypeData::Tuple { elems } => elems.iter().any(|&e| self.type_contains_param(param, e)),
             TypeData::Coproduct { alternatives } => alternatives
                 .iter()
@@ -1089,12 +1073,12 @@ impl TypeContext {
                     .collect();
                 self.tuple(new_elems)
             }
-            TypeData::App { def_id, args } => {
+            TypeData::Adt { def_id, args } => {
                 let new_args: Vec<TypeId> = args
                     .iter()
                     .map(|&a| self.replace_generic(a, param_index, replacement))
                     .collect();
-                self.alloc(TypeData::App {
+                self.alloc(TypeData::Adt {
                     def_id: *def_id,
                     args: new_args,
                 })
@@ -1153,8 +1137,8 @@ impl TypeContext {
         }
         let resolved = self.resolve_binding(ty);
         match &self.types[resolved.index()].as_ref() {
-            TypeData::App { args, .. } => args.iter().any(|&a| self.occurs_check(param, a)),
-            TypeData::Struct { .. } | TypeData::Enum { .. } => false,
+            TypeData::Adt { args, .. } => args.iter().any(|&a| self.occurs_check(param, a)),
+            TypeData::Adt { .. } => false,
             TypeData::Tuple { elems } => elems.iter().any(|&e| self.occurs_check(param, e)),
             TypeData::Coproduct { alternatives } => {
                 alternatives.iter().any(|&a| self.occurs_check(param, a))
@@ -1320,25 +1304,13 @@ impl TypeContext {
 
             // ── Compound types: same variant, recursive sub-component unification ──
 
-            // Struct: same def_id (zero-arg only)
-            (TypeData::Struct { def_id: d1 }, TypeData::Struct { def_id: d2 }) if d1 == d2 => {
-                self.set_binding(a, b);
-                Ok(b)
-            }
-
-            // Enum: same def_id (zero-arg only)
-            (TypeData::Enum { def_id: d1 }, TypeData::Enum { def_id: d2 }) if d1 == d2 => {
-                self.set_binding(a, b);
-                Ok(b)
-            }
-
-            // App: same def_id, same args length, unify args pairwise (invariant).
+            // Adt (struct/enum): same def_id, same args length, unify args pairwise (invariant).
             (
-                TypeData::App {
+                TypeData::Adt {
                     def_id: d1,
                     args: a1,
                 },
-                TypeData::App {
+                TypeData::Adt {
                     def_id: d2,
                     args: a2,
                 },
@@ -1799,9 +1771,9 @@ impl TypeContext {
             | TypeData::Never
             | TypeData::Unit
             | TypeData::Error => ty,
-            TypeData::App { def_id, args } => {
+            TypeData::Adt { def_id, args } => {
                 let new_args: Vec<TypeId> = args.iter().map(|&a| self.subst(a, subst)).collect();
-                self.alloc(TypeData::App {
+                self.alloc(TypeData::Adt {
                     def_id: *def_id,
                     args: new_args,
                 })
@@ -1903,11 +1875,11 @@ impl TypeContext {
     }
 
     fn struct_ty_no_alloc(&self, def_id: DefId, args: Vec<TypeId>) -> Option<TypeId> {
-        self.find_type(&TypeData::App { def_id, args })
+        self.find_type(&TypeData::Adt { def_id, args })
     }
 
     fn enum_ty_no_alloc(&self, def_id: DefId, args: Vec<TypeId>) -> Option<TypeId> {
-        self.find_type(&TypeData::App { def_id, args })
+        self.find_type(&TypeData::Adt { def_id, args })
     }
 
     fn tuple_ty_no_alloc(&self, elems: Vec<TypeId>) -> Option<TypeId> {
@@ -2044,14 +2016,14 @@ impl TypeContext {
     pub fn type_constructor_depth(&self, ty: TypeId) -> usize {
         match self.get(ty) {
             TypeData::GenericParam { .. } | TypeData::InferVar { .. } => 0,
-            TypeData::App { args, .. } => {
+            TypeData::Adt { args, .. } => {
                 1 + args
                     .iter()
                     .map(|a| self.type_constructor_depth(*a))
                     .max()
                     .unwrap_or(0)
             }
-            TypeData::Struct { .. } | TypeData::Enum { .. } => 1,
+            TypeData::Adt { .. } => 1,
             TypeData::Tuple { elems }
             | TypeData::Coproduct {
                 alternatives: elems,
@@ -2101,11 +2073,11 @@ impl TypeContext {
     }
 
     pub fn is_struct(&self, ty: TypeId) -> bool {
-        matches!(self.get(ty), TypeData::Struct { .. })
+        matches!(self.get(ty), TypeData::Adt { .. })
     }
 
     pub fn is_enum(&self, ty: TypeId) -> bool {
-        matches!(self.get(ty), TypeData::Enum { .. })
+        matches!(self.get(ty), TypeData::Adt { .. })
     }
 
     pub fn is_tuple(&self, ty: TypeId) -> bool {
@@ -2640,9 +2612,7 @@ impl TypeContext {
                 //  classified during Phase 2.)
                 Characteristic::FiniteExhaustible(usize::MAX)
             }
-            TypeData::Struct { .. } | TypeData::Enum { .. } => {
-                Characteristic::FiniteExhaustible(usize::MAX)
-            }
+            TypeData::Adt { .. } => Characteristic::FiniteExhaustible(usize::MAX),
             TypeData::InferVar { .. } => Characteristic::FiniteExhaustible(usize::MAX),
             TypeData::DynTrait { .. } => Characteristic::InfiniteEnumerable,
 
@@ -2690,7 +2660,7 @@ impl TypeContext {
                     Characteristic::FiniteExhaustible(total)
                 }
             }
-            TypeData::App { args, .. } => {
+            TypeData::Adt { args, .. } => {
                 let mut has_infinite = false;
                 for &a in args {
                     match ck(self, a, kappa_map) {
@@ -3108,7 +3078,7 @@ mod tests {
         ctx.begin_transaction();
         ctx.set_binding(a, int64);
         assert_eq!(ctx.resolve_binding(a), int64);
-        ctx.commit_transaction();  // L3 log merged into L2
+        ctx.commit_transaction(); // L3 log merged into L2
 
         // L2 commit → merged log (L3+L2) merged into L1
         assert_eq!(ctx.resolve_binding(a), int64);
