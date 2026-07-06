@@ -298,10 +298,13 @@ pub struct TypeContext {
     /// Pre-computed variance-annotated outgoing edges for each TypeId.
     /// Built lazily on first variance check, then reused.
     variance_edges: RefCell<HashMap<TypeId, Vec<VarianceEdge>>>,
-    /// Transaction stack for atomic unification (OmniML-style rollback).
-    /// Each entry captures bindings before an operation.
-    /// On rollback, bindings are restored; on commit, snapshot is discarded.
-    transaction_stack: RefCell<Vec<HashMap<TypeId, TypeId>>>,
+    /// Transaction stack for atomic unification (OmniML-style rollback via undo log).
+    /// Each entry is a list of (key, old_value) pairs recording every binding
+    /// change made during that transaction.  On rollback the changes are undone
+    /// in reverse order; on commit the log is discarded.
+    /// This is O(changes) instead of O(total_bindings) — a significant saving
+    /// when the binding table is large and transactions are frequent.
+    transaction_stack: RefCell<Vec<Vec<(TypeId, Option<TypeId>)>>>,
     /// Cache for unification with variance: prevents infinite recursion on
     /// self-referential types.  Keyed by (a, b, variance_tag) where
     /// variance_tag = 0 for Invariant, 1 for Covariant, 2 for Contravariant.
@@ -370,12 +373,23 @@ impl TypeContext {
         &self.types[resolved.index()]
     }
 
+    /// Returns an `Arc<TypeData>` instead of a borrow, enabling cheap clone via
+    /// `Arc::clone` (reference-count bump only).  Use this instead of
+    /// `self.get(ty).clone()` on hot paths (substitution, Yoneda reduction,
+    /// unification) to avoid deep-copying `Vec<TypeId>` and `String` fields.
+    pub fn get_arc(&self, id: TypeId) -> Arc<TypeData> {
+        let resolved = self.resolve_binding(id);
+        Arc::clone(&self.types[resolved.index()])
+    }
+
     pub fn is_infer_var(&self, id: TypeId) -> bool {
         matches!(self.get(id), TypeData::InferVar { .. })
     }
 
     pub(crate) fn resolve_binding(&self, id: TypeId) -> TypeId {
         // Safety: guard against infinite loops from circular bindings.
+        // 10 000 is generous enough for any real program while preventing
+        // a maliciously constructed chain from DoS-ing the compiler.
         const MAX_CHAIN_DEPTH: usize = 10_000;
 
         // First pass: follow the binding chain to the root with a single
@@ -569,6 +583,10 @@ impl TypeContext {
     /// same convergence principle as Yen's KSP algorithm:
     /// "keep iterating until no more candidates can be generated".
     pub fn try_yoneda_reduce(&mut self, ty: TypeId) -> TypeId {
+        // Limit iterations to prevent DoS from maliciously constructed types.
+        // In practice, Yoneda/co-Yoneda reduction converges in ≤3 iterations
+        // because each pass either eliminates a Forall node or reaches a
+        // fixed point.  10 is a generous safety ceiling.
         const MAX_ITERATIONS: usize = 10;
         let mut result = ty;
         for _iteration in 0..MAX_ITERATIONS {
@@ -604,40 +622,45 @@ impl TypeContext {
     /// μX/νX fixpoints are elided when X does not appear in B⟨X⟩ (common case).
     fn yoneda_reduce_once(&mut self, ty: TypeId) -> TypeId {
         // ── Case A: explicit Forall node ──────────────────────────────
+        let ty_data = self.get_arc(ty);
         if let TypeData::Forall {
             param_index,
             param_name: _,
             body,
-        } = self.get(ty).clone()
+        } = &*ty_data
         {
-            if let TypeData::Fn { params, ret } = self.get(body).clone() {
-                let pi = param_index;
+            let body_data = self.get_arc(*body);
+            if let TypeData::Fn { params, ret } = &*body_data {
+                let pi = *param_index;
+                let ret = *ret;
                 let mut branch_replacements: Vec<TypeId> = Vec::new();
                 let mut is_coyoneda = false;
-                for branch in params {
+                for &branch in params {
                     // Peel outer Forall layers (∀Z⃗ₖ).
                     let mut inner_quantifiers: Vec<(usize, String)> = Vec::new();
                     let mut inner = branch;
                     loop {
-                        match self.get(inner).clone() {
+                        let inner_data = self.get_arc(inner);
+                        match &*inner_data {
                             TypeData::Forall {
                                 param_index: fi,
                                 param_name: fn_,
                                 body: b,
                             } => {
-                                inner_quantifiers.push((fi, fn_));
-                                inner = b;
+                                inner_quantifiers.push((*fi, fn_.clone()));
+                                inner = *b;
                             }
                             _ => break,
                         }
                     }
+                    let inner_data = self.get_arc(inner);
                     if let TypeData::Fn {
                         params: ips,
                         ret: ir,
-                    } = self.get(inner).clone()
+                    } = &*inner_data
                     {
                         // Check ≡_X (Yoneda): ir = GenericParam(pi)
-                        let yoneda_match = match self.get(ir) {
+                        let yoneda_match = match self.get(*ir) {
                             TypeData::GenericParam { index, .. } if *index == pi => true,
                             _ => false,
                         };
@@ -683,9 +706,9 @@ impl TypeContext {
                             // When ips.len() > 1, the branch is X ⇒ A₁ ⇒ ... ⇒ Aⱼ ⇒ ir,
                             // and the replacement is A₁ ⇒ (A₂ ⇒ ... ⇒ (Aⱼ ⇒ ir)).
                             let replacement = if ips.len() <= 1 {
-                                ir
+                                *ir
                             } else {
-                                self.function(ips[1..].to_vec(), ir)
+                                self.function(ips[1..].to_vec(), *ir)
                             };
                             let repl = if inner_quantifiers.is_empty() {
                                 replacement
@@ -739,13 +762,14 @@ impl TypeContext {
             TypeData::Fn { params, ret } if params.len() == 1 => (params[0], *ret),
             _ => return ty,
         };
+        let inner_data = self.get_arc(inner);
         if let TypeData::Fn {
             params: inner_params,
             ret: inner_ret,
-        } = self.get(inner).clone()
+        } = &*inner_data
         {
             // ≡_X (Yoneda): inner_ret is GenericParam X
-            let yoneda_idx = match self.get(inner_ret) {
+            let yoneda_idx = match self.get(*inner_ret) {
                 TypeData::GenericParam { index, .. } => Some(*index),
                 _ => None,
             };
@@ -764,7 +788,7 @@ impl TypeContext {
                     _ => None,
                 };
                 if let Some(idx) = coyoneda_idx {
-                    return self.replace_generic(ret, idx, inner_ret);
+                    return self.replace_generic(ret, idx, *inner_ret);
                 }
             }
         }
@@ -1015,15 +1039,15 @@ impl TypeContext {
         if !self.type_contains_param(param_index, ty) {
             return ty;
         }
-        let data = self.get(ty).clone();
-        match data {
-            TypeData::GenericParam { index, .. } if index == param_index => replacement,
+        let data = self.get_arc(ty);
+        match &*data {
+            TypeData::GenericParam { index, .. } if *index == param_index => replacement,
             TypeData::Fn { params, ret } => {
                 let new_params: Vec<TypeId> = params
                     .iter()
                     .map(|&p| self.replace_generic(p, param_index, replacement))
                     .collect();
-                let new_ret = self.replace_generic(ret, param_index, replacement);
+                let new_ret = self.replace_generic(*ret, param_index, replacement);
                 self.function(new_params, new_ret)
             }
             TypeData::Forall {
@@ -1031,18 +1055,18 @@ impl TypeContext {
                 param_name,
                 body,
             } => {
-                let new_body = self.replace_generic(body, param_index, replacement);
-                self.forall(pi, param_name, new_body)
+                let new_body = self.replace_generic(*body, param_index, replacement);
+                self.forall(*pi, param_name.clone(), new_body)
             }
             TypeData::Mu {
                 param_index: pi,
                 param_name,
                 body,
             } => {
-                let new_body = self.replace_generic(body, param_index, replacement);
+                let new_body = self.replace_generic(*body, param_index, replacement);
                 self.alloc(TypeData::Mu {
-                    param_index: pi,
-                    param_name,
+                    param_index: *pi,
+                    param_name: param_name.clone(),
                     body: new_body,
                 })
             }
@@ -1051,10 +1075,10 @@ impl TypeContext {
                 param_name,
                 body,
             } => {
-                let new_body = self.replace_generic(body, param_index, replacement);
+                let new_body = self.replace_generic(*body, param_index, replacement);
                 self.alloc(TypeData::Nu {
-                    param_index: pi,
-                    param_name,
+                    param_index: *pi,
+                    param_name: param_name.clone(),
                     body: new_body,
                 })
             }
@@ -1071,7 +1095,7 @@ impl TypeContext {
                     .map(|&a| self.replace_generic(a, param_index, replacement))
                     .collect();
                 self.alloc(TypeData::App {
-                    def_id,
+                    def_id: *def_id,
                     args: new_args,
                 })
             }
@@ -1089,8 +1113,8 @@ impl TypeContext {
                 }
             }
             TypeData::Poly { quantifiers, body } => {
-                let new_body = self.replace_generic(body, param_index, replacement);
-                self.poly(quantifiers, new_body)
+                let new_body = self.replace_generic(*body, param_index, replacement);
+                self.poly(quantifiers.clone(), new_body)
             }
             _ => ty,
         }
@@ -1108,6 +1132,21 @@ impl TypeContext {
         })
     }
 
+    /// Check whether `param` occurs inside `ty` (the "occurs check").
+    ///
+    /// # Why no `visited` set is needed
+    ///
+    /// The `types` arena (`Vec<Arc<TypeData>>`) is physically a DAG — every
+    /// `TypeData` is allocated before any cycles could exist, and the only
+    /// way to form a cycle is through the `bindings` table.  Since this
+    /// function calls `self.resolve_binding(ty)` first, the incoming `ty`
+    /// is already dereferenced past any binding chain, making the recursive
+    /// walk of the type structure **acyclic by construction**.
+    ///
+    /// A naive reader might be tempted to add a `visited: HashSet<TypeId>`
+    /// to guard against infinite recursion.  **Do not.**  It would add O(n)
+    /// memory overhead and mask the fact that the real cycle-safety proof
+    /// lives upstream, in the binding layer.
     fn occurs_check(&self, param: TypeId, ty: TypeId) -> bool {
         if param == ty {
             return true;
@@ -1224,14 +1263,14 @@ impl TypeContext {
         b: TypeId,
         variance: Variance,
     ) -> Result<TypeId, TypeError> {
-        let data_a = self.get(a).clone();
-        let data_b = self.get(b).clone();
+        let data_a = self.get_arc(a);
+        let data_b = self.get_arc(b);
 
-        if data_a == data_b {
+        if *data_a == *data_b {
             return Ok(a);
         }
 
-        match (&data_a, &data_b) {
+        match (&*data_a, &*data_b) {
             (TypeData::Error, _) => Ok(b),
             (_, TypeData::Error) => Ok(a),
             (
@@ -1245,7 +1284,7 @@ impl TypeContext {
                         span: crate::ast::Span::new(0, 0),
                     });
                 }
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
             (_, TypeData::GenericParam { .. }) => {
@@ -1255,7 +1294,7 @@ impl TypeContext {
                         span: crate::ast::Span::new(0, 0),
                     });
                 }
-                self.bindings.borrow_mut().insert(b, a);
+                self.set_binding(b, a);
                 Ok(a)
             }
             (TypeData::InferVar { .. }, _) => {
@@ -1265,7 +1304,7 @@ impl TypeContext {
                         span: crate::ast::Span::new(0, 0),
                     });
                 }
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
             (_, TypeData::InferVar { .. }) => {
@@ -1275,7 +1314,7 @@ impl TypeContext {
                         span: crate::ast::Span::new(0, 0),
                     });
                 }
-                self.bindings.borrow_mut().insert(b, a);
+                self.set_binding(b, a);
                 Ok(a)
             }
 
@@ -1283,13 +1322,13 @@ impl TypeContext {
 
             // Struct: same def_id (zero-arg only)
             (TypeData::Struct { def_id: d1 }, TypeData::Struct { def_id: d2 }) if d1 == d2 => {
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
             // Enum: same def_id (zero-arg only)
             (TypeData::Enum { def_id: d1 }, TypeData::Enum { def_id: d2 }) if d1 == d2 => {
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1307,7 +1346,7 @@ impl TypeContext {
                 for (t1, t2) in a1.iter().zip(a2.iter()) {
                     self.unify_internal(*t1, *t2, Variance::Invariant)?;
                 }
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1319,7 +1358,7 @@ impl TypeContext {
                 for (t1, t2) in e1.iter().zip(e2.iter()) {
                     self.unify_internal(*t1, *t2, elem_variance)?;
                 }
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1340,7 +1379,7 @@ impl TypeContext {
                 }
                 let ret_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*r1, *r2, ret_variance)?;
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1350,7 +1389,7 @@ impl TypeContext {
             {
                 let elem_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*e1, *e2, elem_variance)?;
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1358,7 +1397,7 @@ impl TypeContext {
             (TypeData::Slice { elem: e1 }, TypeData::Slice { elem: e2 }) => {
                 let elem_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*e1, *e2, elem_variance)?;
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1395,7 +1434,7 @@ impl TypeContext {
                 }
                 let ty_variance = variance.xform(Variance::Invariant);
                 self.unify_internal(*t1, *t2, ty_variance)?;
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1405,7 +1444,7 @@ impl TypeContext {
             (TypeData::Pointer { ty: t1 }, TypeData::Pointer { ty: t2 }) => {
                 let ty_variance = variance.xform(Variance::Invariant);
                 self.unify_internal(*t1, *t2, ty_variance)?;
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1422,7 +1461,7 @@ impl TypeContext {
             ) => {
                 self.unify_internal(*s1, *s2, Variance::Invariant)?;
                 self.unify_internal(*p1, *p2, Variance::Invariant)?;
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1435,7 +1474,7 @@ impl TypeContext {
                 for (t1, t2) in a1.iter().zip(a2.iter()) {
                     self.unify_internal(*t1, *t2, alt_variance)?;
                 }
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1454,7 +1493,7 @@ impl TypeContext {
             ) if pi1 == pi2 && pn1 == pn2 => {
                 let body_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*b1, *b2, body_variance)?;
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1464,7 +1503,7 @@ impl TypeContext {
             {
                 let base_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*b1, *b2, base_variance)?;
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1481,7 +1520,7 @@ impl TypeContext {
             ) if q1.len() == q2.len() && q1.iter().zip(q2.iter()).all(|(a, b)| a == b) => {
                 let body_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*b1, *b2, body_variance)?;
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1500,7 +1539,7 @@ impl TypeContext {
             ) if pi1 == pi2 && pn1 == pn2 => {
                 let body_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*b1, *b2, body_variance)?;
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1519,7 +1558,7 @@ impl TypeContext {
             ) if pi1 == pi2 && pn1 == pn2 => {
                 let body_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*b1, *b2, body_variance)?;
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1534,13 +1573,13 @@ impl TypeContext {
                     frac_bits: f2,
                 },
             ) if i1 == i2 && f1 == f2 => {
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
             // DynTrait: same trait list (invariant)
             (TypeData::DynTrait { traits: t1 }, TypeData::DynTrait { traits: t2 }) if t1 == t2 => {
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1559,7 +1598,7 @@ impl TypeContext {
             ) if ti1 == ti2 && n1 == n2 => {
                 let self_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*s1, *s2, self_variance)?;
-                self.bindings.borrow_mut().insert(a, b);
+                self.set_binding(a, b);
                 Ok(b)
             }
 
@@ -1571,7 +1610,7 @@ impl TypeContext {
                     _ => unreachable!(),
                 };
                 if self.subtype(sub, sup) {
-                    self.bindings.borrow_mut().insert(a, b);
+                    self.set_binding(a, b);
                     Ok(b)
                 } else {
                     Err(TypeError::Mismatch {
@@ -1590,29 +1629,64 @@ impl TypeContext {
         }
     }
 
-    // ── Transaction support for atomic unification ────────────────
+    // ── Transaction support for atomic unification (Undo Log) ─────
 
-    /// Begin a new transaction: save current bindings snapshot.
+    /// Begin a new transaction: push an empty undo log onto the stack.
+    /// All subsequent binding changes (via `set_binding`) will be recorded
+    /// for potential rollback, without cloning the entire binding table.
     pub fn begin_transaction(&self) {
-        let snapshot = self.bindings.borrow().clone();
-        self.transaction_stack.borrow_mut().push(snapshot);
+        self.transaction_stack.borrow_mut().push(Vec::new());
     }
 
-    /// Commit the current transaction: discard the snapshot.
+    /// Commit the current transaction: discard the undo log.
     pub fn commit_transaction(&self) {
-        self.transaction_stack.borrow_mut().pop();
+        // Pop the current (innermost) transaction's undo log.
+        let committed = self.transaction_stack.borrow_mut().pop();
+        // Merge its entries into the parent transaction's log so that if
+        // the parent later rolls back, it also undoes changes that were
+        // committed by the inner transaction.
+        //
+        // Without this merge, the inner transaction's log is discarded on
+        // commit, leaving the parent unaware of those changes.  A subsequent
+        // parent rollback would then only undo the parent's own direct
+        // changes, leaving the inner transaction's modifications in place
+        // — a semantic mismatch with the original full-snapshot behaviour.
+        if let Some(committed_log) = committed {
+            if let Some(parent_log) = self.transaction_stack.borrow_mut().last_mut() {
+                parent_log.extend(committed_log);
+            }
+        }
         // κ cache may be invalidated by binding changes across transaction boundaries.
         self.kappa_cache.borrow_mut().clear();
     }
 
-    /// Rollback the current transaction: restore bindings from snapshot.
+    /// Rollback the current transaction: reverse-apply every binding change
+    /// recorded in this transaction's undo log.
     /// Also clears the unification cache so subsequent attempts re-evaluate.
     pub fn rollback_transaction(&self) {
-        if let Some(snapshot) = self.transaction_stack.borrow_mut().pop() {
-            *self.bindings.borrow_mut() = snapshot;
+        if let Some(log) = self.transaction_stack.borrow_mut().pop() {
+            let mut bindings = self.bindings.borrow_mut();
+            for (key, old) in log.into_iter().rev() {
+                match old {
+                    Some(v) => bindings.insert(key, v),
+                    None => bindings.remove(&key),
+                };
+            }
         }
         self.unify_seen.borrow_mut().clear();
         self.kappa_cache.borrow_mut().clear();
+    }
+
+    /// Insert a binding, recording the old value in the current transaction's
+    /// undo log if one is active.  Always use this instead of
+    /// `self.bindings.borrow_mut().insert(...)` so that transactions can
+    /// correctly roll back.
+    pub(crate) fn set_binding(&self, key: TypeId, value: TypeId) {
+        if let Some(log) = self.transaction_stack.borrow_mut().last_mut() {
+            let old = self.bindings.borrow().get(&key).copied();
+            log.push((key, old));
+        }
+        self.bindings.borrow_mut().insert(key, value);
     }
 
     pub fn subtype(&self, sub: TypeId, sup: TypeId) -> bool {
@@ -2544,7 +2618,11 @@ impl TypeContext {
                 ..
             } => {
                 let total_bits = *int_bits as u32 + *frac_bits as u32;
-                if total_bits >= 16 {
+                // Use (usize::BITS - 1) so we can safely represent 1 << total_bits.
+                // The previous hard-coded threshold of 16 would misclassify even
+                // modest fixed-point types like Rational<8,8> as `usize::MAX`,
+                // degrading pattern-match exhaustiveness precision.
+                if total_bits >= (usize::BITS - 1) {
                     Characteristic::FiniteExhaustible(usize::MAX)
                 } else {
                     Characteristic::FiniteExhaustible(1usize << total_bits)
@@ -2953,7 +3031,7 @@ mod tests {
         let a = ctx.int(32, true);
         let bool_ty = ctx.bool();
         ctx.begin_transaction();
-        ctx.bindings.borrow_mut().insert(a, bool_ty);
+        ctx.set_binding(a, bool_ty);
         ctx.rollback_transaction();
         assert!(ctx.resolve_binding(a) == a);
     }
@@ -2965,12 +3043,83 @@ mod tests {
         let bool_ty = ctx.bool();
         let unit_ty = ctx.unit();
         ctx.begin_transaction();
-        ctx.bindings.borrow_mut().insert(a, bool_ty);
+        ctx.set_binding(a, bool_ty);
         ctx.begin_transaction();
-        ctx.bindings.borrow_mut().insert(a, unit_ty);
+        ctx.set_binding(a, unit_ty);
         ctx.rollback_transaction();
         assert_eq!(ctx.resolve_binding(a), bool_ty);
         ctx.commit_transaction();
+    }
+
+    #[test]
+    /// Inner commit + outer rollback: verify that the outer transaction's undo log
+    /// correctly absorbs the inner transaction's changes on commit.  Without the
+    /// log-merge in `commit_transaction`, the outer rollback would leave the inner
+    /// transaction's modifications in place, breaking the atomicity semantics.
+    fn test_transaction_nested_commit_outer_rollback() {
+        let mut ctx = TypeContext::new();
+        let a = ctx.int(32, true);
+        let bool_ty = ctx.bool();
+        let unit_ty = ctx.unit();
+
+        // Outer: set a → Bool
+        ctx.begin_transaction();
+        ctx.set_binding(a, bool_ty);
+        assert_eq!(ctx.resolve_binding(a), bool_ty);
+
+        // Inner: set a → Unit, then commit
+        ctx.begin_transaction();
+        ctx.set_binding(a, unit_ty);
+        assert_eq!(ctx.resolve_binding(a), unit_ty);
+        ctx.commit_transaction();
+
+        // After inner commit, a is still Unit
+        assert_eq!(ctx.resolve_binding(a), unit_ty);
+
+        // Outer rollback: should restore a to its state BEFORE the outer began
+        ctx.rollback_transaction();
+        assert_eq!(ctx.resolve_binding(a), a);
+    }
+
+    #[test]
+    /// Three-level nested transaction with commit/rollback at each layer.
+    /// Verifies that the undo-log merge across three levels correctly restores
+    /// the outermost state when the outermost rolls back.
+    ///
+    /// Layer-3 commit → merge into Layer-2 log.
+    /// Layer-2 commit → merge (Layer-3 ∪ Layer-2) into Layer-1 log.
+    /// Layer-1 rollback → reverse-apply the combined log → initial state.
+    fn test_transaction_nested_three_level() {
+        let mut ctx = TypeContext::new();
+        let a = ctx.int(32, true);
+        let bool_ty = ctx.bool();
+        let unit_ty = ctx.unit();
+        let int64 = ctx.int(64, true);
+
+        // L1: a → Bool
+        ctx.begin_transaction();
+        ctx.set_binding(a, bool_ty);
+
+        // L2: a → Unit
+        ctx.begin_transaction();
+        ctx.set_binding(a, unit_ty);
+
+        // L3: a → Int64, then commit L3
+        ctx.begin_transaction();
+        ctx.set_binding(a, int64);
+        assert_eq!(ctx.resolve_binding(a), int64);
+        ctx.commit_transaction();  // L3 log merged into L2
+
+        // L2 commit → merged log (L3+L2) merged into L1
+        assert_eq!(ctx.resolve_binding(a), int64);
+        ctx.commit_transaction();
+
+        // After L2 commit, a is still Int64
+        assert_eq!(ctx.resolve_binding(a), int64);
+
+        // L1 rollback → should undo everything
+        ctx.rollback_transaction();
+        assert_eq!(ctx.resolve_binding(a), a);
     }
 
     // -- replace_generic --

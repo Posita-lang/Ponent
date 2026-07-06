@@ -1821,7 +1821,7 @@ impl InferenceContext {
                     TypeVariableKind::Unconstrained => ctx.error(),
                     TypeVariableKind::Any => ctx.error(),
                 };
-                ctx.bindings.borrow_mut().insert(ty_id, default_ty);
+                ctx.set_binding(ty_id, default_ty);
             }
         }
 
