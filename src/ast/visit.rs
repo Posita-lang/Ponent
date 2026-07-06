@@ -63,9 +63,9 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
             visitor.visit_expr(base);
             visitor.visit_expr(index)
         }
-        Expr::FieldAccess { base, .. } | Expr::AttrAccess { base, .. } | Expr::Cast { expr: base, .. } => {
-            visitor.visit_expr(base)
-        }
+        Expr::FieldAccess { base, .. }
+        | Expr::AttrAccess { base, .. }
+        | Expr::Cast { expr: base, .. } => visitor.visit_expr(base),
         Expr::Range { start, end, .. } => {
             if let Some(e) = start {
                 visitor.visit_expr(e);
@@ -88,9 +88,13 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
                 V::Result::output()
             }
         }
-        Expr::Move(e, _) | Expr::Await { expr: e, .. } | Expr::Try { expr: e, .. }
-        | Expr::LeaveWith { expr: e, .. } | Expr::PolyBox { expr: e, .. }
-        | Expr::PolyUnbox { expr: e, .. } | Expr::Old(e, _) => visitor.visit_expr(e),
+        Expr::Move(e, _)
+        | Expr::Await { expr: e, .. }
+        | Expr::Try { expr: e, .. }
+        | Expr::LeaveWith { expr: e, .. }
+        | Expr::PolyBox { expr: e, .. }
+        | Expr::PolyUnbox { expr: e, .. }
+        | Expr::Old(e, _) => visitor.visit_expr(e),
         Expr::Path(_, _) => V::Result::output(),
         Expr::Tuple(exprs, _) | Expr::Array(exprs, _) => {
             for e in exprs {
@@ -108,7 +112,10 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
             V::Result::output()
         }
         Expr::If {
-            cond, then_branch, else_branch, ..
+            cond,
+            then_branch,
+            else_branch,
+            ..
         } => {
             visitor.visit_expr(cond);
             for s in then_branch {
@@ -122,7 +129,11 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
             V::Result::output()
         }
         Expr::IfLet {
-            pattern, scrutinee, then_branch, else_branch, ..
+            pattern,
+            scrutinee,
+            then_branch,
+            else_branch,
+            ..
         } => {
             visitor.visit_expr(scrutinee);
             visitor.visit_pattern(pattern);
@@ -136,7 +147,9 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
             }
             V::Result::output()
         }
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             visitor.visit_expr(scrutinee);
             for arm in arms {
                 visitor.visit_pattern(&arm.pattern);
@@ -153,7 +166,9 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
             }
             V::Result::output()
         }
-        Expr::Catch { expr: e, branches, .. } => {
+        Expr::Catch {
+            expr: e, branches, ..
+        } => {
             visitor.visit_expr(e);
             for b in branches {
                 for s in &b.body {
@@ -172,7 +187,12 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
 
 pub fn walk_stmt<'ast, V: Visitor<'ast>>(visitor: &mut V, stmt: &'ast Stmt) -> V::Result {
     match stmt {
-        Stmt::VariableDef { value, pattern, else_branch, .. } => {
+        Stmt::VariableDef {
+            value,
+            pattern,
+            else_branch,
+            ..
+        } => {
             if let Some(e) = value {
                 visitor.visit_expr(e);
             }
@@ -186,7 +206,12 @@ pub fn walk_stmt<'ast, V: Visitor<'ast>>(visitor: &mut V, stmt: &'ast Stmt) -> V
             }
             V::Result::output()
         }
-        Stmt::FunctionDef { params, body, finally, .. } => {
+        Stmt::FunctionDef {
+            params,
+            body,
+            finally,
+            ..
+        } => {
             for p in params {
                 visitor.visit_param(p);
             }
@@ -203,7 +228,12 @@ pub fn walk_stmt<'ast, V: Visitor<'ast>>(visitor: &mut V, stmt: &'ast Stmt) -> V
             V::Result::output()
         }
         Stmt::Expression(expr) => visitor.visit_expr(expr),
-        Stmt::If { cond, then_branch, else_branch, .. } => {
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             visitor.visit_expr(cond);
             for s in then_branch {
                 visitor.visit_stmt(s);
@@ -215,7 +245,13 @@ pub fn walk_stmt<'ast, V: Visitor<'ast>>(visitor: &mut V, stmt: &'ast Stmt) -> V
             }
             V::Result::output()
         }
-        Stmt::IfLet { pattern, scrutinee, then_branch, else_branch, .. } => {
+        Stmt::IfLet {
+            pattern,
+            scrutinee,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             visitor.visit_expr(scrutinee);
             visitor.visit_pattern(pattern);
             for s in then_branch {
@@ -230,19 +266,32 @@ pub fn walk_stmt<'ast, V: Visitor<'ast>>(visitor: &mut V, stmt: &'ast Stmt) -> V
         }
         Stmt::While { cond, body, .. } => {
             visitor.visit_expr(cond);
-            for s in body { visitor.visit_stmt(s); }
+            for s in body {
+                visitor.visit_stmt(s);
+            }
             V::Result::output()
         }
-        Stmt::WhileLet { scrutinee, body, .. } => {
+        Stmt::WhileLet {
+            scrutinee, body, ..
+        } => {
             visitor.visit_expr(scrutinee);
-            for s in body { visitor.visit_stmt(s); }
+            for s in body {
+                visitor.visit_stmt(s);
+            }
             V::Result::output()
         }
         Stmt::Loop { body, .. } => {
-            for s in body { visitor.visit_stmt(s); }
+            for s in body {
+                visitor.visit_stmt(s);
+            }
             V::Result::output()
         }
-        Stmt::For { pattern, iterable, body, .. } => {
+        Stmt::For {
+            pattern,
+            iterable,
+            body,
+            ..
+        } => {
             visitor.visit_expr(iterable);
             visitor.visit_pattern(pattern);
             for s in body {
@@ -261,20 +310,27 @@ pub fn walk_stmt<'ast, V: Visitor<'ast>>(visitor: &mut V, stmt: &'ast Stmt) -> V
             visitor.visit_expr(target);
             visitor.visit_expr(value)
         }
-        Stmt::ComptimeBlock { body, .. } | Stmt::ScopeCleanup { body, .. }
-        | Stmt::Unsafe { body, .. } | Stmt::Isolate { body, .. } => {
+        Stmt::ComptimeBlock { body, .. }
+        | Stmt::ScopeCleanup { body, .. }
+        | Stmt::Unsafe { body, .. }
+        | Stmt::Isolate { body, .. } => {
             for s in body {
                 visitor.visit_stmt(s);
             }
             V::Result::output()
         }
         Stmt::GhostVariableDef { inner, .. } => visitor.visit_stmt(inner),
-        Stmt::Leave { .. } | Stmt::Continue { .. } | Stmt::Trigger { .. }
-        | Stmt::Edition(..) | Stmt::Error(_) => V::Result::output(),
-        Stmt::TypeDef { .. } | Stmt::TraitDef { .. } | Stmt::ImplBlock { .. }
-        | Stmt::Import { .. } | Stmt::ExternFunction { .. } | Stmt::Constraint { .. } => {
-            V::Result::output()
-        }
+        Stmt::Leave { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Trigger { .. }
+        | Stmt::Edition(..)
+        | Stmt::Error(_) => V::Result::output(),
+        Stmt::TypeDef { .. }
+        | Stmt::TraitDef { .. }
+        | Stmt::ImplBlock { .. }
+        | Stmt::Import { .. }
+        | Stmt::ExternFunction { .. }
+        | Stmt::Constraint { .. } => V::Result::output(),
     }
 }
 
@@ -323,7 +379,10 @@ pub fn walk_param<'ast, V: Visitor<'ast>>(visitor: &mut V, param: &'ast Param) -
     }
 }
 
-pub fn walk_contract<'ast, V: Visitor<'ast>>(visitor: &mut V, contract: &'ast Contract) -> V::Result {
+pub fn walk_contract<'ast, V: Visitor<'ast>>(
+    visitor: &mut V,
+    contract: &'ast Contract,
+) -> V::Result {
     match contract {
         Contract::Requires(expr, _)
         | Contract::Invariant(expr, _)
@@ -363,7 +422,9 @@ pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
         Expr::UnaryOp { expr: e, .. } => visitor.visit_expr_mut(e),
         Expr::Call { callee, args, .. } => {
             visitor.visit_expr_mut(callee);
-            for a in args { visitor.visit_expr_mut(a); }
+            for a in args {
+                visitor.visit_expr_mut(a);
+            }
         }
         Expr::Index { base, index, .. } => {
             visitor.visit_expr_mut(base);
@@ -373,14 +434,22 @@ pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
         | Expr::AttrAccess { base, .. }
         | Expr::Cast { expr: base, .. } => visitor.visit_expr_mut(base),
         Expr::Range { start, end, .. } => {
-            if let Some(s) = start { visitor.visit_expr_mut(s); }
-            if let Some(e) = end { visitor.visit_expr_mut(e); }
+            if let Some(s) = start {
+                visitor.visit_expr_mut(s);
+            }
+            if let Some(e) = end {
+                visitor.visit_expr_mut(e);
+            }
         }
         Expr::StructLit { fields, .. } => {
-            for (_, e) in fields { visitor.visit_expr_mut(e); }
+            for (_, e) in fields {
+                visitor.visit_expr_mut(e);
+            }
         }
         Expr::EnumLit { payload, .. } => {
-            if let Some(e) = payload { visitor.visit_expr_mut(e); }
+            if let Some(e) = payload {
+                visitor.visit_expr_mut(e);
+            }
         }
         Expr::Move(e, _)
         | Expr::Await { expr: e, .. }
@@ -390,39 +459,74 @@ pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
         | Expr::PolyUnbox { expr: e, .. }
         | Expr::Old(e, _) => visitor.visit_expr_mut(e),
         Expr::Tuple(exprs, _) | Expr::Array(exprs, _) => {
-            for e in exprs { visitor.visit_expr_mut(e); }
+            for e in exprs {
+                visitor.visit_expr_mut(e);
+            }
         }
-        Expr::Closure { params: _, body, .. } => {
-            for s in body { visitor.visit_stmt_mut(s); }
+        Expr::Closure {
+            params: _, body, ..
+        } => {
+            for s in body {
+                visitor.visit_stmt_mut(s);
+            }
         }
         Expr::If {
-            cond, then_branch, else_branch, ..
+            cond,
+            then_branch,
+            else_branch,
+            ..
         } => {
             visitor.visit_expr_mut(cond);
-            for s in then_branch { visitor.visit_stmt_mut(s); }
-            if let Some(eb) = else_branch { for s in eb { visitor.visit_stmt_mut(s); } }
+            for s in then_branch {
+                visitor.visit_stmt_mut(s);
+            }
+            if let Some(eb) = else_branch {
+                for s in eb {
+                    visitor.visit_stmt_mut(s);
+                }
+            }
         }
         Expr::IfLet {
-            scrutinee, then_branch, else_branch, ..
+            scrutinee,
+            then_branch,
+            else_branch,
+            ..
         } => {
             visitor.visit_expr_mut(scrutinee);
-            for s in then_branch { visitor.visit_stmt_mut(s); }
-            if let Some(eb) = else_branch { for s in eb { visitor.visit_stmt_mut(s); } }
+            for s in then_branch {
+                visitor.visit_stmt_mut(s);
+            }
+            if let Some(eb) = else_branch {
+                for s in eb {
+                    visitor.visit_stmt_mut(s);
+                }
+            }
         }
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             visitor.visit_expr_mut(scrutinee);
             for arm in arms {
-                if let Some(g) = &mut arm.guard { visitor.visit_expr_mut(g); }
+                if let Some(g) = &mut arm.guard {
+                    visitor.visit_expr_mut(g);
+                }
                 visitor.visit_expr_mut(&mut arm.body);
             }
         }
-        Expr::Block(stmts, _)
-        | Expr::UnsafeBlock { body: stmts, .. } => {
-            for s in stmts { visitor.visit_stmt_mut(s); }
+        Expr::Block(stmts, _) | Expr::UnsafeBlock { body: stmts, .. } => {
+            for s in stmts {
+                visitor.visit_stmt_mut(s);
+            }
         }
-        Expr::Catch { expr: e, branches, .. } => {
+        Expr::Catch {
+            expr: e, branches, ..
+        } => {
             visitor.visit_expr_mut(e);
-            for b in branches { for s in &mut b.body { visitor.visit_stmt_mut(s); } }
+            for b in branches {
+                for s in &mut b.body {
+                    visitor.visit_stmt_mut(s);
+                }
+            }
         }
         Expr::Quantified { range, body, .. } => {
             visitor.visit_expr_mut(range);
@@ -433,55 +537,124 @@ pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
 
 pub fn walk_stmt_mut<V: MutVisitor>(visitor: &mut V, stmt: &mut Stmt) {
     match stmt {
-        Stmt::VariableDef { value, pattern, else_branch, .. } => {
-            if let Some(e) = value { visitor.visit_expr_mut(e); }
-            if let Some(p) = pattern { visitor.visit_pattern_mut(p); }
-            if let Some(eb) = else_branch { for s in eb { visitor.visit_stmt_mut(s); } }
+        Stmt::VariableDef {
+            value,
+            pattern,
+            else_branch,
+            ..
+        } => {
+            if let Some(e) = value {
+                visitor.visit_expr_mut(e);
+            }
+            if let Some(p) = pattern {
+                visitor.visit_pattern_mut(p);
+            }
+            if let Some(eb) = else_branch {
+                for s in eb {
+                    visitor.visit_stmt_mut(s);
+                }
+            }
         }
-        Stmt::FunctionDef { params: _, body, finally, .. } => {
-            if let Some(b) = body { for s in b { visitor.visit_stmt_mut(s); } }
-            if let Some(f) = finally { for s in f { visitor.visit_stmt_mut(s); } }
+        Stmt::FunctionDef {
+            params: _,
+            body,
+            finally,
+            ..
+        } => {
+            if let Some(b) = body {
+                for s in b {
+                    visitor.visit_stmt_mut(s);
+                }
+            }
+            if let Some(f) = finally {
+                for s in f {
+                    visitor.visit_stmt_mut(s);
+                }
+            }
         }
         Stmt::Expression(expr) => visitor.visit_expr_mut(expr),
-        Stmt::If { cond, then_branch, else_branch, .. } => {
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             visitor.visit_expr_mut(cond);
-            for s in then_branch { visitor.visit_stmt_mut(s); }
-            if let Some(eb) = else_branch { for s in eb { visitor.visit_stmt_mut(s); } }
+            for s in then_branch {
+                visitor.visit_stmt_mut(s);
+            }
+            if let Some(eb) = else_branch {
+                for s in eb {
+                    visitor.visit_stmt_mut(s);
+                }
+            }
         }
-        Stmt::IfLet { scrutinee, then_branch, else_branch, .. } => {
+        Stmt::IfLet {
+            scrutinee,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             visitor.visit_expr_mut(scrutinee);
-            for s in then_branch { visitor.visit_stmt_mut(s); }
-            if let Some(eb) = else_branch { for s in eb { visitor.visit_stmt_mut(s); } }
+            for s in then_branch {
+                visitor.visit_stmt_mut(s);
+            }
+            if let Some(eb) = else_branch {
+                for s in eb {
+                    visitor.visit_stmt_mut(s);
+                }
+            }
         }
         Stmt::While { cond, body, .. } => {
             visitor.visit_expr_mut(cond);
-            for s in body { visitor.visit_stmt_mut(s); }
+            for s in body {
+                visitor.visit_stmt_mut(s);
+            }
         }
-        Stmt::WhileLet { scrutinee, body, .. } => {
+        Stmt::WhileLet {
+            scrutinee, body, ..
+        } => {
             visitor.visit_expr_mut(scrutinee);
-            for s in body { visitor.visit_stmt_mut(s); }
+            for s in body {
+                visitor.visit_stmt_mut(s);
+            }
         }
         Stmt::For { iterable, body, .. } => {
             visitor.visit_expr_mut(iterable);
-            for s in body { visitor.visit_stmt_mut(s); }
+            for s in body {
+                visitor.visit_stmt_mut(s);
+            }
         }
-        Stmt::Loop { body, .. } | Stmt::ComptimeBlock { body, .. }
-        | Stmt::ScopeCleanup { body, .. } | Stmt::Unsafe { body, .. }
+        Stmt::Loop { body, .. }
+        | Stmt::ComptimeBlock { body, .. }
+        | Stmt::ScopeCleanup { body, .. }
+        | Stmt::Unsafe { body, .. }
         | Stmt::Isolate { body, .. } => {
-            for s in body { visitor.visit_stmt_mut(s); }
+            for s in body {
+                visitor.visit_stmt_mut(s);
+            }
         }
         Stmt::Return { value, .. } => {
-            if let Some(e) = value { visitor.visit_expr_mut(e); }
+            if let Some(e) = value {
+                visitor.visit_expr_mut(e);
+            }
         }
         Stmt::Assign { target, value, .. } => {
             visitor.visit_expr_mut(target);
             visitor.visit_expr_mut(value);
         }
         Stmt::GhostVariableDef { inner, .. } => visitor.visit_stmt_mut(inner),
-        Stmt::Leave { .. } | Stmt::Continue { .. } | Stmt::Trigger { .. }
-        | Stmt::Edition(..) | Stmt::Error(_) | Stmt::TypeDef { .. }
-        | Stmt::TraitDef { .. } | Stmt::ImplBlock { .. } | Stmt::Import { .. }
-        | Stmt::ExternFunction { .. } | Stmt::Constraint { .. } => {}
+        Stmt::Leave { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Trigger { .. }
+        | Stmt::Edition(..)
+        | Stmt::Error(_)
+        | Stmt::TypeDef { .. }
+        | Stmt::TraitDef { .. }
+        | Stmt::ImplBlock { .. }
+        | Stmt::Import { .. }
+        | Stmt::ExternFunction { .. }
+        | Stmt::Constraint { .. } => {}
     }
 }
 

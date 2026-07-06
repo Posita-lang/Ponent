@@ -99,9 +99,7 @@ impl SmtSolver {
             return Some(match ctx.get(resolved) {
                 TypeData::Fn { .. } => PrincipalShape::Arrow,
                 TypeData::Tuple { elems } => PrincipalShape::Tuple(elems.len()),
-                TypeData::App { args, .. } => {
-                    PrincipalShape::Constructor(args.len())
-                }
+                TypeData::App { args, .. } => PrincipalShape::Constructor(args.len()),
                 TypeData::Struct { .. } | TypeData::Enum { .. } => PrincipalShape::Constructor(0),
                 TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } => {
                     PrincipalShape::Poly
@@ -190,7 +188,9 @@ impl SmtSolver {
         );
         smt.push_str("(assert (forall ((tag Int) (a Type)) (and (= (shape-of (type-struct tag a)) SHAPE_CONSTRUCTOR) (= (arity-of (type-struct tag a)) 1))))\n");
         smt.push_str("(assert (forall ((a Type)) (= (shape-of (type-poly a)) SHAPE_POLY)))\n");
-        smt.push_str("(assert (forall ((p Int) (q Int)) (= (shape-of (type-rational p q)) SHAPE_SCALAR)))\n");
+        smt.push_str(
+            "(assert (forall ((p Int) (q Int)) (= (shape-of (type-rational p q)) SHAPE_SCALAR)))\n",
+        );
         smt.push_str("(assert (forall ((a Type) (m Bool)) (and (= (shape-of (type-ref a m)) SHAPE_CONSTRUCTOR) (= (arity-of (type-ref a m)) 1))))\n");
         smt.push_str("(assert (forall ((s Type) (p Type)) (and (= (shape-of (type-ptr s p)) SHAPE_CONSTRUCTOR) (= (arity-of (type-ptr s p)) 2))))\n");
         smt.push_str("(assert (forall ((a Type)) (and (= (shape-of (type-slice a)) SHAPE_CONSTRUCTOR) (= (arity-of (type-slice a)) 1))))\n");
@@ -359,18 +359,17 @@ impl SmtSolver {
                 let tag = traits.first().map(|t| t.0 as i64).unwrap_or(0);
                 format!("(type-dyn-trait {})", tag)
             }
-            TypeData::AssociatedType { self_ty, .. } => {
-                Self::type_to_smt_term(ctx, *self_ty)
-            }
+            TypeData::AssociatedType { self_ty, .. } => Self::type_to_smt_term(ctx, *self_ty),
             TypeData::Error => "type-unknown".into(),
             TypeData::GenericParam { .. } => "type-unknown".into(),
             TypeData::Float { bits } => {
-                if *bits == 32 { "type-float32".into() } else { "type-float64".into() }
+                if *bits == 32 {
+                    "type-float32".into()
+                } else {
+                    "type-float64".into()
+                }
             }
-            TypeData::Struct { .. }
-            | TypeData::Enum { .. } => {
-                "type-unknown".to_string()
-            }
+            TypeData::Struct { .. } | TypeData::Enum { .. } => "type-unknown".to_string(),
         }
     }
 }
@@ -395,10 +394,7 @@ impl SmtSolver {
         }
         // Build the SMT query with timeout and memory limit baked in.
         let mut smt_with_limits = String::new();
-        smt_with_limits.push_str(&format!(
-            "(set-option :timeout {})\n",
-            Z3_TIMEOUT_MS
-        ));
+        smt_with_limits.push_str(&format!("(set-option :timeout {})\n", Z3_TIMEOUT_MS));
         smt_with_limits.push_str(&format!(
             "(set-option :memory_max_size {})\n",
             Z3_MEMORY_LIMIT_MB

@@ -1836,5 +1836,9 @@ fn test_type_capture_auto_with_struct() {
              return 0;
          }",
     );
-    assert!(result.is_ok(), "type capture with struct: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "type capture with struct: {:?}",
+        result.err()
+    );
 }

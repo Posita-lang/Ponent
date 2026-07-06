@@ -811,8 +811,12 @@ impl Parser {
                     _ => {
                         return Err(Diagnostic::error("expected lifetime name after `'`")
                             .with_code("E004")
-                            .with_help("lifetime parameters use `'name` syntax — e.g. `<'a, 'b, T>`")
-                            .with_suggestion("add a lifetime name after `'`, e.g. `<'a>` or `<'a, T>`")
+                            .with_help(
+                                "lifetime parameters use `'name` syntax — e.g. `<'a, 'b, T>`",
+                            )
+                            .with_suggestion(
+                                "add a lifetime name after `'`, e.g. `<'a>` or `<'a, T>`",
+                            )
                             .with_span(self.span()));
                     }
                 }
@@ -3598,7 +3602,8 @@ impl Parser {
         };
         let body = if matches!(self.peek(), Ok(Token::LBrace)) {
             self.advance().ok();
-            let stmts = self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block())?;
+            let stmts =
+                self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block())?;
             self.expect(Token::RBrace)?;
             stmts
         } else {
@@ -5081,7 +5086,8 @@ mod tests {
 
     #[test]
     fn test_fn_type_two_params() {
-        let program = check_parse("def main() { set f: (Int<32>, Bool) -> Result<(), Error> = 0; }");
+        let program =
+            check_parse("def main() { set f: (Int<32>, Bool) -> Result<(), Error> = 0; }");
         assert_eq!(program.items.len(), 1);
     }
 
@@ -5125,16 +5131,13 @@ mod tests {
     #[test]
     fn test_projection_type() {
         // `<ImplType as TraitPath>::AssocType`
-        let program = check_parse(
-            "def main() { set x: <Int<32> as Add<Int<32>>>::Output = 0; }",
-        );
+        let program = check_parse("def main() { set x: <Int<32> as Add<Int<32>>>::Output = 0; }");
         assert_eq!(program.items.len(), 1);
     }
 
     #[test]
     fn test_projection_type_in_fn_param() {
-        let src =
-            "def serialize<T>(value: &T, stream: &mut S) where T: Serialize, T::Format: Display { }";
+        let src = "def serialize<T>(value: &T, stream: &mut S) where T: Serialize, T::Format: Display { }";
         let program = check_parse(src);
         assert_eq!(program.items.len(), 1);
     }
@@ -5149,9 +5152,8 @@ mod tests {
     #[test]
     fn test_projection_type_nested() {
         // Nested projection: <<A as Trait1>::Assoc1 as Trait2>::Assoc2
-        let program = check_parse(
-            "def main() { set x: <<A as Trait1>::Assoc1 as Trait2>::Assoc2 = 0; }",
-        );
+        let program =
+            check_parse("def main() { set x: <<A as Trait1>::Assoc1 as Trait2>::Assoc2 = 0; }");
         assert_eq!(program.items.len(), 1);
     }
 
@@ -5167,25 +5169,21 @@ mod tests {
     #[test]
     fn test_named_generic_arg_multiple() {
         // Multiple named parameters with mixed order
-        let program =
-            check_parse("def main() { set p: Ptr<size = UInt<16>, pointee = T> = 0; }");
+        let program = check_parse("def main() { set p: Ptr<size = UInt<16>, pointee = T> = 0; }");
         assert_eq!(program.items.len(), 1);
     }
 
     #[test]
     fn test_named_generic_arg_mixed() {
         // Positional + named (positional should come first)
-        let program =
-            check_parse("def main() { set x: SomeType<Int<32>, flag = true> = 0; }");
+        let program = check_parse("def main() { set x: SomeType<Int<32>, flag = true> = 0; }");
         assert_eq!(program.items.len(), 1);
     }
 
     #[test]
     fn test_named_generic_arg_nested_type() {
         // Named arg value is itself a complex type
-        let program = check_parse(
-            "def main() { set p: Ptr<pointee = Vec<Int<32>>> = 0; }",
-        );
+        let program = check_parse("def main() { set p: Ptr<pointee = Vec<Int<32>>> = 0; }");
         assert_eq!(program.items.len(), 1);
     }
 

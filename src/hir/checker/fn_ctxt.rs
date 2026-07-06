@@ -279,12 +279,23 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         if !param_tys.is_empty() {
                             let self_param_ty = param_tys[0];
                             // Try direct unification first (self = MyType, receiver = MyType)
-                            let mut unified = self.unify_with(self_param_ty, base_ty, *span, TypingContext::None).is_ok();
+                            let mut unified = self
+                                .unify_with(self_param_ty, base_ty, *span, TypingContext::None)
+                                .is_ok();
                             if !unified {
                                 // If self param is a ref and receiver is a value, auto-ref
-                                if let TypeData::Ref { ty: inner_ref, .. } = self.checker.ctx.get(self_param_ty) {
+                                if let TypeData::Ref { ty: inner_ref, .. } =
+                                    self.checker.ctx.get(self_param_ty)
+                                {
                                     let ref_base = self.checker.ctx.reference(base_ty, false);
-                                    unified = self.unify_with(self_param_ty, ref_base, *span, TypingContext::None).is_ok();
+                                    unified = self
+                                        .unify_with(
+                                            self_param_ty,
+                                            ref_base,
+                                            *span,
+                                            TypingContext::None,
+                                        )
+                                        .is_ok();
                                 }
                             }
                         }
@@ -511,8 +522,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         fn_ty,
                     ));
                 }
-                Err(Diagnostic::error(format!("no field or method '{}' on this type", field))
-                    .with_span(*span))
+                Err(
+                    Diagnostic::error(format!("no field or method '{}' on this type", field))
+                        .with_span(*span),
+                )
             }
             Expr::AttrAccess { base, attr, span } => {
                 let (base_hir, base_ty) = self.infer_expr(base)?;
@@ -903,13 +916,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     .map(|h| self.block_type(h))
                     .unwrap_or(self.checker.ctx.unit());
                 // Divergence detection: if both branches end in return/leave/continue, result is never
-                let then_diverges = then_hir
-                    .last()
-                    .map_or(false, |s| matches!(s, HirStmt::Return { .. } | HirStmt::Leave { .. } | HirStmt::Continue { .. }));
-                let else_diverges = else_hir
-                    .as_ref()
-                    .and_then(|h| h.last())
-                    .map_or(false, |s| matches!(s, HirStmt::Return { .. } | HirStmt::Leave { .. } | HirStmt::Continue { .. }));
+                let then_diverges = then_hir.last().map_or(false, |s| {
+                    matches!(
+                        s,
+                        HirStmt::Return { .. } | HirStmt::Leave { .. } | HirStmt::Continue { .. }
+                    )
+                });
+                let else_diverges = else_hir.as_ref().and_then(|h| h.last()).map_or(false, |s| {
+                    matches!(
+                        s,
+                        HirStmt::Return { .. } | HirStmt::Leave { .. } | HirStmt::Continue { .. }
+                    )
+                });
                 let both_diverge = then_diverges && else_diverges;
                 if *is_expression && !both_diverge {
                     if then_ty != else_ty {
@@ -917,9 +935,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     }
                 }
                 let result_ty = if *is_expression {
-                    if then_diverges { else_ty }
-                    else if else_diverges { then_ty }
-                    else { then_ty }
+                    if then_diverges {
+                        else_ty
+                    } else if else_diverges {
+                        then_ty
+                    } else {
+                        then_ty
+                    }
                 } else if both_diverge {
                     self.checker.ctx.never()
                 } else {
@@ -1073,10 +1095,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     // Use characteristic κ after resolving inference variables.
                     // For InferVars, also check the variable kind directly
                     // (characteristic returns usize::MAX for unresolved infer vars).
-                    let char = self
-                        .checker
-                        .ctx
-                        .characteristic(resolved_scrut_ty);
+                    let char = self.checker.ctx.characteristic(resolved_scrut_ty);
                     let total_count_from_char = match char {
                         Characteristic::FiniteExhaustible(n) => Some(n),
                         _ => None,
@@ -1440,19 +1459,22 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     if path.len() == 1 {
                         match path[0].as_str() {
                             "Int" => {
-                                let width = args.get(0)
+                                let width = args
+                                    .get(0)
                                     .and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
                                     .unwrap_or(32);
                                 return Ok(self.checker.ctx.int(width, true));
                             }
                             "UInt" => {
-                                let width = args.get(0)
+                                let width = args
+                                    .get(0)
                                     .and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
                                     .unwrap_or(32);
                                 return Ok(self.checker.ctx.int(width, false));
                             }
                             "Float" => {
-                                let width = args.get(0)
+                                let width = args
+                                    .get(0)
                                     .and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
                                     .unwrap_or(64);
                                 return Ok(self.checker.ctx.float(width));
@@ -1477,10 +1499,15 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                     let ty = self.resolve_type(arg.ty())?;
                                     match arg {
                                         GenericArg::Named(name, _) if name == "size" => size = ty,
-                                        GenericArg::Named(name, _) if name == "pointee" => pointee = ty,
+                                        GenericArg::Named(name, _) if name == "pointee" => {
+                                            pointee = ty
+                                        }
                                         GenericArg::Positional(_) => {
-                                            if self.checker.ctx.is_error(pointee) { pointee = ty; }
-                                            else { size = ty; }
+                                            if self.checker.ctx.is_error(pointee) {
+                                                pointee = ty;
+                                            } else {
+                                                size = ty;
+                                            }
                                         }
                                         _ => {}
                                     }
@@ -1501,7 +1528,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     arg_tys.push(self.resolve_type(arg.ty())?);
                 }
                 match self.checker.ctx.get(expanded) {
-                    TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } | TypeData::App { def_id, .. } => {
+                    TypeData::Struct { def_id, .. }
+                    | TypeData::Enum { def_id, .. }
+                    | TypeData::App { def_id, .. } => {
                         let binding = self
                             .checker
                             .symbols
@@ -1532,7 +1561,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     ),
                 }
             }
-            Type::Reference { inner: ty, mutable, .. } => {
+            Type::Reference {
+                inner: ty, mutable, ..
+            } => {
                 let inner = self.resolve_type(ty)?;
                 Ok(self.checker.ctx.reference(inner, *mutable))
             }
@@ -1570,7 +1601,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let ret_ty = self.resolve_type(ret)?;
                 Ok(self.checker.ctx.function(param_tys, ret_ty))
             }
-            Type::Projection { impl_type, trait_path, assoc_name: name, span } => {
+            Type::Projection {
+                impl_type,
+                trait_path,
+                assoc_name: name,
+                span,
+            } => {
                 let _impl_ty = self.resolve_type(impl_type)?;
                 let _trait_ty = self.resolve_type(trait_path)?;
                 let candidates = self.checker.symbols.lookup_traits_by_assoc_type_name(name);
@@ -1585,10 +1621,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         );
                         Ok(self.checker.ctx.error())
                     }
-                    1 => Ok(self
-                        .checker
-                        .ctx
-                        .associated_type(candidates[0], name.clone(), _impl_ty)),
+                    1 => {
+                        Ok(self
+                            .checker
+                            .ctx
+                            .associated_type(candidates[0], name.clone(), _impl_ty))
+                    }
                     _ => {
                         self.checker.diagnostics.push(
                             Diagnostic::error(format!(

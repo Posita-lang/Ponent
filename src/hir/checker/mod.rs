@@ -408,8 +408,7 @@ impl<'a> TypeChecker<'a> {
                 guard.defuse();
 
                 if let Err(diags) = exit_res {
-                    let details: Vec<String> =
-                        diags.iter().map(|d| d.message.clone()).collect();
+                    let details: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
                     return Err(Diagnostic::error(format!(
                         "inference failure: {}",
                         details.join("; ")
@@ -1026,7 +1025,8 @@ impl<'a> TypeChecker<'a> {
                     ),
                     _ => {
                         let msg = format!("check_stmt: expected ImplBlock, got {:?}", stmt);
-                        self.diagnostics.push(Diagnostic::error(&msg).with_span(stmt.span()));
+                        self.diagnostics
+                            .push(Diagnostic::error(&msg).with_span(stmt.span()));
                         return Ok(HirStmt::Error);
                     }
                 };
@@ -1171,8 +1171,9 @@ impl<'a> TypeChecker<'a> {
                     }
 
                     // Also register the resolved methods for method resolution
-                    if let TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } | TypeData::App { def_id, .. } =
-                        self.ctx.get(for_ty)
+                    if let TypeData::Struct { def_id, .. }
+                    | TypeData::Enum { def_id, .. }
+                    | TypeData::App { def_id, .. } = self.ctx.get(for_ty)
                     {
                         self.trait_env.add_inherent_methods(*def_id, method_infos);
                     }
@@ -1189,7 +1190,9 @@ impl<'a> TypeChecker<'a> {
                     // Inherent impl block: resolve the type and register methods
                     let for_ty = self.resolve_type(for_type)?;
                     let for_def_id = match self.ctx.get(for_ty) {
-                        TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } | TypeData::App { def_id, .. } => *def_id,
+                        TypeData::Struct { def_id, .. }
+                        | TypeData::Enum { def_id, .. }
+                        | TypeData::App { def_id, .. } => *def_id,
                         _ => {
                             self.diagnostics.push(
                                 Diagnostic::error("inherent impl on non-struct/enum type")
@@ -1249,7 +1252,6 @@ impl<'a> TypeChecker<'a> {
         fc.check_block(stmts)
     }
 
-
     fn infer_expr(&mut self, expr: &Expr) -> Result<(HirExpr, TypeId), Diagnostic> {
         let mut fc = FnCtxt::new(self);
         fc.infer_expr(expr)
@@ -1285,54 +1287,75 @@ impl<'a> TypeChecker<'a> {
             Type::Path(p, s) if p.len() == 1 && (p[0] == "Self" || p[0] == "self") => {
                 self_ty.clone()
             }
-            Type::Reference { inner, mutable, span: s, .. } => {
-                Type::Reference {
-                    inner: Box::new(self.resolve_self_ty(inner, self_ty)),
-                    mutable: *mutable,
-                    lifetime: None,
-                    span: *s,
-                }
-            }
+            Type::Reference {
+                inner,
+                mutable,
+                span: s,
+                ..
+            } => Type::Reference {
+                inner: Box::new(self.resolve_self_ty(inner, self_ty)),
+                mutable: *mutable,
+                lifetime: None,
+                span: *s,
+            },
             Type::Pointer(inner, s) => {
                 Type::Pointer(Box::new(self.resolve_self_ty(inner, self_ty)), *s)
             }
             Type::Generic(base, args, span) => {
                 let new_base = self.resolve_self_ty(base, self_ty);
-                let new_args: Vec<GenericArg> = args.iter().map(|a| {
-                    match a {
-                        GenericArg::Positional(t) => GenericArg::Positional(self.resolve_self_ty(t, self_ty)),
-                        GenericArg::Named(n, t) => GenericArg::Named(n.clone(), self.resolve_self_ty(t, self_ty)),
-                    }
-                }).collect();
+                let new_args: Vec<GenericArg> = args
+                    .iter()
+                    .map(|a| match a {
+                        GenericArg::Positional(t) => {
+                            GenericArg::Positional(self.resolve_self_ty(t, self_ty))
+                        }
+                        GenericArg::Named(n, t) => {
+                            GenericArg::Named(n.clone(), self.resolve_self_ty(t, self_ty))
+                        }
+                    })
+                    .collect();
                 Type::Generic(Box::new(new_base), new_args, *span)
             }
-            Type::Tuple(tys, span) => {
-                Type::Tuple(tys.iter().map(|t| self.resolve_self_ty(t, self_ty)).collect(), *span)
-            }
+            Type::Tuple(tys, span) => Type::Tuple(
+                tys.iter()
+                    .map(|t| self.resolve_self_ty(t, self_ty))
+                    .collect(),
+                *span,
+            ),
             Type::Slice(inner, span) => {
                 Type::Slice(Box::new(self.resolve_self_ty(inner, self_ty)), *span)
             }
-            Type::Array(inner, size, span) => {
-                Type::Array(Box::new(self.resolve_self_ty(inner, self_ty)), size.clone(), *span)
-            }
-            Type::DynTrait(traits, span) => {
-                Type::DynTrait(traits.iter().map(|t| self.resolve_self_ty(t, self_ty)).collect(), *span)
-            }
-            Type::Function { params, ret, span } => {
-                Type::Function {
-                    params: params.iter().map(|p| self.resolve_self_ty(p, self_ty)).collect(),
-                    ret: Box::new(self.resolve_self_ty(ret, self_ty)),
-                    span: *span,
-                }
-            }
-            Type::Projection { impl_type, trait_path, assoc_name, span } => {
-                Type::Projection {
-                    impl_type: Box::new(self.resolve_self_ty(impl_type, self_ty)),
-                    trait_path: Box::new(self.resolve_self_ty(trait_path, self_ty)),
-                    assoc_name: assoc_name.clone(),
-                    span: *span,
-                }
-            }
+            Type::Array(inner, size, span) => Type::Array(
+                Box::new(self.resolve_self_ty(inner, self_ty)),
+                size.clone(),
+                *span,
+            ),
+            Type::DynTrait(traits, span) => Type::DynTrait(
+                traits
+                    .iter()
+                    .map(|t| self.resolve_self_ty(t, self_ty))
+                    .collect(),
+                *span,
+            ),
+            Type::Function { params, ret, span } => Type::Function {
+                params: params
+                    .iter()
+                    .map(|p| self.resolve_self_ty(p, self_ty))
+                    .collect(),
+                ret: Box::new(self.resolve_self_ty(ret, self_ty)),
+                span: *span,
+            },
+            Type::Projection {
+                impl_type,
+                trait_path,
+                assoc_name,
+                span,
+            } => Type::Projection {
+                impl_type: Box::new(self.resolve_self_ty(impl_type, self_ty)),
+                trait_path: Box::new(self.resolve_self_ty(trait_path, self_ty)),
+                assoc_name: assoc_name.clone(),
+                span: *span,
+            },
             other => other.clone(),
         }
     }
@@ -1723,10 +1746,15 @@ impl<'a> TypeChecker<'a> {
         if let Some(deref_mut_id) = deref_mut_id {
             for cand in &candidates {
                 if cand.trait_id == deref_mut_id && cand.has_auto_deref {
-                    if let Some(target_ty) = self.trait_env.lookup_impl(deref_trait_id, ty)
-                        .and_then(|dc| dc.assoc_tys.iter()
-                            .find(|(name, _)| name == "Target")
-                            .map(|(_, ty)| *ty))
+                    if let Some(target_ty) = self
+                        .trait_env
+                        .lookup_impl(deref_trait_id, ty)
+                        .and_then(|dc| {
+                            dc.assoc_tys
+                                .iter()
+                                .find(|(name, _)| name == "Target")
+                                .map(|(_, ty)| *ty)
+                        })
                     {
                         return Some(target_ty);
                     }
@@ -2026,9 +2054,9 @@ impl<'a> TypeChecker<'a> {
         {
             let data = self.ctx.get(ty);
             let def_id = match data {
-                TypeData::App { def_id, .. } | TypeData::Struct { def_id } | TypeData::Enum { def_id } => {
-                    Some(*def_id)
-                }
+                TypeData::App { def_id, .. }
+                | TypeData::Struct { def_id }
+                | TypeData::Enum { def_id } => Some(*def_id),
                 _ => None,
             };
             if let Some(def_id) = def_id {
@@ -2036,10 +2064,9 @@ impl<'a> TypeChecker<'a> {
                     TypeData::App { args, .. } => args.as_slice(),
                     _ => &[],
                 };
-                let binding = self
-                    .symbols
-                    .lookup_type_by_def_id(def_id)
-                    .ok_or_else(|| Diagnostic::error("struct definition not found").with_span(span))?;
+                let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| {
+                    Diagnostic::error("struct definition not found").with_span(span)
+                })?;
                 all_field_names.extend(binding.fields.iter().map(|f| f.name.clone()));
                 if let Some(field) = binding.fields.iter().find(|f| f.name == name) {
                     let mut subst = Subst::new();
@@ -2057,7 +2084,9 @@ impl<'a> TypeChecker<'a> {
         for deref_ty in self.autoderef_chain(ty).skip(1) {
             let data = self.ctx.get(deref_ty);
             let def_id = match data {
-                TypeData::App { def_id, .. } | TypeData::Struct { def_id } | TypeData::Enum { def_id } => Some(*def_id),
+                TypeData::App { def_id, .. }
+                | TypeData::Struct { def_id }
+                | TypeData::Enum { def_id } => Some(*def_id),
                 _ => None,
             };
             if let Some(def_id) = def_id {
@@ -2105,7 +2134,8 @@ impl<'a> TypeChecker<'a> {
         // Pre-collect all unique trait IDs.
         let all_trait_ids: Vec<DefId> = {
             let mut seen = std::collections::HashSet::new();
-            self.trait_env.all_impls()
+            self.trait_env
+                .all_impls()
                 .iter()
                 .filter(|c| seen.insert(c.trait_id))
                 .map(|c| c.trait_id)
@@ -2132,7 +2162,8 @@ impl<'a> TypeChecker<'a> {
             // Fallback: try generic impl matching for every trait.
             for &trait_id in &all_trait_ids {
                 if let Some((cand, subst)) =
-                    self.trait_env.lookup_impl_generic(trait_id, current_ty, self.ctx, self.symbols)
+                    self.trait_env
+                        .lookup_impl_generic(trait_id, current_ty, self.ctx, self.symbols)
                 {
                     for method in &cand.resolved_methods {
                         if method.name == name {
@@ -2172,7 +2203,9 @@ impl<'a> TypeChecker<'a> {
     ) -> Result<Option<Expr>, Diagnostic> {
         let resolved = self.ctx.resolve_binding(ty_id);
         let def_id = match self.ctx.get(resolved) {
-            TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } | TypeData::App { def_id, .. } => Some(*def_id),
+            TypeData::Struct { def_id, .. }
+            | TypeData::Enum { def_id, .. }
+            | TypeData::App { def_id, .. } => Some(*def_id),
             _ => None,
         };
         if let Some(def_id) = def_id {
@@ -2269,9 +2302,9 @@ impl<'a> TypeChecker<'a> {
     fn lookup_type_binding(&self, ty: TypeId) -> Option<TypeBinding> {
         let resolved = self.ctx.resolve_binding(ty);
         match self.ctx.get(resolved) {
-            TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } | TypeData::App { def_id, .. } => {
-                self.symbols.lookup_type_by_def_id(*def_id).cloned()
-            }
+            TypeData::Struct { def_id, .. }
+            | TypeData::Enum { def_id, .. }
+            | TypeData::App { def_id, .. } => self.symbols.lookup_type_by_def_id(*def_id).cloned(),
             _ => None,
         }
     }

@@ -1,5 +1,5 @@
-use crate::ast::*;
 use crate::ast::visit::replace_ident_in_expr;
+use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticCollector, DiagnosticLevel};
 use crate::hir::symbol::*;
 use crate::hir::traits::{ImplCandidate, TraitEnv};
@@ -1218,8 +1218,14 @@ impl<'a> NameResolver<'a> {
                                 return self.ctx.rational(p, q);
                             }
                             "Ptr" => {
-                                let size = args.get(0).map(|a| self.resolve_type_expr(a.ty())).unwrap_or(self.ctx.usize());
-                                let pointee = args.get(1).map(|a| self.resolve_type_expr(a.ty())).unwrap_or(self.ctx.error());
+                                let size = args
+                                    .get(0)
+                                    .map(|a| self.resolve_type_expr(a.ty()))
+                                    .unwrap_or(self.ctx.usize());
+                                let pointee = args
+                                    .get(1)
+                                    .map(|a| self.resolve_type_expr(a.ty()))
+                                    .unwrap_or(self.ctx.error());
                                 return self.ctx.ptr(size, pointee);
                             }
                             "USize" => {
@@ -1233,8 +1239,10 @@ impl<'a> NameResolver<'a> {
                 if let Some(def_id) = self.ctx.get_def_id_for_type(base_ty) {
                     let binding = self.symbols.lookup_type_by_def_id(def_id).cloned();
                     if let Some(binding) = binding {
-                        let arg_tys: Vec<TypeId> =
-                            args.iter().map(|a| self.resolve_type_expr(a.ty())).collect();
+                        let arg_tys: Vec<TypeId> = args
+                            .iter()
+                            .map(|a| self.resolve_type_expr(a.ty()))
+                            .collect();
                         match binding.kind {
                             TypeKind::Struct => self.ctx.struct_ty(def_id, arg_tys),
                             TypeKind::Enum => self.ctx.enum_ty(def_id, arg_tys),
@@ -1258,7 +1266,9 @@ impl<'a> NameResolver<'a> {
                     self.ctx.error()
                 }
             }
-            Type::Reference { inner: ty, mutable, .. } => {
+            Type::Reference {
+                inner: ty, mutable, ..
+            } => {
                 let inner = self.resolve_type_expr(ty);
                 self.ctx.reference(inner, *mutable)
             }
@@ -1291,7 +1301,12 @@ impl<'a> NameResolver<'a> {
                 let ret_ty = self.resolve_type_expr(ret);
                 self.ctx.function(param_tys, ret_ty)
             }
-            Type::Projection { impl_type, trait_path, assoc_name: name, span } => {
+            Type::Projection {
+                impl_type,
+                trait_path,
+                assoc_name: name,
+                span,
+            } => {
                 let _impl_ty = self.resolve_type_expr(impl_type);
                 let _trait_ty = self.resolve_type_expr(trait_path);
                 self.ctx.error()
@@ -1489,54 +1504,75 @@ impl<'a> NameResolver<'a> {
             Type::Path(p, s) if p.len() == 1 && (p[0] == "Self" || p[0] == "self") => {
                 self_ty.clone()
             }
-            Type::Reference { inner, mutable, span: s, .. } => {
-                Type::Reference {
-                    inner: Box::new(self.resolve_self_in_type(inner, self_ty)),
-                    mutable: *mutable,
-                    lifetime: None,
-                    span: *s,
-                }
-            }
+            Type::Reference {
+                inner,
+                mutable,
+                span: s,
+                ..
+            } => Type::Reference {
+                inner: Box::new(self.resolve_self_in_type(inner, self_ty)),
+                mutable: *mutable,
+                lifetime: None,
+                span: *s,
+            },
             Type::Pointer(inner, s) => {
                 Type::Pointer(Box::new(self.resolve_self_in_type(inner, self_ty)), *s)
             }
             Type::Generic(base, args, span) => {
                 let new_base = self.resolve_self_in_type(base, self_ty);
-                let new_args: Vec<GenericArg> = args.iter().map(|a| {
-                    match a {
-                        GenericArg::Positional(t) => GenericArg::Positional(self.resolve_self_in_type(t, self_ty)),
-                        GenericArg::Named(n, t) => GenericArg::Named(n.clone(), self.resolve_self_in_type(t, self_ty)),
-                    }
-                }).collect();
+                let new_args: Vec<GenericArg> = args
+                    .iter()
+                    .map(|a| match a {
+                        GenericArg::Positional(t) => {
+                            GenericArg::Positional(self.resolve_self_in_type(t, self_ty))
+                        }
+                        GenericArg::Named(n, t) => {
+                            GenericArg::Named(n.clone(), self.resolve_self_in_type(t, self_ty))
+                        }
+                    })
+                    .collect();
                 Type::Generic(Box::new(new_base), new_args, *span)
             }
-            Type::Tuple(tys, span) => {
-                Type::Tuple(tys.iter().map(|t| self.resolve_self_in_type(t, self_ty)).collect(), *span)
-            }
+            Type::Tuple(tys, span) => Type::Tuple(
+                tys.iter()
+                    .map(|t| self.resolve_self_in_type(t, self_ty))
+                    .collect(),
+                *span,
+            ),
             Type::Slice(inner, span) => {
                 Type::Slice(Box::new(self.resolve_self_in_type(inner, self_ty)), *span)
             }
-            Type::Array(inner, size, span) => {
-                Type::Array(Box::new(self.resolve_self_in_type(inner, self_ty)), size.clone(), *span)
-            }
-            Type::DynTrait(traits, span) => {
-                Type::DynTrait(traits.iter().map(|t| self.resolve_self_in_type(t, self_ty)).collect(), *span)
-            }
-            Type::Function { params, ret, span } => {
-                Type::Function {
-                    params: params.iter().map(|p| self.resolve_self_in_type(p, self_ty)).collect(),
-                    ret: Box::new(self.resolve_self_in_type(ret, self_ty)),
-                    span: *span,
-                }
-            }
-            Type::Projection { impl_type, trait_path, assoc_name, span } => {
-                Type::Projection {
-                    impl_type: Box::new(self.resolve_self_in_type(impl_type, self_ty)),
-                    trait_path: Box::new(self.resolve_self_in_type(trait_path, self_ty)),
-                    assoc_name: assoc_name.clone(),
-                    span: *span,
-                }
-            }
+            Type::Array(inner, size, span) => Type::Array(
+                Box::new(self.resolve_self_in_type(inner, self_ty)),
+                size.clone(),
+                *span,
+            ),
+            Type::DynTrait(traits, span) => Type::DynTrait(
+                traits
+                    .iter()
+                    .map(|t| self.resolve_self_in_type(t, self_ty))
+                    .collect(),
+                *span,
+            ),
+            Type::Function { params, ret, span } => Type::Function {
+                params: params
+                    .iter()
+                    .map(|p| self.resolve_self_in_type(p, self_ty))
+                    .collect(),
+                ret: Box::new(self.resolve_self_in_type(ret, self_ty)),
+                span: *span,
+            },
+            Type::Projection {
+                impl_type,
+                trait_path,
+                assoc_name,
+                span,
+            } => Type::Projection {
+                impl_type: Box::new(self.resolve_self_in_type(impl_type, self_ty)),
+                trait_path: Box::new(self.resolve_self_in_type(trait_path, self_ty)),
+                assoc_name: assoc_name.clone(),
+                span: *span,
+            },
             other => other.clone(),
         }
     }
@@ -1579,9 +1615,7 @@ impl<'a> NameResolver<'a> {
                         if let Some(binding) =
                             self.symbols.lookup_type_by_def_id(item_def_id).cloned()
                         {
-                            self.symbols
-                                .insert_type(item.clone(), binding, span)
-                                .ok();
+                            self.symbols.insert_type(item.clone(), binding, span).ok();
                         }
                         // Register the full path: path::to::item
                         let mut full_item_path = path.to_vec();
@@ -1611,7 +1645,8 @@ impl<'a> NameResolver<'a> {
             if let Some(func_binding) = self.symbols.lookup_function(&path[0]).cloned() {
                 if let Some(name) = &import_name {
                     if let Err(diag) =
-                        self.symbols.insert_function(name.clone(), func_binding, span)
+                        self.symbols
+                            .insert_function(name.clone(), func_binding, span)
                     {
                         self.diagnostics.push(diag);
                     }
@@ -1620,11 +1655,9 @@ impl<'a> NameResolver<'a> {
             }
         }
 
-        Err(Diagnostic::error(format!(
-            "cannot resolve import `{}`",
-            path.join("::"),
-        ))
-        .with_span(span))
+        Err(
+            Diagnostic::error(format!("cannot resolve import `{}`", path.join("::"),))
+                .with_span(span),
+        )
     }
 }
-

@@ -361,7 +361,9 @@ impl InferenceContext {
                 TypeData::InferVar { id } => {
                     if *id < self.resolutions.len() {
                         if let Some(resolved) = self.resolutions[*id] {
-                            if resolved == current { return current; }
+                            if resolved == current {
+                                return current;
+                            }
                             current = resolved;
                             continue;
                         }
@@ -375,10 +377,17 @@ impl InferenceContext {
 
     /// Unify with local InferVar resolution (TypeOrVar pattern).
     /// Records resolutions in `self.resolutions` instead of global bindings.
-    pub fn unify(&mut self, a: TypeId, b: TypeId, ctx: &mut TypeContext) -> Result<TypeId, TypeError> {
+    pub fn unify(
+        &mut self,
+        a: TypeId,
+        b: TypeId,
+        ctx: &mut TypeContext,
+    ) -> Result<TypeId, TypeError> {
         let ra = self.resolve(a, ctx);
         let rb = self.resolve(b, ctx);
-        if ra == rb { return Ok(ra); }
+        if ra == rb {
+            return Ok(ra);
+        }
         match (ctx.get(ra), ctx.get(rb)) {
             (TypeData::InferVar { id }, _) if *id < self.resolutions.len() => {
                 self.resolutions[*id] = Some(rb);
@@ -543,9 +552,7 @@ impl InferenceContext {
         match ctx.get(resolved) {
             TypeData::Fn { params, .. } => PrincipalShape::Arrow,
             TypeData::Tuple { elems } => PrincipalShape::Tuple(elems.len()),
-            TypeData::App { args, .. } => {
-                PrincipalShape::Constructor(args.len())
-            }
+            TypeData::App { args, .. } => PrincipalShape::Constructor(args.len()),
             TypeData::Struct { .. } | TypeData::Enum { .. } => PrincipalShape::Constructor(0),
             TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } => {
                 PrincipalShape::Poly
@@ -1928,15 +1935,18 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
         | TypeData::Error
         | TypeData::Poly { .. } => ty,
         TypeData::GenericParam { .. } => ty,
-        TypeData::Struct { def_id } => ty,  // zero-arg, nothing to replace
-        TypeData::Enum { def_id } => ty,    // zero-arg, nothing to replace
+        TypeData::Struct { def_id } => ty, // zero-arg, nothing to replace
+        TypeData::Enum { def_id } => ty,   // zero-arg, nothing to replace
         TypeData::App { def_id, args } => {
             let new_args: Vec<TypeId> = args
                 .iter()
                 .map(|&a| replace_infer(a, solution, ctx))
                 .collect();
-            ctx.find_type(&TypeData::App { def_id, args: new_args })
-                .unwrap_or(ctx.error())
+            ctx.find_type(&TypeData::App {
+                def_id,
+                args: new_args,
+            })
+            .unwrap_or(ctx.error())
         }
         TypeData::Tuple { elems } => {
             let new_elems: Vec<TypeId> = elems
@@ -2495,11 +2505,19 @@ mod tests {
         let sv = svc.new_var(0);
         let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let f = fired.clone();
-        svc.on_resolve(sv, move |_| { f.store(true, std::sync::atomic::Ordering::SeqCst); });
-        assert!(!fired.load(std::sync::atomic::Ordering::SeqCst), "callback should not fire before resolution");
+        svc.on_resolve(sv, move |_| {
+            f.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::SeqCst),
+            "callback should not fire before resolution"
+        );
 
         assert!(svc.try_set(sv, TypeShape::Arrow));
-        assert!(fired.load(std::sync::atomic::Ordering::SeqCst), "callback should fire on resolution");
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "callback should fire on resolution"
+        );
     }
 
     #[test]
@@ -2510,9 +2528,13 @@ mod tests {
 
         let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let f = fired.clone();
-        svc.on_resolve(sv, move |_| { f.store(true, std::sync::atomic::Ordering::SeqCst); });
-        assert!(fired.load(std::sync::atomic::Ordering::SeqCst),
-            "on_resolve should fire immediately if already resolved");
+        svc.on_resolve(sv, move |_| {
+            f.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "on_resolve should fire immediately if already resolved"
+        );
     }
 
     #[test]
@@ -2537,15 +2559,25 @@ mod tests {
         let fired_b = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fa = fired_a.clone();
         let fb = fired_b.clone();
-        svc.on_resolve(a, move |_| { fa.store(true, std::sync::atomic::Ordering::SeqCst); });
-        svc.on_resolve(b, move |_| { fb.store(true, std::sync::atomic::Ordering::SeqCst); });
+        svc.on_resolve(a, move |_| {
+            fa.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        svc.on_resolve(b, move |_| {
+            fb.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
 
         svc.unify(a, b);
         // Resolve the unified target — both callbacks should fire
         let target = svc.resolve(a);
         svc.try_set(target, TypeShape::Arrow);
-        assert!(fired_a.load(std::sync::atomic::Ordering::SeqCst), "callback on a should fire");
-        assert!(fired_b.load(std::sync::atomic::Ordering::SeqCst), "callback on b should fire");
+        assert!(
+            fired_a.load(std::sync::atomic::Ordering::SeqCst),
+            "callback on a should fire"
+        );
+        assert!(
+            fired_b.load(std::sync::atomic::Ordering::SeqCst),
+            "callback on b should fire"
+        );
     }
 
     #[test]
@@ -2557,11 +2589,15 @@ mod tests {
 
         let fired_b = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fb = fired_b.clone();
-        svc.on_resolve(b, move |_| { fb.store(true, std::sync::atomic::Ordering::SeqCst); });
+        svc.on_resolve(b, move |_| {
+            fb.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
 
         svc.unify(a, b);
-        assert!(fired_b.load(std::sync::atomic::Ordering::SeqCst),
-            "b's callback should fire when unified with resolved a");
+        assert!(
+            fired_b.load(std::sync::atomic::Ordering::SeqCst),
+            "b's callback should fire when unified with resolved a"
+        );
     }
 
     #[test]
@@ -2604,7 +2640,10 @@ mod tests {
         assert!(shapes_compatible(TypeShape::Arrow, TypeShape::Arrow));
         assert!(shapes_compatible(TypeShape::Tuple(3), TypeShape::Tuple(3)));
         assert!(!shapes_compatible(TypeShape::Tuple(2), TypeShape::Tuple(3)));
-        assert!(shapes_compatible(TypeShape::Constructor(0), TypeShape::Constructor(5)));
+        assert!(shapes_compatible(
+            TypeShape::Constructor(0),
+            TypeShape::Constructor(5)
+        ));
         assert!(!shapes_compatible(TypeShape::Arrow, TypeShape::Tuple(1)));
         assert!(shapes_compatible(TypeShape::Poly, TypeShape::Poly));
         assert!(!shapes_compatible(TypeShape::Poly, TypeShape::Arrow));
@@ -2834,11 +2873,11 @@ mod tests {
             TypeData::Fn { params, ret } => {
                 assert_eq!(params.len(), 1, "instance should become a fn type");
                 let p0_resolved = ctx.resolve_binding(params[0]);
+                assert!(ctx.is_integer(p0_resolved), "param should be Int<32>");
                 assert!(
-                    ctx.is_integer(p0_resolved),
-                    "param should be Int<32>"
+                    ctx.is_bool(ctx.resolve_binding(*ret)),
+                    "return should be Bool"
                 );
-                assert!(ctx.is_bool(ctx.resolve_binding(*ret)), "return should be Bool");
             }
             other => panic!("instance should be fn type, got {:?}", other),
         }
@@ -2866,10 +2905,7 @@ mod tests {
         assert_eq!(updated, 1, "should have updated the instance");
 
         let inst_resolved = ctx.resolve_binding(inst);
-        assert!(
-            ctx.is_bool(inst_resolved),
-            "instance should now be Bool"
-        );
+        assert!(ctx.is_bool(inst_resolved), "instance should now be Bool");
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -2940,14 +2976,21 @@ mod tests {
         infer.exit_level(prev);
 
         // Eq(deep, shallow) — should promote deep to shallow's level
-        infer.add_constraint(Constraint::Eq(deep_var, shallow_var, crate::ast::Span::new(0, 0)));
+        infer.add_constraint(Constraint::Eq(
+            deep_var,
+            shallow_var,
+            crate::ast::Span::new(0, 0),
+        ));
         let bool_ty = ctx.bool();
         ctx.bindings.borrow_mut().insert(shallow_var, bool_ty);
 
         let result = infer.solve(&mut ctx, &trait_env, &symbols);
         assert!(result.is_ok(), "level promotion solve should succeed");
         let deep_resolved = ctx.resolve_binding(deep_var);
-        assert!(ctx.is_bool(deep_resolved), "deep var should resolve to Bool");
+        assert!(
+            ctx.is_bool(deep_resolved),
+            "deep var should resolve to Bool"
+        );
     }
 
     #[test]
@@ -2959,11 +3002,7 @@ mod tests {
         let int32 = ctx.int(32, true);
         let branches = vec![MatchBranchSet {
             shape_pattern: PrincipalShape::Arrow,
-            continuation: vec![Constraint::Eq(
-                int32,
-                int32,
-                crate::ast::Span::new(0, 0),
-            )],
+            continuation: vec![Constraint::Eq(int32, int32, crate::ast::Span::new(0, 0))],
             else_continuation: Vec::new(),
         }];
         let bid = infer.register_match_branches(branches);
@@ -2978,8 +3017,10 @@ mod tests {
         let _handled = infer.try_match_via_shape_var(&mut ctx, infer_var, bid, &mut heap);
         // try_match_via_shape_var always returns true (handled) but for an InferVar
         // it should suspend on the wait list, not discharge
-        assert!(var_id < infer.wait_lists.len() && !infer.wait_lists[var_id].is_empty(),
-                "match should be suspended on the infer var's wait list");
+        assert!(
+            var_id < infer.wait_lists.len() && !infer.wait_lists[var_id].is_empty(),
+            "match should be suspended on the infer var's wait list"
+        );
 
         // Now resolve the infer var to a concrete fn type and wake it
         let fn_bool = ctx.bool();
@@ -2990,15 +3031,20 @@ mod tests {
         // The match should now be in the heap
         assert!(!heap.is_empty(), "match should be woken and placed in heap");
         let woken = heap.pop().unwrap();
-        assert!(matches!(woken.constraint, Constraint::Match { .. }),
-                "woken constraint should be Match");
+        assert!(
+            matches!(woken.constraint, Constraint::Match { .. }),
+            "woken constraint should be Match"
+        );
 
         // Discharge it directly
         let fn_ty2 = ctx.function(vec![ctx.bool()], ctx.bool());
         let discharged = infer.discharge_match(&mut ctx, fn_ty2, bid, &mut heap);
         assert!(discharged, "match on fn type should discharge");
         // The continuation Eq(int32, int32) should be in the heap now
-        assert!(!heap.is_empty(), "continuation constraints should be enqueued");
+        assert!(
+            !heap.is_empty(),
+            "continuation constraints should be enqueued"
+        );
     }
 
     #[test]
@@ -3013,8 +3059,10 @@ mod tests {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
         };
-        assert!(infer.get_var_level(x_id).unwrap_or(0) > 0,
-                "x should be at a deeper level");
+        assert!(
+            infer.get_var_level(x_id).unwrap_or(0) > 0,
+            "x should be at a deeper level"
+        );
 
         // Bind x to Int<32>
         let int32 = ctx.int(32, true);

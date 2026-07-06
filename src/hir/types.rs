@@ -1,6 +1,6 @@
 use rustc_hash::FxHashMap as HashMap;
-use std::collections::HashSet;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -896,7 +896,7 @@ impl TypeContext {
             }
             TypeData::App { args, .. } => args
                 .iter()
-                .map(|&a| VarianceEdge { target: a, sign: 0 })  // invariant — nominal types have invariant params
+                .map(|&a| VarianceEdge { target: a, sign: 0 }) // invariant — nominal types have invariant params
                 .collect(),
             TypeData::Tuple { elems } => elems
                 .iter()
@@ -953,9 +953,7 @@ impl TypeContext {
                 params.iter().any(|&p| self.type_contains_param(param, p))
                     || self.type_contains_param(param, *ret)
             }
-            TypeData::App { args, .. } => {
-                args.iter().any(|&a| self.type_contains_param(param, a))
-            }
+            TypeData::App { args, .. } => args.iter().any(|&a| self.type_contains_param(param, a)),
             TypeData::Tuple { elems } => elems.iter().any(|&e| self.type_contains_param(param, e)),
             TypeData::Coproduct { alternatives } => alternatives
                 .iter()
@@ -1072,7 +1070,10 @@ impl TypeContext {
                     .iter()
                     .map(|&a| self.replace_generic(a, param_index, replacement))
                     .collect();
-                self.alloc(TypeData::App { def_id, args: new_args })
+                self.alloc(TypeData::App {
+                    def_id,
+                    args: new_args,
+                })
             }
             TypeData::Coproduct { alternatives } => {
                 let new_alts: Vec<TypeId> = alternatives
@@ -1113,9 +1114,7 @@ impl TypeContext {
         }
         let resolved = self.resolve_binding(ty);
         match &self.types[resolved.index()].as_ref() {
-            TypeData::App { args, .. } => {
-                args.iter().any(|&a| self.occurs_check(param, a))
-            }
+            TypeData::App { args, .. } => args.iter().any(|&a| self.occurs_check(param, a)),
             TypeData::Struct { .. } | TypeData::Enum { .. } => false,
             TypeData::Tuple { elems } => elems.iter().any(|&e| self.occurs_check(param, e)),
             TypeData::Coproduct { alternatives } => {
@@ -1194,7 +1193,12 @@ impl TypeContext {
     ///   those in contravariant positions flip to Contravariant
     /// - Contravariant (T :> U): sub-components in covariant positions flip to
     ///   Contravariant, those in contravariant positions flip to Covariant
-    fn unify_internal(&self, a: TypeId, b: TypeId, variance: Variance) -> Result<TypeId, TypeError> {
+    fn unify_internal(
+        &self,
+        a: TypeId,
+        b: TypeId,
+        variance: Variance,
+    ) -> Result<TypeId, TypeError> {
         // ── Caching: skip if we've already checked this (a, b, variance) pair ──
         let tag = Self::variance_tag(variance);
         let key = (a, b, tag);
@@ -1214,7 +1218,12 @@ impl TypeContext {
 
     /// The actual unification logic, called by `unify_internal` which wraps
     /// it with cache management.
-    fn unify_internal_impl(&self, a: TypeId, b: TypeId, variance: Variance) -> Result<TypeId, TypeError> {
+    fn unify_internal_impl(
+        &self,
+        a: TypeId,
+        b: TypeId,
+        variance: Variance,
+    ) -> Result<TypeId, TypeError> {
         let data_a = self.get(a).clone();
         let data_b = self.get(b).clone();
 
@@ -1273,19 +1282,13 @@ impl TypeContext {
             // ── Compound types: same variant, recursive sub-component unification ──
 
             // Struct: same def_id (zero-arg only)
-            (
-                TypeData::Struct { def_id: d1 },
-                TypeData::Struct { def_id: d2 },
-            ) if d1 == d2 => {
+            (TypeData::Struct { def_id: d1 }, TypeData::Struct { def_id: d2 }) if d1 == d2 => {
                 self.bindings.borrow_mut().insert(a, b);
                 Ok(b)
             }
 
             // Enum: same def_id (zero-arg only)
-            (
-                TypeData::Enum { def_id: d1 },
-                TypeData::Enum { def_id: d2 },
-            ) if d1 == d2 => {
+            (TypeData::Enum { def_id: d1 }, TypeData::Enum { def_id: d2 }) if d1 == d2 => {
                 self.bindings.borrow_mut().insert(a, b);
                 Ok(b)
             }
@@ -1309,10 +1312,9 @@ impl TypeContext {
             }
 
             // Tuple: same length, elements are COVARIANT
-            (
-                TypeData::Tuple { elems: e1 },
-                TypeData::Tuple { elems: e2 },
-            ) if e1.len() == e2.len() => {
+            (TypeData::Tuple { elems: e1 }, TypeData::Tuple { elems: e2 })
+                if e1.len() == e2.len() =>
+            {
                 let elem_variance = variance.xform(Variance::Covariant);
                 for (t1, t2) in e1.iter().zip(e2.iter()) {
                     self.unify_internal(*t1, *t2, elem_variance)?;
@@ -1343,16 +1345,9 @@ impl TypeContext {
             }
 
             // Array: same size, element is COVARIANT
-            (
-                TypeData::Array {
-                    elem: e1,
-                    size: s1,
-                },
-                TypeData::Array {
-                    elem: e2,
-                    size: s2,
-                },
-            ) if s1 == s2 => {
+            (TypeData::Array { elem: e1, size: s1 }, TypeData::Array { elem: e2, size: s2 })
+                if s1 == s2 =>
+            {
                 let elem_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*e1, *e2, elem_variance)?;
                 self.bindings.borrow_mut().insert(a, b);
@@ -1433,12 +1428,8 @@ impl TypeContext {
 
             // Coproduct: same length, alternatives COVARIANT
             (
-                TypeData::Coproduct {
-                    alternatives: a1,
-                },
-                TypeData::Coproduct {
-                    alternatives: a2,
-                },
+                TypeData::Coproduct { alternatives: a1 },
+                TypeData::Coproduct { alternatives: a2 },
             ) if a1.len() == a2.len() => {
                 let alt_variance = variance.xform(Variance::Covariant);
                 for (t1, t2) in a1.iter().zip(a2.iter()) {
@@ -1468,10 +1459,9 @@ impl TypeContext {
             }
 
             // Exists: same name + base is COVARIANT
-            (
-                TypeData::Exists { name: n1, base: b1 },
-                TypeData::Exists { name: n2, base: b2 },
-            ) if n1 == n2 => {
+            (TypeData::Exists { name: n1, base: b1 }, TypeData::Exists { name: n2, base: b2 })
+                if n1 == n2 =>
+            {
                 let base_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*b1, *b2, base_variance)?;
                 self.bindings.borrow_mut().insert(a, b);
@@ -1549,10 +1539,7 @@ impl TypeContext {
             }
 
             // DynTrait: same trait list (invariant)
-            (
-                TypeData::DynTrait { traits: t1 },
-                TypeData::DynTrait { traits: t2 },
-            ) if t1 == t2 => {
+            (TypeData::DynTrait { traits: t1 }, TypeData::DynTrait { traits: t2 }) if t1 == t2 => {
                 self.bindings.borrow_mut().insert(a, b);
                 Ok(b)
             }
@@ -1656,17 +1643,14 @@ impl TypeContext {
                 // - &T <: &mut T NEVER allowed
                 // - same mutability → invariant inner type
                 if *m1 == *m2 {
-                    *t1 == *t2  // same mutability, invariant
+                    *t1 == *t2 // same mutability, invariant
                 } else if *m1 == true && *m2 == false {
-                    *t1 == *t2  // &mut T <: &T, invariant
+                    *t1 == *t2 // &mut T <: &T, invariant
                 } else {
-                    false       // &T <: &mut T: never allowed
+                    false // &T <: &mut T: never allowed
                 }
             }
-            (
-                TypeData::Pointer { ty: t1 },
-                TypeData::Pointer { ty: t2 },
-            ) => *t1 == *t2,  // invariant — exact equality required
+            (TypeData::Pointer { ty: t1 }, TypeData::Pointer { ty: t2 }) => *t1 == *t2, // invariant — exact equality required
             (
                 TypeData::Fn {
                     params: p1,
@@ -1743,7 +1727,10 @@ impl TypeContext {
             | TypeData::Error => ty,
             TypeData::App { def_id, args } => {
                 let new_args: Vec<TypeId> = args.iter().map(|&a| self.subst(a, subst)).collect();
-                self.alloc(TypeData::App { def_id: *def_id, args: new_args })
+                self.alloc(TypeData::App {
+                    def_id: *def_id,
+                    args: new_args,
+                })
             }
             TypeData::Tuple { elems } => {
                 let new_elems: Vec<TypeId> = elems.iter().map(|&e| self.subst(e, subst)).collect();
@@ -1781,7 +1768,11 @@ impl TypeContext {
                 self.poly(quantifiers.clone(), new_body)
             }
             TypeData::DynTrait { .. } => ty,
-            TypeData::Forall { param_index, param_name, body } => {
+            TypeData::Forall {
+                param_index,
+                param_name,
+                body,
+            } => {
                 let new_body = self.subst(*body, subst);
                 self.alloc(TypeData::Forall {
                     param_index: *param_index,
@@ -1789,7 +1780,11 @@ impl TypeContext {
                     body: new_body,
                 })
             }
-            TypeData::Mu { param_index, param_name, body } => {
+            TypeData::Mu {
+                param_index,
+                param_name,
+                body,
+            } => {
                 let new_body = self.subst(*body, subst);
                 self.alloc(TypeData::Mu {
                     param_index: *param_index,
@@ -1797,7 +1792,11 @@ impl TypeContext {
                     body: new_body,
                 })
             }
-            TypeData::Nu { param_index, param_name, body } => {
+            TypeData::Nu {
+                param_index,
+                param_name,
+                body,
+            } => {
                 let new_body = self.subst(*body, subst);
                 self.alloc(TypeData::Nu {
                     param_index: *param_index,
@@ -1817,7 +1816,11 @@ impl TypeContext {
                     alternatives.iter().map(|&a| self.subst(a, subst)).collect();
                 self.coproduct(new_alts)
             }
-            TypeData::AssociatedType { trait_id, name, self_ty } => {
+            TypeData::AssociatedType {
+                trait_id,
+                name,
+                self_ty,
+            } => {
                 let new_self = self.subst(*self_ty, subst);
                 self.associated_type(*trait_id, name.clone(), new_self)
             }
@@ -2328,9 +2331,15 @@ impl TypeContext {
                         edges.push((idx, idx, 1));
                     }
                 }
-                TypeData::Forall { param_index, body, .. }
-                | TypeData::Mu { param_index, body, .. }
-                | TypeData::Nu { param_index, body, .. } => {
+                TypeData::Forall {
+                    param_index, body, ..
+                }
+                | TypeData::Mu {
+                    param_index, body, ..
+                }
+                | TypeData::Nu {
+                    param_index, body, ..
+                } => {
                     // Push binder FIRST, then traverse body so GenericParam
                     // occurrences register with the correct binder scope.
                     binder_stack.push((*param_index, idx));
@@ -2428,10 +2437,7 @@ impl TypeContext {
             }
         }
 
-        KappaGraph {
-            nodes,
-            edges,
-        }
+        KappaGraph { nodes, edges }
     }
 
     /// Solve κ for a graph using fixed-point iteration.
@@ -2479,10 +2485,7 @@ impl TypeContext {
                 }
                 unresolved_count[pred] = unresolved_count[pred].saturating_sub(1);
                 if unresolved_count[pred] == 0 {
-                    let k = self.combine_kappa(
-                        graph.nodes[pred],
-                        &type_kappa,
-                    );
+                    let k = self.combine_kappa(graph.nodes[pred], &type_kappa);
                     result[pred] = Some(k);
                     type_kappa.insert(graph.nodes[pred], k);
                     queue.push(pred);
@@ -2536,7 +2539,9 @@ impl TypeContext {
                 Characteristic::FiniteExhaustible(usize::MAX)
             }
             TypeData::Rational {
-                int_bits, frac_bits, ..
+                int_bits,
+                frac_bits,
+                ..
             } => {
                 let total_bits = *int_bits as u32 + *frac_bits as u32;
                 if total_bits >= 16 {
@@ -2580,8 +2585,13 @@ impl TypeContext {
         kappa_map: &HashMap<TypeId, Characteristic>,
     ) -> Characteristic {
         /// Helper: look up a child's κ — must be resolved at this point.
-        fn ck(ctx: &TypeContext, child: TypeId, map: &HashMap<TypeId, Characteristic>) -> Characteristic {
-            *map.get(&child).expect("child kappa not resolved: graph construction missed a dependency edge")
+        fn ck(
+            ctx: &TypeContext,
+            child: TypeId,
+            map: &HashMap<TypeId, Characteristic>,
+        ) -> Characteristic {
+            *map.get(&child)
+                .expect("child kappa not resolved: graph construction missed a dependency edge")
         }
 
         let data = self.get(ty);
@@ -2596,8 +2606,11 @@ impl TypeContext {
                         Characteristic::Undecidable => return Characteristic::Undecidable,
                     }
                 }
-                if has_infinite { Characteristic::InfiniteEnumerable }
-                else { Characteristic::FiniteExhaustible(total) }
+                if has_infinite {
+                    Characteristic::InfiniteEnumerable
+                } else {
+                    Characteristic::FiniteExhaustible(total)
+                }
             }
             TypeData::App { args, .. } => {
                 let mut has_infinite = false;
@@ -2608,17 +2621,19 @@ impl TypeContext {
                         Characteristic::Undecidable => return Characteristic::Undecidable,
                     }
                 }
-                if has_infinite { Characteristic::InfiniteEnumerable }
-                else { Characteristic::FiniteExhaustible(usize::MAX) }
-            }
-            TypeData::Array { elem, size } => {
-                match ck(self, *elem, kappa_map) {
-                    Characteristic::FiniteExhaustible(n) =>
-                        Characteristic::FiniteExhaustible(n.saturating_pow(*size as u32)),
-                    Characteristic::InfiniteEnumerable => Characteristic::InfiniteEnumerable,
-                    Characteristic::Undecidable => Characteristic::Undecidable,
+                if has_infinite {
+                    Characteristic::InfiniteEnumerable
+                } else {
+                    Characteristic::FiniteExhaustible(usize::MAX)
                 }
             }
+            TypeData::Array { elem, size } => match ck(self, *elem, kappa_map) {
+                Characteristic::FiniteExhaustible(n) => {
+                    Characteristic::FiniteExhaustible(n.saturating_pow(*size as u32))
+                }
+                Characteristic::InfiniteEnumerable => Characteristic::InfiniteEnumerable,
+                Characteristic::Undecidable => Characteristic::Undecidable,
+            },
             TypeData::Slice { .. }
             | TypeData::Ref { .. }
             | TypeData::Pointer { .. }
@@ -2628,7 +2643,9 @@ impl TypeContext {
                 let mut domain_infinite = false;
                 for &p in params {
                     match ck(self, p, kappa_map) {
-                        Characteristic::FiniteExhaustible(n) => domain_product = domain_product.saturating_mul(n),
+                        Characteristic::FiniteExhaustible(n) => {
+                            domain_product = domain_product.saturating_mul(n)
+                        }
                         Characteristic::InfiniteEnumerable => domain_infinite = true,
                         Characteristic::Undecidable => return Characteristic::Undecidable,
                     }
@@ -2636,18 +2653,28 @@ impl TypeContext {
                 match ck(self, *ret, kappa_map) {
                     Characteristic::Undecidable => Characteristic::Undecidable,
                     Characteristic::FiniteExhaustible(c) => {
-                        if domain_product == 0 { Characteristic::FiniteExhaustible(1) }
-                        else if domain_infinite {
-                            if c == 0 { Characteristic::FiniteExhaustible(0) }
-                            else if c == 1 { Characteristic::FiniteExhaustible(1) }
-                            else { Characteristic::InfiniteEnumerable }
+                        if domain_product == 0 {
+                            Characteristic::FiniteExhaustible(1)
+                        } else if domain_infinite {
+                            if c == 0 {
+                                Characteristic::FiniteExhaustible(0)
+                            } else if c == 1 {
+                                Characteristic::FiniteExhaustible(1)
+                            } else {
+                                Characteristic::InfiniteEnumerable
+                            }
                         } else {
-                            Characteristic::FiniteExhaustible(c.saturating_pow(domain_product as u32))
+                            Characteristic::FiniteExhaustible(
+                                c.saturating_pow(domain_product as u32),
+                            )
                         }
                     }
                     Characteristic::InfiniteEnumerable => {
-                        if domain_product == 0 { Characteristic::FiniteExhaustible(1) }
-                        else { Characteristic::InfiniteEnumerable }
+                        if domain_product == 0 {
+                            Characteristic::FiniteExhaustible(1)
+                        } else {
+                            Characteristic::InfiniteEnumerable
+                        }
                     }
                 }
             }
@@ -2661,8 +2688,11 @@ impl TypeContext {
                         Characteristic::Undecidable => return Characteristic::Undecidable,
                     }
                 }
-                if has_infinite { Characteristic::InfiniteEnumerable }
-                else { Characteristic::FiniteExhaustible(total) }
+                if has_infinite {
+                    Characteristic::InfiniteEnumerable
+                } else {
+                    Characteristic::FiniteExhaustible(total)
+                }
             }
             TypeData::Forall { body, .. }
             | TypeData::Exists { base: body, .. }

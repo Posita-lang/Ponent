@@ -131,10 +131,7 @@ impl<'a> TypeChecker<'a> {
 
     /// Find the innermost continue target (only Loop, While, For).
     /// Posita's `continue` does not support labels; `label` is always None.
-    pub(crate) fn find_continue_target(
-        &self,
-        label: Option<&str>,
-    ) -> Option<(Span, &str)> {
+    pub(crate) fn find_continue_target(&self, label: Option<&str>) -> Option<(Span, &str)> {
         for frame in self.region_tree.iter_frames_rev() {
             match &frame.kind {
                 CtxKind::Loop | CtxKind::While | CtxKind::For => {
