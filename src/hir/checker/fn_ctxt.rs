@@ -1528,9 +1528,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     arg_tys.push(self.resolve_type(arg.ty())?);
                 }
                 match self.checker.ctx.get(expanded) {
-                    TypeData::Adt { def_id, .. }
-                    | TypeData::Adt { def_id, .. }
-                    | TypeData::Adt { def_id, .. } => {
+                    TypeData::Adt { def_id, .. } => {
                         let binding = self
                             .checker
                             .symbols

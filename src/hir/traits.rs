@@ -294,9 +294,7 @@ impl TraitEnv {
             }
             // Get the type binding for the candidate's for_type
             let def_id = match ctx.get(cand.for_type) {
-                TypeData::Adt { def_id, .. }
-                | TypeData::Adt { def_id, .. }
-                | TypeData::Adt { def_id, .. } => *def_id,
+                TypeData::Adt { def_id, .. } => *def_id,
                 _ => continue,
             };
             let binding = match symbols.lookup_type_by_def_id(def_id) {
@@ -384,9 +382,7 @@ impl TraitEnv {
     /// Look up inherent methods registered for a type.
     pub fn lookup_inherent_methods(&self, ty: TypeId, ctx: &TypeContext) -> &[MethodInfo] {
         match ctx.get(ty) {
-            TypeData::Adt { def_id, .. }
-            | TypeData::Adt { def_id, .. }
-            | TypeData::Adt { def_id, .. } => self
+            TypeData::Adt { def_id, .. } => self
                 .inherent_methods
                 .get(def_id)
                 .map(|v| v.as_slice())

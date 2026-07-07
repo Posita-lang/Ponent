@@ -553,8 +553,7 @@ impl InferenceContext {
             TypeData::Fn { params, .. } => PrincipalShape::Arrow,
             TypeData::Tuple { elems } => PrincipalShape::Tuple(elems.len()),
             TypeData::Adt { args, .. } => PrincipalShape::Constructor(args.len()),
-            TypeData::Adt { .. } => PrincipalShape::Constructor(0),
-            TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } => {
+            TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } | TypeData::SkolemVar { .. } => {
                 PrincipalShape::Poly
             }
             TypeData::Int { .. }
@@ -1922,6 +1921,7 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
     let data = ctx.get(resolved).clone();
     match data {
         TypeData::InferVar { id } => solution.get(&id).copied().unwrap_or(ty),
+        TypeData::SkolemVar { .. } => ty,
         TypeData::Int { .. }
         | TypeData::UInt { .. }
         | TypeData::Float { .. }
@@ -1935,14 +1935,13 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
         | TypeData::Error
         | TypeData::Poly { .. } => ty,
         TypeData::GenericParam { .. } => ty,
-        TypeData::Adt { def_id, .. } => ty, // zero-arg, nothing to replace
-        TypeData::Adt { def_id, .. } => ty, // zero-arg, nothing to replace
-        TypeData::Adt { def_id, args } => {
+        TypeData::Adt { kind, def_id, args } => {
             let new_args: Vec<TypeId> = args
                 .iter()
                 .map(|&a| replace_infer(a, solution, ctx))
                 .collect();
             ctx.find_type(&TypeData::Adt {
+                kind,
                 def_id,
                 args: new_args,
             })

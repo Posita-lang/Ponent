@@ -411,12 +411,12 @@ pub fn type_data_to_shape(data: &TypeData) -> TypeShape {
         TypeData::Fn { .. } => TypeShape::Arrow,
         TypeData::Tuple { elems } => TypeShape::Tuple(elems.len()),
         TypeData::Adt { args, .. } => TypeShape::Constructor(args.len()),
-        TypeData::Adt { .. } => TypeShape::Constructor(0),
         TypeData::Forall { .. }
         | TypeData::Exists { .. }
         | TypeData::Mu { .. }
         | TypeData::Nu { .. }
-        | TypeData::Poly { .. } => TypeShape::Poly,
+        | TypeData::Poly { .. }
+        | TypeData::SkolemVar { .. } => TypeShape::Poly,
         TypeData::Rational { .. } => TypeShape::Unknown,
         TypeData::Coproduct { alternatives } => TypeShape::Tuple(alternatives.len()),
         _ => TypeShape::Unknown,

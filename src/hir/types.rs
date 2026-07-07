@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use rustc_hash::FxHashMap as HashMap;
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -41,6 +42,7 @@ pub enum TypeTag {
     /// to its generic arguments.  Follows rustc's single-`Adt` convention
     /// rather than separate `Struct`/`Enum` variants.
     Adt = 28,
+    SkolemVar = 29,
 }
 
 impl From<&TypeData> for TypeTag {
@@ -72,6 +74,7 @@ impl From<&TypeData> for TypeTag {
             TypeData::Nu { .. } => TypeTag::Nu,
             TypeData::Poly { .. } => TypeTag::Poly,
             TypeData::Rational { .. } => TypeTag::Rational,
+            TypeData::SkolemVar { .. } => TypeTag::SkolemVar,
             TypeData::Never => TypeTag::Never,
             TypeData::Unit => TypeTag::Unit,
             TypeData::Error => TypeTag::Error,
@@ -121,6 +124,7 @@ pub enum TypeData {
     ///   `String`          → Adt { def_id: StringDefId, args: [] }
     ///   `Option<Int<32>>` → Adt { def_id: OptionDefId, args: [Int<32>] }
     Adt {
+        kind: AdtKind,
         def_id: DefId,
         args: Vec<TypeId>,
     },
@@ -212,9 +216,20 @@ pub enum TypeData {
         int_bits: u8,
         frac_bits: u8,
     },
+    SkolemVar {
+        id: usize,
+        universe_num: usize,
+    },
     Never,
     Unit,
     Error,
+}
+
+/// Distinguishes between struct and enum ADT kinds (rustc-style).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdtKind {
+    Struct,
+    Enum,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -304,6 +319,11 @@ pub struct TypeContext {
     unify_seen: RefCell<HashSet<(TypeId, TypeId, u8)>>,
     /// Cache for κ(A) characteristic results.  Cleared when bindings change.
     kappa_cache: RefCell<HashMap<TypeId, Characteristic>>,
+    /// Universe counter for Higher-Ranked Type skolemization (rustc-style).
+    /// Each `for<'a>` binder comparison enters a fresh universe.
+    next_universe: Cell<usize>,
+    /// Pre-allocated pool of skolem placeholder types for HRTB comparison.
+    skolem_pool: RefCell<Vec<TypeId>>,
 }
 
 impl TypeContext {
@@ -328,6 +348,8 @@ impl TypeContext {
             transaction_stack: RefCell::new(Vec::new()),
             unify_seen: RefCell::new(HashSet::default()),
             kappa_cache: RefCell::new(HashMap::default()),
+            next_universe: Cell::new(0),
+            skolem_pool: RefCell::new(Vec::new()),
         };
         ctx.builtin_unit = ctx.alloc(TypeData::Unit);
         ctx.builtin_never = ctx.alloc(TypeData::Never);
@@ -338,11 +360,18 @@ impl TypeContext {
         ctx.builtin_usize = ctx.alloc(TypeData::USize);
         // Str type: represented as a zero-sized struct with a sentinel DefId.
         ctx.builtin_str = ctx.alloc(TypeData::Adt {
+            kind: AdtKind::Struct,
             def_id: DefId(usize::MAX),
             args: vec![],
         });
         // &Str = Ref { ty: Str, mutable: false }
         ctx.builtin_str_ref = ctx.reference(ctx.builtin_str, false);
+        let mut pool = Vec::new();
+        for i in 0..16 {
+            let skolem = ctx.alloc(TypeData::SkolemVar { id: i, universe_num: i });
+            pool.push(skolem);
+        }
+        ctx.skolem_pool = RefCell::new(pool);
         ctx
     }
 
@@ -493,13 +522,13 @@ impl TypeContext {
     }
 
     pub fn struct_ty(&mut self, def_id: DefId, args: Vec<TypeId>) -> TypeId {
-        let id = self.alloc(TypeData::Adt { def_id, args });
+        let id = self.alloc(TypeData::Adt { kind: AdtKind::Struct, def_id, args });
         self.def_id_to_type_id.insert(def_id, id);
         id
     }
 
     pub fn enum_ty(&mut self, def_id: DefId, args: Vec<TypeId>) -> TypeId {
-        let id = self.alloc(TypeData::Adt { def_id, args });
+        let id = self.alloc(TypeData::Adt { kind: AdtKind::Enum, def_id, args });
         self.def_id_to_type_id.insert(def_id, id);
         id
     }
@@ -1073,12 +1102,13 @@ impl TypeContext {
                     .collect();
                 self.tuple(new_elems)
             }
-            TypeData::Adt { def_id, args } => {
+            TypeData::Adt { kind, def_id, args } => {
                 let new_args: Vec<TypeId> = args
                     .iter()
                     .map(|&a| self.replace_generic(a, param_index, replacement))
                     .collect();
                 self.alloc(TypeData::Adt {
+                    kind: *kind,
                     def_id: *def_id,
                     args: new_args,
                 })
@@ -1138,7 +1168,6 @@ impl TypeContext {
         let resolved = self.resolve_binding(ty);
         match &self.types[resolved.index()].as_ref() {
             TypeData::Adt { args, .. } => args.iter().any(|&a| self.occurs_check(param, a)),
-            TypeData::Adt { .. } => false,
             TypeData::Tuple { elems } => elems.iter().any(|&e| self.occurs_check(param, e)),
             TypeData::Coproduct { alternatives } => {
                 alternatives.iter().any(|&a| self.occurs_check(param, a))
@@ -1172,7 +1201,8 @@ impl TypeContext {
             | TypeData::Never
             | TypeData::Unit
             | TypeData::Error
-            | TypeData::DynTrait { .. } => false,
+            | TypeData::DynTrait { .. }
+            | TypeData::SkolemVar { .. } => false,
         }
     }
 
@@ -1307,10 +1337,12 @@ impl TypeContext {
             // Adt (struct/enum): same def_id, same args length, unify args pairwise (invariant).
             (
                 TypeData::Adt {
+                    kind: _,
                     def_id: d1,
                     args: a1,
                 },
                 TypeData::Adt {
+                    kind: _,
                     def_id: d2,
                     args: a2,
                 },
@@ -1661,6 +1693,44 @@ impl TypeContext {
         self.bindings.borrow_mut().insert(key, value);
     }
 
+    /// When `self_ty` resolves to a concrete ADT, return its `DefId`.
+    /// Full projection resolution (finding the impl's concrete associated
+    /// type) requires `TraitEnv` and is performed by the checker.
+    pub fn try_normalize_associated_type_def_id(&self, self_ty: TypeId) -> Option<DefId> {
+        let resolved = self.resolve_binding(self_ty);
+        match self.get(resolved) {
+            TypeData::Adt { def_id, .. } => Some(*def_id),
+            _ => None,
+        }
+    }
+
+    pub fn enter_universe(&self) -> (usize, TypeId) {
+        let universe = self.next_universe.get();
+        self.next_universe.set(universe + 1);
+        let pool = self.skolem_pool.borrow();
+        let idx = universe % pool.len();
+        (universe, pool[idx])
+    }
+
+    pub fn check_skolem_escape(&self, ty: TypeId, max_universe: usize) -> Option<usize> {
+        let resolved = self.resolve_binding(ty);
+        match self.get(resolved) {
+            TypeData::SkolemVar { universe_num, .. } if *universe_num > max_universe => Some(*universe_num),
+            TypeData::Adt { args, .. } | TypeData::Tuple { elems: args, .. } | TypeData::Coproduct { alternatives: args, .. } => {
+                for &a in args { if let Some(u) = self.check_skolem_escape(a, max_universe) { return Some(u); } }
+                None
+            }
+            TypeData::Fn { params, ret } => {
+                for &p in params { if let Some(u) = self.check_skolem_escape(p, max_universe) { return Some(u); } }
+                self.check_skolem_escape(*ret, max_universe)
+            }
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } | TypeData::Array { elem: ty, .. } | TypeData::Slice { elem: ty } | TypeData::Ptr { pointee: ty, .. } => self.check_skolem_escape(*ty, max_universe),
+            TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. } | TypeData::Mu { body, .. } | TypeData::Nu { body, .. } | TypeData::Poly { body, .. } => self.check_skolem_escape(*body, max_universe),
+            TypeData::AssociatedType { self_ty, .. } => self.check_skolem_escape(*self_ty, max_universe),
+            _ => None,
+        }
+    }
+
     pub fn subtype(&self, sub: TypeId, sup: TypeId) -> bool {
         if sub == sup {
             return true;
@@ -1673,6 +1743,23 @@ impl TypeContext {
             (TypeData::Error, _) => true,
             (_, TypeData::Error) => true,
             (TypeData::Never, _) => true,
+
+            // ── Higher-Ranked Types: `∀X.T <: ∀Y.U` ────────────
+            (
+                TypeData::Forall {
+                    param_index: pi1,
+                    param_name: _,
+                    body: b1,
+                },
+                TypeData::Forall {
+                    param_index: pi2,
+                    param_name: _,
+                    body: b2,
+                },
+            ) => *pi1 == *pi2 && self.subtype(*b1, *b2),
+            (TypeData::Forall { body, .. }, _) => self.subtype(*body, sup),
+            (_, TypeData::Forall { body, .. }) => self.subtype(sub, *body),
+
             (TypeData::Unit, TypeData::Unit) => true,
             (
                 TypeData::Ref {
@@ -1771,9 +1858,10 @@ impl TypeContext {
             | TypeData::Never
             | TypeData::Unit
             | TypeData::Error => ty,
-            TypeData::Adt { def_id, args } => {
+            TypeData::Adt { kind, def_id, args } => {
                 let new_args: Vec<TypeId> = args.iter().map(|&a| self.subst(a, subst)).collect();
                 self.alloc(TypeData::Adt {
+                    kind: *kind,
                     def_id: *def_id,
                     args: new_args,
                 })
@@ -1875,11 +1963,11 @@ impl TypeContext {
     }
 
     fn struct_ty_no_alloc(&self, def_id: DefId, args: Vec<TypeId>) -> Option<TypeId> {
-        self.find_type(&TypeData::Adt { def_id, args })
+        self.find_type(&TypeData::Adt { kind: AdtKind::Struct, def_id, args })
     }
 
     fn enum_ty_no_alloc(&self, def_id: DefId, args: Vec<TypeId>) -> Option<TypeId> {
-        self.find_type(&TypeData::Adt { def_id, args })
+        self.find_type(&TypeData::Adt { kind: AdtKind::Enum, def_id, args })
     }
 
     fn tuple_ty_no_alloc(&self, elems: Vec<TypeId>) -> Option<TypeId> {
@@ -2023,7 +2111,6 @@ impl TypeContext {
                     .max()
                     .unwrap_or(0)
             }
-            TypeData::Adt { .. } => 1,
             TypeData::Tuple { elems }
             | TypeData::Coproduct {
                 alternatives: elems,
@@ -2068,16 +2155,17 @@ impl TypeContext {
             | TypeData::USize
             | TypeData::Never
             | TypeData::Unit
-            | TypeData::Error => 1,
+            | TypeData::Error
+            | TypeData::SkolemVar { .. } => 1,
         }
     }
 
     pub fn is_struct(&self, ty: TypeId) -> bool {
-        matches!(self.get(ty), TypeData::Adt { .. })
+        matches!(self.get(ty), TypeData::Adt { kind: AdtKind::Struct, .. })
     }
 
     pub fn is_enum(&self, ty: TypeId) -> bool {
-        matches!(self.get(ty), TypeData::Adt { .. })
+        matches!(self.get(ty), TypeData::Adt { kind: AdtKind::Enum, .. })
     }
 
     pub fn is_tuple(&self, ty: TypeId) -> bool {
@@ -3218,5 +3306,53 @@ mod tests {
             reduced, expected,
             "∀X.(X⇒Int⇒Float)⇒X should reduce to Int→Float, not lose Float"
         );
+    }
+
+    // ── HRTB / Forall subtype tests ──────────────────────────────
+
+    #[test]
+    fn test_subtype_forall_identical() {
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let fn_ty = ctx.function(vec![p0], p0);
+        let forall = ctx.forall(0, "X".into(), fn_ty);
+        assert!(ctx.subtype(forall, forall));
+    }
+
+    #[test]
+    fn test_subtype_forall_body_subtype() {
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let never = ctx.never();
+        let int32 = ctx.int(32, true);
+        let sub_fn = ctx.function(vec![p0], never);
+        let sup_fn = ctx.function(vec![p0], int32);
+        let sub_forall = ctx.forall(0, "X".into(), sub_fn);
+        let sup_forall = ctx.forall(0, "X".into(), sup_fn);
+        assert!(ctx.subtype(sub_forall, sup_forall));
+    }
+
+    #[test]
+    fn test_subtype_forall_peel_sup() {
+        let mut ctx = TypeContext::new();
+        let int_ty = ctx.int(32, true);
+        let forall_ty = ctx.forall(0, "X".into(), int_ty);
+        assert!(ctx.subtype(int_ty, forall_ty));
+    }
+
+    #[test]
+    fn test_normalize_associated_type_concrete_self() {
+        let mut ctx = TypeContext::new();
+        let def_id = DefId(42);
+        let int_ty = ctx.int(32, true);
+        let adt_ty = ctx.alloc(TypeData::Adt { kind: AdtKind::Struct, def_id, args: vec![int_ty] });
+        assert_eq!(ctx.try_normalize_associated_type_def_id(adt_ty), Some(def_id));
+    }
+
+    #[test]
+    fn test_normalize_associated_type_abstract_self() {
+        let mut ctx = TypeContext::new();
+        let var_id = ctx.alloc(TypeData::InferVar { id: 0 });
+        assert_eq!(ctx.try_normalize_associated_type_def_id(var_id), None);
     }
 }
