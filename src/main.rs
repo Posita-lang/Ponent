@@ -17,8 +17,8 @@ mod lexer;
 mod parser;
 mod vfs;
 
-use crate::diagnostics::Diagnostic;
 use clap::Parser;
+use diagnostics::{ColoredEmitter, Diagnostic, DiagnosticEmitter};
 use hir::checker::TypeChecker;
 use hir::resolver::NameResolver;
 use hir::types::{CrateId, DefId, TypeContext};
@@ -26,10 +26,12 @@ use logos::Logos;
 use std::fs;
 use std::process;
 
-fn emit_error_diags(diags: &[Diagnostic]) {
-    for diag in diags {
-        if diag.is_error() {
-            eprintln!("{}", diag);
+/// Attach source text to all diagnostics in a slice so the emitter can
+/// render `^`-underline annotations (Rust-style source context).
+fn attach_source_to_diags(diags: &mut [Diagnostic], source: &str) {
+    for diag in diags.iter_mut() {
+        if diag.source.is_none() {
+            diag.source = Some(source.to_string());
         }
     }
 }
@@ -64,6 +66,9 @@ fn main() {
                         let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
                         match resolver.resolve_program(&program) {
                             Ok((mut symbols, mut trait_env, _diags, resolution_map)) => {
+                                let mut diags = _diags.into_inner();
+                                attach_source_to_diags(&mut diags, &source);
+
                                 // Register built-in traits and impls before type checking
                                 hir::builtins::register_builtins(
                                     &mut symbols,
@@ -82,20 +87,28 @@ fn main() {
                                         println!("Type checking succeeded.");
                                     }
                                     Err(errors) => {
-                                        emit_error_diags(&errors.into_inner());
+                                        let mut diags = errors.into_inner();
+                                        attach_source_to_diags(&mut diags, &source);
+                                        let mut emitter = ColoredEmitter::new();
+                                        emitter.emit_all(&diags);
                                         process::exit(1);
                                     }
                                 }
                             }
                             Err(errors) => {
-                                emit_error_diags(&errors.into_inner());
+                                let mut diags = errors.into_inner();
+                                attach_source_to_diags(&mut diags, &source);
+                                let mut emitter = ColoredEmitter::new();
+                                emitter.emit_all(&diags);
                                 process::exit(1);
                             }
                         }
                     }
                 }
-                Err(diagnostics) => {
-                    emit_error_diags(&diagnostics);
+                Err(mut diagnostics) => {
+                    attach_source_to_diags(&mut diagnostics, &source);
+                    let mut emitter = ColoredEmitter::new();
+                    emitter.emit_all(&diagnostics);
                     process::exit(1);
                 }
             }

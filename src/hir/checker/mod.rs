@@ -175,7 +175,7 @@ impl<'a> TypeChecker<'a> {
                         Diagnostic::error(
                             "`set` does not support pattern destructuring; use `let` instead",
                         )
-                        .with_code("E001")
+                        .with_code_str("E001")
                         .with_span(*span),
                     );
                 }
@@ -184,7 +184,7 @@ impl<'a> TypeChecker<'a> {
                 if *kind == VariableKind::Let && value.is_none() {
                     self.diagnostics.push(
                         Diagnostic::error("`let` requires an explicit initializer; it cannot rely on a type's default value")
-                            .with_code("E002")
+                            .with_code_str("E002")
                             .with_span(*span),
                     );
                 }
@@ -228,7 +228,7 @@ impl<'a> TypeChecker<'a> {
                             Diagnostic::error(
                                 "type has no default value and no initializer provided",
                             )
-                            .with_code("E003")
+                            .with_code_str("E003")
                             .with_span(*span),
                         );
                         (None, declared_ty)
@@ -430,8 +430,9 @@ impl<'a> TypeChecker<'a> {
                             if !self.ctx.is_bool(ty) {
                                 self.diagnostics.push(
                                     Diagnostic::error("contract condition must be boolean")
-                                        .with_code("E020")
-                                        .with_span(*cspan),
+                                        .with_code_str("E020")
+                                        .with_span(*cspan)
+                                        .with_label(expr.span(), format!("got {:?}", self.ctx.get(ty))),
                                 );
                             }
                         }
@@ -442,8 +443,9 @@ impl<'a> TypeChecker<'a> {
                             if !self.ctx.is_bool(ty) {
                                 self.diagnostics.push(
                                     Diagnostic::error("ensures clause must be boolean")
-                                        .with_code("E020")
-                                        .with_span(*cspan),
+                                        .with_code_str("E020")
+                                        .with_span(*cspan)
+                                        .with_label(expr.span(), format!("got {:?}", self.ctx.get(ty))),
                                 );
                             }
                         }
@@ -454,8 +456,9 @@ impl<'a> TypeChecker<'a> {
                                     Diagnostic::error(
                                         "decreases/terminates expression must be an integer",
                                     )
-                                    .with_code("E021")
-                                    .with_span(*cspan),
+                                    .with_code_str("E021")
+                                    .with_span(*cspan)
+                                    .with_label(expr.span(), format!("got {:?}", self.ctx.get(ty))),
                                 );
                             }
                         }
@@ -511,7 +514,7 @@ impl<'a> TypeChecker<'a> {
                 if !cond_is_bool {
                     self.diagnostics.push(
                         Diagnostic::error("if condition must be boolean")
-                            .with_code("E004")
+                            .with_code_str("E004")
                             .with_span(*span)
                             .with_label(cond.span(), format!("got {:?}", self.ctx.get(cond_ty))),
                     );
@@ -684,13 +687,13 @@ impl<'a> TypeChecker<'a> {
                         if enclosing_closure.is_some() {
                             self.diagnostics.push(
                                 Diagnostic::error("cannot `leave` out of a closure or async block")
-                                    .with_code("E005")
+                                    .with_code_str("E005")
                                     .with_span(*span),
                             );
                         } else if label.is_some() {
                             self.diagnostics.push(
                                 Diagnostic::error(format!("cannot `leave` with label `{}` – no matching labeled block or loop found", label.as_ref().unwrap()))
-                                    .with_code("E005")
+                                    .with_code_str("E005")
                                     .with_span(*span)
                             );
                         } else {
@@ -698,7 +701,7 @@ impl<'a> TypeChecker<'a> {
                                 Diagnostic::error(
                                     "`leave` statement outside of loop; use `return` instead",
                                 )
-                                .with_code("E005")
+                                .with_code_str("E005")
                                 .with_span(*span)
                                 .with_suggestion("use `return` to exit the current function"),
                             );
@@ -730,13 +733,13 @@ impl<'a> TypeChecker<'a> {
                                 Diagnostic::error(
                                     "cannot `continue` out of a closure or async block",
                                 )
-                                .with_code("E006")
+                                .with_code_str("E006")
                                 .with_span(*span),
                             );
                         } else {
                             self.diagnostics.push(
                                 Diagnostic::error("`continue` statement outside of loop")
-                                    .with_code("E006")
+                                    .with_code_str("E006")
                                     .with_span(*span)
                                     .with_suggestion("use `leave` or `return` instead"),
                             );
@@ -783,7 +786,7 @@ impl<'a> TypeChecker<'a> {
                         if !self.ctx.is_bool(post) {
                             self.diagnostics.push(
                                 Diagnostic::error("ensures condition must be boolean at return")
-                                    .with_code("E022")
+                                    .with_code_str("E022")
                                     .with_span(*span),
                             );
                         }
@@ -798,7 +801,7 @@ impl<'a> TypeChecker<'a> {
                 if !in_function {
                     self.diagnostics.push(
                         Diagnostic::error("`return` statement outside of function")
-                            .with_code("E007")
+                            .with_code_str("E007")
                             .with_span(*span),
                     );
                 }
@@ -807,7 +810,7 @@ impl<'a> TypeChecker<'a> {
                     if variant == "Err" && path.len() == 1 && path[0] == "Result" {
                         self.diagnostics.push(
                             Diagnostic::error("`return Err(...)` is not valid; use `leave with` instead")
-                                .with_code("E008")
+                                .with_code_str("E008")
                                 .with_span(*span)
                                 .with_suggestion("write `leave with error_value;` instead of `return Err(error_value);`")
                         );
@@ -1044,7 +1047,7 @@ impl<'a> TypeChecker<'a> {
                         None => {
                             self.diagnostics.push(
                                 Diagnostic::error("trait not found")
-                                    .with_code("E100")
+                                    .with_code_str("E100")
                                     .with_span(span),
                             );
                             return Ok(HirStmt::Error);
@@ -1075,9 +1078,10 @@ impl<'a> TypeChecker<'a> {
                                     tm_name,
                                     tp.join("::"),
                                 ))
-                                .with_code("E101")
+                                .with_code_str("E101")
                                 .with_help("every trait method must be implemented — add a `def` for it in this impl block")
-                                .with_span(span));
+                                .with_span(span)
+                                .with_label(trait_binding.span, "required by trait declaration here"));
                         }
                     }
 
@@ -1122,7 +1126,7 @@ impl<'a> TypeChecker<'a> {
                                         m.params.len(),
                                         trait_sig.params.len(),
                                     ))
-                                    .with_code("E103")
+                                    .with_code_str("E103")
                                     .with_span(m.span),
                                 );
                             }
@@ -1165,7 +1169,7 @@ impl<'a> TypeChecker<'a> {
                     {
                         self.diagnostics.push(
                             Diagnostic::error(format!("{}", orphan))
-                                .with_code("E102")
+                                .with_code_str("E102")
                                 .with_span(span),
                         );
                     }
@@ -1429,7 +1433,7 @@ impl<'a> TypeChecker<'a> {
                     self.ctx.get(expected),
                     self.ctx.get(actual)
                 );
-                let mut diag = Diagnostic::error(msg).with_code("E030").with_span(span);
+                let mut diag = Diagnostic::error(msg).with_code_str("E030").with_span(span);
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
                     diag = diag.with_suggestion(suggestion);
                 }
@@ -1494,9 +1498,8 @@ impl<'a> TypeChecker<'a> {
                     }
                 };
                 let mut diag = Diagnostic::error(msg)
-                    .with_code("E030")
-                    .with_span(span)
-                    .with_label(span, format!("expected {:?}", self.ctx.get(expected)));
+                    .with_code_str("E030")
+                    .with_span(span);
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
                     diag = diag.with_suggestion(suggestion);
                 }
@@ -1586,14 +1589,14 @@ impl<'a> TypeChecker<'a> {
                 Err(Diagnostic::error(
                     "safe cast from reference type requires explicit dereference or unsafe cast",
                 )
-                .with_code("E601")
+                .with_code_str("E601")
                 .with_span(span)
                 .with_suggestion("consider dereferencing first: `*expr as TargetType`")
                 .with_suggestion("or use `as!` for an unsafe bitcast"))
             } else {
                 Err(
                     Diagnostic::error("safe cast only allowed between numeric and boolean types")
-                        .with_code("E601")
+                        .with_code_str("E601")
                         .with_span(span)
                         .with_suggestion("use `From` trait for non-primitive type conversions"),
                 )
@@ -1611,13 +1614,13 @@ impl<'a> TypeChecker<'a> {
             } else if self.ctx.is_reference(from) && self.ctx.is_integer(to) {
                 Err(
                     Diagnostic::error("unsafe cast from reference to integer not yet supported")
-                        .with_code("E601")
+                        .with_code_str("E601")
                         .with_span(span)
                         .with_suggestion("consider using `*expr as usize` via a pointer cast"),
                 )
             } else {
                 Err(Diagnostic::error("unsafe cast requires compatible types (numeric<->numeric, ref<->ptr, ptr<->ptr)")
-                    .with_code("E601")
+                    .with_code_str("E601")
                     .with_span(span))
             }
         }
@@ -2103,8 +2106,15 @@ impl<'a> TypeChecker<'a> {
 
         // Build an informative error message
         let mut diag = Diagnostic::error(format!("no field `{}` found on type", name))
-            .with_code("E010")
+            .with_code_str("E010")
             .with_span(span);
+
+        // If we found the type definition, show where it was defined
+        if let TypeData::Adt { def_id, .. } = self.ctx.get(ty) {
+            if let Some(binding) = self.symbols.lookup_type_by_def_id(*def_id) {
+                diag = diag.with_label(binding.span, "type defined here");
+            }
+        }
 
         if !all_field_names.is_empty() {
             diag =

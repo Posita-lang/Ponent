@@ -39,6 +39,11 @@ pub struct Parser {
     recursion_depth: usize,
     max_recursion_depth: usize,
     restrictions: ParseRestrictions,
+    /// Once set after a top-level parse error, suppresses subsequent
+    /// "unexpected token at top level" diagnostics until one item
+    /// parses successfully.  Prevents the cascade of 20+ errors from
+    /// a single typo like `defw`.
+    cascade_suppressed: bool,
 }
 
 // Local Diagnostic removed — using crate::diagnostics::Diagnostic
@@ -82,6 +87,7 @@ impl Parser {
             recursion_depth: 0,
             max_recursion_depth: 256,
             restrictions: ParseRestrictions::STMT_EXPR,
+            cascade_suppressed: false,
         }
     }
 
@@ -164,7 +170,7 @@ impl Parser {
                 Ok(())
             }
             _ => Err(Diagnostic::error("expected '>'")
-                .with_code("E004")
+                .with_code_str("E004")
                 .with_span(self.span())),
         }
     }
@@ -173,12 +179,12 @@ impl Parser {
         match self.advance() {
             Ok(tok) if tok == expected => Ok(tok),
             Ok(tok) => Err(Diagnostic::error(format!("expected {:?}, found {:?}", expected, tok))
-                .with_code("E001")
+                .with_code_str("E001")
                 .with_help(format!("expected `{:?}` but saw `{:?}` — check for missing or extra tokens", expected, tok))
                 .with_suggestion(format!("try adding `{:?}` before the `{:?}`", expected, tok))
                 .with_span(self.span(),)),
             Err(()) => Err(Diagnostic::error("unexpected end of file")
-                .with_code("E002")
+                .with_code_str("E002")
                 .with_help("the source file ends before the expected token — check for unclosed blocks or missing items")
                 .with_suggestion("check that all `{`, `(`, and `[` are properly closed, and that the file is not truncated")
                 .with_span(self.span(),)),
@@ -186,7 +192,6 @@ impl Parser {
     }
 
     fn synchronize(&mut self) {
-        let mut reported = false;
         loop {
             match self.peek() {
                 Ok(Token::Semicolon) | Ok(Token::RBrace) => {
@@ -209,15 +214,32 @@ impl Parser {
                 | Ok(Token::Constraint) => return,
                 Err(()) => return,
                 _ => {
-                    let tok = self.advance().ok();
-                    if !reported {
-                        reported = true;
-                        self.diagnostics.push(Diagnostic::error(format!("unexpected token during error recovery: {:?}", tok))
-                            .with_code("E003")
-                            .with_help("the parser skipped this token while trying to recover from a previous error — check the error above first")
-                            .with_suggestion("fix the previous error first; this token was skipped automatically")
-                            .with_span(self.span(),));
-                    }
+                    self.advance().ok();
+                }
+            }
+        }
+    }
+
+    /// Skip tokens that are ONLY valid inside a function body (Set, Let, Return,
+    /// While, For, If, etc.) and stop at genuine top-level keywords or EOF.
+    fn skip_to_next_top_level(&mut self) {
+        loop {
+            match self.peek() {
+                Ok(Token::Def)
+                | Ok(Token::Type)
+                | Ok(Token::Trait)
+                | Ok(Token::Impl)
+                | Ok(Token::Constraint)
+                | Ok(Token::Edition)
+                | Ok(Token::Import)
+                | Ok(Token::From)
+                | Ok(Token::Extern)
+                | Ok(Token::Comptime)
+                | Ok(Token::Async)
+                | Ok(Token::At) => return,
+                Err(()) => return,
+                _ => {
+                    self.advance().ok();
                 }
             }
         }
@@ -363,7 +385,12 @@ impl Parser {
             match self.peek() {
                 Err(()) => break,
                 _ => match self.parse_item() {
-                    Ok(item) => items.push(item),
+                    Ok(item) => {
+                        if !matches!(item, Stmt::Error(_)) {
+                            self.cascade_suppressed = false;
+                        }
+                        items.push(item);
+                    }
                     Err(diag) => {
                         self.diagnostics.push(diag);
                         self.synchronize();
@@ -426,7 +453,7 @@ impl Parser {
                                 "expected 'def' or '{{' after comptime, found {:?}",
                                 tok
                             ))
-                            .with_code("E004")
+                            .with_code_str("E004")
                             .with_help("`comptime` must be followed by `def` (to declare a comptime function) or `{` (to start a comptime block)")
                             .with_suggestion("try `comptime def name(...) { ... }` for a comptime function, or `comptime { ... }` for a comptime block")
                             .with_span(self.span(),))
@@ -461,11 +488,27 @@ impl Parser {
             Ok(Token::Constraint) => self.parse_constraint(),
             _ => {
                 let tok = self.advance().ok();
-                Err(Diagnostic::error(format!("unexpected token at top level: {:?}", tok))
-                    .with_code("E003")
+                let mut diag = Diagnostic::error(format!("unexpected token at top level: {:?}", tok))
+                    .with_code_str("E003")
                     .with_help("only items (`def`, `type`, `trait`, `import`, `edition`, `constraint`, `extern`, `impl`, `comptime`, `async`) are allowed at the top level")
                     .with_suggestion("move this token inside a function body, or start a new top-level declaration")
-                    .with_span(self.span(),))
+                    .with_span(self.span(),);
+                // "Did you mean?" for common keyword typos (Rust-style)
+                if let Some(Token::Ident(name)) = &tok {
+                    if let Some(suggestion) = did_you_mean_keyword(name) {
+                        diag = diag.with_suggestion(suggestion);
+                    }
+                }
+                if self.cascade_suppressed {
+                    // Cascade is already active.  Advance past this token
+                    // unconditionally and skip to the next meaningful item.
+                    // Do NOT stop at sync tokens (Set, Let, etc.) — those
+                    // are only valid inside a function body, not at top level.
+                    self.skip_to_next_top_level();
+                    return Ok(Stmt::Error(Span::new(0, 0)));
+                }
+                self.cascade_suppressed = true;
+                Err(diag)
             }
         }
     }
@@ -480,7 +523,7 @@ impl Parser {
                 .unwrap_or_else(|| format!("{:?}", tok)),
             Err(()) => {
                 return Err(Diagnostic::error("unexpected end of file in attribute")
-                    .with_code("E002")
+                    .with_code_str("E002")
                     .with_help("attributes must have a name — e.g. `@deprecated` or `@cfg(...)`")
                     .with_suggestion("add an attribute name after `@`, or remove the `@` if this is not an attribute")
                     .with_span(self.span(),));
@@ -540,7 +583,7 @@ impl Parser {
             Ok(Token::Ident(name)) => name,
             Ok(tok) => {
                 return Err(Diagnostic::error(format!("expected function name, found {:?}", tok))
-                    .with_code("E004")
+                    .with_code_str("E004")
                     .with_help("a function name must follow `def` — use a valid identifier")
                     .with_suggestion("use a valid identifier like `my_function` — keywords cannot be used as function names")
                     .with_span(self.span(),));
@@ -548,7 +591,7 @@ impl Parser {
             Err(()) => {
                 return Err(
                     Diagnostic::error("unexpected end of file in function definition")
-                        .with_code("E002")
+                        .with_code_str("E002")
                         .with_help(
                             "function definition is incomplete — expected a name after `def`",
                         )
@@ -651,7 +694,7 @@ impl Parser {
             Ok(Token::Ident(name)) => name,
             _ => {
                 return Err(Diagnostic::error("expected trait name")
-                    .with_code("E004")
+                    .with_code_str("E004")
                     .with_help("`trait` must be followed by a name — e.g. `trait Display { ... }`")
                     .with_suggestion(
                         "add a trait name after `trait`, e.g. `trait MyTrait { def foo(&self); }`",
@@ -675,7 +718,7 @@ impl Parser {
                             Ok(Token::Ident(n)) => n,
                             _ => {
                                 return Err(Diagnostic::error("expected associated type name")
-                                    .with_code("E004")
+                                    .with_code_str("E004")
                                     .with_help("`type` in a trait body must be followed by a name — e.g. `type Output;`")
                                     .with_suggestion("add an associated type name, e.g. `type Output;` or `type Item = Int<32>;`")
                                     .with_span(self.span(),));
@@ -700,7 +743,7 @@ impl Parser {
                             Ok(Token::Ident(n)) => n,
                             _ => {
                                 return Err(Diagnostic::error("expected method name")
-                                    .with_code("E004")
+                                    .with_code_str("E004")
                                     .with_help("`def` in a trait body must be followed by a method name")
                                     .with_suggestion("add a method name after `def`, e.g. `def method_name(&self) -> Int<32>;`")
                                     .with_span(self.span(),));
@@ -746,7 +789,7 @@ impl Parser {
                     }
                     _ => {
                         return Err(Diagnostic::error("expected 'type' or 'def' in trait body")
-                            .with_code("E004")
+                            .with_code_str("E004")
                             .with_help("trait bodies can contain `type` (associated types) or `def` (method signatures)")
                             .with_suggestion("use `type AssocType;` for an associated type or `def method(&self);` for a method")
                             .with_span(self.span(),));
@@ -772,7 +815,7 @@ impl Parser {
             Ok(Token::Ident(name)) => name,
             _ => {
                 return Err(Diagnostic::error("expected constraint name")
-                    .with_code("E004")
+                    .with_code_str("E004")
                     .with_help("`constraint` must be followed by a name — e.g. `constraint MyConstraint { ... }`")
                     .with_suggestion("add a name after `constraint`, e.g. `constraint MyConstraint { TraitA + TraitB }`")
                     .with_span(self.span(),));
@@ -810,7 +853,7 @@ impl Parser {
                     Ok(Token::Ident(name)) => (format!("'{}", name), true),
                     _ => {
                         return Err(Diagnostic::error("expected lifetime name after `'`")
-                            .with_code("E004")
+                            .with_code_str("E004")
                             .with_help(
                                 "lifetime parameters use `'name` syntax — e.g. `<'a, 'b, T>`",
                             )
@@ -825,7 +868,7 @@ impl Parser {
                     Ok(Token::Ident(name)) => (name, false),
                     _ => {
                         return Err(Diagnostic::error("expected type parameter name")
-                            .with_code("E004")
+                            .with_code_str("E004")
                             .with_help("type parameters must have a name — e.g. `<T>` or `<K, V>`")
                             .with_suggestion(
                                 "use a valid identifier like `T` or `Item` for the type parameter",
@@ -861,7 +904,7 @@ impl Parser {
                 }
                 _ => {
                     return Err(Diagnostic::error("expected ',' or '>'")
-                        .with_code("E004")
+                        .with_code_str("E004")
                         .with_help("type parameter lists use `<T, U>` syntax — separate parameters with `,` and close with `>`")
                         .with_suggestion("add `>` to close the type parameter list, or `,` to add another parameter")
                     .with_span(self.span(),));
@@ -907,7 +950,7 @@ impl Parser {
             Ok(tok) => {
                 return Err(
                     Diagnostic::error(format!("expected parameter name, found {:?}", tok))
-                        .with_code("E004")
+                        .with_code_str("E004")
                         .with_help("parameters must have a name — e.g. `def foo(x: Int<32>)`")
                         .with_suggestion(
                             "use a valid identifier like `x` or `value` for the parameter",
@@ -918,7 +961,7 @@ impl Parser {
             Err(()) => {
                 return Err(
                     Diagnostic::error("unexpected end of file in parameter list")
-                        .with_code("E002")
+                        .with_code_str("E002")
                         .with_help(
                             "parameter list is incomplete — expected a parameter name or `)`",
                         )
@@ -951,7 +994,7 @@ impl Parser {
     fn parse_contract(&mut self) -> Result<Contract, Diagnostic> {
         let start = self.span().start;
         match self.advance().map_err(|_| Diagnostic::error("unexpected token")
-            .with_code("E003")
+            .with_code_str("E003")
             .with_help("unexpected syntax in contract — expected `requires`, `ensures`, `invariant`, `decreases`, or `terminates`")
             .with_span(Span::new(0, 0)))? {
             Token::Requires => {
@@ -968,7 +1011,7 @@ impl Parser {
                             self.advance().ok();
                         } else {
                             return Err(Diagnostic::error("expected '=>' after on_timeout")
-                                .with_code("E004")
+                                .with_code_str("E004")
                                 .with_help("`ensures on_timeout` must be followed by `=> <expression>`")
                                 .with_suggestion("add `=> <expression>` after `on_timeout`")
                                 .with_span(self.span(),));
@@ -981,7 +1024,7 @@ impl Parser {
                             self.advance().ok();
                         } else {
                             return Err(Diagnostic::error("expected '=>' after on_cancel")
-                                .with_code("E004")
+                                .with_code_str("E004")
                                 .with_help("`ensures on_cancel` must be followed by `=> <expression>`")
                                 .with_suggestion("add `=> <expression>` after `on_cancel`")
                                 .with_span(self.span(),));
@@ -1004,7 +1047,7 @@ impl Parser {
                                     self.advance().ok();
                                 } else {
                                     return Err(Diagnostic::error("expected '=>' after on Ok(...)")
-                                        .with_code("E004")
+                                        .with_code_str("E004")
                                         .with_help("`ensures on Ok(...)` must be followed by `=> <expression>`")
                                         .with_suggestion("add `=> <expression>` after `on Ok(pat)`")
                                         .with_span(self.span(),));
@@ -1024,7 +1067,7 @@ impl Parser {
                                     self.advance().ok();
                                 } else {
                                     return Err(Diagnostic::error("expected '=>' after on Err(...)")
-                                        .with_code("E004")
+                                        .with_code_str("E004")
                                         .with_help("`ensures on Err(...)` must be followed by `=> <expression>`")
                                         .with_suggestion("add `=> <expression>` after `on Err(pat)`")
                                         .with_span(self.span(),));
@@ -1033,7 +1076,7 @@ impl Parser {
                             }
                             _ => {
                                 return Err(Diagnostic::error("expected 'Ok' or 'Err' after 'on'")
-                                    .with_code("E004")
+                                    .with_code_str("E004")
                                     .with_help("`ensures on` must be followed by `Ok(...)` or `Err(...)`")
                                     .with_suggestion("try `ensures on Ok(result) => result != 0` or `ensures on Err(e) => e != 0`")
                                     .with_span(self.span(),));
@@ -1080,7 +1123,7 @@ impl Parser {
                     "maximum recursion depth {} exceeded",
                     self.max_recursion_depth
                 ))
-                .with_code("E006")
+                .with_code_str("E006")
                 .with_help("the parser reached its recursion limit — the type/structure may be deeply nested or self-referential")
                 .with_suggestion("try breaking up deeply nested structures, or use less complex type expressions")
                 .with_span(self.span(),));
@@ -1105,7 +1148,7 @@ impl Parser {
                     Ok(Token::Ident(name)) => name,
                     _ => {
                         return Err(Diagnostic::error("expected associated type name after `::`")
-                            .with_code("E004")
+                            .with_code_str("E004")
                             .with_help("qualified paths use `<Type as Trait>::AssocType` syntax")
                             .with_suggestion("add the associated type name after `::`, e.g. `<T as Display>::Output`")
                             .with_span(self.span(),));
@@ -1133,7 +1176,7 @@ impl Parser {
                     Ok(Token::Ident(name)) => name,
                     _ => {
                         return Err(Diagnostic::error("expected associated type name after `::`")
-                            .with_code("E004")
+                            .with_code_str("E004")
                             .with_help("qualified paths use `<Type as Trait>::AssocType` syntax")
                             .with_suggestion("add the associated type name after `::`, e.g. `<T as Display>::Output`")
                             .with_span(self.span(),));
@@ -1155,7 +1198,7 @@ impl Parser {
                         Ok(Token::Ident(name)) => Some(name),
                         _ => {
                             return Err(Diagnostic::error("expected lifetime name after `'`")
-                                .with_code("E004")
+                                .with_code_str("E004")
                                 .with_help("lifetimes use `'name` syntax — e.g. `&'a T`")
                                 .with_suggestion("add a lifetime name after `'`, e.g. `&'a mut T`")
                                 .with_span(self.span(),));
@@ -1222,7 +1265,7 @@ impl Parser {
                     Ok(Token::Ident(n)) => n,
                     _ => {
                         return Err(Diagnostic::error("expected identifier after exists")
-                            .with_code("E004")
+                            .with_code_str("E004")
                             .with_help("`exists` must be followed by a bound variable name — e.g. `exists n: T invariant ...`")
                             .with_suggestion("add a bound variable name, e.g. `exists n: Int<32> invariant n > 0`")
                             .with_span(self.span(),));
@@ -1259,7 +1302,7 @@ impl Parser {
                             path.push(part);
                         } else {
                             return Err(Diagnostic::error("expected identifier after '::'")
-                                .with_code("E004")
+                                .with_code_str("E004")
                                 .with_help("`::` must be followed by an identifier — e.g. `std::collections::HashMap`")
                                 .with_suggestion("add an identifier after `::`, e.g. `MyModule::MyType`")
                                 .with_span(self.span(),));
@@ -1374,7 +1417,7 @@ impl Parser {
                                 }
                                 _ => {
                                     return Err(Diagnostic::error("expected ',' or '>' in type parameters")
-                                        .with_code("E004")
+                                        .with_code_str("E004")
                                         .with_help("generic type parameters use `<T, U>` syntax — separate with `,` and close with `>`")
                                         .with_suggestion("add `>` to close the generic type, or `,` to add another type argument")
                                         .with_span(self.span(),));
@@ -1411,7 +1454,7 @@ impl Parser {
                                 }
                                 _ => {
                                     return Err(Diagnostic::error("expected ',' or ')' in tuple type")
-                                        .with_code("E004")
+                                        .with_code_str("E004")
                                         .with_help("tuple types use `(T, U)` syntax — separate with `,` and close with `)`")
                                         .with_suggestion("add `)` to close the tuple type, or `,` to add another element")
                                         .with_span(self.span(),));
@@ -1450,17 +1493,17 @@ impl Parser {
                             Ok(Type::Path(vec![format!("'{}", name)], Span::new(start, end)))
                         }
                         _ => Err(Diagnostic::error("expected lifetime name after `'`")
-                            .with_code("E004")
+                            .with_code_str("E004")
                             .with_span(self.span())),
                     }
                 }
                 Ok(tok) => Err(Diagnostic::error(format!("expected type, found {:?}", tok))
-                    .with_code("E004")
+                    .with_code_str("E004")
                     .with_help("expected a valid type expression — try `Int<32>`, `&T`, `[T]`, `(A, B)`, etc.")
                     .with_suggestion("use a type name like `Int<32>`, `Bool`, or `String`")
                     .with_span(self.span(),)),
                 Err(()) => Err(Diagnostic::error("unexpected end of file in type")
-                    .with_code("E002")
+                    .with_code_str("E002")
                     .with_help("type expression is incomplete — check for missing type arguments or brackets")
                     .with_suggestion("check for unclosed `<`, `[`, `(`, or `&` in the type expression")
                     .with_span(self.span(),)),
@@ -1476,7 +1519,7 @@ impl Parser {
                     "maximum recursion depth {} exceeded",
                     self.max_recursion_depth
                 ))
-                .with_code("E006")
+                .with_code_str("E006")
                 .with_help("the parser reached its recursion limit — the type/structure may be deeply nested or self-referential")
                 .with_suggestion("try breaking up deeply nested structures, or use less complex type expressions")
                 .with_span(self.span(),));
@@ -1515,7 +1558,7 @@ impl Parser {
                     "maximum recursion depth {} exceeded",
                     self.max_recursion_depth
                 ))
-                .with_code("E006")
+                .with_code_str("E006")
                 .with_help("the parser reached its recursion limit — the type/structure may be deeply nested or self-referential")
                 .with_suggestion("try breaking up deeply nested structures, or use less complex type expressions")
                 .with_span(self.span(),));
@@ -1579,7 +1622,7 @@ impl Parser {
                         | Ok(Token::SlashEq)
                 ) {
                     let op_token = self.advance().map_err(|_| Diagnostic::error("unexpected token")
-                        .with_code("E003")
+                        .with_code_str("E003")
                         .with_help("expected an assignment operator (`=`, `+=`, `-=`, `*=`, `/=`) after the target")
                         .with_span(Span::new(0, 0)))?;
                     let op = match op_token {
@@ -1640,7 +1683,7 @@ impl Parser {
         }
         Err(
             Diagnostic::error("expected variable definition after ghost")
-                .with_code("E004")
+                .with_code_str("E004")
                 .with_help(
                     "`ghost` must be followed by a variable definition — e.g. `ghost set x = 0;`",
                 )
@@ -1666,7 +1709,7 @@ impl Parser {
         let start = self.span().start;
         let kind = match self.advance().map_err(|_| {
             Diagnostic::error("unexpected token")
-                .with_code("E003")
+                .with_code_str("E003")
                 .with_help("expected `set` or `let` to begin a variable definition")
                 .with_span(Span::new(0, 0))
         })? {
@@ -1711,7 +1754,7 @@ impl Parser {
                         "expected variable name, found {:?}",
                         tok
                     ))
-                    .with_code("E004")
+                    .with_code_str("E004")
                     .with_help(
                         "a variable name must follow `set` or `let` — use a valid identifier",
                     )
@@ -1722,7 +1765,7 @@ impl Parser {
                 }
                 Err(()) => {
                     return Err(Diagnostic::error("unexpected end of file in variable definition")
-                        .with_code("E002")
+                        .with_code_str("E002")
                         .with_help("variable definition is incomplete — expected a name or pattern after `set`/`let`")
                         .with_suggestion("add a variable name after `set`/`let`, e.g. `set x = 42;`")
                         .with_span(self.span(),));
@@ -2109,7 +2152,7 @@ impl Parser {
             Ok(Token::Ident(name)) => name,
             _ => {
                 return Err(Diagnostic::error("expected identifier for scope_cleanup")
-                    .with_code("E004")
+                    .with_code_str("E004")
                     .with_help("`scope_cleanup` must be followed by `@<name>` — e.g. `scope_cleanup @cleanup { ... }`")
                     .with_suggestion("use `scope_cleanup @identifier { body }` syntax")
                     .with_span(self.span(),));
@@ -2127,7 +2170,7 @@ impl Parser {
         } else if matches!(self.peek(), Ok(Token::Overrides)) {
             return Err(
                 Diagnostic::error("`overrides` must be used together with `propagates`")
-                    .with_code("E004")
+                    .with_code_str("E004")
                     .with_suggestion("use both modifiers: `propagates overrides`")
                     .with_span(self.span()),
             );
@@ -2153,7 +2196,7 @@ impl Parser {
             Ok(Token::Ident(name)) => name,
             _ => {
                 return Err(Diagnostic::error("expected identifier for trigger")
-                    .with_code("E004")
+                    .with_code_str("E004")
                     .with_help("`trigger` must be followed by `@<name>` — e.g. `trigger @cleanup;`")
                     .with_suggestion("use `trigger @identifier;` syntax")
                     .with_span(self.span()));
@@ -2175,14 +2218,14 @@ impl Parser {
             Ok(Token::StringLiteral(Ok(s))) => s,
             Ok(tok) => {
                 return Err(Diagnostic::error(format!("expected edition string, found {:?}", tok))
-                    .with_code("E004")
+                    .with_code_str("E004")
                     .with_help("`edition = \"<version>\"` expects a string literal — e.g. `edition = \"2024\"`")
                     .with_suggestion("use a string literal like `\"2024\"` for the edition")
                     .with_span(self.span(),));
             }
             Err(()) => {
                 return Err(Diagnostic::error("unexpected end of file in edition declaration")
-                    .with_code("E002")
+                    .with_code_str("E002")
                     .with_help("`edition = \"<version>\"` declaration is incomplete — expected a string literal after `=`")
                     .with_suggestion("add a string literal after `=`, e.g. `edition = \"2024\";`")
                     .with_span(self.span(),));
@@ -2203,7 +2246,7 @@ impl Parser {
         match self.advance() {
             Ok(Token::Star) => {
                 return Err(Diagnostic::error("wildcard import is prohibited: `import *` is illegal")
-                    .with_code("E005")
+                    .with_code_str("E005")
                     .with_help("explicit imports improve clarity and maintainability — list the items you need, or use `import path` for the module itself")
                     .with_suggestion("use named imports: `import path::Item` or `from path import { Item1, Item2 }`")
                     .with_span(self.span(),));
@@ -2211,7 +2254,7 @@ impl Parser {
             Ok(Token::Ident(part)) => path.push(part),
             _ => {
                 return Err(Diagnostic::error("expected module path")
-                    .with_code("E004")
+                    .with_code_str("E004")
                     .with_help("after `import` or `from`, provide a module path — e.g. `import std::collections`")
                     .with_suggestion("add a module path like `std::collections` or `my_module`")
                     .with_span(self.span(),));
@@ -2222,7 +2265,7 @@ impl Parser {
             match self.advance() {
                 Ok(Token::Star) => {
                     return Err(Diagnostic::error("wildcard import is prohibited: `import *` is illegal")
-                    .with_code("E005")
+                    .with_code_str("E005")
                     .with_help("explicit imports improve clarity and maintainability — list the items you need, or use `import path` for the module itself")
                     .with_suggestion("use named imports: `import path::Item` or `from path import { Item1, Item2 }`")
                     .with_span(self.span(),));
@@ -2230,7 +2273,7 @@ impl Parser {
                 Ok(Token::Ident(part)) => path.push(part),
                 _ => {
                     return Err(Diagnostic::error("expected identifier after '::'")
-                        .with_code("E004")
+                        .with_code_str("E004")
                         .with_help("`::` must be followed by an identifier — e.g. `std::collections::HashMap`")
                         .with_suggestion("add an identifier after `::`, e.g. `MyModule::MyType`")
                         .with_span(self.span(),));
@@ -2248,7 +2291,7 @@ impl Parser {
                 items.push(match self.advance() {
                     Ok(Token::Star) => {
                         return Err(Diagnostic::error("wildcard import is prohibited: `import *` is illegal")
-                    .with_code("E005")
+                    .with_code_str("E005")
                     .with_help("explicit imports improve clarity and maintainability — list the items you need, or use `import path` for the module itself")
                     .with_suggestion("use named imports: `import path::Item` or `from path import { Item1, Item2 }`")
                     .with_span(self.span(),));
@@ -2256,7 +2299,7 @@ impl Parser {
                     Ok(Token::Ident(item)) => item,
                     _ => {
                         return Err(Diagnostic::error("expected import item name")
-                            .with_code("E004")
+                            .with_code_str("E004")
                             .with_help("import items must be identifiers — e.g. `import std::{HashMap, HashSet}`")
                             .with_suggestion("list specific item names: `import path::{Item1, Item2}`")
                             .with_span(self.span(),));
@@ -2275,7 +2318,7 @@ impl Parser {
                     Ok(Token::Ident(a)) => Some(a),
                     _ => {
                         return Err(Diagnostic::error("expected alias name")
-                            .with_code("E004")
+                            .with_code_str("E004")
                             .with_help("`as` must be followed by an alias name — e.g. `import path as alias`")
                             .with_suggestion("add an alias name after `as`, e.g. `import path as MyAlias`")
                             .with_span(self.span(),));
@@ -2301,7 +2344,7 @@ impl Parser {
                 match self.advance() {
                     Ok(Token::Star) => {
                         return Err(Diagnostic::error("wildcard import is prohibited: `import *` is illegal")
-                    .with_code("E005")
+                    .with_code_str("E005")
                     .with_help("explicit imports improve clarity and maintainability — list the items you need, or use `import path` for the module itself")
                     .with_suggestion("use named imports: `import path::Item` or `from path import { Item1, Item2 }`")
                     .with_span(self.span(),));
@@ -2309,7 +2352,7 @@ impl Parser {
                     Ok(Token::Ident(item)) => items.push(item),
                     _ => {
                         return Err(Diagnostic::error("expected import item name")
-                            .with_code("E004")
+                            .with_code_str("E004")
                             .with_help("after `from <path> import`, list the items to import — e.g. `from std import { HashMap }`")
                             .with_suggestion("list specific item names inside `{ }`: `from path import { Item }`")
                             .with_span(self.span(),));
@@ -2325,7 +2368,7 @@ impl Parser {
                     }
                     _ => {
                         return Err(Diagnostic::error("expected ',' or '}' in import list")
-                        .with_code("E004")
+                        .with_code_str("E004")
                         .with_help("import items are separated by commas and enclosed in braces — e.g. `{ A, B }`")
                         .with_suggestion("add `}` to close the import list, or `,` to add another item")
                         .with_span(self.span(),));
@@ -2342,7 +2385,7 @@ impl Parser {
                 Ok(Token::Ident(a)) => Some(a),
                 _ => {
                     return Err(Diagnostic::error("expected alias name")
-                        .with_code("E004")
+                        .with_code_str("E004")
                         .with_help(
                             "`as` must be followed by an alias name — e.g. `import path as alias`",
                         )
@@ -2372,7 +2415,7 @@ impl Parser {
             Ok(Token::StringLiteral(Ok(s))) => s,
             _ => {
                 return Err(Diagnostic::error("expected ABI string after 'extern'")
-                    .with_code("E004")
+                    .with_code_str("E004")
                     .with_help("`extern` must be followed by an ABI string — e.g. `extern \"C\"`")
                     .with_suggestion("add an ABI string like `\"C\"` after `extern`")
                     .with_span(self.span()));
@@ -2383,7 +2426,7 @@ impl Parser {
             Ok(Token::Ident(name)) => name,
             _ => {
                 return Err(Diagnostic::error("expected function name")
-                    .with_code("E004")
+                    .with_code_str("E004")
                     .with_help("after `extern \"<ABI>\" def`, a function name is expected")
                     .with_suggestion(
                         "add a function name after `def`, e.g. `extern \"C\" def my_function()`",
@@ -2440,7 +2483,7 @@ impl Parser {
             Ok(Token::Ident(name)) => name,
             _ => {
                 return Err(Diagnostic::error("expected type name")
-                    .with_code("E004")
+                    .with_code_str("E004")
                     .with_help("after `type`, a type name (identifier) is expected — e.g. `type MyType = ...`")
                     .with_suggestion("add a type name after `type`, e.g. `type MyType = Int<32>;`")
                     .with_span(self.span(),));
@@ -2471,7 +2514,7 @@ impl Parser {
                             Ok(Token::Ident(n)) => n,
                             _ => {
                                 return Err(Diagnostic::error("expected field name")
-                                    .with_code("E004")
+                                    .with_code_str("E004")
                                     .with_help(
                                         "struct fields must have a name — e.g. `name: String`",
                                     )
@@ -2527,7 +2570,7 @@ impl Parser {
                             Ok(Token::Ident(n)) => n,
                             _ => {
                                 return Err(Diagnostic::error("expected variant name")
-                                    .with_code("E004")
+                                    .with_code_str("E004")
                                     .with_help(
                                         "enum variants must have a name — e.g. `enum { A, B }`",
                                     )
@@ -2567,7 +2610,7 @@ impl Parser {
                             Ok(Token::StringLiteral(Ok(s))) => s,
                             _ => {
                                 return Err(Diagnostic::error("expected string for missing_match")
-                                    .with_code("E004")
+                                    .with_code_str("E004")
                                     .with_help("`missing_match` expects a string literal — e.g. `with missing_match = \"message\"`")
                                     .with_suggestion("use a string literal like `\"not all variants covered\"`")
                                     .with_span(self.span(),));
@@ -2650,7 +2693,7 @@ impl Parser {
             match self.peek() {
                 Ok(Token::Ident(_)) | Ok(Token::Default) | Ok(Token::NoDefault) => {
                     let tok = self.advance().map_err(|_| Diagnostic::error("unexpected token")
-                        .with_code("E003")
+                        .with_code_str("E003")
                         .with_help("expected a type modifier name (`overflow`, `validate`, `default`, `no_default`) after `with`")
                         .with_span(Span::new(0, 0)))?;
                     match tok {
@@ -2662,7 +2705,7 @@ impl Parser {
                                 Ok(Token::Trap) => OverflowPolicy::Trap,
                                 _ => {
                                     return Err(Diagnostic::error("expected overflow policy (wrap, saturate, trap)")
-                                        .with_code("E007")
+                                        .with_code_str("E007")
                                         .with_help("`overflow` policy must be one of: `wrap`, `saturate`, or `trap`")
                                         .with_suggestion("use one of: `wrap`, `saturate`, or `trap`")
                                         .with_span(self.span(),));
@@ -2749,7 +2792,7 @@ impl Parser {
                     Ok(Token::Ident(name)) => name,
                     _ => {
                         return Err(Diagnostic::error("expected trait name")
-                            .with_code("E004")
+                            .with_code_str("E004")
                             .with_help("expected a trait name in `impl ... for Type` — e.g. `impl Display for MyType { ... }`")
                             .with_suggestion("add a trait name: `impl TraitName for MyType { ... }`")
                             .with_span(self.span(),));
@@ -2761,7 +2804,7 @@ impl Parser {
                         Ok(Token::Ident(part)) => part,
                         _ => {
                             return Err(Diagnostic::error("expected identifier after '::'")
-                                .with_code("E004")
+                                .with_code_str("E004")
                                 .with_help("`::` must be followed by an identifier — e.g. `std::collections::HashMap`")
                                 .with_span(self.span(),));
                         }
@@ -2792,7 +2835,7 @@ impl Parser {
                     Ok(Token::Ident(n)) => n,
                     _ => {
                         return Err(Diagnostic::error("expected associated type name")
-                            .with_code("E004")
+                            .with_code_str("E004")
                             .with_help("`type` in an impl block must be followed by a name — e.g. `type Output = Int<32>;`")
                             .with_span(self.span(),));
                     }
@@ -2833,7 +2876,7 @@ impl Parser {
             Ok(tok) => {
                 return Err(
                     Diagnostic::error(format!("expected method name, found {:?}", tok))
-                        .with_code("E004")
+                        .with_code_str("E004")
                         .with_help("a method name must follow `def` in an impl block")
                         .with_suggestion(
                             "use a valid identifier like `my_method` for the method name",
@@ -2844,7 +2887,7 @@ impl Parser {
             Err(()) => {
                 return Err(
                     Diagnostic::error("unexpected end of file in method definition")
-                        .with_code("E002")
+                        .with_code_str("E002")
                         .with_help("method definition is incomplete — expected a name after `def`")
                         .with_suggestion(
                             "add a method name after `def`, e.g. `def process(&mut self) { ... }`",
@@ -2935,7 +2978,7 @@ impl Parser {
                 })
             }
             _ => Err(Diagnostic::error("expected 'self'")
-                .with_code("E004")
+                .with_code_str("E004")
                 .with_help("method parameters must start with `self`, `&self`, or `&mut self`")
                 .with_suggestion("try `self`, `&self`, or `&mut self` as the first parameter")
                 .with_span(self.span())),
@@ -2950,7 +2993,7 @@ impl Parser {
                     "maximum recursion depth {} exceeded",
                     self.max_recursion_depth
                 ))
-                .with_code("E006")
+                .with_code_str("E006")
                 .with_help("the parser reached its recursion limit — the type/structure may be deeply nested or self-referential")
                 .with_suggestion("try breaking up deeply nested structures, or use less complex type expressions")
                 .with_span(self.span(),));
@@ -2966,7 +3009,7 @@ impl Parser {
             Ok(t) => t.clone(),
             Err(()) => {
                 return Err(Diagnostic::error("unexpected end of file in pattern")
-                    .with_code("E002")
+                    .with_code_str("E002")
                     .with_help("pattern is incomplete — expected a pattern expression (literal, variable, `_`, etc.)")
                     .with_suggestion("add a pattern like `x`, `_`, `42`, or `Some(val)`")
                     .with_span(self.span(),));
@@ -3007,7 +3050,7 @@ impl Parser {
                             Ok(Token::Ident(f)) => f,
                             _ => {
                                 return Err(Diagnostic::error("expected field name")
-                                    .with_code("E004")
+                                    .with_code_str("E004")
                                     .with_help("pattern fields must have a name — e.g. `Point { x, y }`")
                                     .with_suggestion("add a field name like `x`, `name`, or `value`")
                                     .with_span(self.span(),));
@@ -3051,7 +3094,7 @@ impl Parser {
                         Ok(Token::Ident(variant)) => variant,
                         _ => {
                             return Err(Diagnostic::error("expected variant name")
-                                .with_code("E004")
+                                .with_code_str("E004")
                                 .with_help("expected a variant name after `::` in enum pattern")
                                 .with_suggestion("add a variant name after `::`, e.g. `Option::Some(val)`")
                                 .with_span(self.span(),));
@@ -3096,7 +3139,7 @@ impl Parser {
                 Ok(Pattern::Tuple(patterns, Span::new(start, self.span().end)))
             }
             _ => Err(Diagnostic::error("expected pattern")
-                .with_code("E004")
+                .with_code_str("E004")
                 .with_help("expected a valid pattern — try a literal, variable name, `_`, struct pattern, or tuple pattern")
                 .with_suggestion("try `x`, `_`, `42`, `true`, `Point { x, y }`, or `Some(val)`")
                 .with_span(self.span(),)),
@@ -3115,7 +3158,7 @@ impl Parser {
                     "maximum recursion depth {} exceeded",
                     self.max_recursion_depth
                 ))
-                .with_code("E006")
+                .with_code_str("E006")
                 .with_help("the parser reached its recursion limit — the type/structure may be deeply nested or self-referential")
                 .with_suggestion("try breaking up deeply nested structures, or use less complex type expressions")
                 .with_span(self.span(),));
@@ -3298,7 +3341,7 @@ impl Parser {
                 );
                 if is_operator_arg {
                     let op_tok = self.advance().map_err(|_| Diagnostic::error("unexpected token")
-                        .with_code("E003")
+                        .with_code_str("E003")
                         .with_help("expected an expression after the operator position")
                         .with_span(Span::new(0, 0)))?;
                     let op_name = match op_tok {
@@ -3313,7 +3356,7 @@ impl Parser {
                     Ok(Expr::Ident(op_name, Span::new(start, end)))
                 } else {
                     match self.advance().map_err(|_| Diagnostic::error("unexpected token")
-                        .with_code("E003")
+                        .with_code_str("E003")
                         .with_help("expected a unary operator (`-`, `*`, `!`, `~`, `&`, `move`)")
                         .with_span(Span::new(0, 0)))? {
                         Token::Minus => {
@@ -3335,7 +3378,7 @@ impl Parser {
                             })
                         }
                         _ => Err(Diagnostic::error("unexpected operator in expression")
-                            .with_code("E007")
+                            .with_code_str("E007")
                             .with_help("this operator is not valid at this position — check for missing operands or extra operators")
                             .with_span(self.span(),)),
                     }
@@ -3522,7 +3565,7 @@ impl Parser {
                             "expected binder name after {:?}, found {:?}",
                             quantifier, tok
                         ))
-                        .with_code("E004")
+                        .with_code_str("E004")
                         .with_help(format!(
                             "`{:?}` must be followed by a binder variable and `in <range>`",
                             quantifier
@@ -3535,7 +3578,7 @@ impl Parser {
                             "unexpected end of file after {:?}",
                             quantifier
                         ))
-                        .with_code("E002")
+                        .with_code_str("E002")
                         .with_help("quantified expression is incomplete")
                         .with_span(self.span(),));
                     }
@@ -3554,7 +3597,7 @@ impl Parser {
                 })
             }
             _ => Err(Diagnostic::error("expected expression")
-                .with_code("E007")
+                .with_code_str("E007")
                 .with_help("expected a valid expression — try a literal, variable, `if`, `match`, `|...| { }` closure, or prefix operator")
                 .with_suggestion("try `42`, `true`, `x`, `if cond { a } else { b }`, or `|x| { x + 1 }`")
                 .with_span(self.span(),)),
@@ -3573,14 +3616,14 @@ impl Parser {
                 Ok(Token::Ident(n)) => n,
                 Ok(tok) => {
                     return Err(Diagnostic::error(format!("expected parameter name, found {:?}", tok))
-                        .with_code("E004")
+                        .with_code_str("E004")
                         .with_help("closure parameters must have a name — e.g. `|x, y| { ... }`")
                         .with_suggestion("use a valid identifier like `x`, `acc`, or `item` for the closure parameter")
                         .with_span(self.span(),));
                 }
                 Err(()) => {
                     return Err(Diagnostic::error("unexpected end of file in closure")
-                        .with_code("E002")
+                        .with_code_str("E002")
                         .with_help("closure definition is incomplete — expected `| ... | { ... }`")
                         .with_suggestion("close the closure with `| { body }` or add parameters: `|x, y| { ... }`")
                         .with_span(self.span(),));
@@ -3645,7 +3688,7 @@ impl Parser {
                 path.push(part);
             } else {
                 return Err(Diagnostic::error("expected identifier after '::'")
-                    .with_code("E004")
+                    .with_code_str("E004")
                     .with_help(
                         "`::` must be followed by an identifier — e.g. `std::collections::HashMap`",
                     )
@@ -3715,7 +3758,7 @@ impl Parser {
                 Ok(Token::Ident(n)) => n,
                 Ok(tok) => {
                     return Err(Diagnostic::error(format!("expected field name, found {:?}", tok))
-                        .with_code("E004")
+                        .with_code_str("E004")
                         .with_help("struct literal fields must have a name — e.g. `Point { x = 1, y = 2 }`")
                         .with_suggestion("add a field name followed by `= <value>`, e.g. `field = value`")
                         .with_span(self.span(),));
@@ -3723,7 +3766,7 @@ impl Parser {
                 Err(()) => {
                     return Err(
                         Diagnostic::error("unexpected end of file in struct literal")
-                            .with_code("E002")
+                            .with_code_str("E002")
                             .with_help(
                                 "struct literal is incomplete — expected a field name or `}`",
                             )
@@ -3795,7 +3838,7 @@ impl Parser {
         let start = self.span().start;
         let token = self.advance().map_err(|_| {
             Diagnostic::error("unexpected token")
-                .with_code("E003")
+                .with_code_str("E003")
                 .with_help("expected a literal value (number, string, char, bool, or byte string)")
                 .with_span(Span::new(0, 0))
         })?;
@@ -3865,7 +3908,7 @@ impl Parser {
                     })
                 } else {
                     Err(Diagnostic::error("unexpected !")
-                        .with_code("E007")
+                        .with_code_str("E007")
                         .with_help("`!` as a postfix operator is only used for comptime calls — e.g. `func!()`")
                         .with_suggestion("use `func!()` for comptime calls, or remove the `!`")
                         .with_span(self.span(),))
@@ -4090,7 +4133,7 @@ impl Parser {
                     })
                 } else {
                     Err(Diagnostic::error("expected field name after '.'")
-                        .with_code("E004")
+                        .with_code_str("E004")
                         .with_help("`.` must be followed by a field name — e.g. `object.field`")
                         .with_suggestion("add a field name after `.`, or remove the `.`")
                         .with_span(self.span()))
@@ -4106,7 +4149,7 @@ impl Parser {
                     })
                 } else {
                     Err(Diagnostic::error("expected attribute name after '''")
-                        .with_code("E004")
+                        .with_code_str("E004")
                         .with_help("`'` must be followed by an attribute name — e.g. `object'attr`")
                         .with_suggestion("add an attribute name after `'`, or remove the `'`")
                         .with_span(self.span()))
@@ -4130,7 +4173,7 @@ impl Parser {
                             Ok(Token::Ident(name)) => Some(name),
                             _ => {
                                 return Err(Diagnostic::error("expected binding name after 'as'")
-                                    .with_code("E004")
+                                    .with_code_str("E004")
                                     .with_help("`as` in a catch pattern must be followed by a binding name — e.g. `|NetworkError as e|`")
                                     .with_suggestion("add a capture variable name after `as`, like `|Pattern as var_name|`")
                                     .with_span(self.span(),));
@@ -4314,6 +4357,53 @@ impl Parser {
             span: Span::new(start, end),
         })
     }
+}
+
+/// Compute Levenshtein distance between two strings.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a_len = a.len();
+    let b_len = b.len();
+    if a_len == 0 { return b_len; }
+    if b_len == 0 { return a_len; }
+    let mut prev: Vec<usize> = (0..=b_len).collect();
+    let mut curr = vec![0usize; b_len + 1];
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.chars().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            curr[j + 1] = std::cmp::min(
+                std::cmp::min(curr[j] + 1, prev[j + 1] + 1),
+                prev[j] + cost,
+            );
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b_len]
+}
+
+/// Suggest a close-matching keyword when an unknown identifier is encountered.
+/// Returns `Some("did you mean `def`?")` or similar.
+fn did_you_mean_keyword(input: &str) -> Option<String> {
+    let keywords = [
+        "def", "type", "trait", "import", "from", "edition",
+        "constraint", "extern", "impl", "comptime", "async",
+        "set", "let", "if", "else", "while", "for", "return",
+        "leave", "continue", "match", "ghost", "propagates", "overrides",
+        "trigger", "scope_cleanup", "true", "false",
+    ];
+    let input_lower = input.to_lowercase();
+    let mut best = None;
+    for &kw in &keywords {
+        let d = edit_distance(&input_lower, kw);
+        if d <= 2 && input_lower.chars().next() == kw.chars().next() {
+            match best {
+                None => best = Some((kw, d)),
+                Some((_, db)) if d < db => best = Some((kw, d)),
+                _ => {}
+            }
+        }
+    }
+    best.map(|(kw, _)| format!("did you mean `{}`?", kw))
 }
 
 #[cfg(test)]

@@ -57,7 +57,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     self.checker.ctx.get(expected),
                     self.checker.ctx.get(actual)
                 );
-                let mut diag = Diagnostic::error(msg).with_code("E030").with_span(span);
+                let mut diag = Diagnostic::error(msg).with_code_str("E030").with_span(span);
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
                     diag = diag.with_suggestion(suggestion);
                 }
@@ -115,12 +115,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     ),
                 };
                 let mut diag = Diagnostic::error(msg)
-                    .with_code("E030")
-                    .with_span(span)
-                    .with_label(
-                        span,
-                        format!("expected {:?}", self.checker.ctx.get(expected)),
-                    );
+                    .with_code_str("E030")
+                    .with_span(span);
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
                     diag = diag.with_suggestion(suggestion);
                 }
@@ -363,7 +359,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             "no method named `{}` found for type",
                             field
                         ))
-                        .with_code("E011")
+                        .with_code_str("E011")
                         .with_span(*span);
                         if !method_names.is_empty() {
                             diag = diag.with_suggestion(format!(
@@ -476,7 +472,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 if !self.checker.ctx.is_integer(index_ty) && !self.checker.ctx.is_usize(index_ty) {
                     self.checker.diagnostics.push(
                         Diagnostic::error("index must be an integer")
-                            .with_code("E030")
+                            .with_code_str("E030")
                             .with_span(*span)
                             .with_label(
                                 index.span(),
@@ -622,7 +618,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                     "field '{}' not found in struct",
                                     name
                                 ))
-                                .with_code("E010")
+                                .with_code_str("E010")
                                 .with_span(*span)
                                 .with_suggestion(format!(
                                     "available fields: {}",
@@ -897,7 +893,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 if !cond_is_bool {
                     self.checker.diagnostics.push(
                         Diagnostic::error("if condition must be boolean")
-                            .with_code("E004")
+                            .with_code_str("E004")
                             .with_span(*span)
                             .with_label(
                                 cond.span(),
@@ -1787,14 +1783,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 Err(Diagnostic::error(
                     "safe cast from reference type requires explicit dereference or unsafe cast",
                 )
-                .with_code("E601")
+                .with_code_str("E601")
                 .with_span(span)
                 .with_suggestion("consider dereferencing first: `*expr as TargetType`")
                 .with_suggestion("or use `as!` for an unsafe bitcast"))
             } else {
                 Err(
                     Diagnostic::error("safe cast only allowed between numeric and boolean types")
-                        .with_code("E601")
+                        .with_code_str("E601")
                         .with_span(span)
                         .with_suggestion("use `From` trait for non-primitive type conversions"),
                 )
@@ -1810,7 +1806,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             } else if self.ctx().is_reference(from) && self.ctx().is_integer(to) {
                 Err(
                     Diagnostic::error("unsafe cast from reference to integer not yet supported")
-                        .with_code("E601")
+                        .with_code_str("E601")
                         .with_span(span)
                         .with_suggestion("consider using `*expr as usize` via a pointer cast"),
                 )
@@ -1819,7 +1815,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 match (c.get(from), c.get(to)) {
                     (TypeData::Ptr { .. }, TypeData::Ptr { .. }) => Ok(to),
                     _ => Err(Diagnostic::error("unsafe cast requires compatible types (numeric<->numeric, ref<->ptr, ptr<->ptr)")
-                        .with_code("E601").with_span(span)),
+                        .with_code_str("E601").with_span(span)),
                 }
             }
         }
@@ -1975,7 +1971,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             .find(|f| f.name == *name)
                             .ok_or_else(|| {
                                 Diagnostic::error(format!("field '{}' not found in struct", name))
-                                    .with_code("E010")
+                                    .with_code_str("E010")
                                     .with_span(*span)
                             })?;
                     let field_ty = self.checker.ctx.subst(field_def.ty, &subst);

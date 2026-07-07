@@ -67,7 +67,7 @@ impl<'a> TypeChecker<'a> {
         for msg in &unresolved {
             self.diagnostics.push(
                 Diagnostic::error(msg)
-                    .with_code("E030")
+                    .with_code_str("E030")
                     .with_span(Span::new(0, 0)),
             );
         }
