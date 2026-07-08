@@ -2765,8 +2765,19 @@ impl TypeContext {
                 }
             }
 
+            // ── Existentials: produced by Yoneda reduction ─────
+            TypeData::Exists { param_index, base, .. } => {
+                // ∃Z.A: if Z does not appear in A, the quantifier is vacuous.
+                if !self.type_contains_param(*param_index, *base) {
+                    self.characteristic_of_reduced(*base)
+                } else {
+                    // Z ranges over all types → infinite many inhabitants.
+                    InfiniteEnumerable
+                }
+            }
+
             // ── Should not remain after Yoneda reduction ────
-            TypeData::Forall { .. } | TypeData::Poly { .. } | TypeData::Exists { .. }
+            TypeData::Forall { .. } | TypeData::Poly { .. }
             | TypeData::GenericParam { .. } | TypeData::InferVar { .. }
             | TypeData::SkolemVar { .. } => Undecidable,
 
