@@ -323,8 +323,6 @@ pub struct TypeContext {
     /// Universe counter for Higher-Ranked Type skolemization (rustc-style).
     /// Each `for<'a>` binder comparison enters a fresh universe.
     next_universe: Cell<usize>,
-    /// Pre-allocated pool of skolem placeholder types for HRTB comparison.
-    skolem_pool: RefCell<Vec<TypeId>>,
     /// Counter for generating fresh parameter indices (used by Exists/Forall).
     next_param_index: Cell<usize>,
 }
@@ -352,7 +350,6 @@ impl TypeContext {
             unify_seen: RefCell::new(HashSet::default()),
             kappa_cache: RefCell::new(HashMap::default()),
             next_universe: Cell::new(0),
-            skolem_pool: RefCell::new(Vec::new()),
             next_param_index: Cell::new(0),
         };
         ctx.builtin_unit = ctx.alloc(TypeData::Unit);
@@ -370,12 +367,6 @@ impl TypeContext {
         });
         // &Str = Ref { ty: Str, mutable: false }
         ctx.builtin_str_ref = ctx.reference(ctx.builtin_str, false);
-        let mut pool = Vec::new();
-        for i in 0..16 {
-            let skolem = ctx.alloc(TypeData::SkolemVar { id: i, universe_num: i });
-            pool.push(skolem);
-        }
-        ctx.skolem_pool = RefCell::new(pool);
         ctx
     }
 
@@ -708,14 +699,15 @@ impl TypeContext {
                                 product
                             } else {
                                 let mut w = product;
-                                // Rename peeled GenericParam indices to fresh globally-unique
-                                // indices, then wrap with Exists.  After peeling inner Forall
-                                // layers the body still contains GenericParam references keyed
-                                // to the OLD indices.  Using fresh indices ensures they cannot
-                                // collide with any outer binder even though Exists traversal
-                                // functions do not check scoping.
+                                // Barendregt-inspired renaming: replace each peeled index
+                                // with a globally-unique index (via fresh_param_index) that
+                                // also cannot collide with pi, preventing false positives
+                                // in needs_fix while guaranteeing full capture avoidance.
                                 for (eq, en) in &inner_quantifiers {
-                                    let fresh_idx = self.fresh_param_index();
+                                    let mut fresh_idx = self.fresh_param_index();
+                                    if fresh_idx == pi {
+                                        fresh_idx = self.fresh_param_index();
+                                    }
                                     let fresh_gp = self.generic_param(fresh_idx, en.clone());
                                     w = self.replace_generic(w, *eq, fresh_gp);
                                     w = self.exists(
@@ -732,8 +724,8 @@ impl TypeContext {
                             };
                             branch_replacements.push(repl);
                         }
-                        // Process co-Yoneda case
-                        if coyoneda_match {
+                        // Process co-Yoneda case (only if not already handled by Yoneda)
+                        if !yoneda_match && coyoneda_match {
                             is_coyoneda = true;
                             // The branch is X ⇒ A where A = inner_ret (not a param).
                             // When ips.len() == 1, X is the only param and A = inner_ret.
@@ -748,11 +740,12 @@ impl TypeContext {
                                 replacement
                             } else {
                                 let mut w = replacement;
-                                // Same renaming strategy as the Yoneda branch: rename old
-                                // peeled indices to fresh globally-unique indices to prevent
-                                // dangling GenericParam references before wrapping with Forall.
+                                // Same Barendregt-inspired renaming for co-Yoneda.
                                 for (eq, en) in &inner_quantifiers {
-                                    let fresh_idx = self.fresh_param_index();
+                                    let mut fresh_idx = self.fresh_param_index();
+                                    if fresh_idx == pi {
+                                        fresh_idx = self.fresh_param_index();
+                                    }
                                     let fresh_gp = self.generic_param(fresh_idx, en.clone());
                                     w = self.replace_generic(w, *eq, fresh_gp);
                                     w = self.forall(fresh_idx, en.clone(), w);
@@ -866,6 +859,12 @@ impl TypeContext {
         expected_sign: isize,
         cumulative_sign: isize,
     ) -> bool {
+        // Resolve bindings first: an unresolved InferVar would be treated as a
+        // leaf node with no outgoing variance edges, causing any variance check
+        // to silently return `true`.  This would allow InferVars to later be
+        // bound to types containing restricted-parameter occurrences, bypassing
+        // the variance constraint entirely.
+        let ty = self.resolve_binding(ty);
         // Check cache first
         let cache_key = (param, ty, expected_sign, cumulative_sign);
         if let Some(&cached) = self.variance_cache.borrow().get(&cache_key) {
@@ -1031,6 +1030,7 @@ impl TypeContext {
             TypeData::Ptr { pointee, .. } => self.type_contains_param(param, *pointee),
             TypeData::AssociatedType { self_ty, .. } => self.type_contains_param(param, *self_ty),
             TypeData::Poly { body, .. } => self.type_contains_param(param, *body),
+            TypeData::Forall { body, .. } => self.type_contains_param(param, *body),
             TypeData::Exists { base, .. } => self.type_contains_param(param, *base),
             TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => {
                 self.type_contains_param(param, *body)
@@ -1134,11 +1134,14 @@ impl TypeContext {
                     .iter()
                     .map(|&a| self.replace_generic(a, param_index, replacement))
                     .collect();
-                self.alloc(TypeData::Adt {
+                let new_id = self.alloc(TypeData::Adt {
                     kind: *kind,
                     def_id: *def_id,
                     args: new_args,
-                })
+                });
+                // maintain the def_id reverse mapping for get_type_id_for_def_id
+                self.def_id_to_type_id.insert(*def_id, new_id);
+                new_id
             }
             TypeData::Coproduct { alternatives } => {
                 let new_alts: Vec<TypeId> = alternatives
@@ -1233,7 +1236,7 @@ impl TypeContext {
         }
     }
 
-    pub fn unify(&self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
+    pub fn unify(&mut self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
         // ── Transaction: capture current bindings for rollback ──
         self.begin_transaction();
 
@@ -1274,7 +1277,7 @@ impl TypeContext {
     /// - Contravariant (T :> U): sub-components in covariant positions flip to
     ///   Contravariant, those in contravariant positions flip to Covariant
     fn unify_internal(
-        &self,
+        &mut self,
         a: TypeId,
         b: TypeId,
         variance: Variance,
@@ -1299,7 +1302,7 @@ impl TypeContext {
     /// The actual unification logic, called by `unify_internal` which wraps
     /// it with cache management.
     fn unify_internal_impl(
-        &self,
+        &mut self,
         a: TypeId,
         b: TypeId,
         variance: Variance,
@@ -1509,36 +1512,45 @@ impl TypeContext {
                 Ok(b)
             }
 
-            // Forall: same param_index + body is COVARIANT
+            // Forall: same param_index → body is COVARIANT (ignore name)
             (
                 TypeData::Forall {
                     param_index: pi1,
-                    param_name: pn1,
+                    param_name: _,
                     body: b1,
                 },
                 TypeData::Forall {
                     param_index: pi2,
-                    param_name: pn2,
+                    param_name: _,
                     body: b2,
                 },
-            ) if pi1 == pi2 && pn1 == pn2 => {
+            ) if pi1 == pi2 => {
                 let body_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*b1, *b2, body_variance)?;
                 self.set_binding(a, b);
                 Ok(b)
             }
 
-            // Exists: same name + base is COVARIANT
-            (TypeData::Exists { param_index: _, name: n1, base: b1 }, TypeData::Exists { param_index: _, name: n2, base: b2 })
-                if n1 == n2 =>
-            {
+            // Exists: same param_index → base is COVARIANT (ignore name)
+            (
+                TypeData::Exists {
+                    param_index: pi1,
+                    name: _,
+                    base: b1,
+                },
+                TypeData::Exists {
+                    param_index: pi2,
+                    name: _,
+                    base: b2,
+                },
+            ) if pi1 == pi2 => {
                 let base_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*b1, *b2, base_variance)?;
                 self.set_binding(a, b);
                 Ok(b)
             }
 
-            // Poly: same quantifiers list length + content + body is COVARIANT
+            // Poly: same quantifier indices + COVARIANT body
             (
                 TypeData::Poly {
                     quantifiers: q1,
@@ -1548,45 +1560,45 @@ impl TypeContext {
                     quantifiers: q2,
                     body: b2,
                 },
-            ) if q1.len() == q2.len() && q1.iter().zip(q2.iter()).all(|(a, b)| a == b) => {
+            ) if q1.len() == q2.len() && q1.iter().zip(q2.iter()).all(|((i1, _), (i2, _))| i1 == i2) => {
                 let body_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*b1, *b2, body_variance)?;
                 self.set_binding(a, b);
                 Ok(b)
             }
 
-            // Mu: same param_index + body is COVARIANT
+            // Mu: same param_index → body is COVARIANT (ignore name)
             (
                 TypeData::Mu {
                     param_index: pi1,
-                    param_name: pn1,
+                    param_name: _,
                     body: b1,
                 },
                 TypeData::Mu {
                     param_index: pi2,
-                    param_name: pn2,
+                    param_name: _,
                     body: b2,
                 },
-            ) if pi1 == pi2 && pn1 == pn2 => {
+            ) if pi1 == pi2 => {
                 let body_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*b1, *b2, body_variance)?;
                 self.set_binding(a, b);
                 Ok(b)
             }
 
-            // Nu: same param_index + body is COVARIANT
+            // Nu: same param_index → body is COVARIANT (ignore name)
             (
                 TypeData::Nu {
                     param_index: pi1,
-                    param_name: pn1,
+                    param_name: _,
                     body: b1,
                 },
                 TypeData::Nu {
                     param_index: pi2,
-                    param_name: pn2,
+                    param_name: _,
                     body: b2,
                 },
-            ) if pi1 == pi2 && pn1 == pn2 => {
+            ) if pi1 == pi2 => {
                 let body_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*b1, *b2, body_variance)?;
                 self.set_binding(a, b);
@@ -1731,12 +1743,12 @@ impl TypeContext {
         }
     }
 
-    pub fn enter_universe(&self) -> (usize, TypeId) {
+    pub fn enter_universe(&mut self) -> (usize, TypeId) {
         let universe = self.next_universe.get();
         self.next_universe.set(universe + 1);
-        let pool = self.skolem_pool.borrow();
-        let idx = universe % pool.len();
-        (universe, pool[idx])
+        // Dynamically create a SkolemVar with the correct universe_num
+        let skolem = self.alloc(TypeData::SkolemVar { id: universe, universe_num: universe });
+        (universe, skolem)
     }
 
     pub fn check_skolem_escape(&self, ty: TypeId, max_universe: usize) -> Option<usize> {
@@ -1758,15 +1770,17 @@ impl TypeContext {
         }
     }
 
-    pub fn subtype(&self, sub: TypeId, sup: TypeId) -> bool {
+    pub fn subtype(&mut self, sub: TypeId, sup: TypeId) -> bool {
         if sub == sup {
             return true;
         }
 
-        let sub_data = self.get(sub);
-        let sup_data = self.get(sup);
+        // Clone Arcs to release the immutable borrow from self.get(), since
+        // self.subtype() calls inside match arms require &mut self.
+        let sub_data = self.get_arc(sub);
+        let sup_data = self.get_arc(sup);
 
-        match (sub_data, sup_data) {
+        match (&*sub_data, &*sup_data) {
             (TypeData::Error, _) => true,
             (_, TypeData::Error) => true,
             (TypeData::Never, _) => true,
@@ -1783,8 +1797,31 @@ impl TypeContext {
                     param_name: _,
                     body: b2,
                 },
-            ) => *pi1 == *pi2 && self.subtype(*b1, *b2),
-            (TypeData::Forall { body, .. }, _) => self.subtype(*body, sup),
+            ) => {
+                if *pi1 == *pi2 {
+                    // Same binder index: compare bodies directly.
+                    self.subtype(*b1, *b2)
+                } else {
+                    // α-conversion with capture avoidance: rename BOTH bodies
+                    // to a FRESH index that cannot appear free in either body.
+                    // Simply renaming pi2 → pi1 would capture any free
+                    // GenericParam(pi1) already present in b2.
+                    let fresh_idx = self.fresh_param_index();
+                    let fresh_name = "α".into();
+                    let fresh_gp = self.generic_param(fresh_idx, fresh_name);
+                    let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
+                    let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
+                    self.subtype(b1_renamed, b2_renamed)
+                }
+            }
+            // ∀X.T <: U (U not a Forall): skolemize X in a higher universe so
+            // it cannot accidentally unify with free variables in U.
+            (TypeData::Forall { param_index: pi, param_name: _, body }, _) => {
+                let (_universe, skolem) = self.enter_universe();
+                let body_skolemized = self.replace_generic(*body, *pi, skolem);
+                self.subtype(body_skolemized, sup)
+            }
+            // T <: ∀X.U: peel the right-side binder.
             (_, TypeData::Forall { body, .. }) => self.subtype(sub, *body),
 
             (TypeData::Unit, TypeData::Unit) => true,
@@ -1824,21 +1861,34 @@ impl TypeContext {
                 if p1.len() != p2.len() {
                     return false;
                 }
-                p1.iter().zip(p2.iter()).all(|(a, b)| self.subtype(*b, *a))
-                    && self.subtype(*r1, *r2)
+                // Use explicit loop instead of .all() closure to satisfy &mut self
+                for (a, b) in p1.iter().zip(p2.iter()) {
+                    if !self.subtype(*b, *a) {
+                        return false;
+                    }
+                }
+                self.subtype(*r1, *r2)
             }
             (TypeData::Array { elem: e1, size: s1 }, TypeData::Array { elem: e2, size: s2 }) => {
                 *s1 == *s2 && self.subtype(*e1, *e2)
             }
             (TypeData::Slice { elem: e1 }, TypeData::Slice { elem: e2 }) => self.subtype(*e1, *e2),
             (TypeData::Tuple { elems: e1 }, TypeData::Tuple { elems: e2 }) => {
-                e1.len() == e2.len() && e1.iter().zip(e2.iter()).all(|(a, b)| self.subtype(*a, *b))
+                if e1.len() != e2.len() { return false; }
+                for (a, b) in e1.iter().zip(e2.iter()) {
+                    if !self.subtype(*a, *b) { return false; }
+                }
+                true
             }
             (
                 TypeData::Coproduct { alternatives: a1 },
                 TypeData::Coproduct { alternatives: a2 },
             ) => {
-                a1.len() == a2.len() && a1.iter().zip(a2.iter()).all(|(a, b)| self.subtype(*a, *b))
+                if a1.len() != a2.len() { return false; }
+                for (a, b) in a1.iter().zip(a2.iter()) {
+                    if !self.subtype(*a, *b) { return false; }
+                }
+                true
             }
             (
                 TypeData::Int {
@@ -1887,11 +1937,13 @@ impl TypeContext {
             | TypeData::Error => ty,
             TypeData::Adt { kind, def_id, args } => {
                 let new_args: Vec<TypeId> = args.iter().map(|&a| self.subst(a, subst)).collect();
-                self.alloc(TypeData::Adt {
+                let new_id = self.alloc(TypeData::Adt {
                     kind: *kind,
                     def_id: *def_id,
                     args: new_args,
-                })
+                });
+                self.def_id_to_type_id.insert(*def_id, new_id);
+                new_id
             }
             TypeData::Tuple { elems } => {
                 let new_elems: Vec<TypeId> = elems.iter().map(|&e| self.subst(e, subst)).collect();
@@ -1967,11 +2019,16 @@ impl TypeContext {
             }
             TypeData::Exists { param_index, name, base } => {
                 let new_base = self.subst(*base, subst);
-                self.alloc(TypeData::Exists {
+                let new_id = self.alloc(TypeData::Exists {
                     param_index: *param_index,
                     name: name.clone(),
                     base: new_base,
-                })
+                });
+                // Copy the original Exists meta (invariant, default_value) to the new node
+                if let Some(meta) = self.meta.get(&ty).cloned() {
+                    self.meta.entry(new_id).or_insert(meta);
+                }
+                new_id
             }
             TypeData::Coproduct { alternatives } => {
                 let new_alts: Vec<TypeId> =
@@ -3263,7 +3320,7 @@ mod tests {
 
     #[test]
     fn test_yoneda_no_reduction() {
-        // ∀X.Int⇒Int 不应约简
+        // ∀X.Int⇒Int should not reduce
         let mut ctx = TypeContext::new();
         let int_ty = ctx.int(32, true);
         let fn_ty = ctx.function(vec![int_ty], int_ty);
@@ -3334,6 +3391,376 @@ mod tests {
             reduced, expected,
             "∀X.(X⇒Int⇒Float)⇒X should reduce to Int→Float, not lose Float"
         );
+    }
+
+    // ── Yoneda / co-Yoneda with inner quantifiers (∀Z⃗ₖ) ────────
+    //
+    // These test the fix for a binding-maintenance bug where inner-Forall
+    // GenericParam references became dangling after Yoneda reduction
+    // peeled the quantifier layers.
+
+    #[test]
+    fn test_yoneda_inner_quantifier_one() {
+        // ∀X. (∀Z. Z ⇒ X) ⇒ X  →  ∃Z. Z
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let gp_z = ctx.generic_param(1, "Z".into());
+
+        // Expected: ∃Z. Z
+        let expected = ctx.alloc(TypeData::Exists {
+            param_index: 1,
+            name: "Z".into(),
+            base: gp_z,
+        });
+
+        let inner_fn = ctx.function(vec![gp_z], p0);
+        let inner_forall = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z".into(),
+            body: inner_fn,
+        });
+        let outer_fn = ctx.function(vec![inner_forall], p0);
+        let result = ctx.forall(0, "X".into(), outer_fn);
+        assert_eq!(
+            result, expected,
+            "∀X.(∀Z.Z⇒X)⇒X should reduce to ∃Z.Z"
+        );
+    }
+
+    #[test]
+    fn test_yoneda_inner_quantifier_x_in_body() {
+        // ∀X. (∀Z. (Z, X) ⇒ X) ⇒ X  →  μX. ∃Z. (Z, X)
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let gp_z = ctx.generic_param(1, "Z".into());
+        let int_ty = ctx.int(32, true);
+
+        // Expected: μX. ∃Z. (Z, X)
+        let tup = ctx.tuple(vec![gp_z, p0]);
+        let inner_exists = ctx.alloc(TypeData::Exists {
+            param_index: 1,
+            name: "Z".into(),
+            base: tup,
+        });
+        let expected = ctx.alloc(TypeData::Mu {
+            param_index: 0,
+            param_name: "X".into(),
+            body: inner_exists,
+        });
+
+        let tup = ctx.tuple(vec![gp_z, p0]);
+        let inner_fn = ctx.function(vec![tup], p0);
+        let inner_forall = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z".into(),
+            body: inner_fn,
+        });
+        let outer_fn = ctx.function(vec![inner_forall], p0);
+        let result = ctx.forall(0, "X".into(), outer_fn);
+        assert_eq!(
+            result, expected,
+            "∀X.(∀Z.(Z,X)⇒X)⇒X should reduce to μX.∃Z.(Z,X)"
+        );
+    }
+
+    #[test]
+    fn test_yoneda_two_inner_quantifiers() {
+        // ∀X. (∀Z₁. ∀Z₂. (Z₁, Z₂, Int) ⇒ X) ⇒ X  →  ∃Z₂. ∃Z₁. (Z₁, Z₂, Int)
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let gp_z1 = ctx.generic_param(1, "Z₁".into());
+        let gp_z2 = ctx.generic_param(2, "Z₂".into());
+        let int_ty = ctx.int(32, true);
+
+        // Expected: ∃Z₂. ∃Z₁. (Z₁, Z₂, Int)
+        let tup = ctx.tuple(vec![gp_z1, gp_z2, int_ty]);
+        let inner_ex = ctx.alloc(TypeData::Exists {
+            param_index: 1,
+            name: "Z₁".into(),
+            base: tup,
+        });
+        let expected = ctx.alloc(TypeData::Exists {
+            param_index: 2,
+            name: "Z₂".into(),
+            base: inner_ex,
+        });
+
+        let tup = ctx.tuple(vec![gp_z1, gp_z2, int_ty]);
+        let inner_fn = ctx.function(vec![tup], p0);
+        let inner_forall2 = ctx.alloc(TypeData::Forall {
+            param_index: 2,
+            param_name: "Z₂".into(),
+            body: inner_fn,
+        });
+        let inner_forall1 = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z₁".into(),
+            body: inner_forall2,
+        });
+        let outer_fn = ctx.function(vec![inner_forall1], p0);
+        let result = ctx.forall(0, "X".into(), outer_fn);
+        assert_eq!(
+            result, expected,
+            "∀X.(∀Z₁.∀Z₂.(Z₁,Z₂,Int)⇒X)⇒X should reduce to ∃Z₂.∃Z₁.(Z₁,Z₂,Int)"
+        );
+    }
+
+    #[test]
+    fn test_coyoneda_inner_quantifier_one() {
+        // ∀X. (∀Z. X ⇒ Z) ⇒ X  →  ∀Z. Z
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let gp_z = ctx.generic_param(1, "Z".into());
+
+        // Expected: ∀Z. Z
+        let expected = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z".into(),
+            body: gp_z,
+        });
+
+        let inner_fn = ctx.function(vec![p0], gp_z);
+        let inner_forall = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z".into(),
+            body: inner_fn,
+        });
+        let outer_fn = ctx.function(vec![inner_forall], p0);
+        let result = ctx.forall(0, "X".into(), outer_fn);
+        assert_eq!(
+            result, expected,
+            "∀X.(∀Z.X⇒Z)⇒X should reduce to ∀Z.Z"
+        );
+    }
+
+    #[test]
+    fn test_coyoneda_inner_quantifier_x_in_body() {
+        // ∀X. (∀Z. X ⇒ (Z, X)) ⇒ X  →  νX. ∀Z. (Z, X)
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let gp_z = ctx.generic_param(1, "Z".into());
+
+        // Expected: νX. ∀Z. (Z, X)
+        let tup = ctx.tuple(vec![gp_z, p0]);
+        let inner_forall = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z".into(),
+            body: tup,
+        });
+        let expected = ctx.alloc(TypeData::Nu {
+            param_index: 0,
+            param_name: "X".into(),
+            body: inner_forall,
+        });
+
+        let i_tup = ctx.tuple(vec![gp_z, p0]);
+        let inner_fn = ctx.function(vec![p0], i_tup);
+        let inner_forall_wrap = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z".into(),
+            body: inner_fn,
+        });
+        let outer_fn = ctx.function(vec![inner_forall_wrap], p0);
+        let result = ctx.forall(0, "X".into(), outer_fn);
+        assert_eq!(
+            result, expected,
+            "∀X.(∀Z.X⇒(Z,X))⇒X should reduce to νX.∀Z.(Z,X)"
+        );
+    }
+
+    #[test]
+    fn test_yoneda_two_branches_with_inner_quantifiers() {
+        // ∀X. (∀Z₁. Z₁ ⇒ X) ⇒ (∀Z₂. Z₂ ⇒ X) ⇒ X  →  ∃Z₁.Z₁ + ∃Z₂.Z₂
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let gp_z1 = ctx.generic_param(1, "Z₁".into());
+        let gp_z2 = ctx.generic_param(2, "Z₂".into());
+
+        // Expected: Coproduct(∃Z₁.Z₁, ∃Z₂.Z₂)
+        let ex_z1 = ctx.alloc(TypeData::Exists {
+            param_index: 1,
+            name: "Z₁".into(),
+            base: gp_z1,
+        });
+        let ex_z2 = ctx.alloc(TypeData::Exists {
+            param_index: 2,
+            name: "Z₂".into(),
+            base: gp_z2,
+        });
+        let expected = ctx.coproduct(vec![ex_z1, ex_z2]);
+
+        // Branch 1: ∀Z₁. Z₁ ⇒ X
+        let inner_fn1 = ctx.function(vec![gp_z1], p0);
+        let forall1 = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z₁".into(),
+            body: inner_fn1,
+        });
+        // Branch 2: ∀Z₂. Z₂ ⇒ X
+        let inner_fn2 = ctx.function(vec![gp_z2], p0);
+        let forall2 = ctx.alloc(TypeData::Forall {
+            param_index: 2,
+            param_name: "Z₂".into(),
+            body: inner_fn2,
+        });
+        let outer_fn = ctx.function(vec![forall1, forall2], p0);
+        let result = ctx.forall(0, "X".into(), outer_fn);
+        assert_eq!(
+            result, expected,
+            "∀X.(∀Z₁.Z₁⇒X)⇒(∀Z₂.Z₂⇒X)⇒X should reduce to ∃Z₁.Z₁ + ∃Z₂.Z₂"
+        );
+    }
+
+    #[test]
+    fn test_yoneda_inner_quantifier_no_x_ref() {
+        // ∀X. (∀Z. (Int ⇒ Z) ⇒ X) ⇒ X  →  ∃Z. (Int ⇒ Z)
+        // Here A = Int ⇒ Z, and there is no X reference inside A.
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let gp_z = ctx.generic_param(1, "Z".into());
+        let int_ty = ctx.int(32, true);
+
+        // Expected: ∃Z. (Int ⇒ Z)
+        let arrow = ctx.function(vec![int_ty], gp_z);
+        let expected = ctx.alloc(TypeData::Exists {
+            param_index: 1,
+            name: "Z".into(),
+            base: arrow,
+        });
+
+        let inner_fn = ctx.function(vec![arrow], p0);
+        let inner_forall = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z".into(),
+            body: inner_fn,
+        });
+        let outer_fn = ctx.function(vec![inner_forall], p0);
+        let result = ctx.forall(0, "X".into(), outer_fn);
+        assert_eq!(
+            result, expected,
+            "∀X.(∀Z.(Int⇒Z)⇒X)⇒X should reduce to ∃Z.(Int⇒Z)"
+        );
+    }
+
+    #[test]
+    fn test_yoneda_x_to_x_does_not_duplicate_branch() {
+        // ∀X.(X→X)→X  — branch X→X matches BOTH Yoneda (ret=X) and co-Yoneda
+        // (first param=X).  Must NOT push two copies into branch_replacements.
+        //
+        // Paper (Pistone & Tranchini 2022 §2): the ≡_X schema matches when the
+        // branch's return is X (the bound variable).  If the first parameter is
+        // also X, the branch is interpreted as the Yoneda case A⟨X⟩ = X, giving
+        // Σₖ A⟨X⟩ = X and therefore μX.X.
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let branch = ctx.function(vec![p0], p0);            // X → X
+        let outer = ctx.function(vec![branch], p0);         // (X→X) → X
+        let ty = ctx.forall(0, "X".into(), outer);           // ∀X.(X→X)→X
+
+        // Should be µX.X — a single branch, not a coproduct with two entries.
+        match ctx.get(ty) {
+            TypeData::Mu { param_index, body, .. } => {
+                assert_eq!(*param_index, 0, "mu binds the outer X index");
+                match ctx.get(*body) {
+                    TypeData::GenericParam { index, .. } => {
+                        assert_eq!(*index, 0,
+                            "mu body should be X (GenericParam(0)), not a coproduct");
+                    }
+                    other => panic!("expected GenericParam(0) inside Mu, got {other:?}"),
+                }
+            }
+            other => panic!("expected Mu, got {other:?}"),
+        }
+    }
+
+    // ── Forall subtype with α-conversion ──────────────────────────
+
+    #[test]
+    fn test_subtype_forall_alpha_equiv_gp() {
+        // ∀X.{0} X <: ∀Y.{7} Y  → true (alpha-equivalent after renaming Y→X)
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let p7 = ctx.generic_param(7, "Y".into());
+        let fx = ctx.forall(0, "X".into(), p0);
+        let fy = ctx.forall(7, "Y".into(), p7);
+        assert!(ctx.subtype(fx, fy),
+            "∀X.X <: ∀Y.Y should hold under alpha-conversion");
+        assert!(ctx.subtype(fy, fx),
+            "∀Y.Y <: ∀X.X should hold symmetrically");
+    }
+
+    #[test]
+    fn test_subtype_forall_alpha_equiv_fn() {
+        // ∀X.{0} (X → Int) <: ∀Y.{7} (Y → Int)  → true
+        let mut ctx = TypeContext::new();
+        let int32 = ctx.int(32, true);
+        let p0 = ctx.generic_param(0, "X".into());
+        let p7 = ctx.generic_param(7, "Y".into());
+        let fn_x = ctx.function(vec![p0], int32);
+        let fn_y = ctx.function(vec![p7], int32);
+        let fx = ctx.forall(0, "X".into(), fn_x);
+        let fy = ctx.forall(7, "Y".into(), fn_y);
+        assert!(ctx.subtype(fx, fy),
+            "∀X.(X→Int) <: ∀Y.(Y→Int) should hold under alpha-conversion");
+    }
+
+    #[test]
+    fn test_subtype_forall_alpha_equiv_fails_on_body_diff() {
+        // ∀X.{0} (X → Int) <: ∀Y.{7} (Int → Y)  → false (different structure)
+        let mut ctx = TypeContext::new();
+        let int32 = ctx.int(32, true);
+        let p0 = ctx.generic_param(0, "X".into());
+        let p7 = ctx.generic_param(7, "Y".into());
+        let fn_x = ctx.function(vec![p0], int32);     // X → Int
+        let fn_y = ctx.function(vec![int32], p7);     // Int → Y
+        let fx = ctx.forall(0, "X".into(), fn_x);
+        let fy = ctx.forall(7, "Y".into(), fn_y);
+        assert!(!ctx.subtype(fx, fy),
+            "∀X.(X→Int) <: ∀Y.(Int→Y) should be false");
+    }
+
+    #[test]
+    fn test_subtype_forall_alpha_same_index_still_works() {
+        // ∀X.{0} X <: ∀X.{0} X  → true (same index, no renaming needed)
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let fx = ctx.forall(0, "X".into(), p0);
+        assert!(ctx.subtype(fx, fx),
+            "∀X.X <: ∀X.X with same index should hold");
+    }
+
+    #[test]
+    fn test_subtype_forall_no_capture_bug() {
+        // Regression test: α-conversion must NOT capture a free GenericParam
+        // that happens to share the same index as sub's binder.
+        //
+        // Context: free variable X (index 0) from outer scope.
+        //   sub = ∀X.(X → X)   — binds index 0
+        //   sup = ∀Y.(X → X)   — binds index 1, body has free GenericParam(0)
+        //
+        // Without capture-avoidance, renaming Y→X in sup's body would capture
+        // the free X, making both bodies (X→X) == (X→X) and incorrectly
+        // returning true.
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let p1 = ctx.generic_param(1, "Y".into());
+
+        // Build sub: ∀X.{0} (X → X) — binder index 0
+        let sub_fn = ctx.function(vec![p0], p0);
+        let sub = ctx.forall(0, "X".into(), sub_fn);
+
+        // Build sup: ∀Y.{1} (X → X) — binder index 1, body has free GP(0)
+        let sup_fn = ctx.function(vec![p0], p0);
+        let sup = ctx.forall(1, "Y".into(), sup_fn);
+
+        // ∀X.(X→X) <: ∀Y.(X→X) must be FALSE:
+        // the body of sup contains a FREE X (GP{0}) which is NOT the
+        // bound Y (GP{1}).  After α-conversion with capture avoidance,
+        // sub's X(0) → fresh(2), sup's Y(1) → fresh(2),
+        // sup's free X(0) STAYS AS 0, giving bodies (GP(2)→GP(2)) vs
+        // (GP(0)→GP(0)) — structurally different → false.
+        assert!(!ctx.subtype(sub, sup),
+            "∀X.(X→X) <: ∀Y.(X→X) must NOT hold — free X in sup would be captured");
     }
 
     // ── HRTB / Forall subtype tests ──────────────────────────────

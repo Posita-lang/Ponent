@@ -868,7 +868,7 @@ fn test_region_tree_find_break_in_nested() {
         label: None,
     });
 
-    // Loop is outside Closure (loop 先于 closure)
+    // Loop is outside Closure (loop precedes closure)
     let _l = rt.enter_region();
     rt.push_frame(CtxFrame {
         kind: CtxKind::Loop,
