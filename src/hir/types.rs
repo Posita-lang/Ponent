@@ -1,5 +1,5 @@
-use std::cell::Cell;
 use rustc_hash::FxHashMap as HashMap;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -524,13 +524,21 @@ impl TypeContext {
     }
 
     pub fn struct_ty(&mut self, def_id: DefId, args: Vec<TypeId>) -> TypeId {
-        let id = self.alloc(TypeData::Adt { kind: AdtKind::Struct, def_id, args });
+        let id = self.alloc(TypeData::Adt {
+            kind: AdtKind::Struct,
+            def_id,
+            args,
+        });
         self.def_id_to_type_id.insert(def_id, id);
         id
     }
 
     pub fn enum_ty(&mut self, def_id: DefId, args: Vec<TypeId>) -> TypeId {
-        let id = self.alloc(TypeData::Adt { kind: AdtKind::Enum, def_id, args });
+        let id = self.alloc(TypeData::Adt {
+            kind: AdtKind::Enum,
+            def_id,
+            args,
+        });
         self.def_id_to_type_id.insert(def_id, id);
         id
     }
@@ -1043,8 +1051,18 @@ impl TypeContext {
         self.alloc(TypeData::DynTrait { traits })
     }
 
-    pub fn exists(&mut self, param_index: usize, name: String, base: TypeId, invariant: crate::ast::Expr) -> TypeId {
-        let id = self.alloc(TypeData::Exists { param_index, name, base });
+    pub fn exists(
+        &mut self,
+        param_index: usize,
+        name: String,
+        base: TypeId,
+        invariant: crate::ast::Expr,
+    ) -> TypeId {
+        let id = self.alloc(TypeData::Exists {
+            param_index,
+            name,
+            base,
+        });
         self.meta.entry(id).or_insert(TypeMeta {
             default_value: None,
             invariant: Some(invariant),
@@ -1560,7 +1578,9 @@ impl TypeContext {
                     quantifiers: q2,
                     body: b2,
                 },
-            ) if q1.len() == q2.len() && q1.iter().zip(q2.iter()).all(|((i1, _), (i2, _))| i1 == i2) => {
+            ) if q1.len() == q2.len()
+                && q1.iter().zip(q2.iter()).all(|((i1, _), (i2, _))| i1 == i2) =>
+            {
                 let body_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*b1, *b2, body_variance)?;
                 self.set_binding(a, b);
@@ -1747,25 +1767,52 @@ impl TypeContext {
         let universe = self.next_universe.get();
         self.next_universe.set(universe + 1);
         // Dynamically create a SkolemVar with the correct universe_num
-        let skolem = self.alloc(TypeData::SkolemVar { id: universe, universe_num: universe });
+        let skolem = self.alloc(TypeData::SkolemVar {
+            id: universe,
+            universe_num: universe,
+        });
         (universe, skolem)
     }
 
     pub fn check_skolem_escape(&self, ty: TypeId, max_universe: usize) -> Option<usize> {
         let resolved = self.resolve_binding(ty);
         match self.get(resolved) {
-            TypeData::SkolemVar { universe_num, .. } if *universe_num > max_universe => Some(*universe_num),
-            TypeData::Adt { args, .. } | TypeData::Tuple { elems: args, .. } | TypeData::Coproduct { alternatives: args, .. } => {
-                for &a in args { if let Some(u) = self.check_skolem_escape(a, max_universe) { return Some(u); } }
+            TypeData::SkolemVar { universe_num, .. } if *universe_num > max_universe => {
+                Some(*universe_num)
+            }
+            TypeData::Adt { args, .. }
+            | TypeData::Tuple { elems: args, .. }
+            | TypeData::Coproduct {
+                alternatives: args, ..
+            } => {
+                for &a in args {
+                    if let Some(u) = self.check_skolem_escape(a, max_universe) {
+                        return Some(u);
+                    }
+                }
                 None
             }
             TypeData::Fn { params, ret } => {
-                for &p in params { if let Some(u) = self.check_skolem_escape(p, max_universe) { return Some(u); } }
+                for &p in params {
+                    if let Some(u) = self.check_skolem_escape(p, max_universe) {
+                        return Some(u);
+                    }
+                }
                 self.check_skolem_escape(*ret, max_universe)
             }
-            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } | TypeData::Array { elem: ty, .. } | TypeData::Slice { elem: ty } | TypeData::Ptr { pointee: ty, .. } => self.check_skolem_escape(*ty, max_universe),
-            TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. } | TypeData::Mu { body, .. } | TypeData::Nu { body, .. } | TypeData::Poly { body, .. } => self.check_skolem_escape(*body, max_universe),
-            TypeData::AssociatedType { self_ty, .. } => self.check_skolem_escape(*self_ty, max_universe),
+            TypeData::Ref { ty, .. }
+            | TypeData::Pointer { ty }
+            | TypeData::Array { elem: ty, .. }
+            | TypeData::Slice { elem: ty }
+            | TypeData::Ptr { pointee: ty, .. } => self.check_skolem_escape(*ty, max_universe),
+            TypeData::Forall { body, .. }
+            | TypeData::Exists { base: body, .. }
+            | TypeData::Mu { body, .. }
+            | TypeData::Nu { body, .. }
+            | TypeData::Poly { body, .. } => self.check_skolem_escape(*body, max_universe),
+            TypeData::AssociatedType { self_ty, .. } => {
+                self.check_skolem_escape(*self_ty, max_universe)
+            }
             _ => None,
         }
     }
@@ -1816,7 +1863,14 @@ impl TypeContext {
             }
             // ∀X.T <: U (U not a Forall): skolemize X in a higher universe so
             // it cannot accidentally unify with free variables in U.
-            (TypeData::Forall { param_index: pi, param_name: _, body }, _) => {
+            (
+                TypeData::Forall {
+                    param_index: pi,
+                    param_name: _,
+                    body,
+                },
+                _,
+            ) => {
                 let (_universe, skolem) = self.enter_universe();
                 let body_skolemized = self.replace_generic(*body, *pi, skolem);
                 self.subtype(body_skolemized, sup)
@@ -1874,9 +1928,13 @@ impl TypeContext {
             }
             (TypeData::Slice { elem: e1 }, TypeData::Slice { elem: e2 }) => self.subtype(*e1, *e2),
             (TypeData::Tuple { elems: e1 }, TypeData::Tuple { elems: e2 }) => {
-                if e1.len() != e2.len() { return false; }
+                if e1.len() != e2.len() {
+                    return false;
+                }
                 for (a, b) in e1.iter().zip(e2.iter()) {
-                    if !self.subtype(*a, *b) { return false; }
+                    if !self.subtype(*a, *b) {
+                        return false;
+                    }
                 }
                 true
             }
@@ -1884,9 +1942,13 @@ impl TypeContext {
                 TypeData::Coproduct { alternatives: a1 },
                 TypeData::Coproduct { alternatives: a2 },
             ) => {
-                if a1.len() != a2.len() { return false; }
+                if a1.len() != a2.len() {
+                    return false;
+                }
                 for (a, b) in a1.iter().zip(a2.iter()) {
-                    if !self.subtype(*a, *b) { return false; }
+                    if !self.subtype(*a, *b) {
+                        return false;
+                    }
                 }
                 true
             }
@@ -2017,7 +2079,11 @@ impl TypeContext {
                     body: new_body,
                 })
             }
-            TypeData::Exists { param_index, name, base } => {
+            TypeData::Exists {
+                param_index,
+                name,
+                base,
+            } => {
                 let new_base = self.subst(*base, subst);
                 let new_id = self.alloc(TypeData::Exists {
                     param_index: *param_index,
@@ -2048,11 +2114,19 @@ impl TypeContext {
     }
 
     fn struct_ty_no_alloc(&self, def_id: DefId, args: Vec<TypeId>) -> Option<TypeId> {
-        self.find_type(&TypeData::Adt { kind: AdtKind::Struct, def_id, args })
+        self.find_type(&TypeData::Adt {
+            kind: AdtKind::Struct,
+            def_id,
+            args,
+        })
     }
 
     fn enum_ty_no_alloc(&self, def_id: DefId, args: Vec<TypeId>) -> Option<TypeId> {
-        self.find_type(&TypeData::Adt { kind: AdtKind::Enum, def_id, args })
+        self.find_type(&TypeData::Adt {
+            kind: AdtKind::Enum,
+            def_id,
+            args,
+        })
     }
 
     fn tuple_ty_no_alloc(&self, elems: Vec<TypeId>) -> Option<TypeId> {
@@ -2088,7 +2162,11 @@ impl TypeContext {
     }
 
     fn exists_ty_no_alloc(&self, param_index: usize, name: String, base: TypeId) -> Option<TypeId> {
-        self.find_type(&TypeData::Exists { param_index, name, base })
+        self.find_type(&TypeData::Exists {
+            param_index,
+            name,
+            base,
+        })
     }
 
     fn associated_ty_no_alloc(
@@ -2246,11 +2324,23 @@ impl TypeContext {
     }
 
     pub fn is_struct(&self, ty: TypeId) -> bool {
-        matches!(self.get(ty), TypeData::Adt { kind: AdtKind::Struct, .. })
+        matches!(
+            self.get(ty),
+            TypeData::Adt {
+                kind: AdtKind::Struct,
+                ..
+            }
+        )
     }
 
     pub fn is_enum(&self, ty: TypeId) -> bool {
-        matches!(self.get(ty), TypeData::Adt { kind: AdtKind::Enum, .. })
+        matches!(
+            self.get(ty),
+            TypeData::Adt {
+                kind: AdtKind::Enum,
+                ..
+            }
+        )
     }
 
     pub fn is_tuple(&self, ty: TypeId) -> bool {
@@ -3421,10 +3511,7 @@ mod tests {
         });
         let outer_fn = ctx.function(vec![inner_forall], p0);
         let result = ctx.forall(0, "X".into(), outer_fn);
-        assert_eq!(
-            result, expected,
-            "∀X.(∀Z.Z⇒X)⇒X should reduce to ∃Z.Z"
-        );
+        assert_eq!(result, expected, "∀X.(∀Z.Z⇒X)⇒X should reduce to ∃Z.Z");
     }
 
     #[test]
@@ -3527,10 +3614,7 @@ mod tests {
         });
         let outer_fn = ctx.function(vec![inner_forall], p0);
         let result = ctx.forall(0, "X".into(), outer_fn);
-        assert_eq!(
-            result, expected,
-            "∀X.(∀Z.X⇒Z)⇒X should reduce to ∀Z.Z"
-        );
+        assert_eq!(result, expected, "∀X.(∀Z.X⇒Z)⇒X should reduce to ∀Z.Z");
     }
 
     #[test]
@@ -3653,18 +3737,22 @@ mod tests {
         // Σₖ A⟨X⟩ = X and therefore μX.X.
         let mut ctx = TypeContext::new();
         let p0 = ctx.generic_param(0, "X".into());
-        let branch = ctx.function(vec![p0], p0);            // X → X
-        let outer = ctx.function(vec![branch], p0);         // (X→X) → X
-        let ty = ctx.forall(0, "X".into(), outer);           // ∀X.(X→X)→X
+        let branch = ctx.function(vec![p0], p0); // X → X
+        let outer = ctx.function(vec![branch], p0); // (X→X) → X
+        let ty = ctx.forall(0, "X".into(), outer); // ∀X.(X→X)→X
 
         // Should be µX.X — a single branch, not a coproduct with two entries.
         match ctx.get(ty) {
-            TypeData::Mu { param_index, body, .. } => {
+            TypeData::Mu {
+                param_index, body, ..
+            } => {
                 assert_eq!(*param_index, 0, "mu binds the outer X index");
                 match ctx.get(*body) {
                     TypeData::GenericParam { index, .. } => {
-                        assert_eq!(*index, 0,
-                            "mu body should be X (GenericParam(0)), not a coproduct");
+                        assert_eq!(
+                            *index, 0,
+                            "mu body should be X (GenericParam(0)), not a coproduct"
+                        );
                     }
                     other => panic!("expected GenericParam(0) inside Mu, got {other:?}"),
                 }
@@ -3683,10 +3771,14 @@ mod tests {
         let p7 = ctx.generic_param(7, "Y".into());
         let fx = ctx.forall(0, "X".into(), p0);
         let fy = ctx.forall(7, "Y".into(), p7);
-        assert!(ctx.subtype(fx, fy),
-            "∀X.X <: ∀Y.Y should hold under alpha-conversion");
-        assert!(ctx.subtype(fy, fx),
-            "∀Y.Y <: ∀X.X should hold symmetrically");
+        assert!(
+            ctx.subtype(fx, fy),
+            "∀X.X <: ∀Y.Y should hold under alpha-conversion"
+        );
+        assert!(
+            ctx.subtype(fy, fx),
+            "∀Y.Y <: ∀X.X should hold symmetrically"
+        );
     }
 
     #[test]
@@ -3700,8 +3792,10 @@ mod tests {
         let fn_y = ctx.function(vec![p7], int32);
         let fx = ctx.forall(0, "X".into(), fn_x);
         let fy = ctx.forall(7, "Y".into(), fn_y);
-        assert!(ctx.subtype(fx, fy),
-            "∀X.(X→Int) <: ∀Y.(Y→Int) should hold under alpha-conversion");
+        assert!(
+            ctx.subtype(fx, fy),
+            "∀X.(X→Int) <: ∀Y.(Y→Int) should hold under alpha-conversion"
+        );
     }
 
     #[test]
@@ -3711,12 +3805,14 @@ mod tests {
         let int32 = ctx.int(32, true);
         let p0 = ctx.generic_param(0, "X".into());
         let p7 = ctx.generic_param(7, "Y".into());
-        let fn_x = ctx.function(vec![p0], int32);     // X → Int
-        let fn_y = ctx.function(vec![int32], p7);     // Int → Y
+        let fn_x = ctx.function(vec![p0], int32); // X → Int
+        let fn_y = ctx.function(vec![int32], p7); // Int → Y
         let fx = ctx.forall(0, "X".into(), fn_x);
         let fy = ctx.forall(7, "Y".into(), fn_y);
-        assert!(!ctx.subtype(fx, fy),
-            "∀X.(X→Int) <: ∀Y.(Int→Y) should be false");
+        assert!(
+            !ctx.subtype(fx, fy),
+            "∀X.(X→Int) <: ∀Y.(Int→Y) should be false"
+        );
     }
 
     #[test]
@@ -3725,8 +3821,10 @@ mod tests {
         let mut ctx = TypeContext::new();
         let p0 = ctx.generic_param(0, "X".into());
         let fx = ctx.forall(0, "X".into(), p0);
-        assert!(ctx.subtype(fx, fx),
-            "∀X.X <: ∀X.X with same index should hold");
+        assert!(
+            ctx.subtype(fx, fx),
+            "∀X.X <: ∀X.X with same index should hold"
+        );
     }
 
     #[test]
@@ -3759,8 +3857,10 @@ mod tests {
         // sub's X(0) → fresh(2), sup's Y(1) → fresh(2),
         // sup's free X(0) STAYS AS 0, giving bodies (GP(2)→GP(2)) vs
         // (GP(0)→GP(0)) — structurally different → false.
-        assert!(!ctx.subtype(sub, sup),
-            "∀X.(X→X) <: ∀Y.(X→X) must NOT hold — free X in sup would be captured");
+        assert!(
+            !ctx.subtype(sub, sup),
+            "∀X.(X→X) <: ∀Y.(X→X) must NOT hold — free X in sup would be captured"
+        );
     }
 
     // ── HRTB / Forall subtype tests ──────────────────────────────
@@ -3800,8 +3900,15 @@ mod tests {
         let mut ctx = TypeContext::new();
         let def_id = DefId(42);
         let int_ty = ctx.int(32, true);
-        let adt_ty = ctx.alloc(TypeData::Adt { kind: AdtKind::Struct, def_id, args: vec![int_ty] });
-        assert_eq!(ctx.try_normalize_associated_type_def_id(adt_ty), Some(def_id));
+        let adt_ty = ctx.alloc(TypeData::Adt {
+            kind: AdtKind::Struct,
+            def_id,
+            args: vec![int_ty],
+        });
+        assert_eq!(
+            ctx.try_normalize_associated_type_def_id(adt_ty),
+            Some(def_id)
+        );
     }
 
     #[test]
