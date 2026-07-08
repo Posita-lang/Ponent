@@ -708,14 +708,15 @@ impl TypeContext {
                                 product
                             } else {
                                 let mut w = product;
-                                // Rename peeled GenericParam indices to fresh globally-unique
-                                // indices, then wrap with Exists.  After peeling inner Forall
-                                // layers the body still contains GenericParam references keyed
-                                // to the OLD indices.  Using fresh indices ensures they cannot
-                                // collide with any outer binder even though Exists traversal
-                                // functions do not check scoping.
+                                // Barendregt-inspired renaming: replace each peeled index
+                                // with a globally-unique index (via fresh_param_index) that
+                                // also cannot collide with pi, preventing false positives
+                                // in needs_fix while guaranteeing full capture avoidance.
                                 for (eq, en) in &inner_quantifiers {
-                                    let fresh_idx = self.fresh_param_index();
+                                    let mut fresh_idx = self.fresh_param_index();
+                                    if fresh_idx == pi {
+                                        fresh_idx = self.fresh_param_index();
+                                    }
                                     let fresh_gp = self.generic_param(fresh_idx, en.clone());
                                     w = self.replace_generic(w, *eq, fresh_gp);
                                     w = self.exists(
@@ -732,8 +733,8 @@ impl TypeContext {
                             };
                             branch_replacements.push(repl);
                         }
-                        // Process co-Yoneda case
-                        if coyoneda_match {
+                        // Process co-Yoneda case (only if not already handled by Yoneda)
+                        if !yoneda_match && coyoneda_match {
                             is_coyoneda = true;
                             // The branch is X ⇒ A where A = inner_ret (not a param).
                             // When ips.len() == 1, X is the only param and A = inner_ret.
@@ -748,11 +749,12 @@ impl TypeContext {
                                 replacement
                             } else {
                                 let mut w = replacement;
-                                // Same renaming strategy as the Yoneda branch: rename old
-                                // peeled indices to fresh globally-unique indices to prevent
-                                // dangling GenericParam references before wrapping with Forall.
+                                // Same Barendregt-inspired renaming for co-Yoneda.
                                 for (eq, en) in &inner_quantifiers {
-                                    let fresh_idx = self.fresh_param_index();
+                                    let mut fresh_idx = self.fresh_param_index();
+                                    if fresh_idx == pi {
+                                        fresh_idx = self.fresh_param_index();
+                                    }
                                     let fresh_gp = self.generic_param(fresh_idx, en.clone());
                                     w = self.replace_generic(w, *eq, fresh_gp);
                                     w = self.forall(fresh_idx, en.clone(), w);
@@ -1031,6 +1033,7 @@ impl TypeContext {
             TypeData::Ptr { pointee, .. } => self.type_contains_param(param, *pointee),
             TypeData::AssociatedType { self_ty, .. } => self.type_contains_param(param, *self_ty),
             TypeData::Poly { body, .. } => self.type_contains_param(param, *body),
+            TypeData::Forall { body, .. } => self.type_contains_param(param, *body),
             TypeData::Exists { base, .. } => self.type_contains_param(param, *base),
             TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => {
                 self.type_contains_param(param, *body)
@@ -3334,6 +3337,286 @@ mod tests {
             reduced, expected,
             "∀X.(X⇒Int⇒Float)⇒X should reduce to Int→Float, not lose Float"
         );
+    }
+
+    // ── Yoneda / co-Yoneda with inner quantifiers (∀Z⃗ₖ) ────────
+    //
+    // These test the fix for a binding-maintenance bug where inner-Forall
+    // GenericParam references became dangling after Yoneda reduction
+    // peeled the quantifier layers.
+
+    #[test]
+    fn test_yoneda_inner_quantifier_one() {
+        // ∀X. (∀Z. Z ⇒ X) ⇒ X  →  ∃Z. Z
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let gp_z = ctx.generic_param(1, "Z".into());
+
+        // Expected: ∃Z. Z
+        let expected = ctx.alloc(TypeData::Exists {
+            param_index: 1,
+            name: "Z".into(),
+            base: gp_z,
+        });
+
+        let inner_fn = ctx.function(vec![gp_z], p0);
+        let inner_forall = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z".into(),
+            body: inner_fn,
+        });
+        let outer_fn = ctx.function(vec![inner_forall], p0);
+        let result = ctx.forall(0, "X".into(), outer_fn);
+        assert_eq!(
+            result, expected,
+            "∀X.(∀Z.Z⇒X)⇒X should reduce to ∃Z.Z"
+        );
+    }
+
+    #[test]
+    fn test_yoneda_inner_quantifier_x_in_body() {
+        // ∀X. (∀Z. (Z, X) ⇒ X) ⇒ X  →  μX. ∃Z. (Z, X)
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let gp_z = ctx.generic_param(1, "Z".into());
+        let int_ty = ctx.int(32, true);
+
+        // Expected: μX. ∃Z. (Z, X)
+        let tup = ctx.tuple(vec![gp_z, p0]);
+        let inner_exists = ctx.alloc(TypeData::Exists {
+            param_index: 1,
+            name: "Z".into(),
+            base: tup,
+        });
+        let expected = ctx.alloc(TypeData::Mu {
+            param_index: 0,
+            param_name: "X".into(),
+            body: inner_exists,
+        });
+
+        let tup = ctx.tuple(vec![gp_z, p0]);
+        let inner_fn = ctx.function(vec![tup], p0);
+        let inner_forall = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z".into(),
+            body: inner_fn,
+        });
+        let outer_fn = ctx.function(vec![inner_forall], p0);
+        let result = ctx.forall(0, "X".into(), outer_fn);
+        assert_eq!(
+            result, expected,
+            "∀X.(∀Z.(Z,X)⇒X)⇒X should reduce to μX.∃Z.(Z,X)"
+        );
+    }
+
+    #[test]
+    fn test_yoneda_two_inner_quantifiers() {
+        // ∀X. (∀Z₁. ∀Z₂. (Z₁, Z₂, Int) ⇒ X) ⇒ X  →  ∃Z₂. ∃Z₁. (Z₁, Z₂, Int)
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let gp_z1 = ctx.generic_param(1, "Z₁".into());
+        let gp_z2 = ctx.generic_param(2, "Z₂".into());
+        let int_ty = ctx.int(32, true);
+
+        // Expected: ∃Z₂. ∃Z₁. (Z₁, Z₂, Int)
+        let tup = ctx.tuple(vec![gp_z1, gp_z2, int_ty]);
+        let inner_ex = ctx.alloc(TypeData::Exists {
+            param_index: 1,
+            name: "Z₁".into(),
+            base: tup,
+        });
+        let expected = ctx.alloc(TypeData::Exists {
+            param_index: 2,
+            name: "Z₂".into(),
+            base: inner_ex,
+        });
+
+        let tup = ctx.tuple(vec![gp_z1, gp_z2, int_ty]);
+        let inner_fn = ctx.function(vec![tup], p0);
+        let inner_forall2 = ctx.alloc(TypeData::Forall {
+            param_index: 2,
+            param_name: "Z₂".into(),
+            body: inner_fn,
+        });
+        let inner_forall1 = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z₁".into(),
+            body: inner_forall2,
+        });
+        let outer_fn = ctx.function(vec![inner_forall1], p0);
+        let result = ctx.forall(0, "X".into(), outer_fn);
+        assert_eq!(
+            result, expected,
+            "∀X.(∀Z₁.∀Z₂.(Z₁,Z₂,Int)⇒X)⇒X should reduce to ∃Z₂.∃Z₁.(Z₁,Z₂,Int)"
+        );
+    }
+
+    #[test]
+    fn test_coyoneda_inner_quantifier_one() {
+        // ∀X. (∀Z. X ⇒ Z) ⇒ X  →  ∀Z. Z
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let gp_z = ctx.generic_param(1, "Z".into());
+
+        // Expected: ∀Z. Z
+        let expected = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z".into(),
+            body: gp_z,
+        });
+
+        let inner_fn = ctx.function(vec![p0], gp_z);
+        let inner_forall = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z".into(),
+            body: inner_fn,
+        });
+        let outer_fn = ctx.function(vec![inner_forall], p0);
+        let result = ctx.forall(0, "X".into(), outer_fn);
+        assert_eq!(
+            result, expected,
+            "∀X.(∀Z.X⇒Z)⇒X should reduce to ∀Z.Z"
+        );
+    }
+
+    #[test]
+    fn test_coyoneda_inner_quantifier_x_in_body() {
+        // ∀X. (∀Z. X ⇒ (Z, X)) ⇒ X  →  νX. ∀Z. (Z, X)
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let gp_z = ctx.generic_param(1, "Z".into());
+
+        // Expected: νX. ∀Z. (Z, X)
+        let tup = ctx.tuple(vec![gp_z, p0]);
+        let inner_forall = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z".into(),
+            body: tup,
+        });
+        let expected = ctx.alloc(TypeData::Nu {
+            param_index: 0,
+            param_name: "X".into(),
+            body: inner_forall,
+        });
+
+        let i_tup = ctx.tuple(vec![gp_z, p0]);
+        let inner_fn = ctx.function(vec![p0], i_tup);
+        let inner_forall_wrap = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z".into(),
+            body: inner_fn,
+        });
+        let outer_fn = ctx.function(vec![inner_forall_wrap], p0);
+        let result = ctx.forall(0, "X".into(), outer_fn);
+        assert_eq!(
+            result, expected,
+            "∀X.(∀Z.X⇒(Z,X))⇒X should reduce to νX.∀Z.(Z,X)"
+        );
+    }
+
+    #[test]
+    fn test_yoneda_two_branches_with_inner_quantifiers() {
+        // ∀X. (∀Z₁. Z₁ ⇒ X) ⇒ (∀Z₂. Z₂ ⇒ X) ⇒ X  →  ∃Z₁.Z₁ + ∃Z₂.Z₂
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let gp_z1 = ctx.generic_param(1, "Z₁".into());
+        let gp_z2 = ctx.generic_param(2, "Z₂".into());
+
+        // Expected: Coproduct(∃Z₁.Z₁, ∃Z₂.Z₂)
+        let ex_z1 = ctx.alloc(TypeData::Exists {
+            param_index: 1,
+            name: "Z₁".into(),
+            base: gp_z1,
+        });
+        let ex_z2 = ctx.alloc(TypeData::Exists {
+            param_index: 2,
+            name: "Z₂".into(),
+            base: gp_z2,
+        });
+        let expected = ctx.coproduct(vec![ex_z1, ex_z2]);
+
+        // Branch 1: ∀Z₁. Z₁ ⇒ X
+        let inner_fn1 = ctx.function(vec![gp_z1], p0);
+        let forall1 = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z₁".into(),
+            body: inner_fn1,
+        });
+        // Branch 2: ∀Z₂. Z₂ ⇒ X
+        let inner_fn2 = ctx.function(vec![gp_z2], p0);
+        let forall2 = ctx.alloc(TypeData::Forall {
+            param_index: 2,
+            param_name: "Z₂".into(),
+            body: inner_fn2,
+        });
+        let outer_fn = ctx.function(vec![forall1, forall2], p0);
+        let result = ctx.forall(0, "X".into(), outer_fn);
+        assert_eq!(
+            result, expected,
+            "∀X.(∀Z₁.Z₁⇒X)⇒(∀Z₂.Z₂⇒X)⇒X should reduce to ∃Z₁.Z₁ + ∃Z₂.Z₂"
+        );
+    }
+
+    #[test]
+    fn test_yoneda_inner_quantifier_no_x_ref() {
+        // ∀X. (∀Z. (Int ⇒ Z) ⇒ X) ⇒ X  →  ∃Z. (Int ⇒ Z)
+        // Here A = Int ⇒ Z, and there is no X reference inside A.
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let gp_z = ctx.generic_param(1, "Z".into());
+        let int_ty = ctx.int(32, true);
+
+        // Expected: ∃Z. (Int ⇒ Z)
+        let arrow = ctx.function(vec![int_ty], gp_z);
+        let expected = ctx.alloc(TypeData::Exists {
+            param_index: 1,
+            name: "Z".into(),
+            base: arrow,
+        });
+
+        let inner_fn = ctx.function(vec![arrow], p0);
+        let inner_forall = ctx.alloc(TypeData::Forall {
+            param_index: 1,
+            param_name: "Z".into(),
+            body: inner_fn,
+        });
+        let outer_fn = ctx.function(vec![inner_forall], p0);
+        let result = ctx.forall(0, "X".into(), outer_fn);
+        assert_eq!(
+            result, expected,
+            "∀X.(∀Z.(Int⇒Z)⇒X)⇒X should reduce to ∃Z.(Int⇒Z)"
+        );
+    }
+
+    #[test]
+    fn test_yoneda_x_to_x_does_not_duplicate_branch() {
+        // ∀X.(X→X)→X  — branch X→X matches BOTH Yoneda (ret=X) and co-Yoneda
+        // (first param=X).  Must NOT push two copies into branch_replacements.
+        //
+        // Paper (Pistone & Tranchini 2022 §2): the ≡_X schema matches when the
+        // branch's return is X (the bound variable).  If the first parameter is
+        // also X, the branch is interpreted as the Yoneda case A⟨X⟩ = X, giving
+        // Σₖ A⟨X⟩ = X and therefore μX.X.
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let branch = ctx.function(vec![p0], p0);            // X → X
+        let outer = ctx.function(vec![branch], p0);         // (X→X) → X
+        let ty = ctx.forall(0, "X".into(), outer);           // ∀X.(X→X)→X
+
+        // Should be µX.X — a single branch, not a coproduct with two entries.
+        match ctx.get(ty) {
+            TypeData::Mu { param_index, body, .. } => {
+                assert_eq!(*param_index, 0, "mu binds the outer X index");
+                match ctx.get(*body) {
+                    TypeData::GenericParam { index, .. } => {
+                        assert_eq!(*index, 0,
+                            "mu body should be X (GenericParam(0)), not a coproduct");
+                    }
+                    other => panic!("expected GenericParam(0) inside Mu, got {other:?}"),
+                }
+            }
+            other => panic!("expected Mu, got {other:?}"),
+        }
     }
 
     // ── HRTB / Forall subtype tests ──────────────────────────────
