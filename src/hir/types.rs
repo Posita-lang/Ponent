@@ -643,6 +643,23 @@ impl TypeContext {
     /// Terms: `Σₖ` = sum (multi-branch → Tuple of results), `Πⱼ` = product (Tuple),
     /// `∃Z⃗ₖ` = Exists node when the branch has inner quantifiers.
     /// μX/νX fixpoints are elided when X does not appear in B⟨X⟩ (common case).
+    ///
+    /// ## Note on partial solving (2026-07)
+    ///
+    /// We considered extending this function to perform "partial" Yoneda reduction
+    /// when the type contains unresolved inference variables (InferVar) or other
+    /// non-standard shapes that don't match ≡_X / ≡^X exactly.  The idea would be
+    /// to reduce what can be reduced and suspend the rest, resuming once more type
+    /// information becomes available (akin to OmniML's suspended match constraints).
+    ///
+    /// The paper (Pistone & Tranchini 2022) defines ≡_X / ≡^X as deterministic,
+    /// all-or-nothing rewrite rules — partial solving would be an extension beyond
+    /// what the paper specifies, lacking formal guarantees (soundness, completeness,
+    /// termination) for the new "partial" rules.  We chose not to pursue this.
+    ///
+    /// If κ(A) imprecision from abandoned reductions becomes a practical problem,
+    /// consider revisiting with a well-scoped extension (e.g. limited to InferVar
+    /// only, or as a separate κ-only pass).
     fn yoneda_reduce_once(&mut self, ty: TypeId) -> TypeId {
         // ── Case A: explicit Forall node ──────────────────────────────
         let ty_data = self.get_arc(ty);
