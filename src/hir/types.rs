@@ -437,15 +437,21 @@ impl TypeContext {
 
         // Second pass: path compression.  Point every node along the chain
         // directly to the root so that future lookups are O(1) instead of
-        // O(depth).  Uses a single mutable borrow for all updates.
+        // O(depth).  Uses set_binding per step to ensure the transaction undo
+        // log captures each mutation (OmniML-style Ref-level logging).
         if root != id {
-            let mut bindings = self.bindings.borrow_mut();
             let mut current = id;
             let mut depth = 0;
             while current != root {
-                if let Some(&next) = bindings.get(&current) {
-                    bindings.insert(current, root);
-                    current = next;
+                let next = {
+                    let bindings = self.bindings.borrow();
+                    bindings.get(&current).copied()
+                };
+                if let Some(next_val) = next {
+                    // set_binding records the old value in the undo log so
+                    // that rollback can restore the exact pre-transaction chain.
+                    self.set_binding(current, root);
+                    current = next_val;
                     depth += 1;
                     if depth > MAX_CHAIN_DEPTH {
                         break;
@@ -529,7 +535,11 @@ impl TypeContext {
             def_id,
             args,
         });
-        self.def_id_to_type_id.insert(def_id, id);
+        // Register the prototype (first instantiation) only.
+        // Generic instances (e.g. Vec<i32>, Vec<bool>) share the same DefId
+        // and must not overwrite the prototype — OmniML uses Constr + Ident
+        // for constructor identity; our DefId is the analog of Ident.t.
+        self.def_id_to_type_id.entry(def_id).or_insert(id);
         id
     }
 
@@ -539,7 +549,8 @@ impl TypeContext {
             def_id,
             args,
         });
-        self.def_id_to_type_id.insert(def_id, id);
+        // Same as struct_ty — register prototype only, never overwrite.
+        self.def_id_to_type_id.entry(def_id).or_insert(id);
         id
     }
 
@@ -1288,6 +1299,10 @@ impl TypeContext {
             return true;
         }
         let resolved = self.resolve_binding(ty);
+        // Resolve again in case ty had a binding chain that ends at param.
+        if resolved == param {
+            return true;
+        }
         match &self.types[resolved.index()].as_ref() {
             TypeData::Adt { args, .. } => args.iter().any(|&a| self.occurs_check(param, a)),
             TypeData::Tuple { elems } => elems.iter().any(|&e| self.occurs_check(param, e)),
@@ -1604,45 +1619,63 @@ impl TypeContext {
                 Ok(b)
             }
 
-            // Forall: same param_index → body is COVARIANT (ignore name)
+            // Forall: α-convert then COVARIANT body
             (
                 TypeData::Forall {
                     param_index: pi1,
-                    param_name: _,
+                    param_name: pn1,
                     body: b1,
                 },
                 TypeData::Forall {
                     param_index: pi2,
-                    param_name: _,
+                    param_name: pn2,
                     body: b2,
                 },
-            ) if pi1 == pi2 => {
+            ) => {
                 let body_variance = variance.xform(Variance::Covariant);
-                self.unify_internal(*b1, *b2, body_variance)?;
+                if *pi1 != *pi2 {
+                    // α-conversion with capture avoidance: rename BOTH bodies
+                    // to a FRESH index that cannot appear free in either body.
+                    let fresh_idx = self.fresh_param_index();
+                    let fresh_gp = self.generic_param(fresh_idx, pn2.clone());
+                    let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
+                    let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
+                    self.unify_internal(b1_renamed, b2_renamed, body_variance)?;
+                } else {
+                    self.unify_internal(*b1, *b2, body_variance)?;
+                }
                 self.set_binding(a, b);
                 Ok(b)
             }
 
-            // Exists: same param_index → base is COVARIANT (ignore name)
+            // Exists: α-convert then COVARIANT base
             (
                 TypeData::Exists {
                     param_index: pi1,
-                    name: _,
+                    name: n1,
                     base: b1,
                 },
                 TypeData::Exists {
                     param_index: pi2,
-                    name: _,
+                    name: n2,
                     base: b2,
                 },
-            ) if pi1 == pi2 => {
+            ) => {
                 let base_variance = variance.xform(Variance::Covariant);
-                self.unify_internal(*b1, *b2, base_variance)?;
+                if *pi1 != *pi2 {
+                    let fresh_idx = self.fresh_param_index();
+                    let fresh_gp = self.generic_param(fresh_idx, n2.clone());
+                    let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
+                    let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
+                    self.unify_internal(b1_renamed, b2_renamed, base_variance)?;
+                } else {
+                    self.unify_internal(*b1, *b2, base_variance)?;
+                }
                 self.set_binding(a, b);
                 Ok(b)
             }
 
-            // Poly: same quantifier indices + COVARIANT body
+            // Poly: α-convert quantifiers then COVARIANT body
             (
                 TypeData::Poly {
                     quantifiers: q1,
@@ -1652,49 +1685,75 @@ impl TypeContext {
                     quantifiers: q2,
                     body: b2,
                 },
-            ) if q1.len() == q2.len()
-                && q1.iter().zip(q2.iter()).all(|((i1, _), (i2, _))| i1 == i2) =>
-            {
+            ) if q1.len() == q2.len() => {
                 let body_variance = variance.xform(Variance::Covariant);
-                self.unify_internal(*b1, *b2, body_variance)?;
+                // α-conversion with capture avoidance: rename BOTH sides to
+                // fresh indices for each mismatched quantifier.
+                let mut b1_renamed = *b1;
+                let mut b2_renamed = *b2;
+                for ((i1, _), (i2, pn2)) in q1.iter().zip(q2.iter()) {
+                    if i1 != i2 {
+                        let fresh_idx = self.fresh_param_index();
+                        let fresh_gp = self.generic_param(fresh_idx, pn2.clone());
+                        b1_renamed = self.replace_generic(b1_renamed, *i1, fresh_gp);
+                        b2_renamed = self.replace_generic(b2_renamed, *i2, fresh_gp);
+                    }
+                }
+                self.unify_internal(b1_renamed, b2_renamed, body_variance)?;
                 self.set_binding(a, b);
                 Ok(b)
             }
 
-            // Mu: same param_index → body is COVARIANT (ignore name)
+            // Mu: α-convert then COVARIANT body
             (
                 TypeData::Mu {
                     param_index: pi1,
-                    param_name: _,
+                    param_name: pn1,
                     body: b1,
                 },
                 TypeData::Mu {
                     param_index: pi2,
-                    param_name: _,
+                    param_name: pn2,
                     body: b2,
                 },
-            ) if pi1 == pi2 => {
+            ) => {
                 let body_variance = variance.xform(Variance::Covariant);
-                self.unify_internal(*b1, *b2, body_variance)?;
+                if *pi1 != *pi2 {
+                    let fresh_idx = self.fresh_param_index();
+                    let fresh_gp = self.generic_param(fresh_idx, pn2.clone());
+                    let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
+                    let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
+                    self.unify_internal(b1_renamed, b2_renamed, body_variance)?;
+                } else {
+                    self.unify_internal(*b1, *b2, body_variance)?;
+                }
                 self.set_binding(a, b);
                 Ok(b)
             }
 
-            // Nu: same param_index → body is COVARIANT (ignore name)
+            // Nu: α-convert with capture avoidance then COVARIANT body
             (
                 TypeData::Nu {
                     param_index: pi1,
-                    param_name: _,
+                    param_name: pn1,
                     body: b1,
                 },
                 TypeData::Nu {
                     param_index: pi2,
-                    param_name: _,
+                    param_name: pn2,
                     body: b2,
                 },
-            ) if pi1 == pi2 => {
+            ) => {
                 let body_variance = variance.xform(Variance::Covariant);
-                self.unify_internal(*b1, *b2, body_variance)?;
+                if *pi1 != *pi2 {
+                    let fresh_idx = self.fresh_param_index();
+                    let fresh_gp = self.generic_param(fresh_idx, pn2.clone());
+                    let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
+                    let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
+                    self.unify_internal(b1_renamed, b2_renamed, body_variance)?;
+                } else {
+                    self.unify_internal(*b1, *b2, body_variance)?;
+                }
                 self.set_binding(a, b);
                 Ok(b)
             }
@@ -1795,6 +1854,7 @@ impl TypeContext {
         }
         // κ cache may be invalidated by binding changes across transaction boundaries.
         self.kappa_cache.borrow_mut().clear();
+        self.variance_cache.borrow_mut().clear();
     }
 
     /// Rollback the current transaction: reverse-apply every binding change
@@ -1812,6 +1872,7 @@ impl TypeContext {
         }
         self.unify_seen.borrow_mut().clear();
         self.kappa_cache.borrow_mut().clear();
+        self.variance_cache.borrow_mut().clear();
     }
 
     /// Insert a binding, recording the old value in the current transaction's
@@ -1951,9 +2012,13 @@ impl TypeContext {
                 },
                 _,
             ) => {
-                let (_universe, skolem) = self.enter_universe();
+                let (universe, skolem) = self.enter_universe();
                 let body_skolemized = self.replace_generic(*body, *pi, skolem);
-                self.subtype(body_skolemized, sup)
+                let ok = self.subtype(body_skolemized, sup);
+                // The skolem must not escape into sup.  The subtype check
+                // is currently read-only (no bindings), so escape cannot
+                // happen today — this is defense-in-depth for future changes.
+                ok && self.check_skolem_escape(sup, universe.saturating_sub(1)).is_none()
             }
             // T <: ∀X.U: peel the right-side binder.
             (_, TypeData::Forall { body, .. }) => self.subtype(sub, *body),
@@ -2064,7 +2129,7 @@ impl TypeContext {
                     pointee: p2,
                 },
             ) => *s1 == *s2 && *p1 == *p2,
-            // Poly: same quantifier indices → covariant body
+            // Poly: α-convert quantifiers → covariant body
             (
                 TypeData::Poly {
                     quantifiers: q1,
@@ -2074,10 +2139,18 @@ impl TypeContext {
                     quantifiers: q2,
                     body: b2,
                 },
-            ) if q1.len() == q2.len()
-                && q1.iter().zip(q2.iter()).all(|((i1, _), (i2, _))| i1 == i2) =>
-            {
-                self.subtype(*b1, *b2)
+            ) if q1.len() == q2.len() => {
+                let mut b1_renamed = *b1;
+                let mut b2_renamed = *b2;
+                for ((i1, _), (i2, pn2)) in q1.iter().zip(q2.iter()) {
+                    if i1 != i2 {
+                        let fresh_idx = self.fresh_param_index();
+                        let fresh_gp = self.generic_param(fresh_idx, pn2.clone());
+                        b1_renamed = self.replace_generic(b1_renamed, *i1, fresh_gp);
+                        b2_renamed = self.replace_generic(b2_renamed, *i2, fresh_gp);
+                    }
+                }
+                self.subtype(b1_renamed, b2_renamed)
             }
             _ => false,
         }
@@ -2681,6 +2754,10 @@ impl TypeContext {
     /// 1. Yoneda-reduce the type to eliminate quantifiers.
     /// 2. Compute κ on the reduced (monomorphic) type via simple combinatoric rules.
     pub fn characteristic(&mut self, ty: TypeId) -> Characteristic {
+        // Resolve bindings first: if ty is an InferVar or GenericParam that has
+        // been bound to a concrete type, compute κ on the resolved type instead
+        // of the unbound variable.
+        let ty = self.resolve_binding(ty);
         // Check cache first.
         if let Some(&cached) = self.kappa_cache.borrow().get(&ty) {
             return cached;
@@ -2703,11 +2780,11 @@ impl TypeContext {
             TypeData::Bool => FiniteExhaustible(2),
             TypeData::Char | TypeData::Byte | TypeData::USize => FiniteExhaustible(256),
             TypeData::Int { bits, .. } | TypeData::UInt { bits } => {
-                FiniteExhaustible(1 << bits)
+                FiniteExhaustible(1usize.checked_shl(*bits as u32).unwrap_or(usize::MAX))
             }
             TypeData::Float { .. } => InfiniteEnumerable,
             TypeData::Rational { int_bits, frac_bits } => {
-                FiniteExhaustible(1 << (int_bits + frac_bits))
+                FiniteExhaustible(1usize.checked_shl((*int_bits + *frac_bits) as u32).unwrap_or(usize::MAX))
             }
 
             // ── Composite types: recurse combinatorially ─────
@@ -3116,8 +3193,10 @@ impl TypeContext {
         // Does NOT go through `characteristic_body` — this is the base case.
         let data = self.get(ty);
         match data {
-            TypeData::Int { bits, .. } => Characteristic::FiniteExhaustible(1usize << bits),
-            TypeData::UInt { bits } => Characteristic::FiniteExhaustible(1usize << bits),
+            TypeData::Int { bits, .. } => Characteristic::FiniteExhaustible(
+                1usize.checked_shl(*bits as u32).unwrap_or(usize::MAX)),
+            TypeData::UInt { bits } => Characteristic::FiniteExhaustible(
+                1usize.checked_shl(*bits as u32).unwrap_or(usize::MAX)),
             TypeData::Float { .. } | TypeData::USize => {
                 Characteristic::FiniteExhaustible(usize::MAX)
             }
@@ -4202,4 +4281,172 @@ mod tests {
         let var_id = ctx.alloc(TypeData::InferVar { id: 0 });
         assert_eq!(ctx.try_normalize_associated_type_def_id(var_id), None);
     }
+
+    // ── Transaction + path compression ──────────────────────────
+
+    #[test]
+    fn test_transaction_rollback_path_compression() {
+        // Verify that resolve_binding path compression inside a transaction
+        // is correctly undone on rollback (Fix 1).
+        //
+        // NOTE: resolve_binding triggers path compression as a side effect,
+        // so we must NOT call it before setting up the transaction.
+        let mut ctx = TypeContext::new();
+        let a = ctx.alloc(TypeData::InferVar { id: 1 });
+        let b = ctx.alloc(TypeData::InferVar { id: 2 });
+        let c = ctx.alloc(TypeData::InferVar { id: 3 });
+
+        // Build a binding chain: a → b → c
+        ctx.set_binding(a, b);
+        ctx.set_binding(b, c);
+
+        // Verify the chain exists WITHOUT triggering path compression
+        // (check raw bindings, not resolve_binding).
+        assert_eq!(ctx.bindings.borrow().get(&a).copied(), Some(b));
+        assert_eq!(ctx.bindings.borrow().get(&b).copied(), Some(c));
+
+        // Start a transaction and resolve a, triggering path compression
+        // (a → c and b → c, both logged via set_binding).
+        ctx.begin_transaction();
+        let resolved = ctx.resolve_binding(a);
+        assert_eq!(resolved, c);
+        // After compression, a should point directly to c
+        assert_eq!(ctx.bindings.borrow().get(&a).copied(), Some(c));
+
+        // Rollback — should restore the original chain a → b → c
+        ctx.rollback_transaction();
+        // After rollback, a should point to b again
+        assert_eq!(ctx.bindings.borrow().get(&a).copied(), Some(b));
+        // The chain a → b → c should still resolve to c
+        assert_eq!(ctx.resolve_binding(a), c);
+    }
+
+    // ── characteristic resolves bindings ─────────────────────────
+
+    #[test]
+    fn test_characteristic_resolves_binding() {
+        // Verify that characteristic resolves bindings before computing κ
+        // (Fix 3).  If an InferVar is bound to Bool, characteristic should
+        // return Bool's κ (2), not the κ of InferVar (usize::MAX fallback).
+        let mut ctx = TypeContext::new();
+        let bool_ty = ctx.bool();
+        let infer = ctx.alloc(TypeData::InferVar { id: 42 });
+
+        // Bind infer → Bool
+        ctx.set_binding(infer, bool_ty);
+
+        // characteristic should resolve the binding and compute κ(Bool) = 2
+        assert_eq!(
+            ctx.characteristic(infer),
+            Characteristic::FiniteExhaustible(2),
+            "κ(InferVar bound to Bool) should be 2, not a fallback"
+        );
+    }
+
+    // ── checked_shl overflow safety ─────────────────────────────
+
+    #[test]
+    fn test_characteristic_int_overflow_safe() {
+        // Verify that Int with bits >= usize::BITS saturates instead of
+        // panicking (Fix 4).
+        let mut ctx = TypeContext::new();
+        // usize::BITS is 64 on 64-bit, 32 on 32-bit.  bits=64 is valid
+        // for Int<64>.  This should not panic.
+        let large = ctx.int(64, true);
+        let k = ctx.characteristic(large);
+        // Should saturate to usize::MAX or wrap around, not panic.
+        assert!(k != Characteristic::Undecidable);
+    }
+
+    // ── def_id_to_type_id prototype preservation ────────────────
+
+    #[test]
+    fn test_def_id_preserves_prototype() {
+        // Verify that struct_ty with different generic args does NOT
+        // overwrite the prototype mapping (Fix 5).
+        let mut ctx = TypeContext::new();
+        let def_id = DefId(99);
+        let int32 = ctx.int(32, true);
+        let bool_ty = ctx.bool();
+
+        // Create generic instances in various orders
+        let vec_i32 = ctx.struct_ty(def_id, vec![int32]);
+        let vec_bool = ctx.struct_ty(def_id, vec![bool_ty]);
+
+        // These should be different TypeIds (different args)
+        assert_ne!(vec_i32, vec_bool, "Vec<i32> and Vec<bool> should differ");
+
+        // get_type_id_for_def_id should return the FIRST registered
+        // (the prototype), NOT the last instance.
+        let registered = ctx.get_type_id_for_def_id(def_id);
+        assert_eq!(
+            registered,
+            Some(vec_i32),
+            "get_type_id_for_def_id should return the first registered instance (the prototype)"
+        );
+    }
 }
+
+    // ── α-conversion with capture avoidance ──────────────────────
+
+    #[test]
+    fn test_alpha_conv_forall_different_indices() {
+        // ∀X{0}.X <: ∀Y{7}.Y — structurally identical, different indices
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let p7 = ctx.generic_param(7, "Y".into());
+        let fx = ctx.forall(0, "X".into(), p0);
+        let fy = ctx.forall(7, "Y".into(), p7);
+
+        assert!(ctx.subtype(fx, fy));
+        assert!(ctx.subtype(fy, fx));
+        assert!(ctx.unify(fx, fy).is_ok());
+    }
+
+    #[test]
+    fn test_alpha_conv_forall_no_capture() {
+        // Forall(2, "X", body=GP(2)) vs Forall(0, "Y", body=GP(2)).
+        // Without capture avoidance, renaming Y→X captures the free GP(2).
+        let mut ctx = TypeContext::new();
+        let gp2 = ctx.generic_param(2, "X".into());
+        let fsub = ctx.forall(2, "X".into(), gp2);
+        let fsup = ctx.forall(0, "Y".into(), gp2);
+        assert!(!ctx.subtype(fsub, fsup),
+            "∀X(2).X <: ∀Y(0).X(free) must NOT hold — capture would be incorrect");
+    }
+
+    #[test]
+    fn test_alpha_conv_mu_different_indices() {
+        let mut ctx = TypeContext::new();
+        let int_ty = ctx.int(32, true);
+        let mu0 = ctx.alloc(TypeData::Mu {
+            param_index: 0, param_name: "X".into(), body: int_ty,
+        });
+        let mu5 = ctx.alloc(TypeData::Mu {
+            param_index: 5, param_name: "Y".into(), body: int_ty,
+        });
+        assert!(ctx.unify(mu0, mu5).is_ok());
+    }
+
+    #[test]
+    fn test_alpha_conv_poly_unify_and_subtype() {
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let p3 = ctx.generic_param(3, "Z".into());
+        let poly1 = ctx.poly(vec![(0, "X".into())], p0);
+        let poly2 = ctx.poly(vec![(3, "Z".into())], p3);
+        assert!(ctx.subtype(poly1, poly2));
+        assert!(ctx.unify(poly1, poly2).is_ok());
+    }
+
+    #[test]
+    fn test_occurs_check_through_binding() {
+        let mut ctx = TypeContext::new();
+        let param = ctx.alloc(TypeData::InferVar { id: 0 });
+        let mid = ctx.alloc(TypeData::InferVar { id: 1 });
+        let ty = ctx.alloc(TypeData::InferVar { id: 2 });
+        ctx.set_binding(ty, mid);
+        ctx.set_binding(mid, param);
+        assert!(ctx.occurs_check(param, ty),
+            "occurs_check should find param through binding chain ty→mid→param");
+    }
