@@ -652,7 +652,26 @@ impl TypeContext {
             body,
         } = &*ty_data
         {
-            let body_data = self.get_arc(*body);
+            // Strip leading ∀Y⃗ outer quantifiers before the Fn kernel.
+            // Paper (Fig.3): ≡_X / ≡^X preserves ∀Y⃗ on both sides.
+            //   ∀X. ∀Y⃗. ⟨...⟩ₖ ⇒ B⟨X⟩   ≡_X   ∀Y⃗. B⟨X ↦ ...⟩
+            let mut outer_quantifiers: Vec<(usize, String)> = Vec::new();
+            let mut inner = *body;
+            loop {
+                let inner_data = self.get_arc(inner);
+                match &*inner_data {
+                    TypeData::Forall {
+                        param_index: oi,
+                        param_name: on,
+                        body: ob,
+                    } => {
+                        outer_quantifiers.push((*oi, on.clone()));
+                        inner = *ob;
+                    }
+                    _ => break,
+                }
+            }
+            let body_data = self.get_arc(inner);
             if let TypeData::Fn { params, ret } = &*body_data {
                 let pi = *param_index;
                 let ret = *ret;
@@ -662,7 +681,21 @@ impl TypeContext {
                 // not coproduct. Each branch's Aⱼ = whole function tail after X.
                 // (Pistone & Tranchini 2022 §2, ≡_X formula)
                 let mut coyoneda_replacements: Vec<TypeId> = Vec::new();
-                for &branch in params {
+                // βη normalization: expand Tuple-of-Fn branches into separate branches.
+                // (Pistone & Tranchini 2022 §2, βη-isomorphisms: (A→C)×(B→C) ≅ (A+B)→C)
+                // A single branch that is a Tuple of Fns is expanded so that each
+                // Fn component becomes an independent branch for Yoneda/co-Yoneda matching.
+                let mut normalized_params: Vec<TypeId> = Vec::with_capacity(params.len());
+                for &b in params.iter() {
+                    match self.get(b) {
+                        TypeData::Tuple { elems } => {
+                            // Each element of the tuple becomes a separate branch.
+                            normalized_params.extend(elems.iter().copied());
+                        }
+                        _ => normalized_params.push(b),
+                    }
+                }
+                for &branch in &normalized_params {
                     // Peel outer Forall layers (∀Z⃗ₖ).
                     let mut inner_quantifiers: Vec<(usize, String)> = Vec::new();
                     let mut inner = branch;
@@ -766,6 +799,12 @@ impl TypeContext {
                         }
                     }
                 }
+                // ≡_X and ≡^X are exclusive global patterns (paper §2):
+                // ALL branches must match the SAME schema.  Mixed branches
+                // (some Yoneda, some co-Yoneda) cannot be reduced.
+                if !branch_replacements.is_empty() && !coyoneda_replacements.is_empty() {
+                    return ty;
+                }
                 if !branch_replacements.is_empty() || !coyoneda_replacements.is_empty() {
                     let sigma = if is_coyoneda {
                         // ≡_X: no Σₖ — multiple branches combine via product (tuple),
@@ -804,7 +843,12 @@ impl TypeContext {
                     } else {
                         sigma
                     };
-                    return self.replace_generic(ret, pi, replacement);
+                    let mut result = self.replace_generic(ret, pi, replacement);
+                    // Re-wrap preserved outer quantifiers ∀Y⃗ (paper Fig.3).
+                    for (oi, on) in outer_quantifiers.into_iter().rev() {
+                        result = self.forall(oi, on, result);
+                    }
+                    return result;
                 }
             }
             return ty;
@@ -1168,14 +1212,11 @@ impl TypeContext {
                     .iter()
                     .map(|&a| self.replace_generic(a, param_index, replacement))
                     .collect();
-                let new_id = self.alloc(TypeData::Adt {
+                self.alloc(TypeData::Adt {
                     kind: *kind,
                     def_id: *def_id,
                     args: new_args,
-                });
-                // maintain the def_id reverse mapping for get_type_id_for_def_id
-                self.def_id_to_type_id.insert(*def_id, new_id);
-                new_id
+                })
             }
             TypeData::Coproduct { alternatives } => {
                 let new_alts: Vec<TypeId> = alternatives
@@ -1995,6 +2036,32 @@ impl TypeContext {
                     frac_bits: q2,
                 },
             ) => *p1 == *p2 && *q1 == *q2,
+            // Ptr: invariant on both size and pointee
+            (
+                TypeData::Ptr {
+                    size: s1,
+                    pointee: p1,
+                },
+                TypeData::Ptr {
+                    size: s2,
+                    pointee: p2,
+                },
+            ) => *s1 == *s2 && *p1 == *p2,
+            // Poly: same quantifier indices → covariant body
+            (
+                TypeData::Poly {
+                    quantifiers: q1,
+                    body: b1,
+                },
+                TypeData::Poly {
+                    quantifiers: q2,
+                    body: b2,
+                },
+            ) if q1.len() == q2.len()
+                && q1.iter().zip(q2.iter()).all(|((i1, _), (i2, _))| i1 == i2) =>
+            {
+                self.subtype(*b1, *b2)
+            }
             _ => false,
         }
     }
@@ -2026,7 +2093,6 @@ impl TypeContext {
                     def_id: *def_id,
                     args: new_args,
                 });
-                self.def_id_to_type_id.insert(*def_id, new_id);
                 new_id
             }
             TypeData::Tuple { elems } => {
@@ -2592,25 +2658,181 @@ struct KappaGraph {
 }
 
 impl TypeContext {
-    /// Compute the characteristic κ(A) of a type, used for exhaustiveness checking
-    /// of match expressions.
+    /// Compute the characteristic κ(A) of a type, used for exhaustiveness checking.
     ///
-    /// Algorithm (Pistone & Tranchini 2022 §5) — global fixed-point iteration:
-    /// 1. Build the type graph G_A with variance edges and axiom links.
-    /// 2. Mark all "leaf" types (Bool, Int, …) as determined.
-    /// 3. Propagate: when every child of a node has κ fixed, compute the node's κ.
-    /// 4. Nodes that remain unmarked form cycles → classify by edge variance:
-    ///    all-covariant → InfiniteEnumerable (κ=1), else → Undecidable (κ=∞).
-    pub fn characteristic(&self, ty: TypeId) -> Characteristic {
+    /// Two-phase algorithm (Pistone & Tranchini 2022 §5):
+    /// 1. Yoneda-reduce the type to eliminate quantifiers.
+    /// 2. Compute κ on the reduced (monomorphic) type via simple combinatoric rules.
+    pub fn characteristic(&mut self, ty: TypeId) -> Characteristic {
         // Check cache first.
         if let Some(&cached) = self.kappa_cache.borrow().get(&ty) {
             return cached;
         }
-        let graph = self.build_kappa_graph(ty);
-        let result = self.solve_kappa(&graph);
+        let reduced = self.try_yoneda_reduce(ty);
+        let result = self.characteristic_of_reduced(reduced);
         // Cache the result.
         self.kappa_cache.borrow_mut().insert(ty, result);
         result
+    }
+
+    /// Compute κ on a Yoneda-reduced type (monomorphic + μ/ν only).
+    fn characteristic_of_reduced(&self, ty: TypeId) -> Characteristic {
+        use Characteristic::*;
+        let data = self.get(ty);
+        match data {
+            // ── Base types ──────────────────────────────────
+            TypeData::Never | TypeData::Error => FiniteExhaustible(0),
+            TypeData::Unit => FiniteExhaustible(1),
+            TypeData::Bool => FiniteExhaustible(2),
+            TypeData::Char | TypeData::Byte | TypeData::USize => FiniteExhaustible(256),
+            TypeData::Int { bits, .. } | TypeData::UInt { bits } => {
+                FiniteExhaustible(1 << bits)
+            }
+            TypeData::Float { .. } => InfiniteEnumerable,
+            TypeData::Rational { int_bits, frac_bits } => {
+                FiniteExhaustible(1 << (int_bits + frac_bits))
+            }
+
+            // ── Composite types: recurse combinatorially ─────
+            TypeData::Tuple { elems } => {
+                let mut k = FiniteExhaustible(1usize);
+                for &e in elems {
+                    k = Self::kappa_mul(k, self.characteristic_of_reduced(e));
+                }
+                k
+            }
+            TypeData::Fn { params, ret } => {
+                // |A ⇒ B| = |B| ^ |A|
+                let mut domain = FiniteExhaustible(1usize);
+                for &p in params {
+                    domain = Self::kappa_mul(domain, self.characteristic_of_reduced(p));
+                }
+                Self::kappa_pow(self.characteristic_of_reduced(*ret), domain)
+            }
+            TypeData::Coproduct { alternatives } => {
+                let mut k = FiniteExhaustible(0usize);
+                for &a in alternatives {
+                    k = Self::kappa_add(k, self.characteristic_of_reduced(a));
+                }
+                k
+            }
+            TypeData::Array { elem, size } => {
+                // |[T; N]| = |T| ^ N
+                Self::kappa_pow(self.characteristic_of_reduced(*elem), FiniteExhaustible(*size as usize))
+            }
+            TypeData::Slice { elem } => {
+                // [T] is an unsized type — any length, so infinitely enumerable.
+                let _ = self.characteristic_of_reduced(*elem);
+                InfiniteEnumerable
+            }
+            TypeData::Ptr { size, pointee } => {
+                // Ptr<size=S, pointee=T> memory cell: S × T
+                Self::kappa_mul(
+                    self.characteristic_of_reduced(*size),
+                    self.characteristic_of_reduced(*pointee),
+                )
+            }
+
+            // ── Data types ──────────────────────────────────
+            TypeData::Adt { args, .. } => {
+                // ADT arguments are invariant — ensure none is undecidable.
+                for &a in args {
+                    if self.characteristic_of_reduced(a) == Undecidable {
+                        return Undecidable;
+                    }
+                }
+                // Conservative upper bound; real value depends on the ADT definition.
+                FiniteExhaustible(usize::MAX)
+            }
+            TypeData::AssociatedType { self_ty, .. } => {
+                // Projection: treat as infinite (depends on impl).
+                let _ = self.characteristic_of_reduced(*self_ty);
+                InfiniteEnumerable
+            }
+
+            // ── Fixpoints: μX.T / νX.T ─────────────────────
+            TypeData::Mu { param_index, body, .. }
+            | TypeData::Nu { param_index, body, .. } => {
+                if !self.type_contains_param(*param_index, *body) {
+                    // X does not appear in body — degenerate, just compute body.
+                    self.characteristic_of_reduced(*body)
+                } else if self.check_positive_only(*param_index, *body) {
+                    // Only covariant self-reference → infinite enumerable
+                    InfiniteEnumerable
+                } else {
+                    // Contains contravariant/invariant self-reference → undecidable
+                    Undecidable
+                }
+            }
+
+            // ── Should not remain after Yoneda reduction ────
+            TypeData::Forall { .. } | TypeData::Poly { .. } | TypeData::Exists { .. }
+            | TypeData::GenericParam { .. } | TypeData::InferVar { .. }
+            | TypeData::SkolemVar { .. } => Undecidable,
+
+            // ── Fallback ────────────────────────────────────
+            _ => FiniteExhaustible(usize::MAX),
+        }
+    }
+
+    /// κ1 × κ2
+    fn kappa_mul(a: Characteristic, b: Characteristic) -> Characteristic {
+        use Characteristic::*;
+        match (a, b) {
+            (FiniteExhaustible(0), _) | (_, FiniteExhaustible(0)) => FiniteExhaustible(0),
+            (FiniteExhaustible(a), FiniteExhaustible(b)) => {
+                a.checked_mul(b).map_or(FiniteExhaustible(usize::MAX), FiniteExhaustible)
+            }
+            (FiniteExhaustible(_), InfiniteEnumerable)
+            | (InfiniteEnumerable, FiniteExhaustible(_))
+            | (InfiniteEnumerable, InfiniteEnumerable) => InfiniteEnumerable,
+            _ => Undecidable,
+        }
+    }
+
+    /// κ1 + κ2
+    fn kappa_add(a: Characteristic, b: Characteristic) -> Characteristic {
+        use Characteristic::*;
+        match (a, b) {
+            (FiniteExhaustible(0), x) | (x, FiniteExhaustible(0)) => x,
+            (FiniteExhaustible(a), FiniteExhaustible(b)) => {
+                a.checked_add(b).map_or(FiniteExhaustible(usize::MAX), FiniteExhaustible)
+            }
+            (FiniteExhaustible(_), InfiniteEnumerable)
+            | (InfiniteEnumerable, FiniteExhaustible(_))
+            | (InfiniteEnumerable, InfiniteEnumerable) => InfiniteEnumerable,
+            _ => Undecidable,
+        }
+    }
+
+    /// κ2 ^ κ1
+    fn kappa_pow(base: Characteristic, exp: Characteristic) -> Characteristic {
+        use Characteristic::*;
+        match (base, exp) {
+            // |A|^0 = 1
+            (_, FiniteExhaustible(0)) => FiniteExhaustible(1),
+            // 0^|A| = 0 (for |A| > 0)
+            (FiniteExhaustible(0), _) => FiniteExhaustible(0),
+            // 1^|A| = 1
+            (FiniteExhaustible(1), _) => FiniteExhaustible(1),
+            // |A|^1 = |A|
+            (x, FiniteExhaustible(1)) => x,
+            // |A|^|B| = finite
+            (FiniteExhaustible(b), FiniteExhaustible(e)) => {
+                b.checked_pow(e as u32).map_or(FiniteExhaustible(usize::MAX), FiniteExhaustible)
+            }
+            // |A|^∞ = ∞ (if |A| > 1) or 0 (if |A| = 0) or 1 (if |A| = 1)
+            (FiniteExhaustible(n), InfiniteEnumerable) if n > 1 => InfiniteEnumerable,
+            (FiniteExhaustible(0), InfiniteEnumerable) => FiniteExhaustible(0),
+            (FiniteExhaustible(1), InfiniteEnumerable) => FiniteExhaustible(1),
+            // ∞^|A| = ∞ (for |A| > 0)
+            (InfiniteEnumerable, FiniteExhaustible(n)) if n > 0 => InfiniteEnumerable,
+            // ∞^0 = 1
+            (InfiniteEnumerable, FiniteExhaustible(0)) => FiniteExhaustible(1),
+            // ∞^∞ = ∞
+            (InfiniteEnumerable, InfiniteEnumerable) => InfiniteEnumerable,
+            _ => Undecidable,
+        }
     }
 
     /// Build the type graph from root, collecting all reachable nodes,
@@ -3198,7 +3420,7 @@ mod tests {
     // -- Characteristic κ --
     #[test]
     fn test_characteristic_bool() {
-        let ctx = TypeContext::new();
+        let mut ctx = TypeContext::new();
         assert_eq!(
             ctx.characteristic(ctx.bool()),
             Characteristic::FiniteExhaustible(2)
@@ -3217,7 +3439,7 @@ mod tests {
 
     #[test]
     fn test_characteristic_unit() {
-        let ctx = TypeContext::new();
+        let mut ctx = TypeContext::new();
         assert_eq!(
             ctx.characteristic(ctx.unit()),
             Characteristic::FiniteExhaustible(1)
