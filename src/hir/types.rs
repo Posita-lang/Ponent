@@ -658,6 +658,10 @@ impl TypeContext {
                 let ret = *ret;
                 let mut branch_replacements: Vec<TypeId> = Vec::new();
                 let mut is_coyoneda = false;
+                // co-Yoneda (≡_X): no Σₖ — multiple branches combine via product,
+                // not coproduct. Each branch's Aⱼ = whole function tail after X.
+                // (Pistone & Tranchini 2022 §2, ≡_X formula)
+                let mut coyoneda_replacements: Vec<TypeId> = Vec::new();
                 for &branch in params {
                     // Peel outer Forall layers (∀Z⃗ₖ).
                     let mut inner_quantifiers: Vec<(usize, String)> = Vec::new();
@@ -735,10 +739,9 @@ impl TypeContext {
                         // Process co-Yoneda case (only if not already handled by Yoneda)
                         if !yoneda_match && coyoneda_match {
                             is_coyoneda = true;
-                            // The branch is X ⇒ A where A = inner_ret (not a param).
-                            // When ips.len() == 1, X is the only param and A = inner_ret.
-                            // When ips.len() > 1, the branch is X ⇒ A₁ ⇒ ... ⇒ Aⱼ ⇒ ir,
-                            // and the replacement is A₁ ⇒ (A₂ ⇒ ... ⇒ (Aⱼ ⇒ ir)).
+                            // ≡_X: each branch's Aⱼ = the whole function tail after X
+                            // (Pistone & Tranchini 2022 §2, ≡_X formula).
+                            // Multiple branches combine via product, NOT coproduct.
                             let replacement = if ips.len() <= 1 {
                                 *ir
                             } else {
@@ -748,7 +751,6 @@ impl TypeContext {
                                 replacement
                             } else {
                                 let mut w = replacement;
-                                // Same Barendregt-inspired renaming for co-Yoneda.
                                 for (eq, en) in &inner_quantifiers {
                                     let mut fresh_idx = self.fresh_param_index();
                                     if fresh_idx == pi {
@@ -760,14 +762,24 @@ impl TypeContext {
                                 }
                                 w
                             };
-                            branch_replacements.push(repl);
+                            coyoneda_replacements.push(repl);
                         }
                     }
                 }
-                if !branch_replacements.is_empty() {
-                    // Σₖ is the categorical coproduct (sum type), NOT a product.
-                    // For ∀X.(A₁⇒X)⇒(A₂⇒X)⇒X  →  A₁ + A₂
-                    let sigma = self.coproduct(branch_replacements);
+                if !branch_replacements.is_empty() || !coyoneda_replacements.is_empty() {
+                    let sigma = if is_coyoneda {
+                        // ≡_X: no Σₖ — multiple branches combine via product (tuple),
+                        // not coproduct.  (Pistone & Tranchini 2022 §2, ≡_X formula)
+                        if coyoneda_replacements.len() == 1 {
+                            coyoneda_replacements[0]
+                        } else {
+                            self.tuple(coyoneda_replacements.clone())
+                        }
+                    } else {
+                        // Σₖ is the categorical coproduct (sum type), NOT a product.
+                        // For ∀X.(A₁⇒X)⇒(A₂⇒X)⇒X  →  A₁ + A₂
+                        self.coproduct(branch_replacements)
+                    };
                     // Wrap with μX/νX only when the branch product(s) depend on X
                     // (Pistone & Tranchini 2022 §2, eq.3 & eq.4):
                     //   Yoneda (A⟨X⟩⇒X):    B⟨X⟩ → B⟨X↦μX.A⟨X⟩⟩
@@ -985,11 +997,17 @@ impl TypeContext {
                     sign: 0,
                 }]
             }
-            TypeData::Ptr { pointee, .. } => {
-                vec![VarianceEdge {
+            TypeData::Ptr { size, pointee, .. } => {
+                let mut edges = vec![VarianceEdge {
                     target: *pointee,
                     sign: 0,
-                }]
+                }];
+                // size must also be traversed — it may carry GenericParam/SkolemVar
+                edges.push(VarianceEdge {
+                    target: *size,
+                    sign: 0,
+                });
+                edges
             }
             TypeData::Forall { body, .. }
             | TypeData::Exists { base: body, .. }
@@ -1035,7 +1053,10 @@ impl TypeContext {
             TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
                 self.type_contains_param(param, *ty)
             }
-            TypeData::Ptr { pointee, .. } => self.type_contains_param(param, *pointee),
+            TypeData::Ptr { size, pointee, .. } => {
+                self.type_contains_param(param, *pointee)
+                    || self.type_contains_param(param, *size)
+            }
             TypeData::AssociatedType { self_ty, .. } => self.type_contains_param(param, *self_ty),
             TypeData::Poly { body, .. } => self.type_contains_param(param, *body),
             TypeData::Forall { body, .. } => self.type_contains_param(param, *body),
@@ -1072,16 +1093,11 @@ impl TypeContext {
     }
 
     pub fn forall(&mut self, param_index: usize, param_name: String, body: TypeId) -> TypeId {
-        let id = self.alloc(TypeData::Forall {
+        self.alloc(TypeData::Forall {
             param_index,
             param_name,
             body,
-        });
-        // Automatically attempt Yoneda reduction:
-        // ∀X.(A ⇒ X) ⇒ B⟨X⟩  →  B[X↦A]   (X only positive in body)
-        // ∀X.(X ⇒ A) ⇒ B⟨X⟩  →  B[X↦A]   (X only negative in body)
-        let reduced = self.try_yoneda_reduce(id);
-        if reduced != id { reduced } else { id }
+        })
     }
 
     /// Skip the `subst` type-pool lookup limitations and directly build
@@ -1803,8 +1819,14 @@ impl TypeContext {
             TypeData::Ref { ty, .. }
             | TypeData::Pointer { ty }
             | TypeData::Array { elem: ty, .. }
-            | TypeData::Slice { elem: ty }
-            | TypeData::Ptr { pointee: ty, .. } => self.check_skolem_escape(*ty, max_universe),
+            | TypeData::Slice { elem: ty } => self.check_skolem_escape(*ty, max_universe),
+            TypeData::Ptr { size, pointee, .. } => {
+                let mut max = self.check_skolem_escape(*pointee, max_universe);
+                if let Some(u) = self.check_skolem_escape(*size, max_universe) {
+                    max = Some(max.map_or(u, |m| m.max(u)));
+                }
+                max
+            }
             TypeData::Forall { body, .. }
             | TypeData::Exists { base: body, .. }
             | TypeData::Mu { body, .. }
@@ -2289,7 +2311,9 @@ impl TypeContext {
             TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
                 1 + self.type_constructor_depth(*ty)
             }
-            TypeData::Ptr { pointee, .. } => 1 + self.type_constructor_depth(*pointee),
+            TypeData::Ptr { size, pointee, .. } => {
+                2 + self.type_constructor_depth(*pointee).max(self.type_constructor_depth(*size))
+            }
             TypeData::Fn { params, ret } => {
                 1 + params
                     .iter()
@@ -3386,7 +3410,8 @@ mod tests {
         let int_ty = ctx.int(32, true);
         let inner_fn = ctx.function(vec![int_ty], p0);
         let outer_fn = ctx.function(vec![inner_fn], p0);
-        let forall = ctx.forall(0, "X".into(), outer_fn);
+        let forall_id = ctx.forall(0, "X".into(), outer_fn);
+        let forall = ctx.try_yoneda_reduce(forall_id);
         assert_eq!(forall, int_ty, "∀X.(Int⇒X)⇒X should reduce to Int");
     }
 
@@ -3400,7 +3425,8 @@ mod tests {
         let inner_fn = ctx.function(vec![p0], int_ty);
         let outer_fn = ctx.function(vec![p0], bool_ty);
         let combined = ctx.function(vec![inner_fn], outer_fn);
-        let forall = ctx.forall(0, "X".into(), combined);
+        let forall_id = ctx.forall(0, "X".into(), combined);
+        let forall = ctx.try_yoneda_reduce(forall_id);
         assert_eq!(
             forall,
             ctx.function(vec![int_ty], bool_ty),
@@ -3430,9 +3456,10 @@ mod tests {
         let inner_fn = ctx.function(vec![int_ty, bool_ty], p0);
         let outer_fn = ctx.function(vec![inner_fn], p0);
         let forall = ctx.forall(0, "X".into(), outer_fn);
+        let reduced = ctx.try_yoneda_reduce(forall);
         let expected = ctx.tuple(vec![int_ty, bool_ty]);
         assert_eq!(
-            forall, expected,
+            reduced, expected,
             "∀X.(Int⇒Bool⇒X)⇒X should reduce to (Int,Bool)"
         );
     }
@@ -3510,7 +3537,8 @@ mod tests {
             body: inner_fn,
         });
         let outer_fn = ctx.function(vec![inner_forall], p0);
-        let result = ctx.forall(0, "X".into(), outer_fn);
+        let forall_id = ctx.forall(0, "X".into(), outer_fn);
+        let result = ctx.try_yoneda_reduce(forall_id);
         assert_eq!(result, expected, "∀X.(∀Z.Z⇒X)⇒X should reduce to ∃Z.Z");
     }
 
@@ -3543,7 +3571,8 @@ mod tests {
             body: inner_fn,
         });
         let outer_fn = ctx.function(vec![inner_forall], p0);
-        let result = ctx.forall(0, "X".into(), outer_fn);
+        let forall_id = ctx.forall(0, "X".into(), outer_fn);
+        let result = ctx.try_yoneda_reduce(forall_id);
         assert_eq!(
             result, expected,
             "∀X.(∀Z.(Z,X)⇒X)⇒X should reduce to μX.∃Z.(Z,X)"
@@ -3585,7 +3614,8 @@ mod tests {
             body: inner_forall2,
         });
         let outer_fn = ctx.function(vec![inner_forall1], p0);
-        let result = ctx.forall(0, "X".into(), outer_fn);
+        let forall_id = ctx.forall(0, "X".into(), outer_fn);
+        let result = ctx.try_yoneda_reduce(forall_id);
         assert_eq!(
             result, expected,
             "∀X.(∀Z₁.∀Z₂.(Z₁,Z₂,Int)⇒X)⇒X should reduce to ∃Z₂.∃Z₁.(Z₁,Z₂,Int)"
@@ -3613,7 +3643,8 @@ mod tests {
             body: inner_fn,
         });
         let outer_fn = ctx.function(vec![inner_forall], p0);
-        let result = ctx.forall(0, "X".into(), outer_fn);
+        let forall_id = ctx.forall(0, "X".into(), outer_fn);
+        let result = ctx.try_yoneda_reduce(forall_id);
         assert_eq!(result, expected, "∀X.(∀Z.X⇒Z)⇒X should reduce to ∀Z.Z");
     }
 
@@ -3645,7 +3676,8 @@ mod tests {
             body: inner_fn,
         });
         let outer_fn = ctx.function(vec![inner_forall_wrap], p0);
-        let result = ctx.forall(0, "X".into(), outer_fn);
+        let forall_id = ctx.forall(0, "X".into(), outer_fn);
+        let result = ctx.try_yoneda_reduce(forall_id);
         assert_eq!(
             result, expected,
             "∀X.(∀Z.X⇒(Z,X))⇒X should reduce to νX.∀Z.(Z,X)"
@@ -3688,7 +3720,8 @@ mod tests {
             body: inner_fn2,
         });
         let outer_fn = ctx.function(vec![forall1, forall2], p0);
-        let result = ctx.forall(0, "X".into(), outer_fn);
+        let forall_id = ctx.forall(0, "X".into(), outer_fn);
+        let result = ctx.try_yoneda_reduce(forall_id);
         assert_eq!(
             result, expected,
             "∀X.(∀Z₁.Z₁⇒X)⇒(∀Z₂.Z₂⇒X)⇒X should reduce to ∃Z₁.Z₁ + ∃Z₂.Z₂"
@@ -3719,7 +3752,8 @@ mod tests {
             body: inner_fn,
         });
         let outer_fn = ctx.function(vec![inner_forall], p0);
-        let result = ctx.forall(0, "X".into(), outer_fn);
+        let forall_id = ctx.forall(0, "X".into(), outer_fn);
+        let result = ctx.try_yoneda_reduce(forall_id);
         assert_eq!(
             result, expected,
             "∀X.(∀Z.(Int⇒Z)⇒X)⇒X should reduce to ∃Z.(Int⇒Z)"
@@ -3739,7 +3773,8 @@ mod tests {
         let p0 = ctx.generic_param(0, "X".into());
         let branch = ctx.function(vec![p0], p0); // X → X
         let outer = ctx.function(vec![branch], p0); // (X→X) → X
-        let ty = ctx.forall(0, "X".into(), outer); // ∀X.(X→X)→X
+        let forall_id = ctx.forall(0, "X".into(), outer); // ∀X.(X→X)→X
+        let ty = ctx.try_yoneda_reduce(forall_id);
 
         // Should be µX.X — a single branch, not a coproduct with two entries.
         match ctx.get(ty) {
