@@ -1332,7 +1332,7 @@ impl<'a> NameResolver<'a> {
             } => {
                 let base_ty = self.resolve_type_expr(base);
                 self.ctx
-                    .exists(name.clone(), base_ty, invariant.as_ref().clone())
+                    .exists(self.ctx.fresh_param_index(), name.clone(), base_ty, invariant.as_ref().clone())
             }
             Type::WhereShorthand {
                 base,
@@ -1344,7 +1344,7 @@ impl<'a> NameResolver<'a> {
                 let mut inv = invariant.as_ref().clone();
                 replace_ident_in_expr(&mut inv, "value", &name);
                 let base_ty = self.resolve_type_expr(base);
-                self.ctx.exists(name, base_ty, inv)
+                self.ctx.exists(self.ctx.fresh_param_index(), name, base_ty, inv)
             }
             Type::Literal(expr, ..) => self.resolve_expr(expr).unwrap_or(self.ctx.error()),
             Type::Never(..) => self.ctx.never(),

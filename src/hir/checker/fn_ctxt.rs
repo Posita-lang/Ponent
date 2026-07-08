@@ -1662,7 +1662,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 Ok(self
                     .checker
                     .ctx
-                    .exists(name.clone(), base_ty, *invariant.clone()))
+                    .exists(self.checker.ctx.fresh_param_index(), name.clone(), base_ty, *invariant.clone()))
             }
             Type::WhereShorthand {
                 base,
@@ -1680,7 +1680,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         .diagnostics
                         .push(Diagnostic::error("invariant must be boolean").with_span(*span));
                 }
-                Ok(self.checker.ctx.exists(name, base_ty, inv))
+                Ok(self.checker.ctx.exists(self.checker.ctx.fresh_param_index(), name, base_ty, inv))
             }
             Type::Literal(expr, _) => {
                 let (_, ty) = self.infer_expr(expr)?;

@@ -157,6 +157,7 @@ pub enum TypeData {
         traits: Vec<DefId>,
     },
     Exists {
+        param_index: usize,
         name: String,
         base: TypeId,
     },
@@ -324,6 +325,8 @@ pub struct TypeContext {
     next_universe: Cell<usize>,
     /// Pre-allocated pool of skolem placeholder types for HRTB comparison.
     skolem_pool: RefCell<Vec<TypeId>>,
+    /// Counter for generating fresh parameter indices (used by Exists/Forall).
+    next_param_index: Cell<usize>,
 }
 
 impl TypeContext {
@@ -350,6 +353,7 @@ impl TypeContext {
             kappa_cache: RefCell::new(HashMap::default()),
             next_universe: Cell::new(0),
             skolem_pool: RefCell::new(Vec::new()),
+            next_param_index: Cell::new(0),
         };
         ctx.builtin_unit = ctx.alloc(TypeData::Unit);
         ctx.builtin_never = ctx.alloc(TypeData::Never);
@@ -377,6 +381,13 @@ impl TypeContext {
 
     pub fn get_invariant(&self, id: TypeId) -> Option<&crate::ast::Expr> {
         self.meta.get(&id).and_then(|m| m.invariant.as_ref())
+    }
+
+    /// Allocate a fresh, globally-unique parameter index for Exists/Forall binders.
+    pub fn fresh_param_index(&self) -> usize {
+        let idx = self.next_param_index.get();
+        self.next_param_index.set(idx + 1);
+        idx
     }
 
     pub fn alloc(&mut self, data: TypeData) -> TypeId {
@@ -697,8 +708,18 @@ impl TypeContext {
                                 product
                             } else {
                                 let mut w = product;
+                                // Rename peeled GenericParam indices to fresh globally-unique
+                                // indices, then wrap with Exists.  After peeling inner Forall
+                                // layers the body still contains GenericParam references keyed
+                                // to the OLD indices.  Using fresh indices ensures they cannot
+                                // collide with any outer binder even though Exists traversal
+                                // functions do not check scoping.
                                 for (eq, en) in &inner_quantifiers {
+                                    let fresh_idx = self.fresh_param_index();
+                                    let fresh_gp = self.generic_param(fresh_idx, en.clone());
+                                    w = self.replace_generic(w, *eq, fresh_gp);
                                     w = self.exists(
+                                        fresh_idx,
                                         en.clone(),
                                         w,
                                         crate::ast::Expr::Literal(
@@ -727,8 +748,14 @@ impl TypeContext {
                                 replacement
                             } else {
                                 let mut w = replacement;
-                                for (_eq, en) in &inner_quantifiers {
-                                    w = self.forall(*_eq, en.clone(), w);
+                                // Same renaming strategy as the Yoneda branch: rename old
+                                // peeled indices to fresh globally-unique indices to prevent
+                                // dangling GenericParam references before wrapping with Forall.
+                                for (eq, en) in &inner_quantifiers {
+                                    let fresh_idx = self.fresh_param_index();
+                                    let fresh_gp = self.generic_param(fresh_idx, en.clone());
+                                    w = self.replace_generic(w, *eq, fresh_gp);
+                                    w = self.forall(fresh_idx, en.clone(), w);
                                 }
                                 w
                             };
@@ -1016,8 +1043,8 @@ impl TypeContext {
         self.alloc(TypeData::DynTrait { traits })
     }
 
-    pub fn exists(&mut self, name: String, base: TypeId, invariant: crate::ast::Expr) -> TypeId {
-        let id = self.alloc(TypeData::Exists { name, base });
+    pub fn exists(&mut self, param_index: usize, name: String, base: TypeId, invariant: crate::ast::Expr) -> TypeId {
+        let id = self.alloc(TypeData::Exists { param_index, name, base });
         self.meta.entry(id).or_insert(TypeMeta {
             default_value: None,
             invariant: Some(invariant),
@@ -1502,7 +1529,7 @@ impl TypeContext {
             }
 
             // Exists: same name + base is COVARIANT
-            (TypeData::Exists { name: n1, base: b1 }, TypeData::Exists { name: n2, base: b2 })
+            (TypeData::Exists { param_index: _, name: n1, base: b1 }, TypeData::Exists { param_index: _, name: n2, base: b2 })
                 if n1 == n2 =>
             {
                 let base_variance = variance.xform(Variance::Covariant);
@@ -1938,9 +1965,10 @@ impl TypeContext {
                     body: new_body,
                 })
             }
-            TypeData::Exists { name, base } => {
+            TypeData::Exists { param_index, name, base } => {
                 let new_base = self.subst(*base, subst);
                 self.alloc(TypeData::Exists {
+                    param_index: *param_index,
                     name: name.clone(),
                     base: new_base,
                 })
@@ -2002,8 +2030,8 @@ impl TypeContext {
         self.find_type(&TypeData::Coproduct { alternatives })
     }
 
-    fn exists_ty_no_alloc(&self, name: String, base: TypeId) -> Option<TypeId> {
-        self.find_type(&TypeData::Exists { name, base })
+    fn exists_ty_no_alloc(&self, param_index: usize, name: String, base: TypeId) -> Option<TypeId> {
+        self.find_type(&TypeData::Exists { param_index, name, base })
     }
 
     fn associated_ty_no_alloc(

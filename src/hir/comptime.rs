@@ -817,7 +817,7 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
                 int_lit(body.0 as i64),
             ], unit_ty, Span::new(0, 0)))
         }
-        TypeData::Exists { name, base } => {
+        TypeData::Exists { param_index: _, name, base } => {
             ComptimeValue::Value(HirExpr::Tuple(vec![
                 str_lit("Exists"),
                 str_lit(name),

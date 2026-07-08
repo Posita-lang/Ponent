@@ -2003,9 +2003,10 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
             .unwrap_or(ctx.error())
         }
         TypeData::DynTrait { .. } => ty,
-        TypeData::Exists { name, base } => {
+        TypeData::Exists { param_index, name, base } => {
             let new_base = replace_infer(base, solution, ctx);
             ctx.find_type(&TypeData::Exists {
+                param_index,
                 name,
                 base: new_base,
             })
