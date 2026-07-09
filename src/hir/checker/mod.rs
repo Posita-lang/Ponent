@@ -164,8 +164,10 @@ impl<'a> TypeChecker<'a> {
         // and commit the transaction. On failure the transaction is
         // rolled back and diagnostics are already collected.
         if let Err(diags) = self.exit_inference_scope() {
+            self.ctx.rollback_transaction();
             return Err(diags);
         }
+        self.ctx.commit_transaction();
 
         if self.diagnostics.has_errors() {
             Err(mem::take(&mut self.diagnostics))
@@ -439,8 +441,7 @@ impl<'a> TypeChecker<'a> {
                     Err(e) => return Err(e),
                 };
 
-                let exit_res = guard.checker.exit_inference_scope();
-                guard.defuse();
+                let exit_res = guard.commit();
 
                 if let Err(diags) = exit_res {
                     let details: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
@@ -990,6 +991,15 @@ impl<'a> TypeChecker<'a> {
                 let body_hir = self.check_block(body)?;
                 Ok(HirStmt::Isolate {
                     body: body_hir,
+                    span: *span,
+                })
+            }
+            Stmt::LayoutDef { name, attributes, span } => {
+                // Layout alias definitions are handled by the resolver.
+                // The checker just passes them through.
+                Ok(HirStmt::LayoutDef {
+                    name: name.clone(),
+                    attributes: attributes.clone(),
                     span: *span,
                 })
             }
@@ -1828,12 +1838,7 @@ impl<'a> TypeChecker<'a> {
 
     /// Walk the autoderef chain up to MAX_DEREFS steps, yielding each intermediate type.
     fn autoderef_chain<'s>(&'s self, ty: TypeId) -> AutoderefIter<'s> {
-        AutoderefIter {
-            checker: self,
-            current: Some(ty),
-            depth: 0,
-            max_depth: 10,
-        }
+        AutoderefIter::with_max_depth(self, ty, DEFAULT_MAX_DEREF_DEPTH)
     }
 
     /// Local type argument synthesis (Pierce & Turner 2000, §3).

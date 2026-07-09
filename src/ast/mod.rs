@@ -424,6 +424,12 @@ pub enum Stmt {
         where_clause: Option<WhereClause>,
         type_params: Vec<TypeParam>,
     },
+    /// A layout alias definition: `layout Name { packed, little_endian; }`
+    LayoutDef {
+        name: String,
+        attributes: Vec<Attribute>,
+        span: Span,
+    },
     Error(Span),
 }
 
@@ -721,6 +727,7 @@ impl Stmt {
             Stmt::GhostVariableDef { span, .. } => *span,
             Stmt::Isolate { span, .. } => *span,
             Stmt::ImplBlock { span, .. } => *span,
+            Stmt::LayoutDef { span, .. } => *span,
             Stmt::Error(span) => *span,
         }
     }

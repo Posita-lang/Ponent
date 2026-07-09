@@ -240,7 +240,8 @@ impl Parser {
                 | Ok(Token::Async)
                 | Ok(Token::At)
                 | Ok(Token::Set)
-                | Ok(Token::Let) => return,
+                | Ok(Token::Let)
+                | Ok(Token::Layout) => return,
                 Err(()) => return,
                 _ => {
                     self.advance().ok();
@@ -347,6 +348,7 @@ impl Parser {
             Token::Validate => Some("validate".into()),
             Token::MissingMatch => Some("missing_match".into()),
             Token::ApplyLemma => Some("apply_lemma".into()),
+            Token::Layout => Some("layout".into()),
             Token::Exists => Some("exists".into()),
             Token::Forall => Some("forall".into()),
             Token::On => Some("on".into()),
@@ -493,6 +495,10 @@ impl Parser {
             Ok(Token::Set) | Ok(Token::Let) => {
                 // Top-level variable declarations (global `set`/`let`).
                 self.parse_variable_def()
+            }
+            Ok(Token::Layout) => {
+                self.advance().ok();
+                self.parse_layout_def(attributes)
             }
             _ => {
                 let tok = self.advance().ok();
@@ -1707,6 +1713,62 @@ impl Parser {
         let end = self.span().end;
         Ok(Stmt::Isolate {
             body,
+            span: Span::new(start, end),
+        })
+    }
+
+    /// Parse a layout alias definition: `layout Name { packed, little_endian; }`
+    fn parse_layout_def(&mut self, mut attributes: Vec<Attribute>) -> Result<Stmt, Diagnostic> {
+        let start = self.span().start;
+        let name = match self.advance() {
+            Ok(Token::Ident(name)) => name,
+            Ok(tok) => self.keyword_to_ident(&tok).unwrap_or_else(|| format!("{:?}", tok)),
+            Err(()) => return Err(Diagnostic::error("unexpected end of file in layout definition")
+                .with_code_str("E002")
+                .with_span(self.span())),
+        };
+        self.expect(Token::LBrace)?;
+        loop {
+            // Skip commas — they are separators, not terminators.
+            if matches!(self.peek(), Ok(Token::Comma)) {
+                self.advance().ok();
+                continue;
+            }
+            // Semicolon terminates the attribute list.
+            if matches!(self.peek(), Ok(Token::Semicolon)) {
+                self.advance().ok();
+                break;
+            }
+            // Expect an identifier naming a built-in layout attribute.
+            let attr_name = match self.advance() {
+                Ok(Token::Ident(name)) => name,
+                Ok(tok) => self.keyword_to_ident(&tok).unwrap_or_else(|| format!("{:?}", tok)),
+                Err(()) => break,
+            };
+            // Check for parenthesized arguments, e.g. `bit_order(lsb_to_msb)`.
+            let mut args = Vec::new();
+            if matches!(self.peek(), Ok(Token::LParen)) {
+                self.advance().ok();
+                let arg_name = match self.advance() {
+                    Ok(Token::Ident(name)) => name,
+                    Ok(tok) => self.keyword_to_ident(&tok).unwrap_or_else(|| format!("{:?}", tok)),
+                    Err(()) => String::new(),
+                };
+                args.push(crate::ast::Expr::Ident(arg_name, self.span()));
+                self.expect(Token::RParen)?;
+            }
+            attributes.push(Attribute {
+                name: attr_name,
+                args,
+                named_args: Vec::new(),
+                span: Span::new(start, self.span().end),
+            });
+        }
+        self.expect(Token::RBrace)?;
+        let end = self.span().end;
+        Ok(Stmt::LayoutDef {
+            name,
+            attributes,
             span: Span::new(start, end),
         })
     }

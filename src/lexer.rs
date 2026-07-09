@@ -358,6 +358,8 @@ pub enum Token {
     ScopeCleanup,
     #[token("trigger")]
     Trigger,
+    #[token("layout")]
+    Layout,
     #[token("validate")]
     Validate,
     #[token("missing_match")]

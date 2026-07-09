@@ -324,6 +324,7 @@ pub fn walk_stmt<'ast, V: Visitor<'ast>>(visitor: &mut V, stmt: &'ast Stmt) -> V
         | Stmt::Continue { .. }
         | Stmt::Trigger { .. }
         | Stmt::Edition(..)
+        | Stmt::LayoutDef { .. }
         | Stmt::Error(_) => V::Result::output(),
         Stmt::TypeDef { .. }
         | Stmt::TraitDef { .. }
@@ -648,6 +649,7 @@ pub fn walk_stmt_mut<V: MutVisitor>(visitor: &mut V, stmt: &mut Stmt) {
         | Stmt::Continue { .. }
         | Stmt::Trigger { .. }
         | Stmt::Edition(..)
+        | Stmt::LayoutDef { .. }
         | Stmt::Error(_)
         | Stmt::TypeDef { .. }
         | Stmt::TraitDef { .. }

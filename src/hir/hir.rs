@@ -162,6 +162,11 @@ pub enum HirStmt {
         body: Vec<HirStmt>,
         span: Span,
     },
+    LayoutDef {
+        name: String,
+        attributes: Vec<Attribute>,
+        span: Span,
+    },
     ImplBlock {
         span: Span,
         attributes: Vec<Attribute>,
@@ -491,6 +496,7 @@ impl HirStmt {
             HirStmt::GhostVariableDef { span, .. } => *span,
             HirStmt::Isolate { span, .. } => *span,
             HirStmt::ImplBlock { span, .. } => *span,
+            HirStmt::LayoutDef { span, .. } => *span,
             HirStmt::Error => Span::new(0, 0),
         }
     }

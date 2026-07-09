@@ -80,6 +80,15 @@ pub struct TypeBinding {
     /// must be exhaustive — `_` wildcards are forbidden.
     /// Set by `@exhaustive` attribute on the type.
     pub exhaustive: bool,
+    /// Layout representation hints (from `@repr` attributes).
+    pub c_layout: bool,
+    /// If true, this single-field type has the same layout as its sole field.
+    /// Set by `@transparent` attribute.
+    pub transparent: bool,
+    /// Expanded layout attributes from `@layout(AliasName)` resolution.
+    /// Contains the full set of built-in attributes (packed, endian, etc.)
+    /// after alias expansion, for use by codegen / layout_of!.
+    pub expanded_layout_attrs: Vec<crate::ast::Attribute>,
 }
 
 #[derive(Debug, Clone)]

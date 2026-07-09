@@ -422,3 +422,97 @@ pub fn type_data_to_shape(data: &TypeData) -> TypeShape {
         _ => TypeShape::Unknown,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn test_shape_var_new_and_resolve() {
+        let mut svc = ShapeVarContext::new();
+        let id = svc.new_var(1);
+        assert!(!svc.is_resolved(id));
+        assert_eq!(svc.get_level(id), 1);
+        assert_eq!(svc.resolve(id), id);
+    }
+
+    #[test]
+    fn test_shape_var_try_set() {
+        let mut svc = ShapeVarContext::new();
+        let id = svc.new_var(0);
+        assert!(!svc.is_resolved(id));
+        assert!(svc.try_set(id, TypeShape::Arrow));
+        assert!(svc.is_resolved(id));
+        assert_eq!(svc.get(id), Some(TypeShape::Arrow));
+    }
+
+    #[test]
+    fn test_shape_var_unify_creates_alias() {
+        let mut svc = ShapeVarContext::new();
+        let a = svc.new_var(0);
+        let b = svc.new_var(0);
+        assert_ne!(svc.resolve(a), svc.resolve(b));
+        svc.unify(a, b);
+        assert_eq!(svc.resolve(a), svc.resolve(b));
+    }
+
+    #[test]
+    fn test_shape_var_callback_fires_on_try_set() {
+        let mut svc = ShapeVarContext::new();
+        let id = svc.new_var(0);
+        let fired = Arc::new(AtomicBool::new(false));
+        let f = Arc::clone(&fired);
+        svc.on_resolve(id, move |_| f.store(true, Ordering::SeqCst));
+        assert!(!fired.load(Ordering::SeqCst));
+        svc.try_set(id, TypeShape::Arrow);
+        assert!(fired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_shape_var_callback_fires_immediately_if_resolved() {
+        let mut svc = ShapeVarContext::new();
+        let id = svc.new_var(0);
+        svc.try_set(id, TypeShape::Arrow);
+        let fired = Arc::new(AtomicBool::new(false));
+        let f = Arc::clone(&fired);
+        svc.on_resolve(id, move |_| f.store(true, Ordering::SeqCst));
+        assert!(fired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_shape_var_unify_merges_wait_lists() {
+        let mut svc = ShapeVarContext::new();
+        let a = svc.new_var(0);
+        let b = svc.new_var(0);
+        let a_fired = Arc::new(AtomicBool::new(false));
+        let b_fired = Arc::new(AtomicBool::new(false));
+        let af = Arc::clone(&a_fired);
+        let bf = Arc::clone(&b_fired);
+        svc.on_resolve(a, move |_| af.store(true, Ordering::SeqCst));
+        svc.on_resolve(b, move |_| bf.store(true, Ordering::SeqCst));
+        svc.unify(a, b);
+        svc.try_set(svc.resolve(a), TypeShape::Arrow);
+        assert!(a_fired.load(Ordering::SeqCst));
+        assert!(b_fired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_shape_var_num_unresolved() {
+        let mut svc = ShapeVarContext::new();
+        assert_eq!(svc.num_unresolved(), 0);
+        svc.new_var(0);
+        svc.new_var(0);
+        assert_eq!(svc.num_unresolved(), 2);
+    }
+
+    #[test]
+    fn test_shapes_compatible() {
+        assert!(shapes_compatible(TypeShape::Unknown, TypeShape::Arrow));
+        assert!(shapes_compatible(TypeShape::Arrow, TypeShape::Arrow));
+        assert!(!shapes_compatible(TypeShape::Arrow, TypeShape::Tuple(2)));
+        assert!(!shapes_compatible(TypeShape::Tuple(2), TypeShape::Tuple(3)));
+    }
+}
+

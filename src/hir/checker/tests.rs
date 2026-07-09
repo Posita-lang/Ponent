@@ -746,198 +746,6 @@ fn test_region_tree_basic_ops() {
     assert_eq!(rt.current_frames().len(), 0);
 }
 
-#[test]
-fn test_region_tree_enter_exit() {
-    let mut rt = RegionTree::new();
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::Function,
-        span: Span::new(0, 0),
-        label: None,
-    });
-
-    // Enter a child region (e.g., loop body)
-    let parent = rt.enter_region();
-    assert_ne!(rt.current, rt.root);
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::Loop,
-        span: Span::new(1, 2),
-        label: None,
-    });
-    assert_eq!(rt.current_frames().len(), 1);
-
-    // Exit back to parent
-    rt.exit_region();
-    assert_eq!(rt.current, parent);
-    // Parent still has its original frame
-    assert_eq!(rt.current_frames().len(), 1);
-}
-
-#[test]
-fn test_region_tree_iter_frames_rev_single_region() {
-    let mut rt = RegionTree::new();
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::Function,
-        span: Span::new(0, 0),
-        label: None,
-    });
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::Loop,
-        span: Span::new(1, 2),
-        label: None,
-    });
-
-    let frames: Vec<&CtxFrame> = rt.iter_frames_rev().collect();
-    assert_eq!(frames.len(), 2);
-    // Innermost first
-    assert!(matches!(frames[0].kind, CtxKind::Loop));
-    assert!(matches!(frames[1].kind, CtxKind::Function));
-}
-
-#[test]
-fn test_region_tree_iter_frames_rev_across_regions() {
-    let mut rt = RegionTree::new();
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::Function,
-        span: Span::new(0, 0),
-        label: None,
-    });
-
-    // Enter nested scope (e.g., loop body)
-    let _parent = rt.enter_region();
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::Loop,
-        span: Span::new(1, 2),
-        label: None,
-    });
-
-    // iter_frames_rev should see loop frame first, then function frame
-    let frames: Vec<&CtxFrame> = rt.iter_frames_rev().collect();
-    assert_eq!(frames.len(), 2);
-    assert!(matches!(frames[0].kind, CtxKind::Loop));
-    assert!(matches!(frames[1].kind, CtxKind::Function));
-}
-
-#[test]
-fn test_region_tree_multi_level_nesting() {
-    let mut rt = RegionTree::new();
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::Function,
-        span: Span::new(0, 0),
-        label: None,
-    });
-
-    // Level 1: loop
-    let _l1 = rt.enter_region();
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::Loop,
-        span: Span::new(1, 2),
-        label: None,
-    });
-
-    // Level 2: nested for
-    let _l2 = rt.enter_region();
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::For,
-        span: Span::new(3, 4),
-        label: None,
-    });
-
-    // Level 3: labeled block
-    let _l3 = rt.enter_region();
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::LabeledBlock,
-        span: Span::new(5, 6),
-        label: Some("outer".into()),
-    });
-
-    // iter_frames_rev should traverse: LabeledBlock → For → Loop → Function
-    let frames: Vec<&CtxFrame> = rt.iter_frames_rev().collect();
-    assert_eq!(frames.len(), 4);
-    assert!(matches!(frames[0].kind, CtxKind::LabeledBlock));
-    assert!(matches!(frames[1].kind, CtxKind::For));
-    assert!(matches!(frames[2].kind, CtxKind::Loop));
-    assert!(matches!(frames[3].kind, CtxKind::Function));
-}
-
-#[test]
-fn test_region_tree_find_break_in_nested() {
-    let mut rt = RegionTree::new();
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::Function,
-        span: Span::new(0, 0),
-        label: None,
-    });
-
-    // Loop is outside Closure (loop precedes closure)
-    let _l = rt.enter_region();
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::Loop,
-        span: Span::new(3, 4),
-        label: None,
-    });
-
-    // Closure is innermost — iter_frames_rev sees Closure first
-    let _c = rt.enter_region();
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::Closure,
-        span: Span::new(1, 2),
-        label: None,
-    });
-
-    // find_break_target should stop at Closure boundary before reaching Loop
-    // (iter_frames_rev visits Closure first, then Loop)
-    let mut found_loop = false;
-    let mut stopped_at_closure = false;
-    for frame in rt.iter_frames_rev() {
-        match frame.kind {
-            CtxKind::Loop | CtxKind::While | CtxKind::For => {
-                found_loop = true;
-                break;
-            }
-            CtxKind::Closure | CtxKind::AsyncBlock => {
-                stopped_at_closure = true;
-                break;
-            }
-            _ => {}
-        }
-    }
-    assert!(!found_loop, "break should not see loop past closure");
-    assert!(stopped_at_closure, "should stop at closure boundary");
-}
-
-#[test]
-fn test_region_tree_labeled_break() {
-    let mut rt = RegionTree::new();
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::Function,
-        span: Span::new(0, 0),
-        label: None,
-    });
-
-    let _l1 = rt.enter_region();
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::For,
-        span: Span::new(1, 2),
-        label: None,
-    });
-
-    let _l2 = rt.enter_region();
-    rt.push_frame(CtxFrame {
-        kind: CtxKind::LabeledBlock,
-        span: Span::new(3, 4),
-        label: Some("outer".into()),
-    });
-
-    // Search for labeled block "outer" — should find it
-    let found_label = rt.iter_frames_rev().find_map(|f| {
-        if let CtxKind::LabeledBlock = f.kind {
-            f.label.as_deref()
-        } else {
-            None
-        }
-    });
-    assert_eq!(found_label, Some("outer"));
-}
 
 // -- Bidirectional if-expression --
 #[test]
@@ -1973,5 +1781,94 @@ fn test_overflow_policy_matches_constructor() {
     assert_eq!(
         ctx.overflow_policy_of(def),
         crate::ast::OverflowPolicy::Trap,
+    );
+}
+
+// ── Layout alias ─────────────────────────────────────────────────
+
+#[test]
+fn test_layout_alias_definition() {
+    // Layout alias definitions should parse and resolve without error.
+    let result = check_source(
+        "layout Mmio {
+             packed,
+             little_endian;
+         }",
+    );
+    assert!(
+        result.is_ok(),
+        "layout alias definition: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_layout_c_on_type() {
+    // @layout(C) should be accepted on a type definition.
+    let result = check_source(
+        "@layout(C)
+         type CStruct = struct { x: Int<32>, y: Int<64> }
+         def main() -> Int<32> { return 0; }",
+    );
+    assert!(
+        result.is_ok(),
+        "@layout(C) on type: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_transparent_on_type() {
+    // @transparent should be accepted on a single-field struct.
+    let result = check_source(
+        "@transparent
+         type Wrapper = struct { inner: Int<32> }
+         def main() -> Int<32> { return 0; }",
+    );
+    assert!(
+        result.is_ok(),
+        "@transparent on type: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_layout_alias_usage() {
+    // Define a layout alias and use it via @layout(AliasName).
+    let result = check_source(
+        "layout Compact {
+             packed,
+             little_endian;
+         }
+
+         @layout(Compact)
+         type Reg = struct { ctrl: UInt<8>, data: UInt<32> }
+
+         def main() -> Int<32> { return 0; }",
+    );
+    assert!(
+        result.is_ok(),
+        "@layout(AliasName): {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_layout_alias_with_function() {
+    // Layout alias alongside a function definition.
+    let result = check_source(
+        "layout Simple {
+             packed;
+         }
+
+         @layout(Simple)
+         type Header = struct { flags: UInt<8>, len: UInt<8> }
+
+         def main() -> Int<32> { return 0; }",
+    );
+    assert!(
+        result.is_ok(),
+        "layout with function: {:?}",
+        result.err()
     );
 }

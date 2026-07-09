@@ -414,3 +414,89 @@ impl std::fmt::Display for OrphanError {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::types::{CrateId, DefId};
+
+    #[test]
+    fn test_trait_env_new_is_empty() {
+        let env = TraitEnv::new();
+        assert!(env.all_impls().is_empty());
+    }
+
+    #[test]
+    fn test_add_impl_simple() {
+        let mut ctx = TypeContext::new();
+        let local = CrateId(DefId(0));
+        let mut symbols = SymbolTable::new(local);
+        let mut env = TraitEnv::new();
+
+        let trait_id = symbols.allocate_def_id();
+        let type_id = symbols.allocate_def_id();
+        let for_ty = ctx.struct_ty(type_id, vec![]);
+
+        let candidate = ImplCandidate {
+            trait_id,
+            for_type: for_ty,
+            methods: vec![],
+            resolved_methods: vec![],
+            assoc_tys: vec![],
+            span: crate::ast::Span::new(0, 0),
+            has_auto_deref: false,
+            context: vec![],
+        };
+
+        // Must register the type in the symbol table so the orphan rule check can find it
+        let binding = crate::hir::symbol::TypeBinding {
+            def_id: type_id,
+            params: vec![],
+            kind: crate::hir::symbol::TypeKind::Struct,
+            span: crate::ast::Span::new(0, 0),
+            alias_ast: None,
+            fields: vec![],
+            variants: vec![],
+            invariant: None,
+            default_value: None,
+            no_default: false,
+            crate_id: local,
+            missing_match: None,
+            exhaustive: false,
+            c_layout: false,
+            transparent: false,
+            expanded_layout_attrs: vec![],
+        };
+        symbols.insert_type("TestType".into(), binding, crate::ast::Span::new(0, 0)).ok();
+
+        // Register the def_id → type_id mapping so the orphan rule check
+        // can find the type and actually execute, not silently skip.
+        ctx.register_def_id(type_id, for_ty);
+
+        let result = env.add_impl(candidate, &symbols, &ctx, false);
+        assert!(result.is_ok(), "add_impl should succeed: {:?}", result.err());
+        assert_eq!(env.all_impls().len(), 1);
+    }
+
+    #[test]
+    fn test_add_inherent_methods() {
+        let mut ctx = TypeContext::new();
+        let local = CrateId(DefId(0));
+        let mut env = TraitEnv::new();
+
+        let def_id = DefId(42);
+        let method = MethodInfo {
+            name: "foo".into(),
+            param_tys: vec![],
+            ret_ty: ctx.int(32, true),
+            span: crate::ast::Span::new(0, 0),
+            has_auto_deref: false,
+        };
+        env.add_inherent_methods(def_id, vec![method]);
+
+        let ty = ctx.struct_ty(def_id, vec![]);
+        let methods = env.lookup_inherent_methods(ty, &ctx);
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].name, "foo");
+    }
+}

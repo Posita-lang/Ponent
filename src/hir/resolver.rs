@@ -58,6 +58,8 @@ pub struct NameResolver<'a> {
     resolution_map: ResolutionMap,
     /// Current module path for registering full-qualified type paths.
     module_path: Vec<String>,
+    /// Layout aliases defined with `layout Name { ... }`.
+    layout_aliases: HashMap<String, Vec<Attribute>>,
 }
 
 struct ImportEntry {
@@ -82,6 +84,7 @@ impl<'a> NameResolver<'a> {
             current_impl_type_params: None,
             resolution_map: ResolutionMap::default(),
             module_path: Vec::new(),
+            layout_aliases: HashMap::default(),
         }
     }
 
@@ -254,6 +257,34 @@ impl<'a> NameResolver<'a> {
                     _ => {}
                 }
 
+                let mut c_layout = false;
+                let mut transparent = false;
+                let mut expanded_attrs = attributes.clone();
+                for attr in attributes {
+                    if attr.name == "layout" {
+                        for arg in &attr.args {
+                            if let crate::ast::Expr::Ident(name, _) = arg {
+                                if name == "C" {
+                                    c_layout = true;
+                                } else if let Some(alias_attrs) = self.layout_aliases.get(name.as_str()) {
+                                    // Expand user-defined layout alias:
+                                    // inject the alias's constituent attributes into the
+                                    // type's attribute list so downstream passes (checker,
+                                    // codegen) see the fully expanded set.
+                                    for alias_attr in alias_attrs {
+                                        if !expanded_attrs.iter().any(|a| a.name == alias_attr.name) {
+                                            expanded_attrs.push(alias_attr.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if attr.name == "transparent" {
+                        transparent = true;
+                    }
+                }
+
                 let binding = TypeBinding {
                     def_id,
                     params: type_params,
@@ -268,6 +299,9 @@ impl<'a> NameResolver<'a> {
                     crate_id: self.symbols.local_crate_id,
                     missing_match,
                     exhaustive,
+                    c_layout,
+                    transparent,
+                    expanded_layout_attrs: expanded_attrs,
                 };
                 if let Err(diag) = self.symbols.insert_type(name.clone(), binding, *span) {
                     self.diagnostics.push(diag);
@@ -458,6 +492,17 @@ impl<'a> NameResolver<'a> {
                 }
             }
             Stmt::Edition(..) => {}
+            Stmt::LayoutDef { name, attributes, .. } => {
+                // Register a layout alias so that @layout(AliasName) can be expanded.
+                if self.layout_aliases.contains_key(name) {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!("duplicate layout alias `{}`", name))
+                            .with_span(Span::new(0, 0)),
+                    );
+                } else {
+                    self.layout_aliases.insert(name.clone(), attributes.clone());
+                }
+            }
             Stmt::Constraint { name, bounds, span } => {
                 let resolved_bounds: Vec<TypeId> =
                     bounds.iter().map(|b| self.resolve_type_expr(b)).collect();
@@ -577,6 +622,9 @@ impl<'a> NameResolver<'a> {
                         crate_id: self.local_crate_id,
                         missing_match: None,
                         exhaustive: false,
+                        c_layout: false,
+                        transparent: false,
+                        expanded_layout_attrs: vec![],
                     };
                     self.symbols
                         .insert_type(cap.name.clone(), binding, *span)
@@ -1659,5 +1707,145 @@ impl<'a> NameResolver<'a> {
             Diagnostic::error(format!("cannot resolve import `{}`", path.join("::"),))
                 .with_span(span),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::Parser;
+
+    /// Parse and resolve a Posita source, returning the resolver's symbol table.
+    fn resolve_source(source: &str) -> Result<(SymbolTable, TraitEnv, ResolutionMap, TypeContext), Vec<String>> {
+        let mut ctx = TypeContext::new();
+        let mut parser = Parser::new(source);
+        let program = parser
+            .parse_program()
+            .map_err(|diags| diags.into_iter().map(|d| d.message).collect::<Vec<_>>())?;
+        let local_crate_id = CrateId(DefId(0));
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
+        let (symbols, trait_env, _diags, resolution_map) = resolver
+            .resolve_program(&program)
+            .map_err(|diags| {
+                diags
+                    .into_inner()
+                    .into_iter()
+                    .map(|d| d.message)
+                    .collect::<Vec<_>>()
+            })?;
+        Ok((symbols, trait_env, resolution_map, ctx))
+    }
+
+    #[test]
+    fn test_resolve_empty_program() {
+        let result = resolve_source("");
+        assert!(result.is_ok(), "empty program: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_resolve_function_def() {
+        let result = resolve_source("def main() -> Int<32> { return 0; }");
+        assert!(result.is_ok(), "function def: {:?}", result.err());
+        let (symbols, _, _, _) = result.unwrap();
+        let func = symbols.lookup_function("main");
+        assert!(func.is_some(), "main should be registered");
+    }
+
+    #[test]
+    fn test_resolve_type_def_struct() {
+        let result = resolve_source("type Point = struct { x: Int<32>, y: Int<32> }");
+        assert!(result.is_ok(), "struct type: {:?}", result.err());
+        let (symbols, _, _, _) = result.unwrap();
+        let binding = symbols.lookup_type("Point");
+        assert!(binding.is_some(), "Point should be registered");
+        if let Some(b) = binding {
+            assert_eq!(b.fields.len(), 2, "Point should have 2 fields");
+        }
+    }
+
+    #[test]
+    fn test_resolve_type_def_enum() {
+        let result = resolve_source("type Option<T> = enum { None, Some(T) }");
+        assert!(result.is_ok(), "enum type: {:?}", result.err());
+        let (symbols, _, _, _) = result.unwrap();
+        let binding = symbols.lookup_type("Option");
+        assert!(binding.is_some(), "Option should be registered");
+        if let Some(b) = binding {
+            assert_eq!(b.params.len(), 1, "Option should have 1 type param");
+            assert_eq!(b.variants.len(), 2, "Option should have 2 variants");
+        }
+    }
+
+    #[test]
+    fn test_resolve_type_alias() {
+        let result = resolve_source("type MyInt = Int<32>");
+        assert!(result.is_ok(), "type alias: {:?}", result.err());
+        let (symbols, _, _, _) = result.unwrap();
+        let binding = symbols.lookup_type("MyInt");
+        assert!(binding.is_some(), "MyInt should be registered");
+        assert!(binding.unwrap().alias_ast.is_some(), "MyInt should have an alias AST");
+    }
+
+    #[test]
+    fn test_resolve_layout_alias() {
+        let result = resolve_source(
+            "layout Mmio {
+                 packed,
+                 little_endian;
+             }",
+        );
+        assert!(result.is_ok(), "layout alias: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_resolve_transparent_attr() {
+        let result = resolve_source(
+            "@transparent
+             type Wrapper = struct { inner: Int<32> }",
+        );
+        assert!(result.is_ok(), "transparent: {:?}", result.err());
+        let (symbols, _, _, _) = result.unwrap();
+        let binding = symbols.lookup_type("Wrapper");
+        assert!(binding.unwrap().transparent, "Wrapper should be transparent");
+    }
+
+    #[test]
+    fn test_resolve_layout_c_attr() {
+        let result = resolve_source(
+            "@layout(C)
+             type CStruct = struct { x: Int<32> }",
+        );
+        assert!(result.is_ok(), "layout(C): {:?}", result.err());
+        let (symbols, _, _, _) = result.unwrap();
+        let binding = symbols.lookup_type("CStruct");
+        assert!(binding.unwrap().c_layout, "CStruct should have c_layout");
+    }
+
+    #[test]
+    fn test_resolve_generic_function() {
+        let result = resolve_source("def id<T>(x: T) -> T { return x; }");
+        assert!(result.is_ok(), "generic function: {:?}", result.err());
+        let (symbols, _, _, _) = result.unwrap();
+        let func = symbols.lookup_function("id");
+        assert!(func.is_some(), "id should be registered");
+        assert!(!func.unwrap().signature.type_params.is_empty(), "id should have type params");
+    }
+
+    #[test]
+    fn test_resolve_trait_and_impl() {
+        let result = resolve_source(
+            "trait Show { }
+             impl Show for Int<32> { }",
+        );
+        assert!(result.is_ok(), "trait + impl: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_resolve_duplicate_function() {
+        let result = resolve_source(
+            "def f() -> Int<32> { return 0; }
+             def f() -> Int<32> { return 1; }",
+        );
+        assert!(result.is_err(), "duplicate function should error");
     }
 }
