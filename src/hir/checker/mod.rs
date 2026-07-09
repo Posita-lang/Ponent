@@ -318,6 +318,9 @@ impl<'a> TypeChecker<'a> {
             } => {
                 // Register generic type parameters FIRST so that `T` in parameter types,
                 // return types, and where clauses can be resolved.
+                // Collect names before insertion so we can clean up after the function body
+                // is fully processed, preventing cross-function cache pollution.
+                let fn_param_names: Vec<String> = type_params.iter().map(|tp| tp.name.clone()).collect();
                 for (i, tp) in type_params.iter().enumerate() {
                     let generic_id = self.ctx.generic_param(i, tp.name.clone());
                     self.local_type_param_cache
@@ -474,6 +477,13 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     None
                 };
+
+                // ── Clean up generic parameter cache ─────────────────
+                // Remove the inserted generic params so they don't leak into subsequent
+                // function or block scopes.  `fn_param_names` was collected at entry.
+                for name in &fn_param_names {
+                    self.local_type_param_cache.remove(name);
+                }
 
                 Ok(HirStmt::FunctionDef {
                     span: *span,
@@ -1055,6 +1065,9 @@ impl<'a> TypeChecker<'a> {
                     };
 
                     // Register generic type parameters so `T` in `impl<T> Foo for T` resolves
+                    // Collect names before insertion so we can clean up after the impl block
+                    // is fully processed, preventing cross-impl cache pollution.
+                    let impl_param_names: Vec<String> = type_params.iter().map(|tp| tp.name.clone()).collect();
                     for (i, tp) in type_params.iter().enumerate() {
                         let generic_id = self.ctx.generic_param(i, tp.name.clone());
                         self.local_type_param_cache
@@ -1178,6 +1191,11 @@ impl<'a> TypeChecker<'a> {
                     if let TypeData::Adt { def_id, .. } = self.ctx.get(for_ty)
                     {
                         self.trait_env.add_inherent_methods(*def_id, method_infos);
+                    }
+
+                    // ── Clean up generic parameter cache for trait impl ──
+                    for name in &impl_param_names {
+                        self.local_type_param_cache.remove(name);
                     }
 
                     Ok(HirStmt::ImplBlock {

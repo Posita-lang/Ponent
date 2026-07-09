@@ -1,5 +1,6 @@
 use crate::hir::infer::PrincipalShape;
 use crate::hir::types::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -28,12 +29,15 @@ const Z3_MIN_VERSION: &str = "4.8.0";
 /// to Cargo.toml and replace this module's internals with the z3 crate API.
 pub struct SmtSolver {
     solver_path: String,
+    /// Cache of SMT query → result, avoiding re-spawning Z3 for identical queries.
+    query_cache: RefCell<HashMap<String, SmtResult>>,
 }
 
 impl SmtSolver {
     pub fn new(solver_path: &str) -> Self {
         let solver = SmtSolver {
             solver_path: solver_path.to_string(),
+            query_cache: RefCell::new(HashMap::new()),
         };
         // Verify Z3 version on first use (lazy, via check_version).
         solver
@@ -391,6 +395,15 @@ impl SmtSolver {
         if smt.is_empty() {
             return SmtResult::Error("empty query".into());
         }
+
+        // Check the query cache first — avoids spawning Z3 for identical queries.
+        {
+            let cache = self.query_cache.borrow();
+            if let Some(cached) = cache.get(smt) {
+                return cached.clone();
+            }
+        }
+
         // Build the SMT query with timeout and memory limit baked in.
         let mut smt_with_limits = String::new();
         smt_with_limits.push_str(&format!("(set-option :timeout {})\n", Z3_TIMEOUT_MS));
@@ -429,7 +442,7 @@ impl SmtSolver {
             Err(e) => return SmtResult::Error(format!("wait failed: {}", e)),
         };
 
-        if output.status.success() {
+        let result = if output.status.success() {
             SmtResult::Sat(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
             // Check stderr for timeout indicator.
@@ -439,7 +452,11 @@ impl SmtSolver {
             } else {
                 SmtResult::Error(format!("z3 error: {}", stderr.trim()))
             }
-        }
+        };
+
+        // Cache the result before returning.
+        self.query_cache.borrow_mut().insert(smt.to_string(), result.clone());
+        result
     }
 
     fn parse_unicity_results(

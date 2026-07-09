@@ -118,8 +118,10 @@ pub enum Constraint {
     Match {
         /// The type whose shape must be determined.
         scrutinee: TypeId,
-        /// Index into the inference context's `match_branches` table.
-        branches_id: usize,
+        /// (start, count) into the inference context's `match_branches` table.
+        /// The count ensures discharge_match only scans this branch set,
+        /// preventing cross-contamination from later-registered branches.
+        branches_id: (usize, usize),
         span: Span,
     },
     /// OmniML existential: `∃α. C` — bind a fresh flexible type variable.
@@ -136,10 +138,12 @@ pub enum Constraint {
     },
     /// OmniML instance: instantiate a generalized scheme at a type.
     /// `x[τ]` — the scheme for `x` is instantiated with `τ`.
+    /// Carries the scheme TypeId directly (not a variable name) so the
+    /// solver can instantiate without an external environment lookup.
     Instance {
-        /// The expression variable to instantiate.
-        expr_var: String,
-        /// The type to instantiate at.
+        /// The polymorphic scheme to instantiate (e.g. `Forall(∀α.τ)`).
+        scheme_ty: TypeId,
+        /// The type to instantiate at (the instance being checked).
         instantiation_ty: TypeId,
         span: Span,
     },
@@ -150,6 +154,25 @@ pub enum Constraint {
         body_constraint: Box<Constraint>,
         span: Span,
     },
+}
+
+/// Describes the instantiation target of a polymorphic scheme,
+/// collected from a TypeData node without holding a borrow on the
+/// TypeContext. Used by the Instance constraint handler to separate
+/// the immutable scan phase from the mutable variable-creation phase.
+enum InstantiationTarget {
+    /// `∀α₁.∀α₂. ... αₙ. body_ty` — Forall binders.
+    Forall {
+        binder_indices: Vec<usize>,
+        body_ty: TypeId,
+    },
+    /// `∀quantifiers. body_ty` — Poly type.
+    Poly {
+        binder_indices: Vec<usize>,
+        body_ty: TypeId,
+    },
+    /// A concrete (monomorphic) type — no instantiation needed.
+    Concrete(TypeId),
 }
 
 impl Constraint {
@@ -375,6 +398,32 @@ impl InferenceContext {
         }
     }
 
+    /// Unify two types via the global `TypeContext` AND record the resolution
+    /// in `self.resolutions` so that `self.resolve()` stays consistent with
+    /// global bindings.
+    ///
+    /// This must be used instead of bare `ctx.unify()` inside the solver loop
+    /// whenever one of the sides is an InferVar owned by this context.
+    fn unify_and_track(
+        &mut self,
+        a: TypeId,
+        b: TypeId,
+        ctx: &mut TypeContext,
+    ) -> Result<TypeId, TypeError> {
+        let result = ctx.unify(a, b)?;
+        // After unification, record any new bindings in self.resolutions
+        // so that self.resolve() follows the same chain as ctx.resolve_binding().
+        let resolved = ctx.resolve_binding(result);
+        if let TypeData::InferVar { id } = ctx.get(resolved) {
+            if *id < self.resolutions.len() {
+                if self.resolutions[*id].is_none() {
+                    self.resolutions[*id] = Some(resolved);
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// Unify with local InferVar resolution (TypeOrVar pattern).
     /// Records resolutions in `self.resolutions` instead of global bindings.
     pub fn unify(
@@ -451,9 +500,76 @@ impl InferenceContext {
         let new_ty_id = self.new_type_var(ctx, TypeVariableKind::Any);
         // Find the new var's id (it's the last pushed)
         let new_id = self.next_var_id - 1;
-        if let Some(tv) = self.type_vars.iter_mut().find(|tv| tv.id == new_id) {
-            tv.level = target_level;
+        // new_type_var maintains the invariant type_vars[i].id == i,
+        // so direct indexing is safe and avoids the borrow conflict
+        // between iter_mut().find() and type_vars[var_id].
+        self.type_vars[new_id].level = target_level;
+        if var_id < self.type_vars.len() {
+            self.type_vars[new_id].shape = self.type_vars[var_id].shape;
+            self.type_vars[new_id].gen_state = self.type_vars[var_id].gen_state;
         }
+
+        // ── Transfer all suspended-constraint state from the old variable
+        // to the new one (OmniML §3.2, §6). Without this transfer, constraints
+        // suspended on the old variable are silently lost because the old
+        // variable's resolution points to the new InferVar — which is never
+        // considered "resolved" (it's still an InferVar) and thus never
+        // triggers wake-up. This would drop Match, Impl, and any other
+        // constraints queued via suspend_on_var.
+        if var_id < self.wait_lists.len() && new_id < self.wait_lists.len() {
+            let old_wait = std::mem::take(&mut self.wait_lists[var_id]);
+            self.wait_lists[new_id].extend(old_wait);
+        }
+        if var_id < self.guard_sets.len() && new_id < self.guard_sets.len() {
+            let old_guards = std::mem::take(&mut self.guard_sets[var_id]);
+            self.guard_sets[new_id].extend(old_guards);
+        }
+        if var_id < self.gen_statuses.len() && new_id < self.gen_statuses.len() {
+            let old_status = self.gen_statuses[var_id];
+            if old_status != GenStatus::Ungeneralized {
+                self.gen_statuses[new_id] = old_status;
+            }
+        }
+        if var_id < self.lower_bounds.len() && new_id < self.lower_bounds.len() {
+            let old_lbs = std::mem::take(&mut self.lower_bounds[var_id]);
+            self.lower_bounds[new_id].extend(old_lbs);
+        }
+        if var_id < self.upper_bounds.len() && new_id < self.upper_bounds.len() {
+            let old_ubs = std::mem::take(&mut self.upper_bounds[var_id]);
+            self.upper_bounds[new_id].extend(old_ubs);
+        }
+
+        // ── Forward references (OmniML §5.2) ──────────────────────
+        // If the old variable was a PG var with instances, transfer
+        // those instances to the new variable and update their reverse
+        // references to point to the new variable.
+        if var_id < self.forward_refs.len() && new_id < self.forward_refs.len() {
+            let old_fwd = std::mem::take(&mut self.forward_refs[var_id]);
+            self.forward_refs[new_id].extend(old_fwd);
+            for &inst_id in &self.forward_refs[new_id] {
+                if inst_id < self.reverse_refs.len() {
+                    self.reverse_refs[inst_id] = Some(new_id);
+                }
+            }
+        }
+        // If the old variable was itself an instance of a PG var,
+        // transfer that relationship to the new variable and update
+        // the PG var's forward_reference list.
+        if var_id < self.reverse_refs.len() {
+            let old_reverse = self.reverse_refs[var_id];
+            self.reverse_refs[new_id] = old_reverse;
+            self.reverse_refs[var_id] = None; // old var is now just an alias
+            if let Some(pg_id) = old_reverse {
+                if pg_id < self.forward_refs.len() {
+                    if let Some(pos) =
+                        self.forward_refs[pg_id].iter().position(|&r| r == var_id)
+                    {
+                        self.forward_refs[pg_id][pos] = new_id;
+                    }
+                }
+            }
+        }
+
         // Bind the old variable to the new one (promotion)
         if var_id < self.resolutions.len() {
             self.resolutions[var_id] = Some(new_ty_id);
@@ -467,13 +583,20 @@ impl InferenceContext {
 
     /// OmniML-inspired: suspend a constraint on the target InferVar id.
     /// When the var is bound, the constraint will be woken and reprocessed.
-    /// Also marks the variable as PartiallyGeneralizable (PG).
+    /// Also marks the variable as PartiallyGeneralizable (PG) and adds a
+    /// guard entry so the variable stays PG until the guard is released.
     pub fn suspend_on_var(&mut self, c: Constraint, var_id: usize) {
         if var_id < self.wait_lists.len() {
             self.wait_lists[var_id].push(c);
             if var_id < self.gen_statuses.len() {
                 self.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
             }
+            // Add a guard: the variable is now blocked until this constraint
+            // is woken and processed.  This is essential for the PG→G lifecycle
+            // (OmniML §6).  Use the wait-list index (before push) as the guard
+            // id so it can be cleared in bulk by wake_var_incremental.
+            let guard_id = self.wait_lists[var_id].len().wrapping_sub(1);
+            self.add_guard(var_id, guard_id);
         } else {
             self.constraints.push(c);
         }
@@ -553,9 +676,10 @@ impl InferenceContext {
             TypeData::Fn { params, .. } => PrincipalShape::Arrow,
             TypeData::Tuple { elems } => PrincipalShape::Tuple(elems.len()),
             TypeData::Adt { args, .. } => PrincipalShape::Constructor(args.len()),
-            TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } | TypeData::SkolemVar { .. } => {
-                PrincipalShape::Poly
-            }
+            TypeData::Forall { .. }
+            | TypeData::Exists { .. }
+            | TypeData::Poly { .. }
+            | TypeData::SkolemVar { .. } => PrincipalShape::Poly,
             TypeData::Int { .. }
             | TypeData::UInt { .. }
             | TypeData::Float { .. }
@@ -587,7 +711,8 @@ impl InferenceContext {
 
     /// Incrementally wake constraints for a resolved variable.
     /// Woken constraints are enqueued directly onto the heap.
-    /// After waking, if the wait list is empty, the variable can be re-generalised (G).
+    /// After waking, if the wait list is empty AND no guards remain,
+    /// the variable can be re-generalised (G) — OmniML §6.
     fn wake_var_incremental(
         &mut self,
         var_id: usize,
@@ -603,25 +728,42 @@ impl InferenceContext {
                     constraint: c,
                 });
             }
-            // All constraints woken — restore to Generalized if no guards remain
+            // Clear all guards for this variable: every constraint placed
+            // in the wait list by `suspend_on_var` had a guard added; we
+            // must release those guards now that the constraints have been
+            // woken to the heap (OmniML §6 confirmation: "once a suspended
+            // match constraint is solved, it removes the guards it
+            // introduced").
+            if var_id < self.guard_sets.len() {
+                self.guard_sets[var_id].clear();
+            }
+            // All constraints woken and guards cleared — transition to
+            // Generalized if no further guards remain.
             if var_id < self.gen_statuses.len()
                 && self.gen_statuses[var_id] == GenStatus::PartiallyGeneralizable
             {
-                self.gen_statuses[var_id] = GenStatus::Generalized;
+                let guards_empty =
+                    var_id < self.guard_sets.len() && self.guard_sets[var_id].is_empty();
+                if guards_empty {
+                    self.gen_statuses[var_id] = GenStatus::Generalized;
+                }
             }
         }
     }
 
     // ── OmniML: Match branches ───────────────────────────────────
 
-    /// Register a set of match branch patterns. Returns a `branches_id`
-    /// that can be referenced by a `Constraint::Match`.
-    pub fn register_match_branches(&mut self, branches: Vec<MatchBranchSet>) -> usize {
-        let id = self.match_branches.len();
+    /// Register a set of match branch patterns. Returns a `(start, count)`
+    /// pair identifying the range of branches in `self.match_branches`.
+    /// `discharge_match` uses the exact range so later-registered branch sets
+    /// are never accidentally scanned.
+    pub fn register_match_branches(&mut self, branches: Vec<MatchBranchSet>) -> (usize, usize) {
+        let start = self.match_branches.len();
+        let count = branches.len();
         for b in branches {
             self.match_branches.push(b);
         }
-        id
+        (start, count)
     }
 
     /// Try to discharge a Match constraint using a shape variable.
@@ -634,35 +776,36 @@ impl InferenceContext {
         &mut self,
         ctx: &mut TypeContext,
         scrutinee: TypeId,
-        branches_id: usize,
+        branches_id: (usize, usize),
         heap: &mut BinaryHeap<PrioritizedConstraint>,
     ) -> bool {
         let resolved = ctx.resolve_binding(scrutinee);
         match ctx.get(resolved) {
             TypeData::InferVar { id } => {
-                if *id < self.guard_sets.len() && !self.guard_sets[*id].is_empty() {
-                    true
-                } else {
-                    let match_c = Constraint::Match {
-                        scrutinee,
-                        branches_id,
-                        span: crate::ast::Span::new(0, 0),
-                    };
-                    // #3: Register on this var AND all vars sharing its
-                    // binding root (transitive wait_list).
-                    let root = ctx.resolve_binding(scrutinee);
-                    let targets: Vec<usize> = self
-                        .var_type_ids
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, ty_id)| ctx.resolve_binding(**ty_id) == root)
-                        .map(|(i, _)| i)
-                        .collect();
-                    for other_id in targets {
-                        self.suspend_on_var(match_c.clone(), other_id);
-                    }
-                    true
+                // Always suspend the Match constraint, regardless of whether
+                // this variable already has guards.  A non-empty guard set
+                // from a *previous* Match cannot repel a *new* Match with a
+                // potentially different branches_id — silently dropping it
+                // would lose entire branch sets.
+                let match_c = Constraint::Match {
+                    scrutinee,
+                    branches_id,
+                    span: crate::ast::Span::new(0, 0),
+                };
+                // #3: Register on this var AND all vars sharing its
+                // binding root (transitive wait_list).
+                let root = ctx.resolve_binding(scrutinee);
+                let targets: Vec<usize> = self
+                    .var_type_ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, ty_id)| ctx.resolve_binding(**ty_id) == root)
+                    .map(|(i, _)| i)
+                    .collect();
+                for other_id in targets {
+                    self.suspend_on_var(match_c.clone(), other_id);
                 }
+                true
             }
             _ => {
                 self.discharge_match(ctx, scrutinee, branches_id, heap);
@@ -1175,12 +1318,15 @@ impl InferenceContext {
     }
 
     /// Check whether a resolved type contains escaped rigid (skolem) variables.
-    /// Recursively walks the type tree looking for `GenericParam` references that
-    /// would indicate a Forall-bound variable has escaped into an outer scope.
+    /// Recursively walks the type tree looking for `GenericParam` or `SkolemVar`
+    /// references that would indicate a Forall-bound variable has escaped into
+    /// an outer scope.  SkolemVar is the runtime representation of a universally
+    /// quantified variable bound by a `Constraint::Forall` — detecting it here
+    /// prevents skolem constants from leaking into generalized type schemes.
     fn check_rigid_escape(ctx: &TypeContext, ty: TypeId, max_level: usize) -> bool {
         let resolved = ctx.resolve_binding(ty);
         match ctx.get(resolved) {
-            TypeData::GenericParam { .. } => true, // escape detected
+            TypeData::GenericParam { .. } | TypeData::SkolemVar { .. } => true, // escape detected
             TypeData::Fn { params, ret } => {
                 params
                     .iter()
@@ -1243,16 +1389,17 @@ impl InferenceContext {
         &mut self,
         ctx: &mut TypeContext,
         scrutinee_ty: TypeId,
-        branches_id: usize,
+        branches_id: (usize, usize),
         heap: &mut BinaryHeap<PrioritizedConstraint>,
     ) -> bool {
         let resolved = ctx.resolve_binding(scrutinee_ty);
         let shape = Self::shape_of_type(ctx, resolved);
 
         // Find the branch that matches this shape.
-        let start = branches_id;
+        let (start, count) = branches_id;
+        let end = start + count;
         if start < self.match_branches.len() {
-            for i in start..self.match_branches.len() {
+            for i in start..end.min(self.match_branches.len()) {
                 let branch = &self.match_branches[i];
                 let matches_pattern = shape == branch.shape_pattern;
 
@@ -1344,6 +1491,15 @@ impl InferenceContext {
         // InferVar was resolved and immediately wake its suspended constraints.
         // This follows OmniML's job-queue pattern where unify enqueues jobs
         // that the scheduler runs immediately.
+        //
+        // `delayed` holds constraints that cannot be processed yet (e.g. Impl
+        // on an unresolved infer var).  They are re‑queued into `heap` once
+        // per outer iteration to be retried after any new equalities arrive.
+        // `delayed_retried` prevents infinite looping when the dependency
+        // never resolves: we retry at most once per stall, and if no variable
+        // was woken in between, the stall is permanent.
+        let mut delayed: Vec<PrioritizedConstraint> = Vec::new();
+        let mut delayed_retried: bool = false;
         loop {
             let mut active_count = heap.len();
             while let Some(pc) = heap.pop() {
@@ -1382,22 +1538,22 @@ impl InferenceContext {
                             let b_lvl = self.get_var_level(bvid).unwrap_or(0);
                             if a_lvl > b_lvl {
                                 if let Some(promoted) = self.try_promote_var(ctx, avid, b_lvl) {
-                                    ctx.unify(promoted, *b)?;
+                                    self.unify_and_track(promoted, *b, ctx)?;
                                     // Continue with wake-up below
                                 } else {
-                                    ctx.unify(*a, *b)?;
+                                    self.unify_and_track(*a, *b, ctx)?;
                                 }
                             } else if b_lvl > a_lvl {
                                 if let Some(promoted) = self.try_promote_var(ctx, bvid, a_lvl) {
-                                    ctx.unify(*a, promoted)?;
+                                    self.unify_and_track(*a, promoted, ctx)?;
                                 } else {
-                                    ctx.unify(*a, *b)?;
+                                    self.unify_and_track(*a, *b, ctx)?;
                                 }
                             } else {
-                                ctx.unify(*a, *b)?;
+                                self.unify_and_track(*a, *b, ctx)?;
                             }
                         } else {
-                            ctx.unify(*a, *b)?;
+                            self.unify_and_track(*a, *b, ctx)?;
                         }
 
                         // Mark dirty for drain_dirty tracking.
@@ -1484,9 +1640,16 @@ impl InferenceContext {
                         if matches!(data, TypeData::Error) {
                             return Ok(());
                         }
-                        // If still an infer var, that's fine; solving will assign a default later
+                        // If still an infer var, delay Impl checking until the type
+                        // is resolved — push to the `delayed` queue instead of
+                        // returning Ok(()) or re-pushing to `heap` (which would
+                        // cause immediate re-pop and an infinite loop).
                         if matches!(data, TypeData::InferVar { .. }) {
-                            return Ok(());
+                            delayed.push(PrioritizedConstraint {
+                                priority: 7,
+                                constraint: pc.constraint.clone(),
+                            });
+                            continue;
                         }
                         // Otherwise, check that the impl exists
                         let impl_found = if trait_env.lookup_impl(*trait_id, resolved).is_some() {
@@ -1559,9 +1722,18 @@ impl InferenceContext {
                             );
                             if !shape_known {
                                 // Scrutinee is still an InferVar — try unicity via bounds
+                                // Collect remaining heap items to pass as active constraints
+                                // for UNI-VAR (OmniML §4.1): Eq constraints in the active set
+                                // determine the shape.  Previously this passed &[], which
+                                // disabled UNI-VAR entirely.
+                                let active: Vec<PrioritizedConstraint> = heap.drain().collect();
                                 if let Some(_shape) =
-                                    Self::unicity_check(self, ctx, *scrutinee, &[])
+                                    Self::unicity_check(self, ctx, *scrutinee, &active)
                                 {
+                                    // Re-push active constraints before discharging
+                                    for c in active {
+                                        heap.push(c);
+                                    }
                                     let _ = self.discharge_match(
                                         ctx,
                                         *scrutinee,
@@ -1569,6 +1741,10 @@ impl InferenceContext {
                                         &mut heap,
                                     );
                                 } else {
+                                    // Re-push active constraints
+                                    for c in active {
+                                        heap.push(c);
+                                    }
                                     // Cannot discharge yet — push back as low priority
                                     let p = 6u8;
                                     heap.push(PrioritizedConstraint {
@@ -1599,7 +1775,24 @@ impl InferenceContext {
                         span: _,
                     } => {
                         // OmniML: ∀α. C — bind a fresh rigid (skolem) variable.
-                        // Record for skolem escape check; solve the body.
+                        // Enter a new universe and create a SkolemVar, then bind
+                        // the corresponding InferVar to the SkolemVar so that any
+                        // subsequent unification with a non-skolem type is rejected
+                        // (the unification code's catch-all returns Mismatch for
+                        // SkolemVar/non-SkolemVar or SkolemVar/SkolemVar pairs).
+                        //
+                        // The SkolemVar uses `enter_universe` so that its
+                        // `universe_num` can be checked by `check_skolem_escape`
+                        // on TypeContext, preventing the skolem from leaking
+                        // into outer scopes via generalization.
+                        if *var_id < self.var_type_ids.len() {
+                            let (_universe, skolem_ty) = ctx.enter_universe();
+                            let infer_ty = self.var_type_ids[*var_id];
+                            // Use the local `unify` (not `ctx.unify`) so that
+                            // the resolution is recorded in `self.resolutions`,
+                            // keeping `self.resolve()` consistent.
+                            let _ = self.unify(infer_ty, skolem_ty, ctx);
+                        }
                         let inner = constraint.as_ref().clone();
                         let p = inner.priority(ctx);
                         heap.push(PrioritizedConstraint {
@@ -1608,25 +1801,110 @@ impl InferenceContext {
                         });
                     }
                     Constraint::Instance {
-                        expr_var,
+                        scheme_ty,
                         instantiation_ty,
                         span: _,
                     } => {
-                        let p = Constraint::Eq(
-                            *instantiation_ty,
-                            *instantiation_ty,
-                            crate::ast::Span::new(0, 0),
-                        )
-                        .priority(ctx);
-                        let ic = Constraint::Eq(
-                            *instantiation_ty,
-                            *instantiation_ty,
-                            crate::ast::Span::new(0, 0),
-                        );
-                        heap.push(PrioritizedConstraint {
-                            priority: p,
-                            constraint: ic,
-                        });
+                        // ── OmniML instantiation (S-Let-AppR) ─────────────
+                        // `Instance(scheme_ty, instantiation_ty)` holds when
+                        // `instantiation_ty` is a valid instance of `scheme_ty`.
+                        // If scheme_ty = ∀α₁...∀αₙ. τ_body, create fresh
+                        // InferVars β₁...βₙ and constrain:
+                        //   Eq(instantiation_ty, τ_body[α₁:=β₁,...,αₙ:=βₙ])
+
+                        // Phase 1: Scan scheme type (immutable borrow on ctx)
+                        // to collect binders without holding any borrow.
+                        let resolved_scheme = ctx.resolve_binding(*scheme_ty);
+                        let scheme_info = {
+                            // Use a block to limit the borrow scope.
+                            match ctx.get(resolved_scheme) {
+                                TypeData::Forall { .. } => {
+                                    // Collect all Forall binders by walking the chain.
+                                    let mut indices: Vec<usize> = Vec::new();
+                                    let mut inner = resolved_scheme;
+                                    loop {
+                                        match ctx.get(inner) {
+                                            TypeData::Forall {
+                                                param_index,
+                                                body,
+                                                ..
+                                            } => {
+                                                indices.push(*param_index);
+                                                inner = *body;
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                    // The final `inner` is the body of the innermost Forall.
+                                    Some(InstantiationTarget::Forall {
+                                        binder_indices: indices,
+                                        body_ty: inner,
+                                    })
+                                }
+                                TypeData::Poly { quantifiers, body } => {
+                                    let indices: Vec<usize> =
+                                        quantifiers.iter().map(|(idx, _)| *idx).collect();
+                                    Some(InstantiationTarget::Poly {
+                                        binder_indices: indices,
+                                        body_ty: *body,
+                                    })
+                                }
+                                _ => {
+                                    // Concrete (or error) — just unify directly.
+                                    Some(InstantiationTarget::Concrete(resolved_scheme))
+                                }
+                            }
+                        };
+
+                        // Phase 2: Create fresh vars and emit Eq (mutable borrow).
+                        if let Some(target) = scheme_info {
+                            let eq_c = match target {
+                                InstantiationTarget::Forall {
+                                    binder_indices,
+                                    body_ty,
+                                } => {
+                                    let mut instantiated = body_ty;
+                                    for &idx in binder_indices.iter().rev() {
+                                        let fv =
+                                            self.new_type_var(ctx, TypeVariableKind::Any);
+                                        instantiated =
+                                            ctx.replace_generic(instantiated, idx, fv);
+                                    }
+                                    Constraint::Eq(
+                                        *instantiation_ty,
+                                        instantiated,
+                                        crate::ast::Span::new(0, 0),
+                                    )
+                                }
+                                InstantiationTarget::Poly {
+                                    binder_indices,
+                                    body_ty,
+                                } => {
+                                    let mut instantiated = body_ty;
+                                    for &idx in binder_indices.iter() {
+                                        let fv =
+                                            self.new_type_var(ctx, TypeVariableKind::Any);
+                                        instantiated =
+                                            ctx.replace_generic(instantiated, idx, fv);
+                                    }
+                                    Constraint::Eq(
+                                        *instantiation_ty,
+                                        instantiated,
+                                        crate::ast::Span::new(0, 0),
+                                    )
+                                }
+                                InstantiationTarget::Concrete(target_ty) => Constraint::Eq(
+                                    *instantiation_ty,
+                                    target_ty,
+                                    crate::ast::Span::new(0, 0),
+                                ),
+                            };
+                            let p = eq_c.priority(ctx);
+                            heap.push(PrioritizedConstraint {
+                                priority: p,
+                                constraint: eq_c,
+                            });
+                        }
                     }
                     Constraint::Let {
                         expr_var: _,
@@ -1663,15 +1941,17 @@ impl InferenceContext {
                 } = &pc.constraint
                 {
                     let resolved = ctx.resolve_binding(*scrutinee);
+                    // Collect active constraints for UNI-VAR check
+                    let active: Vec<PrioritizedConstraint> = heap.iter().cloned().collect();
                     // Only attempt discharge if scrutinee is resolved (not an InferVar)
                     if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
-                        if let Some(shape) = Self::unicity_check(self, ctx, *scrutinee, &[]) {
+                        if let Some(shape) = Self::unicity_check(self, ctx, *scrutinee, &active) {
                             let _discharged =
                                 self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
                         }
                     } else {
                         // Scrutinee is still an InferVar — check unicity via bounds
-                        if let Some(_shape) = Self::unicity_check(self, ctx, *scrutinee, &[]) {
+                        if let Some(_shape) = Self::unicity_check(self, ctx, *scrutinee, &active) {
                             let _discharged =
                                 self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
                         }
@@ -1698,15 +1978,46 @@ impl InferenceContext {
                                 constraint: c,
                             });
                         }
+                        // Clear guards for this variable — every constraint
+                        // in the former wait list had a guard added by
+                        // `suspend_on_var`.  Without this clear, the variable
+                        // remains permanently in PG and can never become
+                        // Generalized.
+                        if i < self.guard_sets.len() {
+                            self.guard_sets[i].clear();
+                        }
+                        // If guards are now empty and status was PG,
+                        // transition to Generalized (OmniML §6).
+                        if i < self.gen_statuses.len()
+                            && self.gen_statuses[i] == GenStatus::PartiallyGeneralizable
+                        {
+                            let guards_empty =
+                                i < self.guard_sets.len() && self.guard_sets[i].is_empty();
+                            if guards_empty {
+                                self.gen_statuses[i] = GenStatus::Generalized;
+                            }
+                        }
                         woken += count;
                     }
                 }
             }
             if woken == 0 {
+                // If there are delayed constraints (e.g. Impl on unresolved
+                // infer vars) and we haven't retried them yet, re‑queue
+                // them into the heap and retry once.  If the same delayed
+                // constraints are still present on the next stall, the
+                // dependency never resolves — stop retrying.
+                if !delayed.is_empty() && !delayed_retried {
+                    for c in delayed.drain(..) {
+                        heap.push(c);
+                    }
+                    delayed_retried = true;
+                    continue;
+                }
                 // #2: Solver exhaustion — check for remaining undischarged Match
                 // constraints and fire their else_continuation as a fallback.
                 let remaining: Vec<PrioritizedConstraint> = heap.drain().collect();
-                let match_elses: Vec<(TypeId, usize)> = remaining
+                let match_elses: Vec<(TypeId, (usize, usize))> = remaining
                     .iter()
                     .filter_map(|pc| {
                         if let Constraint::Match {
@@ -1732,6 +2043,9 @@ impl InferenceContext {
                 }
                 break; // converged: no more constraints to wake
             }
+            // woken > 0: progress was made — reset retry guard so delayed
+            // constraints may be retried in the next iteration.
+            delayed_retried = false;
             // Continue the loop to process woken constraints
         }
 
@@ -1821,6 +2135,51 @@ impl InferenceContext {
                     TypeVariableKind::Any => ctx.error(),
                 };
                 ctx.set_binding(ty_id, default_ty);
+            }
+        }
+
+        // ── Re-check delayed Impl constraints after defaulting ──────
+        // Variables that were unresolved during the solver loop may have
+        // been defaulted above.  Any remaining delayed Impl constraints
+        // must now be checked against the concrete (defaulted) types.
+        // Without this, trait obligations could be silently dropped while
+        // the solver reports success — a soundness hole.
+        for pc in &delayed {
+            if let Constraint::Impl(ty, trait_id, span) = &pc.constraint {
+                let resolved = ctx.resolve_binding(*ty);
+                let data = ctx.get(resolved);
+                if matches!(data, TypeData::Error) {
+                    continue;
+                }
+                if matches!(data, TypeData::InferVar { .. }) {
+                    // This variable was not defaulted because it is PG
+                    // (PartiallyGeneralizable) — but the solver has exhausted
+                    // all progress and the Impl constraint was never resolved.
+                    // A required trait implementation cannot be verified,
+                    // so this is an error, not a skip.
+                    return Err(TypeError::TraitNotImplemented {
+                        ty: *ty,
+                        trait_name: format!("{:?}", trait_id),
+                        span: *span,
+                    });
+                }
+                let impl_found = if trait_env.lookup_impl(*trait_id, resolved).is_some() {
+                    true
+                } else {
+                    trait_env
+                        .lookup_impl_generic(*trait_id, resolved, ctx, symbols)
+                        .is_some()
+                };
+                if !impl_found {
+                    return Err(TypeError::TraitNotImplemented {
+                        ty: *ty,
+                        trait_name: format!("{:?}", trait_id),
+                        span: *span,
+                    });
+                }
+                // Associated type obligations could be checked here too,
+                // but they are handled during the main solving pass when
+                // the Impl constraint is resolved.
             }
         }
 
@@ -2003,7 +2362,11 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
             .unwrap_or(ctx.error())
         }
         TypeData::DynTrait { .. } => ty,
-        TypeData::Exists { param_index, name, base } => {
+        TypeData::Exists {
+            param_index,
+            name,
+            base,
+        } => {
             let new_base = replace_infer(base, solution, ctx);
             ctx.find_type(&TypeData::Exists {
                 param_index,
@@ -2208,7 +2571,7 @@ mod tests {
         // Match constraint on an InferVar → low priority (6)
         let match_c = Constraint::Match {
             scrutinee: var,
-            branches_id: 0,
+            branches_id: (0, 0),
             span: crate::ast::Span::new(0, 0),
         };
         assert_eq!(
@@ -2294,7 +2657,7 @@ mod tests {
             else_continuation: Vec::new(),
         }];
         let id = infer.register_match_branches(branches);
-        assert!(id < infer.match_branches.len());
+        assert!(id.0 < infer.match_branches.len());
     }
 
     #[test]
@@ -2304,7 +2667,7 @@ mod tests {
         let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
         let match_c = Constraint::Match {
             scrutinee: var,
-            branches_id: 0,
+            branches_id: (0, 0),
             span: crate::ast::Span::new(0, 0),
         };
         // Before resolution: low priority
@@ -2725,6 +3088,145 @@ mod tests {
             matches!(ctx.get(resolved), TypeData::InferVar { id } if *id == var_id),
             "should be unchanged"
         );
+    }
+
+    #[test]
+    fn test_try_promote_var_transfers_wait_list_and_guards() {
+        // ── Verify that promotion transfers wait list, guard set, gen_status,
+        // lower_bounds, upper_bounds, and forward/reverse refs to the new
+        // variable. Without this transfer, constraints suspended on the old
+        // variable are silently lost (the critical vulnerability).
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let _prev = infer.enter_level();
+        let _prev2 = infer.enter_level();
+
+        // Create a variable at a deep level
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var_id = match ctx.get(var) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        let deep_level = infer.get_var_level(var_id).unwrap();
+        assert!(deep_level > 0, "var should be at a deep level");
+
+        // Suspend constraints on it (simulating match/impl obligations)
+        infer.suspend_on_var(
+            Constraint::Eq(ctx.bool(), ctx.int(32, true), crate::ast::Span::new(0, 0)),
+            var_id,
+        );
+        infer.suspend_on_var(
+            Constraint::Impl(ctx.bool(), DefId(0), crate::ast::Span::new(0, 0)),
+            var_id,
+        );
+
+        // Verify suspension was recorded
+        assert_eq!(
+            infer.wait_lists[var_id].len(),
+            2,
+            "old var should have 2 suspended constraints"
+        );
+        assert!(
+            !infer.guard_sets[var_id].is_empty(),
+            "old var should have guards"
+        );
+        assert_eq!(
+            infer.gen_statuses[var_id],
+            GenStatus::PartiallyGeneralizable,
+            "old var should be PG"
+        );
+
+        // Also set up a forward reference (simulating instance tracking)
+        let inst = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let inst_id = match ctx.get(inst) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        infer.register_instance(var_id, inst_id);
+        assert!(
+            infer.has_instances(var_id),
+            "old var should have instances"
+        );
+
+        // Also add a lower bound
+        if var_id < infer.lower_bounds.len() {
+            infer.lower_bounds[var_id].push(ctx.bool());
+        }
+
+        // ── Promote the variable ──────────────────────────────────
+        let promoted = infer.try_promote_var(&mut ctx, var_id, 0);
+        assert!(promoted.is_some(), "promotion should succeed");
+
+        // The promoted TypeId corresponds to the new variable
+        let new_id = match ctx.get(promoted.unwrap()) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        assert_ne!(new_id, var_id, "new var must be different from old");
+
+        // ── Verify transfer: the new variable now owns the state ──
+        assert!(
+            infer.wait_lists[var_id].is_empty(),
+            "old var's wait list should be cleared"
+        );
+        assert_eq!(
+            infer.wait_lists[new_id].len(),
+            2,
+            "new var should have the 2 suspended constraints"
+        );
+
+        assert!(
+            infer.guard_sets[var_id].is_empty(),
+            "old var's guard set should be cleared"
+        );
+        assert!(
+            !infer.guard_sets[new_id].is_empty(),
+            "new var should have the guards"
+        );
+
+        assert_eq!(
+            infer.gen_statuses[new_id],
+            GenStatus::PartiallyGeneralizable,
+            "new var should inherit PG status"
+        );
+
+        // The old var is now just a resolution alias, status is irrelevant
+        // but the new var must have the right status.
+
+        // ── Verify forward refs transfer ──────────────────────────
+        assert!(
+            infer.has_instances(new_id),
+            "new var should inherit the instances from the old var"
+        );
+        // Actually, forward_refs[new_id] was extended with old_fwd,
+        // which contained inst_id. But new_id might not be < forward_refs.len()
+        // let's check more carefully
+        if new_id < infer.forward_refs.len() {
+            assert!(
+                infer.forward_refs[new_id].contains(&inst_id),
+                "new var's forward refs should include the instance"
+            );
+        }
+        // The instance should now point to new_id
+        if inst_id < infer.reverse_refs.len() {
+            assert_eq!(
+                infer.reverse_refs[inst_id],
+                Some(new_id),
+                "instance should now point to the new var"
+            );
+        }
+
+        // ── Verify lower bound transfer ───────────────────────────
+        if var_id < infer.lower_bounds.len() && new_id < infer.lower_bounds.len() {
+            assert!(
+                infer.lower_bounds[var_id].is_empty(),
+                "old var's lower bounds should be cleared"
+            );
+            assert!(
+                !infer.lower_bounds[new_id].is_empty(),
+                "new var should have the lower bounds"
+            );
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════

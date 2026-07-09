@@ -3,7 +3,7 @@ use crate::diagnostics::{Diagnostic, DiagnosticCollector};
 use crate::hir::checker::TypeChecker;
 use crate::hir::hir::HirExpr;
 use crate::hir::symbol::FunctionBinding;
-use crate::hir::types::{DefId, TypeData, TypeId};
+use crate::hir::types::{AdtKind, DefId, TypeData, TypeId};
 
 /// Errors that can occur during comptime evaluation.
 #[derive(Debug, Clone)]
@@ -46,10 +46,11 @@ impl std::fmt::Display for ComptimeError {
 
 /// The result of evaluating a comptime block:
 /// either a concrete value, a type, a control-flow signal, or an error.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ComptimeValue {
     Type(TypeId),
-    Value(HirExpr),
+    /// A concrete HIR expression value (cheap to clone via Arc).
+    Value(Arc<HirExpr>),
     /// Signal: break out of the current comptime loop with an optional value.
     Break(Option<Box<ComptimeValue>>),
     /// Signal: skip to the next iteration of the current comptime loop.
@@ -57,14 +58,40 @@ pub enum ComptimeValue {
     Error,
 }
 
+impl Clone for ComptimeValue {
+    fn clone(&self) -> Self {
+        match self {
+            ComptimeValue::Type(ty) => ComptimeValue::Type(*ty),
+            ComptimeValue::Value(hir) => ComptimeValue::Value(Arc::clone(hir)),
+            ComptimeValue::Break(val) => ComptimeValue::Break(val.clone()),
+            ComptimeValue::Continue => ComptimeValue::Continue,
+            ComptimeValue::Error => ComptimeValue::Error,
+        }
+    }
+}
+
+impl ComptimeValue {
+    /// If this is a `Value`, return a reference to the inner `HirExpr`.
+    pub fn as_hir_expr(&self) -> Option<&HirExpr> {
+        match self {
+            ComptimeValue::Value(hir) => Some(hir.as_ref()),
+            _ => None,
+        }
+    }
+}
+
 /// A lazy iterator over comptime-generated values, following the KSP
 /// `has_next()`/`next()` pattern (see YenTopKShortestPathsAlg).
+/// `priority` is a function that returns an ordering key for candidates
+/// (lower = explored first).  Callers supply the priority function to
+/// control the exploration order (e.g. simpler types before complex ones).
 #[derive(Debug, Clone)]
 pub struct SeqGen<T: Clone> {
     candidates: Vec<T>,
     limit: usize,
     count: usize,
     generator: Option<fn(&T) -> Option<Vec<T>>>,
+    priority: fn(&T) -> usize,
 }
 
 impl<T: Clone> SeqGen<T> {
@@ -74,6 +101,24 @@ impl<T: Clone> SeqGen<T> {
             limit,
             count: 0,
             generator: Some(generator),
+            priority: |_| 0,
+        }
+    }
+
+    /// Create a new `SeqGen` with a custom priority function.
+    /// Lower priority values are explored first (like Yen's path cost).
+    pub fn with_priority(
+        first: T,
+        limit: usize,
+        generator: fn(&T) -> Option<Vec<T>>,
+        priority: fn(&T) -> usize,
+    ) -> Self {
+        SeqGen {
+            candidates: vec![first],
+            limit,
+            count: 0,
+            generator: Some(generator),
+            priority,
         }
     }
 
@@ -94,7 +139,7 @@ impl<T: Clone> SeqGen<T> {
                 if let Some(new_candidates) = gen(&result) {
                     for c in new_candidates {
                         let pos = self.candidates.iter().position(|x| {
-                            self.priority(x) > self.priority(&c)
+                            (self.priority)(x) > (self.priority)(&c)
                         });
                         match pos {
                             Some(p) => self.candidates.insert(p, c),
@@ -106,10 +151,6 @@ impl<T: Clone> SeqGen<T> {
         }
 
         Some(result)
-    }
-
-    fn priority(&self, _val: &T) -> usize {
-        0
     }
 }
 
@@ -190,6 +231,7 @@ pub struct ComptimeEvalContext<'a> {
 }
 
 use rustc_hash::FxHashMap as HashMap;
+use std::sync::Arc;
 
 impl<'a> ComptimeEvalContext<'a> {
     /// Create a new comptime evaluation context.
@@ -253,7 +295,7 @@ impl<'a> ComptimeEvalContext<'a> {
         match expr {
             // ── Literal ──────────────────────────────────────────────
             HirExpr::Literal(lit, ty, _) => {
-                Ok(ComptimeValue::Value(HirExpr::Literal(lit.clone(), *ty, Span::new(0, 0))))
+                Ok(ComptimeValue::Value(Arc::new(HirExpr::Literal(lit.clone(), *ty, Span::new(0, 0)))))
             }
 
             // ── Identifier ───────────────────────────────────────────
@@ -301,18 +343,21 @@ impl<'a> ComptimeEvalContext<'a> {
             HirExpr::If { cond, then_branch, else_branch, .. } => {
                 let cond_val = self.eval_expr(cond)?;
                 match cond_val {
-                    ComptimeValue::Value(HirExpr::Literal(Literal::Bool(true), _, _)) => {
-                        self.eval_body_stmts(then_branch)
-                    }
-                    ComptimeValue::Value(HirExpr::Literal(Literal::Bool(false), _, _)) => {
-                        if let Some(else_branch) = else_branch {
-                            self.eval_body_stmts(else_branch)
-                        } else {
-                            Ok(ComptimeValue::Value(
-                                HirExpr::Literal(Literal::Bool(false), self.checker.ctx.unit(), Span::new(0, 0))
-                            ))
+                    ComptimeValue::Value(hir) => match hir.as_ref() {
+                        HirExpr::Literal(Literal::Bool(true), _, _) => {
+                            self.eval_body_stmts(then_branch)
                         }
-                    }
+                        HirExpr::Literal(Literal::Bool(false), _, _) => {
+                            if let Some(else_branch) = else_branch {
+                                self.eval_body_stmts(else_branch)
+                            } else {
+                                Ok(ComptimeValue::Value(Arc::new(
+                                    HirExpr::Literal(Literal::Bool(false), self.checker.ctx.unit(), Span::new(0, 0))
+                                )))
+                            }
+                        }
+                        _ => Err(ComptimeError::Deferred),
+                    },
                     _ => Err(ComptimeError::Deferred),
                 }
             }
@@ -340,11 +385,11 @@ impl<'a> ComptimeEvalContext<'a> {
                 let mut evaled = Vec::with_capacity(elems.len());
                 for elem in elems {
                     match self.eval_expr(elem)? {
-                        ComptimeValue::Value(v) => evaled.push(v),
+                        ComptimeValue::Value(v) => evaled.push(HirExpr::clone(v.as_ref())),
                         _ => return Err(ComptimeError::TypeError("tuple element not a comptime value".into())),
                     }
                 }
-                Ok(ComptimeValue::Value(HirExpr::Tuple(evaled, *ty, *span)))
+                Ok(ComptimeValue::Value(Arc::new(HirExpr::Tuple(evaled, *ty, *span))))
             }
 
             // ── Array ────────────────────────────────────────────────
@@ -352,11 +397,11 @@ impl<'a> ComptimeEvalContext<'a> {
                 let mut evaled = Vec::with_capacity(elems.len());
                 for elem in elems {
                     match self.eval_expr(elem)? {
-                        ComptimeValue::Value(v) => evaled.push(v),
+                        ComptimeValue::Value(v) => evaled.push(HirExpr::clone(v.as_ref())),
                         _ => return Err(ComptimeError::TypeError("array element not a comptime value".into())),
                     }
                 }
-                Ok(ComptimeValue::Value(HirExpr::Array(evaled, *ty, *span)))
+                Ok(ComptimeValue::Value(Arc::new(HirExpr::Array(evaled, *ty, *span))))
             }
 
             // ── TypeAnnotated ────────────────────────────────────────
@@ -368,17 +413,30 @@ impl<'a> ComptimeEvalContext<'a> {
             HirExpr::Cast { expr: inner, ty, .. } => {
                 let val = self.eval_expr(inner)?;
                 match val {
-                    ComptimeValue::Value(HirExpr::Literal(lit, _, _)) => {
-                        Ok(ComptimeValue::Value(HirExpr::Literal(lit, *ty, Span::new(0, 0))))
-                    }
+                    ComptimeValue::Value(hir) => match hir.as_ref() {
+                        HirExpr::Literal(lit, _, _) => {
+                            Ok(ComptimeValue::Value(Arc::new(
+                                HirExpr::Literal(lit.clone(), *ty, Span::new(0, 0))
+                            )))
+                        }
+                        _ => {
+                            Ok(ComptimeValue::Value(Arc::new(HirExpr::Cast {
+                                expr: Box::new(HirExpr::clone(inner.as_ref())),
+                                ty: *ty,
+                                safe: true,
+                                rounding: None,
+                                span: Span::new(0, 0),
+                            })))
+                        }
+                    },
                     _ => {
-                        Ok(ComptimeValue::Value(HirExpr::Cast {
-                            expr: Box::new(inner.as_ref().clone()),
+                        Ok(ComptimeValue::Value(Arc::new(HirExpr::Cast {
+                            expr: Box::new(HirExpr::clone(inner.as_ref())),
                             ty: *ty,
                             safe: true,
                             rounding: None,
                             span: Span::new(0, 0),
-                        }))
+                        })))
                     }
                 }
             }
@@ -433,18 +491,24 @@ impl<'a> ComptimeEvalContext<'a> {
                 if args.len() == 1 {
                     let cond = self.eval_expr(&args[0])?;
                     match cond {
-                        ComptimeValue::Value(HirExpr::Literal(Literal::Bool(true), _, _)) => {
-                            Ok(ComptimeValue::Value(
-                                HirExpr::Literal(Literal::Bool(true), ret_ty, Span::new(0, 0))
-                            ))
-                        }
-                        ComptimeValue::Value(HirExpr::Literal(Literal::Bool(false), _, _)) => {
-                            Err(ComptimeError::AssertionFailed(format!(
-                                "assertion failed{}{}",
-                                if self.call_stack.is_empty() { String::new() } else { " at ".to_string() },
-                                self.format_stack_trace(),
-                            )))
-                        }
+                        ComptimeValue::Value(hir) => match hir.as_ref() {
+                            HirExpr::Literal(Literal::Bool(true), _, _) => {
+                                Ok(ComptimeValue::Value(Arc::new(
+                                    HirExpr::Literal(Literal::Bool(true), ret_ty, Span::new(0, 0))
+                                )))
+                            }
+                            HirExpr::Literal(Literal::Bool(false), _, _) => {
+                                Err(ComptimeError::AssertionFailed(format!(
+                                    "assertion failed{}{}",
+                                    if self.call_stack.is_empty() { String::new() } else { " at ".to_string() },
+                                    self.format_stack_trace(),
+                                )))
+                            }
+                            _ => Err(ComptimeError::TypeError(
+                                "assert requires a comptime boolean expression".into()
+                            )),
+                        },
+                        ComptimeValue::Error => Ok(ComptimeValue::Error),
                         _ => Err(ComptimeError::TypeError(
                             "assert requires a comptime boolean expression".into()
                         )),
@@ -491,9 +555,9 @@ impl<'a> ComptimeEvalContext<'a> {
                         ComptimeValue::Type(type_id) => {
                             let size = self.estimate_type_size(type_id);
                             let usize_ty = self.checker.ctx.usize();
-                            Ok(ComptimeValue::Value(
+                            Ok(ComptimeValue::Value(Arc::new(
                                 HirExpr::Literal(Literal::Int(size as i64), usize_ty, Span::new(0, 0))
-                            ))
+                            )))
                         }
                         _ => Err(ComptimeError::TypeError("sizeof requires a type argument".into())),
                     }
@@ -600,9 +664,9 @@ impl<'a> ComptimeEvalContext<'a> {
                     if let Some(val_expr) = value {
                         return self.eval_expr(val_expr);
                     }
-                    return Ok(ComptimeValue::Value(
+                    return Ok(ComptimeValue::Value(Arc::new(
                         HirExpr::Literal(Literal::Bool(false), self.checker.ctx.unit(), Span::new(0, 0))
-                    ));
+                    )));
                 }
                 HirStmt::Leave { .. } => {
                     // `leave` inside comptime: break out of the current loop
@@ -673,12 +737,12 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
 
     let make_info = |elems: Vec<HirExpr>| -> ComptimeValue {
         let ty = info_tup_ty(&elems);
-        ComptimeValue::Value(HirExpr::Tuple(elems, ty, Span::new(0, 0)))
+        ComptimeValue::Value(Arc::new(HirExpr::Tuple(elems, ty, Span::new(0, 0))))
     };
 
     let make_nested_info = |label: HirExpr, inner: HirExpr| -> ComptimeValue {
         let ty = info_tup_ty(&[label.clone(), inner.clone()]);
-        ComptimeValue::Value(HirExpr::Tuple(vec![label, inner], ty, Span::new(0, 0)))
+        ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![label, inner], ty, Span::new(0, 0))))
     };
 
     match ctx.get(type_id) {
@@ -691,13 +755,13 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
         TypeData::Float { bits } => {
             make_info(vec![str_lit("Float"), int_lit(*bits as i64)])
         }
-        TypeData::Bool => ComptimeValue::Value(str_lit("Bool")),
-        TypeData::Char => ComptimeValue::Value(str_lit("Char")),
-        TypeData::Byte => ComptimeValue::Value(str_lit("Byte")),
-        TypeData::USize => ComptimeValue::Value(str_lit("USize")),
-        TypeData::Unit => ComptimeValue::Value(str_lit("Unit")),
-        TypeData::Never => ComptimeValue::Value(str_lit("Never")),
-        TypeData::Adt { def_id, .. } => {
+        TypeData::Bool => ComptimeValue::Value(Arc::new(str_lit("Bool"))),
+        TypeData::Char => ComptimeValue::Value(Arc::new(str_lit("Char"))),
+        TypeData::Byte => ComptimeValue::Value(Arc::new(str_lit("Byte"))),
+        TypeData::USize => ComptimeValue::Value(Arc::new(str_lit("USize"))),
+        TypeData::Unit => ComptimeValue::Value(Arc::new(str_lit("Unit"))),
+        TypeData::Never => ComptimeValue::Value(Arc::new(str_lit("Never"))),
+        TypeData::Adt { kind: AdtKind::Struct, def_id, .. } => {
             let mut fields_tuple = Vec::new();
             if let Some(binding) = self.checker.symbols.lookup_type_by_def_id(*def_id) {
                 for field in &binding.fields {
@@ -706,8 +770,8 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
                         int_lit(field.ty.0 as i64),
                         str_lit(&format!("{:?}", ctx.get(field.ty))),
                     ]);
-                    if let ComptimeValue::Value(hir) = field_info {
-                        fields_tuple.push(hir);
+                    if let ComptimeValue::Value(hir) = &field_info {
+                        fields_tuple.push(HirExpr::clone(hir.as_ref()));
                     }
                 }
             }
@@ -724,7 +788,7 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
                 HirExpr::Tuple(fields_tuple, fields_ty, Span::new(0, 0)),
             ])
         }
-        TypeData::Adt { def_id, .. } => {
+        TypeData::Adt { kind: AdtKind::Enum, def_id, .. } => {
             let mut variants_tuple = Vec::new();
             if let Some(binding) = self.checker.symbols.lookup_type_by_def_id(*def_id) {
                 for variant in &binding.variants {
@@ -738,8 +802,8 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
                         str_lit(&variant.name),
                         int_lit(if is_none { -1i64 } else { payload_id }),
                     ]);
-                    if let ComptimeValue::Value(hir) = vinfo {
-                        variants_tuple.push(hir);
+                    if let ComptimeValue::Value(hir) = &vinfo {
+                        variants_tuple.push(HirExpr::clone(hir.as_ref()));
                     }
                 }
             }
@@ -774,7 +838,7 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
         TypeData::Fn { params, ret } => {
             // Return: ("Fn", param_count, [param_ty_id, ...], ret_ty_id)
             let param_ids: Vec<HirExpr> = params.iter().map(|p| int_lit(p.0 as i64)).collect();
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![
                 str_lit("Fn"),
                 int_lit(params.len() as i64),
                 HirExpr::Tuple(param_ids, unit_ty, Span::new(0, 0)),
@@ -782,20 +846,20 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
             ], unit_ty, Span::new(0, 0)))
         }
         TypeData::Ref { ty, mutable } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![
                 str_lit("Ref"),
                 int_lit(ty.0 as i64),
                 bool_lit(*mutable),
             ], unit_ty, Span::new(0, 0)))
         }
         TypeData::Pointer { ty } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![
                 str_lit("Pointer"),
                 int_lit(ty.0 as i64),
             ], unit_ty, Span::new(0, 0)))
         }
         TypeData::Ptr { size, pointee } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![
                 str_lit("Ptr"),
                 int_lit(size.0 as i64),
                 int_lit(pointee.0 as i64),
@@ -803,14 +867,14 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
         }
         TypeData::Coproduct { alternatives } => {
             let alt_ids: Vec<HirExpr> = alternatives.iter().map(|a| int_lit(a.0 as i64)).collect();
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![
                 str_lit("Coproduct"),
                 int_lit(alternatives.len() as i64),
                 HirExpr::Tuple(alt_ids, unit_ty, Span::new(0, 0)),
             ], unit_ty, Span::new(0, 0)))
         }
         TypeData::Forall { param_index, param_name, body } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![
                 str_lit("Forall"),
                 int_lit(*param_index as i64),
                 str_lit(param_name),
@@ -818,7 +882,7 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
             ], unit_ty, Span::new(0, 0)))
         }
         TypeData::Exists { param_index: _, name, base } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![
                 str_lit("Exists"),
                 str_lit(name),
                 int_lit(base.0 as i64),
@@ -828,7 +892,7 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
             let q_strings: Vec<HirExpr> = quantifiers.iter()
                 .map(|(idx, name)| str_lit(&format!("{}:{}", idx, name)))
                 .collect();
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![
                 str_lit("Poly"),
                 int_lit(quantifiers.len() as i64),
                 HirExpr::Tuple(q_strings, unit_ty, Span::new(0, 0)),
@@ -836,21 +900,21 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
             ], unit_ty, Span::new(0, 0)))
         }
         TypeData::Rational { int_bits, frac_bits } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![
                 str_lit("Rational"),
                 int_lit(*int_bits as i64),
                 int_lit(*frac_bits as i64),
             ], unit_ty, Span::new(0, 0)))
         }
         TypeData::Mu { param_index, param_name, body } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![
                 str_lit("Mu"),
                 int_lit(*param_index as i64),
                 int_lit(body.0 as i64),
             ], unit_ty, Span::new(0, 0)))
         }
         TypeData::Nu { param_index, param_name, body } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![
                 str_lit("Nu"),
                 int_lit(*param_index as i64),
                 int_lit(body.0 as i64),
@@ -860,21 +924,21 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
             let trait_ids: Vec<HirExpr> = traits.iter()
                 .map(|t| int_lit(t.0 as i64))
                 .collect();
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![
                 str_lit("DynTrait"),
                 int_lit(traits.len() as i64),
                 HirExpr::Tuple(trait_ids, unit_ty, Span::new(0, 0)),
             ], unit_ty, Span::new(0, 0)))
         }
         TypeData::GenericParam { index, name } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![
                 str_lit("GenericParam"),
                 int_lit(*index as i64),
                 str_lit(name),
             ], unit_ty, Span::new(0, 0)))
         }
         TypeData::AssociatedType { trait_id, name, self_ty } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![
                 str_lit("AssociatedType"),
                 int_lit(trait_id.0 as i64),
                 str_lit(name),
@@ -882,13 +946,13 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
             ], unit_ty, Span::new(0, 0)))
         }
         TypeData::InferVar { id } => {
-            ComptimeValue::Value(HirExpr::Tuple(vec![
+            ComptimeValue::Value(Arc::new(HirExpr::Tuple(vec![
                 str_lit("InferVar"),
                 int_lit(*id as i64),
             ], unit_ty, Span::new(0, 0)))
         }
         _ => {
-            ComptimeValue::Value(str_lit("Other"))
+            ComptimeValue::Value(Arc::new(str_lit("Other")))
         }
     }
 }
@@ -988,76 +1052,81 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
         span: Span,
     ) -> Result<ComptimeValue, ComptimeError> {
         match (left, right) {
-            (ComptimeValue::Value(HirExpr::Literal(l1, _, _)), ComptimeValue::Value(HirExpr::Literal(l2, _, _))) => {
-                match (&l1, &l2) {
-                    // Integer arithmetic
-                    (Literal::Int(a), Literal::Int(b)) => {
-                        let result = match op {
-                            BinOp::Add => Literal::Int(a.wrapping_add(b)),
-                            BinOp::Sub => Literal::Int(a.wrapping_sub(b)),
-                            BinOp::Mul => Literal::Int(a.wrapping_mul(b)),
-                            BinOp::Div => {
-                                if *b == 0 { return Err(ComptimeError::DivisionByZero); }
-                                Literal::Int(a / b)
+            (ComptimeValue::Value(l), ComptimeValue::Value(r)) => {
+                match (l.as_ref(), r.as_ref()) {
+                    (HirExpr::Literal(l1, _, _), HirExpr::Literal(l2, _, _)) => {
+                        match (l1, l2) {
+                            // Integer arithmetic
+                            (Literal::Int(a), Literal::Int(b)) => {
+                                let result = match op {
+                                    BinOp::Add => Literal::Int(a.wrapping_add(b)),
+                                    BinOp::Sub => Literal::Int(a.wrapping_sub(b)),
+                                    BinOp::Mul => Literal::Int(a.wrapping_mul(b)),
+                                    BinOp::Div => {
+                                        if *b == 0 { return Err(ComptimeError::DivisionByZero); }
+                                        Literal::Int(a / b)
+                                    }
+                                    BinOp::Rem => {
+                                        if *b == 0 { return Err(ComptimeError::DivisionByZero); }
+                                        Literal::Int(a % b)
+                                    }
+                                    BinOp::Eq => Literal::Bool(a == b),
+                                    BinOp::Neq => Literal::Bool(a != b),
+                                    BinOp::Lt => Literal::Bool(a < b),
+                                    BinOp::Gt => Literal::Bool(a > b),
+                                    BinOp::Le => Literal::Bool(a <= b),
+                                    BinOp::Ge => Literal::Bool(a >= b),
+                                    BinOp::BitAnd => Literal::Int(a & b),
+                                    BinOp::BitOr => Literal::Int(a | b),
+                                    BinOp::BitXor => Literal::Int(a ^ b),
+                                    BinOp::Shl => Literal::Int(a.wrapping_shl(*b as u32)),
+                                    BinOp::Shr => Literal::Int(a.wrapping_shr(*b as u32)),
+                                    _ => return Err(ComptimeError::Deferred),
+                                };
+                                Ok(ComptimeValue::Value(Arc::new(HirExpr::Literal(result, ty, span))))
                             }
-                            BinOp::Rem => {
-                                if *b == 0 { return Err(ComptimeError::DivisionByZero); }
-                                Literal::Int(a % b)
+                            // Float arithmetic
+                            (Literal::Float(a), Literal::Float(b)) => {
+                                let result = match op {
+                                    BinOp::Add => Literal::Float(a + b),
+                                    BinOp::Sub => Literal::Float(a - b),
+                                    BinOp::Mul => Literal::Float(a * b),
+                                    BinOp::Div => Literal::Float(a / b),
+                                    BinOp::Eq => Literal::Bool(a == b),
+                                    BinOp::Neq => Literal::Bool(a != b),
+                                    BinOp::Lt => Literal::Bool(a < b),
+                                    BinOp::Gt => Literal::Bool(a > b),
+                                    BinOp::Le => Literal::Bool(a <= b),
+                                    BinOp::Ge => Literal::Bool(a >= b),
+                                    _ => return Err(ComptimeError::Deferred),
+                                };
+                                Ok(ComptimeValue::Value(Arc::new(HirExpr::Literal(result, ty, span))))
                             }
-                            BinOp::Eq => Literal::Bool(a == b),
-                            BinOp::Neq => Literal::Bool(a != b),
-                            BinOp::Lt => Literal::Bool(a < b),
-                            BinOp::Gt => Literal::Bool(a > b),
-                            BinOp::Le => Literal::Bool(a <= b),
-                            BinOp::Ge => Literal::Bool(a >= b),
-                            BinOp::BitAnd => Literal::Int(a & b),
-                            BinOp::BitOr => Literal::Int(a | b),
-                            BinOp::BitXor => Literal::Int(a ^ b),
-                            BinOp::Shl => Literal::Int(a.wrapping_shl(*b as u32)),
-                            BinOp::Shr => Literal::Int(a.wrapping_shr(*b as u32)),
-                            _ => return Err(ComptimeError::Deferred),
-                        };
-                        Ok(ComptimeValue::Value(HirExpr::Literal(result, ty, span)))
-                    }
-                    // Float arithmetic
-                    (Literal::Float(a), Literal::Float(b)) => {
-                        let result = match op {
-                            BinOp::Add => Literal::Float(a + b),
-                            BinOp::Sub => Literal::Float(a - b),
-                            BinOp::Mul => Literal::Float(a * b),
-                            BinOp::Div => Literal::Float(a / b),
-                            BinOp::Eq => Literal::Bool(a == b),
-                            BinOp::Neq => Literal::Bool(a != b),
-                            BinOp::Lt => Literal::Bool(a < b),
-                            BinOp::Gt => Literal::Bool(a > b),
-                            BinOp::Le => Literal::Bool(a <= b),
-                            BinOp::Ge => Literal::Bool(a >= b),
-                            _ => return Err(ComptimeError::Deferred),
-                        };
-                        Ok(ComptimeValue::Value(HirExpr::Literal(result, ty, span)))
-                    }
-                    // Boolean logic
-                    (Literal::Bool(a), Literal::Bool(b)) => {
-                        let result = match op {
-                            BinOp::And => Literal::Bool(*a && *b),
-                            BinOp::Or => Literal::Bool(*a || *b),
-                            BinOp::Eq => Literal::Bool(a == b),
-                            BinOp::Neq => Literal::Bool(a != b),
-                            _ => return Err(ComptimeError::Deferred),
-                        };
-                        Ok(ComptimeValue::Value(HirExpr::Literal(result, ty, span)))
+                            // Boolean logic
+                            (Literal::Bool(a), Literal::Bool(b)) => {
+                                let result = match op {
+                                    BinOp::And => Literal::Bool(*a && *b),
+                                    BinOp::Or => Literal::Bool(*a || *b),
+                                    BinOp::Eq => Literal::Bool(a == b),
+                                    BinOp::Neq => Literal::Bool(a != b),
+                                    _ => return Err(ComptimeError::Deferred),
+                                };
+                                Ok(ComptimeValue::Value(Arc::new(HirExpr::Literal(result, ty, span))))
+                            }
+                            _ => Err(ComptimeError::Deferred),
+                        }
                     }
                     _ => Err(ComptimeError::Deferred),
                 }
             }
             (ComptimeValue::Value(l), ComptimeValue::Value(r)) => {
-                Ok(ComptimeValue::Value(HirExpr::BinaryOp {
-                    left: Box::new(l),
+                Ok(ComptimeValue::Value(Arc::new(HirExpr::BinaryOp {
+                    left: Box::new(HirExpr::clone(l.as_ref())),
                     op,
-                    right: Box::new(r),
+                    right: Box::new(HirExpr::clone(r.as_ref())),
                     ty,
                     span,
-                }))
+                })))
             }
             _ => Err(ComptimeError::Deferred),
         }
@@ -1072,31 +1141,31 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
         span: Span,
     ) -> Result<ComptimeValue, ComptimeError> {
         match val {
-            ComptimeValue::Value(HirExpr::Literal(lit, _, _)) => {
-                match (op, lit) {
-                    (UnaryOp::Neg, Literal::Int(v)) => {
-                        Ok(ComptimeValue::Value(HirExpr::Literal(Literal::Int(-v), ty, span)))
+            ComptimeValue::Value(hir) => match hir.as_ref() {
+                HirExpr::Literal(lit, _, _) => {
+                    match (op, lit) {
+                        (UnaryOp::Neg, Literal::Int(v)) => {
+                            Ok(ComptimeValue::Value(Arc::new(HirExpr::Literal(Literal::Int(-v), ty, span))))
+                        }
+                        (UnaryOp::Neg, Literal::Float(v)) => {
+                            Ok(ComptimeValue::Value(Arc::new(HirExpr::Literal(Literal::Float(-v), ty, span))))
+                        }
+                        (UnaryOp::Not, Literal::Bool(v)) => {
+                            Ok(ComptimeValue::Value(Arc::new(HirExpr::Literal(Literal::Bool(!v), ty, span))))
+                        }
+                        (UnaryOp::BitNot, Literal::Int(v)) => {
+                            Ok(ComptimeValue::Value(Arc::new(HirExpr::Literal(Literal::Int(!v), ty, span))))
+                        }
+                        _ => Err(ComptimeError::Deferred),
                     }
-                    (UnaryOp::Neg, Literal::Float(v)) => {
-                        Ok(ComptimeValue::Value(HirExpr::Literal(Literal::Float(-v), ty, span)))
-                    }
-                    (UnaryOp::Not, Literal::Bool(v)) => {
-                        Ok(ComptimeValue::Value(HirExpr::Literal(Literal::Bool(!v), ty, span)))
-                    }
-                    (UnaryOp::BitNot, Literal::Int(v)) => {
-                        Ok(ComptimeValue::Value(HirExpr::Literal(Literal::Int(!v), ty, span)))
-                    }
-                    _ => Err(ComptimeError::Deferred),
                 }
-            }
-            ComptimeValue::Value(v) => {
-                Ok(ComptimeValue::Value(HirExpr::UnaryOp {
+                _ => Ok(ComptimeValue::Value(Arc::new(HirExpr::UnaryOp {
                     op,
-                    expr: Box::new(v),
+                    expr: Box::new(HirExpr::clone(hir.as_ref())),
                     ty,
                     span,
-                }))
-            }
+                }))),
+            },
             _ => Err(ComptimeError::Deferred),
         }
     }
