@@ -474,7 +474,7 @@ pub enum TypeModifier {
     NoDefault,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OverflowPolicy {
     Wrap,
     Saturate,

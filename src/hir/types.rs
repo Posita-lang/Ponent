@@ -4,6 +4,8 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::ast::OverflowPolicy;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeId(pub usize);
 
@@ -105,9 +107,11 @@ pub enum TypeData {
     Int {
         bits: u8,
         signed: bool,
+        overflow_policy: OverflowPolicy,
     },
     UInt {
         bits: u8,
+        overflow_policy: OverflowPolicy,
     },
     Float {
         bits: u8,
@@ -486,11 +490,29 @@ impl TypeContext {
     }
 
     pub fn int(&mut self, bits: u8, signed: bool) -> TypeId {
-        self.alloc(TypeData::Int { bits, signed })
+        self.alloc(TypeData::Int { bits, signed, overflow_policy: OverflowPolicy::Trap })
     }
 
     pub fn uint(&mut self, bits: u8) -> TypeId {
-        self.alloc(TypeData::UInt { bits })
+        self.alloc(TypeData::UInt { bits, overflow_policy: OverflowPolicy::Trap })
+    }
+
+    /// Create an Int type with a specific overflow policy.
+    pub fn int_with_overflow(&mut self, bits: u8, signed: bool, policy: OverflowPolicy) -> TypeId {
+        self.alloc(TypeData::Int { bits, signed, overflow_policy: policy })
+    }
+
+    /// Create a UInt type with a specific overflow policy.
+    pub fn uint_with_overflow(&mut self, bits: u8, policy: OverflowPolicy) -> TypeId {
+        self.alloc(TypeData::UInt { bits, overflow_policy: policy })
+    }
+
+    /// Get the overflow policy for an integer type (defaults to Trap for non-integers).
+    pub fn overflow_policy_of(&self, ty: TypeId) -> OverflowPolicy {
+        match self.get(ty) {
+            TypeData::Int { overflow_policy, .. } | TypeData::UInt { overflow_policy, .. } => *overflow_policy,
+            _ => OverflowPolicy::Trap,
+        }
     }
 
     pub fn float(&mut self, bits: u8) -> TypeId {
@@ -2101,10 +2123,12 @@ impl TypeContext {
                 TypeData::Int {
                     bits: b1,
                     signed: s1,
+                    ..
                 },
                 TypeData::Int {
                     bits: b2,
                     signed: s2,
+                    ..
                 },
             ) => *s1 == *s2 && *b1 == *b2,
             (TypeData::Float { bits: b1 }, TypeData::Float { bits: b2 }) => *b1 == *b2,
@@ -2166,8 +2190,8 @@ impl TypeContext {
         let data = self.types[resolved.index()].clone();
         match &*data {
             TypeData::GenericParam { index, .. } => subst.get(*index).copied().unwrap_or(ty),
-            TypeData::Int { bits, signed } => self.int(*bits, *signed),
-            TypeData::UInt { bits } => self.uint(*bits),
+            TypeData::Int { bits, signed, overflow_policy } => self.int_with_overflow(*bits, *signed, *overflow_policy),
+            TypeData::UInt { bits, overflow_policy } => self.uint_with_overflow(*bits, *overflow_policy),
             TypeData::Float { bits } => self.float(*bits),
             TypeData::Bool
             | TypeData::Char
@@ -2579,7 +2603,7 @@ impl TypeContext {
 
     pub fn bits_of_int(&self, ty: TypeId) -> Option<u8> {
         match self.get(ty) {
-            TypeData::Int { bits, .. } | TypeData::UInt { bits } => Some(*bits),
+            TypeData::Int { bits, .. } | TypeData::UInt { bits, .. } => Some(*bits),
             _ => None,
         }
     }
@@ -2779,7 +2803,7 @@ impl TypeContext {
             TypeData::Unit => FiniteExhaustible(1),
             TypeData::Bool => FiniteExhaustible(2),
             TypeData::Char | TypeData::Byte | TypeData::USize => FiniteExhaustible(256),
-            TypeData::Int { bits, .. } | TypeData::UInt { bits } => {
+            TypeData::Int { bits, .. } | TypeData::UInt { bits, .. } => {
                 FiniteExhaustible(1usize.checked_shl(*bits as u32).unwrap_or(usize::MAX))
             }
             TypeData::Float { .. } => InfiniteEnumerable,
@@ -3195,7 +3219,7 @@ impl TypeContext {
         match data {
             TypeData::Int { bits, .. } => Characteristic::FiniteExhaustible(
                 1usize.checked_shl(*bits as u32).unwrap_or(usize::MAX)),
-            TypeData::UInt { bits } => Characteristic::FiniteExhaustible(
+            TypeData::UInt { bits, .. } => Characteristic::FiniteExhaustible(
                 1usize.checked_shl(*bits as u32).unwrap_or(usize::MAX)),
             TypeData::Float { .. } | TypeData::USize => {
                 Characteristic::FiniteExhaustible(usize::MAX)

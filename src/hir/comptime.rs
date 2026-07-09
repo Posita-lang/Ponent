@@ -746,10 +746,10 @@ fn reflect_type_info(&mut self, type_id: TypeId, _span: Span) -> ComptimeValue {
     };
 
     match ctx.get(type_id) {
-        TypeData::Int { bits, signed } => {
+        TypeData::Int { bits, signed, .. } => {
             make_info(vec![str_lit("Int"), int_lit(*bits as i64), bool_lit(*signed)])
         }
-        TypeData::UInt { bits } => {
+        TypeData::UInt { bits, .. } => {
             make_info(vec![str_lit("UInt"), int_lit(*bits as i64)])
         }
         TypeData::Float { bits } => {

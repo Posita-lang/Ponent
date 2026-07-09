@@ -220,8 +220,10 @@ impl Parser {
         }
     }
 
-    /// Skip tokens that are ONLY valid inside a function body (Set, Let, Return,
+    /// Skip tokens that are ONLY valid inside a function body (Return,
     /// While, For, If, etc.) and stop at genuine top-level keywords or EOF.
+    /// Set/Let ARE valid at top level (global variable declarations), so
+    /// they stop the skip (i.e. are NOT swallowed).
     fn skip_to_next_top_level(&mut self) {
         loop {
             match self.peek() {
@@ -236,7 +238,9 @@ impl Parser {
                 | Ok(Token::Extern)
                 | Ok(Token::Comptime)
                 | Ok(Token::Async)
-                | Ok(Token::At) => return,
+                | Ok(Token::At)
+                | Ok(Token::Set)
+                | Ok(Token::Let) => return,
                 Err(()) => return,
                 _ => {
                     self.advance().ok();
@@ -486,11 +490,15 @@ impl Parser {
                     this.parse_impl_block(attributes)
                 }),
             Ok(Token::Constraint) => self.parse_constraint(),
+            Ok(Token::Set) | Ok(Token::Let) => {
+                // Top-level variable declarations (global `set`/`let`).
+                self.parse_variable_def()
+            }
             _ => {
                 let tok = self.advance().ok();
                 let mut diag = Diagnostic::error(format!("unexpected token at top level: {:?}", tok))
                     .with_code_str("E003")
-                    .with_help("only items (`def`, `type`, `trait`, `import`, `edition`, `constraint`, `extern`, `impl`, `comptime`, `async`) are allowed at the top level")
+                    .with_help("only items (`def`, `type`, `trait`, `import`, `edition`, `constraint`, `extern`, `impl`, `comptime`, `async`, `set`, `let`) are allowed at the top level")
                     .with_suggestion("move this token inside a function body, or start a new top-level declaration")
                     .with_span(self.span(),);
                 // "Did you mean?" for common keyword typos (Rust-style)
@@ -502,8 +510,6 @@ impl Parser {
                 if self.cascade_suppressed {
                     // Cascade is already active.  Advance past this token
                     // unconditionally and skip to the next meaningful item.
-                    // Do NOT stop at sync tokens (Set, Let, etc.) — those
-                    // are only valid inside a function body, not at top level.
                     self.skip_to_next_top_level();
                     return Ok(Stmt::Error(Span::new(0, 0)));
                 }

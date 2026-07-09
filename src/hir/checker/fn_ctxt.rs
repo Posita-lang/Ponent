@@ -142,9 +142,32 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             Expr::Ident(name, span) => {
                 // Check the local variable type cache first (set by VariableDef)
                 if let Some(&ty) = self.checker.local_variable_types.get(name) {
+                    // Reading a mutable global outside @trusted is forbidden
+                    if self.checker.mutable_globals.contains(name) && !self.checker.current_function_trusted {
+                        self.checker.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "cannot read mutable global `{}` outside `@trusted` function",
+                                name,
+                            ))
+                            .with_code_str("E040")
+                            .with_span(*span)
+                            .with_help("wrap the function in `@trusted` and add `requires`/`ensures` contracts")
+                        );
+                    }
                     Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
                 } else if let Some(&ty) = self.checker.resolution_map.variable_types.get(name) {
                     // Fall back to the name resolver's pre-resolved types
+                    if self.checker.mutable_globals.contains(name) && !self.checker.current_function_trusted {
+                        self.checker.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "cannot read mutable global `{}` outside `@trusted` function",
+                                name,
+                            ))
+                            .with_code_str("E040")
+                            .with_span(*span)
+                            .with_help("wrap the function in `@trusted` and add `requires`/`ensures` contracts")
+                        );
+                    }
                     self.checker.local_variable_types.insert(name.clone(), ty);
                     Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
                 } else if let Some(binding) = self.checker.symbols.lookup_variable(name, *span) {

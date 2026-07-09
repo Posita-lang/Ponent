@@ -78,6 +78,11 @@ pub struct TypeChecker<'a> {
     /// SCAP-style guarantee chain: tracks outstanding postconditions that must
     /// be discharged on function return (Feng & Shao 2006 §4).
     guarantee_chain: GuaranteeChain,
+    /// Names of mutable global variables (top-level `set mut`).
+    /// These can only be read/written inside `@trusted` functions.
+    mutable_globals: HashSet<String>,
+    /// Whether the current function is annotated `@trusted`.
+    current_function_trusted: bool,
 }
 
 /// Error type for comptime control flow within comptime blocks.
@@ -122,6 +127,8 @@ impl<'a> TypeChecker<'a> {
             local_type_param_cache: HashMap::new(),
             resolution_map,
             guarantee_chain: GuaranteeChain::new(),
+            mutable_globals: HashSet::new(),
+            current_function_trusted: false,
         };
         // Pre-populate from the name resolver's results
         for (name, ty) in &checker.resolution_map.variable_types {
@@ -135,6 +142,14 @@ impl<'a> TypeChecker<'a> {
     /// Find the innermost continue tawget (onwy Woop, Whiwe, Fow) ☆ﾟ.*･｡ﾟ
     pub fn check_program(&mut self, program: &Program) -> Result<HirProgram, DiagnosticCollector> {
         let mut items = Vec::new();
+
+        // Wrap the entire program in an inference scope so that
+        // top‑level statements (variable defs, expression stmts, etc.)
+        // also have their Eq/Impl/Match constraints solved and finalized.
+        // Previously the solver only ran inside function bodies via
+        // enter_inference_scope in check_stmt(FunctionDef).
+        self.enter_inference_scope();
+
         for stmt in &program.items {
             match self.check_stmt(stmt) {
                 Ok(hir) => items.push(hir),
@@ -143,6 +158,13 @@ impl<'a> TypeChecker<'a> {
                     items.push(HirStmt::Error);
                 }
             }
+        }
+
+        // Solve all queued constraints, finalize inference variables,
+        // and commit the transaction. On failure the transaction is
+        // rolled back and diagnostics are already collected.
+        if let Err(diags) = self.exit_inference_scope() {
+            return Err(diags);
         }
 
         if self.diagnostics.has_errors() {
@@ -269,6 +291,14 @@ impl<'a> TypeChecker<'a> {
                     self.local_variable_types.insert(var_name.clone(), final_ty);
                 }
 
+                // Track mutable global variables (top-level `set mut`).
+                // These require `@trusted` context to be read/written.
+                if *mutable && self.current_function.is_none() {
+                    if let Some(var_name) = name {
+                        self.mutable_globals.insert(var_name.clone());
+                    }
+                }
+
                 // `set auto<T> = expr` — bind captured type names to the inferred type.
                 // Each name in `type_captures` becomes available as a type alias in
                 // comptime reflection (e.g., `@typeInfo!(T)`).
@@ -346,6 +376,8 @@ impl<'a> TypeChecker<'a> {
 
                 let guard = ScopeGuard::new(self);
                 guard.checker.current_function = Some(DefId(0));
+                guard.checker.current_function_trusted =
+                    attributes.iter().any(|a| a.name == "trusted");
                 guard.checker.current_return_type = Some(return_ty);
                 guard.checker.enter_inference_scope();
                 guard.checker.push_ctx(CtxKind::Function, *span, None);
@@ -871,6 +903,20 @@ impl<'a> TypeChecker<'a> {
                         Diagnostic::error("invalid left-hand side for assignment; expected variable, field access, or index")
                             .with_span(*span)
                     );
+                }
+                // Check that mutable globals are only assigned inside @trusted functions
+                if let Expr::Ident(name, _) = target.as_ref() {
+                    if self.mutable_globals.contains(name) && !self.current_function_trusted {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "cannot assign to mutable global `{}` outside `@trusted` function",
+                                name,
+                            ))
+                            .with_code_str("E040")
+                            .with_span(*span)
+                            .with_help("wrap the function in `@trusted` and add `requires`/`ensures` contracts")
+                        );
+                    }
                 }
                 let (target_hir, target_ty) = self.infer_expr(target)?;
                 let value_hir = if let Some(op) = op {

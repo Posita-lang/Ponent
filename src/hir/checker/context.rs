@@ -6,6 +6,7 @@ pub(crate) struct ScopeGuard<'a, 'tcx> {
     pub(crate) checker: &'tcx mut TypeChecker<'a>,
     pub(crate) old_function: Option<DefId>,
     pub(crate) old_return: Option<TypeId>,
+    pub(crate) old_trusted: bool,
     pub(crate) should_restore: bool,
 }
 
@@ -13,10 +14,12 @@ impl<'a, 'tcx> ScopeGuard<'a, 'tcx> {
     pub(crate) fn new(checker: &'tcx mut TypeChecker<'a>) -> Self {
         let old_function = checker.current_function;
         let old_return = checker.current_return_type;
+        let old_trusted = checker.current_function_trusted;
         ScopeGuard {
             checker,
             old_function,
             old_return,
+            old_trusted,
             should_restore: true,
         }
     }
@@ -31,6 +34,7 @@ impl<'a, 'tcx> Drop for ScopeGuard<'a, 'tcx> {
         if self.should_restore {
             self.checker.current_function = self.old_function;
             self.checker.current_return_type = self.old_return;
+            self.checker.current_function_trusted = self.old_trusted;
             self.checker.exit_inference_scope().ok();
         }
     }
