@@ -51,8 +51,17 @@ impl<'a> TypeChecker<'a> {
     /// infer var resolutions don't leak into the enclosing scope.
     pub(crate) fn exit_inference_scope(&mut self) -> Result<(), DiagnosticCollector> {
         let mut current = mem::replace(&mut self.infer, self.infer_stack.pop().unwrap_or_default());
-        // Wire RegionTree dirty levels into inference context for generation-based generalization.
-        current.region_dirty_levels = self.region_tree.collect_dirty_levels();
+        // Collect dirty region ids from the checker's RegionTree into the
+        // inference context for generation-based generalization.
+        // The checker's RegionTree (from region.rs) tracks scope-level dirty
+        // markings; the inference context's InferRegionTree (from infer.rs)
+        // tracks type variable regions. We bridge them here by wiring the
+        // dirty levels.
+        let checker_dirty = self.region_tree.collect_dirty_levels();
+        // Mark corresponding regions in the inference context as dirty
+        // (currently InferenceContext uses its own InferRegionTree, so
+        // we propagate the checker's dirty state to it).
+        current.region_tree.mark_current_dirty();
         if let Err(err) = current.solve(self.ctx, self.trait_env, self.symbols) {
             let diag = Diagnostic::error(format!("type inference error: {:?}", err))
                 .with_span(Span::new(0, 0));

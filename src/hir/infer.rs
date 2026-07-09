@@ -9,6 +9,142 @@ use crate::hir::types::*;
 use rustc_hash::FxHashMap as HashMap;
 use std::collections::BinaryHeap;
 
+/// ── Inline GuardSet (ported from OmniML guard_set.ml) ───────────
+
+/// Reference-counted guard set for tracking when inference variables
+/// are captured by suspended constraints (OmniML §6).
+#[derive(Debug, Clone)]
+pub struct GuardSet {
+    pub direct_guards: usize,
+    pub transitive_guards: HashMap<usize, usize>,
+}
+
+impl Default for GuardSet {
+    fn default() -> Self { Self::empty() }
+}
+
+impl GuardSet {
+    pub fn empty() -> Self { GuardSet { direct_guards: 0, transitive_guards: HashMap::default() } }
+    pub fn is_empty(&self) -> bool { self.direct_guards == 0 && self.transitive_guards.is_empty() }
+    pub fn add_guard(&mut self) { self.direct_guards = self.direct_guards.wrapping_add(1); }
+    pub fn remove_guard(&mut self) { if self.direct_guards > 0 { self.direct_guards -= 1; } }
+    pub fn add_transitive_guard(&mut self, region_id: usize) { *self.transitive_guards.entry(region_id).or_insert(0) += 1; }
+    pub fn remove_transitive_guard(&mut self, region_id: usize) {
+        if let Some(count) = self.transitive_guards.get_mut(&region_id) {
+            debug_assert!(*count > 0); *count -= 1;
+            if *count == 0 { self.transitive_guards.remove(&region_id); }
+        }
+    }
+    pub fn clear_transitive_guard(&mut self, region_id: usize) { self.transitive_guards.remove(&region_id); }
+    pub fn is_transitively_guarded(&self, region_id: usize) -> bool {
+        self.transitive_guards.get(&region_id).map_or(false, |&c| c > 0)
+    }
+    pub fn union(&self, other: &Self) -> Self {
+        let mut transitive = self.transitive_guards.clone();
+        for (&region, &count) in &other.transitive_guards { *transitive.entry(region).or_insert(0) += count; }
+        GuardSet { direct_guards: self.direct_guards + other.direct_guards, transitive_guards: transitive }
+    }
+    pub fn clear(&mut self) { self.direct_guards = 0; self.transitive_guards.clear(); }
+}
+
+/// ── Inline InferRegionTree (ported from OmniML tree.ml + generalization.ml InferPool) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InferRegionId(pub usize);
+
+#[derive(Debug, Clone)]
+pub struct InferPool {
+    pub var_ids: Vec<usize>,
+    pub rigid_var_ids: Vec<usize>,
+}
+
+impl InferPool {
+    pub fn new() -> Self { InferPool { var_ids: Vec::new(), rigid_var_ids: Vec::new() } }
+    pub fn register_var(&mut self, var_id: usize) { self.var_ids.push(var_id); }
+    pub fn register_rigid_var(&mut self, var_id: usize) { self.rigid_var_ids.push(var_id); }
+    pub fn is_alive(&self) -> bool { !self.var_ids.is_empty() }
+}
+
+#[derive(Debug, Clone)]
+pub struct InferRegionNode {
+    pub id: InferRegionId,
+    pub level: usize,
+    pub parent: Option<InferRegionId>,
+    pub children: Vec<InferRegionId>,
+    pub pool: InferPool,
+    pub dirty: bool,
+    pub dirty_children: Vec<InferRegionId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InferRegionTree {
+    pub nodes: Vec<InferRegionNode>,
+    pub root: InferRegionId,
+    pub current: InferRegionId,
+}
+
+impl InferRegionTree {
+    pub fn new() -> Self {
+        InferRegionTree {
+            nodes: vec![InferRegionNode { id: InferRegionId(0), level: 0, parent: None, children: Vec::new(), pool: InferPool::new(), dirty: false, dirty_children: Vec::new() }],
+            root: InferRegionId(0), current: InferRegionId(0),
+        }
+    }
+    pub fn enter_region(&mut self) -> InferRegionId {
+        let new_id = InferRegionId(self.nodes.len());
+        let current_level = self.nodes[self.current.0].level;
+        self.nodes.push(InferRegionNode { id: new_id, level: current_level + 1, parent: Some(self.current), children: Vec::new(), pool: InferPool::new(), dirty: false, dirty_children: Vec::new() });
+        self.nodes[self.current.0].children.push(new_id);
+        let old = self.current;
+        self.current = new_id;
+        old
+    }
+    pub fn exit_region(&mut self) { if let Some(parent) = self.nodes[self.current.0].parent { self.current = parent; } }
+    pub fn get_level(&self, region_id: InferRegionId) -> usize { self.nodes[region_id.0].level }
+    pub fn nearest_common_ancestor(&self, a: InferRegionId, b: InferRegionId) -> InferRegionId {
+        if a == b { return a; }
+        let a_node = &self.nodes[a.0]; let b_node = &self.nodes[b.0];
+        if a_node.level < b_node.level { self.nearest_common_ancestor(a, self.nodes[b.0].parent.expect("parent"))
+        } else if a_node.level > b_node.level { self.nearest_common_ancestor(self.nodes[a.0].parent.expect("parent"), b)
+        } else { self.nearest_common_ancestor(self.nodes[a.0].parent.expect("parent"), self.nodes[b.0].parent.expect("parent")) }
+    }
+    pub fn is_ancestor(&self, ancestor: InferRegionId, node: InferRegionId) -> bool { self.nearest_common_ancestor(ancestor, node) == ancestor }
+    pub fn mark_dirty(&mut self, region_id: InferRegionId) {
+        let node = &mut self.nodes[region_id.0];
+        if node.dirty { return; }
+        node.dirty = true;
+        let mut current = node.parent;
+        while let Some(pid) = current {
+            let parent = &mut self.nodes[pid.0];
+            if parent.dirty { if !parent.dirty_children.contains(&region_id) { parent.dirty_children.push(region_id); } return; }
+            current = parent.parent;
+        }
+    }
+    pub fn mark_current_dirty(&mut self) { self.mark_dirty(self.current); }
+    pub fn register_var(&mut self, var_id: usize) { self.nodes[self.current.0].pool.register_var(var_id); }
+    pub fn register_rigid_var(&mut self, var_id: usize) { self.nodes[self.current.0].pool.register_rigid_var(var_id); }
+    pub fn register_var_in_region(&mut self, var_id: usize, region_id: InferRegionId) {
+        self.nodes[region_id.0].pool.register_var(var_id);
+    }
+    pub fn unregister_var(&mut self, var_id: usize, region_id: InferRegionId) {
+        self.nodes[region_id.0].pool.var_ids.retain(|&v| v != var_id);
+    }
+    pub fn collect_dirty_ids(&self) -> Vec<InferRegionId> { self.nodes.iter().filter(|n| n.dirty).map(|n| n.id).collect() }
+    pub fn collect_alive_ids(&self) -> Vec<InferRegionId> { self.nodes.iter().filter(|n| n.pool.is_alive()).map(|n| n.id).collect() }
+
+    pub fn drain_dirty<F>(&mut self, node_id: InferRegionId, f: &mut F) where F: FnMut(InferRegionId, &mut Self) {
+        if !self.nodes[node_id.0].dirty { return; }
+        let children: Vec<InferRegionId> = self.nodes[node_id.0].dirty_children.clone();
+        for child_id in children { self.drain_dirty(child_id, f); }
+        f(node_id, self);
+        if self.nodes[node_id.0].dirty_children.is_empty() {
+            self.nodes[node_id.0].dirty = false;
+            if let Some(parent_id) = self.nodes[node_id.0].parent { self.nodes[parent_id.0].dirty_children.retain(|&c| c != node_id); }
+        }
+    }
+    pub fn drain_dirty_roots<F>(&mut self, f: &mut F) where F: FnMut(InferRegionId, &mut Self) { self.drain_dirty(self.root, f); }
+}
+
 /// Priority wrapper for constraints, enabling BinaryHeap-based sorting.
 /// Constraints are processed in order of "determinism":
 ///   Priority 0: Eq(concrete, concrete) — both sides fully resolved
@@ -95,16 +231,17 @@ pub enum PrincipalShape {
 pub struct TypeVar {
     pub id: usize,
     pub kind: TypeVariableKind,
-    /// Generalization state for let-polymorphism (OmniML-inspired).
     pub gen_state: GenState,
-    /// Principal shape (OmniML): tracks what shape this variable has
-    /// been determined to be, enabling shape-based constraint suspension.
     pub shape: PrincipalShape,
-    /// Level of this type variable (Fan, Xu & Xie 2025 §4).
-    /// Lower levels are "outer" scopes; higher levels are "inner" scopes.
-    /// Variables at level n+1 inside a let can be generalized.
-    /// Promotion adjusts levels when unifying variables at different levels.
-    pub level: usize,
+    pub region_id: InferRegionId,
+}
+
+impl TypeVar {
+    /// Backward-compatible level accessor — resolves level from the region tree.
+    /// Used by legacy code that hasn't been migrated to the region tree yet.
+    pub fn get_level(&self, tree: &InferRegionTree) -> usize {
+        tree.get_level(self.region_id)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -246,12 +383,11 @@ pub struct InferenceContext {
     var_type_ids: Vec<TypeId>,
     constraints: Vec<Constraint>,
     next_var_id: usize,
-    /// Current typing level (Fan, Xu & Xie 2025 §4).
-    /// Incremented on entering let/forall/region scope.
-    /// Variables at level > current_level can be generalized.
-    /// Skolem escape check: a var at higher level cannot be bound
-    /// to a concrete type at lower level without promotion.
-    pub current_level: usize,
+    /// Region tree replacing the linear level system (OmniML §6).
+    /// Tracks nested scopes as a tree with dirty-marking for efficient
+    /// incremental generalization. When PG variables keep a region alive,
+    /// sibling regions at equivalent depths remain correctly distinguished.
+    pub region_tree: InferRegionTree,
     /// Per-variable lower bounds (subtypes that must be ≤ this variable).
     /// lower_bounds[i] contains TypeIds that must be subtypes of variable i.
     lower_bounds: Vec<Vec<TypeId>>,
@@ -262,11 +398,12 @@ pub struct InferenceContext {
     /// When the var is bound (unified with a concrete type), these constraints
     /// are woken and reprocessed, enabling bidirectional type information flow.
     wait_lists: Vec<Vec<Constraint>>,
-    /// Guard sets (OmniML §6): for each InferVar, which constraints (by index)
-    /// reference it in a suspended match.  A non-empty guard set means the
-    /// variable is PG (PartiallyGeneralizable).  When all guards are discharged,
-    /// the variable can become G (Generalized).
-    guard_sets: Vec<Vec<usize>>,
+    /// Guard sets (OmniML §6): reference-counted guards tracking whether a
+    /// variable is captured by suspended constraints. A non-empty guard set
+    /// means the variable is PG (PartiallyGeneralizable). When all guards are
+    /// discharged, the variable can become G (Generalized).
+    /// Uses GuardSet with direct_guards and per-region transitive_guards.
+    guard_sets: Vec<GuardSet>,
     /// Per-variable generalisation status (I / G / PG / PI).
     gen_statuses: Vec<GenStatus>,
     /// Shape variable context (OmniML §3.3, §6).
@@ -289,8 +426,6 @@ pub struct InferenceContext {
     /// Tracks which InferVar ids have been unified since the last
     /// `force_generalize` call, enabling incremental processing.
     dirty_set: std::collections::HashSet<usize>,
-    /// Dirty region levels from TypeChecker's RegionTree.
-    pub region_dirty_levels: Vec<usize>,
     /// Per-InferenceContext resolution table (TypeOrVar pattern).
     resolutions: Vec<Option<TypeId>>,
     /// Local bindings for GenericParam indices during instantiation.
@@ -318,7 +453,7 @@ impl InferenceContext {
             var_type_ids: Vec::new(),
             constraints: Vec::new(),
             next_var_id: 0,
-            current_level: 0,
+            region_tree: InferRegionTree::new(),
             lower_bounds: Vec::new(),
             upper_bounds: Vec::new(),
             wait_lists: Vec::new(),
@@ -329,7 +464,6 @@ impl InferenceContext {
             forward_refs: Vec::new(),
             reverse_refs: Vec::new(),
             dirty_set: std::collections::HashSet::new(),
-            region_dirty_levels: Vec::new(),
             resolutions: Vec::new(),
             generic_param_bindings: HashMap::default(),
         }
@@ -342,14 +476,17 @@ impl InferenceContext {
         if id >= self.resolutions.len() {
             self.resolutions.resize(id + 1, None);
         }
+        let region_id = self.region_tree.current;
         self.type_vars.push(TypeVar {
             id,
             kind,
             gen_state: GenState::Ungeneralized,
             shape: PrincipalShape::Unknown,
-            level: self.current_level,
+            region_id,
         });
         self.var_type_ids.push(ty_id);
+        // Register the variable in the current region's pool
+        self.region_tree.register_var(id);
         // Grow bounds vectors to match the new variable id
         while self.lower_bounds.len() <= id {
             self.lower_bounds.push(Vec::new());
@@ -361,7 +498,7 @@ impl InferenceContext {
             self.wait_lists.push(Vec::new());
         }
         while self.guard_sets.len() <= id {
-            self.guard_sets.push(Vec::new());
+            self.guard_sets.push(GuardSet::empty());
         }
         while self.gen_statuses.len() <= id {
             self.gen_statuses.push(GenStatus::Ungeneralized);
@@ -458,52 +595,54 @@ impl InferenceContext {
             .map(|tv| tv.kind)
     }
 
-    /// Get the level of a type variable by its id.
+    /// Get the region level of a type variable by its id.
     pub fn get_var_level(&self, id: usize) -> Option<usize> {
         self.type_vars
             .iter()
             .find(|tv| tv.id == id)
-            .map(|tv| tv.level)
+            .map(|tv| self.region_tree.get_level(tv.region_id))
     }
 
     /// Enter a deeper typing scope (let/forall/region).
-    /// All new variables created within this scope will have the new level.
-    /// Returns the previous level so caller can restore it.
-    pub fn enter_level(&mut self) -> usize {
-        let prev = self.current_level;
-        self.current_level += 1;
-        prev
+    /// Creates a new child region in the region tree.
+    /// Returns the previous InferRegionId so caller can restore it.
+    pub fn enter_level(&mut self) -> InferRegionId {
+        self.region_tree.enter_region()
     }
 
-    /// Exit the current typing scope, restoring the previous level.
-    pub fn exit_level(&mut self, prev_level: usize) {
-        self.current_level = prev_level;
+    /// Exit the current typing scope, restoring the previous region.
+    pub fn exit_level(&mut self, prev_region: InferRegionId) {
+        self.region_tree.current = prev_region;
     }
 
-    /// Try to promote a variable at `from_level` to `target_level`
-    /// by creating a new variable at the target level and unifying.
-    /// Returns true if promotion succeeded.
-    /// This implements the level-based promotion mechanism from
-    /// Fan, Xu & Xie 2025 §6 (rule PR-UVARPR).
+    /// Try to promote a variable to the target region's scope
+    /// by creating a new variable at the target region and unifying.
+    /// Uses the region tree's ancestor check (OmniML §6 PR-UVARPR).
     pub fn try_promote_var(
         &mut self,
         ctx: &mut TypeContext,
         var_id: usize,
-        target_level: usize,
+        target_region: InferRegionId,
     ) -> Option<TypeId> {
-        let var_level = self.get_var_level(var_id)?;
-        if var_level <= target_level {
-            // No promotion needed — the var is already at an appropriate level
+        let var_region = self.type_vars.get(var_id)?.region_id;
+
+        // If the variable's region is already an ancestor of (or equal to)
+        // the target region, it is already at an outer/equal scope — no
+        // promotion needed. Otherwise the variable is deeper and needs
+        // promotion to the target region.
+        if self.region_tree.is_ancestor(var_region, target_region) || var_region == target_region {
             return Some(self.var_type_ids[var_id]);
         }
-        // Create a new variable at the target level
+        // Promotion needed: create a new variable at the target region.
+        // `new_type_var` registers the var in the *current* region's pool,
+        // but we need it in the target (outer) region's pool. We unregister
+        // from the current pool and re-register in the target pool.
         let new_ty_id = self.new_type_var(ctx, TypeVariableKind::Any);
-        // Find the new var's id (it's the last pushed)
         let new_id = self.next_var_id - 1;
-        // new_type_var maintains the invariant type_vars[i].id == i,
-        // so direct indexing is safe and avoids the borrow conflict
-        // between iter_mut().find() and type_vars[var_id].
-        self.type_vars[new_id].level = target_level;
+        let current_region = self.region_tree.current;
+        self.region_tree.unregister_var(new_id, current_region);
+        self.region_tree.register_var_in_region(new_id, target_region);
+        self.type_vars[new_id].region_id = target_region;
         if var_id < self.type_vars.len() {
             self.type_vars[new_id].shape = self.type_vars[var_id].shape;
             self.type_vars[new_id].gen_state = self.type_vars[var_id].gen_state;
@@ -522,7 +661,7 @@ impl InferenceContext {
         }
         if var_id < self.guard_sets.len() && new_id < self.guard_sets.len() {
             let old_guards = std::mem::take(&mut self.guard_sets[var_id]);
-            self.guard_sets[new_id].extend(old_guards);
+            self.guard_sets[new_id] = self.guard_sets[new_id].union(&old_guards);
         }
         if var_id < self.gen_statuses.len() && new_id < self.gen_statuses.len() {
             let old_status = self.gen_statuses[var_id];
@@ -593,10 +732,8 @@ impl InferenceContext {
             }
             // Add a guard: the variable is now blocked until this constraint
             // is woken and processed.  This is essential for the PG→G lifecycle
-            // (OmniML §6).  Use the wait-list index (before push) as the guard
-            // id so it can be cleared in bulk by wake_var_incremental.
-            let guard_id = self.wait_lists[var_id].len().wrapping_sub(1);
-            self.add_guard(var_id, guard_id);
+            // (OmniML §6).  Uses the reference-counted GuardSet.
+            self.add_guard(var_id);
         } else {
             self.constraints.push(c);
         }
@@ -1153,9 +1290,18 @@ impl InferenceContext {
         // ── Fallback: level-based heuristic ───────────────────────
         // When Z3 is unavailable or the query times out, use the
         // conservative level-based approximation.
-        let var_level = self.type_vars[var_id].level;
-        if var_level > 0 && var_level > self.current_level {
-            self.type_vars[var_id].level = var_level - 1;
+        let var_region = self.type_vars[var_id].region_id;
+        let var_level = self.region_tree.get_level(var_region);
+        let cur_region = self.region_tree.current;
+        let cur_level = self.region_tree.get_level(cur_region);
+        if var_level > 0 && var_level > cur_level {
+            // Move the variable from its current region's pool to the root pool
+            // before updating region_id, keeping the pool and the field consistent.
+            let root_id = self.region_tree.root;
+            let old_region = self.type_vars[var_id].region_id;
+            self.region_tree.unregister_var(var_id, old_region);
+            self.type_vars[var_id].region_id = root_id;
+            self.region_tree.register_var_in_region(var_id, root_id);
             self.gen_statuses[var_id] = GenStatus::Ungeneralized;
             return true;
         }
@@ -1183,54 +1329,30 @@ impl InferenceContext {
         dirty_levels: &[usize],
         target_var: Option<usize>,
     ) {
-        // Collect PG variables from dirty_set or dirty_levels.
+        // Collect PG variables from dirty_set or region levels.
         let dirty: Vec<usize> = if let Some(tv) = target_var {
-            // Targeted: only process the region containing `tv`.
-            let level = self.type_vars.get(tv).map(|v| v.level).unwrap_or(0);
+            let region = self.type_vars.get(tv).map(|v| v.region_id).unwrap_or(self.region_tree.root);
             (0..self.gen_statuses.len())
                 .filter(|i| {
                     self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable)
-                        && self
-                            .type_vars
-                            .get(*i)
-                            .map(|v| v.level == level)
-                            .unwrap_or(false)
+                        && self.type_vars.get(*i).map(|v| v.region_id == region).unwrap_or(false)
                 })
                 .collect()
         } else if !self.dirty_set.is_empty() {
-            self.dirty_set
-                .iter()
-                .copied()
+            self.dirty_set.iter().copied()
                 .filter(|i| self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable))
                 .collect()
-        } else if !self.region_dirty_levels.is_empty() {
-            let dl: std::collections::HashSet<usize> =
-                self.region_dirty_levels.iter().copied().collect();
-            (0..self.gen_statuses.len())
-                .filter(|i| {
-                    self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable)
-                        && self
-                            .type_vars
-                            .get(*i)
-                            .map(|v| dl.contains(&v.level))
-                            .unwrap_or(false)
-                })
-                .collect()
         } else if !dirty_levels.is_empty() {
-            // Use provided dirty levels (from RegionTree).
-            let dl: std::collections::HashSet<usize> = dirty_levels.iter().copied().collect();
+            let parent_levels: std::collections::HashSet<usize> = dirty_levels.iter().copied().collect();
             (0..self.gen_statuses.len())
                 .filter(|i| {
                     self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable)
-                        && self
-                            .type_vars
-                            .get(*i)
-                            .map(|v| dl.contains(&v.level))
+                        && self.type_vars.get(*i)
+                            .map(|v| parent_levels.contains(&self.region_tree.get_level(v.region_id)))
                             .unwrap_or(false)
                 })
                 .collect()
         } else {
-            // Fallback: process all PG variables.
             (0..self.gen_statuses.len())
                 .filter(|i| self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable))
                 .collect()
@@ -1243,7 +1365,7 @@ impl InferenceContext {
         // Ensure guard_sets consistency.
         for &i in &dirty {
             while self.guard_sets.len() <= i {
-                self.guard_sets.push(Vec::new());
+                self.guard_sets.push(GuardSet::empty());
             }
         }
 
@@ -1271,11 +1393,12 @@ impl InferenceContext {
         // Process innermost-first (highest level first = most nested first).
         let mut vars_by_level: Vec<(usize, usize)> = dirty
             .iter()
-            .map(|&i| (i, self.type_vars.get(i).map(|v| v.level).unwrap_or(0)))
+            .map(|&i| (i, self.type_vars.get(i).map(|v| self.region_tree.get_level(v.region_id)).unwrap_or(0)))
             .collect();
         vars_by_level.sort_by(|a, b| b.1.cmp(&a.1));
 
         // Rigid scope check per generation.
+        let cur_level = self.region_tree.get_level(self.region_tree.current);
         for &(i, level) in &vars_by_level {
             if i >= self.var_type_ids.len() {
                 continue;
@@ -1284,7 +1407,7 @@ impl InferenceContext {
             if matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
                 continue;
             }
-            if level < self.current_level {
+            if level < cur_level {
                 if Self::check_rigid_escape(ctx, resolved, level) {
                     continue;
                 }
@@ -1439,30 +1562,24 @@ impl InferenceContext {
     }
 
     /// Mark a variable as guarded by a suspended constraint.
-    /// Adds `constraint_idx` to the variable's guard set and sets status to PG.
-    pub fn add_guard(&mut self, var_id: usize, constraint_idx: usize) {
+    /// Increments the reference-counted guard on the variable.
+    pub fn add_guard(&mut self, var_id: usize) {
         while self.guard_sets.len() <= var_id {
-            self.guard_sets.push(Vec::new());
+            self.guard_sets.push(GuardSet::empty());
         }
-        let guards = &mut self.guard_sets[var_id];
-        if !guards.contains(&constraint_idx) {
-            guards.push(constraint_idx);
-            if var_id < self.gen_statuses.len() {
-                self.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
-            }
+        self.guard_sets[var_id].add_guard();
+        if var_id < self.gen_statuses.len() {
+            self.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
         }
     }
 
     /// Remove a guard from a variable when its suspended constraint is discharged.
-    /// If no guards remain, the variable can be re-generalised.
-    pub fn remove_guard(&mut self, var_id: usize, constraint_idx: usize) {
+    /// Decrements the reference count. If no guards remain, the variable can be
+    /// re-generalised (PG → G transition, OmniML §6).
+    pub fn remove_guard(&mut self, var_id: usize) {
         if var_id < self.guard_sets.len() {
-            let guards = &mut self.guard_sets[var_id];
-            guards.retain(|&g| g != constraint_idx);
-            if guards.is_empty() && var_id < self.gen_statuses.len() {
-                // All guards discharged — the variable can become Generalized (G)
-                // if it was previously PG.  If it was PI, it stays PI until
-                // re-unified.
+            self.guard_sets[var_id].remove_guard();
+            if self.guard_sets[var_id].is_empty() && var_id < self.gen_statuses.len() {
                 if self.gen_statuses[var_id] == GenStatus::PartiallyGeneralizable {
                     self.gen_statuses[var_id] = GenStatus::Generalized;
                 }
@@ -1531,26 +1648,65 @@ impl InferenceContext {
                         };
 
                         // Level-based promotion (Fan, Xu & Xie 2025 §6.2):
-                        // If unifying two InferVars at different levels, promote
-                        // the higher-level one to the lower level before unifying.
+                        // If unifying two InferVars at different regions, promote
+                        // the deeper variable to the nearest common ancestor (NCA)
+                        // of both regions before unifying.  Using the NCA guarantees
+                        // the promoted variable lives in a scope that is accessible
+                        // from both original branches — critical when the two
+                        // variables live in sibling branches, not just on the same
+                        // ancestor-descendant line.
                         if let (Some(avid), Some(bvid)) = (a_var_id, b_var_id) {
-                            let a_lvl = self.get_var_level(avid).unwrap_or(0);
-                            let b_lvl = self.get_var_level(bvid).unwrap_or(0);
+                            let a_region = self.type_vars[avid].region_id;
+                            let b_region = self.type_vars[bvid].region_id;
+                            let a_lvl = self.region_tree.get_level(a_region);
+                            let b_lvl = self.region_tree.get_level(b_region);
+                            let nca = self.region_tree.nearest_common_ancestor(a_region, b_region);
+                            debug_assert!(
+                                self.region_tree.is_ancestor(nca, a_region) && self.region_tree.is_ancestor(nca, b_region),
+                                "NCA must be an ancestor of both regions",
+                            );
                             if a_lvl > b_lvl {
-                                if let Some(promoted) = self.try_promote_var(ctx, avid, b_lvl) {
+                                // a is deeper — promote a to NCA
+                                if let Some(promoted) = self.try_promote_var(ctx, avid, nca) {
                                     self.unify_and_track(promoted, *b, ctx)?;
-                                    // Continue with wake-up below
                                 } else {
                                     self.unify_and_track(*a, *b, ctx)?;
                                 }
                             } else if b_lvl > a_lvl {
-                                if let Some(promoted) = self.try_promote_var(ctx, bvid, a_lvl) {
+                                // b is deeper — promote b to NCA
+                                if let Some(promoted) = self.try_promote_var(ctx, bvid, nca) {
                                     self.unify_and_track(*a, promoted, ctx)?;
                                 } else {
                                     self.unify_and_track(*a, *b, ctx)?;
                                 }
                             } else {
-                                self.unify_and_track(*a, *b, ctx)?;
+                                // Same level — NCA handles the sibling / ancestor / equal cases.
+                                // If NCA equals one of the regions, one region is an ancestor
+                                // of the other (same level still possible via grandparent-child
+                                // through different paths?  No — same level with one ancestor of
+                                // the other implies they are the same node.)  Otherwise the
+                                // regions are siblings: promote the shallower-rooted variable
+                                // (the one whose region is deeper in the NCA's subtree).
+                                if nca == a_region && nca == b_region {
+                                    // Same region — no promotion needed.
+                                    self.unify_and_track(*a, *b, ctx)?;
+                                } else if self.region_tree.is_ancestor(a_region, b_region) {
+                                    // a_region is ancestor of b_region *at the same level* —
+                                    // this is actually impossible (ancestor at same level == same node),
+                                    // but handle defensively.
+                                    self.unify_and_track(*a, *b, ctx)?;
+                                } else if self.region_tree.is_ancestor(b_region, a_region) {
+                                    // Same as above but swapped — defensive only.
+                                    self.unify_and_track(*a, *b, ctx)?;
+                                } else {
+                                    // Sibling regions at the same level: promote both to NCA,
+                                    // then unify the promoted copies.
+                                    let a_promoted = self.try_promote_var(ctx, avid, nca)
+                                        .unwrap_or(*a);
+                                    let b_promoted = self.try_promote_var(ctx, bvid, nca)
+                                        .unwrap_or(*b);
+                                    self.unify_and_track(a_promoted, b_promoted, ctx)?;
+                                }
                             }
                         } else {
                             self.unify_and_track(*a, *b, ctx)?;
@@ -2523,9 +2679,9 @@ mod tests {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
         let prev = infer.enter_level();
-        assert!(infer.current_level > 0);
+        assert!(infer.region_tree.get_level(infer.region_tree.current) > 0);
         infer.exit_level(prev);
-        assert_eq!(infer.current_level, 0);
+        assert_eq!(infer.region_tree.get_level(infer.region_tree.current), 0);
     }
 
     #[test]
@@ -2735,7 +2891,7 @@ mod tests {
         if var_id < infer.gen_statuses.len() {
             infer.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
         }
-        infer.add_guard(var_id, 0);
+        infer.add_guard(var_id);
 
         infer.force_generalize(&mut ctx);
         assert_eq!(
@@ -3060,7 +3216,7 @@ mod tests {
         assert!(deep_level > 0, "var should be at a deep level");
 
         // Promote to level 0
-        let promoted = infer.try_promote_var(&mut ctx, var_id, 0);
+        let promoted = infer.try_promote_var(&mut ctx, var_id, InferRegionId(0));
         assert!(promoted.is_some(), "promotion should succeed");
         // The old var should now be bound to the promoted var (via infer.resolve)
         let resolved = infer.resolve(var, &ctx);
@@ -3081,7 +3237,7 @@ mod tests {
             _ => unreachable!(),
         };
         // Try to promote to level 0 — no-op since already at level 0
-        let promoted = infer.try_promote_var(&mut ctx, var_id, 0);
+        let promoted = infer.try_promote_var(&mut ctx, var_id, InferRegionId(0));
         assert!(promoted.is_some(), "should return the existing var");
         let resolved = ctx.resolve_binding(var);
         assert!(
@@ -3154,7 +3310,7 @@ mod tests {
         }
 
         // ── Promote the variable ──────────────────────────────────
-        let promoted = infer.try_promote_var(&mut ctx, var_id, 0);
+        let promoted = infer.try_promote_var(&mut ctx, var_id, InferRegionId(0));
         assert!(promoted.is_some(), "promotion should succeed");
 
         // The promoted TypeId corresponds to the new variable
@@ -3578,6 +3734,124 @@ mod tests {
             infer.gen_statuses[x_id],
             GenStatus::Generalized,
             "resolved PG var at inner scope should generalize"
+        );
+    }
+
+    #[test]
+    fn test_solve_cross_branch_nca_promotion() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let symbols = SymbolTable::new(crate::hir::types::CrateId(DefId(0)));
+        let trait_env = TraitEnv::new();
+
+        // Create a tree: root → branch_A → leaf_A1 (a_deep)
+        //                  └─ branch_B → leaf_B1 (b_deep)
+        // Variables in leaf_A1 and leaf_B1 are siblings, not ancestors.
+        // Without NCA-based promotion, unifying them would place the
+        // promoted variable in the WRONG branch, breaking scoping.
+        let _r0 = infer.enter_level(); // → branch_A
+        let _r1 = infer.enter_level(); // → leaf_A1
+        let a_deep = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let a_deep_id = match ctx.get(a_deep) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        infer.exit_level(_r1); // back to branch_A
+        infer.exit_level(_r0); // back to root
+
+        // Now enter branch_B → leaf_B1
+        let _r2 = infer.enter_level(); // → branch_B
+        let _r3 = infer.enter_level(); // → leaf_B1
+        let b_deep = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let b_deep_id = match ctx.get(b_deep) {
+            TypeData::InferVar { id } => *id,
+            _ => unreachable!(),
+        };
+        infer.exit_level(_r3); // back to branch_B
+        infer.exit_level(_r2); // back to root
+
+        // Verify the variables are at different (sibling) regions
+        let a_region = infer.type_vars[a_deep_id].region_id;
+        let b_region = infer.type_vars[b_deep_id].region_id;
+        assert_ne!(a_region, b_region, "sibling vars must be in different regions");
+        let root = infer.region_tree.root;
+        assert!(
+            infer.region_tree.is_ancestor(root, a_region),
+            "root must be ancestor of a's region",
+        );
+        assert!(
+            infer.region_tree.is_ancestor(root, b_region),
+            "root must be ancestor of b's region",
+        );
+
+        // Eq(a_deep, b_deep) — should promote both to NCA (root) before unifying
+        infer.add_constraint(Constraint::Eq(
+            a_deep,
+            b_deep,
+            crate::ast::Span::new(0, 0),
+        ));
+
+        // Bind B to Int<32> so the solver can resolve
+        let int32 = ctx.int(32, true);
+        ctx.bindings.borrow_mut().insert(b_deep, int32);
+
+        let result = infer.solve(&mut ctx, &trait_env, &symbols);
+        assert!(
+            result.is_ok(),
+            "cross-branch promotion solve should succeed: {:?}",
+            result,
+        );
+
+        // Both variables should resolve to Int<32>
+        let a_resolved = ctx.resolve_binding(a_deep);
+        let b_resolved = ctx.resolve_binding(b_deep);
+        assert!(
+            ctx.is_integer(a_resolved),
+            "a_deep should resolve to Int, got {:?}",
+            ctx.get(a_resolved),
+        );
+        assert!(
+            ctx.is_integer(b_resolved),
+            "b_deep should resolve to Int, got {:?}",
+            ctx.get(b_resolved),
+        );
+    }
+
+    #[test]
+    fn test_solve_cross_branch_no_leak_on_unification_failure() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let symbols = SymbolTable::new(crate::hir::types::CrateId(DefId(0)));
+        let trait_env = TraitEnv::new();
+
+        // Sibling branches: promote to NCA, then unify with incompatible
+        // types should still fail (smoke test that NCA doesn't paper over
+        // real type errors).
+        let _r0 = infer.enter_level(); // → branch_A
+        let a = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        infer.exit_level(_r0);
+
+        let _r1 = infer.enter_level(); // → branch_B
+        let b = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        infer.exit_level(_r1);
+
+        // Bind a to Bool, b to Int<32>, then constrain Eq(a, b)
+        let bool_ty = ctx.bool();
+        let int32 = ctx.int(32, true);
+        ctx.bindings.borrow_mut().insert(a, bool_ty);
+        ctx.bindings.borrow_mut().insert(b, int32);
+
+        infer.add_constraint(Constraint::Eq(
+            a,
+            b,
+            crate::ast::Span::new(0, 0),
+        ));
+
+        let result = infer.solve(&mut ctx, &trait_env, &symbols);
+        assert!(
+            result.is_err(),
+            "cross-branch unification of Bool and Int should fail, got {:?}",
+            result,
         );
     }
 }
