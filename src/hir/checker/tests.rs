@@ -880,12 +880,15 @@ fn test_scap_ensures_bool_check() {
 
     // Push a guarantee with a boolean postcondition (simulating 'ensures result > 0')
     let post = checker.ctx.bool();
-    let g = Guarantee::new(None, Some(post), None);
+    let g = Guarantee::new(Predicate::True, Predicate::Type(post), None);
     checker.guarantee_chain.push(g);
 
     // The guarantee chain should have depth 1
     assert!(checker.guarantee_chain.current().is_some());
-    assert!(checker.guarantee_chain.current().unwrap().post.is_some());
+    assert_eq!(
+        checker.guarantee_chain.current().unwrap().post,
+        Predicate::Type(post)
+    );
 
     // Pop the guarantee on simulated return
     let popped = checker.guarantee_chain.pop();
@@ -904,11 +907,11 @@ fn test_scap_ensures_chaining() {
         TypeChecker::new(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
 
     // Push g₀ (caller's guarantee)
-    let g0 = Guarantee::new(None, Some(checker.ctx.bool()), None);
+    let g0 = Guarantee::new(Predicate::True, Predicate::Type(checker.ctx.bool()), None);
     checker.guarantee_chain.push(g0);
 
     // Push g' (callee's guarantee — CALL rule chains through callee)
-    let g_callee = Guarantee::new(None, Some(checker.ctx.bool()), None);
+    let g_callee = Guarantee::new(Predicate::True, Predicate::Type(checker.ctx.bool()), None);
     checker.guarantee_chain.push(g_callee);
 
     // Pop g' (callee returns)
@@ -946,8 +949,8 @@ fn test_scap_multiple_ensures_clauses() {
         TypeChecker::new(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
 
     // Push two guarantees (simulating two ensures clauses)
-    let g1 = Guarantee::new(None, Some(checker.ctx.bool()), None);
-    let g2 = Guarantee::new(None, Some(checker.ctx.bool()), None);
+    let g1 = Guarantee::new(Predicate::True, Predicate::Type(checker.ctx.bool()), None);
+    let g2 = Guarantee::new(Predicate::True, Predicate::Type(checker.ctx.bool()), None);
     checker.guarantee_chain.push(g1);
     checker.guarantee_chain.push(g2);
 
@@ -974,7 +977,7 @@ fn test_scap_guarantee_discharge_on_return() {
         TypeChecker::new(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
 
     // Simulate entering a function: push a guarantee
-    let g = Guarantee::new(None, Some(checker.ctx.bool()), None);
+    let g = Guarantee::new(Predicate::True, Predicate::Type(checker.ctx.bool()), None);
     checker.guarantee_chain.push(g);
 
     // The return should see the guarantee and verify it

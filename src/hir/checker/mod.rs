@@ -477,7 +477,7 @@ impl<'a> TypeChecker<'a> {
                             .checker
                             .infer_expr(expr)
                             .unwrap_or_else(|_| (HirExpr::Error(*span), guard.checker.ctx.bool()));
-                        let g = Guarantee::new(None, Some(ensures_ty), None);
+                        let g = Guarantee::new(Predicate::True, Predicate::Type(ensures_ty), None);
                         guard.checker.guarantee_chain.push(g);
                     }
                 }
@@ -907,10 +907,9 @@ impl<'a> TypeChecker<'a> {
                 // If there's an ensures clause, it acts as the postcondition
                 // and must be satisfied at this return point.
                 if let Some(g) = self.guarantee_chain.current() {
-                    if let Some(post) = g.post {
-                        // The postcondition type must be bool and should hold
-                        // at the return point.  We verify this by type-checking
-                        // unify(post, bool) as a basic consistency check.
+                    // The postcondition type (if present) must be bool,
+                    // indicating the ensures clause holds at the return point.
+                    if let Predicate::Type(post) = g.post {
                         if !self.ctx.is_bool(post) {
                             self.diagnostics.push(
                                 Diagnostic::error("ensures condition must be boolean at return")
