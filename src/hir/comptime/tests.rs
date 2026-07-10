@@ -3,28 +3,48 @@ use crate::hir::hir::{HirExpr, HirStmt};
 use crate::hir::types::{TypeContext, TypeId};
 use crate::ast::{BinOp, Literal, Span};
 
+fn make_int_val(n: i128, ty: TypeId) -> HirExpr {
+    HirExpr::Literal(Literal::Int(n), ty, Span::new(0, 0))
+}
+
 fn make_int(n: i128) -> HirExpr {
-    HirExpr::Literal(Literal::Int(n), TypeId(999), Span::new(0, 0))
+    make_int_val(n, TypeId(0))
 }
 
 fn make_bool(b: bool) -> HirExpr {
-    HirExpr::Literal(Literal::Bool(b), TypeId(999), Span::new(0, 0))
+    HirExpr::Literal(Literal::Bool(b), TypeId(0), Span::new(0, 0))
 }
 
-fn make_binop(l: HirExpr, op: BinOp, r: HirExpr) -> HirExpr {
+fn make_binop_ty(l: HirExpr, op: BinOp, r: HirExpr, ty: TypeId) -> HirExpr {
     HirExpr::BinaryOp {
         left: Box::new(l),
         op,
         right: Box::new(r),
-        ty: TypeId(999),
+        ty,
         span: Span::new(0, 0),
     }
+}
+
+fn make_binop(l: HirExpr, op: BinOp, r: HirExpr) -> HirExpr {
+    make_binop_ty(l, op, r, TypeId(0))
+}
+
+/// Create an Int<32> type and wrap a value in a Literal with that type.
+fn make_int32(ctx: &mut TypeContext, n: i128) -> HirExpr {
+    let int32 = ctx.int(32, true);
+    make_int_val(n, int32)
+}
+
+/// Create a BinaryOp with Int<32> as the result type.
+fn make_binop32(ctx: &mut TypeContext, l: HirExpr, op: BinOp, r: HirExpr) -> HirExpr {
+    let int32 = ctx.int(32, true);
+    make_binop_ty(l, op, r, int32)
 }
 
 fn make_block(stmts: Vec<HirStmt>, last: HirExpr) -> HirExpr {
     let mut all = stmts;
     all.push(HirStmt::Expression(Box::new(last)));
-    HirExpr::Block(all, TypeId(999), Span::new(0, 0))
+    HirExpr::Block(all, TypeId(0), Span::new(0, 0))
 }
 
 fn make_if(cond: HirExpr, then: HirExpr, els: Option<HirExpr>) -> HirExpr {
@@ -35,7 +55,7 @@ fn make_if(cond: HirExpr, then: HirExpr, els: Option<HirExpr>) -> HirExpr {
         then_branch: then_block,
         else_branch: else_block,
         is_expression: true,
-        ty: TypeId(999),
+        ty: TypeId(0),
         span: Span::new(0, 0),
     }
 }
@@ -62,7 +82,9 @@ fn test_eval_bool_literal() {
 #[test]
 fn test_eval_add() {
     let mut ctx = TypeContext::new();
-    let expr = make_binop(make_int(3), BinOp::Add, make_int(4));
+    let a = make_int32(&mut ctx, 3);
+    let b = make_int32(&mut ctx, 4);
+    let expr = make_binop32(&mut ctx, a, BinOp::Add, b);
     let r = eval(&mut ctx, &expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(7))));
 }
@@ -70,7 +92,9 @@ fn test_eval_add() {
 #[test]
 fn test_eval_sub() {
     let mut ctx = TypeContext::new();
-    let expr = make_binop(make_int(10), BinOp::Sub, make_int(3));
+    let a = make_int32(&mut ctx, 10);
+    let b = make_int32(&mut ctx, 3);
+    let expr = make_binop32(&mut ctx, a, BinOp::Sub, b);
     let r = eval(&mut ctx, &expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(7))));
 }
@@ -78,7 +102,9 @@ fn test_eval_sub() {
 #[test]
 fn test_eval_mul() {
     let mut ctx = TypeContext::new();
-    let expr = make_binop(make_int(6), BinOp::Mul, make_int(7));
+    let a = make_int32(&mut ctx, 6);
+    let b = make_int32(&mut ctx, 7);
+    let expr = make_binop32(&mut ctx, a, BinOp::Mul, b);
     let r = eval(&mut ctx, &expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(42))));
 }
@@ -86,7 +112,9 @@ fn test_eval_mul() {
 #[test]
 fn test_eval_div() {
     let mut ctx = TypeContext::new();
-    let expr = make_binop(make_int(10), BinOp::Div, make_int(3));
+    let a = make_int32(&mut ctx, 10);
+    let b = make_int32(&mut ctx, 3);
+    let expr = make_binop32(&mut ctx, a, BinOp::Div, b);
     let r = eval(&mut ctx, &expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(3))));
 }
@@ -100,13 +128,32 @@ fn test_eval_div_by_zero() {
 }
 
 #[test]
+fn test_eval_int8_overflow() {
+    let mut ctx = TypeContext::new();
+    let int8_ty = ctx.int(8, true);
+    // 100 + 50 = 150, which overflows Int<8> (max 127) but not i128.
+    let expr = make_binop_ty(
+        make_int_val(100, int8_ty),
+        BinOp::Add,
+        make_int_val(50, int8_ty),
+        int8_ty,
+    );
+    let r = eval(&mut ctx, &expr);
+    assert!(
+        matches!(r, Err(ComptimeError::Overflow)),
+        "Int<8> 100 + 50 should overflow, got {:?}",
+        r
+    );
+}
+
+#[test]
 fn test_eval_nested_arith() {
     let mut ctx = TypeContext::new();
-    let expr = make_binop(
-        make_binop(make_int(1), BinOp::Add, make_int(2)),
-        BinOp::Mul,
-        make_int(3),
-    );
+    let a = make_int32(&mut ctx, 1);
+    let b = make_int32(&mut ctx, 2);
+    let c = make_int32(&mut ctx, 3);
+    let inner = make_binop32(&mut ctx, a, BinOp::Add, b);
+    let expr = make_binop32(&mut ctx, inner, BinOp::Mul, c);
     let r = eval(&mut ctx, &expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(9))));
 }

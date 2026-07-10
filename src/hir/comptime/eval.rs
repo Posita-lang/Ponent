@@ -1,8 +1,53 @@
 use crate::hir::hir::{HirExpr, HirStmt};
-use crate::hir::types::TypeContext;
+use crate::hir::types::{TypeContext, TypeId};
 
 use super::error::ComptimeError;
 use super::value::ComptimeValue;
+
+/// Compute the representable range for a signed integer of `bits` width.
+fn signed_range(bits: u8) -> (i128, i128) {
+    if bits == 0 {
+        (0, 0)
+    } else if bits >= 127 {
+        (i128::MIN, i128::MAX)
+    } else {
+        let max = (1i128 << (bits - 1)) - 1;
+        let min = -(1i128 << (bits - 1));
+        (min, max)
+    }
+}
+
+/// Compute the representable range for an unsigned integer of `bits` width.
+fn unsigned_range(bits: u8) -> (i128, i128) {
+    if bits >= 128 {
+        (0, i128::MAX)
+    } else {
+        let max = (1i128 << bits) - 1;
+        (0, max)
+    }
+}
+
+/// Check `result` against the type's bit width.  Returns `Overflow` if the
+/// value falls outside the representable range of the declared type.
+/// Returns `Internal` if called on a non-integer type — this is a HIR invariant
+/// violation that must be caught, not silently forwarded.
+fn check_range(result: i128, ty: TypeId, ctx: &TypeContext) -> Result<i128, ComptimeError> {
+    let (min, max) = match ctx.get(ty) {
+        crate::hir::types::TypeData::Int { bits, .. } => signed_range(*bits),
+        crate::hir::types::TypeData::UInt { bits, .. } => unsigned_range(*bits),
+        _ => {
+            return Err(ComptimeError::Internal(format!(
+                "check_range called on non-integer type: {:?}",
+                ctx.get(ty)
+            )));
+        }
+    };
+    if result < min || result > max {
+        Err(ComptimeError::Overflow)
+    } else {
+        Ok(result)
+    }
+}
 
 /// Evaluation context for comptime blocks.
 /// Tracks step budget and provides expression evaluation.
@@ -49,7 +94,7 @@ impl<'a> ComptimeEvalContext<'a> {
         if self.steps >= self.step_limit {
             return Err(ComptimeError::StepLimitExceeded);
         }
-        self.steps += 1;
+        self.steps = self.steps.saturating_add(1);
 
         match expr {
             HirExpr::Literal(lit, _ty, _span) => match lit {
@@ -58,27 +103,42 @@ impl<'a> ComptimeEvalContext<'a> {
                 _ => Err(ComptimeError::Deferred),
             },
             HirExpr::Block(stmts, _ty, _span) => self.eval_block(stmts),
-            HirExpr::BinaryOp { left, op, right, .. } => {
+            HirExpr::BinaryOp { left, op, right, ty, .. } => {
                 let l = self.eval_expr(left)?;
                 let r = self.eval_expr(right)?;
                 match (l, r, op) {
                     (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Add) => {
-                        a.checked_add(b).map(ComptimeValue::Int).ok_or(ComptimeError::Overflow)
+                        let result = a.checked_add(b).ok_or(ComptimeError::Overflow)?;
+                        check_range(result, *ty, self.ctx).map(ComptimeValue::Int)
                     }
                     (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Sub) => {
-                        a.checked_sub(b).map(ComptimeValue::Int).ok_or(ComptimeError::Overflow)
+                        let result = a.checked_sub(b).ok_or(ComptimeError::Overflow)?;
+                        check_range(result, *ty, self.ctx).map(ComptimeValue::Int)
                     }
                     (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Mul) => {
-                        a.checked_mul(b).map(ComptimeValue::Int).ok_or(ComptimeError::Overflow)
+                        let result = a.checked_mul(b).ok_or(ComptimeError::Overflow)?;
+                        check_range(result, *ty, self.ctx).map(ComptimeValue::Int)
                     }
                     (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Div) => {
                         if b == 0 {
                             Err(ComptimeError::DivisionByZero)
                         } else if a == i128::MIN && b == -1 {
-                            // i64::MIN / -1 overflows (can't represent as i64)
+                            // i128::MIN / -1 overflows (can't represent as i128)
                             Err(ComptimeError::Overflow)
                         } else {
-                            Ok(ComptimeValue::Int(a / b))
+                            let result = a / b;
+                            check_range(result, *ty, self.ctx).map(ComptimeValue::Int)
+                        }
+                    }
+                    (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Rem) => {
+                        if b == 0 {
+                            Err(ComptimeError::DivisionByZero)
+                        } else if a == i128::MIN && b == -1 {
+                            // i128::MIN % -1 overflows in the same way as division
+                            Err(ComptimeError::Overflow)
+                        } else {
+                            let result = a % b;
+                            check_range(result, *ty, self.ctx).map(ComptimeValue::Int)
                         }
                     }
                     _ => Err(ComptimeError::type_error("unsupported binary operation")),
