@@ -66,7 +66,8 @@ fn main() {
                         let mut ctx = TypeContext::new();
                         let local_crate_id = CrateId(DefId(0));
 
-                        // Expand `generate` blocks before name resolution.
+                        // Expand `generate` blocks before name resolution,
+                        // so the resolver sees only concrete declarations.
                         let expander = hir::generate::GenerateExpander::new(&mut ctx);
                         let expanded_items = expander.expand_program(program.items);
                         let program = ast::Program {

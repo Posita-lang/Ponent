@@ -29,10 +29,12 @@ pub enum TypeKind {
 
 /// The `generate` block expansion engine.
 ///
-/// Operates on the AST before name resolution, transforming `Stmt::Generate`
-/// nodes into concrete declarations (impl blocks, defs, types, etc.).
+/// Operates on the AST **before** name resolution.  Structural type
+/// information (field lists, parameter names) will be embedded in
+/// `TypeContext` in a future change; for now `get_type_info` returns
+/// placeholder data and the expander simply passes the body through.
 ///
-/// This runs immediately after parsing, before the name resolver.
+/// Pipeline: parse → expand generate blocks → resolve → type check.
 pub struct GenerateExpander<'a> {
     ctx: &'a mut TypeContext,
 }
@@ -42,16 +44,14 @@ impl<'a> GenerateExpander<'a> {
         GenerateExpander { ctx }
     }
 
-    /// Expand all `Generate` blocks in a program's items.
-    /// Returns a new list of items with `Generate` blocks replaced
-    /// by their expanded declarations.
+    /// Expand all `Generate` blocks in a list of AST statements.
+    /// Called after parsing, before name resolution.
     pub fn expand_program(&self, items: Vec<Stmt>) -> Vec<Stmt> {
         let mut result = Vec::new();
         for item in items {
             match item {
-                Stmt::Generate { for_type, body, span } => {
-                    // For now, just pass through the body as-is.
-                    // In future phases, this will:
+                Stmt::Generate { body, .. } => {
+                    // TODO: implement actual expansion:
                     // 1. Evaluate @typeInfo!(T) for the for_type
                     // 2. Unroll declarative loops
                     // 3. Expand name-mapped templates
@@ -66,6 +66,8 @@ impl<'a> GenerateExpander<'a> {
 
     /// Get type info for a given type at compile time.
     /// This is the implementation of `@typeInfo!(Type)`.
+    /// Returns placeholder data until structural type information is
+    /// embedded in `TypeContext` (see `collect_fields` / `collect_params`).
     pub fn get_type_info(&self, ty: TypeId) -> TypeInfo {
         let name = format!("{:?}", self.ctx.get(ty));
         let kind = match self.ctx.get(ty) {
@@ -81,18 +83,13 @@ impl<'a> GenerateExpander<'a> {
             TypeData::Int { .. } | TypeData::Float { .. } | TypeData::Bool => TypeKind::Primitive,
             _ => TypeKind::Other,
         };
-        let fields = self.collect_fields(ty);
-        let params = self.collect_params(ty);
-        TypeInfo { name, params, fields, kind }
-    }
-
-    fn collect_fields(&self, ty: TypeId) -> Vec<FieldInfo> {
-        // TODO: Implement field collection from TypeBinding.
-        Vec::new()
-    }
-
-    fn collect_params(&self, ty: TypeId) -> Vec<String> {
-        // TODO: Implement type parameter collection.
-        Vec::new()
+        // TODO: collect real fields and params from TypeContext once
+        // structural type information is available pre-resolution.
+        TypeInfo {
+            name,
+            params: Vec::new(),
+            fields: Vec::new(),
+            kind,
+        }
     }
 }

@@ -1532,12 +1532,11 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Stmt::Error(span) => Err(Diagnostic::error("invalid statement").with_span(*span)),
-            // `Stmt::Generate` should never reach the checker — it is expanded
-            // by `GenerateExpander` before name resolution.  If it does, the
-            // expander is not properly wired into the pipeline.
+            // Stmt::Generate is expanded before name resolution, so it
+            // should never reach the checker.  If it does, the pipeline
+            // is misconfigured.
             Stmt::Generate { span, .. } => Err(Diagnostic::error("generate block not expanded before type checking")
-                .with_span(*span)
-                .with_help("ensure the GenerateExpander runs before the name resolver")),
+                .with_span(*span)),
         }
     }
 

@@ -425,6 +425,10 @@ pub struct InferenceContext {
     reverse_refs: Vec<Option<usize>>,
     /// Tracks which InferVar ids have been unified since the last
     /// `force_generalize` call, enabling incremental processing.
+    /// After a partial generalization (via `force_generalize_for_regions`
+    /// with `dirty_levels` or `target_var`), unprocessed entries remain
+    /// in the set — the next full `force_generalize` will clean them up.
+    /// Do NOT read this field directly; use `mark_dirty` / `is_dirty`.
     dirty_set: std::collections::HashSet<usize>,
     /// Per-InferenceContext resolution table (TypeOrVar pattern).
     resolutions: Vec<Option<TypeId>>,
@@ -3434,7 +3438,7 @@ mod tests {
         // Resolve the variable
         ctx.bindings.borrow_mut().insert(var, ctx.bool());
         // Mark dirty
-        infer.dirty_set.insert(var_id);
+        infer.mark_dirty(var_id);
 
         infer.force_generalize(&mut ctx);
         assert_eq!(

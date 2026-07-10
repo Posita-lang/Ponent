@@ -110,17 +110,34 @@ impl From<&TypeData> for TypeTag {
 }
 
 impl TypeId {
+    /// Number of bits reserved for the type tag in the lower bits of TypeId.
+    /// Must be large enough to hold all TypeTag variants (currently 30, max 31
+    /// with 5 bits).  Bump to 6 if more than 31 variants are needed.
     pub const TAG_BITS: usize = 5;
     const TAG_MASK: usize = (1 << Self::TAG_BITS) - 1;
+    /// The maximum discriminant value that fits in TAG_BITS.
+    const TAG_MAX: usize = Self::TAG_MASK;
 
     pub fn index(self) -> usize {
         self.0 >> Self::TAG_BITS
     }
 
     pub fn tag(self) -> TypeTag {
-        // SAFETY: every TypeId created through TypeContext::alloc has a valid tag
-        // and TAG_MASK covers all 31 discriminants (0..30).
-        unsafe { std::mem::transmute::<usize, TypeTag>(self.0 & Self::TAG_MASK) }
+        let tag_val = self.0 & Self::TAG_MASK;
+        // Catch tag overflow in debug builds: if a new TypeTag variant pushes
+        // the discriminant past TAG_MAX, this assert fires immediately rather
+        // than silently producing an invalid transmute.
+        debug_assert!(
+            tag_val <= Self::TAG_MAX,
+            "TypeTag discriminant {} exceeds TAG_MASK={}; \
+             increase TAG_BITS to accommodate more variants",
+            tag_val,
+            Self::TAG_MASK,
+        );
+        // SAFETY: every TypeId created through TypeContext::alloc has a valid
+        // tag in 0..TAG_MAX, enforced by TypeTag's explicit discriminants and
+        // debug_assert above.  TAG_MASK covers all current discriminants.
+        unsafe { std::mem::transmute::<usize, TypeTag>(tag_val) }
     }
 }
 
@@ -459,6 +476,13 @@ impl TypeContext {
         // a maliciously constructed chain from DoS-ing the compiler.
         const MAX_CHAIN_DEPTH: usize = 10_000;
 
+        // Invariant: path compression calls set_binding, which records undo
+        // entries in the active transaction.  If there is no active transaction,
+        // the undo log is empty and rollback would be incomplete — but this is
+        // only a concern when called inside a transaction.  The assertion below
+        // fires in debug builds if path compression is needed but no transaction
+        // is active, catching silent contract violations early.
+
         // First pass: follow the binding chain to the root with a single
         // immutable borrow.  This is a simple linked-list traversal through
         // the bindings map until we reach an unbound TypeId.
@@ -481,6 +505,9 @@ impl TypeContext {
         // directly to the root so that future lookups are O(1) instead of
         // O(depth).  Uses set_binding per step to ensure the transaction undo
         // log captures each mutation (OmniML-style Ref-level logging).
+        // If no transaction is active, set_binding still performs the
+        // mutation but skips undo logging — path compression is safe in
+        // either mode.
         if root != id {
             let mut current = id;
             let mut depth = 0;
