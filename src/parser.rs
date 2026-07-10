@@ -3453,6 +3453,15 @@ impl Parser {
                 }
             }
             Ok(Token::If) => self.parse_if_expr(),
+            Ok(Token::Task) => {
+                let start = self.span().start;
+                self.advance().ok();
+                self.expect(Token::LBrace)?;
+                let body = self.parse_block()?;
+                self.expect(Token::RBrace)?;
+                let end = self.span().end;
+                Ok(Expr::Task { body, span: Span::new(start, end) })
+            }
             Ok(Token::Match) => self.parse_match_expr(),
             Ok(Token::Leave) => {
                 self.advance().ok();

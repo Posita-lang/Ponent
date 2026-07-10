@@ -466,6 +466,11 @@ mod tests {
             c_layout: false,
             transparent: false,
             expanded_layout_attrs: vec![],
+            packed: false,
+            endian: None,
+            bit_order: None,
+            align: None,
+            pad: None,
         };
         symbols.insert_type("TestType".into(), binding, crate::ast::Span::new(0, 0)).ok();
 

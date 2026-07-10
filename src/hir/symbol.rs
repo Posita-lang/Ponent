@@ -89,6 +89,16 @@ pub struct TypeBinding {
     /// Contains the full set of built-in attributes (packed, endian, etc.)
     /// after alias expansion, for use by codegen / layout_of!.
     pub expanded_layout_attrs: Vec<crate::ast::Attribute>,
+    /// Whether `@packed` is set on this type (remove padding between fields).
+    pub packed: bool,
+    /// Endianness from `@endian(little)` or `@endian(big)`.
+    pub endian: Option<crate::ast::Endianness>,
+    /// Bit field fill order from `@bit_order(lsb_to_msb)` or `@bit_order(msb_to_lsb)`.
+    pub bit_order: Option<crate::ast::BitOrder>,
+    /// Alignment override from `@align(N)`.
+    pub align: Option<u64>,
+    /// Padding from `@pad(N)`.
+    pub pad: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

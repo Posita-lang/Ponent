@@ -95,7 +95,7 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
         | Expr::PolyBox { expr: e, .. }
         | Expr::PolyUnbox { expr: e, .. }
         | Expr::Old(e, _) => visitor.visit_expr(e),
-        Expr::Path(_, _) => V::Result::output(),
+        Expr::Task { .. } | Expr::Path(_, _) => V::Result::output(),
         Expr::Tuple(exprs, _) | Expr::Array(exprs, _) => {
             for e in exprs {
                 visitor.visit_expr(e);
@@ -414,7 +414,7 @@ pub trait MutVisitor: Sized {
 
 pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
     match expr {
-        Expr::Literal(_, _) | Expr::Ident(_, _) | Expr::Path(_, _) | Expr::Error(_) => {}
+        Expr::Literal(_, _) | Expr::Ident(_, _) | Expr::Path(_, _) | Expr::Task { .. } | Expr::Error(_) => {}
         Expr::TypeAnnotated { expr: e, ty: _, .. } => visitor.visit_expr_mut(e),
         Expr::BinaryOp { left, right, .. } => {
             visitor.visit_expr_mut(left);

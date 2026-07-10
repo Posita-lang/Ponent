@@ -1330,6 +1330,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 Ok((HirExpr::Error(*span), self.checker.ctx.error()))
             }
             Expr::Error(span) => Ok((HirExpr::Error(*span), self.checker.ctx.error())),
+            Expr::Task { body, span } => {
+                let block = self.check_block(body)?;
+                let ty = self.checker.ctx.unit();
+                Ok((HirExpr::Task { block, ty, span: *span }, ty))
+            }
         }
     }
 

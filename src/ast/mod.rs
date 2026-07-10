@@ -225,6 +225,11 @@ pub enum Expr {
     /// `old(expr)` — captures the value of `expr` at function entry.
     /// Used in `ensures` clauses: `ensures *x == old(*x) + 1`.
     Old(Box<Expr>, Span),
+    /// Spawn a task: `task { body }`
+    Task {
+        body: Vec<Stmt>,
+        span: Span,
+    },
     Error(Span),
 }
 
@@ -485,6 +490,20 @@ pub enum OverflowPolicy {
     Wrap,
     Saturate,
     Trap,
+}
+
+/// Byte order for `@endian` attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Endianness {
+    Little,
+    Big,
+}
+
+/// Bit field fill order for `@bit_order` attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BitOrder {
+    LsbToMsb,
+    MsbToLsb,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -767,6 +786,7 @@ impl Expr {
             Expr::PolyUnbox { span, .. } => *span,
             Expr::Quantified { span, .. } => *span,
             Expr::Old(_, span) => *span,
+            Expr::Task { span, .. } => *span,
             Expr::Error(span) => *span,
         }
     }

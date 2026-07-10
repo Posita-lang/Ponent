@@ -259,6 +259,11 @@ impl<'a> NameResolver<'a> {
 
                 let mut c_layout = false;
                 let mut transparent = false;
+                let mut packed = false;
+                let mut endian = None;
+                let mut bit_order = None;
+                let mut align = None;
+                let mut pad = None;
                 let mut expanded_attrs = attributes.clone();
                 for attr in attributes {
                     if attr.name == "layout" {
@@ -267,10 +272,6 @@ impl<'a> NameResolver<'a> {
                                 if name == "C" {
                                     c_layout = true;
                                 } else if let Some(alias_attrs) = self.layout_aliases.get(name.as_str()) {
-                                    // Expand user-defined layout alias:
-                                    // inject the alias's constituent attributes into the
-                                    // type's attribute list so downstream passes (checker,
-                                    // codegen) see the fully expanded set.
                                     for alias_attr in alias_attrs {
                                         if !expanded_attrs.iter().any(|a| a.name == alias_attr.name) {
                                             expanded_attrs.push(alias_attr.clone());
@@ -280,8 +281,99 @@ impl<'a> NameResolver<'a> {
                             }
                         }
                     }
-                    if attr.name == "transparent" {
-                        transparent = true;
+                    if attr.name == "transparent" { transparent = true; }
+                    if attr.name == "packed" { packed = true; }
+                    if attr.name == "endian" {
+                        match attr.args.first() {
+                            Some(crate::ast::Expr::Ident(name, _)) if name == "little" => {
+                                endian = Some(crate::ast::Endianness::Little);
+                            }
+                            Some(crate::ast::Expr::Ident(name, _)) if name == "big" => {
+                                endian = Some(crate::ast::Endianness::Big);
+                            }
+                            Some(crate::ast::Expr::Ident(name, _)) => {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!("`@endian` expects `little` or `big`, got `{}`", name))
+                                        .with_code_str("E061")
+                                        .with_span(attr.span)
+                                        .with_suggestion("write `@endian(little)` or `@endian(big)`"),
+                                );
+                            }
+                            Some(_) => {
+                                self.diagnostics.push(
+                                    Diagnostic::error("`@endian` requires an identifier argument (`little` or `big`)")
+                                        .with_code_str("E061")
+                                        .with_span(attr.span)
+                                        .with_suggestion("write `@endian(little)` or `@endian(big)`"),
+                                );
+                            }
+                            None => {
+                                self.diagnostics.push(
+                                    Diagnostic::error("`@endian` requires an argument")
+                                        .with_code_str("E061")
+                                        .with_span(attr.span)
+                                        .with_suggestion("write `@endian(little)` or `@endian(big)`"),
+                                );
+                            }
+                        }
+                    }
+                    if attr.name == "bit_order" {
+                        match attr.args.first() {
+                            Some(crate::ast::Expr::Ident(name, _)) if name == "lsb_to_msb" => {
+                                bit_order = Some(crate::ast::BitOrder::LsbToMsb);
+                            }
+                            Some(crate::ast::Expr::Ident(name, _)) if name == "msb_to_lsb" => {
+                                bit_order = Some(crate::ast::BitOrder::MsbToLsb);
+                            }
+                            Some(crate::ast::Expr::Ident(name, _)) => {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!("`@bit_order` expects `lsb_to_msb` or `msb_to_lsb`, got `{}`", name))
+                                        .with_code_str("E061")
+                                        .with_span(attr.span)
+                                        .with_suggestion("write `@bit_order(lsb_to_msb)` or `@bit_order(msb_to_lsb)`"),
+                                );
+                            }
+                            Some(_) => {
+                                self.diagnostics.push(
+                                    Diagnostic::error("`@bit_order` requires an identifier argument")
+                                        .with_code_str("E061")
+                                        .with_span(attr.span)
+                                        .with_suggestion("write `@bit_order(lsb_to_msb)` or `@bit_order(msb_to_lsb)`"),
+                                );
+                            }
+                            None => {
+                                self.diagnostics.push(
+                                    Diagnostic::error("`@bit_order` requires an argument")
+                                        .with_code_str("E061")
+                                        .with_span(attr.span)
+                                        .with_suggestion("write `@bit_order(lsb_to_msb)` or `@bit_order(msb_to_lsb)`"),
+                                );
+                            }
+                        }
+                    }
+                    if attr.name == "align" || attr.name == "pad" {
+                        match attr.args.first() {
+                            Some(crate::ast::Expr::Literal(crate::ast::Literal::Int(n), _)) => {
+                                if attr.name == "align" { align = Some(*n as u64); }
+                                if attr.name == "pad" { pad = Some(*n as u64); }
+                            }
+                            Some(_) => {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!("`@{}` requires an integer argument", attr.name))
+                                        .with_code_str("E060")
+                                        .with_span(attr.span)
+                                        .with_suggestion(format!("write `@{}(N)` where N is a power of two", attr.name)),
+                                );
+                            }
+                            None => {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!("`@{}` requires an integer argument", attr.name))
+                                        .with_code_str("E060")
+                                        .with_span(attr.span)
+                                        .with_suggestion(format!("write `@{}(128)`", attr.name)),
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -302,6 +394,11 @@ impl<'a> NameResolver<'a> {
                     c_layout,
                     transparent,
                     expanded_layout_attrs: expanded_attrs,
+                    packed,
+                    endian,
+                    bit_order,
+                    align,
+                    pad,
                 };
                 if let Err(diag) = self.symbols.insert_type(name.clone(), binding, *span) {
                     self.diagnostics.push(diag);
@@ -491,7 +588,17 @@ impl<'a> NameResolver<'a> {
                     self.diagnostics.push(diag);
                 }
             }
-            Stmt::Edition(..) => {}
+            Stmt::Edition(version, span) => {
+                match crate::hir::types::Edition::from_str(version) {
+                    Some(ed) => self.ctx.set_edition(ed),
+                    None => self.diagnostics.push(
+                        Diagnostic::error(format!("unknown edition `{}`", version))
+                            .with_code_str("E070")
+                            .with_span(*span)
+                            .with_suggestion("use a valid edition: `\"2024\"` or `\"2026\"`"),
+                    ),
+                }
+            }
             Stmt::LayoutDef { name, attributes, .. } => {
                 // Register a layout alias so that @layout(AliasName) can be expanded.
                 if self.layout_aliases.contains_key(name) {
@@ -625,6 +732,11 @@ impl<'a> NameResolver<'a> {
                         c_layout: false,
                         transparent: false,
                         expanded_layout_attrs: vec![],
+            packed: false,
+            endian: None,
+            bit_order: None,
+            align: None,
+            pad: None,
                     };
                     self.symbols
                         .insert_type(cap.name.clone(), binding, *span)
@@ -1137,6 +1249,10 @@ impl<'a> NameResolver<'a> {
                 Some(self.ctx.error())
             }
             Expr::Error(..) => Some(self.ctx.error()),
+            Expr::Task { body, .. } => {
+                for s in body { self.resolve_stmt(s); }
+                Some(self.ctx.unit())
+            }
         }
     }
 

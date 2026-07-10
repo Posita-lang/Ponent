@@ -137,6 +137,7 @@ pub enum HirStmt {
     },
     ComptimeBlock {
         body: Vec<HirStmt>,
+        ty: TypeId,
         span: Span,
     },
     ScopeCleanup {
@@ -339,6 +340,12 @@ pub enum HirExpr {
         ty: TypeId,
         span: Span,
     },
+    /// Spawn a task: `task { body }`
+    Task {
+        block: Vec<HirStmt>,
+        ty: TypeId,
+        span: Span,
+    },
     Error(Span),
 }
 
@@ -426,6 +433,7 @@ impl HirExpr {
             HirExpr::PolyUnbox { ty, .. } => *ty,
             HirExpr::Quantified { ty, .. } => *ty,
             HirExpr::Old { ty, .. } => *ty,
+            HirExpr::Task { ty, .. } => *ty,
             HirExpr::Error(_) => unreachable!("Error expression has no type"),
         }
     }
@@ -462,6 +470,7 @@ impl HirExpr {
             HirExpr::PolyUnbox { span, .. } => *span,
             HirExpr::Quantified { span, .. } => *span,
             HirExpr::Old { span, .. } => *span,
+            HirExpr::Task { span, .. } => *span,
             HirExpr::Error(span) => *span,
         }
     }

@@ -376,6 +376,66 @@ impl<'a> TypeChecker<'a> {
                     });
                 }
 
+                // ── @interrupt handler checks ─────────────────────────
+                let is_interrupt = attributes.iter().any(|a| a.name == "interrupt");
+                if is_interrupt {
+                    // Rule 1: return type must be Never (!)
+                    if !self.ctx.is_never(return_ty) {
+                        self.diagnostics.push(
+                            Diagnostic::error("@interrupt handler must return `!` (never type)")
+                                .with_code_str("E050")
+                                .with_span(*span)
+                                .with_help("interrupt handlers must have return type `!` because they never return")
+                        );
+                    }
+                    // Rule 2: no custom parameters
+                    if !params.is_empty() {
+                        self.diagnostics.push(
+                            Diagnostic::error("@interrupt handler cannot have parameters")
+                                .with_code_str("E051")
+                                .with_span(*span)
+                                .with_help("interrupt handlers take no arguments — state is read via MMIO or ghost variables")
+                        );
+                    }
+                    // Rule 3: must have @no_alloc and @no_panic (both required for interrupt handlers)
+                    let has_no_alloc = attributes.iter().any(|a| a.name == "no_alloc");
+                    let has_no_panic = attributes.iter().any(|a| a.name == "no_panic");
+                    if !has_no_alloc {
+                        self.diagnostics.push(
+                            Diagnostic::error("@interrupt handler must satisfy @no_alloc")
+                                .with_code_str("E052")
+                                .with_span(*span)
+                                .with_suggestion("add `@no_alloc` to this function (redundant with `@no_panic`?)")
+                        );
+                    }
+                    if !has_no_panic {
+                        self.diagnostics.push(
+                            Diagnostic::error("@interrupt handler must satisfy @no_panic")
+                                .with_code_str("E053")
+                                .with_span(*span)
+                                .with_suggestion("add `@no_panic` to this function")
+                        );
+                    }
+                    // Rule 4: @interrupt + @alloc is incompatible
+                    if attributes.iter().any(|a| a.name == "alloc") {
+                        self.diagnostics.push(
+                            Diagnostic::error("@interrupt handler cannot have @alloc")
+                                .with_code_str("E054")
+                                .with_span(*span)
+                                .with_help("@interrupt and @alloc are incompatible — interrupt handlers must not allocate")
+                        );
+                    }
+                    // Rule 5: @interrupt + @io is incompatible
+                    if attributes.iter().any(|a| a.name == "io") {
+                        self.diagnostics.push(
+                            Diagnostic::error("@interrupt handler cannot have @io")
+                                .with_code_str("E055")
+                                .with_span(*span)
+                                .with_help("@interrupt and @io are incompatible — interrupt handlers must not perform I/O")
+                        );
+                    }
+                }
+
                 let guard = ScopeGuard::new(self);
                 guard.checker.current_function = Some(DefId(0));
                 guard.checker.current_function_trusted =
@@ -411,6 +471,8 @@ impl<'a> TypeChecker<'a> {
                 }
                 // Generate where-clause constraints as Impl(clause_ty, trait_id)
                 // so the solver can verify trait bounds on generic parameters.
+                // Also expand constraint aliases (e.g. `where C: SortableContainer`
+                // → Impl(C, Container) + Impl(C::Item, Ord) + ...).
                 if let Some(wc) = where_clause {
                     for pred in &wc.predicates {
                         let pred_ty = guard.checker.resolve_type(&pred.ty)?;
@@ -419,6 +481,16 @@ impl<'a> TypeChecker<'a> {
                                 guard
                                     .checker
                                     .add_constraint(Constraint::Impl(pred_ty, trait_id, pred.span));
+                            } else if let Some(name) = TypeChecker::extract_bound_name(bound) {
+                                if let Some(constraint) = guard.checker.symbols.lookup_constraint(&name) {
+                                    for &bound_ty in &constraint.bounds {
+                                        if let Some(trait_id) = guard.checker.ctx.get_def_id_for_type(bound_ty) {
+                                            guard.checker.add_constraint(
+                                                Constraint::Impl(pred_ty, trait_id, pred.span),
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -453,7 +525,8 @@ impl<'a> TypeChecker<'a> {
                 }
 
                 if let Some(ref body_stmts) = body_hir {
-                    let body_ty = self.block_type(body_stmts);
+                    // Function bodies require explicit `return` — no implicit trailing expression.
+                    let body_ty = self.block_type_impl(body_stmts, false);
                     self.unify_with(return_ty, body_ty, *span, TypingContext::ReturnValue)?;
                 }
 
@@ -941,8 +1014,24 @@ impl<'a> TypeChecker<'a> {
                 let body_hir = match self.check_block(body) {
                     Ok(hir) => {
                         self.pop_ctx();
+                        // Extract the type of the comptime block from its last expression,
+                        // so that `def f() -> Int<32> { comptime { 42 } }` type-checks.
+                        let ty = hir.last().and_then(|s| match s {
+                            HirStmt::Expression(e) => Some(e.ty()),
+                            _ => None,
+                        }).unwrap_or_else(|| self.ctx.unit());
+                        // Evaluate the comptime block at compile time.
+                        let mut eval = crate::hir::comptime::ComptimeEvalContext::new(self.ctx);
+                        if let Err(e) = eval.eval_block(&hir) {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!("comptime error: {}", e))
+                                    .with_code_str("E080")
+                                    .with_span(*span),
+                            );
+                        }
                         Ok(HirStmt::ComptimeBlock {
                             body: hir,
+                            ty,
                             span: *span,
                         })
                     }
@@ -1008,9 +1097,10 @@ impl<'a> TypeChecker<'a> {
                 // no additional checking needed here.
                 Ok(HirStmt::Error)
             }
-            Stmt::Edition(..) => {
-                // Edition declarations are handled by the parser; skip silently.
-                Ok(HirStmt::Error)
+            Stmt::Edition(version, span) => {
+                // Edition is validated and stored by the resolver.
+                // The checker simply passes it through.
+                Ok(HirStmt::Edition(version.clone(), *span))
             }
             Stmt::TraitDef { .. } => {
                 // Trait definitions are handled by the resolver; skip silently.
@@ -1777,6 +1867,19 @@ impl<'a> TypeChecker<'a> {
         self.symbols.lookup_trait(name).map(|b| b.def_id)
     }
 
+    /// Extract the name from a bound `Type` for constraint alias lookup.
+    fn extract_bound_name(bound: &Type) -> Option<String> {
+        let base = match bound {
+            Type::Path(path, _) => return path.first().cloned(),
+            Type::Generic(base, _, _) => base.as_ref(),
+            _ => return None,
+        };
+        match base {
+            Type::Path(path, _) => path.first().cloned(),
+            _ => None,
+        }
+    }
+
     /// Attempt to dereference a type once using built-in rules.
     /// Handles `&T` / `&mut T`, `*T`, `Ptr<pointee = T>`, and known wrapper types.
     fn builtin_deref_ty(&self, ty: TypeId) -> Option<TypeId> {
@@ -2294,9 +2397,21 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn block_type(&self, stmts: &[HirStmt]) -> TypeId {
+        self.block_type_impl(stmts, true)
+    }
+
+    /// Whether an implicit trailing expression counts as the block's return type.
+    /// Functions (`def`) require explicit `return`; closures and blocks allow
+    /// trailing expressions as implicit return values.
+    fn block_type_impl(&self, stmts: &[HirStmt], allow_implicit: bool) -> TypeId {
         for stmt in stmts.iter().rev() {
             match stmt {
-                HirStmt::Expression(expr) => {
+                HirStmt::ComptimeBlock { ty, .. } => {
+                    if *ty != self.ctx.error() {
+                        return *ty;
+                    }
+                }
+                HirStmt::Expression(expr) if allow_implicit => {
                     if !matches!(expr.as_ref(), HirExpr::Error(_)) {
                         return expr.ty();
                     }

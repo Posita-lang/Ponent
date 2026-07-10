@@ -199,6 +199,11 @@ pub fn register_builtins(
             c_layout: false,
                         transparent: false,
                         expanded_layout_attrs: vec![],
+            packed: false,
+            endian: None,
+            bit_order: None,
+            align: None,
+            pad: None,
         };
         symbols
             .insert_type("Result".to_string(), binding, Span::new(0, 0))
@@ -241,6 +246,11 @@ pub fn register_builtins(
             c_layout: false,
                         transparent: false,
                         expanded_layout_attrs: vec![],
+            packed: false,
+            endian: None,
+            bit_order: None,
+            align: None,
+            pad: None,
         };
         symbols
             .insert_type("Option".to_string(), binding, Span::new(0, 0))
@@ -293,6 +303,11 @@ pub fn register_builtins(
             c_layout: false,
                         transparent: false,
                         expanded_layout_attrs: vec![],
+            packed: false,
+            endian: None,
+            bit_order: None,
+            align: None,
+            pad: None,
         };
         symbols
             .insert_type("Future".to_string(), binding, Span::new(0, 0))
@@ -339,4 +354,45 @@ pub fn register_builtins(
     insert_trait(symbols, "Sized", &mut DefId(0));
     insert_trait(symbols, "Deref", &mut DefId(0));
     insert_trait(symbols, "DerefMut", &mut DefId(0));
+
+    // ── Channel<T> type ──────────────────────────────────────────
+    // `Channel<T>` is a built-in type constructor for typed channels.
+    // Syntax: `Channel<Int<32>>::new(16)` → (Sender, Receiver)
+    // Currently registered as a minimal placeholder (no variants, no methods).
+    // A full implementation will add Send(T)/Recv(T) payload variants
+    // and the associated new() method.
+    {
+        let channel_t = TypeParam {
+            name: "T".to_string(),
+            bounds: vec![],
+            is_lifetime: false,
+            span: Span::new(0, 0),
+        };
+        let binding = TypeBinding {
+            def_id: symbols.allocate_def_id(),
+            params: vec![channel_t],
+            kind: TypeKind::Enum,
+            span: Span::new(0, 0),
+            alias_ast: None,
+            fields: vec![],
+            variants: vec![],
+            invariant: None,
+            default_value: None,
+            no_default: true,
+            crate_id: symbols.local_crate_id,
+            missing_match: None,
+            exhaustive: false,
+            c_layout: false,
+            transparent: false,
+            expanded_layout_attrs: vec![],
+            packed: false,
+            endian: None,
+            bit_order: None,
+            align: None,
+            pad: None,
+        };
+        symbols
+            .insert_type("Channel".to_string(), binding, Span::new(0, 0))
+            .ok();
+    }
 }

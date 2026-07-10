@@ -4,6 +4,7 @@ mod diagnostics;
 mod hir {
     pub mod builtins;
     pub mod checker;
+    pub mod comptime;
     pub mod hir;
     pub mod infer;
     pub mod resolver;

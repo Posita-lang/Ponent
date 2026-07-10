@@ -5,6 +5,31 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::ast::OverflowPolicy;
+use std::cmp::Ordering;
+
+/// Posita language edition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Edition {
+    Year2024,
+    Year2026,
+}
+
+impl Edition {
+    /// Parse an edition from a string like "2024" or "2026".
+    /// Returns `None` for unknown edition strings.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "2024" => Some(Edition::Year2024),
+            "2026" => Some(Edition::Year2026),
+            _ => None,
+        }
+    }
+
+    /// The latest (current) edition.
+    pub const fn latest() -> Self {
+        Edition::Year2026
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeId(pub usize);
@@ -329,6 +354,8 @@ pub struct TypeContext {
     next_universe: Cell<usize>,
     /// Counter for generating fresh parameter indices (used by Exists/Forall).
     next_param_index: Cell<usize>,
+    /// Language edition for this compilation unit.
+    edition: Edition,
 }
 
 impl TypeContext {
@@ -355,6 +382,7 @@ impl TypeContext {
             kappa_cache: RefCell::new(HashMap::default()),
             next_universe: Cell::new(0),
             next_param_index: Cell::new(0),
+            edition: Edition::latest(),
         };
         ctx.builtin_unit = ctx.alloc(TypeData::Unit);
         ctx.builtin_never = ctx.alloc(TypeData::Never);
@@ -383,6 +411,16 @@ impl TypeContext {
         let idx = self.next_param_index.get();
         self.next_param_index.set(idx + 1);
         idx
+    }
+
+    /// Get the current language edition.
+    pub fn edition(&self) -> Edition {
+        self.edition
+    }
+
+    /// Set the language edition (e.g. from an `edition = "2026"` declaration).
+    pub fn set_edition(&mut self, edition: Edition) {
+        self.edition = edition;
     }
 
     pub fn alloc(&mut self, data: TypeData) -> TypeId {
