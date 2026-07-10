@@ -187,6 +187,8 @@ impl SourceContext {
         filename: &str,
         context_lines: usize,
     ) -> Self {
+        // `_span` is reserved for future use (scoping the context to a
+        // specific region); currently the entire source is always loaded.
         SourceContext {
             table: LineTable::build(source),
             source: source.to_string(),
@@ -208,10 +210,13 @@ impl SourceContext {
             lines_set.insert(l + 1);
         }
 
-        // Secondary labels
+        // Secondary labels — include ALL lines each label covers
         for lbl in labels {
             let lc = byte_to_linecol(&self.source, lbl.span.start);
-            lines_set.insert(lc.line + 1);
+            let lc_end = byte_to_linecol(&self.source, lbl.span.end);
+            for l in lc.line..=lc_end.line {
+                lines_set.insert(l + 1);
+            }
         }
 
         // Add context lines around each annotated line
@@ -250,15 +255,18 @@ impl SourceContext {
         let primary_lc = byte_to_linecol(&self.source, primary_span.start);
         let primary_end_lc = byte_to_linecol(&self.source, primary_span.end);
 
-        // Group labels by line
+        // Group labels by line — include ALL lines each label covers
         let mut labels_by_line: std::collections::BTreeMap<usize, Vec<&Label>> =
             std::collections::BTreeMap::new();
         for lbl in labels {
             let lc = byte_to_linecol(&self.source, lbl.span.start);
-            labels_by_line
-                .entry(lc.line + 1)
-                .or_default()
-                .push(lbl);
+            let lc_end = byte_to_linecol(&self.source, lbl.span.end);
+            for line in (lc.line + 1)..=(lc_end.line + 1) {
+                labels_by_line
+                    .entry(line)
+                    .or_default()
+                    .push(lbl);
+            }
         }
 
         let reset = "\x1b[0m";
@@ -326,8 +334,24 @@ impl SourceContext {
                         let lc = byte_to_linecol(&self.source, lbl.span.start);
                         let lc_end = byte_to_linecol(&self.source, lbl.span.end);
                         let ch = lbl.underline_char();
-                        let start = std::cmp::min(lc.col, line_str.len());
-                        let end = std::cmp::min(lc_end.col, line_str.len());
+                        // For multi-line labels, compute the underline range
+                        // on this specific line:
+                        //   - first line:    lc.col .. (end of line if span
+                        //                     continues, else lc_end.col)
+                        //   - middle lines:  0 .. end of line
+                        //   - last line:     0 .. lc_end.col
+                        let start_col = if line_1based == lc.line + 1 {
+                            lc.col
+                        } else {
+                            0
+                        };
+                        let end_col = if line_1based == lc_end.line + 1 {
+                            lc_end.col
+                        } else {
+                            line_str.len()
+                        };
+                        let start = std::cmp::min(start_col, line_str.len());
+                        let end = std::cmp::min(end_col, line_str.len());
                         let end = std::cmp::max(end, start + 1);
                         for c in chars.iter_mut().take(end).skip(start) {
                             *c = ch;
@@ -341,10 +365,13 @@ impl SourceContext {
                 out.push_str(&trimmed);
                 out.push('\n');
 
-                // ── Label messages ─────────────────────────
+                // ── Label messages — only on the label's first line ──
                 if let Some(lbls) = line_labels {
                     for lbl in lbls {
-                        if !lbl.message.is_empty() {
+                        if !lbl.message.is_empty()
+                            && line_1based
+                                == byte_to_linecol(&self.source, lbl.span.start).line + 1
+                        {
                             let msg_prefix = if use_color {
                                 format!("{}{}{}", blue, "     | ", reset)
                             } else {
