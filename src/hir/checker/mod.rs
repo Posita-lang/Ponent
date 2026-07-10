@@ -62,7 +62,11 @@ pub struct TypeChecker<'a> {
     current_return_type: Option<TypeId>,
     resolving_aliases: HashSet<DefId>,
     infer: InferenceContext,
-    infer_stack: Vec<InferenceContext>,
+    /// Stack of (inference_context, region_tree_snapshot) for scope management.
+    /// Storing a snapshot of the region tree allows abort_inference_scope
+    /// to roll back any CtxFrames and region structure changes made inside
+    /// the aborted scope.
+    infer_stack: Vec<(InferenceContext, region::RegionTree)>,
     /// Wegion twee: twacks cuwwent function, woop, cwosuwe, etc.
     /// Wepwaces the owd wineaw `woop_stack` with a twee stwuctuwe
     /// suppowting pawtiaw genewawization (OmniML §3.2). (｀・ω・´)
@@ -162,10 +166,18 @@ impl<'a> TypeChecker<'a> {
 
         // Solve all queued constraints, finalize inference variables,
         // and commit the transaction. On failure the transaction is
-        // rolled back and diagnostics are already collected.
-        if let Err(diags) = self.exit_inference_scope() {
-            self.ctx.rollback_transaction();
-            return Err(diags);
+        // rolled back and the region tree is restored to its pre-scope state.
+        {
+            let (prev, saved_tree) = self.infer_stack.pop().expect(
+                "check_program: infer_stack is empty — \
+                 enter_inference_scope was never called",
+            );
+            let mut current = mem::replace(&mut self.infer, prev);
+            if let Err(diags) = self.solve_current_ctx(&mut current) {
+                self.ctx.rollback_transaction();
+                self.region_tree = saved_tree;
+                return Err(diags);
+            }
         }
         self.ctx.commit_transaction();
 

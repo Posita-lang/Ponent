@@ -1,21 +1,24 @@
 use super::*;
 
-/// A scoped guard that restores `current_function` and `current_return_type`
-/// on drop, and optionally exits the inference scope.
+/// A scoped guard that owns the inference-scope lifecycle.
 ///
-/// # Safety
-/// `Drop` does NOT call `exit_inference_scope` — that function can fail,
-/// and Rust's `Drop` cannot propagate errors.  Instead, callers MUST
-/// invoke [`commit`](ScopeGuard::commit) before the guard drops.
-/// If the guard drops without `commit()` having been called, the
-/// TypeContext transaction is **rolled back** to prevent leaking partial
-/// inference state (reviewer #2, issue 1 & 4).
+/// Responsibilities:
+/// - Pops the infer stack on `commit` (before fallible work).
+/// - Holds the saved `RegionTree` snapshot so `Drop` can restore it
+///   if a panic occurs during solving.
+/// - Restores saved fields (`current_function`, …) on drop.
 pub(crate) struct ScopeGuard<'a, 'tcx> {
     pub(crate) checker: &'tcx mut TypeChecker<'a>,
     pub(crate) old_function: Option<DefId>,
     pub(crate) old_return: Option<TypeId>,
     pub(crate) old_trusted: bool,
     pub(crate) should_restore: bool,
+    /// True after `exit_inference_scope` has been called (infer stack already popped).
+    inference_popped: bool,
+    /// Saved region tree snapshot — used on panic to discard frames pushed
+    /// inside this scope.  Taken from `infer_stack` during `commit` and
+    /// stored here before any fallible work runs.
+    saved_tree: Option<region::RegionTree>,
 }
 
 impl<'a, 'tcx> ScopeGuard<'a, 'tcx> {
@@ -29,34 +32,61 @@ impl<'a, 'tcx> ScopeGuard<'a, 'tcx> {
             old_return,
             old_trusted,
             should_restore: true,
+            inference_popped: false,
+            saved_tree: None,
         }
     }
 
-    /// Commit the inference scope: solve constraints, finalize, and commit
-    /// the TypeContext transaction.  On success the guard is defused so that
-    /// `Drop` only restores the saved fields (function, return type, trusted).
-    /// On failure the transaction is rolled back and diagnostics are returned.
+    /// Commit the inference scope.
     ///
-    /// Must be called before the guard drops; calling it twice is a no-op.
+    /// # Panic safety
+    /// 1. Pop the infer stack + save the region-tree snapshot *before*
+    ///    any fallible work.  `inference_popped` is set immediately after
+    ///    the pop so `Drop` never double-pops.
+    /// 2. Store the snapshot in `self.saved_tree` so `Drop` can restore
+    ///    the region tree if solving panics.
+    /// 3. On success discard the snapshot; on error restore it.
     pub(crate) fn commit(mut self) -> Result<(), DiagnosticCollector> {
         if !self.should_restore {
             return Ok(());
         }
-        // Run exit_inference_scope *before* restoring saved fields so the
-        // inference context is still the current one and the transaction is
-        // still open.
-        let result = self.checker.exit_inference_scope();
-        // Commit on success, roll back on failure.
-        if result.is_err() {
-            self.checker.ctx.rollback_transaction();
-        } else {
-            self.checker.ctx.commit_transaction();
+        // ── Pop the infer stack ────────────────────────────────
+        // SAFETY: enter_inference_scope pushes a pair; we are that pair.
+        let (prev, saved_tree) = self.checker.infer_stack.pop().expect(
+            "commit: infer_stack is empty — \
+             enter_inference_scope was never called",
+        );
+        let mut current = mem::replace(&mut self.checker.infer, prev);
+        self.inference_popped = true;
+        // Store the tree snapshot so Drop can restore it on panic.
+        self.saved_tree = Some(saved_tree);
+
+        // ── Solve the popped context ───────────────────────────
+        // This is the same logic that `exit_inference_scope` used to
+        // contain, but without the stack-pop (which is now above).
+        let result = self.checker.solve_current_ctx(&mut current);
+        // Handle the result *inside* the guard so that saved_tree
+        // and should_restore are still accessible.
+        match &result {
+            Ok(()) => {
+                // Success — keep the bindings.
+                self.checker.ctx.commit_transaction();
+                // Discard the snapshot (region tree is consistent).
+                self.saved_tree = None;
+            }
+            Err(_) => {
+                // Inference failed — undo everything.
+                self.checker.ctx.rollback_transaction();
+                // Restore the region tree to its state at scope entry.
+                if let Some(tree) = self.saved_tree.take() {
+                    self.checker.region_tree = tree;
+                }
+            }
         }
         // Restore saved fields regardless of success/failure.
         self.checker.current_function = self.old_function;
         self.checker.current_return_type = self.old_return;
         self.checker.current_function_trusted = self.old_trusted;
-        // Defuse the drop so Drop doesn't do redundant cleanup.
         self.should_restore = false;
         result
     }
@@ -69,10 +99,19 @@ impl<'a, 'tcx> ScopeGuard<'a, 'tcx> {
 impl<'a, 'tcx> Drop for ScopeGuard<'a, 'tcx> {
     fn drop(&mut self) {
         if self.should_restore {
-            // Drop without commit: roll back the transaction and abort the
-            // inference scope to keep `infer` and `infer_stack` consistent.
+            // Always roll back the transaction.
             self.checker.ctx.rollback_transaction();
-            self.checker.abort_inference_scope();
+            // Restore the inference context and region tree.
+            if self.inference_popped {
+                // commit() popped the stack but panicked during solving.
+                // Restore the region tree from the saved snapshot.
+                if let Some(tree) = self.saved_tree.take() {
+                    self.checker.region_tree = tree;
+                }
+            } else {
+                // commit() was never called — normal abort path.
+                self.checker.abort_inference_scope();
+            }
             self.checker.current_function = self.old_function;
             self.checker.current_return_type = self.old_return;
             self.checker.current_function_trusted = self.old_trusted;
@@ -82,46 +121,23 @@ impl<'a, 'tcx> Drop for ScopeGuard<'a, 'tcx> {
 
 impl<'a> TypeChecker<'a> {
     /// Save the current inference context and push a fresh one.
-    /// Also saves TypeContext bindings so the nested scope's resolution
-    /// can be committed on exit rather than leaked incrementally.
     pub(crate) fn enter_inference_scope(&mut self) {
         self.ctx.begin_transaction();
         let old = mem::replace(&mut self.infer, InferenceContext::new());
-        self.infer_stack.push(old);
+        self.infer_stack.push((old, self.region_tree.clone()));
     }
 
-    /// Pop the inference context, solve its constraints, and finalize.
+    /// Solve and finalise `ctx` (the inference context that was popped
+    /// from the stack by the caller).  Does **not** touch the infer stack
+    /// or the region tree — those are the caller's responsibility.
     ///
-    /// # Panics
-    /// Panics if `infer_stack` is empty — callers must ensure every
-    /// `enter_inference_scope` has a matching `exit_inference_scope`.
-    ///
-    /// On success the TypeContext transaction remains open so the caller
-    /// can commit it (via `ScopeGuard::commit`); on error the caller must
-    /// roll back.
-    ///
-    /// Fixes (reviewer #2):
-    /// - Panics on empty stack instead of silently using a default context.
-    /// - Does NOT commit the transaction — the caller decides.
-    /// - Propagates `checker_dirty` region levels into the inference context.
-    /// - Diagnostics are collected in `self.diagnostics` and returned.
-    pub(crate) fn exit_inference_scope(&mut self) -> Result<(), DiagnosticCollector> {
-        let prev = self.infer_stack.pop().expect(
-            "exit_inference_scope: infer_stack is empty — \
-             enter_inference_scope was never called or was called twice",
-        );
-        let mut current = mem::replace(&mut self.infer, prev);
-
+    /// Returns `Ok(())` on success.  On error the caller must roll back
+    /// the transaction and restore the region tree.
+    pub(crate) fn solve_current_ctx(
+        &mut self,
+        current: &mut InferenceContext,
+    ) -> Result<(), DiagnosticCollector> {
         // ── Dirty region propagation ─────────────────────────────
-        // Mark the inference context's current region as dirty so that
-        // the generalization step considers it.  The checker's own region
-        // tree (region.rs) has a mark_dirty() / collect_dirty_levels()
-        // API, but it is not yet wired into any variable‑binding path —
-        // inference-variable dirtiness is tracked entirely within the
-        // inference context's own InferRegionTree.  When the checker's
-        // region dirtiness is eventually populated, this block should
-        // map checker RegionIds to infer InferRegionIds (they share the
-        // same usize encoding) and propagate them here.
         current.region_tree.mark_current_dirty();
 
         // ── Solve ───────────────────────────────────────────────────
@@ -136,15 +152,14 @@ impl<'a> TypeChecker<'a> {
         // ── Check for unresolved constraints ─────────────────────────
         let unresolved = current.check_unresolved(self.ctx);
         let has_errors = !unresolved.is_empty();
-        for msg in &unresolved {
-            self.diagnostics.push(
-                Diagnostic::error(msg)
-                    .with_code_str("E030")
-                    .with_span(Span::new(0, 0)),
-            );
-        }
-
         if has_errors {
+            for msg in &unresolved {
+                self.diagnostics.push(
+                    Diagnostic::error(msg)
+                        .with_code_str("E030")
+                        .with_span(Span::new(0, 0)),
+                );
+            }
             return Err(mem::take(&mut self.diagnostics));
         }
 
@@ -152,19 +167,16 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Abort the current inference scope without solving constraints.
-    /// Pops the inference stack and restores the previous inference context,
-    /// discarding any work done in the aborted scope.
-    /// The caller is responsible for rolling back the TypeContext transaction.
-    ///
-    /// # Panics
-    /// Panics if `infer_stack` is empty — matching the contract of
-    /// `exit_inference_scope` and `enter_inference_scope`.
+    /// Pops the inference stack and restores the previous inference context
+    /// **and** region tree (via the saved snapshot), discarding any work
+    /// done in the aborted scope.
     pub(crate) fn abort_inference_scope(&mut self) {
-        let prev = self.infer_stack.pop().expect(
+        let (prev, saved_tree) = self.infer_stack.pop().expect(
             "abort_inference_scope: infer_stack is empty — \
              enter_inference_scope was never called or was called twice",
         );
         self.infer = prev;
+        self.region_tree = saved_tree;
     }
 
     /// Push a new context frame (e.g., entering a function body, loop, closure).
@@ -177,10 +189,7 @@ impl<'a> TypeChecker<'a> {
         self.region_tree.pop_frame();
     }
 
-    /// Find the innermost break target (Loop, While, For, LabeledBlock).
-    /// Returns the target's span and optional label.
-    /// If `label` is Some, only match same-named LabeledBlock.
-    /// Stops at Closure/AsyncBlock boundaries to prevent cross-boundary breaks.
+    /// Find the innermost break target.
     pub(crate) fn find_break_target<'b>(
         &self,
         label: Option<&'b str>,
@@ -191,7 +200,6 @@ impl<'a> TypeChecker<'a> {
                     if label.is_none() {
                         return Some((frame.span, None));
                     }
-                    // With a label, only matching LabeledBlock is a valid target.
                     continue;
                 }
                 CtxKind::LabeledBlock => {
@@ -199,9 +207,7 @@ impl<'a> TypeChecker<'a> {
                         if frame.label.as_deref() == Some(lbl) {
                             return Some((frame.span, Some(lbl)));
                         }
-                        // Different label — skip, continue searching outward.
                     }
-                    // Without a label, LabeledBlock is not an implicit break target.
                 }
                 CtxKind::Closure | CtxKind::AsyncBlock => {
                     return None;
@@ -213,14 +219,10 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Find the innermost continue target (only Loop, While, For).
-    /// Posita's `continue` does not support labels; `label` is always None.
     pub(crate) fn find_continue_target(&self, label: Option<&str>) -> Option<(Span, &str)> {
         for frame in self.region_tree.iter_frames_rev() {
             match &frame.kind {
                 CtxKind::Loop | CtxKind::While | CtxKind::For => {
-                    // `continue` with a label is not valid in Posita.
-                    // If a label was provided, skip this loop and keep searching
-                    // (the caller will report "label not found").
                     if label.is_some() {
                         continue;
                     }
@@ -233,7 +235,6 @@ impl<'a> TypeChecker<'a> {
                     return Some((frame.span, kind_str));
                 }
                 CtxKind::LabeledBlock => {
-                    // `continue` cannot target LabeledBlock; skip.
                     continue;
                 }
                 CtxKind::Closure | CtxKind::AsyncBlock => {
