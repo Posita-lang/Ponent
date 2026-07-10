@@ -440,6 +440,17 @@ This restriction prevents conflicting implementations across crates.",
             _ => "No detailed explanation is available for this error code yet.",
         }
     }
+    /// The diagnostic URL for the `--explain` feature.
+    /// Returns a URL to the online error code documentation,
+    /// matching the pattern of rustc's `https://doc.rust-lang.org/error_codes/E030.html`.
+    pub fn url(&self) -> String {
+        format!("https://doc.posita-lang.org/error_codes/{}.html", self.code())
+    }
+
+    /// The diagnostic URL, formatted as an ANSI hyperlink if the terminal supports it.
+    pub fn url_ansi(&self) -> String {
+        format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", self.url(), self.code())
+    }
 }
 
 impl fmt::Display for ErrorCode {

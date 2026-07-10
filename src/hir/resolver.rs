@@ -587,12 +587,14 @@ impl<'a> NameResolver<'a> {
             Stmt::Edition(version, span) => {
                 match crate::hir::types::Edition::from_str(version) {
                     Some(ed) => self.ctx.set_edition(ed),
-                    None => self.diagnostics.push(
-                        Diagnostic::error(format!("unknown edition `{}`", version))
-                            .with_code_str("E070")
-                            .with_span(*span)
-                            .with_suggestion("use a valid edition: `\"2024\"` or `\"2026\"`"),
-                    ),
+                    None => {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!("unknown edition `{}`", version))
+                                .with_code_str("E070")
+                                .with_span(*span)
+                                .with_suggestion("use a valid edition: `\"2024\"` or `\"2026\"`"),
+                        );
+                    }
                 }
             }
             Stmt::LayoutDef { name, attributes, .. } => {

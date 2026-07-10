@@ -465,19 +465,19 @@ pub enum Token {
 
     #[regex("[0-9][0-9_]*", |lex| {
         let s = lex.slice().replace('_', "");
-        s.parse::<i64>().map(Ok).unwrap_or_else(|_| Err("integer literal overflow".to_string()))
+        s.parse::<i128>().map(Ok).unwrap_or_else(|_| Err("integer literal overflow".to_string()))
     })]
-    IntLiteral(Result<i64, String>),
+    IntLiteral(Result<i128, String>),
     #[regex("0x[0-9a-fA-F][0-9a-fA-F_]*", |lex| {
         let s = lex.slice()[2..].replace('_', "");
-        i64::from_str_radix(&s, 16).map(Ok).unwrap_or_else(|_| Err("hex literal overflow".to_string()))
+        i128::from_str_radix(&s, 16).map(Ok).unwrap_or_else(|_| Err("hex literal overflow".to_string()))
     })]
-    HexLiteral(Result<i64, String>),
+    HexLiteral(Result<i128, String>),
     #[regex("0b[01][01_]*", |lex| {
         let s = lex.slice()[2..].replace('_', "");
-        i64::from_str_radix(&s, 2).map(Ok).unwrap_or_else(|_| Err("binary literal overflow".to_string()))
+        i128::from_str_radix(&s, 2).map(Ok).unwrap_or_else(|_| Err("binary literal overflow".to_string()))
     })]
-    BinLiteral(Result<i64, String>),
+    BinLiteral(Result<i128, String>),
 
     #[regex("'(?:[^'\\\\]|\\\\[^']*|\\\\')'", |lex| parse_char_literal(lex.slice()))]
     CharLiteral(Result<u8, String>),
@@ -800,16 +800,17 @@ mod tests {
 
     #[test]
     fn integer_overflow_errors() {
+        // These values overflow i128 and should produce errors.
         check_tokens(
-            "99999999999999999999",
+            "999999999999999999999999999999999999999",
             vec![Token::IntLiteral(Err("integer literal overflow".into()))],
         );
         check_tokens(
-            "0xFFFFFFFFFFFFFFFFF",
+            "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
             vec![Token::HexLiteral(Err("hex literal overflow".into()))],
         );
         check_tokens(
-            "0b1111111111111111111111111111111111111111111111111111111111111111",
+            "0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
             vec![Token::BinLiteral(Err("binary literal overflow".into()))],
         );
         check_tokens("-42", vec![Token::Minus, Token::IntLiteral(Ok(42))]);
@@ -1102,7 +1103,7 @@ mod tests {
 
     #[test]
     fn numeric_literal_safety_does_not_panic_on_overflow() {
-        let huge_int = "99999999999999999999";
+        let huge_int = "999999999999999999999999999999999999999";
         let tokens: Vec<_> = Token::lexer(huge_int)
             .filter_map(|r| r.ok())
             .filter(|t| *t != Token::WhitespaceOrComment)
@@ -1112,7 +1113,7 @@ mod tests {
             vec![Token::IntLiteral(Err("integer literal overflow".into()))]
         );
 
-        let huge_hex = "0xFFFFFFFFFFFFFFFFF";
+        let huge_hex = "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
         let tokens: Vec<_> = Token::lexer(huge_hex)
             .filter_map(|r| r.ok())
             .filter(|t| *t != Token::WhitespaceOrComment)
@@ -1519,8 +1520,8 @@ mod tests {
 
     #[test]
     fn integer_max_values() {
-        check_tokens("9223372036854775807", vec![Token::IntLiteral(Ok(i64::MAX))]);
-        check_tokens("0x7FFFFFFFFFFFFFFF", vec![Token::HexLiteral(Ok(i64::MAX))]);
+        check_tokens("9223372036854775807", vec![Token::IntLiteral(Ok(9223372036854775807))]);
+        check_tokens("0x7FFFFFFFFFFFFFFF", vec![Token::HexLiteral(Ok(0x7FFFFFFFFFFFFFFF))]);
     }
 
     #[test]

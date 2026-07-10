@@ -29,10 +29,32 @@ pub use level::DiagnosticLevel;
 use crate::ast::Span;
 use std::fmt;
 
+// ── Emission guarantee (inspired by rustc's ErrorGuaranteed) ─────
+
+/// A token proving that a diagnostic (error or warning) has been emitted.
+///
+/// Functions that can fail should return `Result<T, Diagnostic>` and the
+/// caller pushes it into the collector.  `EmissionGuarantee` tracks
+/// whether the diagnostic was *actually* pushed, preventing "silent
+/// swallowing" of errors.
+///
+/// See rustc's `ErrorGuaranteed` for the original pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmissionGuarantee {
+    _private: (),
+}
+
+impl EmissionGuarantee {
+    /// The emitted diagnostic was an error or warning.
+    pub fn emitted() -> Self {
+        EmissionGuarantee { _private: () }
+    }
+}
+
 /// A complete compiler diagnostic (error, warning, help, note, or info).
 ///
 /// Architecture inspired by multiple compilers:
-/// - **rustc**: Error codes + `^`-underline annotations + suggestions
+/// - **rustc**: Error codes + `^`-underline annotations + suggestions + sub-diagnostics
 /// - **Zig**: `referenced by` call chains for traceability
 /// - **Austral**: Error type categorization + multi-format output
 /// - **Vale**: Structured error variants per compiler pass
@@ -50,6 +72,54 @@ pub struct Diagnostic {
     pub call_chain: Option<CallChain>,
     /// Retained source text for `^`-underline rendering
     pub source: Option<String>,
+    /// Child diagnostics (notes, help messages attached to this diagnostic).
+    /// Inspired by rustc's `Subdiag` — emitted immediately after the parent.
+    pub children: Vec<Subdiag>,
+}
+
+/// A child diagnostic attached to a parent `Diagnostic`.
+/// Inspired by rustc's `Subdiag` — used for notes, help, or secondary
+/// labels that are logically part of the same diagnostic group.
+#[derive(Debug, Clone)]
+pub struct Subdiag {
+    pub level: DiagnosticLevel,
+    pub message: String,
+    pub span: Option<Span>,
+    pub labels: Vec<Label>,
+}
+
+impl Subdiag {
+    /// Create a new sub-diagnostic.
+    pub fn new(level: DiagnosticLevel, message: impl Into<String>) -> Self {
+        Subdiag {
+            level,
+            message: message.into(),
+            span: None,
+            labels: Vec::new(),
+        }
+    }
+
+    /// Create a note sub-diagnostic.
+    pub fn note(message: impl Into<String>) -> Self {
+        Self::new(DiagnosticLevel::Note, message)
+    }
+
+    /// Create a help sub-diagnostic.
+    pub fn help_sub(message: impl Into<String>) -> Self {
+        Self::new(DiagnosticLevel::Help, message)
+    }
+
+    /// Attach a source span to this sub-diagnostic.
+    pub fn with_span(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
+    }
+
+    /// Add a label to this sub-diagnostic.
+    pub fn with_label(mut self, span: Span, label: impl Into<String>) -> Self {
+        self.labels.push(Label::new(span, label));
+        self
+    }
 }
 
 impl Diagnostic {
@@ -66,6 +136,7 @@ impl Diagnostic {
             labels: Vec::new(),
             call_chain: None,
             source: None,
+            children: Vec::new(),
         }
     }
 

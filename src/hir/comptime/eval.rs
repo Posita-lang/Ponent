@@ -63,17 +63,20 @@ impl<'a> ComptimeEvalContext<'a> {
                 let r = self.eval_expr(right)?;
                 match (l, r, op) {
                     (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Add) => {
-                        Ok(ComptimeValue::Int(a + b))
+                        a.checked_add(b).map(ComptimeValue::Int).ok_or(ComptimeError::Overflow)
                     }
                     (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Sub) => {
-                        Ok(ComptimeValue::Int(a - b))
+                        a.checked_sub(b).map(ComptimeValue::Int).ok_or(ComptimeError::Overflow)
                     }
                     (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Mul) => {
-                        Ok(ComptimeValue::Int(a * b))
+                        a.checked_mul(b).map(ComptimeValue::Int).ok_or(ComptimeError::Overflow)
                     }
                     (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Div) => {
                         if b == 0 {
                             Err(ComptimeError::DivisionByZero)
+                        } else if a == i128::MIN && b == -1 {
+                            // i64::MIN / -1 overflows (can't represent as i64)
+                            Err(ComptimeError::Overflow)
                         } else {
                             Ok(ComptimeValue::Int(a / b))
                         }

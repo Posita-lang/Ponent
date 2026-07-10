@@ -7,6 +7,8 @@ pub enum ComptimeError {
     StepLimitExceeded,
     /// Division or remainder by zero.
     DivisionByZero,
+    /// Integer overflow (trap policy) in a comptime expression.
+    Overflow,
     /// Type mismatch in a comptime operation.
     TypeError(String),
     /// Assertion failed at compile time.
@@ -26,6 +28,7 @@ impl std::fmt::Display for ComptimeError {
         match self {
             ComptimeError::StepLimitExceeded => write!(f, "comptime step limit exceeded (possible infinite loop)"),
             ComptimeError::DivisionByZero => write!(f, "division by zero in comptime expression"),
+            ComptimeError::Overflow => write!(f, "integer overflow in comptime expression"),
             ComptimeError::TypeError(msg) => write!(f, "comptime type error: {}", msg),
             ComptimeError::AssertionFailed(msg) => write!(f, "comptime assertion failed: {}", msg),
             ComptimeError::UnknownIdentifier(name) => write!(f, "unknown identifier in comptime: {}", name),

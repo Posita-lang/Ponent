@@ -8,7 +8,7 @@ pub enum ComptimeValue {
     /// A boolean literal.
     Bool(bool),
     /// An integer literal.
-    Int(i64),
+    Int(i128),
     /// A type value (returned by type factories).
     Type(TypeId),
 }

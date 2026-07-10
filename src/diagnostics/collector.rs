@@ -1,4 +1,4 @@
-use super::Diagnostic;
+use super::{Diagnostic, EmissionGuarantee};
 
 /// Collects multiple diagnostics and provides utilities for error aggregation.
 /// Analogue to rustc's `DiagnosticBuilder` / `Handler` pattern.
@@ -14,8 +14,11 @@ impl DiagnosticCollector {
         }
     }
 
-    pub fn push(&mut self, diag: Diagnostic) {
+    /// Push a diagnostic into the collector and return an `EmissionGuarantee`
+    /// proving the diagnostic was recorded (inspired by rustc's `ErrorGuaranteed`).
+    pub fn push(&mut self, diag: Diagnostic) -> EmissionGuarantee {
         self.diagnostics.push(diag);
+        EmissionGuarantee::emitted()
     }
 
     pub fn extend(&mut self, diags: Vec<Diagnostic>) {

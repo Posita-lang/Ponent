@@ -3,7 +3,7 @@ use crate::hir::hir::{HirExpr, HirStmt};
 use crate::hir::types::{TypeContext, TypeId};
 use crate::ast::{BinOp, Literal, Span};
 
-fn make_int(n: i64) -> HirExpr {
+fn make_int(n: i128) -> HirExpr {
     HirExpr::Literal(Literal::Int(n), TypeId(999), Span::new(0, 0))
 }
 

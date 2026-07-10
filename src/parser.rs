@@ -194,11 +194,14 @@ impl Parser {
     fn synchronize(&mut self) {
         loop {
             match self.peek() {
-                Ok(Token::Semicolon) | Ok(Token::RBrace) => {
+                Ok(Token::Semicolon) => {
                     self.advance().ok();
                     return;
                 }
-                Ok(Token::Def)
+                // Stop at RBrace without consuming it — the caller's loop
+                // or enclosing parse function will handle it.
+                Ok(Token::RBrace)
+                | Ok(Token::Def)
                 | Ok(Token::Set)
                 | Ok(Token::Let)
                 | Ok(Token::Type)
@@ -3599,21 +3602,30 @@ impl Parser {
                         .next()
                         .unwrap_or("0")
                         .replace('_', "");
-                    i64::from_str_radix(&num_part, 16).unwrap_or(0)
+                    match i128::from_str_radix(&num_part, 16) {
+                        Ok(v) => v,
+                        Err(_) => return Ok(Expr::Error(Span::new(start, end))),
+                    }
                 } else if s.starts_with("0b") || s.starts_with("0B") {
                     let num_part = s[2..]
                         .split(|c: char| c == 'i' || c == 'u')
                         .next()
                         .unwrap_or("0")
                         .replace('_', "");
-                    i64::from_str_radix(&num_part, 2).unwrap_or(0)
+                    match i128::from_str_radix(&num_part, 2) {
+                        Ok(v) => v,
+                        Err(_) => return Ok(Expr::Error(Span::new(start, end))),
+                    }
                 } else {
                     let num_part = s
                         .split(|c: char| c == 'i' || c == 'u')
                         .next()
                         .unwrap_or("0")
                         .replace('_', "");
-                    num_part.parse::<i64>().unwrap_or(0)
+                    match num_part.parse::<i128>() {
+                        Ok(v) => v,
+                        Err(_) => return Ok(Expr::Error(Span::new(start, end))),
+                    }
                 };
                 let expr = Expr::Literal(Literal::Int(value), Span::new(start, end));
                 if matches!(self.peek(), Ok(Token::Colon)) {
@@ -4305,14 +4317,11 @@ impl Parser {
         if let Some(tok) = self.pending.last() {
             return Some(tok.clone());
         }
-        // Ensure the current token is consumed into peeked, so the cursor
-        // is at the *following* token rather than re-reading the same one.
+        // peek() ensures cursor is at the current token; the next
+        // unconsumed token is always at cursor (peeked advances cursor by 1).
         self.peek();
-        // If peeked is Some, advance() consumed the cursor one step.
-        // The next token in the buffer is at cursor + offset.
-        let offset = if self.peeked.is_some() { 0 } else { 0 };
         self.tokens
-            .get(self.cursor + offset)
+            .get(self.cursor)
             .map(|st| st.token.clone())
     }
 

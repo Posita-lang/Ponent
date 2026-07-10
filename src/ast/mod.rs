@@ -15,7 +15,7 @@ impl Span {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
-    Int(i64),
+    Int(i128),
     Float(f64),
     Char(u8),
     String(String),
