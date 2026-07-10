@@ -30,7 +30,6 @@ pub enum Res {
 /// Pre-resolved name resolution results, populated by NameResolver and consumed by TypeChecker.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ResolutionMap {
-    pub variable_types: FxHashMap<String, TypeId>,
     pub type_def_ids: FxHashMap<String, DefId>,
     pub type_bindings: FxHashMap<DefId, TypeBinding>,
     /// Partial resolution of value paths (multi-segment), keyed by the first segment.
@@ -172,9 +171,6 @@ impl<'a> NameResolver<'a> {
                         span: param.span,
                         def_id: self.allocate_def_id(),
                     };
-                    self.resolution_map
-                        .variable_types
-                        .insert(param.name.clone(), ty);
                     if let Err(diag) =
                         self.symbols
                             .insert_variable(param.name.clone(), binding, param.span)
@@ -693,9 +689,6 @@ impl<'a> NameResolver<'a> {
                         def_id: self.allocate_def_id(),
                     };
                     // Pre-populate resolution map for the type checker
-                    self.resolution_map
-                        .variable_types
-                        .insert(name.clone(), ty_id);
                     if let Err(diag) = self.symbols.insert_variable(name.clone(), binding, *span) {
                         self.diagnostics.push(diag);
                     }
@@ -1074,9 +1067,6 @@ impl<'a> NameResolver<'a> {
                         span: param.span,
                         def_id: self.allocate_def_id(),
                     };
-                    self.resolution_map
-                        .variable_types
-                        .insert(param.name.clone(), ty);
                     if let Err(diag) =
                         self.symbols
                             .insert_variable(param.name.clone(), binding, param.span)
@@ -1792,19 +1782,35 @@ impl<'a> NameResolver<'a> {
             return Ok(());
         }
 
-        // Try as a trait.
-        if path.len() == 1 {
-            if let Some(trait_binding) = self.symbols.lookup_trait(&path[0]).cloned() {
+        // Try as a trait — supports multi-segment paths.
+        if let Some(trait_def_id) = self.symbols.lookup_trait_by_path(path) {
+            if let Some(trait_binding) = self.symbols.lookup_trait_by_def_id(trait_def_id).cloned() {
                 if let Some(name) = &import_name {
                     self.symbols
                         .insert_trait(name.clone(), trait_binding, span)
                         .ok();
                 }
+                // `from path import { items }` — also import traits
+                if let Some(item_list) = items {
+                    for item in item_list {
+                        let item_path = [item.clone()];
+                        if let Some(item_def_id) = self.symbols.lookup_trait_by_path(&item_path) {
+                            if let Some(item_binding) =
+                                self.symbols.lookup_trait_by_def_id(item_def_id).cloned()
+                            {
+                                self.symbols
+                                    .insert_trait(item.clone(), item_binding, span)
+                                    .ok();
+                            }
+                        }
+                    }
+                }
                 return Ok(());
             }
         }
 
-        // Try as a function.
+        // Try as a function — single-segment only for now;
+        // multi-segment function imports require module hierarchy support.
         if path.len() == 1 {
             if let Some(func_binding) = self.symbols.lookup_function(&path[0]).cloned() {
                 if let Some(name) = &import_name {

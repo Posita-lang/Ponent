@@ -155,21 +155,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         );
                     }
                     Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
-                } else if let Some(&ty) = self.checker.resolution_map.variable_types.get(name) {
-                    // Fall back to the name resolver's pre-resolved types
-                    if self.checker.mutable_globals.contains(name) && !self.checker.current_function_trusted {
-                        self.checker.diagnostics.push(
-                            Diagnostic::error(format!(
-                                "cannot read mutable global `{}` outside `@trusted` function",
-                                name,
-                            ))
-                            .with_code_str("E040")
-                            .with_span(*span)
-                            .with_help("wrap the function in `@trusted` and add `requires`/`ensures` contracts")
-                        );
-                    }
-                    self.checker.local_variable_types.insert_global(name.clone(), ty);
-                    Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
                 } else if let Some(binding) = self.checker.symbols.lookup_variable(name, *span) {
                     Ok((HirExpr::Ident(name.clone(), binding.ty, *span), binding.ty))
                 } else if let Some(func) = self.checker.symbols.lookup_function(name) {
@@ -790,10 +775,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     });
                     param_tys.push(ty);
                 }
+                // Enter a variable scope for closure parameters so they don't leak
+                // into the enclosing function's scope.
+                let _closure_scope = self.checker.enter_var_scope();
+                for p in &hir_params {
+                    self.checker.local_variable_types.insert(p.name.clone(), p.ty);
+                }
                 self.checker.push_ctx(CtxKind::Closure, *span, None);
                 let body_hir = self.check_block(body)?;
                 let body_ty = self.block_type(&body_hir);
                 self.checker.pop_ctx();
+                // _closure_scope dropped here — removes closure parameter bindings
                 let ret_ty = match return_type {
                     Some(ty) => {
                         let declared = self.resolve_type(ty)?;

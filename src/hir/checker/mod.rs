@@ -231,10 +231,6 @@ impl<'a> TypeChecker<'a> {
             mutable_globals: HashSet::new(),
             current_function_trusted: false,
         };
-        // Pre-populate from the name resolver's results into the base scope
-        checker
-            .local_variable_types
-            .extend(checker.resolution_map.variable_types.clone().into_iter());
         checker
     }
 

@@ -363,6 +363,11 @@ impl SymbolTable {
         self.trait_defs.get(&def_id)
     }
 
+    /// Expose the full-path-to-DefId table for multi-segment lookups.
+    pub fn full_path_to_def_id(&self) -> &HashMap<String, DefId> {
+        &self.full_path_to_def_id
+    }
+
     pub fn lookup_constraint(&self, name: &str) -> Option<&ConstraintBinding> {
         let mut idx = self.current_scope;
         while let Some(scope) = self.scopes.get(idx) {
