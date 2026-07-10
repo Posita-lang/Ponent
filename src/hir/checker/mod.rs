@@ -6,8 +6,10 @@ use crate::hir::resolver::ResolutionMap;
 use crate::hir::symbol::*;
 use crate::hir::traits::TraitEnv;
 use crate::hir::types::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::mem;
 
 pub mod autoderef;
@@ -53,6 +55,100 @@ pub struct CtxFrame {
     /// Optionaw wabew name (onwy used by WabewedBwock)
     label: Option<String>,
 }
+/// A scoped map of variable name → TypeId.
+///
+/// Maintains a stack of `HashMap` frames. New bindings are always
+/// inserted into the innermost frame. Lookups search from innermost
+/// to outermost, implementing lexical shadowing.
+///
+/// Uses `Rc<RefCell<...>>` for interior mutability so that
+/// `VarScopeGuard` can own a separate `Rc` reference and pop frames
+/// in its `Drop` without holding any borrow on the `TypeChecker`.
+///
+/// This replaces a flat `HashMap` that leaked bindings across scope
+/// boundaries (e.g. `if let Some(x) = ... { }` would leave `x` in
+/// scope after the block).
+#[derive(Debug, Clone)]
+pub struct ScopedVarMap {
+    frames: Rc<RefCell<Vec<HashMap<String, TypeId>>>>,
+}
+
+impl ScopedVarMap {
+    pub fn new() -> Self {
+        ScopedVarMap {
+            frames: Rc::new(RefCell::new(vec![HashMap::new()])),
+        }
+    }
+
+    /// Push a new, empty scope frame.
+    pub fn push_frame(&self) {
+        self.frames.borrow_mut().push(HashMap::new());
+    }
+
+    /// Pop the innermost scope frame, discarding its bindings.
+    pub fn pop_frame(&self) {
+        self.frames.borrow_mut().pop();
+    }
+
+    /// Insert a binding into the innermost scope frame.
+    pub fn insert(&self, name: String, ty: TypeId) {
+        self.frames.borrow_mut().last_mut().unwrap().insert(name, ty);
+    }
+
+    /// Insert a binding into the base (outermost) scope frame.
+    /// Used for caching global/module‑level variable types so they
+    /// persist across all nested scopes.
+    pub fn insert_global(&self, name: String, ty: TypeId) {
+        self.frames.borrow_mut()[0].insert(name, ty);
+    }
+
+    /// Look up a binding, searching from innermost to outermost scope.
+    pub fn get(&self, name: &str) -> Option<TypeId> {
+        let frames = self.frames.borrow();
+        for frame in frames.iter().rev() {
+            if let Some(&ty) = frame.get(name) {
+                return Some(ty);
+            }
+        }
+        None
+    }
+
+    /// Extend the innermost frame with an iterator of bindings.
+    pub fn extend(&self, iter: impl IntoIterator<Item = (String, TypeId)>) {
+        self.frames.borrow_mut().last_mut().unwrap().extend(iter);
+    }
+
+    /// Return a clone of the inner `Rc` so a guard can
+    /// operate independently of any borrow on this struct.
+    fn rc_clone(&self) -> Rc<RefCell<Vec<HashMap<String, TypeId>>>> {
+        Rc::clone(&self.frames)
+    }
+}
+
+/// RAII guard that pops a variable scope frame on drop.
+///
+/// Returned by `TypeChecker::enter_var_scope()`. Ensures the frame is
+/// popped even when the enclosing function returns early via `?`.
+///
+/// Owns its own `Rc` reference to the frames vector, completely
+/// independent of any borrow on the `TypeChecker` or `ScopedVarMap`.
+pub(crate) struct VarScopeGuard {
+    frames: Rc<RefCell<Vec<HashMap<String, TypeId>>>>,
+}
+
+impl VarScopeGuard {
+    fn new(frames: Rc<RefCell<Vec<HashMap<String, TypeId>>>>) -> Self {
+        frames.borrow_mut().push(HashMap::new());
+        VarScopeGuard { frames }
+    }
+}
+
+impl Drop for VarScopeGuard {
+    fn drop(&mut self) {
+        self.frames.borrow_mut().pop();
+    }
+}
+
 pub struct TypeChecker<'a> {
     ctx: &'a mut TypeContext,
     symbols: &'a SymbolTable,
@@ -71,9 +167,10 @@ pub struct TypeChecker<'a> {
     /// Wepwaces the owd wineaw `woop_stack` with a twee stwuctuwe
     /// suppowting pawtiaw genewawization (OmniML §3.2). (｀・ω・´)
     region_tree: RegionTree,
-    /// Locaw cache of variabwe types, updated by check_stmt for each VawiabweDef.
+    /// Scoped cache of variable types, managed as a stack of frames.
+    /// A new frame is pushed on block entry and popped on block exit.
     /// Ovewwides the wesowvew's pwacehowdew `ewrow` type. (◕‿◕)
-    local_variable_types: HashMap<String, TypeId>,
+    local_variable_types: ScopedVarMap,
     /// Pre-resolved by NameResolver: variable name → TypeId
     resolution_map: ResolutionMap,
     /// Local cache of generic type parameter types (e.g. `T` in `def foo<T>(x: T)`).
@@ -127,17 +224,17 @@ impl<'a> TypeChecker<'a> {
             infer: InferenceContext::new(),
             infer_stack: Vec::new(),
             region_tree: RegionTree::new(),
-            local_variable_types: HashMap::new(),
+            local_variable_types: ScopedVarMap::new(),
             local_type_param_cache: HashMap::new(),
             resolution_map,
             guarantee_chain: GuaranteeChain::new(),
             mutable_globals: HashSet::new(),
             current_function_trusted: false,
         };
-        // Pre-populate from the name resolver's results
-        for (name, ty) in &checker.resolution_map.variable_types {
-            checker.local_variable_types.insert(name.clone(), *ty);
-        }
+        // Pre-populate from the name resolver's results into the base scope
+        checker
+            .local_variable_types
+            .extend(checker.resolution_map.variable_types.clone().into_iter());
         checker
     }
 
@@ -456,6 +553,9 @@ impl<'a> TypeChecker<'a> {
                 guard.checker.enter_inference_scope();
                 guard.checker.push_ctx(CtxKind::Function, *span, None);
 
+                // Enter a variable scope for the function body
+                let _scope = guard.checker.enter_var_scope();
+
                 // Pre-populate the local variable cache with function parameters
                 // and `result` so that ensures clauses can reference them.
                 for p in &hir_params {
@@ -586,6 +686,10 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
 
+                // Pop variable scope — removes function params and `result` — via RAII
+                // (the _scope guard above drops here on the normal path; on `?` it drops
+                // implicitly via its Drop impl, preventing frame leaks.)
+
                 let finally_hir = if let Some(finally) = finally {
                     let mut stmts = Vec::new();
                     for s in finally {
@@ -668,8 +772,12 @@ impl<'a> TypeChecker<'a> {
                 span,
             } => {
                 let (scrut_hir, scrut_ty) = self.infer_expr(scrutinee)?;
-                let pattern_hir = self.check_pattern(pattern, scrut_ty)?;
-                let then_hir = self.check_block(then_branch)?;
+                let (pattern_hir, then_hir) = {
+                    let _scope = self.enter_var_scope();
+                    let p = self.check_pattern(pattern, scrut_ty)?;
+                    let t = self.check_block(then_branch)?;
+                    (p, t)
+                }; // _scope dropped: pattern + then-branch bindings removed
                 let else_hir = if let Some(else_branch) = else_branch {
                     Some(self.check_block(else_branch)?)
                 } else {
@@ -729,6 +837,7 @@ impl<'a> TypeChecker<'a> {
                 span,
             } => {
                 let (scrut_hir, scrut_ty) = self.infer_expr(scrutinee)?;
+                let _scope = self.enter_var_scope();
                 let pattern_hir = self.check_pattern(pattern, scrut_ty)?;
                 let inv_hir = invariant
                     .as_ref()
@@ -741,6 +850,7 @@ impl<'a> TypeChecker<'a> {
                 self.push_ctx(CtxKind::While, *span, None);
                 let body_hir = self.check_block(body)?;
                 self.pop_ctx();
+                // scope drops here — removes pattern bindings
                 Ok(HirStmt::WhileLet {
                     pattern: pattern_hir,
                     scrutinee: Box::new(scrut_hir),
@@ -770,6 +880,7 @@ impl<'a> TypeChecker<'a> {
                         );
                         self.ctx.error()
                     });
+                let _scope = self.enter_var_scope();
                 let pattern_hir = self.check_pattern(pattern, elem_ty)?;
                 let inv_hir = invariant
                     .as_ref()
@@ -782,6 +893,7 @@ impl<'a> TypeChecker<'a> {
                 self.push_ctx(CtxKind::For, *span, None);
                 let body_hir = self.check_block(body)?;
                 self.pop_ctx();
+                // scope drops here — removes pattern + block bindings
                 Ok(HirStmt::For {
                     pattern: pattern_hir,
                     iterable: Box::new(iter_hir),

@@ -189,6 +189,12 @@ impl<'a> TypeChecker<'a> {
         self.region_tree.pop_frame();
     }
 
+    /// Push a new scope frame for local variable bindings.
+    /// Returns a guard that pops the frame on drop — safe even under `?`.
+    pub(crate) fn enter_var_scope(&self) -> VarScopeGuard {
+        VarScopeGuard::new(self.local_variable_types.rc_clone())
+    }
+
     /// Find the innermost break target.
     pub(crate) fn find_break_target<'b>(
         &self,

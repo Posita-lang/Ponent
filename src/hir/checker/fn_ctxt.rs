@@ -141,7 +141,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
             Expr::Ident(name, span) => {
                 // Check the local variable type cache first (set by VariableDef)
-                if let Some(&ty) = self.checker.local_variable_types.get(name) {
+                if let Some(ty) = self.checker.local_variable_types.get(name) {
                     // Reading a mutable global outside @trusted is forbidden
                     if self.checker.mutable_globals.contains(name) && !self.checker.current_function_trusted {
                         self.checker.diagnostics.push(
@@ -168,7 +168,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             .with_help("wrap the function in `@trusted` and add `requires`/`ensures` contracts")
                         );
                     }
-                    self.checker.local_variable_types.insert(name.clone(), ty);
+                    self.checker.local_variable_types.insert_global(name.clone(), ty);
                     Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
                 } else if let Some(binding) = self.checker.symbols.lookup_variable(name, *span) {
                     Ok((HirExpr::Ident(name.clone(), binding.ty, *span), binding.ty))
@@ -853,6 +853,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let (ok_ty, error_ty) = self.checker.extract_result_types(expr_ty, *span)?;
                 let mut hir_branches = Vec::new();
                 for branch in branches {
+                    let _scope = self.checker.enter_var_scope();
                     let pattern_hir = self.check_pattern(&branch.pattern, error_ty)?;
                     let body_hir = self.check_block(&branch.body)?;
                     hir_branches.push(HirCatchBranch {
@@ -861,6 +862,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         body: body_hir,
                         span: branch.span,
                     });
+                    // scope drops here — removes pattern + body bindings
                 }
                 Ok((
                     HirExpr::Catch {
@@ -986,8 +988,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 span,
             } => {
                 let (scrut_hir, scrut_ty) = self.infer_expr(scrutinee)?;
-                let pattern_hir = self.check_pattern(pattern, scrut_ty)?;
-                let then_hir = self.check_block(then_branch)?;
+                // Enter scope so the pattern binding is scoped to the then-branch
+                let (pattern_hir, then_hir) = {
+                    let _scope = self.checker.enter_var_scope();
+                    let p = self.check_pattern(pattern, scrut_ty)?;
+                    let t = self.check_block(then_branch)?;
+                    (p, t)
+                }; // _scope dropped: pattern + then-branch bindings removed
                 let else_hir = else_branch
                     .as_ref()
                     .map(|b| self.check_block(b))
@@ -1014,6 +1021,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let mut hir_arms = Vec::new();
                 let mut arm_ty = None;
                 for arm in arms {
+                    // Each arm introduces pattern bindings in its own scope
+                    let _scope = self.checker.enter_var_scope();
                     let pattern_hir = self.check_pattern(&arm.pattern, scrut_ty)?;
                     let guard_hir = arm
                         .guard
@@ -1042,6 +1051,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         body: Box::new(body_hir),
                         span: arm.span,
                     });
+                    // scope drops here — removes pattern + body bindings
                 }
                 let result_ty = arm_ty.unwrap_or(self.checker.ctx.unit());
 
@@ -1867,10 +1877,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     /// Check a block — actual implementation, not delegation.
     pub fn check_block(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, Diagnostic> {
+        let _scope = self.checker.enter_var_scope();
         let mut result = Vec::new();
         for stmt in stmts {
             result.push(self.checker.check_stmt(stmt)?);
         }
+        // scope drops here — pops the frame (even on `?` early return)
         Ok(result)
     }
 
@@ -2094,7 +2106,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 /// into `local_variable_types` so the body of if-let / while-let / for / match
 /// can reference the bound variable.
 pub(super) fn register_pattern_bindings(
-    local_variable_types: &mut HashMap<String, TypeId>,
+    local_variable_types: &mut ScopedVarMap,
     pattern: &HirPattern,
 ) {
     match pattern {
