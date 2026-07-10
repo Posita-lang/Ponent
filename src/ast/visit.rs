@@ -1,10 +1,9 @@
-use super::*;
+//! AST walker. Follows the same pattern as `rustc`'s visitor.
+//! Each overridden visit method has full control; the default calls `walk_*`.
 
-// ── Visitor trait (immutable) ────────────────────────────────────
+use crate::ast::*;
 
-/// AST walker. Each visit method has a default implementation that
-/// recursively walks child nodes via the corresponding `walk_*` function.
-/// Override specific methods to intercept traversal.
+/// AST visitor (immutable, shared references).
 pub trait Visitor<'ast>: Sized {
     type Result: VisitorResult;
 
@@ -37,7 +36,7 @@ pub trait Visitor<'ast>: Sized {
     }
 }
 
-// ── Walk functions (default recursion) ───────────────────────────
+// ── Immutable walk functions ─────────────────────────────────────
 
 pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V::Result {
     match expr {
@@ -63,9 +62,15 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
             visitor.visit_expr(base);
             visitor.visit_expr(index)
         }
-        Expr::FieldAccess { base, .. }
-        | Expr::AttrAccess { base, .. }
-        | Expr::Cast { expr: base, .. } => visitor.visit_expr(base),
+        Expr::FieldAccess { base, field, span } => {
+            visitor.visit_expr(base);
+            visitor.visit_ident(field, span)
+        }
+        Expr::AttrAccess { base, attr, span } => {
+            visitor.visit_expr(base);
+            visitor.visit_ident(attr, span)
+        }
+        Expr::Cast { expr: base, .. } => visitor.visit_expr(base),
         Expr::Range { start, end, .. } => {
             if let Some(e) = start {
                 visitor.visit_expr(e);
@@ -81,7 +86,8 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
             }
             V::Result::output()
         }
-        Expr::EnumLit { payload, .. } => {
+        Expr::EnumLit { variant, payload, span, .. } => {
+            visitor.visit_ident(variant, span);
             if let Some(e) = payload {
                 visitor.visit_expr(e)
             } else {
@@ -207,11 +213,14 @@ pub fn walk_stmt<'ast, V: Visitor<'ast>>(visitor: &mut V, stmt: &'ast Stmt) -> V
             V::Result::output()
         }
         Stmt::FunctionDef {
+            name,
             params,
             body,
             finally,
+            span,
             ..
         } => {
+            visitor.visit_ident(name, span);
             for p in params {
                 visitor.visit_param(p);
             }
@@ -272,9 +281,13 @@ pub fn walk_stmt<'ast, V: Visitor<'ast>>(visitor: &mut V, stmt: &'ast Stmt) -> V
             V::Result::output()
         }
         Stmt::WhileLet {
-            scrutinee, body, ..
+            pattern,
+            scrutinee,
+            body,
+            ..
         } => {
             visitor.visit_expr(scrutinee);
+            visitor.visit_pattern(pattern);
             for s in body {
                 visitor.visit_stmt(s);
             }
@@ -342,7 +355,7 @@ pub fn walk_ty<'ast, V: Visitor<'ast>>(_visitor: &mut V, _ty: &'ast Type) -> V::
 pub fn walk_pattern<'ast, V: Visitor<'ast>>(visitor: &mut V, pat: &'ast Pattern) -> V::Result {
     match pat {
         Pattern::Wildcard(_) | Pattern::Error(_) => V::Result::output(),
-        Pattern::Ident(_, _) => V::Result::output(),
+        Pattern::Ident(name, span) => visitor.visit_ident(name, span),
         Pattern::Literal(expr, _) => visitor.visit_expr(expr),
         Pattern::Tuple(patterns, _) | Pattern::Slice(patterns, ..) => {
             for p in patterns {
@@ -373,6 +386,7 @@ pub fn walk_pattern<'ast, V: Visitor<'ast>>(visitor: &mut V, pat: &'ast Pattern)
 }
 
 pub fn walk_param<'ast, V: Visitor<'ast>>(visitor: &mut V, param: &'ast Param) -> V::Result {
+    visitor.visit_ident(&param.name, &param.span);
     if let Some(ty) = &param.ty {
         visitor.visit_ty(ty)
     } else {
@@ -407,6 +421,9 @@ pub trait MutVisitor: Sized {
     fn visit_pattern_mut(&mut self, pat: &mut Pattern) {
         walk_pattern_mut(self, pat)
     }
+    fn visit_param_mut(&mut self, param: &mut Param) {
+        walk_param_mut(self, param)
+    }
     fn visit_ident_mut(&mut self, name: &mut String) {
         let _ = name;
     }
@@ -431,9 +448,15 @@ pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
             visitor.visit_expr_mut(base);
             visitor.visit_expr_mut(index);
         }
-        Expr::FieldAccess { base, .. }
-        | Expr::AttrAccess { base, .. }
-        | Expr::Cast { expr: base, .. } => visitor.visit_expr_mut(base),
+        Expr::FieldAccess { base, field, .. } => {
+            visitor.visit_expr_mut(base);
+            visitor.visit_ident_mut(field);
+        }
+        Expr::AttrAccess { base, attr, .. } => {
+            visitor.visit_expr_mut(base);
+            visitor.visit_ident_mut(attr);
+        }
+        Expr::Cast { expr: base, .. } => visitor.visit_expr_mut(base),
         Expr::Range { start, end, .. } => {
             if let Some(s) = start {
                 visitor.visit_expr_mut(s);
@@ -446,8 +469,10 @@ pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
             for (_, e) in fields {
                 visitor.visit_expr_mut(e);
             }
+            // NOTE: field names are String, not ident — not visited.
         }
-        Expr::EnumLit { payload, .. } => {
+        Expr::EnumLit { variant, payload, .. } => {
+            visitor.visit_ident_mut(variant);
             if let Some(e) = payload {
                 visitor.visit_expr_mut(e);
             }
@@ -465,8 +490,11 @@ pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
             }
         }
         Expr::Closure {
-            params: _, body, ..
+            params, body, ..
         } => {
+            for p in params {
+                visitor.visit_param_mut(p);
+            }
             for s in body {
                 visitor.visit_stmt_mut(s);
             }
@@ -488,12 +516,14 @@ pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
             }
         }
         Expr::IfLet {
+            pattern,
             scrutinee,
             then_branch,
             else_branch,
             ..
         } => {
             visitor.visit_expr_mut(scrutinee);
+            visitor.visit_pattern_mut(pattern);
             for s in then_branch {
                 visitor.visit_stmt_mut(s);
             }
@@ -508,6 +538,7 @@ pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
         } => {
             visitor.visit_expr_mut(scrutinee);
             for arm in arms {
+                visitor.visit_pattern_mut(&mut arm.pattern);
                 if let Some(g) = &mut arm.guard {
                     visitor.visit_expr_mut(g);
                 }
@@ -524,6 +555,7 @@ pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
         } => {
             visitor.visit_expr_mut(e);
             for b in branches {
+                visitor.visit_pattern_mut(&mut b.pattern);
                 for s in &mut b.body {
                     visitor.visit_stmt_mut(s);
                 }
@@ -557,11 +589,16 @@ pub fn walk_stmt_mut<V: MutVisitor>(visitor: &mut V, stmt: &mut Stmt) {
             }
         }
         Stmt::FunctionDef {
-            params: _,
+            name,
+            params,
             body,
             finally,
             ..
         } => {
+            visitor.visit_ident_mut(name);
+            for p in params {
+                visitor.visit_param_mut(p);
+            }
             if let Some(b) = body {
                 for s in b {
                     visitor.visit_stmt_mut(s);
@@ -591,12 +628,14 @@ pub fn walk_stmt_mut<V: MutVisitor>(visitor: &mut V, stmt: &mut Stmt) {
             }
         }
         Stmt::IfLet {
+            pattern,
             scrutinee,
             then_branch,
             else_branch,
             ..
         } => {
             visitor.visit_expr_mut(scrutinee);
+            visitor.visit_pattern_mut(pattern);
             for s in then_branch {
                 visitor.visit_stmt_mut(s);
             }
@@ -613,15 +652,25 @@ pub fn walk_stmt_mut<V: MutVisitor>(visitor: &mut V, stmt: &mut Stmt) {
             }
         }
         Stmt::WhileLet {
-            scrutinee, body, ..
+            pattern,
+            scrutinee,
+            body,
+            ..
         } => {
             visitor.visit_expr_mut(scrutinee);
+            visitor.visit_pattern_mut(pattern);
             for s in body {
                 visitor.visit_stmt_mut(s);
             }
         }
-        Stmt::For { iterable, body, .. } => {
+        Stmt::For {
+            pattern,
+            iterable,
+            body,
+            ..
+        } => {
             visitor.visit_expr_mut(iterable);
+            visitor.visit_pattern_mut(pattern);
             for s in body {
                 visitor.visit_stmt_mut(s);
             }
@@ -660,7 +709,43 @@ pub fn walk_stmt_mut<V: MutVisitor>(visitor: &mut V, stmt: &mut Stmt) {
     }
 }
 
-pub fn walk_pattern_mut<V: MutVisitor>(_visitor: &mut V, _pat: &mut Pattern) {}
+pub fn walk_pattern_mut<V: MutVisitor>(visitor: &mut V, pat: &mut Pattern) {
+    match pat {
+        Pattern::Wildcard(_) | Pattern::Error(_) => {}
+        Pattern::Ident(name, _) => {
+            visitor.visit_ident_mut(name);
+        }
+        Pattern::Literal(expr, _) => visitor.visit_expr_mut(expr),
+        Pattern::Tuple(patterns, _) | Pattern::Slice(patterns, ..) => {
+            for p in patterns {
+                visitor.visit_pattern_mut(p);
+            }
+        }
+        Pattern::Struct { fields, .. } => {
+            for (_, p) in fields {
+                visitor.visit_pattern_mut(p);
+            }
+        }
+        Pattern::Enum { inner, .. } => {
+            if let Some(p) = inner {
+                visitor.visit_pattern_mut(p);
+            }
+        }
+        Pattern::Or(patterns, _) => {
+            for p in patterns {
+                visitor.visit_pattern_mut(p);
+            }
+        }
+    }
+}
+
+pub fn walk_param_mut<V: MutVisitor>(visitor: &mut V, param: &mut Param) {
+    visitor.visit_ident_mut(&mut param.name);
+    if let Some(ty) = &mut param.ty {
+        // Types currently have no mutable walker — skip.
+        let _ = ty;
+    }
+}
 
 // ── Result type helper (like rustc's `V::Result::output()`) ─────
 
