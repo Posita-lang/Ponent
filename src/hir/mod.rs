@@ -1,5 +1,6 @@
 mod checker;
 mod comptime;
+mod generate;
 mod hir;
 mod infer;
 mod resolver;
@@ -12,6 +13,7 @@ pub mod visit;
 
 pub use checker::*;
 pub use comptime::*;
+pub use generate::*;
 pub use hir::*;
 pub use infer::*;
 pub use resolver::*;

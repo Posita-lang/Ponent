@@ -257,6 +257,11 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
+        // Expand `generate` blocks before solving constraints.  (This step
+        // is now performed before name resolution, so the resolver never sees
+        // unexpanded template bodies.  The expander call here is retained as
+        // a safety net for any `Generate` nodes that might survive — but in
+        // normal operation the list should already be fully expanded.)
         // Solve all queued constraints, finalize inference variables,
         // and commit the transaction. On failure the transaction is
         // rolled back and the region tree is restored to its pre-scope state.
@@ -1527,6 +1532,12 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Stmt::Error(span) => Err(Diagnostic::error("invalid statement").with_span(*span)),
+            // `Stmt::Generate` should never reach the checker — it is expanded
+            // by `GenerateExpander` before name resolution.  If it does, the
+            // expander is not properly wired into the pipeline.
+            Stmt::Generate { span, .. } => Err(Diagnostic::error("generate block not expanded before type checking")
+                .with_span(*span)
+                .with_help("ensure the GenerateExpander runs before the name resolver")),
         }
     }
 

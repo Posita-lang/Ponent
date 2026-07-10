@@ -176,6 +176,14 @@ pub enum HirStmt {
         methods: Vec<ImplMethod>,
         associated_types: Vec<AssociatedType>,
     },
+    /// A `generate` block — expanded by GenerateExpander before type checking.
+    /// After expansion, this node is replaced by the generated declarations.
+    Generate {
+        /// The type this block is attached to (the `for_type`).
+        for_type: TypeId,
+        body: Vec<HirStmt>,
+        span: Span,
+    },
     Error,
 }
 
@@ -346,6 +354,10 @@ pub enum HirExpr {
         ty: TypeId,
         span: Span,
     },
+    /// Compile-time type reflection: `@typeInfo!(Type)`.
+    /// Contains the resolved TypeId of the reflected type.
+    /// Evaluated during `generate` block expansion.
+    TypeInfo(TypeId, Span),
     Error(Span),
 }
 
@@ -435,6 +447,7 @@ impl HirExpr {
             HirExpr::Old { ty, .. } => *ty,
             HirExpr::Task { ty, .. } => *ty,
             HirExpr::Error(_) => unreachable!("Error expression has no type"),
+            HirExpr::TypeInfo(_, _) => TypeId(0), // sentinel — TypeInfo is a comptime-only construct
         }
     }
 
@@ -472,6 +485,7 @@ impl HirExpr {
             HirExpr::Old { span, .. } => *span,
             HirExpr::Task { span, .. } => *span,
             HirExpr::Error(span) => *span,
+            HirExpr::TypeInfo(_, span) => *span,
         }
     }
 }
@@ -506,6 +520,7 @@ impl HirStmt {
             HirStmt::Isolate { span, .. } => *span,
             HirStmt::ImplBlock { span, .. } => *span,
             HirStmt::LayoutDef { span, .. } => *span,
+            HirStmt::Generate { span, .. } => *span,
             HirStmt::Error => Span::new(0, 0),
         }
     }

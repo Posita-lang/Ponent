@@ -1241,6 +1241,11 @@ impl<'a> NameResolver<'a> {
                 Some(self.ctx.error())
             }
             Expr::Error(..) => Some(self.ctx.error()),
+            Expr::TypeInfo(ty, _) => {
+                // @typeInfo!(Type) — resolve the type argument, return Unit.
+                self.resolve_type_expr(ty);
+                Some(self.ctx.unit())
+            }
             Expr::Task { body, .. } => {
                 for s in body { self.resolve_stmt(s); }
                 Some(self.ctx.unit())

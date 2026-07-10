@@ -171,6 +171,10 @@ pub fn walk_hir_expr<V: HirVisitor>(visitor: &mut V, expr: &HirExpr) -> V::Resul
             visitor.visit_hir_expr(body)
         }
         HirExpr::Error(_) => V::Result::output(),
+        HirExpr::TypeInfo(ty, _) => {
+            visitor.visit_type_id(*ty)?;
+            V::Result::output()
+        }
     }
 }
 
@@ -244,6 +248,10 @@ pub fn walk_hir_stmt<V: HirVisitor>(visitor: &mut V, stmt: &HirStmt) -> V::Resul
         HirStmt::TypeDef { .. } | HirStmt::TraitDef { .. } | HirStmt::Import { .. }
         | HirStmt::ExternFunction { .. } | HirStmt::Constraint { .. }
         | HirStmt::ImplBlock { .. } => V::Result::output(),
+        HirStmt::Generate { body, .. } => {
+            for s in body { visitor.visit_hir_stmt(s)?; }
+            V::Result::output()
+        }
     }
 }
 

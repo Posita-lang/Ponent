@@ -1332,6 +1332,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 Ok((HirExpr::Error(*span), self.checker.ctx.error()))
             }
             Expr::Error(span) => Ok((HirExpr::Error(*span), self.checker.ctx.error())),
+            Expr::TypeInfo(ty, span) => {
+                // @typeInfo!(Type) — evaluate at compile time in generate expansion.
+                // At type-checking time, we treat it as a deferred comptime expression.
+                let ty_id = self.resolve_type(ty)?;
+                Ok((HirExpr::TypeInfo(ty_id, *span), self.checker.ctx.unit()))
+            }
             Expr::Task { body, span } => {
                 let block = self.check_block(body)?;
                 let ty = self.checker.ctx.unit();

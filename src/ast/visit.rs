@@ -188,6 +188,7 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
             visitor.visit_expr(body)
         }
         Expr::Error(_) => V::Result::output(),
+        Expr::TypeInfo(ty, _) => visitor.visit_ty(ty),
     }
 }
 
@@ -339,6 +340,10 @@ pub fn walk_stmt<'ast, V: Visitor<'ast>>(visitor: &mut V, stmt: &'ast Stmt) -> V
         | Stmt::Edition(..)
         | Stmt::LayoutDef { .. }
         | Stmt::Error(_) => V::Result::output(),
+        Stmt::Generate { body, .. } => {
+            for s in body { visitor.visit_stmt(s); }
+            V::Result::output()
+        }
         Stmt::TypeDef { .. }
         | Stmt::TraitDef { .. }
         | Stmt::ImplBlock { .. }
@@ -431,7 +436,7 @@ pub trait MutVisitor: Sized {
 
 pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
     match expr {
-        Expr::Literal(_, _) | Expr::Ident(_, _) | Expr::Path(_, _) | Expr::Task { .. } | Expr::Error(_) => {}
+        Expr::Literal(_, _) | Expr::Ident(_, _) | Expr::Path(_, _) | Expr::Task { .. } | Expr::Error(_) | Expr::TypeInfo(_, _) => {}
         Expr::TypeAnnotated { expr: e, ty: _, .. } => visitor.visit_expr_mut(e),
         Expr::BinaryOp { left, right, .. } => {
             visitor.visit_expr_mut(left);
@@ -706,6 +711,9 @@ pub fn walk_stmt_mut<V: MutVisitor>(visitor: &mut V, stmt: &mut Stmt) {
         | Stmt::Import { .. }
         | Stmt::ExternFunction { .. }
         | Stmt::Constraint { .. } => {}
+        Stmt::Generate { body, .. } => {
+            for s in body { visitor.visit_stmt_mut(s); }
+        }
     }
 }
 

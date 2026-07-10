@@ -250,6 +250,8 @@ pub enum Token {
     Continue,
     #[token("comptime")]
     Comptime,
+    #[token("generate")]
+    Generate,
     #[token("import")]
     Import,
     #[token("from")]
@@ -668,7 +670,7 @@ mod tests {
     #[test]
     fn keywords_all() {
         check_tokens(
-            "def set type with default return if else for in while loop leave continue comptime import from as true false auto",
+            "def set type with default return if else for in while loop leave continue comptime generate import from as true false auto",
             vec![
                 Token::Def,
                 Token::Set,
@@ -685,6 +687,7 @@ mod tests {
                 Token::Leave,
                 Token::Continue,
                 Token::Comptime,
+                Token::Generate,
                 Token::Import,
                 Token::From,
                 Token::As,

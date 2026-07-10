@@ -230,6 +230,10 @@ pub enum Expr {
         body: Vec<Stmt>,
         span: Span,
     },
+    /// Compile-time type reflection: `@typeInfo!(Type)` — returns a
+    /// `TypeInfo` value describing the type's structure at comptime.
+    /// Inspired by Zig's `@typeInfo`.
+    TypeInfo(Box<Type>, Span),
     Error(Span),
 }
 
@@ -393,6 +397,15 @@ pub enum Stmt {
         span: Span,
     },
     ComptimeBlock {
+        body: Vec<Stmt>,
+        span: Span,
+    },
+    /// A `generate` block: declarative, auditable code generation
+    /// attached to a type.  The block is expanded at compile time
+    /// to produce module-level declarations (impl, def, type, const).
+    /// See SYNTAX.md §1029.
+    Generate {
+        for_type: Box<Type>,
         body: Vec<Stmt>,
         span: Span,
     },
@@ -747,6 +760,7 @@ impl Stmt {
             Stmt::Isolate { span, .. } => *span,
             Stmt::ImplBlock { span, .. } => *span,
             Stmt::LayoutDef { span, .. } => *span,
+            Stmt::Generate { span, .. } => *span,
             Stmt::Error(span) => *span,
         }
     }
@@ -787,6 +801,7 @@ impl Expr {
             Expr::Quantified { span, .. } => *span,
             Expr::Old(_, span) => *span,
             Expr::Task { span, .. } => *span,
+            Expr::TypeInfo(_, span) => *span,
             Expr::Error(span) => *span,
         }
     }

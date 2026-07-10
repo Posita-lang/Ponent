@@ -5,6 +5,7 @@ mod hir {
     pub mod builtins;
     pub mod checker;
     pub mod comptime;
+    pub mod generate;
     pub mod hir;
     pub mod infer;
     pub mod resolver;
@@ -64,6 +65,15 @@ fn main() {
                     } else {
                         let mut ctx = TypeContext::new();
                         let local_crate_id = CrateId(DefId(0));
+
+                        // Expand `generate` blocks before name resolution.
+                        let expander = hir::generate::GenerateExpander::new(&mut ctx);
+                        let expanded_items = expander.expand_program(program.items);
+                        let program = ast::Program {
+                            items: expanded_items,
+                            span: program.span,
+                        };
+
                         let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
                         match resolver.resolve_program(&program) {
                             Ok((mut symbols, mut trait_env, _diags, resolution_map)) => {

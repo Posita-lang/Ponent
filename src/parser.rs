@@ -211,6 +211,7 @@ impl Parser {
                 | Ok(Token::Edition)
                 | Ok(Token::At)
                 | Ok(Token::Comptime)
+                | Ok(Token::Generate)
                 | Ok(Token::Async)
                 | Ok(Token::Trait)
                 | Ok(Token::Impl)
@@ -294,6 +295,7 @@ impl Parser {
             Token::Leave => Some("leave".into()),
             Token::Continue => Some("continue".into()),
             Token::Comptime => Some("comptime".into()),
+            Token::Generate => Some("generate".into()),
             Token::Import => Some("import".into()),
             Token::From => Some("from".into()),
             Token::As => Some("as".into()),
@@ -1609,6 +1611,28 @@ impl Parser {
                 self.expect(Token::RBrace)?;
                 let _end = self.span().end;
                 Ok(Stmt::ComptimeBlock {
+                    body,
+                    span: Span::new(_start, _end),
+                })
+            }
+            Ok(Token::Generate) => {
+                let _start = self.span().start;
+                self.advance().ok();
+                // expect `for` keyword
+                match self.advance() {
+                    Ok(Token::For) => {},
+                    Ok(tok) => return Err(Diagnostic::error(format!("expected `for` after `generate`, found {:?}", tok))
+                        .with_span(self.span())),
+                    Err(()) => return Err(Diagnostic::error("expected `for` after `generate`")
+                        .with_span(self.span())),
+                }
+                let for_type = Box::new(self.parse_type()?);
+                self.expect(Token::LBrace)?;
+                let body = self.parse_block()?;
+                self.expect(Token::RBrace)?;
+                let _end = self.span().end;
+                Ok(Stmt::Generate {
+                    for_type,
                     body,
                     span: Span::new(_start, _end),
                 })
@@ -3684,6 +3708,30 @@ impl Parser {
                     body: Box::new(body),
                     span: Span::new(start, end),
                 })
+            }
+            Ok(Token::At) => {
+                // `@typeInfo!(Type)` — compile-time type reflection
+                self.advance().ok();
+                let name = match self.advance() {
+                    Ok(Token::Ident(n)) => n,
+                    Ok(tok) => return Err(Diagnostic::error(format!(
+                        "expected built-in name after `@`, found {:?}", tok
+                    )).with_span(self.span())),
+                    Err(()) => return Err(Diagnostic::error("unexpected end of input after `@`")
+                        .with_span(self.span())),
+                };
+                if name == "typeInfo" {
+                    self.expect(Token::Bang)?;
+                    self.expect(Token::LParen)?;
+                    let ty = self.parse_type()?;
+                    self.expect(Token::RParen)?;
+                    let end = self.span().end;
+                    Ok(Expr::TypeInfo(Box::new(ty), Span::new(start, end)))
+                } else {
+                    Err(Diagnostic::error(format!("unknown built-in `@{name}`"))
+                        .with_help("available built-ins: `@typeInfo!(Type)`")
+                        .with_span(self.span()))
+                }
             }
             _ => Err(Diagnostic::error("expected expression")
                 .with_code_str("E007")
