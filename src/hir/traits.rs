@@ -319,10 +319,15 @@ impl TraitEnv {
                 TypeKind::Enum => ctx.enum_ty(def_id, fresh_args),
                 _ => continue,
             };
-            // Try to unify target_ty with the substituted type
-            if ctx.unify(target_ty, substituted).is_err() {
+            // Use a transaction so that a failed unification attempt
+            // does not leave stale bindings in the type context.
+            ctx.begin_transaction();
+            let result = ctx.unify(target_ty, substituted);
+            if result.is_err() {
+                ctx.rollback_transaction();
                 continue; // unification failed, not a match
             }
+            ctx.commit_transaction();
             return Some((cand, subst));
         }
         None
