@@ -37,11 +37,13 @@ pub trait HirVisitor {
 
 pub fn walk_hir_expr<V: HirVisitor>(visitor: &mut V, expr: &HirExpr) -> V::Result {
     match expr {
-        HirExpr::Literal(lit, ty, _)
-        | HirExpr::Ident(_, ty, _) => {
+        HirExpr::Literal(lit, ty, _) => {
             visitor.visit_type_id(*ty)?;
-            if let HirExpr::Literal(lit, ..) = expr { visitor.visit_literal(lit) }
-            else { V::Result::output() }
+            visitor.visit_literal(lit)
+        }
+        HirExpr::Ident(name, ty, _) => {
+            visitor.visit_type_id(*ty)?;
+            visitor.visit_ident(name)
         }
         HirExpr::TypeAnnotated { expr: e, ty, .. } => {
             visitor.visit_type_id(*ty)?;
@@ -67,8 +69,18 @@ pub fn walk_hir_expr<V: HirVisitor>(visitor: &mut V, expr: &HirExpr) -> V::Resul
             visitor.visit_hir_expr(base)?;
             visitor.visit_hir_expr(index)
         }
-        HirExpr::FieldAccess { base, ty, .. } | HirExpr::AttrAccess { base, ty, .. }
-        | HirExpr::Cast { expr: base, ty, .. } | HirExpr::Deref { expr: base, ty, .. }
+        HirExpr::FieldAccess { base, field, ty, .. } => {
+            visitor.visit_type_id(*ty)?;
+            visitor.visit_hir_expr(base)?;
+            visitor.visit_ident(field)
+        }
+        HirExpr::AttrAccess { base, attr, ty, .. } => {
+            visitor.visit_type_id(*ty)?;
+            visitor.visit_hir_expr(base)?;
+            visitor.visit_ident(attr)
+        }
+        HirExpr::Cast { expr: base, ty, .. }
+        | HirExpr::Deref { expr: base, ty, .. }
         | HirExpr::Ref { expr: base, ty, .. } => {
             visitor.visit_type_id(*ty)?;
             visitor.visit_hir_expr(base)
@@ -81,7 +93,10 @@ pub fn walk_hir_expr<V: HirVisitor>(visitor: &mut V, expr: &HirExpr) -> V::Resul
         }
         HirExpr::StructLit { fields, ty, .. } => {
             visitor.visit_type_id(*ty)?;
-            for (_, f) in fields { visitor.visit_hir_expr(f)?; }
+            for (name, f) in fields {
+                visitor.visit_ident(name)?;
+                visitor.visit_hir_expr(f)?;
+            }
             V::Result::output()
         }
         HirExpr::EnumLit { payload, ty, .. } => {
@@ -169,7 +184,8 @@ pub fn walk_hir_stmt<V: HirVisitor>(visitor: &mut V, stmt: &HirStmt) -> V::Resul
             }
             V::Result::output()
         }
-        HirStmt::FunctionDef { params, body, finally, .. } => {
+        HirStmt::FunctionDef { name, params, body, finally, .. } => {
+            visitor.visit_ident(name)?;
             for p in params { visitor.visit_hir_param(p)?; }
             if let Some(b) = body { for s in b { visitor.visit_hir_stmt(s)?; } }
             if let Some(f) = finally { for s in f { visitor.visit_hir_stmt(s)?; } }
@@ -239,13 +255,20 @@ pub fn walk_hir_pattern<V: HirVisitor>(visitor: &mut V, pat: &HirPattern) -> V::
             visitor.visit_ident(name)
         }
         HirPattern::Literal(expr, _) => visitor.visit_hir_expr(expr),
-        HirPattern::Tuple(patterns, _) | HirPattern::Slice(patterns, ..) => {
+        HirPattern::Tuple(patterns, _) => {
             for p in patterns {
-                if let HirPattern::Slice(_, rest, after, _) = pat {
-                    if let Some(r) = rest { visitor.visit_hir_pattern(r)?; }
-                    for a in after { visitor.visit_hir_pattern(a)?; }
-                    break;
-                }
+                visitor.visit_hir_pattern(p)?;
+            }
+            V::Result::output()
+        }
+        HirPattern::Slice(before, rest, after, _) => {
+            for p in before {
+                visitor.visit_hir_pattern(p)?;
+            }
+            if let Some(r) = rest {
+                visitor.visit_hir_pattern(r)?;
+            }
+            for p in after {
                 visitor.visit_hir_pattern(p)?;
             }
             V::Result::output()
@@ -266,5 +289,6 @@ pub fn walk_hir_pattern<V: HirVisitor>(visitor: &mut V, pat: &HirPattern) -> V::
 }
 
 pub fn walk_hir_param<V: HirVisitor>(visitor: &mut V, param: &HirParam) -> V::Result {
+    visitor.visit_ident(&param.name)?;
     visitor.visit_type_id(param.ty)
 }
