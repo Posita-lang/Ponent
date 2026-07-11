@@ -184,6 +184,17 @@ pub struct TypeChecker<'a> {
     mutable_globals: HashSet<String>,
     /// Whether the current function is annotated `@trusted`.
     current_function_trusted: bool,
+    /// Registry of comptime functions: name → (param_names, body).
+    /// Populated as the checker encounters `comptime def` functions and
+    /// passed to ComptimeEvalContext for comptime block evaluation.
+    comptime_fn_registry: HashMap<String, (Vec<String>, Vec<HirStmt>)>,
+    /// Whether we are currently in the comptime-function-body pass (Pass 2).
+    /// When true, ComptimeBlock evaluation is deferred to after Pass 2 so
+    /// that forward references between comptime functions work correctly.
+    comptime_fn_pass: bool,
+    /// Deferred comptime blocks collected during Pass 2.  Evaluated after
+    /// all comptime function bodies are registered.
+    deferred_comptime_blocks: Vec<(Vec<HirStmt>, TypeId, Span)>,
 }
 
 /// Error type for comptime control flow within comptime blocks.
@@ -230,6 +241,9 @@ impl<'a> TypeChecker<'a> {
             guarantee_chain: GuaranteeChain::new(),
             mutable_globals: HashSet::new(),
             current_function_trusted: false,
+            comptime_fn_registry: HashMap::new(),
+            comptime_fn_pass: false,
+            deferred_comptime_blocks: Vec::new(),
         };
         checker
     }
@@ -247,7 +261,57 @@ impl<'a> TypeChecker<'a> {
         // enter_inference_scope in check_stmt(FunctionDef).
         self.enter_inference_scope();
 
-        for stmt in &program.items {
+        // Pass 1: register all comptime function signatures (name + param names)
+        // WITHOUT checking bodies, so that forward references between comptime
+        // functions work correctly (e.g. `comptime def f() { g() }` followed by
+        // `comptime def g() { 42 }`).
+        let comptime_fn_indices: Vec<usize> = program.items.iter().enumerate().filter_map(|(i, stmt)| {
+            if let Stmt::FunctionDef { name, params, is_comptime, .. } = stmt {
+                if *is_comptime {
+                    let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+                    self.comptime_fn_registry.insert(name.clone(), (param_names, Vec::new()));
+                    Some(i)
+                } else { None }
+            } else { None }
+        }).collect();
+
+        // Pass 2: type-check all comptime function bodies (all signatures are now available).
+        // During this pass, comptime blocks inside comptime function bodies are deferred
+        // so that forward references to comptime functions defined later work correctly.
+        self.comptime_fn_pass = true;
+        for &i in &comptime_fn_indices {
+            match self.check_stmt(&program.items[i]) {
+                Ok(hir) => items.push(hir),
+                Err(diag) => {
+                    self.diagnostics.push(diag);
+                    items.push(HirStmt::Error);
+                }
+            }
+        }
+        self.comptime_fn_pass = false;
+
+        // Evaluate deferred comptime blocks from Pass 2.  Now all comptime function
+        // bodies are registered, so forward references will resolve correctly.
+        for (hir, ty, span) in self.deferred_comptime_blocks.drain(..) {
+            let mut eval = crate::hir::comptime::ComptimeEvalContext::new(self.ctx, self.symbols);
+            for (name, (params, body)) in &self.comptime_fn_registry {
+                eval.register_fn(name.clone(), params.clone(), body.clone());
+            }
+            if let Err(e) = eval.eval_block(&hir) {
+                self.diagnostics.push(
+                    Diagnostic::error(format!("comptime error: {}", e))
+                        .with_code_str("E080")
+                        .with_span(span),
+                );
+            }
+        }
+
+        // Pass 3: type-check remaining items (non-comptime functions,
+        // comptime blocks, type defs, etc.) in order.
+        for (i, stmt) in program.items.iter().enumerate() {
+            if comptime_fn_indices.contains(&i) {
+                continue; // already processed in pass 2
+            }
             match self.check_stmt(stmt) {
                 Ok(hir) => items.push(hir),
                 Err(diag) => {
@@ -708,6 +772,18 @@ impl<'a> TypeChecker<'a> {
                     self.local_type_param_cache.remove(name);
                 }
 
+                // Register comptime functions in the global registry so that
+                // `comptime { ... }` blocks can call them.
+                if *is_comptime {
+                    let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+                    if let Some(ref body) = body_hir {
+                        self.comptime_fn_registry.insert(
+                            name.clone(),
+                            (param_names, body.clone()),
+                        );
+                    }
+                }
+
                 Ok(HirStmt::FunctionDef {
                     span: *span,
                     attributes: attributes.clone(),
@@ -1144,14 +1220,26 @@ impl<'a> TypeChecker<'a> {
                             HirStmt::Expression(e) => Some(e.ty()),
                             _ => None,
                         }).unwrap_or_else(|| self.ctx.unit());
-                        // Evaluate the comptime block at compile time.
-                        let mut eval = crate::hir::comptime::ComptimeEvalContext::new(self.ctx);
-                        if let Err(e) = eval.eval_block(&hir) {
-                            self.diagnostics.push(
-                                Diagnostic::error(format!("comptime error: {}", e))
-                                    .with_code_str("E080")
-                                    .with_span(*span),
-                            );
+                        if self.comptime_fn_pass {
+                            // During Pass 2 (comptime function body checking), defer
+                            // evaluation so that forward references to comptime functions
+                            // defined later in the source are available at evaluation time.
+                            // After Pass 2 completes, all deferred blocks are evaluated.
+                            self.deferred_comptime_blocks.push((hir.clone(), ty, *span));
+                        } else {
+                            // Evaluate the comptime block at compile time.
+                            let mut eval = crate::hir::comptime::ComptimeEvalContext::new(self.ctx, self.symbols);
+                            // Register pre-collected comptime functions.
+                            for (name, (params, body)) in &self.comptime_fn_registry {
+                                eval.register_fn(name.clone(), params.clone(), body.clone());
+                            }
+                            if let Err(e) = eval.eval_block(&hir) {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!("comptime error: {}", e))
+                                        .with_code_str("E080")
+                                        .with_span(*span),
+                                );
+                            }
                         }
                         Ok(HirStmt::ComptimeBlock {
                             body: hir,

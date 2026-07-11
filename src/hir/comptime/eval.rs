@@ -1,8 +1,14 @@
-use crate::hir::hir::{HirExpr, HirStmt};
+use crate::hir::hir::{HirExpr, HirPattern, HirProgram, HirStmt};
 use crate::hir::types::{TypeContext, TypeId};
+use crate::hir::symbol::SymbolTable;
 
 use super::error::ComptimeError;
 use super::value::ComptimeValue;
+
+use std::collections::HashMap;
+
+/// A registered comptime function: (parameter_names, body_statements).
+type ComptimeFn = (Vec<String>, Vec<HirStmt>);
 
 /// Compute the representable range for a signed integer of `bits` width.
 fn signed_range(bits: u8) -> (i128, i128) {
@@ -74,15 +80,36 @@ pub struct ComptimeEvalContext<'a> {
     ctx: &'a TypeContext,
     steps: usize,
     step_limit: usize,
+    /// The HIR program, used to lookup comptime function definitions.
+    /// Optional because the HirProgram is not available during type checking
+    /// (it is the output of check_program).  Will be populated when comptime
+    /// function calls are implemented.
+    hir_program: Option<&'a HirProgram>,
+    /// The symbol table, used for name resolution.
+    symbols: &'a SymbolTable,
+    /// Local variable bindings within the current comptime block.
+    pub variables: HashMap<String, ComptimeValue>,
+    /// Registry of comptime functions: name → (param_names, body).
+    /// Populated by the checker as it encounters comptime function definitions.
+    fn_registry: HashMap<String, ComptimeFn>,
 }
 
 impl<'a> ComptimeEvalContext<'a> {
-    pub fn new(ctx: &'a TypeContext) -> Self {
+    pub fn new(ctx: &'a TypeContext, symbols: &'a SymbolTable) -> Self {
         ComptimeEvalContext {
             ctx,
+            symbols,
+            hir_program: None,
             steps: 0,
             step_limit: 10_000,
+            variables: HashMap::new(),
+            fn_registry: HashMap::new(),
         }
+    }
+
+    /// Register a comptime function so it can be called from within comptime blocks.
+    pub fn register_fn(&mut self, name: String, params: Vec<String>, body: Vec<HirStmt>) {
+        self.fn_registry.insert(name, (params, body));
     }
 
     /// Set a custom step limit (for testing).
@@ -98,9 +125,58 @@ impl<'a> ComptimeEvalContext<'a> {
                 HirStmt::Expression(expr) => {
                     result = self.eval_expr(expr)?;
                 }
+                HirStmt::VariableDef { name, value, .. } => {
+                    let val = match value {
+                        Some(e) => self.eval_expr(e)?,
+                        None => return Err(ComptimeError::not_allowed(
+                            "variable definitions in comptime blocks must have a value",
+                        )),
+                    };
+                    if let Some(n) = name {
+                        self.variables.insert(n.clone(), val.clone());
+                        result = val;
+                    } else {
+                        return Err(ComptimeError::not_allowed(
+                            "unnamed variables are not allowed in comptime blocks",
+                        ));
+                    }
+                }
+                HirStmt::Assign { target, value, .. } => {
+                    let val = self.eval_expr(value)?;
+                    if let HirExpr::Ident(name, _, _) = target.as_ref() {
+                        if self.variables.contains_key(name) {
+                            self.variables.insert(name.clone(), val.clone());
+                            result = val;
+                        } else {
+                            return Err(ComptimeError::UnknownIdentifier(name.clone()));
+                        }
+                    } else {
+                        return Err(ComptimeError::not_allowed(
+                            "only simple variable assignments are supported in comptime blocks",
+                        ));
+                    }
+                }
+                HirStmt::While { cond, body, .. } => {
+                    loop {
+                        if self.steps >= self.step_limit {
+                            return Err(ComptimeError::StepLimitExceeded);
+                        }
+                        let cond_val = self.eval_expr(cond)?;
+                        match cond_val {
+                            ComptimeValue::Bool(true) => {
+                                self.eval_block(body)?;
+                            }
+                            ComptimeValue::Bool(false) => break,
+                            _ => return Err(ComptimeError::type_error(
+                                "while condition must be a boolean",
+                            )),
+                        }
+                    }
+                    result = ComptimeValue::Unit;
+                }
                 _ => {
                     return Err(ComptimeError::not_allowed(
-                        "only expressions are allowed in comptime blocks",
+                        "only expressions, variable definitions, and assignments are allowed in comptime blocks",
                     ));
                 }
             }
@@ -160,6 +236,25 @@ impl<'a> ComptimeEvalContext<'a> {
                             check_range(result, *ty, self.ctx).map(ComptimeValue::Int)
                         }
                     }
+                    // Comparison operators: return Bool
+                    (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Eq) => {
+                        Ok(ComptimeValue::Bool(a == b))
+                    }
+                    (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Neq) => {
+                        Ok(ComptimeValue::Bool(a != b))
+                    }
+                    (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Lt) => {
+                        Ok(ComptimeValue::Bool(a < b))
+                    }
+                    (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Gt) => {
+                        Ok(ComptimeValue::Bool(a > b))
+                    }
+                    (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Le) => {
+                        Ok(ComptimeValue::Bool(a <= b))
+                    }
+                    (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Ge) => {
+                        Ok(ComptimeValue::Bool(a >= b))
+                    }
                     _ => Err(ComptimeError::type_error("unsupported binary operation")),
                 }
             }
@@ -176,6 +271,55 @@ impl<'a> ComptimeEvalContext<'a> {
                     }
                     _ => Err(ComptimeError::type_error("if condition must be a boolean")),
                 }
+            }
+            HirExpr::Ident(name, _ty, _span) => {
+                // 1. Check local variables first.
+                if let Some(val) = self.variables.get(name) {
+                    return Ok(val.clone());
+                }
+                // 2. Check the symbol table for comptime-known values.
+                //    (e.g. comptime function parameters, imported constants).
+                //    For now, this is a placeholder — full symbol table integration
+                //    will be added in a later phase.
+                Err(ComptimeError::UnknownIdentifier(name.clone()))
+            }
+            HirExpr::Call { callee, args, comptime, .. } if *comptime => {
+                // Resolve the callee to a function name.
+                let fn_name = match callee.as_ref() {
+                    HirExpr::Ident(name, _, _) => name.clone(),
+                    _ => return Err(ComptimeError::type_error(
+                        "comptime call target must be a simple function name",
+                    )),
+                };
+                // Look up the function in the registry.
+                let (params, body) = self.fn_registry.get(&fn_name).ok_or_else(|| {
+                    ComptimeError::UnknownIdentifier(fn_name.clone())
+                })?.clone();
+                // Evaluate arguments.
+                let arg_vals: Vec<ComptimeValue> = args
+                    .iter()
+                    .map(|a| self.eval_expr(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if arg_vals.len() != params.len() {
+                    return Err(ComptimeError::type_error(format!(
+                        "comptime function `{}` expected {} arguments, got {}",
+                        fn_name, params.len(), arg_vals.len(),
+                    )));
+                }
+                // Save the current variable scope and bind parameters.
+                let saved = std::mem::take(&mut self.variables);
+                for (param, val) in params.iter().zip(arg_vals.into_iter()) {
+                    self.variables.insert(param.clone(), val);
+                }
+                // Evaluate the function body.
+                let result = self.eval_block(&body);
+                // Restore the previous variable scope.
+                self.variables = saved;
+                result
+            }
+            HirExpr::TypeInfo(ty, _) => {
+                // @typeInfo(T) returns the type itself as a comptime value.
+                Ok(ComptimeValue::Type(*ty))
             }
             _ => Err(ComptimeError::Deferred),
         }
