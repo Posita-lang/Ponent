@@ -2168,9 +2168,13 @@ impl<'a> TypeChecker<'a> {
                 return Ok(None);
             }
             // Try unification — if it fails, don't error; just fall back.
-            if self.ctx.unify(substituted_ret, exp_ty).is_err() {
+            self.ctx.begin_transaction();
+            let unify_ok = self.ctx.unify(substituted_ret, exp_ty).is_ok();
+            if !unify_ok {
+                self.ctx.rollback_transaction();
                 return Ok(None);
             }
+            self.ctx.commit_transaction();
         }
 
         // Infer argument types and unify with substituted parameter types
