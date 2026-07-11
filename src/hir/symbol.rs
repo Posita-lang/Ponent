@@ -242,10 +242,11 @@ impl SymbolTable {
         let def_id = binding.def_id;
         self.type_defs.insert(def_id, binding.clone());
         scope.types.insert(name.clone(), binding);
-        // Also register the full path so multi-segment lookups can find it.
-        // For top-level types this is just the name itself; for module-qualified
-        // types the caller should use register_full_path to set the canonical path.
-        self.full_path_to_def_id.entry(name).or_insert(def_id);
+        // Note: intentionally NOT inserting the simple name into
+        // full_path_to_def_id here.  The full-path map is reserved for
+        // fully-qualified paths (e.g. "std::collections::HashMap")
+        // registered via register_full_path.  Inserting simple names
+        // would cause lookup_type_by_path to bypass lexical scoping.
         Ok(())
     }
 
@@ -387,16 +388,16 @@ impl SymbolTable {
         if path.is_empty() {
             return None;
         }
-        // Try the full path first (e.g. "std::collections::HashMap")
+        // For single-segment paths, use scoped lookup directly — the
+        // full-path map is reserved for multi-segment qualified paths.
+        if path.len() == 1 {
+            let binding = self.lookup_type(&path[0])?;
+            return Some(binding.def_id);
+        }
+        // Multi-segment path: try the full-path cache first.
         let full = path.join("::");
         if let Some(&id) = self.full_path_to_def_id.get(&full) {
             return Some(id);
-        }
-        // Fall back to single-segment lookup (compatibility with existing code)
-        let name = &path[0];
-        let binding = self.lookup_type(name)?;
-        if path.len() == 1 {
-            return Some(binding.def_id);
         }
         None
     }

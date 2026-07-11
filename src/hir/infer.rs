@@ -87,13 +87,18 @@ pub struct InferRegionTree {
     pub nodes: Vec<InferRegionNode>,
     pub root: InferRegionId,
     pub current: InferRegionId,
+    /// Roots of the dirty frontier, matching the OmniML `Tree.With_dirty.dirty_roots`
+    /// design.  When a region is marked dirty and no dirty ancestor is found, it is
+    /// added here so that `drain_dirty_roots` can reach it — otherwise orphaned
+    /// dirty regions would be silently skipped.
+    pub dirty_roots: Vec<InferRegionId>,
 }
 
 impl InferRegionTree {
     pub fn new() -> Self {
         InferRegionTree {
             nodes: vec![InferRegionNode { id: InferRegionId(0), level: 0, parent: None, children: Vec::new(), pool: InferPool::new(), dirty: false, dirty_children: Vec::new() }],
-            root: InferRegionId(0), current: InferRegionId(0),
+            root: InferRegionId(0), current: InferRegionId(0), dirty_roots: Vec::new(),
         }
     }
     pub fn enter_region(&mut self) -> InferRegionId {
@@ -119,11 +124,24 @@ impl InferRegionTree {
         let node = &mut self.nodes[region_id.0];
         if node.dirty { return; }
         node.dirty = true;
+        // Walk up to find the nearest dirty ancestor (or dirty_roots).
+        // This mirrors OmniML's `find_closest_dirty_ancestor` which returns
+        // `t.dirty_roots` when no dirty ancestor is found.
         let mut current = node.parent;
         while let Some(pid) = current {
             let parent = &mut self.nodes[pid.0];
-            if parent.dirty { if !parent.dirty_children.contains(&region_id) { parent.dirty_children.push(region_id); } return; }
+            if parent.dirty {
+                if !parent.dirty_children.contains(&region_id) {
+                    parent.dirty_children.push(region_id);
+                }
+                return;
+            }
             current = parent.parent;
+        }
+        // No dirty ancestor found — add to dirty_roots so that
+        // drain_dirty_roots can reach this region.
+        if !self.dirty_roots.contains(&region_id) {
+            self.dirty_roots.push(region_id);
         }
     }
     pub fn mark_current_dirty(&mut self) { self.mark_dirty(self.current); }
@@ -148,7 +166,15 @@ impl InferRegionTree {
             if let Some(parent_id) = self.nodes[node_id.0].parent { self.nodes[parent_id.0].dirty_children.retain(|&c| c != node_id); }
         }
     }
-    pub fn drain_dirty_roots<F>(&mut self, f: &mut F) where F: FnMut(InferRegionId, &mut Self) { self.drain_dirty(self.root, f); }
+    pub fn drain_dirty_roots<F>(&mut self, f: &mut F) where F: FnMut(InferRegionId, &mut Self) {
+        // Drain from dirty_roots first, then fall back to the root for
+        // backward compatibility with regions that are reachable from root.
+        let roots: Vec<InferRegionId> = self.dirty_roots.drain(..).collect();
+        for root_id in roots {
+            self.drain_dirty(root_id, f);
+        }
+        self.drain_dirty(self.root, f);
+    }
 }
 
 /// Priority wrapper for constraints, enabling BinaryHeap-based sorting.
