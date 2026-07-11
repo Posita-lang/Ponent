@@ -99,8 +99,9 @@ pub fn walk_hir_expr<V: HirVisitor>(visitor: &mut V, expr: &HirExpr) -> V::Resul
             }
             V::Result::output()
         }
-        HirExpr::EnumLit { payload, ty, .. } => {
+        HirExpr::EnumLit { variant, payload, ty, .. } => {
             visitor.visit_type_id(*ty)?;
+            visitor.visit_ident(variant)?;
             if let Some(p) = payload { visitor.visit_hir_expr(p) }
             else { V::Result::output() }
         }
@@ -165,8 +166,9 @@ pub fn walk_hir_expr<V: HirVisitor>(visitor: &mut V, expr: &HirExpr) -> V::Resul
             }
             V::Result::output()
         }
-        HirExpr::Quantified { range, body, ty, .. } => {
+        HirExpr::Quantified { quantifier: _, binder, range, body, ty, .. } => {
             visitor.visit_type_id(*ty)?;
+            visitor.visit_ident(binder)?;
             visitor.visit_hir_expr(range)?;
             visitor.visit_hir_expr(body)
         }
@@ -175,12 +177,19 @@ pub fn walk_hir_expr<V: HirVisitor>(visitor: &mut V, expr: &HirExpr) -> V::Resul
             visitor.visit_type_id(*ty)?;
             V::Result::output()
         }
+        HirExpr::Task { block, ty, .. } => {
+            visitor.visit_type_id(*ty)?;
+            for s in block { visitor.visit_hir_stmt(s)?; }
+            V::Result::output()
+        }
     }
 }
 
 pub fn walk_hir_stmt<V: HirVisitor>(visitor: &mut V, stmt: &HirStmt) -> V::Result {
     match stmt {
-        HirStmt::VariableDef { value, pattern, else_branch, .. } => {
+        HirStmt::VariableDef { name, value, pattern, else_branch, ty, .. } => {
+            if let Some(ref n) = name { visitor.visit_ident(n)?; }
+            visitor.visit_type_id(*ty)?;
             if let Some(e) = value { visitor.visit_hir_expr(e)?; }
             if let Some(p) = pattern { visitor.visit_hir_pattern(p)?; }
             if let Some(eb) = else_branch {
@@ -188,8 +197,9 @@ pub fn walk_hir_stmt<V: HirVisitor>(visitor: &mut V, stmt: &HirStmt) -> V::Resul
             }
             V::Result::output()
         }
-        HirStmt::FunctionDef { name, params, body, finally, .. } => {
+        HirStmt::FunctionDef { name, params, body, finally, return_type, .. } => {
             visitor.visit_ident(name)?;
+            visitor.visit_type_id(*return_type)?;
             for p in params { visitor.visit_hir_param(p)?; }
             if let Some(b) = body { for s in b { visitor.visit_hir_stmt(s)?; } }
             if let Some(f) = finally { for s in f { visitor.visit_hir_stmt(s)?; } }
@@ -228,9 +238,13 @@ pub fn walk_hir_stmt<V: HirVisitor>(visitor: &mut V, stmt: &HirStmt) -> V::Resul
             for s in body { visitor.visit_hir_stmt(s)?; }
             V::Result::output()
         }
-        HirStmt::Loop { body, .. } | HirStmt::ComptimeBlock { body, .. }
-        | HirStmt::ScopeCleanup { body, .. } | HirStmt::Unsafe { body, .. }
-        | HirStmt::Isolate { body, .. } => {
+        HirStmt::Loop { body, .. } | HirStmt::ScopeCleanup { body, .. }
+        | HirStmt::Unsafe { body, .. } | HirStmt::Isolate { body, .. } => {
+            for s in body { visitor.visit_hir_stmt(s)?; }
+            V::Result::output()
+        }
+        HirStmt::ComptimeBlock { body, ty, .. } => {
+            visitor.visit_type_id(*ty)?;
             for s in body { visitor.visit_hir_stmt(s)?; }
             V::Result::output()
         }
@@ -248,7 +262,8 @@ pub fn walk_hir_stmt<V: HirVisitor>(visitor: &mut V, stmt: &HirStmt) -> V::Resul
         HirStmt::TypeDef { .. } | HirStmt::TraitDef { .. } | HirStmt::Import { .. }
         | HirStmt::ExternFunction { .. } | HirStmt::Constraint { .. }
         | HirStmt::ImplBlock { .. } => V::Result::output(),
-        HirStmt::Generate { body, .. } => {
+        HirStmt::Generate { for_type, body, .. } => {
+            visitor.visit_type_id(*for_type)?;
             for s in body { visitor.visit_hir_stmt(s)?; }
             V::Result::output()
         }

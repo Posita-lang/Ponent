@@ -31,7 +31,13 @@ impl GuardSet {
     pub fn add_transitive_guard(&mut self, region_id: usize) { *self.transitive_guards.entry(region_id).or_insert(0) += 1; }
     pub fn remove_transitive_guard(&mut self, region_id: usize) {
         if let Some(count) = self.transitive_guards.get_mut(&region_id) {
-            debug_assert!(*count > 0); *count -= 1;
+            if *count == 0 {
+                // Invariant violation: removal without matching addition.
+                // Bail out to prevent usize underflow -> silent state corruption.
+                self.transitive_guards.remove(&region_id);
+                return;
+            }
+            *count -= 1;
             if *count == 0 { self.transitive_guards.remove(&region_id); }
         }
     }

@@ -362,8 +362,20 @@ pub fn walk_pattern<'ast, V: Visitor<'ast>>(visitor: &mut V, pat: &'ast Pattern)
         Pattern::Wildcard(_) | Pattern::Error(_) => V::Result::output(),
         Pattern::Ident(name, span) => visitor.visit_ident(name, span),
         Pattern::Literal(expr, _) => visitor.visit_expr(expr),
-        Pattern::Tuple(patterns, _) | Pattern::Slice(patterns, ..) => {
+        Pattern::Tuple(patterns, _) => {
             for p in patterns {
+                visitor.visit_pattern(p);
+            }
+            V::Result::output()
+        }
+        Pattern::Slice(before, rest, after, _) => {
+            for p in before {
+                visitor.visit_pattern(p);
+            }
+            if let Some(r) = rest {
+                visitor.visit_pattern(r);
+            }
+            for p in after {
                 visitor.visit_pattern(p);
             }
             V::Result::output()
@@ -724,8 +736,19 @@ pub fn walk_pattern_mut<V: MutVisitor>(visitor: &mut V, pat: &mut Pattern) {
             visitor.visit_ident_mut(name);
         }
         Pattern::Literal(expr, _) => visitor.visit_expr_mut(expr),
-        Pattern::Tuple(patterns, _) | Pattern::Slice(patterns, ..) => {
+        Pattern::Tuple(patterns, _) => {
             for p in patterns {
+                visitor.visit_pattern_mut(p);
+            }
+        }
+        Pattern::Slice(before, rest, after, _) => {
+            for p in before {
+                visitor.visit_pattern_mut(p);
+            }
+            if let Some(r) = rest {
+                visitor.visit_pattern_mut(r);
+            }
+            for p in after {
                 visitor.visit_pattern_mut(p);
             }
         }
