@@ -334,6 +334,13 @@ impl ShapeVarContext {
         let mut fired = false;
         if let Some(shape) = self.vars[source.0].resolved {
             fired = self.try_set(target, shape);
+            if !fired && self.vars[target.0].resolved.is_some() {
+                // Both source and target are resolved with incompatible shapes.
+                // Do NOT set the alias — merging incompatible shapes silently
+                // would violate type soundness.  Return false so callers can
+                // detect the mismatch.
+                return false;
+            }
         }
 
         // Mark source as alias of target.

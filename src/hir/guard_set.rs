@@ -51,10 +51,14 @@ impl GuardSet {
     }
 
     /// Remove a transitive guard for a region (decrement per-region count).
-    /// Panics in debug if the guard doesn't exist.
     pub fn remove_transitive_guard(&mut self, region_id: usize) {
         if let Some(count) = self.transitive_guards.get_mut(&region_id) {
-            debug_assert!(*count > 0, "remove_transitive_guard: count already zero");
+            if *count == 0 {
+                // Invariant violation: removal without matching addition.
+                // Remove the entry to prevent usize underflow → silent state corruption.
+                self.transitive_guards.remove(&region_id);
+                return;
+            }
             *count -= 1;
             if *count == 0 {
                 self.transitive_guards.remove(&region_id);
