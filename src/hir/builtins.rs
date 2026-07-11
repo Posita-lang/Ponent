@@ -105,6 +105,30 @@ pub fn register_builtins(
             .ok();
     }
 
+    // Register And/Or impls for Bool.  The type checker handles `and`/`or`
+    // for booleans directly, but registering the trait impls is necessary
+    // for operator overloading consistency and downstream trait resolution.
+    let bool_ty = ctx.bool();
+    for &trait_id in &[and_id, or_id] {
+        trait_env
+            .add_impl(
+                ImplCandidate {
+                    trait_id,
+                    for_type: bool_ty,
+                    methods: vec![],
+                    resolved_methods: vec![],
+                    assoc_tys: vec![],
+                    has_auto_deref: false,
+                    context: vec![],
+                    span: Span::new(0, 0),
+                },
+                symbols,
+                ctx,
+                false,
+            )
+            .ok();
+    }
+
     let float64 = ctx.float(64);
     for &trait_id in &[
         add_id, sub_id, mul_id, div_id, rem_id, eq_id, neq_id, lt_id, gt_id, le_id, ge_id,
