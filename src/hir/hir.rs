@@ -1,5 +1,5 @@
 use crate::ast::*;
-use crate::hir::types::TypeId;
+use crate::hir::types::{DefId, TypeId};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirProgram {
@@ -171,7 +171,8 @@ pub enum HirStmt {
     ImplBlock {
         span: Span,
         attributes: Vec<Attribute>,
-        trait_path: Option<Vec<String>>,
+        /// The trait path resolved to its DefId, or `None` for inherent impls.
+        trait_path: Option<DefId>,
         for_type: TypeId,
         methods: Vec<ImplMethod>,
         associated_types: Vec<AssociatedType>,

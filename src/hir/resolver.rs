@@ -466,7 +466,18 @@ impl<'a> NameResolver<'a> {
                 self.current_impl_for_type = Some(resolved_for);
                 let resolved_trait = trait_path
                     .as_ref()
-                    .and_then(|path| self.resolve_trait_path(path));
+                    .and_then(|tp| {
+                        // Extract the path from the trait type for lookup.
+                        match tp.as_ref() {
+                            Type::Path(path, _) => self.resolve_trait_path(path),
+                            _ => {
+                                // For complex trait types (e.g. `Add<Int<32>>`),
+                                // resolve as a type expression and get the DefId.
+                                let ty = self.resolve_type_expr(tp);
+                                self.ctx.get_def_id_for_type(ty)
+                            }
+                        }
+                    });
 
                 // Collect context types from where clause for Paterson/Coverage checking
                 let mut context = Vec::new();

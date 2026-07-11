@@ -435,7 +435,10 @@ pub enum Stmt {
     ImplBlock {
         span: Span,
         attributes: Vec<Attribute>,
-        trait_path: Option<Vec<String>>,
+        /// The trait path (`Add<Int<32>>`), or `None` for inherent impls.
+        /// Stored as a `Type` so that generic arguments on the trait are
+        /// preserved in the AST (e.g. `impl Add<Int<32>> for Type`).
+        trait_path: Option<Box<Type>>,
         for_type: Type,
         methods: Vec<ImplMethod>,
         associated_types: Vec<AssociatedType>,

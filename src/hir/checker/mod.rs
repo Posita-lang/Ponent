@@ -1315,11 +1315,36 @@ impl<'a> TypeChecker<'a> {
                 };
                 if let Some(tp) = &trait_path {
                     // ── Trait impl block ─────────────────────────────────
-                    let trait_id = match self.resolve_def_id(tp) {
-                        Ok(id) => id,
-                        Err(diag) => {
-                            self.diagnostics.push(diag);
-                            return Ok(HirStmt::Error);
+                    // Resolve the trait path to get its DefId.
+                    // For simple paths like `Show`, look up the trait directly;
+                    // for complex types like `Add<Int<32>>`, resolve as a type.
+                    let trait_id = match tp.as_ref() {
+                        Type::Path(path, _) => {
+                            match self.symbols.lookup_trait_by_path(path) {
+                                Some(id) => id,
+                                None => {
+                                    self.diagnostics.push(
+                                        Diagnostic::error("trait not found")
+                                            .with_code_str("E100")
+                                            .with_span(span),
+                                    );
+                                    return Ok(HirStmt::Error);
+                                }
+                            }
+                        }
+                        _ => {
+                            let trait_ty = self.resolve_type(tp.as_ref())?;
+                            match self.ctx.get_def_id_for_type(trait_ty) {
+                                Some(id) => id,
+                                None => {
+                                    self.diagnostics.push(
+                                        Diagnostic::error("trait not found")
+                                            .with_code_str("E100")
+                                            .with_span(span),
+                                    );
+                                    return Ok(HirStmt::Error);
+                                }
+                            }
                         }
                     };
                     let trait_binding = match self.symbols.lookup_trait_by_def_id(trait_id) {
@@ -1359,7 +1384,7 @@ impl<'a> TypeChecker<'a> {
                                 Diagnostic::error(format!(
                                     "impl missing method `{}` required by trait `{}`",
                                     tm_name,
-                                    tp.join("::"),
+                                    Self::type_to_string(tp.as_ref()),
                                 ))
                                 .with_code_str("E101")
                                 .with_help("every trait method must be implemented — add a `def` for it in this impl block")
@@ -1471,7 +1496,7 @@ impl<'a> TypeChecker<'a> {
                     Ok(HirStmt::ImplBlock {
                         span,
                         attributes: attributes.clone(),
-                        trait_path: trait_path.clone(),
+                        trait_path: Some(trait_id),
                         for_type: for_ty,
                         methods: methods.clone(),
                         associated_types: Vec::new(),
@@ -1524,7 +1549,7 @@ impl<'a> TypeChecker<'a> {
                     Ok(HirStmt::ImplBlock {
                         span,
                         attributes: attributes.clone(),
-                        trait_path: trait_path.clone(),
+                        trait_path: None,
                         for_type: for_ty,
                         methods: methods.clone(),
                         associated_types: Vec::new(),
@@ -2620,6 +2645,29 @@ impl<'a> TypeChecker<'a> {
         match self.ctx.get(resolved) {
             TypeData::Adt { def_id, .. } => self.symbols.lookup_type_by_def_id(*def_id).cloned(),
             _ => None,
+        }
+    }
+
+    /// Convert an AST type to a user-friendly string for diagnostics.
+    fn type_to_string(ty: &Type) -> String {
+        match ty {
+            Type::Path(path, _) => path.join("::"),
+            Type::Generic(base, args, _) => {
+                let base_str = Self::type_to_string(base);
+                let args_str: Vec<String> = args.iter().map(|a| match a {
+                    crate::ast::GenericArg::Positional(t) => Self::type_to_string(t),
+                    crate::ast::GenericArg::Named(n, t) => format!("{} = {}", n, Self::type_to_string(t)),
+                }).collect();
+                format!("{}<{}>", base_str, args_str.join(", "))
+            }
+            Type::Reference { inner, mutable, .. } => {
+                if *mutable {
+                    format!("&mut {}", Self::type_to_string(inner))
+                } else {
+                    format!("&{}", Self::type_to_string(inner))
+                }
+            }
+            _ => format!("{:?}", ty),
         }
     }
 }

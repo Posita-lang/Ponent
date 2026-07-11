@@ -1106,10 +1106,7 @@ impl Parser {
                     }
                     _ => {}
                 }
-                let old_restrict = self.restrictions;
-                self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
-                let expr = self.parse_expr()?;
-                self.restrictions = old_restrict;
+                let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
                 let end = self.span().end;
                 Ok(Contract::Ensures {
                     expr,
@@ -1978,10 +1975,7 @@ impl Parser {
             self.advance().ok();
             let pattern = self.parse_pattern()?;
             self.expect(Token::Assign)?;
-            let old_restrict = self.restrictions;
-            self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
-            let scrutinee = self.parse_expr()?;
-            self.restrictions = old_restrict;
+            let scrutinee = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
             self.expect(Token::LBrace)?;
             let then_branch = self.parse_block()?;
             self.expect(Token::RBrace)?;
@@ -2007,10 +2001,7 @@ impl Parser {
                 span: Span::new(start, end),
             });
         }
-        let old_restrict = self.restrictions;
-        self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
-        let cond = self.parse_expr()?;
-        self.restrictions = old_restrict;
+        let cond = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
         self.expect(Token::LBrace)?;
         let then_branch = self.parse_block()?;
         self.expect(Token::RBrace)?;
@@ -2043,10 +2034,7 @@ impl Parser {
             self.advance().ok();
             let pattern = self.parse_pattern()?;
             self.expect(Token::Assign)?;
-            let old_restrict = self.restrictions;
-            self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
-            let scrutinee = self.parse_expr()?;
-            self.restrictions = old_restrict;
+            let scrutinee = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
             let mut invariant: Option<Expr> = None;
             let mut decreases: Option<Expr> = None;
             while matches!(self.peek(), Ok(Token::Invariant) | Ok(Token::Decreases)) {
@@ -2083,10 +2071,7 @@ impl Parser {
                 span: Span::new(start, end),
             });
         }
-        let old_restrict = self.restrictions;
-        self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
-        let cond = self.parse_expr()?;
-        self.restrictions = old_restrict;
+        let cond = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
         let mut invariant: Option<Expr> = None;
         let mut decreases: Option<Expr> = None;
         while matches!(self.peek(), Ok(Token::Invariant) | Ok(Token::Decreases)) {
@@ -2128,10 +2113,7 @@ impl Parser {
         self.advance().ok();
         let pattern = self.parse_pattern()?;
         self.expect(Token::In)?;
-        let old_restrict = self.restrictions;
-        self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
-        let iterable = self.parse_expr()?;
-        self.restrictions = old_restrict;
+        let iterable = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
         let mut invariant: Option<Expr> = None;
         let mut decreases: Option<Expr> = None;
         while matches!(self.peek(), Ok(Token::Invariant) | Ok(Token::Decreases)) {
@@ -2871,51 +2853,29 @@ impl Parser {
         self.advance().ok();
         // Inherent impl: `impl TypeName { ... }` or `impl<T> TypeName { ... }`
         // Trait impl:   `impl TraitName for TypeName { ... }` or `impl<T> TraitName for TypeName { ... }`
-        // Check if the next token is `for` → inherent impl
         let type_params = if matches!(self.peek(), Ok(Token::Lt)) {
             self.parse_type_params()?
         } else {
             Vec::new()
         };
-        let trait_path = if matches!(self.peek(), Ok(Token::For)) {
+        // Check for `impl for Type` (inherent impl with explicit `for`).
+        // This must be checked before parse_type() since `for` is not a valid type.
+        let (trait_path, for_type) = if matches!(self.peek(), Ok(Token::For)) {
             self.advance().ok(); // consume `for`
-            None
-        } else if matches!(self.peek(), Ok(Token::Ident(_))) {
-            // Peek ahead: if followed by `{` or `where`, this is an inherent impl
-            // `impl TypeName { ... }`, not a trait impl `impl Trait for Type`.
-            if matches!(self.peek_next(), Some(Token::LBrace) | Some(Token::Where)) {
-                None
-            } else {
-                let mut path = Vec::new();
-                path.push(match self.advance() {
-                    Ok(Token::Ident(name)) => name,
-                    _ => {
-                        return Err(Diagnostic::error("expected trait name")
-                            .with_code_str("E004")
-                            .with_help("expected a trait name in `impl ... for Type` — e.g. `impl Display for MyType { ... }`")
-                            .with_suggestion("add a trait name: `impl TraitName for MyType { ... }`")
-                            .with_span(self.span(),));
-                    }
-                });
-                while matches!(self.peek(), Ok(Token::ColonColon)) {
-                    self.advance().ok();
-                    path.push(match self.advance() {
-                        Ok(Token::Ident(part)) => part,
-                        _ => {
-                            return Err(Diagnostic::error("expected identifier after '::'")
-                                .with_code_str("E004")
-                                .with_help("`::` must be followed by an identifier — e.g. `std::collections::HashMap`")
-                                .with_span(self.span(),));
-                        }
-                    });
-                }
-                self.expect(Token::For)?;
-                Some(path)
-            }
+            let for_ty = self.parse_type()?;
+            (None, for_ty)
         } else {
-            None
+            // Parse the first type.  If `for` follows, it's the trait path
+            // (e.g. `Add<Int<32>>`); otherwise it's the inherent type.
+            let first_type = self.parse_type()?;
+            if matches!(self.peek(), Ok(Token::For)) {
+                self.advance().ok(); // consume `for`
+                let for_ty = self.parse_type()?;
+                (Some(Box::new(first_type)), for_ty)
+            } else {
+                (None, first_type)
+            }
         };
-        let for_type = self.parse_type()?;
         let where_clause = if matches!(self.peek(), Ok(Token::Where)) {
             Some(self.parse_where_clause()?)
         } else {
@@ -3373,9 +3333,14 @@ impl Parser {
             Some(Token::Apostrophe) => Some((18, true)),
             // Prefix operators
             Some(Token::Question) => Some((17, true)),
-            Some(Token::Bang) => Some((16, false)),
-            Some(Token::Not) => Some((16, false)),
-            Some(Token::Tilde) => Some((16, false)),
+            // Postfix comptime call marker: `func!()`.
+            Some(Token::Bang) => Some((16, true)),
+            // `not` and `~` are prefix-only; they are handled in parse_prefix
+            // and must NOT appear in prefix_binding_power — otherwise the infix
+            // loop would treat them as valid infix operators and call parse_infix,
+            // which has no arm for them and hits unreachable!().
+            // Some(Token::Not) => Some((16, false)),
+            // Some(Token::Tilde) => Some((16, false)),
             // Cast
             Some(Token::As) => Some((14, true)),
             // Catch expression
@@ -3570,9 +3535,10 @@ impl Parser {
                 let end = self.span().end;
                 Ok(Expr::Old(Box::new(expr), Span::new(start, end)))
             }
-            Ok(Token::Bang) => {
+            Ok(Token::Not) => {
                 self.advance().ok();
-                let expr = self.parse_prefix()?;
+                // `not` has precedence 10 (second-lowest, above only `..`/`..=`).
+                let expr = self.parse_expr_bp(1)?;
                 let end = self.span().end;
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Not,
@@ -4408,10 +4374,7 @@ impl Parser {
             self.advance().ok();
             let pattern = self.parse_pattern()?;
             self.expect(Token::Assign)?;
-            let old_restrict = self.restrictions;
-            self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
-            let scrutinee = self.parse_expr()?;
-            self.restrictions = old_restrict;
+            let scrutinee = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
             self.expect(Token::LBrace)?;
             let then_branch =
                 self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block())?;
@@ -4440,10 +4403,7 @@ impl Parser {
                 span: Span::new(start, end),
             });
         }
-        let old_restrict = self.restrictions;
-        self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
-        let cond = self.parse_expr()?;
-        self.restrictions = old_restrict;
+        let cond = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
         self.expect(Token::LBrace)?;
         let then_branch =
             self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block())?;
@@ -4475,10 +4435,7 @@ impl Parser {
     fn parse_match_expr(&mut self) -> Result<Expr, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
-        let old_restrict = self.restrictions;
-        self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
-        let scrutinee = self.parse_expr()?;
-        self.restrictions = old_restrict;
+        let scrutinee = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
         self.expect(Token::LBrace)?;
         let mut arms = Vec::new();
         loop {
