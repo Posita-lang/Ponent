@@ -423,11 +423,17 @@ impl<'a> NameResolver<'a> {
                 ..
             } => {
                 let def_id = self.allocate_def_id();
+                // Set current_impl_for_type to a fresh generic param for Self,
+                // so that trait method signatures can reference `Self` in their
+                // parameter and return types (e.g. `def clone(self) -> Self`).
+                let self_param = self.ctx.generic_param(0, "Self".to_string());
+                self.current_impl_for_type = Some(self_param);
                 let mut method_bindings = Vec::new();
                 for method in methods {
                     let sig = self.collect_trait_method_signature(method);
                     method_bindings.push((method.name.clone(), sig));
                 }
+                self.current_impl_for_type = None;
 
                 let binding = TraitBinding {
                     def_id,
@@ -716,19 +722,17 @@ impl<'a> NameResolver<'a> {
                 // `set auto<T> = expr` — register each capture name as a type
                 // in the resolution map so that comptime code can reference it.
                 for cap in type_captures {
-                    // Placeholder entry: the checker overwrites this with the inferred
-                    // type after evaluating the expression.  We seed it with error()
-                    // so that if the checker doesn't override it (e.g. due to a bug),
-                    // the capture name resolves to Error at the use site, triggering
-                    // a downstream compile error instead of silent miscompilation.
+                    // Allocate a unique DefId for each capture so that
+                    // placeholder bindings don't collide in the type_defs map.
+                    let cap_def_id = self.allocate_def_id();
                     let _placeholder = self.ctx.error();
                     self.resolution_map
                         .type_def_ids
-                        .insert(cap.name.clone(), DefId(usize::MAX));
+                        .insert(cap.name.clone(), cap_def_id);
                     // The actual type binding will be updated by the checker
                     // after inferring the expression's type.
                     let binding = TypeBinding {
-                        def_id: DefId(usize::MAX),
+                        def_id: cap_def_id,
                         params: vec![],
                         kind: TypeKind::Alias,
                         span: *span,
