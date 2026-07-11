@@ -774,7 +774,11 @@ impl Parser {
                                     self.advance().ok();
                                     break;
                                 }
-                                Ok(Token::Ampersand) | Ok(Token::Ident(_)) => {
+                                Ok(Token::Ampersand) => {
+                                    let param = self.parse_self_param()?;
+                                    params.push(param);
+                                }
+                                Ok(Token::Ident(s)) if s == "self" || s == "Self" => {
                                     let param = self.parse_self_param()?;
                                     params.push(param);
                                 }
@@ -2999,7 +3003,11 @@ impl Parser {
                     self.advance().ok();
                     break;
                 }
-                Ok(Token::Ampersand) | Ok(Token::Ident(_)) => {
+                Ok(Token::Ampersand) => {
+                    let param = self.parse_self_param()?;
+                    params.push(param);
+                }
+                Ok(Token::Ident(s)) if s == "self" || s == "Self" => {
                     let param = self.parse_self_param()?;
                     params.push(param);
                 }
@@ -3054,6 +3062,26 @@ impl Parser {
         };
         match self.advance() {
             Ok(Token::Ident(s)) if s == "self" => {
+                let end = self.span().end;
+                let ty: Type = if has_ampersand {
+                    Type::Reference {
+                        inner: Box::new(Type::Path(vec!["Self".into()], Span::new(start, end))),
+                        mutable,
+                        lifetime: None,
+                        span: Span::new(start, end),
+                    }
+                } else {
+                    Type::Path(vec!["Self".into()], Span::new(start, end))
+                };
+                Ok(Param {
+                    name: "self".into(),
+                    ty: Some(ty),
+                    default: None,
+                    span: Span::new(start, end),
+                })
+            }
+            // Also handle `Self` (capital S) as the SelfKw token.
+            Ok(Token::SelfKw) => {
                 let end = self.span().end;
                 let ty: Type = if has_ampersand {
                     Type::Reference {

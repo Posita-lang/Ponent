@@ -2086,7 +2086,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             Pattern::Or(patterns, span) => {
                 let mut hir_patterns = Vec::new();
                 for pat in patterns {
-                    hir_patterns.push(self.check_pattern(pat, expected_ty)?);
+                    // Use check_pattern_inner (not check_pattern) to avoid
+                    // registering variable bindings from each sub-pattern.
+                    // Or-patterns in Posita, like Rust, do not introduce
+                    // variable bindings — each alternative binds separately,
+                    // and no consistent type can be guaranteed across arms.
+                    hir_patterns.push(self.check_pattern_inner(pat, expected_ty)?);
                 }
                 Ok(HirPattern::Or(hir_patterns, *span))
             }
@@ -2136,9 +2141,9 @@ pub(super) fn register_pattern_bindings(
             register_pattern_bindings(local_variable_types, p);
         }
         HirPattern::Or(patterns, _) => {
-            for p in patterns {
-                register_pattern_bindings(local_variable_types, p);
-            }
+            // Or-patterns do not introduce variable bindings, consistent
+            // with Rust's semantics.  Each alternative binds separately,
+            // and no consistent type can be guaranteed across arms.
         }
         _ => {}
     }

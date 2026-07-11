@@ -1535,6 +1535,17 @@ impl TypeContext {
                 self.set_binding(b, a);
                 Ok(a)
             }
+            // SkolemVar: identical skolems are equal; different skolems cannot unify.
+            (
+                TypeData::SkolemVar {
+                    id: id1,
+                    universe_num: u1,
+                },
+                TypeData::SkolemVar {
+                    id: id2,
+                    universe_num: u2,
+                },
+            ) if id1 == id2 && u1 == u2 => Ok(a),
             (TypeData::InferVar { .. }, _) => {
                 if self.occurs_check(a, b) {
                     return Err(TypeError::RecursiveType {
@@ -2241,6 +2252,17 @@ impl TypeContext {
                 }
                 self.subtype(b1_renamed, b2_renamed)
             }
+            // SkolemVar: identical skolems are equal; no subtyping otherwise.
+            (
+                TypeData::SkolemVar {
+                    id: id1,
+                    universe_num: u1,
+                },
+                TypeData::SkolemVar {
+                    id: id2,
+                    universe_num: u2,
+                },
+            ) => id1 == id2 && u1 == u2,
             _ => false,
         }
     }

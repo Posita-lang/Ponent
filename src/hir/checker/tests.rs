@@ -1105,14 +1105,7 @@ fn test_trait_impl_all_methods_provided() {
              impl Show for MyInt { def show(self) -> Int<32> { return 42; } }
              def main() -> Int<32> { return 0; }",
     );
-    // FIXME: `self` in impl methods resolves to `Self` which the checker
-    // cannot resolve yet, causing a false-negative "undefined type: Self".
-    // Expected: Ok, but currently fails due to Self type resolution.
-    // assert!(result.is_ok(), "impl with all methods: {:?}", result.err());
-    if result.is_err() {
-        // Temporary: skip check until Self resolution is implemented
-        return;
-    }
+    assert!(result.is_ok(), "impl with all methods: {:?}", result.err());
 }
 
 #[test]

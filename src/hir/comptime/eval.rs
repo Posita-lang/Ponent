@@ -27,25 +27,44 @@ fn unsigned_range(bits: u8) -> (i128, i128) {
     }
 }
 
-/// Check `result` against the type's bit width.  Returns `Overflow` if the
-/// value falls outside the representable range of the declared type.
-/// Returns `Internal` if called on a non-integer type — this is a HIR invariant
-/// violation that must be caught, not silently forwarded.
-fn check_range(result: i128, ty: TypeId, ctx: &TypeContext) -> Result<i128, ComptimeError> {
-    let (min, max) = match ctx.get(ty) {
-        crate::hir::types::TypeData::Int { bits, .. } => signed_range(*bits),
-        crate::hir::types::TypeData::UInt { bits, .. } => unsigned_range(*bits),
-        _ => {
-            return Err(ComptimeError::Internal(format!(
-                "check_range called on non-integer type: {:?}",
-                ctx.get(ty)
-            )));
+/// Apply the overflow policy to `result` given the type's representable range.
+/// Returns the corrected value, or `Overflow` error if the policy is `Trap`.
+fn apply_overflow_policy(result: i128, min: i128, max: i128, policy: &crate::ast::OverflowPolicy) -> Result<i128, ComptimeError> {
+    if result >= min && result <= max {
+        return Ok(result);
+    }
+    match policy {
+        crate::ast::OverflowPolicy::Wrap => {
+            // Two's complement wrapping within [min, max].
+            let range = max.wrapping_sub(min).wrapping_add(1);
+            if range == 0 {
+                return Ok(result);
+            }
+            Ok(result.wrapping_sub(min).wrapping_rem_euclid(range).wrapping_add(min))
         }
-    };
-    if result < min || result > max {
-        Err(ComptimeError::Overflow)
-    } else {
-        Ok(result)
+        crate::ast::OverflowPolicy::Saturate => {
+            if result < min { Ok(min) } else { Ok(max) }
+        }
+        crate::ast::OverflowPolicy::Trap => Err(ComptimeError::Overflow),
+    }
+}
+
+/// Check `result` against the type's bit width and overflow policy.
+/// Returns the (possibly adjusted) value, or `Overflow` if the policy is `Trap`.
+fn check_range(result: i128, ty: TypeId, ctx: &TypeContext) -> Result<i128, ComptimeError> {
+    match ctx.get(ty) {
+        crate::hir::types::TypeData::Int { bits, overflow_policy, .. } => {
+            let (min, max) = signed_range(*bits);
+            apply_overflow_policy(result, min, max, overflow_policy)
+        }
+        crate::hir::types::TypeData::UInt { bits, overflow_policy, .. } => {
+            let (min, max) = unsigned_range(*bits);
+            apply_overflow_policy(result, min, max, overflow_policy)
+        }
+        _ => Err(ComptimeError::Internal(format!(
+            "check_range called on non-integer type: {:?}",
+            ctx.get(ty)
+        ))),
     }
 }
 

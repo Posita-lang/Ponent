@@ -53,6 +53,9 @@ pub struct NameResolver<'a> {
     /// Temporary mapping of type parameter names to GenericParam TypeIds
     /// used when resolving types inside an `impl<T>` block.
     current_impl_type_params: Option<HashMap<String, TypeId>>,
+    /// The resolved `for_type` of the current `impl` block, used to resolve
+    /// `Self` in method bodies and associated type defaults.
+    current_impl_for_type: Option<TypeId>,
     /// Pre-resolved name resolutions for the type checker.
     resolution_map: ResolutionMap,
     /// Current module path for registering full-qualified type paths.
@@ -81,6 +84,7 @@ impl<'a> NameResolver<'a> {
             import_map: Vec::new(),
             local_crate_id,
             current_impl_type_params: None,
+            current_impl_for_type: None,
             resolution_map: ResolutionMap::default(),
             module_path: Vec::new(),
             layout_aliases: HashMap::default(),
@@ -459,6 +463,7 @@ impl<'a> NameResolver<'a> {
                 self.current_impl_type_params = Some(param_map);
 
                 let resolved_for = self.resolve_type_expr(for_type);
+                self.current_impl_for_type = Some(resolved_for);
                 let resolved_trait = trait_path
                     .as_ref()
                     .and_then(|path| self.resolve_trait_path(path));
@@ -562,6 +567,7 @@ impl<'a> NameResolver<'a> {
 
                 // Clear impl type params so they don't leak into subsequent statements.
                 self.current_impl_type_params = None;
+                self.current_impl_for_type = None;
 
                 self.exit_scope();
             }
@@ -1308,6 +1314,12 @@ impl<'a> NameResolver<'a> {
     fn resolve_type_expr(&mut self, ty: &Type) -> TypeId {
         match ty {
             Type::Path(path, span) => {
+                // Check if this name refers to `Self` in an impl block.
+                if path.len() == 1 && path[0] == "Self" {
+                    if let Some(self_ty) = self.current_impl_for_type {
+                        return self_ty;
+                    }
+                }
                 // Check if this name refers to an impl type parameter (e.g. `T` in `impl<T>`)
                 if path.len() == 1 {
                     if let Some(ref param_map) = self.current_impl_type_params {
