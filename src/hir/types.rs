@@ -441,14 +441,23 @@ impl TypeContext {
     }
 
     pub fn alloc(&mut self, data: TypeData) -> TypeId {
-        if let Some(&id) = self.type_map.get(&data) {
-            return id;
+        // InferVar types must NOT be cached: the same id value can be reused
+        // across inference scopes (each function body gets a fresh
+        // InferenceContext with next_var_id = 0).  Caching would cause the
+        // second function body to get the same TypeId as the first, but with
+        // stale bindings still attached.
+        if !matches!(data, TypeData::InferVar { .. }) {
+            if let Some(&id) = self.type_map.get(&data) {
+                return id;
+            }
         }
         let tag = TypeTag::from(&data) as usize;
         let index = self.types.len();
         let id = TypeId((index << TypeId::TAG_BITS) | tag);
         self.types.push(Arc::new(data.clone()));
-        self.type_map.insert(data, id);
+        if !matches!(data, TypeData::InferVar { .. }) {
+            self.type_map.insert(data, id);
+        }
         id
     }
 

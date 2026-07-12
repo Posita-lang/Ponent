@@ -2603,7 +2603,7 @@ impl<'a> TypeChecker<'a> {
 
     fn lookup_attr(&self, ty: TypeId, name: &str, span: Span) -> Result<TypeId, Diagnostic> {
         match name {
-            "len" if self.ctx.is_array(ty) || self.ctx.is_slice(ty) => Ok(self.ctx.usize()),
+            "len" if self.ctx.is_array(ty) || self.ctx.is_slice(ty) || ty == self.ctx.builtin_str || ty == self.ctx.builtin_str_ref => Ok(self.ctx.usize()),
             "size"
                 if self.ctx.is_integer(ty) || self.ctx.is_float(ty) || self.ctx.is_pointer(ty) =>
             {

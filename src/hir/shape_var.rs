@@ -523,3 +523,50 @@ mod tests {
     }
 }
 
+// ── Region Pool Module (OmniML §6) ────────────────────────────────
+//
+// A Pool tracks all type variables that belong to a region.
+// When a region is exited (generalised), the pool's types can be
+// examined to determine which can become Generic vs. remain Instance.
+
+pub mod pool {
+    /// A region pool: tracks type variable IDs belonging to one region.
+    #[derive(Debug, Clone)]
+    pub struct Pool {
+        /// Type variable IDs in this region.
+        pub type_ids: Vec<usize>,
+        /// Rigid variable IDs in this region.
+        pub rigid_ids: Vec<usize>,
+    }
+
+    impl Pool {
+        pub fn new() -> Self {
+            Pool {
+                type_ids: Vec::new(),
+                rigid_ids: Vec::new(),
+            }
+        }
+
+        pub fn register_type(&mut self, id: usize) {
+            self.type_ids.push(id);
+        }
+
+        pub fn register_rigid(&mut self, id: usize) {
+            self.rigid_ids.push(id);
+        }
+
+        pub fn is_dead(&self) -> bool {
+            self.type_ids.is_empty()
+        }
+
+        pub fn is_alive(&self) -> bool {
+            !self.is_dead()
+        }
+    }
+
+    impl Default for Pool {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+}

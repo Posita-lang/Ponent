@@ -81,28 +81,37 @@ pub fn register_builtins(
     insert_trait(symbols, "And", &mut and_id);
     insert_trait(symbols, "Or", &mut or_id);
 
-    let int32 = ctx.int(32, true);
-    for &trait_id in &[
+    let int_arith_traits = [
         add_id, sub_id, mul_id, div_id, rem_id, bitand_id, bitor_id, bitxor_id, shl_id, shr_id,
         eq_id, neq_id, lt_id, gt_id, le_id, ge_id, and_id, or_id,
+    ];
+    // Register arithmetic/bitwise trait impls for all common integer types.
+    // Signed: Int<8>, Int<16>, Int<32>, Int<64>
+    // Unsigned: UInt<8>, UInt<16>, UInt<32>, UInt<64>
+    for &(bits, signed) in &[
+        (8, true), (16, true), (32, true), (64, true),
+        (8, false), (16, false), (32, false), (64, false),
     ] {
-        trait_env
-            .add_impl(
-                ImplCandidate {
-                    trait_id,
-                    for_type: int32,
-                    methods: vec![],
-                    resolved_methods: vec![],
-                    assoc_tys: vec![],
-                    has_auto_deref: false,
-                    context: vec![],
-                    span: Span::new(0, 0),
-                },
-                symbols,
-                ctx,
-                false,
-            )
-            .ok();
+        let int_ty = ctx.int(bits, signed);
+        for &trait_id in &int_arith_traits {
+            trait_env
+                .add_impl(
+                    ImplCandidate {
+                        trait_id,
+                        for_type: int_ty,
+                        methods: vec![],
+                        resolved_methods: vec![],
+                        assoc_tys: vec![],
+                        has_auto_deref: false,
+                        context: vec![],
+                        span: Span::new(0, 0),
+                    },
+                    symbols,
+                    ctx,
+                    false,
+                )
+                .ok();
+        }
     }
 
     // Register And/Or impls for Bool.  The type checker handles `and`/`or`
