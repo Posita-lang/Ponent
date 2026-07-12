@@ -1,0 +1,61 @@
+edition = "2026";
+
+// ── Enums, generic type params, and pattern matching ──
+
+type Color = enum {
+    Red,
+    Green,
+    Blue,
+}
+
+// Generic enum type — now supported!
+type Option<T> = enum {
+    None,
+    Some(T),
+}
+
+// Enum with concrete payload
+type OptColor = enum {
+    None,
+    Some(Color),
+}
+
+def main() -> Int<32> {
+    // Match on enum (no payload)
+    set c = Color::Red;
+    set code = match c {
+        Color::Red => 0xFF0000,
+        Color::Green => 0x00FF00,
+        Color::Blue => 0x0000FF,
+    };
+
+    // Generic enum with type inference
+    set x = Option::Some(42);
+    set name = match x {
+        Option::Some(v) => v + 1,
+        Option::None => 0,
+        _ => -1,
+    };
+
+    // Match on enum with payload
+    set maybe = OptColor::Some(Color::Red);
+    set val = match maybe {
+        OptColor::Some(Color::Red) => 1,
+        OptColor::Some(Color::Green) => 2,
+        OptColor::Some(Color::Blue) => 3,
+        OptColor::None => 0,
+        _ => -1,
+    };
+
+    // Bool match (exhaustive required)
+    set flag = true;
+    set bval = match flag {
+        true => 100,
+        false => 200,
+    };
+
+    // let destructuring with else
+    let Some(v) = x else { return 0; };
+
+    return code + name + val + bval + v;
+}

@@ -1,0 +1,35 @@
+edition = "2026";
+
+// ── Generic functions and first-class polymorphism ──
+
+// Polymorphic identity function
+def id<T>(x: T) -> T {
+    return x;
+}
+
+// Generic pair function
+def pair<A, B>(a: A, b: B) -> A {
+    return a;
+}
+
+// First-class polymorphism with poly / unbox
+def main() -> Int<32> {
+    // Generic function calls — type args inferred from arguments
+    set x = id(42);
+    set y = id(true);
+
+    // Multiple type parameters
+    set p = pair(42, true);
+
+    // Boxing a polymorphic function into a first-class value
+    set p_id = poly(id);
+    set f = unbox(p_id);
+    set a = f(42);
+
+    // Multi-quantifier poly
+    set p_pair = poly(pair);
+    set g = unbox(p_pair);
+    set b = g(1, true);
+
+    return a + b;
+}

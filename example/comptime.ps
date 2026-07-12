@@ -1,0 +1,33 @@
+edition = "2026";
+
+// ── Compile-time computation ──
+
+// Comptime function with arithmetic
+comptime def double(n: Int<32>) -> Int<32> {
+    return n * 2;
+}
+
+// Comptime function with loop
+comptime def sum_to(n: Int<32>) -> Int<32> {
+    set mut total = 0;
+    set mut i = 0;
+    while i <= n {
+        total = total + i;
+        i = i + 1;
+    }
+    return total;
+}
+
+// Comptime block: executed at compile time
+comptime {
+    set x = 1 + 2;
+    set y = x * 3;
+}
+
+// Using comptime results at runtime
+def main() -> Int<32> {
+    // Call comptime function — the `!` marks the compile-time call
+    set d = double!(21);
+    set s = sum_to!(10);
+    return d + s;
+}

@@ -1,0 +1,58 @@
+edition = "2026";
+
+// ── Basic types, functions, and control flow ──
+
+// Type alias for readability
+type Int32 = Int<32>;
+
+// Simple function: add two integers
+def add(a: Int32, b: Int32) -> Int32 {
+    return a + b;
+}
+
+// Recursive function: factorial
+def factorial(n: Int32) -> Int32
+    requires n >= 0
+{
+    if n == 0 {
+        return 1;
+    }
+    return n * factorial(n - 1);
+}
+
+// Function with contracts
+def divide(a: Int32, b: Int32) -> Int32
+    requires b != 0
+    ensures result * b == a
+{
+    return a / b;
+}
+
+def main() -> Int32 {
+    // Variable declaration with type inference
+    set x = 10;
+    set y = 20;
+    set z = add(x, y);
+
+    // Mutable variable
+    set mut sum: Int32 = 0;
+    set mut i = 0;
+    while i < 10 {
+        sum = sum + i;
+        i = i + 1;
+    }
+
+    // If expression
+    set max = if x > y { x } else { y };
+
+    // Recursive function call
+    set fact5 = factorial(5);
+
+    // Arithmetic operators
+    set a = 1 + 2;
+    set b = 3 * 4;
+    set c = 10 - 3;
+    set d = 20 / 4;
+
+    return z + sum + fact5;
+}

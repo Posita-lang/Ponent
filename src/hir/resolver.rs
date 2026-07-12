@@ -207,6 +207,17 @@ impl<'a> NameResolver<'a> {
                     .type_def_ids
                     .insert(name.clone(), def_id);
                 let type_params = params.clone();
+
+                // Register generic parameters so that resolve_type_expr can
+                // resolve T in `type Option<T> = enum { None, Some(T) }`.
+                let mut param_map = HashMap::default();
+                for (i, tp) in params.iter().enumerate() {
+                    let ty_id = self.ctx.generic_param(i, tp.name.clone());
+                    param_map.insert(tp.name.clone(), ty_id);
+                }
+                // Save the previous param map and install the new one.
+                let prev_param_map = self.current_impl_type_params.take();
+                self.current_impl_type_params = Some(param_map);
                 let kind = match definition {
                     TypeDefinition::Struct(_, _) => TypeKind::Struct,
                     TypeDefinition::Enum(_, _, _) => TypeKind::Enum,
@@ -414,6 +425,8 @@ impl<'a> NameResolver<'a> {
                 if let Some(b) = self.symbols.lookup_type(&name) {
                     self.resolution_map.type_bindings.insert(def_id, b.clone());
                 }
+                // Restore the previous type param map (if any).
+                self.current_impl_type_params = prev_param_map;
             }
             Stmt::TraitDef {
                 span,

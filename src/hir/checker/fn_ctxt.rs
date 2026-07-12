@@ -211,6 +211,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 };
                 let (left_hir, left_ty) = self.infer_expr(left)?;
                 let (right_hir, right_ty) = self.infer_expr(right)?;
+                // Check kind compatibility before unifying operands, so that
+                // e.g. `1 + "2"` (InferVar(Integer) vs InferVar(Any)) is rejected
+                // when one side resolves to a concrete type incompatible with
+                // the other side's kind constraint.
+                self.check_kind_compat(left_ty, right_ty, *span)?;
+                self.check_kind_compat(right_ty, left_ty, *span)?;
                 self.unify_with(left_ty, right_ty, *span, TypingContext::None)?;
                 if let Ok(Some(trait_id)) = self.checker.get_trait_id_for_binop(*op, *span) {
                     self.add_constraint(Constraint::Impl(left_ty, trait_id, *span));
@@ -377,6 +383,64 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         }
                         self.checker.diagnostics.push(diag);
                         return Ok((HirExpr::Error(*span), self.checker.ctx.error()));
+                    }
+                }
+
+                // Check if this is a static method call: `Type::method(args)`
+                if let Expr::Path(path, _) = callee.as_ref() {
+                    if path.len() >= 2 {
+                        // Resolve the type from the first path segment.
+                        let type_name = path[0].clone();
+                        let method_name = path[1].clone();
+                        let type_path = Type::Path(vec![type_name], *span);
+                        if let Ok(ty) = self.resolve_type(&type_path) {
+                            // Look up the method on the resolved type.
+                            // lookup_method also handles inherent methods.
+                            if let Some((param_tys, ret_ty)) = self.checker.lookup_method(ty, &method_name) {
+                                // Static method call: no self parameter to skip.
+                                // The method's param_tys already reflect the full signature.
+                                if param_tys.len() != args.len() {
+                                    self.checker.diagnostics.push(
+                                        Diagnostic::error(format!(
+                                            "wrong number of arguments: expected {}, found {}",
+                                            param_tys.len(),
+                                            args.len()
+                                        ))
+                                        .with_span(*span),
+                                    );
+                                }
+                                let mut hir_args = Vec::new();
+                                for (i, arg) in args.iter().enumerate() {
+                                    let expected = param_tys
+                                        .get(i)
+                                        .copied()
+                                        .unwrap_or(self.checker.ctx.error());
+                                    let hir_arg = self.check_expr(
+                                        arg,
+                                        Expectation::HasType(expected),
+                                        TypingContext::Argument {
+                                            index: i,
+                                            total: args.len(),
+                                        },
+                                    )?;
+                                    hir_args.push(hir_arg);
+                                }
+                                let callee_hir = HirExpr::Ident(method_name, ret_ty, *span);
+                                return Ok((
+                                    HirExpr::Call {
+                                        callee: Box::new(callee_hir),
+                                        args: hir_args,
+                                        comptime: *comptime,
+                                        ty: ret_ty,
+                                        span: *span,
+                                    },
+                                    ret_ty,
+                                ));
+                            }
+                        }
+                        // If type resolution or method lookup fails, fall through to
+                        // normal call handling — infer_expr(Path) will produce a
+                        // diagnostic about the unresolved path.
                     }
                 }
 
@@ -672,9 +736,44 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     .checker
                     .symbols
                     .lookup_type_by_def_id(def_id)
-                    .ok_or_else(|| Diagnostic::error("enum not found").with_span(*span))?;
-                if !matches!(binding.kind, TypeKind::Enum) {
-                    return Err(Diagnostic::error("not an enum type").with_span(*span));
+                    .ok_or_else(|| Diagnostic::error("type not found").with_span(*span))?;
+                // If the type is not an enum, or if the variant is not found among
+                // the enum's variants, treat this as a static method call instead.
+                if !matches!(binding.kind, TypeKind::Enum)
+                    || !binding.variants.iter().any(|v| v.name == *variant)
+                {
+                    // Static method call: `Type::method(args)`
+                    // The payload (if any) is the argument expression.
+                    if let Some((method_param_tys, ret_ty)) =
+                        self.checker.lookup_method(resolved_ty, variant)
+                    {
+                        let mut hir_args = Vec::new();
+                        // Pass the payload (if any) as the argument.
+                        if let Some(p) = &payload {
+                            let expected = method_param_tys.first().copied().unwrap_or(self.checker.ctx.error());
+                            let hir_arg = self.check_expr(
+                                p,
+                                Expectation::HasType(expected),
+                                TypingContext::Argument { index: 0, total: 1 },
+                            )?;
+                            hir_args.push(hir_arg);
+                        }
+                        let callee_hir = HirExpr::Ident(variant.clone(), ret_ty, *span);
+                        return Ok((
+                            HirExpr::Call {
+                                callee: Box::new(callee_hir),
+                                args: hir_args,
+                                comptime: false,
+                                ty: ret_ty,
+                                span: *span,
+                            },
+                            ret_ty,
+                        ));
+                    }
+                    // Fall through: not an enum and not a method — produce a diagnostic below.
+                    if !matches!(binding.kind, TypeKind::Enum) {
+                        return Err(Diagnostic::error("not an enum type").with_span(*span));
+                    }
                 }
                 let enum_ty = self.checker.ctx.enum_ty(def_id, args.clone());
                 let mut subst = Subst::new();
@@ -691,10 +790,29 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         Diagnostic::error(format!("variant '{}' not found", variant))
                             .with_span(*span)
                     })?;
+                // Resolve the payload type, substituting type params with concrete args.
+                // For example, `Option<T>` with `T = Int<32>` means the payload type
+                // `T` should resolve to the `GenericParam` TypeId, which will be
+                // unified with the concrete arg via the subst.
                 let payload_ty = variant_def
                     .payload
                     .as_ref()
-                    .map(|ty| self.resolve_type(ty))
+                    .map(|ty| {
+                        // If the payload type is a bare type param name (e.g. `T` in
+                        // `type Option<T> = enum { None, Some(T) }`), resolve it to
+                        // the corresponding GenericParam TypeId so that substitution
+                        // with the concrete args works correctly.
+                        if let Type::Path(p, _) = ty {
+                            if p.len() == 1 {
+                                if let Some((i, _)) = binding.params.iter().enumerate().find(|(_, tp)| tp.name == p[0]) {
+                                    let gp = self.checker.ctx.generic_param(i, p[0].clone());
+                                    let result = self.checker.ctx.subst(gp, &subst);
+                                    return Ok(result);
+                                }
+                            }
+                        }
+                        self.resolve_type(ty)
+                    })
                     .transpose()?
                     .unwrap_or(self.checker.ctx.error());
                 let payload_hir = if let Some(payload) = payload {
@@ -2147,7 +2265,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let inner_ty = variant_def
                     .payload
                     .as_ref()
-                    .map(|ty| self.resolve_type(ty))
+                    .map(|ty| {
+                        // Same logic as EnumLit: substitute type params with concrete args.
+                        if let Type::Path(p, _) = ty {
+                            if p.len() == 1 {
+                                if let Some((i, _)) = binding.params.iter().enumerate().find(|(_, tp)| tp.name == p[0]) {
+                                    let gp = self.checker.ctx.generic_param(i, p[0].clone());
+                                    return Ok(self.checker.ctx.subst(gp, &subst));
+                                }
+                            }
+                        }
+                        self.resolve_type(ty)
+                    })
                     .unwrap_or(Ok(self.checker.ctx.error()))?;
                 let inner_hir = inner
                     .as_ref()

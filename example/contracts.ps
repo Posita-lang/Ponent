@@ -1,0 +1,28 @@
+edition = "2026";
+
+// ── Contracts: requires, ensures, invariants ──
+
+// Function with pre- and post-conditions
+def divide(a: Int<32>, b: Int<32>) -> Int<32>
+    requires b != 0
+    ensures result * b == a
+{
+    return a / b;
+}
+
+// Recursive function with pre-condition
+def factorial(n: Int<32>) -> Int<32>
+    requires n >= 0
+    ensures result > 0
+{
+    if n == 0 {
+        return 1;
+    }
+    return n * factorial(n - 1);
+}
+
+def main() -> Int<32> {
+    set result = divide(10, 2);
+    set fact5 = factorial(5);
+    return result + fact5;
+}

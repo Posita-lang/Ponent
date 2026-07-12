@@ -67,6 +67,11 @@ fn check_range(result: i128, ty: TypeId, ctx: &TypeContext) -> Result<i128, Comp
             let (min, max) = unsigned_range(*bits);
             apply_overflow_policy(result, min, max, overflow_policy)
         }
+        // During comptime evaluation within type checking, the result type
+        // may still be an un-resolved InferVar (e.g. TypeVariableKind::Numeric
+        // from a BinaryOp).  Skip range checking in that case — the type
+        // checker will resolve it later and catch any mismatches.
+        crate::hir::types::TypeData::InferVar { .. } => Ok(result),
         _ => Err(ComptimeError::Internal(format!(
             "check_range called on non-integer type: {:?}",
             ctx.get(ty)

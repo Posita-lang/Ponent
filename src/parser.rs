@@ -1154,7 +1154,7 @@ impl Parser {
             .with_help("unexpected syntax in contract — expected `requires`, `ensures`, `invariant`, `decreases`, or `terminates`")
             .with_span(Span::new(0, 0)))? {
             Token::Requires => {
-                let expr = self.parse_expr()?;
+                let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
                 let end = self.span().end;
                 Ok(Contract::Requires(expr, Span::new(start, end)))
             }
@@ -1250,17 +1250,17 @@ impl Parser {
                 })
             }
             Token::Invariant => {
-                let expr = self.parse_expr()?;
+                let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
                 let end = self.span().end;
                 Ok(Contract::Invariant(expr, Span::new(start, end)))
             }
             Token::Decreases => {
-                let expr = self.parse_expr()?;
+                let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
                 let end = self.span().end;
                 Ok(Contract::Decreases(expr, Span::new(start, end)))
             }
             Token::Terminates => {
-                let expr = self.parse_expr()?;
+                let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
                 let end = self.span().end;
                 Ok(Contract::Terminates(expr, Span::new(start, end)))
             }
@@ -4066,7 +4066,38 @@ impl Parser {
         start: usize,
     ) -> Result<Expr, Diagnostic> {
         self.expect(Token::LParen)?;
+        // If the next token is `)`, it's an empty payload (no args).
+        if matches!(self.peek(), Ok(Token::RParen)) {
+            self.advance().ok();
+            let end = self.span().end;
+            return Ok(Expr::EnumLit {
+                path,
+                variant,
+                payload: None,
+                span: Span::new(start, end),
+            });
+        }
+        // Parse the first expression.
         let payload = self.parse_expr()?;
+        // If followed by a comma, this is a multi-argument call — treat as
+        // a static method call (`Type::method(args)`) instead of enum variant.
+        if matches!(self.peek(), Ok(Token::Comma)) {
+            let mut args = vec![payload];
+            while matches!(self.peek(), Ok(Token::Comma)) {
+                self.advance().ok();
+                args.push(self.parse_expr()?);
+            }
+            self.expect(Token::RParen)?;
+            let end = self.span().end;
+            // Build a call expression: Type::method(arg1, arg2, ...)
+            let callee = Expr::Path(path, Span::new(start, end));
+            return Ok(Expr::Call {
+                callee: Box::new(callee),
+                args,
+                comptime: false,
+                span: Span::new(start, end),
+            });
+        }
         self.expect(Token::RParen)?;
         let end = self.span().end;
         Ok(Expr::EnumLit {

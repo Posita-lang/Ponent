@@ -1,0 +1,72 @@
+edition = "2026";
+
+// ── Structs, fields, methods, and static method calls ──
+
+type Point = struct {
+    x: Int<32>,
+    y: Int<32>,
+}
+
+type Rectangle = struct {
+    top_left: Point,
+    bottom_right: Point,
+}
+
+impl for Point {
+    // Static method — no self parameter
+    def origin() -> Point {
+        return Point { x = 0, y = 0 };
+    }
+
+    // Instance method with &self
+    def distance_sq(&self) -> Int<32> {
+        return self.x * self.x + self.y * self.y;
+    }
+
+    // Instance method with two points
+    def add(&self, other: &Point) -> Point {
+        return Point {
+            x = self.x + other.x,
+            y = self.y + other.y,
+        };
+    }
+}
+
+impl for Rectangle {
+    def area(&self) -> Int<32> {
+        set width = self.bottom_right.x - self.top_left.x;
+        set height = self.bottom_right.y - self.top_left.y;
+        return width * height;
+    }
+}
+
+def main() -> Int<32> {
+    // Static method call: Type::method()
+    set p = Point::origin();
+    set q = Point { x = 3, y = 4 };
+
+    // Instance method call
+    set d = q.distance_sq();
+
+    // Method with argument
+    set r = q.add(&p);
+
+    // Nested struct
+    set rect = Rectangle {
+        top_left = p,
+        bottom_right = q,
+    };
+
+    // Method call on nested struct
+    set area = rect.area();
+
+    // Field access through reference
+    set r = &rect;
+    set area2 = r.area();
+    set px = r.top_left.x;
+
+    // let destructuring
+    let Point { x, y } = q;
+
+    return d + area + area2 + x + y;
+}
