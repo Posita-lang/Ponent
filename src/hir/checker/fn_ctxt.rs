@@ -1385,9 +1385,86 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
         let (hir, ty) = self.infer_expr(expr)?;
         if let Expectation::HasType(expected_ty) = expected {
+            // Check kind compatibility before unification:
+            // if the inferred type is an InferVar with a kind constraint
+            // (e.g. Bool from a `true` literal, Integer from `42`),
+            // verify that the expected type is compatible with that kind.
+            self.check_kind_compat(ty, expected_ty, hir.span())?;
+            self.check_kind_compat(expected_ty, ty, hir.span())?;
             self.unify_with(expected_ty, ty, hir.span(), ctx)?;
         }
         Ok(hir)
+    }
+
+    /// Check that an InferVar's kind constraint is compatible with the
+    /// resolved type of another type.  This prevents situations like
+    /// `true` (InferVar with kind Bool) being unified with `Int<32>`.
+    /// Only fires when the other side resolves to a concrete (non-type-variable) type.
+    fn check_kind_compat(
+        &self,
+        maybe_var: TypeId,
+        other: TypeId,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        if let TypeData::InferVar { id } = self.checker.ctx.get(maybe_var) {
+            let kind = self.checker.infer.get_var_kind(*id);
+            let resolved_other = self.checker.ctx.resolve_binding(other);
+            // Only check when the other side is a concrete type (not a type variable).
+            // Type variables (InferVar, GenericParam, SkolemVar) are placeholders
+            // that can be unified with any compatible type.
+            match self.checker.ctx.get(resolved_other) {
+                TypeData::InferVar { .. }
+                | TypeData::GenericParam { .. }
+                | TypeData::SkolemVar { .. } => return Ok(()),
+                _ => {}
+            }
+            match kind {
+                Some(TypeVariableKind::Bool) => {
+                    if !self.checker.ctx.is_bool(resolved_other) {
+                        return Err(Diagnostic::error(format!(
+                            "type mismatch: expected `Bool`, found `{:?}`",
+                            self.checker.ctx.get(resolved_other),
+                        ))
+                        .with_span(span));
+                    }
+                }
+                Some(TypeVariableKind::Integer) => {
+                    if !self.checker.ctx.is_integer(resolved_other)
+                        && !matches!(
+                            self.checker.ctx.get(resolved_other),
+                            TypeData::Rational { .. }
+                        )
+                    {
+                        return Err(Diagnostic::error(format!(
+                            "type mismatch: expected integer type, found `{:?}`",
+                            self.checker.ctx.get(resolved_other),
+                        ))
+                        .with_span(span));
+                    }
+                }
+                Some(TypeVariableKind::Float) => {
+                    if !self.checker.ctx.is_float(resolved_other) {
+                        return Err(Diagnostic::error(format!(
+                            "type mismatch: expected float type, found `{:?}`",
+                            self.checker.ctx.get(resolved_other),
+                        ))
+                        .with_span(span));
+                    }
+                }
+                Some(TypeVariableKind::Numeric) => {
+                    if !self.checker.ctx.is_numeric(resolved_other) {
+                        return Err(Diagnostic::error(format!(
+                            "type mismatch: expected numeric type, found `{:?}`",
+                            self.checker.ctx.get(resolved_other),
+                        ))
+                        .with_span(span));
+                    }
+                }
+                // Any / Unconstrained are compatible with everything
+                Some(TypeVariableKind::Any) | Some(TypeVariableKind::Unconstrained) | None => {}
+            }
+        }
+        Ok(())
     }
 
     /// Resolve a syntactic type to a TypeId — actual implementation.

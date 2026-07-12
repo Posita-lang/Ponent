@@ -361,7 +361,8 @@ fn test_poly_box_identity() {
 
 #[test]
 fn test_poly_box_twice() {
-    // Use the same poly in two different instantiations.
+    // unbox(p) creates ONE set of fresh type variables; f(42) constrains
+    // them to Int<32>, so f(true) must fail.
     let result = check_source(
         "def id<T>(x: T) -> T { return x; }
              def main() -> Int<32> {
@@ -372,7 +373,7 @@ fn test_poly_box_twice() {
                  return x;
              }",
     );
-    assert!(result.is_ok(), "poly box twice: {:?}", result.err());
+    assert!(result.is_err(), "poly box twice should fail: {:?}", result);
 }
 
 #[test]

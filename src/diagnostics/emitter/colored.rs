@@ -76,10 +76,11 @@ impl super::DiagnosticEmitter for ColoredEmitter {
         }
 
         // suggestion(s)
+        let reset = DiagnosticLevel::ansi_reset();
         for suggestion in &diag.suggestions {
             eprintln!(
-                "{cyan}suggestion: {msg}{reset}",
-                cyan = DiagnosticLevel::ansi_color_for_level(DiagnosticLevel::Help),
+                "{green}suggestion: {msg}{reset}",
+                green = "\x1b[92m",
                 msg = suggestion,
                 reset = reset,
             );

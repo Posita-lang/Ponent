@@ -1,6 +1,45 @@
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
 use crate::lexer::Token;
+
+/// Whether parser recovery is allowed at a given call site (rustc-style).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    Allowed,
+    Forbidden,
+}
+
+/// A token that the parser expects, used for error recovery.
+#[derive(Debug, Clone)]
+pub struct ExpectedToken {
+    /// The expected token kind.
+    tok: Token,
+    /// A human-readable description of what was expected.
+    desc: &'static str,
+}
+
+impl ExpectedToken {
+    pub fn new(tok: Token, desc: &'static str) -> Self {
+        ExpectedToken { tok, desc }
+    }
+}
+
+/// Result of parser recovery (rustc-style).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovered {
+    No,
+    Yes(ErrorGuaranteed),
+}
+
+/// A token representing that an error has been reported (rustc-style).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorGuaranteed(u32);
+
+impl ErrorGuaranteed {
+    pub fn new_unchecked(id: u32) -> Self {
+        ErrorGuaranteed(id)
+    }
+}
 use bitflags::bitflags;
 use logos::Logos;
 
@@ -44,6 +83,12 @@ pub struct Parser {
     /// parses successfully.  Prevents the cascade of 20+ errors from
     /// a single typo like `defw`.
     cascade_suppressed: bool,
+    /// Whether parser recovery is allowed (rustc-style).
+    recovery: Recovery,
+    /// Span of the last unexpected token, used to detect infinite recovery loops.
+    last_unexpected_token_span: Option<Span>,
+    /// Stack of expected token types for better error messages.
+    expected_token_types: Vec<ExpectedToken>,
 }
 
 // Local Diagnostic removed — using crate::diagnostics::Diagnostic
@@ -88,6 +133,9 @@ impl Parser {
             max_recursion_depth: 256,
             restrictions: ParseRestrictions::STMT_EXPR,
             cascade_suppressed: false,
+            recovery: Recovery::Allowed,
+            last_unexpected_token_span: None,
+            expected_token_types: Vec::new(),
         }
     }
 
@@ -116,6 +164,96 @@ impl Parser {
         match self.peeked.take() {
             Some(tok) => tok,
             None => self.next_token(),
+        }
+    }
+
+    /// Set recovery mode for a scope (rustc-style).
+    fn set_recovery(&mut self, recovery: Recovery) -> Recovery {
+        let old = self.recovery;
+        self.recovery = recovery;
+        old
+    }
+
+    /// Run a closure with modified recovery mode, restoring the original after.
+    fn with_recovery<F, T>(&mut self, recovery: Recovery, f: F) -> T
+    where
+        F: FnOnce(&mut Self) -> T,
+    {
+        let old = self.set_recovery(recovery);
+        let result = f(self);
+        self.recovery = old;
+        result
+    }
+
+    /// Push an expected token type onto the stack (for error recovery).
+    fn push_expected(&mut self, tok: Token, desc: &'static str) {
+        self.expected_token_types.push(ExpectedToken::new(tok, desc));
+    }
+
+    /// Pop the last expected token type.
+    fn pop_expected(&mut self) {
+        self.expected_token_types.pop();
+    }
+
+    /// Generate a diagnostic for an unexpected token, optionally with recovery.
+    /// Returns `Some(Recovered::Yes)` if recovery was possible, `None` if fatal.
+    fn unexpected_err(&mut self, expected: &Option<Token>) -> Option<Recovered> {
+        let span = self.span();
+        let found = self.peek().clone();
+        let found_str = match &found {
+            Ok(tok) => format!("{:?}", tok),
+            Err(()) => "end of file".to_string(),
+        };
+        let expected_str = if let Some(tok) = expected {
+            format!("{:?}", tok)
+        } else if !self.expected_token_types.is_empty() {
+            self.expected_token_types.last().unwrap().desc.to_string()
+        } else {
+            "something".to_string()
+        };
+
+        let diag = Diagnostic::error(format!("expected {}, found {}", expected_str, found_str))
+            .with_span(span);
+        self.diagnostics.push(diag);
+
+        if self.recovery == Recovery::Forbidden {
+            return None;
+        }
+
+        // Check for infinite recovery loop: two consecutive errors at the same span.
+        if self.last_unexpected_token_span == Some(span) {
+            return None;
+        }
+        self.last_unexpected_token_span = Some(span);
+        Some(Recovered::Yes(ErrorGuaranteed::new_unchecked(0)))
+    }
+
+    /// Expect one of the given edible tokens. If the next token matches,
+    /// consume it. Otherwise, report an error and try to recover.
+    /// Returns `Ok(Recovered::Yes)` if recovery was needed, `Ok(Recovered::No)` otherwise.
+    fn expect_one_of(
+        &mut self,
+        edible: &[Token],
+        inedible: &[Token],
+    ) -> Result<Recovered, ()> {
+        // Check edible tokens first.
+        for exp in edible {
+            if matches!(self.peek(), Ok(tok) if tok == exp) {
+                self.advance().ok();
+                return Ok(Recovered::No);
+            }
+        }
+        // Check inedible tokens — leave them in the input.
+        for exp in inedible {
+            if matches!(self.peek(), Ok(tok) if tok == exp) {
+                return Ok(Recovered::No);
+            }
+        }
+        // Unexpected token — try to recover.
+        let expected = edible.first().or_else(|| inedible.first()).cloned();
+        match self.unexpected_err(&expected) {
+            Some(recovered) => Ok(recovered),
+            None => Err(()),
         }
     }
 
@@ -176,50 +314,44 @@ impl Parser {
     }
 
     fn expect(&mut self, expected: Token) -> Result<Token, Diagnostic> {
-        match self.advance() {
-            Ok(tok) if tok == expected => Ok(tok),
-            Ok(tok) => Err(Diagnostic::error(format!("expected {:?}, found {:?}", expected, tok))
+        if matches!(self.peek(), Ok(tok) if tok == &expected) {
+            self.advance().ok();
+            Ok(expected)
+        } else {
+            let found = match self.peek() {
+                Ok(tok) => format!("{:?}", tok),
+                Err(()) => "end of file".to_string(),
+            };
+            Err(Diagnostic::error(format!("expected {:?}, found {}", expected, found))
                 .with_code_str("E001")
-                .with_help(format!("expected `{:?}` but saw `{:?}` — check for missing or extra tokens", expected, tok))
-                .with_suggestion(format!("try adding `{:?}` before the `{:?}`", expected, tok))
-                .with_span(self.span(),)),
-            Err(()) => Err(Diagnostic::error("unexpected end of file")
-                .with_code_str("E002")
-                .with_help("the source file ends before the expected token — check for unclosed blocks or missing items")
-                .with_suggestion("check that all `{`, `(`, and `[` are properly closed, and that the file is not truncated")
-                .with_span(self.span(),)),
+                .with_help(format!("expected `{:?}` but saw `{}` — check for missing or extra tokens", expected, found))
+                .with_suggestion(format!("try adding `{:?}` before the `{}`", expected, found))
+                .with_span(self.span()))
         }
     }
 
     fn synchronize(&mut self) {
+        let sync_tokens = [
+            Token::Semicolon, Token::RBrace, Token::Def, Token::Set, Token::Let,
+            Token::Type, Token::Import, Token::From, Token::Extern, Token::Edition,
+            Token::At, Token::Comptime, Token::Generate, Token::Async, Token::Trait,
+            Token::Impl, Token::Constraint,
+        ];
+        // Consume semicolon if present (it's a statement terminator).
+        if matches!(self.peek(), Ok(Token::Semicolon)) {
+            self.advance().ok();
+            return;
+        }
+        // Skip tokens silently until we hit a sync token or EOF.
+        // The original error has already been reported by `expect` or `expect_one_of`;
+        // synchronize is only responsible for advancing the token stream to a safe
+        // point so that subsequent parsing can continue.  Emitting additional
+        // diagnostics here would cascade noise over the real error.
         loop {
             match self.peek() {
-                Ok(Token::Semicolon) => {
-                    self.advance().ok();
-                    return;
-                }
-                // Stop at RBrace without consuming it — the caller's loop
-                // or enclosing parse function will handle it.
-                Ok(Token::RBrace)
-                | Ok(Token::Def)
-                | Ok(Token::Set)
-                | Ok(Token::Let)
-                | Ok(Token::Type)
-                | Ok(Token::Import)
-                | Ok(Token::From)
-                | Ok(Token::Extern)
-                | Ok(Token::Edition)
-                | Ok(Token::At)
-                | Ok(Token::Comptime)
-                | Ok(Token::Generate)
-                | Ok(Token::Async)
-                | Ok(Token::Trait)
-                | Ok(Token::Impl)
-                | Ok(Token::Constraint) => return,
                 Err(()) => return,
-                _ => {
-                    self.advance().ok();
-                }
+                Ok(tok) if sync_tokens.contains(tok) => return,
+                _ => { self.advance().ok(); }
             }
         }
     }
@@ -507,16 +639,19 @@ impl Parser {
             }
             _ => {
                 let tok = self.advance().ok();
-                let mut diag = Diagnostic::error(format!("unexpected token at top level: {:?}", tok))
+                let mut diag = Diagnostic::error(format!("unexpected token at top level: {}", tok.as_ref().map(|t| t.to_user_string()).unwrap_or_else(|| "end of file".to_string())))
                     .with_code_str("E003")
                     .with_help("only items (`def`, `type`, `trait`, `import`, `edition`, `constraint`, `extern`, `impl`, `comptime`, `async`, `set`, `let`) are allowed at the top level")
-                    .with_suggestion("move this token inside a function body, or start a new top-level declaration")
                     .with_span(self.span(),);
                 // "Did you mean?" for common keyword typos (Rust-style)
                 if let Some(Token::Ident(name)) = &tok {
                     if let Some(suggestion) = did_you_mean_keyword(name) {
                         diag = diag.with_suggestion(suggestion);
+                    } else {
+                        diag = diag.with_suggestion("move this token inside a function body, or start a new top-level declaration");
                     }
+                } else {
+                    diag = diag.with_suggestion("enclose this in a function definition, or start a new top-level declaration");
                 }
                 if self.cascade_suppressed {
                     // Cascade is already active.  Advance past this token
