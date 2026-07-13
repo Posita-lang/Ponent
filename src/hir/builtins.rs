@@ -2,6 +2,7 @@ use crate::ast::{EnumVariant, Span, Type, TypeParam};
 use crate::hir::symbol::{SymbolTable, TraitBinding, TypeBinding, TypeKind};
 use crate::hir::traits::{ImplCandidate, TraitEnv};
 use crate::hir::types::{DefId, TypeContext};
+use crate::symbol::Symbol;
 
 /// Insert a trait with no associated types into the symbol table.
 fn insert_trait(symbols: &mut SymbolTable, name: &str, def_id: &mut DefId) {
@@ -14,7 +15,7 @@ fn insert_trait(symbols: &mut SymbolTable, name: &str, def_id: &mut DefId) {
         crate_id: symbols.local_crate_id,
     };
     symbols
-        .insert_trait(name.to_string(), binding, Span::new(0, 0))
+        .insert_trait(Symbol::intern(name), binding, Span::new(0, 0))
         .ok();
 }
 
@@ -23,7 +24,7 @@ fn insert_trait_with_assoc_types(
     symbols: &mut SymbolTable,
     name: &str,
     def_id: &mut DefId,
-    associated_types: Vec<(String, Option<Type>)>,
+    associated_types: Vec<(Symbol, Option<Type>)>,
 ) {
     *def_id = symbols.allocate_def_id();
     let binding = TraitBinding {
@@ -34,7 +35,7 @@ fn insert_trait_with_assoc_types(
         crate_id: symbols.local_crate_id,
     };
     symbols
-        .insert_trait(name.to_string(), binding, Span::new(0, 0))
+        .insert_trait(Symbol::intern(name), binding, Span::new(0, 0))
         .ok();
 }
 
@@ -194,25 +195,25 @@ pub fn register_builtins(
     {
         let def_id = symbols.allocate_def_id();
         let result_t = TypeParam {
-            name: "T".to_string(),
+            name: Symbol::intern("T"),
             bounds: vec![],
             is_lifetime: false,
             span: Span::new(0, 0),
         };
         let result_e = TypeParam {
-            name: "E".to_string(),
+            name: Symbol::intern("E"),
             bounds: vec![],
             is_lifetime: false,
             span: Span::new(0, 0),
         };
         let ok_variant = EnumVariant {
-            name: "Ok".to_string(),
-            payload: Some(Type::Path(vec!["T".to_string()], Span::new(0, 0))),
+            name: Symbol::intern("Ok"),
+            payload: Some(Type::Path(vec![Symbol::intern("T")], Span::new(0, 0))),
             span: Span::new(0, 0),
         };
         let err_variant = EnumVariant {
-            name: "Err".to_string(),
-            payload: Some(Type::Path(vec!["E".to_string()], Span::new(0, 0))),
+            name: Symbol::intern("Err"),
+            payload: Some(Type::Path(vec![Symbol::intern("E")], Span::new(0, 0))),
             span: Span::new(0, 0),
         };
         let binding = TypeBinding {
@@ -239,7 +240,7 @@ pub fn register_builtins(
             pad: None,
         };
         symbols
-            .insert_type("Result".to_string(), binding, Span::new(0, 0))
+            .insert_type(Symbol::intern("Result"), binding, Span::new(0, 0))
             .ok();
     }
 
@@ -247,19 +248,19 @@ pub fn register_builtins(
     {
         let def_id = symbols.allocate_def_id();
         let option_t = TypeParam {
-            name: "T".to_string(),
+            name: Symbol::intern("T"),
             bounds: vec![],
             is_lifetime: false,
             span: Span::new(0, 0),
         };
         let none_variant = EnumVariant {
-            name: "None".to_string(),
+            name: Symbol::intern("None"),
             payload: None,
             span: Span::new(0, 0),
         };
         let some_variant = EnumVariant {
-            name: "Some".to_string(),
-            payload: Some(Type::Path(vec!["T".to_string()], Span::new(0, 0))),
+            name: Symbol::intern("Some"),
+            payload: Some(Type::Path(vec![Symbol::intern("T")], Span::new(0, 0))),
             span: Span::new(0, 0),
         };
         let binding = TypeBinding {
@@ -286,7 +287,7 @@ pub fn register_builtins(
             pad: None,
         };
         symbols
-            .insert_type("Option".to_string(), binding, Span::new(0, 0))
+            .insert_type(Symbol::intern("Option"), binding, Span::new(0, 0))
             .ok();
     }
 
@@ -309,14 +310,14 @@ pub fn register_builtins(
     let future_enum_def_id = symbols.allocate_def_id();
     {
         let future_t = TypeParam {
-            name: "T".to_string(),
+            name: Symbol::intern("T"),
             bounds: vec![],
             is_lifetime: false,
             span: Span::new(0, 0),
         };
         let output_variant = EnumVariant {
-            name: "Output".to_string(),
-            payload: Some(Type::Path(vec!["T".to_string()], Span::new(0, 0))),
+            name: Symbol::intern("Output"),
+            payload: Some(Type::Path(vec![Symbol::intern("T")], Span::new(0, 0))),
             span: Span::new(0, 0),
         };
         let binding = TypeBinding {
@@ -343,7 +344,7 @@ pub fn register_builtins(
             pad: None,
         };
         symbols
-            .insert_type("Future".to_string(), binding, Span::new(0, 0))
+            .insert_type(Symbol::intern("Future"), binding, Span::new(0, 0))
             .ok();
     }
 
@@ -353,7 +354,7 @@ pub fn register_builtins(
         symbols,
         "Future",
         &mut future_trait_id,
-        vec![("Output".to_string(), None)],
+        vec![(Symbol::intern("Output"), None)],
     );
 
     // 3) Register `impl Future for Future<T>` where `Output = T`.
@@ -361,7 +362,7 @@ pub fn register_builtins(
     //    the `Output` associated type resolves to `T`.
     //
     //    We register a generic impl using a generic param index 0.
-    let future_output_ty = ctx.generic_param(0, "T".to_string());
+    let future_output_ty = ctx.generic_param(0, Symbol::intern("T"));
     let future_for_ty = ctx.enum_ty(future_enum_def_id, vec![future_output_ty]);
     trait_env
         .add_impl(
@@ -370,7 +371,7 @@ pub fn register_builtins(
                 for_type: future_for_ty,
                 methods: vec![],
                 resolved_methods: vec![],
-                assoc_tys: vec![("Output".to_string(), future_output_ty)],
+                assoc_tys: vec![(Symbol::intern("Output"), future_output_ty)],
                 has_auto_deref: false,
                 context: vec![],
                 span: Span::new(0, 0),
@@ -396,7 +397,7 @@ pub fn register_builtins(
     // and the associated new() method.
     {
         let channel_t = TypeParam {
-            name: "T".to_string(),
+            name: Symbol::intern("T"),
             bounds: vec![],
             is_lifetime: false,
             span: Span::new(0, 0),
@@ -425,7 +426,7 @@ pub fn register_builtins(
             pad: None,
         };
         symbols
-            .insert_type("Channel".to_string(), binding, Span::new(0, 0))
+            .insert_type(Symbol::intern("Channel"), binding, Span::new(0, 0))
             .ok();
     }
 }

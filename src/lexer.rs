@@ -1,4 +1,5 @@
 use logos::Logos;
+use crate::symbol::Symbol;
 
 fn parse_char_literal(s: &str) -> Result<u8, String> {
     let inner = &s[1..s.len() - 1];
@@ -431,8 +432,8 @@ pub enum Token {
     #[token("unbox")]
     Unbox,
 
-    #[regex("[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
-    Ident(String),
+    #[regex("[a-zA-Z_][a-zA-Z0-9_]*", |lex| Symbol::intern(lex.slice()))]
+    Ident(Symbol),
 
     #[regex("[0-9][0-9_]*i[0-9]+", |lex| lex.slice().to_string())]
     IntSuffix(String),
@@ -598,7 +599,7 @@ impl Token {
     /// Never uses Debug formatting — avoids leaking `Some(Ident(...))` to users.
     pub fn to_user_string(&self) -> String {
         match self {
-            Token::Ident(s) => format!("`{}`", s),
+            Token::Ident(s) => format!("`{}`", s.as_str()),
             Token::IntLiteral(s) => match s {
                 Ok(n) => format!("the number `{}`", n),
                 Err(e) => format!("invalid integer literal: {}", e),
@@ -1159,7 +1160,7 @@ mod tests {
             if tok == Token::WhitespaceOrComment {
                 continue;
             }
-            assert_eq!(tok, Token::Ident("x".into()));
+            assert_eq!(tok, Token::Ident(Symbol::intern("x")));
             break;
         }
         assert!(lex.next().is_none());
@@ -1179,7 +1180,7 @@ mod tests {
         }
         assert_eq!(
             toks,
-            vec![Token::Ident("a".into()), Token::Ident("b".into())]
+            vec![Token::Ident(Symbol::intern("a")), Token::Ident(Symbol::intern("b"))]
         );
     }
 
@@ -1193,7 +1194,7 @@ mod tests {
             if tok == Token::WhitespaceOrComment {
                 continue;
             }
-            assert_eq!(tok, Token::Ident("hello".into()));
+            assert_eq!(tok, Token::Ident(Symbol::intern("hello")));
             break;
         }
     }
@@ -1209,7 +1210,7 @@ mod tests {
     fn ascii_identifier() {
         check_tokens(
             "hello world",
-            vec![Token::Ident("hello".into()), Token::Ident("world".into())],
+            vec![Token::Ident(Symbol::intern("hello")), Token::Ident(Symbol::intern("world"))],
         );
     }
 
@@ -1232,37 +1233,37 @@ mod tests {
             Token::StringLiteral(Ok("2026".into())),
             Token::Semicolon,
             Token::Type,
-            Token::Ident("Age".into()),
+            Token::Ident(Symbol::intern("Age")),
             Token::Assign,
             Token::Exists,
-            Token::Ident("n".into()),
+            Token::Ident(Symbol::intern("n")),
             Token::Colon,
-            Token::Ident("UInt".into()),
+            Token::Ident(Symbol::intern("UInt")),
             Token::Lt,
             Token::IntLiteral(Ok(8)),
             Token::Gt,
             Token::Invariant,
-            Token::Ident("n".into()),
+            Token::Ident(Symbol::intern("n")),
             Token::Ge,
             Token::IntLiteral(Ok(18)),
             Token::Semicolon,
             Token::Def,
-            Token::Ident("main".into()),
+            Token::Ident(Symbol::intern("main")),
             Token::LParen,
             Token::RParen,
             Token::Arrow,
-            Token::Ident("Result".into()),
+            Token::Ident(Symbol::intern("Result")),
             Token::Lt,
             Token::LParen,
             Token::RParen,
             Token::Comma,
-            Token::Ident("AppError".into()),
+            Token::Ident(Symbol::intern("AppError")),
             Token::Gt,
             Token::LBrace,
             Token::Set,
-            Token::Ident("x".into()),
+            Token::Ident(Symbol::intern("x")),
             Token::Colon,
-            Token::Ident("Int".into()),
+            Token::Ident(Symbol::intern("Int")),
             Token::Lt,
             Token::IntLiteral(Ok(32)),
             Token::Gt,
@@ -1273,12 +1274,12 @@ mod tests {
             Token::Semicolon,
             Token::DocComment("doc comment".into()),
             Token::Let,
-            Token::Ident("y".into()),
+            Token::Ident(Symbol::intern("y")),
             Token::Assign,
             Token::StringLiteral(Ok("hello\nworld".into())),
             Token::Semicolon,
             Token::Return,
-            Token::Ident("Ok".into()),
+            Token::Ident(Symbol::intern("Ok")),
             Token::LParen,
             Token::LParen,
             Token::RParen,
@@ -1360,7 +1361,7 @@ mod tests {
             .collect();
         assert_eq!(
             tokens,
-            vec![Token::Ident("a".into()), Token::Ident("b".into())]
+            vec![Token::Ident(Symbol::intern("a")), Token::Ident(Symbol::intern("b"))]
         );
     }
 
@@ -1431,9 +1432,9 @@ mod tests {
         check_tokens(
             "defi letx type2",
             vec![
-                Token::Ident("defi".into()),
-                Token::Ident("letx".into()),
-                Token::Ident("type2".into()),
+                Token::Ident(Symbol::intern("defi")),
+                Token::Ident(Symbol::intern("letx")),
+                Token::Ident(Symbol::intern("type2")),
             ],
         );
     }
@@ -1446,7 +1447,7 @@ mod tests {
             .filter_map(|r| r.ok())
             .filter(|t| *t != Token::WhitespaceOrComment)
             .collect();
-        assert_eq!(tokens, vec![Token::Ident(long)]);
+        assert_eq!(tokens, vec![Token::Ident(Symbol::intern(&long))]);
     }
 
     #[test]
@@ -1488,14 +1489,14 @@ mod tests {
 
     #[test]
     fn line_comment_stops_at_newline() {
-        check_tokens("// comment\na", vec![Token::Ident("a".into())]);
+        check_tokens("// comment\na", vec![Token::Ident(Symbol::intern("a"))]);
     }
 
     #[test]
     fn mixed_whitespace_and_comments() {
         check_tokens(
             " \t  // skip\n  /* skip */ \n x",
-            vec![Token::Ident("x".into())],
+            vec![Token::Ident(Symbol::intern("x"))],
         );
     }
 
@@ -1556,7 +1557,7 @@ mod tests {
             .collect();
         assert_eq!(
             tokens,
-            vec![Token::Ident("a".into()), Token::Ident("b".into())]
+            vec![Token::Ident(Symbol::intern("a")), Token::Ident(Symbol::intern("b"))]
         );
     }
 
@@ -1570,9 +1571,9 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                Token::Ident("hello".into()),
-                Token::Ident("world".into()),
-                Token::Ident("again".into()),
+                Token::Ident(Symbol::intern("hello")),
+                Token::Ident(Symbol::intern("world")),
+                Token::Ident(Symbol::intern("again")),
             ]
         );
     }
@@ -1666,12 +1667,12 @@ mod tests {
         check_tokens(
             source,
             vec![
-                Token::Ident("x".into()),
+                Token::Ident(Symbol::intern("x")),
                 Token::Apostrophe,
-                Token::Ident("len".into()),
-                Token::Ident("y".into()),
+                Token::Ident(Symbol::intern("len")),
+                Token::Ident(Symbol::intern("y")),
                 Token::Apostrophe,
-                Token::Ident("first".into()),
+                Token::Ident(Symbol::intern("first")),
             ],
         );
     }
@@ -1683,9 +1684,9 @@ mod tests {
             source,
             vec![
                 Token::CharLiteral(Ok(b'a')),
-                Token::Ident("x".into()),
+                Token::Ident(Symbol::intern("x")),
                 Token::Apostrophe,
-                Token::Ident("len".into()),
+                Token::Ident(Symbol::intern("len")),
             ],
         );
     }
@@ -1699,7 +1700,7 @@ mod tests {
             .collect();
         assert_eq!(
             tokens,
-            vec![Token::Ident("a".into()), Token::Ident("b".into())]
+            vec![Token::Ident(Symbol::intern("a")), Token::Ident(Symbol::intern("b"))]
         );
     }
 
@@ -1757,12 +1758,12 @@ mod tests {
             "def main(){set x=1+2;if(x<=3){return x;}}",
             vec![
                 Token::Def,
-                Token::Ident("main".into()),
+                Token::Ident(Symbol::intern("main")),
                 Token::LParen,
                 Token::RParen,
                 Token::LBrace,
                 Token::Set,
-                Token::Ident("x".into()),
+                Token::Ident(Symbol::intern("x")),
                 Token::Assign,
                 Token::IntLiteral(Ok(1)),
                 Token::Plus,
@@ -1770,13 +1771,13 @@ mod tests {
                 Token::Semicolon,
                 Token::If,
                 Token::LParen,
-                Token::Ident("x".into()),
+                Token::Ident(Symbol::intern("x")),
                 Token::Le,
                 Token::IntLiteral(Ok(3)),
                 Token::RParen,
                 Token::LBrace,
                 Token::Return,
-                Token::Ident("x".into()),
+                Token::Ident(Symbol::intern("x")),
                 Token::Semicolon,
                 Token::RBrace,
                 Token::RBrace,

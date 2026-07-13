@@ -6,6 +6,7 @@ use crate::hir::resolver::ResolutionMap;
 use crate::hir::symbol::*;
 use crate::hir::traits::TraitEnv;
 use crate::hir::types::*;
+use crate::symbol::Symbol;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -70,7 +71,7 @@ pub struct CtxFrame {
 /// scope after the block).
 #[derive(Debug, Clone)]
 pub struct ScopedVarMap {
-    frames: Rc<RefCell<Vec<HashMap<String, TypeId>>>>,
+    frames: Rc<RefCell<Vec<HashMap<Symbol, TypeId>>>>,
 }
 
 impl ScopedVarMap {
@@ -91,22 +92,22 @@ impl ScopedVarMap {
     }
 
     /// Insert a binding into the innermost scope frame.
-    pub fn insert(&self, name: String, ty: TypeId) {
+    pub fn insert(&self, name: Symbol, ty: TypeId) {
         self.frames.borrow_mut().last_mut().unwrap().insert(name, ty);
     }
 
     /// Insert a binding into the base (outermost) scope frame.
     /// Used for caching global/module‑level variable types so they
     /// persist across all nested scopes.
-    pub fn insert_global(&self, name: String, ty: TypeId) {
+    pub fn insert_global(&self, name: Symbol, ty: TypeId) {
         self.frames.borrow_mut()[0].insert(name, ty);
     }
 
     /// Look up a binding, searching from innermost to outermost scope.
-    pub fn get(&self, name: &str) -> Option<TypeId> {
+    pub fn get(&self, name: Symbol) -> Option<TypeId> {
         let frames = self.frames.borrow();
         for frame in frames.iter().rev() {
-            if let Some(&ty) = frame.get(name) {
+            if let Some(&ty) = frame.get(&name) {
                 return Some(ty);
             }
         }
@@ -114,13 +115,13 @@ impl ScopedVarMap {
     }
 
     /// Extend the innermost frame with an iterator of bindings.
-    pub fn extend(&self, iter: impl IntoIterator<Item = (String, TypeId)>) {
+    pub fn extend(&self, iter: impl IntoIterator<Item = (Symbol, TypeId)>) {
         self.frames.borrow_mut().last_mut().unwrap().extend(iter);
     }
 
     /// Return a clone of the inner `Rc` so a guard can
     /// operate independently of any borrow on this struct.
-    fn rc_clone(&self) -> Rc<RefCell<Vec<HashMap<String, TypeId>>>> {
+    fn rc_clone(&self) -> Rc<RefCell<Vec<HashMap<Symbol, TypeId>>>> {
         Rc::clone(&self.frames)
     }
 }
@@ -133,11 +134,11 @@ impl ScopedVarMap {
 /// Owns its own `Rc` reference to the frames vector, completely
 /// independent of any borrow on the `TypeChecker` or `ScopedVarMap`.
 pub(crate) struct VarScopeGuard {
-    frames: Rc<RefCell<Vec<HashMap<String, TypeId>>>>,
+    frames: Rc<RefCell<Vec<HashMap<Symbol, TypeId>>>>,
 }
 
 impl VarScopeGuard {
-    fn new(frames: Rc<RefCell<Vec<HashMap<String, TypeId>>>>) -> Self {
+    fn new(frames: Rc<RefCell<Vec<HashMap<Symbol, TypeId>>>>) -> Self {
         frames.borrow_mut().push(HashMap::new());
         VarScopeGuard { frames }
     }
@@ -175,19 +176,19 @@ pub struct TypeChecker<'a> {
     resolution_map: ResolutionMap,
     /// Local cache of generic type parameter types (e.g. `T` in `def foo<T>(x: T)`).
     /// Populated when processing function definitions with type_params.
-    local_type_param_cache: HashMap<String, TypeId>,
+    local_type_param_cache: HashMap<Symbol, TypeId>,
     /// SCAP-style guarantee chain: tracks outstanding postconditions that must
     /// be discharged on function return (Feng & Shao 2006 §4).
     guarantee_chain: GuaranteeChain,
     /// Names of mutable global variables (top-level `set mut`).
     /// These can only be read/written inside `@trusted` functions.
-    mutable_globals: HashSet<String>,
+    mutable_globals: HashSet<Symbol>,
     /// Whether the current function is annotated `@trusted`.
     current_function_trusted: bool,
     /// Registry of comptime functions: name → (param_names, body).
     /// Populated as the checker encounters `comptime def` functions and
     /// passed to ComptimeEvalContext for comptime block evaluation.
-    comptime_fn_registry: HashMap<String, (Vec<String>, Vec<HirStmt>)>,
+    comptime_fn_registry: HashMap<Symbol, (Vec<Symbol>, Vec<HirStmt>)>,
     /// Whether we are currently in the comptime-function-body pass (Pass 2).
     /// When true, ComptimeBlock evaluation is deferred to after Pass 2 so
     /// that forward references between comptime functions work correctly.
@@ -268,8 +269,8 @@ impl<'a> TypeChecker<'a> {
         let comptime_fn_indices: Vec<usize> = program.items.iter().enumerate().filter_map(|(i, stmt)| {
             if let Stmt::FunctionDef { name, params, is_comptime, .. } = stmt {
                 if *is_comptime {
-                    let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
-                    self.comptime_fn_registry.insert(name.clone(), (param_names, Vec::new()));
+                    let param_names: Vec<Symbol> = params.iter().map(|p| p.name).collect();
+                    self.comptime_fn_registry.insert(*name, (param_names, Vec::new()));
                     Some(i)
                 } else { None }
             } else { None }
@@ -540,7 +541,7 @@ impl<'a> TypeChecker<'a> {
                 // return types, and where clauses can be resolved.
                 // Collect names before insertion so we can clean up after the function body
                 // is fully processed, preventing cross-function cache pollution.
-                let fn_param_names: Vec<String> = type_params.iter().map(|tp| tp.name.clone()).collect();
+                let fn_param_names: Vec<Symbol> = type_params.iter().map(|tp| tp.name).collect();
                 for (i, tp) in type_params.iter().enumerate() {
                     let generic_id = self.ctx.generic_param(i, tp.name.clone());
                     self.local_type_param_cache
@@ -565,7 +566,7 @@ impl<'a> TypeChecker<'a> {
                 }
 
                 // ── @interrupt handler checks ─────────────────────────
-                let is_interrupt = attributes.iter().any(|a| a.name == "interrupt");
+                let is_interrupt = attributes.iter().any(|a| a.name.eq_str("interrupt"));
                 if is_interrupt {
                     // Rule 1: return type must be Never (!)
                     if !self.ctx.is_never(return_ty) {
@@ -586,8 +587,8 @@ impl<'a> TypeChecker<'a> {
                         );
                     }
                     // Rule 3: must have @no_alloc and @no_panic (both required for interrupt handlers)
-                    let has_no_alloc = attributes.iter().any(|a| a.name == "no_alloc");
-                    let has_no_panic = attributes.iter().any(|a| a.name == "no_panic");
+                    let has_no_alloc = attributes.iter().any(|a| a.name.eq_str("no_alloc"));
+                    let has_no_panic = attributes.iter().any(|a| a.name.eq_str("no_panic"));
                     if !has_no_alloc {
                         self.diagnostics.push(
                             Diagnostic::error("@interrupt handler must satisfy @no_alloc")
@@ -605,7 +606,7 @@ impl<'a> TypeChecker<'a> {
                         );
                     }
                     // Rule 4: @interrupt + @alloc is incompatible
-                    if attributes.iter().any(|a| a.name == "alloc") {
+                    if attributes.iter().any(|a| a.name.eq_str("alloc")) {
                         self.diagnostics.push(
                             Diagnostic::error("@interrupt handler cannot have @alloc")
                                 .with_code_str("E054")
@@ -614,7 +615,7 @@ impl<'a> TypeChecker<'a> {
                         );
                     }
                     // Rule 5: @interrupt + @io is incompatible
-                    if attributes.iter().any(|a| a.name == "io") {
+                    if attributes.iter().any(|a| a.name.eq_str("io")) {
                         self.diagnostics.push(
                             Diagnostic::error("@interrupt handler cannot have @io")
                                 .with_code_str("E055")
@@ -627,7 +628,7 @@ impl<'a> TypeChecker<'a> {
                 let guard = ScopeGuard::new(self);
                 guard.checker.current_function = Some(DefId(0));
                 guard.checker.current_function_trusted =
-                    attributes.iter().any(|a| a.name == "trusted");
+                    attributes.iter().any(|a| a.name.eq_str("trusted"));
                 guard.checker.current_return_type = Some(return_ty);
                 guard.checker.enter_inference_scope();
                 guard.checker.push_ctx(CtxKind::Function, *span, None);
@@ -646,7 +647,7 @@ impl<'a> TypeChecker<'a> {
                 guard
                     .checker
                     .local_variable_types
-                    .insert("result".to_string(), return_ty);
+                    .insert(Symbol::intern("result"), return_ty);
 
                 // SCAP: collect ensures conditions into the guarantee chain.
                 // Each `ensures` becomes a postcondition that must hold at return.
@@ -673,7 +674,7 @@ impl<'a> TypeChecker<'a> {
                                     .checker
                                     .add_constraint(Constraint::Impl(pred_ty, trait_id, pred.span));
                             } else if let Some(name) = TypeChecker::extract_bound_name(bound) {
-                                if let Some(constraint) = guard.checker.symbols.lookup_constraint(&name) {
+                                if let Some(constraint) = guard.checker.symbols.lookup_constraint(name) {
                                     for &bound_ty in &constraint.bounds {
                                         if let Some(trait_id) = guard.checker.ctx.get_def_id_for_type(bound_ty) {
                                             guard.checker.add_constraint(
@@ -789,7 +790,7 @@ impl<'a> TypeChecker<'a> {
                 // Register comptime functions in the global registry so that
                 // `comptime { ... }` blocks can call them.
                 if *is_comptime {
-                    let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+                    let param_names: Vec<Symbol> = params.iter().map(|p| p.name).collect();
                     if let Some(ref body) = body_hir {
                         self.comptime_fn_registry.insert(
                             name.clone(),
@@ -812,10 +813,10 @@ impl<'a> TypeChecker<'a> {
                     finally: finally_hir,
                     is_comptime: *is_comptime,
                     is_async: *is_async,
-                    is_ieee_contracts: attributes.iter().any(|a| a.name == "ieee_contracts"),
+                    is_ieee_contracts: attributes.iter().any(|a| a.name.eq_str("ieee_contracts")),
                     hints: attributes
                         .iter()
-                        .filter(|a| a.name == "hint")
+                        .filter(|a| a.name.eq_str("hint"))
                         .flat_map(|a| a.args.clone())
                         .collect(),
                 })
@@ -1004,7 +1005,8 @@ impl<'a> TypeChecker<'a> {
                 })
             }
             Stmt::Leave { label, span } => {
-                let target = self.find_break_target(label.as_deref());
+                let label_str = label.map(|l| l.as_str());
+                let target = self.find_break_target(label_str.as_deref());
                 match target {
                     None => {
                         // Check if we're inside a cwosuwe (>_<)
@@ -1049,7 +1051,8 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Stmt::Continue { label, span } => {
-                let target = self.find_continue_target(label.as_deref());
+                let label_str = label.map(|l| l.as_str());
+                let target = self.find_continue_target(label_str.as_deref());
                 match target {
                     None => {
                         let enclosing_closure =
@@ -1137,7 +1140,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 // Ban `return Err(...)` — use `leave with` instead
                 if let Some(Expr::EnumLit { path, variant, .. }) = value {
-                    if variant == "Err" && path.len() == 1 && path[0] == "Result" {
+                    if variant.eq_str("Err") && path.len() == 1 && path[0].eq_str("Result") {
                         self.diagnostics.push(
                             Diagnostic::error("`return Err(...)` is not valid; use `leave with` instead")
                                 .with_code_str("E008")
@@ -1464,7 +1467,7 @@ impl<'a> TypeChecker<'a> {
                     // Register generic type parameters so `T` in `impl<T> Foo for T` resolves
                     // Collect names before insertion so we can clean up after the impl block
                     // is fully processed, preventing cross-impl cache pollution.
-                    let impl_param_names: Vec<String> = type_params.iter().map(|tp| tp.name.clone()).collect();
+                    let impl_param_names: Vec<Symbol> = type_params.iter().map(|tp| tp.name).collect();
                     for (i, tp) in type_params.iter().enumerate() {
                         let generic_id = self.ctx.generic_param(i, tp.name.clone());
                         self.local_type_param_cache
@@ -1475,9 +1478,9 @@ impl<'a> TypeChecker<'a> {
                     let for_ty = self.resolve_type(for_type)?;
 
                     // Check that all required trait methods are provided
-                    let auto_deref = attributes.iter().any(|a| a.name == "auto_deref");
-                    let impl_method_names: HashSet<String> =
-                        methods.iter().map(|m| m.name.clone()).collect();
+                    let auto_deref = attributes.iter().any(|a| a.name.eq_str("auto_deref"));
+                    let impl_method_names: HashSet<Symbol> =
+                        methods.iter().map(|m| m.name).collect();
                     let self_ty = &for_type;
 
                     for (tm_name, _tm_sig) in &trait_binding.methods {
@@ -1618,7 +1621,7 @@ impl<'a> TypeChecker<'a> {
                     };
                     // Resolve method param/return types, replacing `Self` with for_type
                     let self_ty = &for_type; // The original AST type for Self
-                    let auto_deref = attributes.iter().any(|a| a.name == "auto_deref");
+                    let auto_deref = attributes.iter().any(|a| a.name.eq_str("auto_deref"));
                     let mut method_infos = Vec::new();
                     for m in methods {
                         let param_tys = m
@@ -1704,7 +1707,7 @@ impl<'a> TypeChecker<'a> {
     /// concrete `self_ty` (the type being implemented for).
     fn resolve_self_ty(&self, ty: &Type, self_ty: &Type) -> Type {
         match ty {
-            Type::Path(p, s) if p.len() == 1 && (p[0] == "Self" || p[0] == "self") => {
+            Type::Path(p, s) if p.len() == 1 && (p[0].eq_str("Self") || p[0].eq_str("self")) => {
                 self_ty.clone()
             }
             Type::Reference {
@@ -1798,7 +1801,7 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn resolve_def_id(&self, path: &[String]) -> Result<DefId, Diagnostic> {
+    fn resolve_def_id(&self, path: &[Symbol]) -> Result<DefId, Diagnostic> {
         if path.is_empty() {
             return Err(Diagnostic::error("empty path").with_span(Span::new(0, 0)));
         }
@@ -1817,11 +1820,11 @@ impl<'a> TypeChecker<'a> {
             }
         }
         self.symbols
-            .lookup_type(&path[0])
+            .lookup_type(path[0])
             .map(|b| b.def_id)
-            .or_else(|| self.symbols.lookup_trait(&path[0]).map(|b| b.def_id))
+            .or_else(|| self.symbols.lookup_trait(path[0]).map(|b| b.def_id))
             .ok_or_else(|| {
-                Diagnostic::error(format!("'{}' not found", path[0])).with_span(Span::new(0, 0))
+                Diagnostic::error(format!("'{}' not found", path[0].as_str())).with_span(Span::new(0, 0))
             })
     }
 
@@ -2078,7 +2081,7 @@ impl<'a> TypeChecker<'a> {
 
     fn extract_ok_type(&self, ty: TypeId) -> Option<TypeId> {
         if let TypeData::Adt { kind: _, def_id: did, args } = self.ctx.get(ty) {
-            if let Some(result_id) = self.known_def_id("Result") {
+            if let Some(result_id) = self.known_def_id(Symbol::intern("Result")) {
                 if *did == result_id && args.len() == 2 {
                     return Some(args[0]);
                 }
@@ -2090,14 +2093,14 @@ impl<'a> TypeChecker<'a> {
     fn extract_future_type(&mut self, ty: TypeId) -> Option<TypeId> {
         // Use the trait-based associated type projection:
         // resolve `<ty as Future>::Output`
-        let future_id = self.known_def_id("Future")?;
+        let future_id = self.known_def_id(Symbol::intern("Future"))?;
         self.trait_env
             .resolve_assoc_type(future_id, ty, "Output", self.ctx, self.symbols)
     }
 
     fn extract_result_types(&self, ty: TypeId, span: Span) -> Result<(TypeId, TypeId), Diagnostic> {
         if let TypeData::Adt { kind: _, def_id: did, args } = self.ctx.get(ty) {
-            if let Some(result_id) = self.known_def_id("Result") {
+            if let Some(result_id) = self.known_def_id(Symbol::intern("Result")) {
                 if *did == result_id && args.len() == 2 {
                     return Ok((args[0], args[1]));
                 }
@@ -2106,7 +2109,7 @@ impl<'a> TypeChecker<'a> {
         Err(Diagnostic::error("catch requires Result type").with_span(span))
     }
 
-    fn known_def_id(&self, name: &str) -> Option<DefId> {
+    fn known_def_id(&self, name: Symbol) -> Option<DefId> {
         self.symbols.lookup_type(name).map(|b| b.def_id)
     }
 
@@ -2120,13 +2123,13 @@ impl<'a> TypeChecker<'a> {
             },
             _ => return None,
         };
-        self.symbols.lookup_trait(name).map(|b| b.def_id)
+        self.symbols.lookup_trait(*name).map(|b| b.def_id)
     }
 
     /// Extract the name from a bound `Type` for constraint alias lookup.
-    fn extract_bound_name(bound: &Type) -> Option<String> {
+    fn extract_bound_name(bound: &Type) -> Option<Symbol> {
         let base = match bound {
-            Type::Path(path, _) => return path.first().cloned(),
+            Type::Path(path, _) => return path.first().copied(),
             Type::Generic(base, _, _) => base.as_ref(),
             _ => return None,
         };
@@ -2157,7 +2160,7 @@ impl<'a> TypeChecker<'a> {
 
     /// Attempt to dereference through a `Deref` trait impl marked `@auto_deref`.
     fn try_deref_trait_step(&self, ty: TypeId) -> Option<TypeId> {
-        let deref_trait_id = self.symbols.lookup_trait("Deref").map(|b| b.def_id)?;
+        let deref_trait_id = self.symbols.lookup_trait(Symbol::intern("Deref")).map(|b| b.def_id)?;
         let candidates = self.trait_env.lookup_impls_for_type(ty);
         // Check Deref first
         for cand in &candidates {
@@ -2165,7 +2168,7 @@ impl<'a> TypeChecker<'a> {
                 if let Some(target_ty) = cand
                     .assoc_tys
                     .iter()
-                    .find(|(name, _)| name == "Target")
+                    .find(|(name, _)| name.eq_str("Target"))
                     .map(|(_, ty)| *ty)
                 {
                     return Some(target_ty);
@@ -2173,7 +2176,7 @@ impl<'a> TypeChecker<'a> {
             }
         }
         // Also try DerefMut: same Target as Deref
-        let deref_mut_id = self.symbols.lookup_trait("DerefMut").map(|b| b.def_id);
+        let deref_mut_id = self.symbols.lookup_trait(Symbol::intern("DerefMut")).map(|b| b.def_id);
         if let Some(deref_mut_id) = deref_mut_id {
             for cand in &candidates {
                 if cand.trait_id == deref_mut_id && cand.has_auto_deref {
@@ -2183,7 +2186,7 @@ impl<'a> TypeChecker<'a> {
                         .and_then(|dc| {
                             dc.assoc_tys
                                 .iter()
-                                .find(|(name, _)| name == "Target")
+                                .find(|(name, _)| name.eq_str("Target"))
                                 .map(|(_, ty)| *ty)
                         })
                     {
@@ -2476,7 +2479,7 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn lookup_field(&mut self, ty: TypeId, name: &str, span: Span) -> Result<TypeId, Diagnostic> {
+    fn lookup_field(&mut self, ty: TypeId, name: Symbol, span: Span) -> Result<TypeId, Diagnostic> {
         // Collect field names from all types in the deref chain for error reporting
         let mut all_field_names: Vec<String> = Vec::new();
 
@@ -2495,7 +2498,7 @@ impl<'a> TypeChecker<'a> {
                 let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| {
                     Diagnostic::error("struct definition not found").with_span(span)
                 })?;
-                all_field_names.extend(binding.fields.iter().map(|f| f.name.clone()));
+                all_field_names.extend(binding.fields.iter().map(|f| f.name.as_str()));
                 if let Some(field) = binding.fields.iter().find(|f| f.name == name) {
                     let mut subst = Subst::new();
                     for (i, _param) in binding.params.iter().enumerate() {
@@ -2523,7 +2526,7 @@ impl<'a> TypeChecker<'a> {
                 let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| {
                     Diagnostic::error("struct definition not found").with_span(span)
                 })?;
-                all_field_names.extend(binding.fields.iter().map(|f| f.name.clone()));
+                all_field_names.extend(binding.fields.iter().map(|f| f.name.as_str()));
                 if let Some(field) = binding.fields.iter().find(|f| f.name == name) {
                     let mut subst = Subst::new();
                     for (i, _param) in binding.params.iter().enumerate() {
@@ -2551,7 +2554,7 @@ impl<'a> TypeChecker<'a> {
         if !all_field_names.is_empty() {
             diag =
                 diag.with_suggestion(format!("available fields: {}", all_field_names.join(", ")));
-            if let Some(suggestion) = did_you_mean_suggestion(name, &all_field_names) {
+            if let Some(suggestion) = did_you_mean_suggestion(&name.as_str(), &all_field_names) {
                 diag = diag.with_suggestion(suggestion);
             }
         }
@@ -2561,7 +2564,7 @@ impl<'a> TypeChecker<'a> {
 
     /// Look up a method by name on a type, walking the autoderef chain.
     /// Returns `(param_types, return_type)` if found.
-    fn lookup_method(&mut self, ty: TypeId, name: &str) -> Option<(Vec<TypeId>, TypeId)> {
+    fn lookup_method(&mut self, ty: TypeId, name: Symbol) -> Option<(Vec<TypeId>, TypeId)> {
         // Collect autoderef chain first to avoid borrow conflicts with self.ctx.
         let chain: Vec<TypeId> = self.autoderef_chain(ty).collect();
         // Pre-collect all unique trait IDs.
@@ -2615,17 +2618,17 @@ impl<'a> TypeChecker<'a> {
         None
     }
 
-    fn lookup_attr(&self, ty: TypeId, name: &str, span: Span) -> Result<TypeId, Diagnostic> {
-        match name {
-            "len" if self.ctx.is_array(ty) || self.ctx.is_slice(ty) || ty == self.ctx.builtin_str || ty == self.ctx.builtin_str_ref => Ok(self.ctx.usize()),
-            "size"
-                if self.ctx.is_integer(ty) || self.ctx.is_float(ty) || self.ctx.is_pointer(ty) =>
-            {
-                Ok(self.ctx.usize())
-            }
-            "align" => Ok(self.ctx.usize()),
-            "default" => Ok(ty),
-            _ => Err(Diagnostic::error(format!("unknown attribute '{}'", name)).with_span(span)),
+    fn lookup_attr(&self, ty: TypeId, name: Symbol, span: Span) -> Result<TypeId, Diagnostic> {
+        if name.eq_str("len") && (self.ctx.is_array(ty) || self.ctx.is_slice(ty) || ty == self.ctx.builtin_str || ty == self.ctx.builtin_str_ref) {
+            Ok(self.ctx.usize())
+        } else if name.eq_str("size") && (self.ctx.is_integer(ty) || self.ctx.is_float(ty) || self.ctx.is_pointer(ty)) {
+            Ok(self.ctx.usize())
+        } else if name.eq_str("align") {
+            Ok(self.ctx.usize())
+        } else if name.eq_str("default") {
+            Ok(ty)
+        } else {
+            Err(Diagnostic::error(format!("unknown attribute '{}'", name)).with_span(span))
         }
     }
 
@@ -2719,7 +2722,7 @@ impl<'a> TypeChecker<'a> {
                 );
             }
         };
-        Ok(self.symbols.lookup_trait(trait_name).map(|b| b.def_id))
+        Ok(self.symbols.lookup_trait(Symbol::intern(trait_name)).map(|b| b.def_id))
     }
 
     fn extract_int_from_type(&self, ty: &Type) -> Option<u8> {
@@ -2753,7 +2756,7 @@ impl<'a> TypeChecker<'a> {
     /// Convert an AST type to a user-friendly string for diagnostics.
     fn type_to_string(ty: &Type) -> String {
         match ty {
-            Type::Path(path, _) => path.join("::"),
+            Type::Path(path, _) => path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
             Type::Generic(base, args, _) => {
                 let base_str = Self::type_to_string(base);
                 let args_str: Vec<String> = args.iter().map(|a| match a {

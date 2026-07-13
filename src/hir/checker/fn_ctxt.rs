@@ -141,7 +141,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
             Expr::Ident(name, span) => {
                 // Check the local variable type cache first (set by VariableDef)
-                if let Some(ty) = self.checker.local_variable_types.get(name) {
+                if let Some(ty) = self.checker.local_variable_types.get(*name) {
                     // Reading a mutable global outside @trusted is forbidden
                     if self.checker.mutable_globals.contains(name) && !self.checker.current_function_trusted {
                         self.checker.diagnostics.push(
@@ -155,9 +155,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         );
                     }
                     Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
-                } else if let Some(binding) = self.checker.symbols.lookup_variable(name, *span) {
-                    Ok((HirExpr::Ident(name.clone(), binding.ty, *span), binding.ty))
-                } else if let Some(func) = self.checker.symbols.lookup_function(name) {
+                } else if let Some(binding) = self.checker.symbols.lookup_variable(*name, *span) {
+                    Ok((HirExpr::Ident(*name, binding.ty, *span), binding.ty))
+                } else if let Some(func) = self.checker.symbols.lookup_function(*name) {
                     let sig = &func.signature;
                     // Construct the function type: Fn(params..., ret)
                     let mut fn_ty = self
@@ -171,7 +171,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             fn_ty = self.checker.ctx.forall(i, tp.name.clone(), fn_ty);
                         }
                     }
-                    Ok((HirExpr::Ident(name.clone(), fn_ty, *span), fn_ty))
+                    Ok((HirExpr::Ident(*name, fn_ty, *span), fn_ty))
                 } else {
                     self.checker.diagnostics.push(
                         Diagnostic::error(format!("undefined name: {}", name)).with_span(*span),
@@ -281,7 +281,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // Check if this is a method call (x.foo()) rather than a free function call
                 if let Expr::FieldAccess { base, field, .. } = callee.as_ref() {
                     let (base_hir, base_ty) = self.infer_expr(base)?;
-                    if let Some((param_tys, ret_ty)) = self.checker.lookup_method(base_ty, field) {
+                    if let Some((param_tys, ret_ty)) = self.checker.lookup_method(base_ty, *field) {
                         // Adjust: method calls pass `self` as the first arg implicitly,
                         // so the param list from the declaration includes self.
                         // We treat `base` as the receiver and check remaining args.
@@ -359,12 +359,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         ));
                     } else {
                         // Method not found — collect available method names for a helpful error
-                        let mut method_names: Vec<String> = Vec::new();
+                        let mut method_names: Vec<Symbol> = Vec::new();
                         for ty in self.checker.autoderef_chain(base_ty) {
                             for cand in self.checker.trait_env.lookup_impls_for_type(ty) {
                                 for m in &cand.methods {
                                     if !method_names.contains(&m.name) {
-                                        method_names.push(m.name.clone());
+                                        method_names.push(m.name);
                                     }
                                 }
                             }
@@ -378,7 +378,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         if !method_names.is_empty() {
                             diag = diag.with_suggestion(format!(
                                 "available methods: {}",
-                                method_names.join(", ")
+                                method_names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
                             ));
                         }
                         self.checker.diagnostics.push(diag);
@@ -396,7 +396,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         if let Ok(ty) = self.resolve_type(&type_path) {
                             // Look up the method on the resolved type.
                             // lookup_method also handles inherent methods.
-                            if let Some((param_tys, ret_ty)) = self.checker.lookup_method(ty, &method_name) {
+                            if let Some((param_tys, ret_ty)) = self.checker.lookup_method(ty, method_name) {
                                 // Static method call: no self parameter to skip.
                                 // The method's param_tys already reflect the full signature.
                                 if param_tys.len() != args.len() {
@@ -565,7 +565,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             Expr::FieldAccess { base, field, span } => {
                 let (base_hir, base_ty) = self.infer_expr(base)?;
                 // Try to resolve as a struct field first
-                if let Ok(field_ty) = self.checker.lookup_field(base_ty, field, *span) {
+                if let Ok(field_ty) = self.checker.lookup_field(base_ty, *field, *span) {
                     return Ok((
                         HirExpr::FieldAccess {
                             base: Box::new(base_hir),
@@ -577,7 +577,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     ));
                 }
                 // If not a field, try as a method via autoderef
-                if let Some((param_tys, ret_ty)) = self.checker.lookup_method(base_ty, field) {
+                if let Some((param_tys, ret_ty)) = self.checker.lookup_method(base_ty, *field) {
                     // Full function type including self parameter: fn(&Obj) -> RetTy
                     let fn_ty = self.checker.ctx.function(param_tys, ret_ty);
                     return Ok((
@@ -597,7 +597,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
             Expr::AttrAccess { base, attr, span } => {
                 let (base_hir, base_ty) = self.infer_expr(base)?;
-                let attr_ty = self.checker.lookup_attr(base_ty, attr, *span)?;
+                let attr_ty = self.checker.lookup_attr(base_ty, *attr, *span)?;
                 Ok((
                     HirExpr::AttrAccess {
                         base: Box::new(base_hir),
@@ -685,7 +685,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             .find(|f| f.name == *name)
                             .ok_or_else(|| {
                                 let field_names: Vec<String> =
-                                    binding.fields.iter().map(|f| f.name.clone()).collect();
+                                    binding.fields.iter().map(|f| f.name.as_str()).collect();
                                 let mut diag = Diagnostic::error(format!(
                                     "field '{}' not found in struct",
                                     name
@@ -697,7 +697,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                     field_names.join(", ")
                                 ));
                                 if let Some(suggestion) =
-                                    did_you_mean_suggestion(name, &field_names)
+                                    did_you_mean_suggestion(&name.as_str(), &field_names)
                                 {
                                     diag = diag.with_suggestion(suggestion);
                                 }
@@ -745,7 +745,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     // Static method call: `Type::method(args)`
                     // The payload (if any) is the argument expression.
                     if let Some((method_param_tys, ret_ty)) =
-                        self.checker.lookup_method(resolved_ty, variant)
+                        self.checker.lookup_method(resolved_ty, *variant)
                     {
                         let mut hir_args = Vec::new();
                         // Pass the payload (if any) as the argument.
@@ -1180,15 +1180,15 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     for arm in &hir_arms {
                         match &arm.pattern {
                             HirPattern::Enum { variant, .. } => {
-                                if !covered_variants.contains(variant) {
-                                    covered_variants.push(variant.clone());
+                                if !covered_variants.contains(&variant.as_str()) {
+                                    covered_variants.push(variant.as_str());
                                 }
                             }
                             HirPattern::Or(patterns, _) => {
                                 for p in patterns {
                                     if let HirPattern::Enum { variant, .. } = p {
-                                        if !covered_variants.contains(variant) {
-                                            covered_variants.push(variant.clone());
+                                        if !covered_variants.contains(&variant.as_str()) {
+                                            covered_variants.push(variant.as_str());
                                         }
                                     }
                                 }
@@ -1444,7 +1444,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
             Expr::Path(path, span) => {
                 self.checker.diagnostics.push(
-                    Diagnostic::error(format!("unresolved path: {}", path.join("::")))
+                    Diagnostic::error(format!("unresolved path: {}", path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")))
                         .with_span(*span),
                 );
                 Ok((HirExpr::Error(*span), self.checker.ctx.error()))
@@ -1590,7 +1590,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         match ty {
             Type::Path(path, span) => {
                 // Lifetime parsed as placeholder path `["'a"]` — skip resolution.
-                if path.len() == 1 && path[0].starts_with('\'') {
+                if path.len() == 1 && path[0].as_str().starts_with('\'') {
                     return Ok(self.checker.ctx.unit());
                 }
                 if let Ok(def_id) = self.checker.resolve_def_id(path) {
@@ -1660,14 +1660,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             .with_span(*span)),
                     }
                 } else {
-                    match path[0].as_str() {
-                        "Bool" => Ok(self.checker.ctx.bool()),
-                        "Char" => Ok(self.checker.ctx.char()),
-                        "Byte" => Ok(self.checker.ctx.byte()),
-                        "USize" => Ok(self.checker.ctx.usize()),
-                        "Unit" => Ok(self.checker.ctx.unit()),
-                        "Never" => Ok(self.checker.ctx.never()),
-                        _ => {
+                    if path[0].eq_str("Bool") {
+                        Ok(self.checker.ctx.bool())
+                    } else if path[0].eq_str("Char") {
+                        Ok(self.checker.ctx.char())
+                    } else if path[0].eq_str("Byte") {
+                        Ok(self.checker.ctx.byte())
+                    } else if path[0].eq_str("USize") {
+                        Ok(self.checker.ctx.usize())
+                    } else if path[0].eq_str("Unit") {
+                        Ok(self.checker.ctx.unit())
+                    } else if path[0].eq_str("Never") {
+                        Ok(self.checker.ctx.never())
+                    } else {
                             // Check if this is a generic type parameter registered in the local cache
                             if path.len() == 1 {
                                 if let Some(&ty) = self.checker.local_type_param_cache.get(&path[0])
@@ -1680,53 +1685,47 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         }
                     }
                 }
-            }
             Type::Generic(base, args, span) => {
                 if let Type::Path(path, _) = base.as_ref() {
                     if path.len() == 1 {
-                        match path[0].as_str() {
-                            "Int" => {
-                                let width = args
-                                    .get(0)
-                                    .and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
-                                    .unwrap_or(32);
-                                return Ok(self.checker.ctx.int(width, true));
+                        if path[0].eq_str("Int") {
+                            let width = args
+                                .get(0)
+                                .and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
+                                .unwrap_or(32);
+                            return Ok(self.checker.ctx.int(width, true));
+                        } else if path[0].eq_str("UInt") {
+                            let width = args
+                                .get(0)
+                                .and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
+                                .unwrap_or(32);
+                            return Ok(self.checker.ctx.int(width, false));
+                        } else if path[0].eq_str("Float") {
+                            let width = args
+                                .get(0)
+                                .and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
+                                .unwrap_or(64);
+                            return Ok(self.checker.ctx.float(width));
+                        } else if path[0].eq_str("Rational") {
+                            let p = args.get(0).and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
+                                .ok_or_else(|| Diagnostic::error("Rational requires a compile-time constant integer bit count for the integer part").with_span(*span))?;
+                            let q = args.get(1).and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
+                                .ok_or_else(|| Diagnostic::error("Rational requires a compile-time constant integer bit count for the fractional part").with_span(*span))?;
+                            if p == 0 || p > 64 || q == 0 || q > 64 {
+                                return Err(Diagnostic::error(
+                                    "Rational bit counts must be 1..64",
+                                )
+                                .with_span(*span));
                             }
-                            "UInt" => {
-                                let width = args
-                                    .get(0)
-                                    .and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
-                                    .unwrap_or(32);
-                                return Ok(self.checker.ctx.int(width, false));
-                            }
-                            "Float" => {
-                                let width = args
-                                    .get(0)
-                                    .and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
-                                    .unwrap_or(64);
-                                return Ok(self.checker.ctx.float(width));
-                            }
-                            "Rational" => {
-                                let p = args.get(0).and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
-                                    .ok_or_else(|| Diagnostic::error("Rational requires a compile-time constant integer bit count for the integer part").with_span(*span))?;
-                                let q = args.get(1).and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
-                                    .ok_or_else(|| Diagnostic::error("Rational requires a compile-time constant integer bit count for the fractional part").with_span(*span))?;
-                                if p == 0 || p > 64 || q == 0 || q > 64 {
-                                    return Err(Diagnostic::error(
-                                        "Rational bit counts must be 1..64",
-                                    )
-                                    .with_span(*span));
-                                }
-                                return Ok(self.checker.ctx.rational(p, q));
-                            }
-                            "Ptr" => {
+                            return Ok(self.checker.ctx.rational(p, q));
+                        } else if path[0].eq_str("Ptr") {
                                 let mut size = self.checker.ctx.usize();
                                 let mut pointee = self.checker.ctx.error();
                                 for arg in args {
                                     let ty = self.resolve_type(arg.ty())?;
                                     match arg {
-                                        GenericArg::Named(name, _) if name == "size" => size = ty,
-                                        GenericArg::Named(name, _) if name == "pointee" => {
+                                        GenericArg::Named(name, _) if name.eq_str("size") => size = ty,
+                                        GenericArg::Named(name, _) if name.eq_str("pointee") => {
                                             pointee = ty
                                         }
                                         GenericArg::Positional(_) => {
@@ -1740,11 +1739,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                     }
                                 }
                                 return Ok(self.checker.ctx.ptr(size, pointee));
-                            }
-                            "USize" => {
-                                return Ok(self.checker.ctx.usize());
-                            }
-                            _ => {}
+                        } else if path[0].eq_str("USize") {
+                            return Ok(self.checker.ctx.usize());
                         }
                     }
                 }
@@ -1834,7 +1830,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             } => {
                 let _impl_ty = self.resolve_type(impl_type)?;
                 let _trait_ty = self.resolve_type(trait_path)?;
-                let candidates = self.checker.symbols.lookup_traits_by_assoc_type_name(name);
+                let candidates = self.checker.symbols.lookup_traits_by_assoc_type_name(*name);
                 match candidates.len() {
                     0 => {
                         self.checker.diagnostics.push(
@@ -1901,9 +1897,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 span,
             } => {
                 // Desugar `type T = Base where value > 0` into `exists _where_N: Base invariant _where_N > 0`.
-                let name = format!("_where_{}", span.start);
+                let name = Symbol::intern(&format!("_where_{}", span.start));
                 let mut inv = invariant.as_ref().clone();
-                replace_ident_in_expr(&mut inv, "value", &name);
+                replace_ident_in_expr(&mut inv, Symbol::intern("value"), name);
                 let base_ty = self.resolve_type(base)?;
                 let (_, inv_ty) = self.infer_expr(&inv)?;
                 if !self.checker.ctx.is_bool(inv_ty) {

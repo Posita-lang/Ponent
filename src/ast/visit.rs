@@ -2,6 +2,7 @@
 //! Each overridden visit method has full control; the default calls `walk_*`.
 
 use crate::ast::*;
+use crate::symbol::Symbol;
 
 /// AST visitor (immutable, shared references).
 pub trait Visitor<'ast>: Sized {
@@ -22,7 +23,7 @@ pub trait Visitor<'ast>: Sized {
     fn visit_literal(&mut self, _lit: &'ast Literal) -> Self::Result {
         Self::Result::output()
     }
-    fn visit_ident(&mut self, _name: &'ast str, _span: &'ast Span) -> Self::Result {
+    fn visit_ident(&mut self, _name: Symbol, _span: &'ast Span) -> Self::Result {
         Self::Result::output()
     }
     fn visit_param(&mut self, param: &'ast Param) -> Self::Result {
@@ -41,7 +42,7 @@ pub trait Visitor<'ast>: Sized {
 pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V::Result {
     match expr {
         Expr::Literal(lit, _) => visitor.visit_literal(lit),
-        Expr::Ident(name, span) => visitor.visit_ident(name, span),
+        Expr::Ident(name, span) => visitor.visit_ident(*name, span),
         Expr::TypeAnnotated { expr: e, ty, .. } => {
             visitor.visit_expr(e);
             visitor.visit_ty(ty)
@@ -64,11 +65,11 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
         }
         Expr::FieldAccess { base, field, span } => {
             visitor.visit_expr(base);
-            visitor.visit_ident(field, span)
+            visitor.visit_ident(*field, span)
         }
         Expr::AttrAccess { base, attr, span } => {
             visitor.visit_expr(base);
-            visitor.visit_ident(attr, span)
+            visitor.visit_ident(*attr, span)
         }
         Expr::Cast { expr: base, .. } => visitor.visit_expr(base),
         Expr::Range { start, end, .. } => {
@@ -87,7 +88,7 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
             V::Result::output()
         }
         Expr::EnumLit { variant, payload, span, .. } => {
-            visitor.visit_ident(variant, span);
+            visitor.visit_ident(*variant, span);
             if let Some(e) = payload {
                 visitor.visit_expr(e)
             } else {
@@ -221,7 +222,7 @@ pub fn walk_stmt<'ast, V: Visitor<'ast>>(visitor: &mut V, stmt: &'ast Stmt) -> V
             span,
             ..
         } => {
-            visitor.visit_ident(name, span);
+            visitor.visit_ident(*name, span);
             for p in params {
                 visitor.visit_param(p);
             }
@@ -360,7 +361,7 @@ pub fn walk_ty<'ast, V: Visitor<'ast>>(_visitor: &mut V, _ty: &'ast Type) -> V::
 pub fn walk_pattern<'ast, V: Visitor<'ast>>(visitor: &mut V, pat: &'ast Pattern) -> V::Result {
     match pat {
         Pattern::Wildcard(_) | Pattern::Error(_) => V::Result::output(),
-        Pattern::Ident(name, span) => visitor.visit_ident(name, span),
+        Pattern::Ident(name, span) => visitor.visit_ident(*name, span),
         Pattern::Literal(expr, _) => visitor.visit_expr(expr),
         Pattern::Tuple(patterns, _) => {
             for p in patterns {
@@ -403,7 +404,7 @@ pub fn walk_pattern<'ast, V: Visitor<'ast>>(visitor: &mut V, pat: &'ast Pattern)
 }
 
 pub fn walk_param<'ast, V: Visitor<'ast>>(visitor: &mut V, param: &'ast Param) -> V::Result {
-    visitor.visit_ident(&param.name, &param.span);
+    visitor.visit_ident(param.name, &param.span);
     if let Some(ty) = &param.ty {
         visitor.visit_ty(ty)
     } else {
@@ -441,7 +442,7 @@ pub trait MutVisitor: Sized {
     fn visit_param_mut(&mut self, param: &mut Param) {
         walk_param_mut(self, param)
     }
-    fn visit_ident_mut(&mut self, name: &mut String) {
+    fn visit_ident_mut(&mut self, name: &mut Symbol) {
         let _ = name;
     }
 }
@@ -798,32 +799,32 @@ impl<T> VisitorResult for Option<T> {
 // ── ReplaceIdentVisitor (renames identifiers in-place) ───────────
 
 struct ReplaceIdentVisitor {
-    old_name: String,
-    new_name: String,
+    old_name: Symbol,
+    new_name: Symbol,
 }
 
 impl MutVisitor for ReplaceIdentVisitor {
-    fn visit_ident_mut(&mut self, name: &mut String) {
+    fn visit_ident_mut(&mut self, name: &mut Symbol) {
         if *name == self.old_name {
-            *name = self.new_name.clone();
+            *name = self.new_name;
         }
     }
 }
 
 /// Rename all occurrences of `old_name` to `new_name` in an expression tree.
-pub fn replace_ident_in_expr(expr: &mut Expr, old_name: &str, new_name: &str) {
+pub fn replace_ident_in_expr(expr: &mut Expr, old_name: Symbol, new_name: Symbol) {
     let mut v = ReplaceIdentVisitor {
-        old_name: old_name.to_string(),
-        new_name: new_name.to_string(),
+        old_name,
+        new_name,
     };
     v.visit_expr_mut(expr);
 }
 
 /// Rename all occurrences of `old_name` to `new_name` in a statement tree.
-pub fn replace_ident_in_stmt(stmt: &mut Stmt, old_name: &str, new_name: &str) {
+pub fn replace_ident_in_stmt(stmt: &mut Stmt, old_name: Symbol, new_name: Symbol) {
     let mut v = ReplaceIdentVisitor {
-        old_name: old_name.to_string(),
-        new_name: new_name.to_string(),
+        old_name,
+        new_name,
     };
     v.visit_stmt_mut(stmt);
 }

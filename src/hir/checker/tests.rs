@@ -1970,7 +1970,7 @@ fn test_channel_type_parses() {
     let mut symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(crate::hir::types::DefId(0)));
     let mut trait_env = crate::hir::traits::TraitEnv::new();
     crate::hir::builtins::register_builtins(&mut symbols, &mut trait_env, &mut ctx);
-    let binding = symbols.lookup_type("Channel");
+    let binding = symbols.lookup_type(Symbol::intern("Channel"));
     assert!(binding.is_some(), "Channel should be registered as a built-in type");
     assert!(
         !binding.unwrap().params.is_empty(),

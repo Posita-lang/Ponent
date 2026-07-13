@@ -1,13 +1,14 @@
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
 use crate::hir::types::*;
+use crate::symbol::Symbol;
 use indexmap::IndexMap;
 use rustc_hash::FxBuildHasher;
 use rustc_hash::FxHashMap as HashMap;
 
 #[derive(Debug, Clone)]
 pub struct FieldBinding {
-    pub name: String,
+    pub name: Symbol,
     pub ty: TypeId,
     pub default: Option<Expr>,
     pub span: Span,
@@ -33,7 +34,7 @@ pub struct VariableBinding {
 
 #[derive(Debug, Clone)]
 pub struct Parameter {
-    pub name: String,
+    pub name: Symbol,
     pub ty: TypeId,
     pub span: Span,
     pub default: Option<Expr>,
@@ -104,8 +105,8 @@ pub struct TypeBinding {
 #[derive(Debug, Clone)]
 pub struct TraitBinding {
     pub def_id: DefId,
-    pub methods: Vec<(String, FunctionSignature)>,
-    pub associated_types: Vec<(String, Option<Type>)>,
+    pub methods: Vec<(Symbol, FunctionSignature)>,
+    pub associated_types: Vec<(Symbol, Option<Type>)>,
     pub span: Span,
     pub crate_id: CrateId,
 }
@@ -125,12 +126,12 @@ pub struct ConstraintBinding {
 
 pub struct Scope {
     pub parent: Option<usize>,
-    pub variables: IndexMap<String, VariableBinding, FxBuildHasher>,
-    pub functions: HashMap<String, FunctionBinding>,
-    pub types: HashMap<String, TypeBinding>,
-    pub traits: HashMap<String, TraitBinding>,
+    pub variables: IndexMap<Symbol, VariableBinding, FxBuildHasher>,
+    pub functions: HashMap<Symbol, FunctionBinding>,
+    pub types: HashMap<Symbol, TypeBinding>,
+    pub traits: HashMap<Symbol, TraitBinding>,
     pub impls: Vec<ImplBinding>,
-    pub constraints: HashMap<String, ConstraintBinding>,
+    pub constraints: HashMap<Symbol, ConstraintBinding>,
     /// If true, duplicate names in this scope are allowed (shadowing).
     /// Block scopes are ordered; module/function scopes are not.
     pub ordered: bool,
@@ -160,7 +161,7 @@ pub struct SymbolTable {
     pub local_crate_id: CrateId,
     /// Maps fully-qualified type path (e.g. "std::collections::HashMap") to DefId.
     /// Used to resolve multi-segment paths when no module hierarchy exists yet.
-    full_path_to_def_id: HashMap<String, DefId>,
+    full_path_to_def_id: HashMap<Symbol, DefId>,
 }
 
 impl SymbolTable {
@@ -197,14 +198,14 @@ impl SymbolTable {
 
     pub fn insert_variable(
         &mut self,
-        name: String,
+        name: Symbol,
         binding: VariableBinding,
         span: Span,
     ) -> Result<(), Diagnostic> {
         let scope = &mut self.scopes[self.current_scope];
         if !scope.ordered && scope.variables.contains_key(&name) {
             return Err(
-                Diagnostic::error(format!("variable '{}' already defined", name)).with_span(span),
+                Diagnostic::error(format!("variable '{}' already defined", name.as_str())).with_span(span),
             );
         }
         scope.variables.insert(name, binding);
@@ -213,14 +214,14 @@ impl SymbolTable {
 
     pub fn insert_function(
         &mut self,
-        name: String,
+        name: Symbol,
         binding: FunctionBinding,
         span: Span,
     ) -> Result<(), Diagnostic> {
         let scope = &mut self.scopes[self.current_scope];
         if scope.functions.contains_key(&name) {
             return Err(
-                Diagnostic::error(format!("function '{}' already defined", name)).with_span(span),
+                Diagnostic::error(format!("function '{}' already defined", name.as_str())).with_span(span),
             );
         }
         scope.functions.insert(name, binding);
@@ -229,19 +230,19 @@ impl SymbolTable {
 
     pub fn insert_type(
         &mut self,
-        name: String,
+        name: Symbol,
         binding: TypeBinding,
         span: Span,
     ) -> Result<(), Diagnostic> {
         let scope = &mut self.scopes[self.current_scope];
         if scope.types.contains_key(&name) {
             return Err(
-                Diagnostic::error(format!("type '{}' already defined", name)).with_span(span),
+                Diagnostic::error(format!("type '{}' already defined", name.as_str())).with_span(span),
             );
         }
         let def_id = binding.def_id;
         self.type_defs.insert(def_id, binding.clone());
-        scope.types.insert(name.clone(), binding);
+        scope.types.insert(name, binding);
         // Note: intentionally NOT inserting the simple name into
         // full_path_to_def_id here.  The full-path map is reserved for
         // fully-qualified paths (e.g. "std::collections::HashMap")
@@ -253,20 +254,20 @@ impl SymbolTable {
     /// Register a fully-qualified type path (e.g. "std::collections::HashMap")
     /// mapping to an already-inserted DefId.  Used by the resolver when it
     /// encounters type definitions inside modules or when processing imports.
-    pub fn register_full_path(&mut self, full_path: String, def_id: DefId) {
+    pub fn register_full_path(&mut self, full_path: Symbol, def_id: DefId) {
         self.full_path_to_def_id.entry(full_path).or_insert(def_id);
     }
 
     pub fn insert_trait(
         &mut self,
-        name: String,
+        name: Symbol,
         binding: TraitBinding,
         span: Span,
     ) -> Result<(), Diagnostic> {
         let scope = &mut self.scopes[self.current_scope];
         if scope.traits.contains_key(&name) {
             return Err(
-                Diagnostic::error(format!("trait '{}' already defined", name)).with_span(span),
+                Diagnostic::error(format!("trait '{}' already defined", name.as_str())).with_span(span),
             );
         }
         let def_id = binding.def_id;
@@ -282,24 +283,24 @@ impl SymbolTable {
 
     pub fn insert_constraint(
         &mut self,
-        name: String,
+        name: Symbol,
         binding: ConstraintBinding,
         span: Span,
     ) -> Result<(), Diagnostic> {
         let scope = &mut self.scopes[self.current_scope];
         if scope.constraints.contains_key(&name) {
             return Err(
-                Diagnostic::error(format!("constraint '{}' already defined", name)).with_span(span),
+                Diagnostic::error(format!("constraint '{}' already defined", name.as_str())).with_span(span),
             );
         }
         scope.constraints.insert(name, binding);
         Ok(())
     }
 
-    pub fn lookup_variable(&self, name: &str, span: Span) -> Option<&VariableBinding> {
+    pub fn lookup_variable(&self, name: Symbol, span: Span) -> Option<&VariableBinding> {
         let mut idx = self.current_scope;
         while let Some(scope) = self.scopes.get(idx) {
-            if let Some(binding) = scope.variables.get(name) {
+            if let Some(binding) = scope.variables.get(&name) {
                 return Some(binding);
             }
             if let Some(parent) = scope.parent {
@@ -311,10 +312,10 @@ impl SymbolTable {
         None
     }
 
-    pub fn lookup_function(&self, name: &str) -> Option<&FunctionBinding> {
+    pub fn lookup_function(&self, name: Symbol) -> Option<&FunctionBinding> {
         let mut idx = self.current_scope;
         while let Some(scope) = self.scopes.get(idx) {
-            if let Some(binding) = scope.functions.get(name) {
+            if let Some(binding) = scope.functions.get(&name) {
                 return Some(binding);
             }
             if let Some(parent) = scope.parent {
@@ -326,10 +327,10 @@ impl SymbolTable {
         None
     }
 
-    pub fn lookup_type(&self, name: &str) -> Option<&TypeBinding> {
+    pub fn lookup_type(&self, name: Symbol) -> Option<&TypeBinding> {
         let mut idx = self.current_scope;
         while let Some(scope) = self.scopes.get(idx) {
-            if let Some(binding) = scope.types.get(name) {
+            if let Some(binding) = scope.types.get(&name) {
                 return Some(binding);
             }
             if let Some(parent) = scope.parent {
@@ -345,10 +346,10 @@ impl SymbolTable {
         self.type_defs.get(&def_id)
     }
 
-    pub fn lookup_trait(&self, name: &str) -> Option<&TraitBinding> {
+    pub fn lookup_trait(&self, name: Symbol) -> Option<&TraitBinding> {
         let mut idx = self.current_scope;
         while let Some(scope) = self.scopes.get(idx) {
-            if let Some(binding) = scope.traits.get(name) {
+            if let Some(binding) = scope.traits.get(&name) {
                 return Some(binding);
             }
             if let Some(parent) = scope.parent {
@@ -365,14 +366,14 @@ impl SymbolTable {
     }
 
     /// Expose the full-path-to-DefId table for multi-segment lookups.
-    pub fn full_path_to_def_id(&self) -> &HashMap<String, DefId> {
+    pub fn full_path_to_def_id(&self) -> &HashMap<Symbol, DefId> {
         &self.full_path_to_def_id
     }
 
-    pub fn lookup_constraint(&self, name: &str) -> Option<&ConstraintBinding> {
+    pub fn lookup_constraint(&self, name: Symbol) -> Option<&ConstraintBinding> {
         let mut idx = self.current_scope;
         while let Some(scope) = self.scopes.get(idx) {
-            if let Some(binding) = scope.constraints.get(name) {
+            if let Some(binding) = scope.constraints.get(&name) {
                 return Some(binding);
             }
             if let Some(parent) = scope.parent {
@@ -384,28 +385,38 @@ impl SymbolTable {
         None
     }
 
-    pub fn lookup_type_by_path(&self, path: &[String]) -> Option<DefId> {
+    pub fn lookup_type_by_path(&self, path: &[Symbol]) -> Option<DefId> {
         if path.is_empty() {
             return None;
         }
         // For single-segment paths, use scoped lookup directly — the
         // full-path map is reserved for multi-segment qualified paths.
         if path.len() == 1 {
-            let binding = self.lookup_type(&path[0])?;
+            let binding = self.lookup_type(path[0])?;
             return Some(binding.def_id);
         }
         // Multi-segment path: try the full-path cache first.
-        let full = path.join("::");
-        if let Some(&id) = self.full_path_to_def_id.get(&full) {
+        let full = path
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("::");
+        let full_sym = Symbol::intern(&full);
+        if let Some(&id) = self.full_path_to_def_id.get(&full_sym) {
             return Some(id);
         }
         None
     }
 
-    pub fn lookup_trait_by_path(&self, path: &[String]) -> Option<DefId> {
+    pub fn lookup_trait_by_path(&self, path: &[Symbol]) -> Option<DefId> {
         // Try the full-path lookup first.
-        let full = path.join("::");
-        if let Some(&id) = self.full_path_to_def_id.get(&full) {
+        let full = path
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("::");
+        let full_sym = Symbol::intern(&full);
+        if let Some(&id) = self.full_path_to_def_id.get(&full_sym) {
             // Check if this DefId is actually a trait (by looking it up in trait_defs)
             if self.trait_defs.contains_key(&id) {
                 return Some(id);
@@ -414,20 +425,20 @@ impl SymbolTable {
         if path.len() != 1 {
             return None;
         }
-        let binding = self.lookup_trait(&path[0])?;
+        let binding = self.lookup_trait(path[0])?;
         Some(binding.def_id)
     }
 
     /// Find all traits that define an associated type with the given name.
-    pub fn lookup_traits_by_assoc_type_name(&self, name: &str) -> Vec<DefId> {
+    pub fn lookup_traits_by_assoc_type_name(&self, name: Symbol) -> Vec<DefId> {
         self.trait_defs
             .iter()
-            .filter(|(_, b)| b.associated_types.iter().any(|(n, _)| n == name))
+            .filter(|(_, b)| b.associated_types.iter().any(|(n, _)| *n == name))
             .map(|(id, _)| *id)
             .collect()
     }
 
-    pub fn lookup_field(&self, def_id: DefId, name: &str) -> Option<TypeId> {
+    pub fn lookup_field(&self, def_id: DefId, name: Symbol) -> Option<TypeId> {
         let binding = self.type_defs.get(&def_id)?;
         if let TypeKind::Struct = binding.kind {
             binding.fields.iter().find(|f| f.name == name).map(|f| f.ty)
@@ -446,12 +457,16 @@ impl SymbolTable {
         CrateId(self.allocate_def_id())
     }
 
-    pub fn lookup_method(
-        &self,
-        _type_id: TypeId,
-        _trait_id: DefId,
-        _method_name: &str,
-    ) -> Option<&FunctionBinding> {
-        None
+    /// Look up a method by name on a trait bound at a given DefId.
+    pub fn lookup_method(&self, def_id: DefId, name: Symbol) -> Option<&FunctionSignature> {
+        if let Some(trait_binding) = self.trait_defs.get(&def_id) {
+            trait_binding
+                .methods
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, sig)| sig)
+        } else {
+            None
+        }
     }
 }

@@ -1,6 +1,7 @@
 use super::*;
 use crate::hir::hir::{HirExpr, HirStmt};
 use crate::hir::types::{TypeContext, TypeId};
+use crate::symbol::Symbol;
 use crate::ast::{BinOp, Literal, Span};
 
 fn make_int_val(n: i128, ty: TypeId) -> HirExpr {
@@ -219,7 +220,7 @@ fn test_eval_variable_def() {
     };
     let r = ec.eval_block(&[block]);
     assert!(matches!(r, Ok(ComptimeValue::Int(42))));
-    assert!(matches!(ec.variables.get("x"), Some(ComptimeValue::Int(42))));
+    assert!(matches!(ec.variables.get(&Symbol::intern("x")), Some(ComptimeValue::Int(42))));
 }
 
 #[test]
@@ -237,7 +238,7 @@ fn test_eval_variable_assign() {
     };
     let r = ec.eval_block(&[assign]);
     assert!(matches!(r, Ok(ComptimeValue::Int(20))));
-    assert!(matches!(ec.variables.get("x"), Some(ComptimeValue::Int(20))));
+    assert!(matches!(ec.variables.get(&Symbol::intern("x")), Some(ComptimeValue::Int(20))));
 }
 
 #[test]
@@ -358,7 +359,7 @@ fn test_eval_while_loop() {
     };
     let _ = ec.eval_block(&[while_stmt]);
     // After the loop, i should be 5
-    assert!(matches!(ec.variables.get("i"), Some(ComptimeValue::Int(5))));
+    assert!(matches!(ec.variables.get(&Symbol::intern("i")), Some(ComptimeValue::Int(5))));
 }
 
 #[test]
@@ -431,5 +432,5 @@ fn test_eval_fn_call_scope_isolation() {
     };
     let _ = ec.eval_expr(&call);
     // Outer x should still be 1, not 99
-    assert!(matches!(ec.variables.get("x"), Some(ComptimeValue::Int(1))));
+    assert!(matches!(ec.variables.get(&Symbol::intern("x")), Some(ComptimeValue::Int(1))));
 }

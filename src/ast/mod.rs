@@ -1,5 +1,6 @@
 pub mod visit;
 use std::fmt;
+use crate::symbol::Symbol;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
@@ -82,7 +83,7 @@ pub enum Quantifier {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Literal, Span),
-    Ident(String, Span),
+    Ident(Symbol, Span),
     TypeAnnotated {
         expr: Box<Expr>,
         ty: Box<Type>,
@@ -112,12 +113,12 @@ pub enum Expr {
     },
     FieldAccess {
         base: Box<Expr>,
-        field: String,
+        field: Symbol,
         span: Span,
     },
     AttrAccess {
         base: Box<Expr>,
-        attr: String,
+        attr: Symbol,
         span: Span,
     },
     Cast {
@@ -134,13 +135,13 @@ pub enum Expr {
         span: Span,
     },
     StructLit {
-        path: Vec<String>,
-        fields: Vec<(String, Expr)>,
+        path: Vec<Symbol>,
+        fields: Vec<(Symbol, Expr)>,
         span: Span,
     },
     EnumLit {
-        path: Vec<String>,
-        variant: String,
+        path: Vec<Symbol>,
+        variant: Symbol,
         payload: Option<Box<Expr>>,
         span: Span,
     },
@@ -148,7 +149,7 @@ pub enum Expr {
     /// Multi-segment path: `Module::Type::item`. Preserves `::` semantics,
     /// distinct from FieldAccess (`.`). Used for associated fn calls,
     /// enum variant construction, etc.
-    Path(Vec<String>, Span),
+    Path(Vec<Symbol>, Span),
     Tuple(Vec<Expr>, Span),
     Array(Vec<Expr>, Span),
     Closure {
@@ -217,7 +218,7 @@ pub enum Expr {
     /// Used in contract position (`requires forall i in 0..arr'len: arr[i] > 0`).
     Quantified {
         quantifier: Quantifier,
-        binder: String,
+        binder: Symbol,
         range: Box<Expr>,
         body: Box<Expr>,
         span: Span,
@@ -240,7 +241,7 @@ pub enum Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatchBranch {
     pub pattern: Pattern,
-    pub bind: Option<String>,
+    pub bind: Option<Symbol>,
     pub body: Vec<Stmt>,
     pub span: Span,
 }
@@ -255,7 +256,7 @@ pub struct MatchArm {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Capture {
-    pub name: String,
+    pub name: Symbol,
     pub mode: CaptureMode,
     pub span: Span,
 }
@@ -273,7 +274,7 @@ pub enum Stmt {
     VariableDef {
         kind: VariableKind,
         mutable: bool,
-        name: Option<String>,
+        name: Option<Symbol>,
         pattern: Option<Pattern>,
         ty: Option<Type>,
         value: Option<Expr>,
@@ -290,7 +291,7 @@ pub enum Stmt {
         attributes: Vec<Attribute>,
         contracts: Vec<Contract>,
         doc: Option<String>,
-        name: String,
+        name: Symbol,
         params: Vec<Param>,
         return_type: Type,
         body: Option<Vec<Stmt>>,
@@ -304,7 +305,7 @@ pub enum Stmt {
         span: Span,
         attributes: Vec<Attribute>,
         doc: Option<String>,
-        name: String,
+        name: Symbol,
         params: Vec<TypeParam>,
         definition: TypeDefinition,
         contracts: Vec<Contract>,
@@ -313,26 +314,26 @@ pub enum Stmt {
         span: Span,
         attributes: Vec<Attribute>,
         doc: Option<String>,
-        name: String,
+        name: Symbol,
         methods: Vec<TraitMethod>,
         associated_types: Vec<AssociatedType>,
     },
     Import {
-        path: Vec<String>,
-        items: Option<Vec<String>>,
-        alias: Option<String>,
+        path: Vec<Symbol>,
+        items: Option<Vec<Symbol>>,
+        alias: Option<Symbol>,
         span: Span,
     },
     ExternFunction {
         abi: String,
-        name: String,
+        name: Symbol,
         params: Vec<Param>,
         return_type: Type,
         span: Span,
         attributes: Vec<Attribute>,
     },
     Constraint {
-        name: String,
+        name: Symbol,
         bounds: Vec<Type>,
         span: Span,
     },
@@ -379,11 +380,11 @@ pub enum Stmt {
         span: Span,
     },
     Leave {
-        label: Option<String>,
+        label: Option<Symbol>,
         span: Span,
     },
     Continue {
-        label: Option<String>,
+        label: Option<Symbol>,
         span: Span,
     },
     Return {
@@ -410,14 +411,14 @@ pub enum Stmt {
         span: Span,
     },
     ScopeCleanup {
-        name: String,
+        name: Symbol,
         body: Vec<Stmt>,
         propagates: bool,
         overrides: bool,
         span: Span,
     },
     Trigger {
-        name: String,
+        name: Symbol,
         span: Span,
     },
     Unsafe {
@@ -447,7 +448,7 @@ pub enum Stmt {
     },
     /// A layout alias definition: `layout Name { packed, little_endian; }`
     LayoutDef {
-        name: String,
+        name: Symbol,
         attributes: Vec<Attribute>,
         span: Span,
     },
@@ -462,7 +463,7 @@ pub enum VariableKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
-    pub name: String,
+    pub name: Symbol,
     pub ty: Option<Type>,
     pub default: Option<Expr>,
     pub span: Span,
@@ -470,7 +471,7 @@ pub struct Param {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeParam {
-    pub name: String,
+    pub name: Symbol,
     pub bounds: Vec<Type>,
     pub is_lifetime: bool,
     pub span: Span,
@@ -485,7 +486,7 @@ pub enum TypeDefinition {
         associated_types: Vec<AssociatedType>,
     },
     ImplBlock {
-        trait_path: Option<Vec<String>>,
+        trait_path: Option<Vec<Symbol>>,
         for_type: Type,
         methods: Vec<ImplMethod>,
     },
@@ -536,7 +537,7 @@ pub struct WhereClause {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructField {
-    pub name: String,
+    pub name: Symbol,
     pub ty: Type,
     pub default: Option<Expr>,
     pub span: Span,
@@ -544,14 +545,14 @@ pub struct StructField {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumVariant {
-    pub name: String,
+    pub name: Symbol,
     pub payload: Option<Type>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraitMethod {
-    pub name: String,
+    pub name: Symbol,
     pub params: Vec<Param>,
     pub return_type: Type,
     pub span: Span,
@@ -559,14 +560,14 @@ pub struct TraitMethod {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssociatedType {
-    pub name: String,
+    pub name: Symbol,
     pub default: Option<Type>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImplMethod {
-    pub name: String,
+    pub name: Symbol,
     pub params: Vec<Param>,
     pub return_type: Type,
     pub body: Option<Vec<Stmt>>,
@@ -577,7 +578,7 @@ pub struct ImplMethod {
 #[derive(Debug, Clone, PartialEq)]
 pub enum GenericArg {
     Positional(Type),
-    Named(String, Type),
+    Named(Symbol, Type),
 }
 
 impl GenericArg {
@@ -590,12 +591,12 @@ impl GenericArg {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
-    Path(Vec<String>, Span),
+    Path(Vec<Symbol>, Span),
     Generic(Box<Type>, Vec<GenericArg>, Span),
     Reference {
         inner: Box<Type>,
         mutable: bool,
-        lifetime: Option<String>,
+        lifetime: Option<Symbol>,
         span: Span,
     },
     Pointer(Box<Type>, Span),
@@ -611,12 +612,12 @@ pub enum Type {
     Projection {
         impl_type: Box<Type>,
         trait_path: Box<Type>,
-        assoc_name: String,
+        assoc_name: Symbol,
         span: Span,
     },
     DynTrait(Vec<Type>, Span),
     Exists {
-        name: String,
+        name: Symbol,
         base: Box<Type>,
         invariant: Box<Expr>,
         span: Span,
@@ -640,7 +641,7 @@ pub enum Type {
 /// A polymorphic type scheme: `forall T1, T2, ... . body`
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeScheme {
-    pub quantifiers: Vec<(Span, String)>,
+    pub quantifiers: Vec<(Span, Symbol)>,
     pub body: Box<Type>,
     pub span: Span,
 }
@@ -648,17 +649,17 @@ pub struct TypeScheme {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     Wildcard(Span),
-    Ident(String, Span),
+    Ident(Symbol, Span),
     Literal(Box<Expr>, Span),
     Tuple(Vec<Pattern>, Span),
     Struct {
-        path: Vec<String>,
-        fields: Vec<(String, Pattern)>,
+        path: Vec<Symbol>,
+        fields: Vec<(Symbol, Pattern)>,
         span: Span,
     },
     Enum {
-        path: Vec<String>,
-        variant: String,
+        path: Vec<Symbol>,
+        variant: Symbol,
         inner: Option<Box<Pattern>>,
         span: Span,
     },
@@ -669,9 +670,9 @@ pub enum Pattern {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Attribute {
-    pub name: String,
+    pub name: Symbol,
     pub args: Vec<Expr>,
-    pub named_args: Vec<(String, Expr)>,
+    pub named_args: Vec<(Symbol, Expr)>,
     pub span: Span,
 }
 

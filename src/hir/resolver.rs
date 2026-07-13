@@ -3,6 +3,8 @@ use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticCollector, DiagnosticLevel};
 use crate::hir::symbol::*;
 use crate::hir::traits::{ImplCandidate, TraitEnv};
+use crate::hir::builtins;
+use crate::symbol::Symbol;
 use rustc_hash::FxHashMap;
 
 /// Represents the result of partially resolving a multi-segment path
@@ -30,12 +32,12 @@ pub enum Res {
 /// Pre-resolved name resolution results, populated by NameResolver and consumed by TypeChecker.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ResolutionMap {
-    pub type_def_ids: FxHashMap<String, DefId>,
+    pub type_def_ids: FxHashMap<Symbol, DefId>,
     pub type_bindings: FxHashMap<DefId, TypeBinding>,
     /// Partial resolution of value paths (multi-segment), keyed by the first segment.
-    pub value_resolutions: FxHashMap<String, PartialRes>,
+    pub value_resolutions: FxHashMap<Symbol, PartialRes>,
     /// Partial resolution of type paths (multi-segment), keyed by the first segment.
-    pub type_resolutions: FxHashMap<String, PartialRes>,
+    pub type_resolutions: FxHashMap<Symbol, PartialRes>,
 }
 use crate::hir::types::*;
 use rustc_hash::FxHashMap as HashMap;
@@ -52,31 +54,37 @@ pub struct NameResolver<'a> {
     local_crate_id: CrateId,
     /// Temporary mapping of type parameter names to GenericParam TypeIds
     /// used when resolving types inside an `impl<T>` block.
-    current_impl_type_params: Option<HashMap<String, TypeId>>,
+    current_impl_type_params: Option<HashMap<Symbol, TypeId>>,
     /// The resolved `for_type` of the current `impl` block, used to resolve
     /// `Self` in method bodies and associated type defaults.
     current_impl_for_type: Option<TypeId>,
     /// Pre-resolved name resolutions for the type checker.
     resolution_map: ResolutionMap,
     /// Current module path for registering full-qualified type paths.
-    module_path: Vec<String>,
+    module_path: Vec<Symbol>,
     /// Layout aliases defined with `layout Name { ... }`.
-    layout_aliases: HashMap<String, Vec<Attribute>>,
+    layout_aliases: HashMap<Symbol, Vec<Attribute>>,
 }
 
 struct ImportEntry {
-    path: Vec<String>,
-    alias: Option<String>,
-    items: Option<Vec<String>>,
+    path: Vec<Symbol>,
+    alias: Option<Symbol>,
+    items: Option<Vec<Symbol>>,
     span: Span,
 }
 
 impl<'a> NameResolver<'a> {
     pub fn new(ctx: &'a mut TypeContext, local_crate_id: CrateId) -> Self {
+        let mut symbols = SymbolTable::new(local_crate_id);
+        let mut trait_env = TraitEnv::new();
+        // Register built-in types (Result, Option, Channel, etc.) so that
+        // the resolver can resolve them in type annotations like
+        // `fn f() -> Result<(), Int<32>>`.
+        builtins::register_builtins(&mut symbols, &mut trait_env, ctx);
         NameResolver {
             ctx,
-            symbols: SymbolTable::new(local_crate_id),
-            trait_env: TraitEnv::new(),
+            symbols,
+            trait_env,
             diagnostics: DiagnosticCollector::new(),
             current_scope: 0,
             current_function: None,
@@ -143,7 +151,7 @@ impl<'a> NameResolver<'a> {
                 }
                 self.current_impl_type_params = Some(param_map);
 
-                let sig = self.collect_function_signature(name, params, return_type, type_params);
+                let sig = self.collect_function_signature(*name, params, return_type, type_params);
 
                 let binding = FunctionBinding {
                     def_id,
@@ -234,7 +242,7 @@ impl<'a> NameResolver<'a> {
                 let mut default_value = None;
                 let mut no_default = false;
                 let mut missing_match = None;
-                let exhaustive = attributes.iter().any(|a| a.name == "exhaustive");
+                let exhaustive = attributes.iter().any(|a| a.name.eq_str("exhaustive"));
 
                 match definition {
                     TypeDefinition::Struct(fields_def, _) => {
@@ -277,12 +285,12 @@ impl<'a> NameResolver<'a> {
                 let mut pad = None;
                 let mut expanded_attrs = attributes.clone();
                 for attr in attributes {
-                    if attr.name == "layout" {
+                    if attr.name.eq_str("layout") {
                         for arg in &attr.args {
                             if let crate::ast::Expr::Ident(name, _) = arg {
-                                if name == "C" {
+                                if name.eq_str("C") {
                                     c_layout = true;
-                                } else if let Some(alias_attrs) = self.layout_aliases.get(name.as_str()) {
+                                } else if let Some(alias_attrs) = self.layout_aliases.get(&name) {
                                     for alias_attr in alias_attrs {
                                         if !expanded_attrs.iter().any(|a| a.name == alias_attr.name) {
                                             expanded_attrs.push(alias_attr.clone());
@@ -292,14 +300,14 @@ impl<'a> NameResolver<'a> {
                             }
                         }
                     }
-                    if attr.name == "transparent" { transparent = true; }
-                    if attr.name == "packed" { packed = true; }
-                    if attr.name == "endian" {
+                    if attr.name.eq_str("transparent") { transparent = true; }
+                    if attr.name.eq_str("packed") { packed = true; }
+                    if attr.name.eq_str("endian") {
                         match attr.args.first() {
-                            Some(crate::ast::Expr::Ident(name, _)) if name == "little" => {
+                            Some(crate::ast::Expr::Ident(name, _)) if name.eq_str("little") => {
                                 endian = Some(crate::ast::Endianness::Little);
                             }
-                            Some(crate::ast::Expr::Ident(name, _)) if name == "big" => {
+                            Some(crate::ast::Expr::Ident(name, _)) if name.eq_str("big") => {
                                 endian = Some(crate::ast::Endianness::Big);
                             }
                             Some(crate::ast::Expr::Ident(name, _)) => {
@@ -328,12 +336,12 @@ impl<'a> NameResolver<'a> {
                             }
                         }
                     }
-                    if attr.name == "bit_order" {
+                    if attr.name.eq_str("bit_order") {
                         match attr.args.first() {
-                            Some(crate::ast::Expr::Ident(name, _)) if name == "lsb_to_msb" => {
+                            Some(crate::ast::Expr::Ident(name, _)) if name.eq_str("lsb_to_msb") => {
                                 bit_order = Some(crate::ast::BitOrder::LsbToMsb);
                             }
-                            Some(crate::ast::Expr::Ident(name, _)) if name == "msb_to_lsb" => {
+                            Some(crate::ast::Expr::Ident(name, _)) if name.eq_str("msb_to_lsb") => {
                                 bit_order = Some(crate::ast::BitOrder::MsbToLsb);
                             }
                             Some(crate::ast::Expr::Ident(name, _)) => {
@@ -362,11 +370,11 @@ impl<'a> NameResolver<'a> {
                             }
                         }
                     }
-                    if attr.name == "align" || attr.name == "pad" {
+                    if attr.name.eq_str("align") || attr.name.eq_str("pad") {
                         match attr.args.first() {
                             Some(crate::ast::Expr::Literal(crate::ast::Literal::Int(n), _)) => {
-                                if attr.name == "align" { align = Some(*n as u64); }
-                                if attr.name == "pad" { pad = Some(*n as u64); }
+                                if attr.name.eq_str("align") { align = Some(*n as u64); }
+                                if attr.name.eq_str("pad") { pad = Some(*n as u64); }
                             }
                             Some(_) => {
                                 self.diagnostics.push(
@@ -418,11 +426,11 @@ impl<'a> NameResolver<'a> {
                 {
                     let mut full_path = self.module_path.clone();
                     full_path.push(name.clone());
-                    let full = full_path.join("::");
+                    let full = Symbol::intern(&full_path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"));
                     self.symbols.register_full_path(full, def_id);
                 }
                 // Populate the resolution map for the type checker
-                if let Some(b) = self.symbols.lookup_type(&name) {
+                if let Some(b) = self.symbols.lookup_type(*name) {
                     self.resolution_map.type_bindings.insert(def_id, b.clone());
                 }
                 // Restore the previous type param map (if any).
@@ -439,7 +447,7 @@ impl<'a> NameResolver<'a> {
                 // Set current_impl_for_type to a fresh generic param for Self,
                 // so that trait method signatures can reference `Self` in their
                 // parameter and return types (e.g. `def clone(self) -> Self`).
-                let self_param = self.ctx.generic_param(0, "Self".to_string());
+                let self_param = self.ctx.generic_param(0, Symbol::intern("Self"));
                 self.current_impl_for_type = Some(self_param);
                 let mut method_bindings = Vec::new();
                 for method in methods {
@@ -532,7 +540,7 @@ impl<'a> NameResolver<'a> {
                 // can resolve type parameters like `T` in `impl<T> Foo for Bar { ... }`.
                 // It is cleared after the impl block is fully processed.
 
-                let has_auto_deref = attributes.iter().any(|a| a.name == "auto_deref");
+                let has_auto_deref = attributes.iter().any(|a| a.name.eq_str("auto_deref"));
 
                 // Pre-resolve method param types using the impl's type param mapping,
                 // so generic params like `T` are properly substituted in lookup_method.
@@ -665,7 +673,7 @@ impl<'a> NameResolver<'a> {
                 ..
             } => {
                 let def_id = self.allocate_def_id();
-                let sig = self.collect_function_signature(name, params, return_type, &[]);
+                let sig = self.collect_function_signature(*name, params, return_type, &[]);
                 let binding = FunctionBinding {
                     def_id,
                     signature: sig,
@@ -956,17 +964,17 @@ impl<'a> NameResolver<'a> {
                 Some(ty)
             }
             Expr::Ident(name, span) => {
-                if let Some(binding) = self.symbols.lookup_variable(name, *span) {
+                if let Some(binding) = self.symbols.lookup_variable(*name, *span) {
                     Some(binding.ty)
-                } else if let Some(func) = self.symbols.lookup_function(name) {
+                } else if let Some(func) = self.symbols.lookup_function(*name) {
                     let sig = func.signature.clone();
                     let ty = self
                         .ctx
                         .function(sig.params.iter().map(|p| p.ty).collect(), sig.return_type);
                     Some(ty)
-                } else if let Some(_ty_binding) = self.symbols.lookup_type(name) {
+                } else if let Some(_ty_binding) = self.symbols.lookup_type(*name) {
                     None
-                } else if name == "result" {
+                } else if name.eq_str("result") {
                     // `result` in `ensures` clauses is resolved by the checker.
                     None
                 } else {
@@ -1269,7 +1277,7 @@ impl<'a> NameResolver<'a> {
             }
             Expr::Path(path, _) => {
                 self.diagnostics.push(
-                    Diagnostic::error(format!("unresolved path: {}", path.join("::")))
+                    Diagnostic::error(format!("unresolved path: {}", path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")))
                         .with_span(Span::new(0, 0)),
                 );
                 Some(self.ctx.error())
@@ -1343,7 +1351,7 @@ impl<'a> NameResolver<'a> {
         match ty {
             Type::Path(path, span) => {
                 // Check if this name refers to `Self` in an impl block.
-                if path.len() == 1 && path[0] == "Self" {
+                if path.len() == 1 && path[0].eq_str("Self") {
                     if let Some(self_ty) = self.current_impl_for_type {
                         return self_ty;
                     }
@@ -1374,25 +1382,28 @@ impl<'a> NameResolver<'a> {
                     }
                 } else {
                     // Check for built-in types
-                    let name = &path[0];
-                    match name.as_str() {
-                        "Bool" => self.ctx.bool(),
-                        "Char" => self.ctx.char(),
-                        "Byte" => self.ctx.byte(),
-                        "USize" => self.ctx.usize(),
-                        "Unit" => self.ctx.unit(),
-                        "Never" => self.ctx.never(),
-                        "Int" | "UInt" | "Float" | "Rational" => {
-                            // These require type arguments; handled in Type::Generic
-                            self.ctx.error()
-                        }
-                        _ => {
-                            self.diagnostics.push(
-                                Diagnostic::error(format!("undefined type: {}", path.join("::")))
-                                    .with_span(*span),
-                            );
-                            self.ctx.error()
-                        }
+                    let name = path[0];
+                    if name.eq_str("Bool") {
+                        self.ctx.bool()
+                    } else if name.eq_str("Char") {
+                        self.ctx.char()
+                    } else if name.eq_str("Byte") {
+                        self.ctx.byte()
+                    } else if name.eq_str("USize") {
+                        self.ctx.usize()
+                    } else if name.eq_str("Unit") {
+                        self.ctx.unit()
+                    } else if name.eq_str("Never") {
+                        self.ctx.never()
+                    } else if name.eq_str("Int") || name.eq_str("UInt") || name.eq_str("Float") || name.eq_str("Rational") {
+                        // These require type arguments; handled in Type::Generic
+                        self.ctx.error()
+                    } else {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!("undefined type: {}", path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")))
+                                .with_span(*span),
+                        );
+                        self.ctx.error()
                     }
                 }
             }
@@ -1400,25 +1411,20 @@ impl<'a> NameResolver<'a> {
                 // Handle generic built-in types (Int, UInt, Float) by matching base path
                 if let Type::Path(path, _) = base.as_ref() {
                     if path.len() == 1 {
-                        match path[0].as_str() {
-                            "Int" => {
-                                let bits = self.extract_int_from_type(args[0].ty()).unwrap_or(32);
-                                return self.ctx.int(bits, true);
-                            }
-                            "UInt" => {
-                                let bits = self.extract_int_from_type(args[0].ty()).unwrap_or(32);
-                                return self.ctx.int(bits, false);
-                            }
-                            "Float" => {
-                                let bits = self.extract_int_from_type(args[0].ty()).unwrap_or(64);
-                                return self.ctx.float(bits);
-                            }
-                            "Rational" => {
-                                let p = self.extract_int_from_type(args[0].ty()).unwrap_or(16);
-                                let q = self.extract_int_from_type(args[1].ty()).unwrap_or(16);
-                                return self.ctx.rational(p, q);
-                            }
-                            "Ptr" => {
+                        if path[0].eq_str("Int") {
+                            let bits = self.extract_int_from_type(args[0].ty()).unwrap_or(32);
+                            return self.ctx.int(bits, true);
+                        } else if path[0].eq_str("UInt") {
+                            let bits = self.extract_int_from_type(args[0].ty()).unwrap_or(32);
+                            return self.ctx.int(bits, false);
+                        } else if path[0].eq_str("Float") {
+                            let bits = self.extract_int_from_type(args[0].ty()).unwrap_or(64);
+                            return self.ctx.float(bits);
+                        } else if path[0].eq_str("Rational") {
+                            let p = self.extract_int_from_type(args[0].ty()).unwrap_or(16);
+                            let q = self.extract_int_from_type(args[1].ty()).unwrap_or(16);
+                            return self.ctx.rational(p, q);
+                        } else if path[0].eq_str("Ptr") {
                                 let size = args
                                     .get(0)
                                     .map(|a| self.resolve_type_expr(a.ty()))
@@ -1428,11 +1434,8 @@ impl<'a> NameResolver<'a> {
                                     .map(|a| self.resolve_type_expr(a.ty()))
                                     .unwrap_or(self.ctx.error());
                                 return self.ctx.ptr(size, pointee);
-                            }
-                            "USize" => {
-                                return self.ctx.usize();
-                            }
-                            _ => {}
+                        } else if path[0].eq_str("USize") {
+                            return self.ctx.usize();
                         }
                     }
                 }
@@ -1541,9 +1544,9 @@ impl<'a> NameResolver<'a> {
                 span,
             } => {
                 // Desugar `type T = Base where value > 0` into `exists _where_N: Base invariant _where_N > 0`.
-                let name = format!("_where_{}", span.start);
+                let name = Symbol::intern(&format!("_where_{}", span.start));
                 let mut inv = invariant.as_ref().clone();
-                replace_ident_in_expr(&mut inv, "value", &name);
+                replace_ident_in_expr(&mut inv, Symbol::intern("value"), name);
                 let base_ty = self.resolve_type_expr(base);
                 self.ctx.exists(self.ctx.fresh_param_index(), name, base_ty, inv)
             }
@@ -1555,14 +1558,14 @@ impl<'a> NameResolver<'a> {
         }
     }
 
-    fn resolve_type_path(&mut self, path: &[String]) -> Option<DefId> {
+    fn resolve_type_path(&mut self, path: &[Symbol]) -> Option<DefId> {
         if path.is_empty() {
             return None;
         }
         self.symbols.lookup_type_by_path(path)
     }
 
-    fn resolve_trait_path(&mut self, path: &[String]) -> Option<DefId> {
+    fn resolve_trait_path(&mut self, path: &[Symbol]) -> Option<DefId> {
         if path.is_empty() {
             return None;
         }
@@ -1612,17 +1615,17 @@ impl<'a> NameResolver<'a> {
     }
 
     fn has_pure_attribute(&self, attributes: &[Attribute]) -> bool {
-        attributes.iter().any(|attr| attr.name == "pure")
+        attributes.iter().any(|attr| attr.name.eq_str("pure"))
     }
 
     fn has_ieee_contracts_attribute(&self, attributes: &[Attribute]) -> bool {
-        attributes.iter().any(|attr| attr.name == "ieee_contracts")
+        attributes.iter().any(|attr| attr.name.eq_str("ieee_contracts"))
     }
 
     fn extract_hints(&self, attributes: &[Attribute]) -> Vec<Expr> {
         attributes
             .iter()
-            .filter(|attr| attr.name == "hint")
+            .filter(|attr| attr.name.eq_str("hint"))
             .flat_map(|attr| attr.args.clone())
             .collect()
     }
@@ -1640,7 +1643,7 @@ impl<'a> NameResolver<'a> {
 
     fn collect_function_signature(
         &mut self,
-        name: &str,
+        name: Symbol,
         params: &[Param],
         return_type: &Type,
         type_params: &[TypeParam],
@@ -1702,7 +1705,7 @@ impl<'a> NameResolver<'a> {
     /// `&self` desugars to `Self` which resolve_type_expr cannot handle.
     fn resolve_self_in_type(&self, ty: &Type, self_ty: &Type) -> Type {
         match ty {
-            Type::Path(p, s) if p.len() == 1 && (p[0] == "Self" || p[0] == "self") => {
+            Type::Path(p, s) if p.len() == 1 && (p[0].eq_str("Self") || p[0].eq_str("self")) => {
                 self_ty.clone()
             }
             Type::Reference {
@@ -1785,44 +1788,45 @@ impl<'a> NameResolver<'a> {
     ///   `from path::to import { a, b };`   → each item by explicit name
     fn resolve_import_path(
         &mut self,
-        path: &[String],
-        items: &Option<Vec<String>>,
-        alias: &Option<String>,
+        path: &[Symbol],
+        items: &Option<Vec<Symbol>>,
+        alias: &Option<Symbol>,
         span: Span,
     ) -> Result<(), Diagnostic> {
-        let import_name = alias.as_ref().or_else(|| path.last()).cloned();
+        let import_name = alias.as_ref().or_else(|| path.last()).copied();
 
         // First try to resolve as a type.
         if let Some(def_id) = self.symbols.lookup_type_by_path(path) {
             if let Some(name) = &import_name {
                 self.resolution_map
                     .type_def_ids
-                    .insert(name.clone(), def_id);
+                    .insert(*name, def_id);
                 if let Some(binding) = self.symbols.lookup_type_by_def_id(def_id).cloned() {
-                    self.symbols.insert_type(name.clone(), binding, span).ok();
+                    self.symbols.insert_type(*name, binding, span).ok();
                 }
                 // Register the import's original full path for re-export resolution.
-                let full_path = path.join("::");
+                let full_path = Symbol::intern(&path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"));
                 self.symbols.register_full_path(full_path, def_id);
             }
             // `from path import { items }`
             if let Some(item_list) = items {
                 for item in item_list {
-                    let item_path = [item.clone()];
+                    let item_path = [*item];
                     if let Some(item_def_id) = self.symbols.lookup_type_by_path(&item_path) {
                         self.resolution_map
                             .type_def_ids
-                            .insert(item.clone(), item_def_id);
+                            .insert(*item, item_def_id);
                         if let Some(binding) =
                             self.symbols.lookup_type_by_def_id(item_def_id).cloned()
                         {
-                            self.symbols.insert_type(item.clone(), binding, span).ok();
+                            self.symbols.insert_type(*item, binding, span).ok();
                         }
                         // Register the full path: path::to::item
                         let mut full_item_path = path.to_vec();
-                        full_item_path.push(item.clone());
+                        full_item_path.push(*item);
+                        let full_item_str = Symbol::intern(&full_item_path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"));
                         self.symbols
-                            .register_full_path(full_item_path.join("::"), item_def_id);
+                            .register_full_path(full_item_str, item_def_id);
                     }
                 }
             }
@@ -1834,19 +1838,19 @@ impl<'a> NameResolver<'a> {
             if let Some(trait_binding) = self.symbols.lookup_trait_by_def_id(trait_def_id).cloned() {
                 if let Some(name) = &import_name {
                     self.symbols
-                        .insert_trait(name.clone(), trait_binding, span)
+                        .insert_trait(*name, trait_binding, span)
                         .ok();
                 }
                 // `from path import { items }` — also import traits
                 if let Some(item_list) = items {
                     for item in item_list {
-                        let item_path = [item.clone()];
+                        let item_path = [*item];
                         if let Some(item_def_id) = self.symbols.lookup_trait_by_path(&item_path) {
                             if let Some(item_binding) =
                                 self.symbols.lookup_trait_by_def_id(item_def_id).cloned()
                             {
                                 self.symbols
-                                    .insert_trait(item.clone(), item_binding, span)
+                                    .insert_trait(*item, item_binding, span)
                                     .ok();
                             }
                         }
@@ -1859,11 +1863,11 @@ impl<'a> NameResolver<'a> {
         // Try as a function — single-segment only for now;
         // multi-segment function imports require module hierarchy support.
         if path.len() == 1 {
-            if let Some(func_binding) = self.symbols.lookup_function(&path[0]).cloned() {
+            if let Some(func_binding) = self.symbols.lookup_function(path[0]).cloned() {
                 if let Some(name) = &import_name {
                     if let Err(diag) =
                         self.symbols
-                            .insert_function(name.clone(), func_binding, span)
+                            .insert_function(*name, func_binding, span)
                     {
                         self.diagnostics.push(diag);
                     }
@@ -1873,7 +1877,7 @@ impl<'a> NameResolver<'a> {
         }
 
         Err(
-            Diagnostic::error(format!("cannot resolve import `{}`", path.join("::"),))
+            Diagnostic::error(format!("cannot resolve import `{}`", path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),))
                 .with_span(span),
         )
     }
@@ -1916,7 +1920,7 @@ mod tests {
         let result = resolve_source("def main() -> Int<32> { return 0; }");
         assert!(result.is_ok(), "function def: {:?}", result.err());
         let (symbols, _, _, _) = result.unwrap();
-        let func = symbols.lookup_function("main");
+        let func = symbols.lookup_function(Symbol::intern("main"));
         assert!(func.is_some(), "main should be registered");
     }
 
@@ -1925,7 +1929,7 @@ mod tests {
         let result = resolve_source("type Point = struct { x: Int<32>, y: Int<32> }");
         assert!(result.is_ok(), "struct type: {:?}", result.err());
         let (symbols, _, _, _) = result.unwrap();
-        let binding = symbols.lookup_type("Point");
+        let binding = symbols.lookup_type(Symbol::intern("Point"));
         assert!(binding.is_some(), "Point should be registered");
         if let Some(b) = binding {
             assert_eq!(b.fields.len(), 2, "Point should have 2 fields");
@@ -1934,14 +1938,14 @@ mod tests {
 
     #[test]
     fn test_resolve_type_def_enum() {
-        let result = resolve_source("type Option<T> = enum { None, Some(T) }");
+        let result = resolve_source("type MyOption<T> = enum { None, Some(T) }");
         assert!(result.is_ok(), "enum type: {:?}", result.err());
         let (symbols, _, _, _) = result.unwrap();
-        let binding = symbols.lookup_type("Option");
-        assert!(binding.is_some(), "Option should be registered");
+        let binding = symbols.lookup_type(Symbol::intern("MyOption"));
+        assert!(binding.is_some(), "MyOption should be registered");
         if let Some(b) = binding {
-            assert_eq!(b.params.len(), 1, "Option should have 1 type param");
-            assert_eq!(b.variants.len(), 2, "Option should have 2 variants");
+            assert_eq!(b.params.len(), 1, "MyOption should have 1 type param");
+            assert_eq!(b.variants.len(), 2, "MyOption should have 2 variants");
         }
     }
 
@@ -1950,7 +1954,7 @@ mod tests {
         let result = resolve_source("type MyInt = Int<32>");
         assert!(result.is_ok(), "type alias: {:?}", result.err());
         let (symbols, _, _, _) = result.unwrap();
-        let binding = symbols.lookup_type("MyInt");
+        let binding = symbols.lookup_type(Symbol::intern("MyInt"));
         assert!(binding.is_some(), "MyInt should be registered");
         assert!(binding.unwrap().alias_ast.is_some(), "MyInt should have an alias AST");
     }
@@ -1974,7 +1978,7 @@ mod tests {
         );
         assert!(result.is_ok(), "transparent: {:?}", result.err());
         let (symbols, _, _, _) = result.unwrap();
-        let binding = symbols.lookup_type("Wrapper");
+        let binding = symbols.lookup_type(Symbol::intern("Wrapper"));
         assert!(binding.unwrap().transparent, "Wrapper should be transparent");
     }
 
@@ -1986,7 +1990,7 @@ mod tests {
         );
         assert!(result.is_ok(), "layout(C): {:?}", result.err());
         let (symbols, _, _, _) = result.unwrap();
-        let binding = symbols.lookup_type("CStruct");
+        let binding = symbols.lookup_type(Symbol::intern("CStruct"));
         assert!(binding.unwrap().c_layout, "CStruct should have c_layout");
     }
 
@@ -1995,7 +1999,7 @@ mod tests {
         let result = resolve_source("def id<T>(x: T) -> T { return x; }");
         assert!(result.is_ok(), "generic function: {:?}", result.err());
         let (symbols, _, _, _) = result.unwrap();
-        let func = symbols.lookup_function("id");
+        let func = symbols.lookup_function(Symbol::intern("id"));
         assert!(func.is_some(), "id should be registered");
         assert!(!func.unwrap().signature.type_params.is_empty(), "id should have type params");
     }

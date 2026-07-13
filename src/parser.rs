@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
+use crate::symbol::Symbol;
 use crate::lexer::Token;
 
 /// Whether parser recovery is allowed at a given call site (rustc-style).
@@ -410,113 +411,113 @@ impl Parser {
         result
     }
 
-    fn keyword_to_ident(&self, tok: &Token) -> Option<String> {
+    fn keyword_to_ident(&self, tok: &Token) -> Option<Symbol> {
         match tok {
-            Token::Def => Some("def".into()),
-            Token::Set => Some("set".into()),
-            Token::Type => Some("type".into()),
-            Token::With => Some("with".into()),
-            Token::Default => Some("default".into()),
-            Token::Return => Some("return".into()),
-            Token::If => Some("if".into()),
-            Token::Else => Some("else".into()),
-            Token::For => Some("for".into()),
-            Token::In => Some("in".into()),
-            Token::While => Some("while".into()),
-            Token::Loop => Some("loop".into()),
-            Token::Leave => Some("leave".into()),
-            Token::Continue => Some("continue".into()),
-            Token::Comptime => Some("comptime".into()),
-            Token::Generate => Some("generate".into()),
-            Token::Import => Some("import".into()),
-            Token::From => Some("from".into()),
-            Token::As => Some("as".into()),
-            Token::True => Some("true".into()),
-            Token::False => Some("false".into()),
-            Token::Auto => Some("auto".into()),
-            Token::And => Some("and".into()),
-            Token::Or => Some("or".into()),
-            Token::Not => Some("not".into()),
-            Token::Sizeof => Some("sizeof".into()),
-            Token::Alignof => Some("alignof".into()),
-            Token::Catch => Some("catch".into()),
-            Token::Panic => Some("panic".into()),
-            Token::Unsafe => Some("unsafe".into()),
-            Token::Let => Some("let".into()),
-            Token::Finally => Some("finally".into()),
-            Token::Where => Some("where".into()),
-            Token::Requires => Some("requires".into()),
-            Token::Ensures => Some("ensures".into()),
-            Token::Invariant => Some("invariant".into()),
-            Token::Constraint => Some("constraint".into()),
-            Token::Move => Some("move".into()),
-            Token::Dyn => Some("dyn".into()),
-            Token::By => Some("by".into()),
-            Token::Copy => Some("copy".into()),
-            Token::Ref => Some("ref".into()),
-            Token::Mut => Some("mut".into()),
-            Token::Wrap => Some("wrap".into()),
-            Token::Saturate => Some("saturate".into()),
-            Token::Trap => Some("trap".into()),
-            Token::SelfKw => Some("Self".into()),
-            Token::NoDefault => Some("no_default".into()),
-            Token::Extern => Some("extern".into()),
-            Token::Pub => Some("pub".into()),
-            Token::Edition => Some("edition".into()),
-            Token::Deprecated => Some("deprecated".into()),
-            Token::Experimental => Some("experimental".into()),
-            Token::Endian => Some("endian".into()),
-            Token::BitOrder => Some("bit_order".into()),
-            Token::Align => Some("align".into()),
-            Token::Pad => Some("pad".into()),
-            Token::Packed => Some("packed".into()),
-            Token::Async => Some("async".into()),
-            Token::Await => Some("await".into()),
-            Token::Task => Some("task".into()),
-            Token::Channel => Some("channel".into()),
-            Token::Linear => Some("linear".into()),
-            Token::Consume => Some("consume".into()),
-            Token::Pure => Some("pure".into()),
-            Token::Io => Some("io".into()),
-            Token::Trusted => Some("trusted".into()),
-            Token::Ghost => Some("ghost".into()),
-            Token::ScopeCleanup => Some("scope_cleanup".into()),
-            Token::Trigger => Some("trigger".into()),
-            Token::Validate => Some("validate".into()),
-            Token::MissingMatch => Some("missing_match".into()),
-            Token::ApplyLemma => Some("apply_lemma".into()),
-            Token::Layout => Some("layout".into()),
-            Token::Exists => Some("exists".into()),
-            Token::Forall => Some("forall".into()),
-            Token::On => Some("on".into()),
-            Token::OnTimeout => Some("on_timeout".into()),
-            Token::OnCancel => Some("on_cancel".into()),
-            Token::Trait => Some("trait".into()),
-            Token::Impl => Some("impl".into()),
-            Token::Decreases => Some("decreases".into()),
-            Token::Terminates => Some("terminates".into()),
-            Token::Cfg => Some("cfg".into()),
-            Token::Isolate => Some("isolate".into()),
-            Token::Hint => Some("hint".into()),
-            Token::MustUse => Some("must_use".into()),
-            Token::MustHandle => Some("must_handle".into()),
-            Token::LinkProof => Some("link_proof".into()),
-            Token::Exhaustive => Some("exhaustive".into()),
-            Token::NoAllocError => Some("no_alloc_error".into()),
-            Token::NoPanic => Some("no_panic".into()),
-            Token::DebugInfo => Some("debug_info".into()),
-            Token::Old => Some("old".into()),
-            Token::AuditLog => Some("audit_log".into()),
-            Token::Interrupt => Some("interrupt".into()),
-            Token::Match => Some("match".into()),
-            Token::Round => Some("round".into()),
-            Token::Trunc => Some("trunc".into()),
-            Token::Ceil => Some("ceil".into()),
-            Token::Floor => Some("floor".into()),
-            Token::Poly => Some("poly".into()),
-            Token::Unbox => Some("unbox".into()),
-            Token::Propagates => Some("propagates".into()),
-            Token::Overrides => Some("overrides".into()),
+            Token::Def => Some(Symbol::intern("def")),
+            Token::Set => Some(Symbol::intern("set")),
+            Token::Type => Some(Symbol::intern("type")),
+            Token::With => Some(Symbol::intern("with")),
+            Token::Default => Some(Symbol::intern("default")),
+            Token::Return => Some(Symbol::intern("return")),
+            Token::If => Some(Symbol::intern("if")),
+            Token::Else => Some(Symbol::intern("else")),
+            Token::For => Some(Symbol::intern("for")),
+            Token::In => Some(Symbol::intern("in")),
+            Token::While => Some(Symbol::intern("while")),
+            Token::Loop => Some(Symbol::intern("loop")),
+            Token::Leave => Some(Symbol::intern("leave")),
+            Token::Continue => Some(Symbol::intern("continue")),
+            Token::Comptime => Some(Symbol::intern("comptime")),
+            Token::Generate => Some(Symbol::intern("generate")),
+            Token::Import => Some(Symbol::intern("import")),
+            Token::From => Some(Symbol::intern("from")),
+            Token::As => Some(Symbol::intern("as")),
+            Token::True => Some(Symbol::intern("true")),
+            Token::False => Some(Symbol::intern("false")),
+            Token::Auto => Some(Symbol::intern("auto")),
+            Token::And => Some(Symbol::intern("and")),
+            Token::Or => Some(Symbol::intern("or")),
+            Token::Not => Some(Symbol::intern("not")),
+            Token::Sizeof => Some(Symbol::intern("sizeof")),
+            Token::Alignof => Some(Symbol::intern("alignof")),
+            Token::Catch => Some(Symbol::intern("catch")),
+            Token::Panic => Some(Symbol::intern("panic")),
+            Token::Unsafe => Some(Symbol::intern("unsafe")),
+            Token::Let => Some(Symbol::intern("let")),
+            Token::Finally => Some(Symbol::intern("finally")),
+            Token::Where => Some(Symbol::intern("where")),
+            Token::Requires => Some(Symbol::intern("requires")),
+            Token::Ensures => Some(Symbol::intern("ensures")),
+            Token::Invariant => Some(Symbol::intern("invariant")),
+            Token::Constraint => Some(Symbol::intern("constraint")),
+            Token::Move => Some(Symbol::intern("move")),
+            Token::Dyn => Some(Symbol::intern("dyn")),
+            Token::By => Some(Symbol::intern("by")),
+            Token::Copy => Some(Symbol::intern("copy")),
+            Token::Ref => Some(Symbol::intern("ref")),
+            Token::Mut => Some(Symbol::intern("mut")),
+            Token::Wrap => Some(Symbol::intern("wrap")),
+            Token::Saturate => Some(Symbol::intern("saturate")),
+            Token::Trap => Some(Symbol::intern("trap")),
+            Token::SelfKw => Some(Symbol::intern("Self")),
+            Token::NoDefault => Some(Symbol::intern("no_default")),
+            Token::Extern => Some(Symbol::intern("extern")),
+            Token::Pub => Some(Symbol::intern("pub")),
+            Token::Edition => Some(Symbol::intern("edition")),
+            Token::Deprecated => Some(Symbol::intern("deprecated")),
+            Token::Experimental => Some(Symbol::intern("experimental")),
+            Token::Endian => Some(Symbol::intern("endian")),
+            Token::BitOrder => Some(Symbol::intern("bit_order")),
+            Token::Align => Some(Symbol::intern("align")),
+            Token::Pad => Some(Symbol::intern("pad")),
+            Token::Packed => Some(Symbol::intern("packed")),
+            Token::Async => Some(Symbol::intern("async")),
+            Token::Await => Some(Symbol::intern("await")),
+            Token::Task => Some(Symbol::intern("task")),
+            Token::Channel => Some(Symbol::intern("channel")),
+            Token::Linear => Some(Symbol::intern("linear")),
+            Token::Consume => Some(Symbol::intern("consume")),
+            Token::Pure => Some(Symbol::intern("pure")),
+            Token::Io => Some(Symbol::intern("io")),
+            Token::Trusted => Some(Symbol::intern("trusted")),
+            Token::Ghost => Some(Symbol::intern("ghost")),
+            Token::ScopeCleanup => Some(Symbol::intern("scope_cleanup")),
+            Token::Trigger => Some(Symbol::intern("trigger")),
+            Token::Validate => Some(Symbol::intern("validate")),
+            Token::MissingMatch => Some(Symbol::intern("missing_match")),
+            Token::ApplyLemma => Some(Symbol::intern("apply_lemma")),
+            Token::Layout => Some(Symbol::intern("layout")),
+            Token::Exists => Some(Symbol::intern("exists")),
+            Token::Forall => Some(Symbol::intern("forall")),
+            Token::On => Some(Symbol::intern("on")),
+            Token::OnTimeout => Some(Symbol::intern("on_timeout")),
+            Token::OnCancel => Some(Symbol::intern("on_cancel")),
+            Token::Trait => Some(Symbol::intern("trait")),
+            Token::Impl => Some(Symbol::intern("impl")),
+            Token::Decreases => Some(Symbol::intern("decreases")),
+            Token::Terminates => Some(Symbol::intern("terminates")),
+            Token::Cfg => Some(Symbol::intern("cfg")),
+            Token::Isolate => Some(Symbol::intern("isolate")),
+            Token::Hint => Some(Symbol::intern("hint")),
+            Token::MustUse => Some(Symbol::intern("must_use")),
+            Token::MustHandle => Some(Symbol::intern("must_handle")),
+            Token::LinkProof => Some(Symbol::intern("link_proof")),
+            Token::Exhaustive => Some(Symbol::intern("exhaustive")),
+            Token::NoAllocError => Some(Symbol::intern("no_alloc_error")),
+            Token::NoPanic => Some(Symbol::intern("no_panic")),
+            Token::DebugInfo => Some(Symbol::intern("debug_info")),
+            Token::Old => Some(Symbol::intern("old")),
+            Token::AuditLog => Some(Symbol::intern("audit_log")),
+            Token::Interrupt => Some(Symbol::intern("interrupt")),
+            Token::Match => Some(Symbol::intern("match")),
+            Token::Round => Some(Symbol::intern("round")),
+            Token::Trunc => Some(Symbol::intern("trunc")),
+            Token::Ceil => Some(Symbol::intern("ceil")),
+            Token::Floor => Some(Symbol::intern("floor")),
+            Token::Poly => Some(Symbol::intern("poly")),
+            Token::Unbox => Some(Symbol::intern("unbox")),
+            Token::Propagates => Some(Symbol::intern("propagates")),
+            Token::Overrides => Some(Symbol::intern("overrides")),
             _ => None,
         }
     }
@@ -645,7 +646,7 @@ impl Parser {
                     .with_span(self.span(),);
                 // "Did you mean?" for common keyword typos (Rust-style)
                 if let Some(Token::Ident(name)) = &tok {
-                    if let Some(suggestion) = did_you_mean_keyword(name) {
+                    if let Some(suggestion) = did_you_mean_keyword(&name.as_str()) {
                         diag = diag.with_suggestion(suggestion);
                     } else {
                         diag = diag.with_suggestion("move this token inside a function body, or start a new top-level declaration");
@@ -672,7 +673,7 @@ impl Parser {
             Ok(Token::Ident(name)) => name,
             Ok(tok) => self
                 .keyword_to_ident(&tok)
-                .unwrap_or_else(|| format!("{:?}", tok)),
+                .unwrap_or_else(|| Symbol::intern(&format!("{:?}", tok))),
             Err(()) => {
                 return Err(Diagnostic::error("unexpected end of file in attribute")
                     .with_code_str("E002")
@@ -913,7 +914,7 @@ impl Parser {
                                     let param = self.parse_self_param()?;
                                     params.push(param);
                                 }
-                                Ok(Token::Ident(s)) if s == "self" || s == "Self" => {
+                                Ok(Token::Ident(s)) if s.eq_str("self") || s.eq_str("Self") => {
                                     let param = self.parse_self_param()?;
                                     params.push(param);
                                 }
@@ -1006,7 +1007,7 @@ impl Parser {
             let (name, is_lifetime) = if matches!(self.peek(), Ok(Token::Apostrophe)) {
                 self.advance().ok();
                 match self.advance() {
-                    Ok(Token::Ident(name)) => (format!("'{}", name), true),
+                    Ok(Token::Ident(name)) => (Symbol::intern(&format!("'{}", name)), true),
                     _ => {
                         return Err(Diagnostic::error("expected lifetime name after `'`")
                             .with_code_str("E004")
@@ -1190,7 +1191,7 @@ impl Parser {
                     Ok(Token::On) => {
                         self.advance().ok();
                         match self.peek() {
-                            Ok(Token::Ident(s)) if s == "Ok" => {
+                            Ok(Token::Ident(s)) if s.eq_str("Ok") => {
                                 self.advance().ok();
                                 self.expect(Token::LParen)?;
                                 let pat = if !matches!(self.peek(), Ok(Token::RParen)) {
@@ -1210,7 +1211,7 @@ impl Parser {
                                 }
                                 target = EnsuresTarget::OnOk(pat);
                             }
-                            Ok(Token::Ident(s)) if s == "Err" => {
+                            Ok(Token::Ident(s)) if s.eq_str("Err") => {
                                 self.advance().ok();
                                 self.expect(Token::LParen)?;
                                 let pat = if !matches!(self.peek(), Ok(Token::RParen)) {
@@ -1444,7 +1445,7 @@ impl Parser {
             Ok(Token::Type) => {
                 self.advance().ok();
                 let end = self.span().end;
-                Ok(Type::Path(vec!["type".to_string()], Span::new(start, end)))
+                Ok(Type::Path(vec![Symbol::intern("type")], Span::new(start, end)))
             }
             _ => match self.advance() {
                 Ok(Token::Ident(name)) => {
@@ -1643,7 +1644,7 @@ impl Parser {
                     match self.advance() {
                         Ok(Token::Ident(name)) => {
                             let end = self.span().end;
-                            Ok(Type::Path(vec![format!("'{}", name)], Span::new(start, end)))
+                            Ok(Type::Path(vec![Symbol::intern(&format!("'{}", name))], Span::new(start, end)))
                         }
                         _ => Err(Diagnostic::error("expected lifetime name after `'`")
                             .with_code_str("E004")
@@ -1885,7 +1886,7 @@ impl Parser {
         let start = self.span().start;
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
-            Ok(tok) => self.keyword_to_ident(&tok).unwrap_or_else(|| format!("{:?}", tok)),
+            Ok(tok) => self.keyword_to_ident(&tok).unwrap_or_else(|| Symbol::intern(&format!("{:?}", tok))),
             Err(()) => return Err(Diagnostic::error("unexpected end of file in layout definition")
                 .with_code_str("E002")
                 .with_span(self.span())),
@@ -1905,7 +1906,7 @@ impl Parser {
             // Expect an identifier naming a built-in layout attribute.
             let attr_name = match self.advance() {
                 Ok(Token::Ident(name)) => name,
-                Ok(tok) => self.keyword_to_ident(&tok).unwrap_or_else(|| format!("{:?}", tok)),
+                Ok(tok) => self.keyword_to_ident(&tok).unwrap_or_else(|| Symbol::intern(&format!("{:?}", tok))),
                 Err(()) => break,
             };
             // Check for parenthesized arguments, e.g. `bit_order(lsb_to_msb)`.
@@ -1914,8 +1915,8 @@ impl Parser {
                 self.advance().ok();
                 let arg_name = match self.advance() {
                     Ok(Token::Ident(name)) => name,
-                    Ok(tok) => self.keyword_to_ident(&tok).unwrap_or_else(|| format!("{:?}", tok)),
-                    Err(()) => String::new(),
+                    Ok(tok) => self.keyword_to_ident(&tok).unwrap_or_else(|| Symbol::intern(&format!("{:?}", tok))),
+                    Err(()) => Symbol::INVALID,
                 };
                 args.push(crate::ast::Expr::Ident(arg_name, self.span()));
                 self.expect(Token::RParen)?;
@@ -1965,7 +1966,7 @@ impl Parser {
                     Some(Token::LBrace) | Some(Token::LParen) | Some(Token::ColonColon)
                 );
                 if !next_is_pattern
-                    && (s == "_" || s.chars().next().map_or(false, |c| c.is_alphabetic()))
+                    && (s.eq_str("_") || s.as_str().chars().next().map_or(false, |c| c.is_alphabetic()))
                 {
                     let ident = s;
                     self.advance().ok();
@@ -1979,7 +1980,7 @@ impl Parser {
         } else {
             let ident = match self.advance() {
                 Ok(Token::Ident(name)) => name,
-                Ok(Token::Auto) => "auto".to_string(),
+                Ok(Token::Auto) => Symbol::intern("auto"),
                 Ok(tok) => {
                     return Err(Diagnostic::error(format!(
                         "expected variable name, found {:?}",
@@ -2015,7 +2016,7 @@ impl Parser {
         // Parse `<T>` BEFORE the `= expr` part so the value expression parser
         // sees the `=` as the next meaningful token.
         let type_captures = if let Some(ref name_str) = name {
-            if name_str == "auto" && matches!(self.peek(), Ok(Token::Lt)) {
+            if name_str.eq_str("auto") && matches!(self.peek(), Ok(Token::Lt)) {
                 self.parse_type_capture_params()?
             } else {
                 Vec::new()
@@ -2716,65 +2717,63 @@ impl Parser {
         };
         self.expect(Token::Assign)?;
         let mut ty = if let Ok(Token::Ident(s)) = self.peek().clone() {
-            match s.as_str() {
-                "struct" => {
-                    self.advance().ok();
-                    self.expect(Token::LBrace)?;
-                    let mut fields = Vec::new();
-                    loop {
-                        if matches!(self.peek(), Ok(Token::RBrace)) {
-                            self.advance().ok();
-                            break;
-                        }
-                        let field_name = match self.advance() {
-                            Ok(Token::Ident(n)) => n,
-                            _ => {
-                                return Err(Diagnostic::error("expected field name")
-                                    .with_code_str("E004")
-                                    .with_help(
-                                        "struct fields must have a name — e.g. `name: String`",
-                                    )
-                                    .with_suggestion(
-                                        "add a field name like `name`, `age`, or `value`",
-                                    )
-                                    .with_span(self.span()));
-                            }
-                        };
-                        self.expect(Token::Colon)?;
-                        let field_ty = self.parse_type()?;
-                        let default = if matches!(self.peek(), Ok(Token::Assign)) {
-                            self.advance().ok();
-                            Some(self.parse_expr()?)
-                        } else {
-                            None
-                        };
-                        fields.push(StructField {
-                            name: field_name,
-                            ty: field_ty,
-                            default,
-                            span: Span::new(start, self.span().end),
-                        });
-                        if matches!(self.peek(), Ok(Token::Comma)) {
-                            self.advance().ok();
-                        } else {
-                            self.expect(Token::RBrace)?;
-                            break;
-                        }
+            if s.eq_str("struct") {
+                self.advance().ok();
+                self.expect(Token::LBrace)?;
+                let mut fields = Vec::new();
+                loop {
+                    if matches!(self.peek(), Ok(Token::RBrace)) {
+                        self.advance().ok();
+                        break;
                     }
-                    let definition = TypeDefinition::Struct(fields, self.parse_type_modifiers()?);
-                    let end = self.span().end;
-                    return Ok(Stmt::TypeDef {
-                        span: Span::new(start, end),
-                        attributes,
-                        doc,
-                        name,
-                        params,
-                        definition,
-                        contracts: Vec::new(),
+                    let field_name = match self.advance() {
+                        Ok(Token::Ident(n)) => n,
+                        _ => {
+                            return Err(Diagnostic::error("expected field name")
+                                .with_code_str("E004")
+                                .with_help(
+                                    "struct fields must have a name — e.g. `name: String`",
+                                )
+                                .with_suggestion(
+                                    "add a field name like `name`, `age`, or `value`",
+                                )
+                                .with_span(self.span()));
+                        }
+                    };
+                    self.expect(Token::Colon)?;
+                    let field_ty = self.parse_type()?;
+                    let default = if matches!(self.peek(), Ok(Token::Assign)) {
+                        self.advance().ok();
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    fields.push(StructField {
+                        name: field_name,
+                        ty: field_ty,
+                        default,
+                        span: Span::new(start, self.span().end),
                     });
+                    if matches!(self.peek(), Ok(Token::Comma)) {
+                        self.advance().ok();
+                    } else {
+                        self.expect(Token::RBrace)?;
+                        break;
+                    }
                 }
-                "enum" => {
-                    self.advance().ok();
+                let definition = TypeDefinition::Struct(fields, self.parse_type_modifiers()?);
+                let end = self.span().end;
+                return Ok(Stmt::TypeDef {
+                    span: Span::new(start, end),
+                    attributes,
+                    doc,
+                    name,
+                    params,
+                    definition,
+                    contracts: Vec::new(),
+                });
+            } else if s.eq_str("enum") {
+                self.advance().ok();
                     self.expect(Token::LBrace)?;
                     let mut variants = Vec::new();
                     loop {
@@ -2853,10 +2852,9 @@ impl Parser {
                         contracts: Vec::new(),
                     });
                 }
-                _ => {
-                    let ty = self.parse_type()?;
-                    ty
-                }
+            else {
+                let ty = self.parse_type()?;
+                ty
             }
         } else {
             let ty = self.parse_type()?;
@@ -2913,7 +2911,7 @@ impl Parser {
                         .with_help("expected a type modifier name (`overflow`, `validate`, `default`, `no_default`) after `with`")
                         .with_span(Span::new(0, 0)))?;
                     match tok {
-                        Token::Ident(ref s) if s.as_str() == "overflow" => {
+                        Token::Ident(ref s) if s.eq_str("overflow") => {
                             self.expect(Token::Assign)?;
                             let policy = match self.advance() {
                                 Ok(Token::Wrap) => OverflowPolicy::Wrap,
@@ -2932,7 +2930,7 @@ impl Parser {
                                 self.advance().ok();
                             }
                         }
-                        Token::Ident(ref s) if s.as_str() == "validate" => {
+                        Token::Ident(ref s) if s.eq_str("validate") => {
                             self.expect(Token::Assign)?;
                             let closure = self.parse_closure(self.span().start)?;
                             modifiers.push(TypeModifier::Validate(closure));
@@ -3102,7 +3100,7 @@ impl Parser {
                     let param = self.parse_self_param()?;
                     params.push(param);
                 }
-                Ok(Token::Ident(s)) if s == "self" || s == "Self" => {
+                Ok(Token::Ident(s)) if s.eq_str("self") || s.eq_str("Self") => {
                     let param = self.parse_self_param()?;
                     params.push(param);
                 }
@@ -3156,7 +3154,7 @@ impl Parser {
             false
         };
         match self.advance() {
-            Ok(Token::Ident(s)) if s == "self" => {
+            Ok(Token::Ident(s)) if s.eq_str("self") => {
                 let end = self.span().end;
                 let ty: Type = if has_ampersand {
                     Type::Reference {
@@ -3247,7 +3245,7 @@ impl Parser {
                     Span::new(start, self.span().end),
                 ))
             }
-            Token::Ident(s) if s == "_" => {
+            Token::Ident(s) if s.eq_str("_") => {
                 self.advance().ok();
                 Ok(Pattern::Wildcard(Span::new(start, self.span().end)))
             }
@@ -3568,11 +3566,11 @@ impl Parser {
                         .with_help("expected an expression after the operator position")
                         .with_span(Span::new(0, 0)))?;
                     let op_name = match op_tok {
-                        Token::Plus => "+".to_string(),
-                        Token::Minus => "-".to_string(),
-                        Token::Star => "*".to_string(),
-                        Token::Slash => "/".to_string(),
-                        Token::Percent => "%".to_string(),
+                        Token::Plus => Symbol::intern("+"),
+                        Token::Minus => Symbol::intern("-"),
+                        Token::Star => Symbol::intern("*"),
+                        Token::Slash => Symbol::intern("/"),
+                        Token::Percent => Symbol::intern("%"),
                         _ => unreachable!(),
                     };
                     let end = self.span().end;
@@ -3849,7 +3847,7 @@ impl Parser {
                     Err(()) => return Err(Diagnostic::error("unexpected end of input after `@`")
                         .with_span(self.span())),
                 };
-                if name == "typeInfo" {
+                if name.eq_str("typeInfo") {
                     self.expect(Token::Bang)?;
                     self.expect(Token::LParen)?;
                     let ty = self.parse_type()?;
@@ -4012,7 +4010,7 @@ impl Parser {
         }
     }
 
-    fn parse_struct_lit(&mut self, path: Vec<String>, start: usize) -> Result<Expr, Diagnostic> {
+    fn parse_struct_lit(&mut self, path: Vec<Symbol>, start: usize) -> Result<Expr, Diagnostic> {
         self.expect(Token::LBrace)?;
         let mut fields = Vec::new();
         loop {
@@ -4061,8 +4059,8 @@ impl Parser {
 
     fn parse_enum_lit(
         &mut self,
-        path: Vec<String>,
-        variant: String,
+        path: Vec<Symbol>,
+        variant: Symbol,
         start: usize,
     ) -> Result<Expr, Diagnostic> {
         self.expect(Token::LParen)?;
@@ -4718,7 +4716,7 @@ mod tests {
             Stmt::FunctionDef {
                 name, params, body, ..
             } => {
-                assert_eq!(name, "main");
+                assert!(name.eq_str("main"));
                 assert!(params.is_empty());
                 assert!(body.as_ref().map_or(false, |b| b.is_empty()));
             }
@@ -4731,7 +4729,7 @@ mod tests {
         let program = check_parse("def main() { set x = 42; }");
         match &program.items[0] {
             Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
-                Stmt::VariableDef { name, .. } => assert_eq!(name.as_ref().unwrap(), "x"),
+                Stmt::VariableDef { name, .. } => assert!(name.unwrap().eq_str("x")),
                 _ => panic!("expected VariableDef"),
             },
             _ => panic!("expected FunctionDef"),
@@ -4761,7 +4759,7 @@ mod tests {
                     overrides,
                     ..
                 } => {
-                    assert_eq!(name, "close_file");
+                    assert!(name.eq_str("close_file"));
                     assert!(!propagates);
                     assert!(!overrides);
                 }
@@ -4923,7 +4921,7 @@ mod tests {
                 is_comptime, name, ..
             } => {
                 assert!(is_comptime);
-                assert_eq!(name, "eval");
+                assert!(name.eq_str("eval"));
             }
             _ => panic!("expected FunctionDef"),
         }
@@ -4936,7 +4934,7 @@ mod tests {
         match &program.items[0] {
             Stmt::FunctionDef { is_async, name, .. } => {
                 assert!(is_async);
-                assert_eq!(name, "fetch");
+                assert!(name.eq_str("fetch"));
             }
             _ => panic!("expected FunctionDef"),
         }
@@ -4954,7 +4952,7 @@ mod tests {
                 associated_types,
                 ..
             } => {
-                assert_eq!(name, "Show");
+                assert!(name.eq_str("Show"));
                 assert_eq!(methods.len(), 1);
                 assert_eq!(associated_types.len(), 1);
             }
@@ -4969,7 +4967,7 @@ mod tests {
         assert_eq!(program.items.len(), 1);
         match &program.items[0] {
             Stmt::Constraint { name, bounds, .. } => {
-                assert_eq!(name, "MyConstraint");
+                assert!(name.eq_str("MyConstraint"));
                 assert_eq!(bounds.len(), 2);
             }
             _ => panic!("expected Constraint"),
@@ -5053,7 +5051,7 @@ mod tests {
         match &program.items[0] {
             Stmt::FunctionDef { attributes, .. } => {
                 assert_eq!(attributes.len(), 1);
-                assert_eq!(attributes[0].name, "deprecated");
+                assert!(attributes[0].name.eq_str("deprecated"));
             }
             _ => panic!("expected FunctionDef"),
         }
@@ -5066,7 +5064,7 @@ mod tests {
         match &program.items[0] {
             Stmt::FunctionDef { attributes, .. } => {
                 assert_eq!(attributes.len(), 1);
-                assert_eq!(attributes[0].name, "cfg");
+                assert!(attributes[0].name.eq_str("cfg"));
             }
             _ => panic!("expected FunctionDef"),
         }
@@ -5243,7 +5241,7 @@ mod tests {
         let program = check_parse(src);
         match &program.items[0] {
             Stmt::FunctionDef { return_type, .. } => {
-                assert!(matches!(return_type, Type::Path(path, _) if path == &["type"]));
+                assert!(matches!(return_type, Type::Path(path, _) if path.len() == 1 && path[0].eq_str("type")));
             }
             _ => panic!("expected FunctionDef"),
         }
@@ -5287,7 +5285,7 @@ mod tests {
         let program = check_parse("def main() { trigger @close_file; }");
         match &program.items[0] {
             Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
-                Stmt::Trigger { name, .. } => assert_eq!(name, "close_file"),
+                Stmt::Trigger { name, .. } => assert!(name.eq_str("close_file")),
                 _ => panic!("expected Trigger"),
             },
             _ => panic!("expected FunctionDef"),
@@ -5341,7 +5339,7 @@ mod tests {
                     ..
                 } => {
                     assert!(matches!(**expr, Expr::Literal(Literal::Int(1), _)));
-                    assert!(matches!(**ty, Type::Path(ref path, _) if path == &["PositiveInt"]));
+                    assert!(matches!(**ty, Type::Path(ref path, _) if path.len() == 1 && path[0].eq_str("PositiveInt")));
                 }
                 _ => panic!("expected TypeAnnotated"),
             },

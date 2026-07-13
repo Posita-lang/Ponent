@@ -7,6 +7,7 @@ mod resolver;
 mod shape_var;
 mod smt;
 mod symbol;
+pub mod symbol_table;
 mod traits;
 mod types;
 pub mod visit;

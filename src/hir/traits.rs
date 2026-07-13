@@ -1,6 +1,7 @@
 use crate::ast::Span;
 use crate::hir::symbol::{SymbolTable, TypeKind};
 use crate::hir::types::{DefId, Subst, TypeContext, TypeData, TypeId};
+use crate::symbol::Symbol;
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -14,7 +15,7 @@ pub struct ImplCandidate {
     /// Pre-resolved method signatures (resolved during resolution using impl's
     /// type param mapping, so generic params like `T` are properly handled).
     pub resolved_methods: Vec<MethodInfo>,
-    pub assoc_tys: Vec<(String, TypeId)>,
+    pub assoc_tys: Vec<(Symbol, TypeId)>,
     pub span: Span,
     /// Whether this impl's method calls can be auto-deref'd through.
     /// Set by `@auto_deref` attribute on the impl.
@@ -29,7 +30,7 @@ pub struct ImplCandidate {
 /// Describes a single method with resolved type IDs, ready for method lookup.
 #[derive(Debug, Clone)]
 pub struct MethodInfo {
-    pub name: String,
+    pub name: Symbol,
     pub param_tys: Vec<TypeId>,
     pub ret_ty: TypeId,
     pub span: Span,
@@ -359,7 +360,7 @@ impl TraitEnv {
         // Try exact match first
         if let Some(cand) = self.lookup_impl(trait_id, self_ty) {
             for (name, ty) in &cand.assoc_tys {
-                if name == assoc_name {
+                if name.eq_str(assoc_name) {
                     return Some(ctx.resolve_binding(*ty));
                 }
             }
@@ -368,7 +369,7 @@ impl TraitEnv {
         // Fall back to generic impl lookup
         let (cand, subst) = self.lookup_impl_generic(trait_id, self_ty, ctx, symbols)?;
         for (name, ty) in &cand.assoc_tys {
-            if name == assoc_name {
+            if name.eq_str(assoc_name) {
                 let resolved = ctx.subst(*ty, &subst);
                 return Some(ctx.resolve_binding(resolved));
             }
@@ -507,6 +508,6 @@ mod tests {
         let ty = ctx.struct_ty(def_id, vec![]);
         let methods = env.lookup_inherent_methods(ty, &ctx);
         assert_eq!(methods.len(), 1);
-        assert_eq!(methods[0].name, "foo");
+        assert!(methods[0].name.eq_str("foo"));
     }
 }

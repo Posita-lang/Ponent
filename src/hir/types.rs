@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::ast::OverflowPolicy;
+use crate::symbol::Symbol;
 use std::cmp::Ordering;
 
 /// Posita language edition.
@@ -204,7 +205,7 @@ pub enum TypeData {
     },
     Exists {
         param_index: usize,
-        name: String,
+        name: Symbol,
         base: TypeId,
     },
     /// An explicit universal quantifier: ∀X. Body
@@ -213,16 +214,16 @@ pub enum TypeData {
     /// This is a compiler-internal node — there is no user-facing ∀ syntax.
     Forall {
         param_index: usize,
-        param_name: String,
+        param_name: Symbol,
         body: TypeId,
     },
     GenericParam {
         index: usize,
-        name: String,
+        name: Symbol,
     },
     AssociatedType {
         trait_id: DefId,
-        name: String,
+        name: Symbol,
         self_ty: TypeId,
     },
     InferVar {
@@ -238,13 +239,13 @@ pub enum TypeData {
     /// X is the recursive type variable, identified by param_index in body.
     Mu {
         param_index: usize,
-        param_name: String,
+        param_name: Symbol,
         body: TypeId,
     },
     /// Greatest fixed-point type: νX.A⟨X⟩.
     Nu {
         param_index: usize,
-        param_name: String,
+        param_name: Symbol,
         body: TypeId,
     },
     /// A polytype: `[∀ᾱ. τ]` — a boxed first-class polymorphic type.
@@ -252,7 +253,7 @@ pub enum TypeData {
     /// `body` is the inner type, referencing quantifiers via `GenericParam`.
     /// See OmniML §3.1 (O'Brien, Rémy & Scherer).
     Poly {
-        quantifiers: Vec<(usize, String)>,
+        quantifiers: Vec<(usize, Symbol)>,
         body: TypeId,
     },
     /// Fixed-precision rational type: `Rational<p, q>`.
@@ -756,7 +757,7 @@ impl TypeContext {
     /// Allocate a polytype `[∀ᾱ. τ]` — a boxed first-class polymorphic type.
     /// `quantifiers` are (index, name) pairs for universally quantified variables.
     /// `body` references them via `GenericParam`.
-    pub fn poly(&mut self, quantifiers: Vec<(usize, String)>, body: TypeId) -> TypeId {
+    pub fn poly(&mut self, quantifiers: Vec<(usize, Symbol)>, body: TypeId) -> TypeId {
         self.alloc(TypeData::Poly { quantifiers, body })
     }
 
@@ -844,7 +845,7 @@ impl TypeContext {
             // Strip leading ∀Y⃗ outer quantifiers before the Fn kernel.
             // Paper (Fig.3): ≡_X / ≡^X preserves ∀Y⃗ on both sides.
             //   ∀X. ∀Y⃗. ⟨...⟩ₖ ⇒ B⟨X⟩   ≡_X   ∀Y⃗. B⟨X ↦ ...⟩
-            let mut outer_quantifiers: Vec<(usize, String)> = Vec::new();
+            let mut outer_quantifiers: Vec<(usize, Symbol)> = Vec::new();
             let mut inner = *body;
             loop {
                 let inner_data = self.get_arc(inner);
@@ -886,7 +887,7 @@ impl TypeContext {
                 }
                 for &branch in &normalized_params {
                     // Peel outer Forall layers (∀Z⃗ₖ).
-                    let mut inner_quantifiers: Vec<(usize, String)> = Vec::new();
+                    let mut inner_quantifiers: Vec<(usize, Symbol)> = Vec::new();
                     let mut inner = branch;
                     loop {
                         let inner_data = self.get_arc(inner);
@@ -1308,7 +1309,7 @@ impl TypeContext {
     pub fn exists(
         &mut self,
         param_index: usize,
-        name: String,
+        name: Symbol,
         base: TypeId,
         invariant: crate::ast::Expr,
     ) -> TypeId {
@@ -1325,7 +1326,7 @@ impl TypeContext {
         id
     }
 
-    pub fn forall(&mut self, param_index: usize, param_name: String, body: TypeId) -> TypeId {
+    pub fn forall(&mut self, param_index: usize, param_name: Symbol, body: TypeId) -> TypeId {
         self.alloc(TypeData::Forall {
             param_index,
             param_name,
@@ -1428,11 +1429,11 @@ impl TypeContext {
         }
     }
 
-    pub fn generic_param(&mut self, index: usize, name: String) -> TypeId {
+    pub fn generic_param(&mut self, index: usize, name: Symbol) -> TypeId {
         self.alloc(TypeData::GenericParam { index, name })
     }
 
-    pub fn associated_type(&mut self, trait_id: DefId, name: String, self_ty: TypeId) -> TypeId {
+    pub fn associated_type(&mut self, trait_id: DefId, name: Symbol, self_ty: TypeId) -> TypeId {
         self.alloc(TypeData::AssociatedType {
             trait_id,
             name,
@@ -2524,7 +2525,7 @@ impl TypeContext {
         self.find_type(&TypeData::Coproduct { alternatives })
     }
 
-    fn exists_ty_no_alloc(&self, param_index: usize, name: String, base: TypeId) -> Option<TypeId> {
+    fn exists_ty_no_alloc(&self, param_index: usize, name: Symbol, base: TypeId) -> Option<TypeId> {
         self.find_type(&TypeData::Exists {
             param_index,
             name,
@@ -2535,7 +2536,7 @@ impl TypeContext {
     fn associated_ty_no_alloc(
         &self,
         trait_id: DefId,
-        name: String,
+        name: Symbol,
         self_ty: TypeId,
     ) -> Option<TypeId> {
         self.find_type(&TypeData::AssociatedType {
@@ -2854,7 +2855,7 @@ impl TypeContext {
         }
     }
 
-    pub fn name_of_exists(&self, ty: TypeId) -> Option<&String> {
+    pub fn name_of_exists(&self, ty: TypeId) -> Option<&Symbol> {
         match self.get(ty) {
             TypeData::Exists { name, .. } => Some(name),
             _ => None,

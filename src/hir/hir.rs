@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::hir::types::{DefId, TypeId};
+use crate::symbol::Symbol;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirProgram {
@@ -12,14 +13,12 @@ pub enum HirStmt {
     VariableDef {
         kind: VariableKind,
         mutable: bool,
-        name: Option<String>,
+        name: Option<Symbol>,
         pattern: Option<HirPattern>,
         ty: TypeId,
         value: Option<Box<HirExpr>>,
         else_branch: Option<Vec<HirStmt>>,
         span: Span,
-        /// Type captures from `set auto<T> = expr` — stored as hint for
-        /// comptime reflection; the actual binding is in the resolution map.
         type_captures: Vec<TypeParam>,
     },
     FunctionDef {
@@ -27,7 +26,7 @@ pub enum HirStmt {
         attributes: Vec<Attribute>,
         contracts: Vec<Contract>,
         doc: Option<String>,
-        name: String,
+        name: Symbol,
         params: Vec<HirParam>,
         return_type: TypeId,
         body: Option<Vec<HirStmt>>,
@@ -43,7 +42,7 @@ pub enum HirStmt {
         span: Span,
         attributes: Vec<Attribute>,
         doc: Option<String>,
-        name: String,
+        name: Symbol,
         params: Vec<TypeParam>,
         definition: TypeDefinition,
         contracts: Vec<Contract>,
@@ -52,26 +51,26 @@ pub enum HirStmt {
         span: Span,
         attributes: Vec<Attribute>,
         doc: Option<String>,
-        name: String,
+        name: Symbol,
         methods: Vec<TraitMethod>,
         associated_types: Vec<AssociatedType>,
     },
     Import {
-        path: Vec<String>,
-        items: Option<Vec<String>>,
-        alias: Option<String>,
+        path: Vec<Symbol>,
+        items: Option<Vec<Symbol>>,
+        alias: Option<Symbol>,
         span: Span,
     },
     ExternFunction {
         abi: String,
-        name: String,
+        name: Symbol,
         params: Vec<HirParam>,
         return_type: TypeId,
         span: Span,
         attributes: Vec<Attribute>,
     },
     Constraint {
-        name: String,
+        name: Symbol,
         bounds: Vec<TypeId>,
         span: Span,
     },
@@ -118,11 +117,11 @@ pub enum HirStmt {
         span: Span,
     },
     Leave {
-        label: Option<String>,
+        label: Option<Symbol>,
         span: Span,
     },
     Continue {
-        label: Option<String>,
+        label: Option<Symbol>,
         span: Span,
     },
     Return {
@@ -141,14 +140,14 @@ pub enum HirStmt {
         span: Span,
     },
     ScopeCleanup {
-        name: String,
+        name: Symbol,
         body: Vec<HirStmt>,
         propagates: bool,
         overrides: bool,
         span: Span,
     },
     Trigger {
-        name: String,
+        name: Symbol,
         span: Span,
     },
     Unsafe {
@@ -164,23 +163,19 @@ pub enum HirStmt {
         span: Span,
     },
     LayoutDef {
-        name: String,
+        name: Symbol,
         attributes: Vec<Attribute>,
         span: Span,
     },
     ImplBlock {
         span: Span,
         attributes: Vec<Attribute>,
-        /// The trait path resolved to its DefId, or `None` for inherent impls.
         trait_path: Option<DefId>,
         for_type: TypeId,
         methods: Vec<ImplMethod>,
         associated_types: Vec<AssociatedType>,
     },
-    /// A `generate` block — expanded by GenerateExpander before type checking.
-    /// After expansion, this node is replaced by the generated declarations.
     Generate {
-        /// The type this block is attached to (the `for_type`).
         for_type: TypeId,
         body: Vec<HirStmt>,
         span: Span,
@@ -191,7 +186,7 @@ pub enum HirStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirExpr {
     Literal(Literal, TypeId, Span),
-    Ident(String, TypeId, Span),
+    Ident(Symbol, TypeId, Span),
     TypeAnnotated {
         expr: Box<HirExpr>,
         ty: TypeId,
@@ -225,13 +220,13 @@ pub enum HirExpr {
     },
     FieldAccess {
         base: Box<HirExpr>,
-        field: String,
+        field: Symbol,
         ty: TypeId,
         span: Span,
     },
     AttrAccess {
         base: Box<HirExpr>,
-        attr: String,
+        attr: Symbol,
         ty: TypeId,
         span: Span,
     },
@@ -250,14 +245,14 @@ pub enum HirExpr {
         span: Span,
     },
     StructLit {
-        path: Vec<String>,
-        fields: Vec<(String, Box<HirExpr>)>,
+        path: Vec<Symbol>,
+        fields: Vec<(Symbol, Box<HirExpr>)>,
         ty: TypeId,
         span: Span,
     },
     EnumLit {
-        path: Vec<String>,
-        variant: String,
+        path: Vec<Symbol>,
+        variant: Symbol,
         payload: Option<Box<HirExpr>>,
         ty: TypeId,
         span: Span,
@@ -324,40 +319,32 @@ pub enum HirExpr {
     Block(Vec<HirStmt>, TypeId, Span),
     PolyBox {
         expr: Box<HirExpr>,
-        /// The boxed polytype `[∀ᾱ. τ]` — a `TypeData::Poly` node.
         ty: TypeId,
         span: Span,
     },
     PolyUnbox {
         expr: Box<HirExpr>,
-        /// The instantiated monotype `τ` (after unboxing).
         ty: TypeId,
         span: Span,
     },
-    /// Quantified expression: `forall i in 0..n: body` or `exists i in range: body`.
     Quantified {
         quantifier: crate::ast::Quantifier,
-        binder: String,
+        binder: Symbol,
         range: Box<HirExpr>,
         body: Box<HirExpr>,
         ty: TypeId,
         span: Span,
     },
-    /// `old(expr)` — captures the value of `expr` at function entry.
     Old {
         expr: Box<HirExpr>,
         ty: TypeId,
         span: Span,
     },
-    /// Spawn a task: `task { body }`
     Task {
         block: Vec<HirStmt>,
         ty: TypeId,
         span: Span,
     },
-    /// Compile-time type reflection: `@typeInfo!(Type)`.
-    /// Contains the resolved TypeId of the reflected type.
-    /// Evaluated during `generate` block expansion.
     TypeInfo(TypeId, Span),
     Error(Span),
 }
@@ -365,7 +352,7 @@ pub enum HirExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirCatchBranch {
     pub pattern: HirPattern,
-    pub bind: Option<String>,
+    pub bind: Option<Symbol>,
     pub body: Vec<HirStmt>,
     pub span: Span,
 }
@@ -380,7 +367,7 @@ pub struct HirMatchArm {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirParam {
-    pub name: String,
+    pub name: Symbol,
     pub ty: TypeId,
     pub default: Option<Expr>,
     pub span: Span,
@@ -389,17 +376,17 @@ pub struct HirParam {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirPattern {
     Wildcard(Span),
-    Ident(String, TypeId, Span),
+    Ident(Symbol, TypeId, Span),
     Literal(Box<HirExpr>, Span),
     Tuple(Vec<HirPattern>, Span),
     Struct {
-        path: Vec<String>,
-        fields: Vec<(String, Box<HirPattern>)>,
+        path: Vec<Symbol>,
+        fields: Vec<(Symbol, Box<HirPattern>)>,
         span: Span,
     },
     Enum {
-        path: Vec<String>,
-        variant: String,
+        path: Vec<Symbol>,
+        variant: Symbol,
         inner: Option<Box<HirPattern>>,
         span: Span,
     },
@@ -447,8 +434,8 @@ impl HirExpr {
             HirExpr::Quantified { ty, .. } => *ty,
             HirExpr::Old { ty, .. } => *ty,
             HirExpr::Task { ty, .. } => *ty,
-            HirExpr::Error(_) => unreachable!("Error expression has no type"),
-            HirExpr::TypeInfo(_, _) => TypeId(0), // sentinel — TypeInfo is a comptime-only construct
+            HirExpr::TypeInfo(_, _) => TypeId(0),
+            HirExpr::Error(_) => TypeId(0),
         }
     }
 
@@ -485,8 +472,8 @@ impl HirExpr {
             HirExpr::Quantified { span, .. } => *span,
             HirExpr::Old { span, .. } => *span,
             HirExpr::Task { span, .. } => *span,
-            HirExpr::Error(span) => *span,
             HirExpr::TypeInfo(_, span) => *span,
+            HirExpr::Error(span) => *span,
         }
     }
 }

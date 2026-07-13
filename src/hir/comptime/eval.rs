@@ -1,6 +1,7 @@
 use crate::hir::hir::{HirExpr, HirPattern, HirProgram, HirStmt};
 use crate::hir::types::{TypeContext, TypeId};
 use crate::hir::symbol::SymbolTable;
+use crate::symbol::Symbol;
 
 use super::error::ComptimeError;
 use super::value::ComptimeValue;
@@ -8,7 +9,7 @@ use super::value::ComptimeValue;
 use std::collections::HashMap;
 
 /// A registered comptime function: (parameter_names, body_statements).
-type ComptimeFn = (Vec<String>, Vec<HirStmt>);
+type ComptimeFn = (Vec<Symbol>, Vec<HirStmt>);
 
 /// Compute the representable range for a signed integer of `bits` width.
 fn signed_range(bits: u8) -> (i128, i128) {
@@ -93,10 +94,10 @@ pub struct ComptimeEvalContext<'a> {
     /// The symbol table, used for name resolution.
     symbols: &'a SymbolTable,
     /// Local variable bindings within the current comptime block.
-    pub variables: HashMap<String, ComptimeValue>,
+    pub variables: HashMap<Symbol, ComptimeValue>,
     /// Registry of comptime functions: name → (param_names, body).
     /// Populated by the checker as it encounters comptime function definitions.
-    fn_registry: HashMap<String, ComptimeFn>,
+    fn_registry: HashMap<Symbol, ComptimeFn>,
 }
 
 impl<'a> ComptimeEvalContext<'a> {
@@ -113,7 +114,7 @@ impl<'a> ComptimeEvalContext<'a> {
     }
 
     /// Register a comptime function so it can be called from within comptime blocks.
-    pub fn register_fn(&mut self, name: String, params: Vec<String>, body: Vec<HirStmt>) {
+    pub fn register_fn(&mut self, name: Symbol, params: Vec<Symbol>, body: Vec<HirStmt>) {
         self.fn_registry.insert(name, (params, body));
     }
 
@@ -153,7 +154,7 @@ impl<'a> ComptimeEvalContext<'a> {
                             self.variables.insert(name.clone(), val.clone());
                             result = val;
                         } else {
-                            return Err(ComptimeError::UnknownIdentifier(name.clone()));
+                            return Err(ComptimeError::UnknownIdentifier(name.as_str()));
                         }
                     } else {
                         return Err(ComptimeError::not_allowed(
@@ -286,19 +287,19 @@ impl<'a> ComptimeEvalContext<'a> {
                 //    (e.g. comptime function parameters, imported constants).
                 //    For now, this is a placeholder — full symbol table integration
                 //    will be added in a later phase.
-                Err(ComptimeError::UnknownIdentifier(name.clone()))
+                Err(ComptimeError::UnknownIdentifier(name.as_str()))
             }
             HirExpr::Call { callee, args, comptime, .. } if *comptime => {
                 // Resolve the callee to a function name.
                 let fn_name = match callee.as_ref() {
-                    HirExpr::Ident(name, _, _) => name.clone(),
+                    HirExpr::Ident(name, _, _) => *name,
                     _ => return Err(ComptimeError::type_error(
                         "comptime call target must be a simple function name",
                     )),
                 };
                 // Look up the function in the registry.
                 let (params, body) = self.fn_registry.get(&fn_name).ok_or_else(|| {
-                    ComptimeError::UnknownIdentifier(fn_name.clone())
+                    ComptimeError::UnknownIdentifier(fn_name.as_str())
                 })?.clone();
                 // Evaluate arguments.
                 let arg_vals: Vec<ComptimeValue> = args

@@ -17,7 +17,13 @@ mod hir {
 }
 mod lexer;
 mod parser;
+mod symbol;
 mod vfs;
+
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 use clap::Parser;
 use diagnostics::{ColoredEmitter, Diagnostic, DiagnosticEmitter};
