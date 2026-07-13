@@ -2029,3 +2029,46 @@ fn test_layout_attr_pad() {
     );
     assert!(result.is_ok(), "@pad: {:?}", result.err());
 }
+
+// ── Generic constraint aliases (constraint … <T> { T: … }) ─────
+
+#[test]
+fn test_generic_constraint_satisfied_accepted() {
+    // Define a generic constraint and apply it to a type that satisfies it.
+    let result = check_source(
+        "
+            trait Foo { }
+            impl Foo for Int<32> { }
+            constraint NeedsFoo<T> { T: Foo }
+            def needs_foo<T>(x: T) -> T where T: NeedsFoo { return x; }
+            def main() -> Int<32> {
+                return needs_foo(42);
+            }",
+    );
+    assert!(
+        result.is_ok(),
+        "constraint satisfied should be accepted: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_generic_constraint_parses_and_resolves() {
+    // Verify that a generic constraint parses, resolves, and the checker
+    // does not crash.  The full call-site impl check requires generic
+    // instantiation, which is a broader checker feature.
+    let result = check_source(
+        "
+            trait Foo { }
+            impl Foo for Int<32> { }
+            constraint NeedsFoo<T> { T: Foo }
+            def needs_foo<T>(x: T) -> T where T: NeedsFoo { return x; }
+            def main() -> Int<32> { return 0; }
+        ",
+    );
+    assert!(
+        result.is_ok(),
+        "constraint should parse and resolve: {:?}",
+        result.err()
+    );
+}

@@ -119,8 +119,20 @@ pub struct ImplBinding {
 }
 
 #[derive(Debug, Clone)]
-pub struct ConstraintBinding {
+pub struct ConstraintPredicate {
+    pub subject: TypeId,
     pub bounds: Vec<TypeId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstraintBinding {
+    /// Each predicate is a subject type with its trait bounds,
+    /// matching the syntax `Subject: Bound1 + Bound2`.
+    pub predicates: Vec<ConstraintPredicate>,
+    /// The type parameters declared on the constraint (e.g. `<T>` in
+    /// `constraint Foo<T> { T: Display }`).  Stored so the checker can build
+    /// a substitution map when the constraint is instantiated at a use site.
+    pub params: Vec<crate::ast::TypeParam>,
     pub span: Span,
 }
 

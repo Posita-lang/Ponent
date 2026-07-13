@@ -804,6 +804,88 @@ impl Token {
             other => format!("{:?}", other),
         }
     }
+
+    /// If this token represents an identifier — either a true `Ident` or a
+    /// keyword that can serve as a name in path position (e.g. `default`
+    /// after `::`) — return the corresponding `Symbol`.
+    ///
+    /// # Track‑A Policy (Engineering Canon)
+    /// This is an intentionally comprehensive mapping: **every keyword that
+    /// could plausibly appear as a type / method / variant name after `::`
+    /// is accepted**.  This matches rustc's approach where keywords are
+    /// weak identifiers in path position.
+    ///
+    /// ## When adding a new keyword token
+    /// 1. Add the token variant to the `#[token("keyword")]` section of
+    ///    `Token` (the logos lexer).
+    /// 2. Add an arm to **this method** so the keyword is accepted after
+    ///    `::` in paths, patterns, and expressions.
+    /// 3. Add a test — at minimum a parser test that exercises the keyword
+    ///    in a qualified path (e.g. `Mod::keyword`).
+    /// 4. **Do NOT** add a keyword here if it can never be a legal
+    ///    identifier (e.g. `;`, `{`, `::`, `->` are structural tokens
+    ///    with their own `Token` variants and are not keywords).
+    /// 5. **Do NOT** skip a keyword just because it "seems unlikely" to be
+    ///    a method name — `default`, `move`, `copy`, and `type` have all
+    ///    been needed.  Missing one will produce a confusing
+    ///    `expected identifier after '::'` error.
+    pub fn as_ident_symbol(&self) -> Option<Symbol> {
+        match self {
+            Token::Ident(s) => Some(*s),
+            // Keywords commonly used as identifiers in paths / methods.
+            Token::Default => Some(Symbol::intern("default")),
+            Token::Move => Some(Symbol::intern("move")),
+            Token::Copy => Some(Symbol::intern("copy")),
+            Token::Ref => Some(Symbol::intern("ref")),
+            Token::Mut => Some(Symbol::intern("mut")),
+            Token::Type => Some(Symbol::intern("type")),
+            Token::SelfKw => Some(Symbol::intern("Self")),
+            Token::Async => Some(Symbol::intern("async")),
+            Token::Await => Some(Symbol::intern("await")),
+            Token::Catch => Some(Symbol::intern("catch")),
+            Token::Let => Some(Symbol::intern("let")),
+            Token::Where => Some(Symbol::intern("where")),
+            Token::As => Some(Symbol::intern("as")),
+            Token::In => Some(Symbol::intern("in")),
+            Token::And => Some(Symbol::intern("and")),
+            Token::Or => Some(Symbol::intern("or")),
+            Token::Not => Some(Symbol::intern("not")),
+            Token::Isolate => Some(Symbol::intern("isolate")),
+            Token::Pure => Some(Symbol::intern("pure")),
+            Token::Io => Some(Symbol::intern("io")),
+            Token::Trusted => Some(Symbol::intern("trusted")),
+            Token::Ghost => Some(Symbol::intern("ghost")),
+            Token::Layout => Some(Symbol::intern("layout")),
+            Token::Validate => Some(Symbol::intern("validate")),
+            Token::Exists => Some(Symbol::intern("exists")),
+            Token::Forall => Some(Symbol::intern("forall")),
+            Token::On => Some(Symbol::intern("on")),
+            Token::Trait => Some(Symbol::intern("trait")),
+            Token::Impl => Some(Symbol::intern("impl")),
+            Token::Cfg => Some(Symbol::intern("cfg")),
+            Token::Hint => Some(Symbol::intern("hint")),
+            Token::Old => Some(Symbol::intern("old")),
+            Token::Overrides => Some(Symbol::intern("overrides")),
+            Token::Propagates => Some(Symbol::intern("propagates")),
+            Token::Poly => Some(Symbol::intern("poly")),
+            Token::Unbox => Some(Symbol::intern("unbox")),
+            Token::Extern => Some(Symbol::intern("extern")),
+            Token::Pub => Some(Symbol::intern("pub")),
+            Token::Unsafe => Some(Symbol::intern("unsafe")),
+            Token::Panic => Some(Symbol::intern("panic")),
+            Token::Finally => Some(Symbol::intern("finally")),
+            Token::Dyn => Some(Symbol::intern("dyn")),
+            Token::By => Some(Symbol::intern("by")),
+            Token::Wrap => Some(Symbol::intern("wrap")),
+            Token::Saturate => Some(Symbol::intern("saturate")),
+            Token::Trap => Some(Symbol::intern("trap")),
+            Token::Round => Some(Symbol::intern("round")),
+            Token::Trunc => Some(Symbol::intern("trunc")),
+            Token::Ceil => Some(Symbol::intern("ceil")),
+            Token::Floor => Some(Symbol::intern("floor")),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

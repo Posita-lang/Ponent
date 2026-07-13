@@ -327,6 +327,9 @@ impl<'a> ComptimeEvalContext<'a> {
                 // @typeInfo(T) returns the type itself as a comptime value.
                 Ok(ComptimeValue::Type(*ty))
             }
+            HirExpr::CompileError(msg, _) => {
+                Err(ComptimeError::AssertionFailed(msg.clone()))
+            }
             _ => Err(ComptimeError::Deferred),
         }
     }

@@ -235,6 +235,10 @@ pub enum Expr {
     /// `TypeInfo` value describing the type's structure at comptime.
     /// Inspired by Zig's `@typeInfo`.
     TypeInfo(Box<Type>, Span),
+    /// Compile-time error: `@compile_error!("msg")` unconditionally halts
+    /// compilation with the given message when evaluated (comptime-only).
+    /// Parsed as an expression so it can be guarded by `if` / `match`.
+    CompileError(String, Span),
     Error(Span),
 }
 
@@ -334,7 +338,8 @@ pub enum Stmt {
     },
     Constraint {
         name: Symbol,
-        bounds: Vec<Type>,
+        params: Vec<TypeParam>,
+        predicates: Vec<WherePredicate>,
         span: Span,
     },
     Edition(String, Span),
@@ -655,6 +660,7 @@ pub enum Pattern {
     Struct {
         path: Vec<Symbol>,
         fields: Vec<(Symbol, Pattern)>,
+        rest: bool,
         span: Span,
     },
     Enum {
@@ -806,6 +812,7 @@ impl Expr {
             Expr::Old(_, span) => *span,
             Expr::Task { span, .. } => *span,
             Expr::TypeInfo(_, span) => *span,
+            Expr::CompileError(_, span) => *span,
             Expr::Error(span) => *span,
         }
     }

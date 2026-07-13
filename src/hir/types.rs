@@ -617,6 +617,7 @@ impl TypeContext {
         let resolved = self.resolve_binding(id);
         match &self.types[resolved.index()].as_ref() {
             TypeData::Adt { def_id, .. } => Some(*def_id),
+            TypeData::DynTrait { traits } => traits.first().copied(),
             _ => None,
         }
     }

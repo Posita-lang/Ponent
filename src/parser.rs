@@ -3,6 +3,22 @@ use crate::diagnostics::Diagnostic;
 use crate::symbol::Symbol;
 use crate::lexer::Token;
 
+// ── Track‑A (Engineering Canon) ──────────────────────────────────────────────
+// Keyword-as-identifier policy (see `Token::as_ident_symbol` in lexer.rs):
+//
+// Posita keywords are *not* reserved in path position.  Any keyword token may
+// appear after `::` — e.g. `T::default()`, `T::move()`, `Module::type` — because
+// method / variant / associated-type names are always user-chosen identifiers
+// that happen to overlap with keyword strings.
+//
+// When adding a new keyword:
+//   1. Add it to the lexer (`Token` enum in lexer.rs).
+//   2. Add it to `Token::as_ident_symbol()`.
+//   3. This module will *automatically* accept it after `::` in paths, patterns,
+//      and expressions — no parser changes needed.
+//   4. Add a parser test that exercises the keyword in a qualified path.
+// ──────────────────────────────────────────────────────────────────────────────
+
 /// Whether parser recovery is allowed at a given call site (rustc-style).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovery {
@@ -974,19 +990,47 @@ impl Parser {
                 return Err(Diagnostic::error("expected constraint name")
                     .with_code_str("E004")
                     .with_help("`constraint` must be followed by a name — e.g. `constraint MyConstraint { ... }`")
-                    .with_suggestion("add a name after `constraint`, e.g. `constraint MyConstraint { TraitA + TraitB }`")
+                    .with_suggestion("add a name after `constraint`, e.g. `constraint MyConstraint { T: Display + Debug }`")
                     .with_span(self.span(),));
             }
         };
+        // Optional generic type parameters: constraint Foo<T, U> { ... }
+        let params = if matches!(self.peek(), Ok(Token::Lt)) {
+            self.parse_type_params()?
+        } else {
+            Vec::new()
+        };
         self.expect(Token::LBrace)?;
-        let mut bounds = Vec::new();
+        let mut predicates = Vec::new();
         loop {
             if matches!(self.peek(), Ok(Token::RBrace)) {
                 self.advance().ok();
                 break;
             }
-            bounds.push(self.parse_type()?);
-            if !matches!(self.peek(), Ok(Token::Plus)) {
+            // Parse a single predicate: `Subject: Bound1 + Bound2`
+            let pred_start = self.span().start;
+            let subject = self.parse_type()?;
+            if !matches!(self.peek(), Ok(Token::Colon)) {
+                return Err(Diagnostic::error(
+                    "expected `:` after subject type in constraint predicate",
+                )
+                .with_code_str("E004")
+                .with_help(
+                    "constraint predicates must have the form `Subject: Bound1 + Bound2`",
+                )
+                .with_suggestion(
+                    "add a colon after the subject type, e.g. `T: Display + Debug`",
+                )
+                .with_span(self.span()));
+            }
+            self.advance().ok(); // consume ':'
+            let mut bs = vec![self.parse_type()?];
+            while matches!(self.peek(), Ok(Token::Plus)) {
+                self.advance().ok();
+                bs.push(self.parse_type()?);
+            }
+            predicates.push(WherePredicate { ty: subject, bounds: bs, span: Span::new(pred_start, self.span().end) });
+            if !matches!(self.peek(), Ok(Token::Comma)) {
                 break;
             }
             self.advance().ok();
@@ -995,7 +1039,8 @@ impl Parser {
         let end = self.span().end;
         Ok(Stmt::Constraint {
             name,
-            bounds,
+            params,
+            predicates,
             span: Span::new(start, end),
         })
     }
@@ -3262,41 +3307,12 @@ impl Parser {
                     _ => unreachable!(),
                 };
                 if matches!(self.peek(), Ok(Token::LBrace)) {
-                    self.advance().ok();
-                    let mut fields = Vec::new();
-                    loop {
-                        if matches!(self.peek(), Ok(Token::RBrace)) {
-                            self.advance().ok();
-                            break;
-                        }
-                        let field_name = match self.advance() {
-                            Ok(Token::Ident(f)) => f,
-                            _ => {
-                                return Err(Diagnostic::error("expected field name")
-                                    .with_code_str("E004")
-                                    .with_help("pattern fields must have a name — e.g. `Point { x, y }`")
-                                    .with_suggestion("add a field name like `x`, `name`, or `value`")
-                                    .with_span(self.span(),));
-                            }
-                        };
-                        let field_pattern = if matches!(self.peek(), Ok(Token::Colon)) {
-                            self.advance().ok();
-                            self.parse_pattern()?
-                        } else {
-                            Pattern::Ident(field_name.clone(), self.span())
-                        };
-                        fields.push((field_name, field_pattern));
-                        if matches!(self.peek(), Ok(Token::Comma)) {
-                            self.advance().ok();
-                        } else {
-                            self.expect(Token::RBrace)?;
-                            break;
-                        }
-                    }
+                    let (fields, rest, _) = self.parse_struct_pattern_fields()?;
                     let end = self.span().end;
                     Ok(Pattern::Struct {
                         path: vec![name],
                         fields,
+                        rest,
                         span: Span::new(start, end),
                     })
                 } else if matches!(self.peek(), Ok(Token::LParen)) {
@@ -3313,8 +3329,8 @@ impl Parser {
                 } else if matches!(self.peek(), Ok(Token::ColonColon)) {
                     let mut path = vec![name];
                     self.advance().ok();
-                    path.push(match self.advance() {
-                        Ok(Token::Ident(variant)) => variant,
+                    let variant_sym = match self.advance() {
+                        Ok(tok) if tok.as_ident_symbol().is_some() => tok.as_ident_symbol().unwrap(),
                         _ => {
                             return Err(Diagnostic::error("expected variant name")
                                 .with_code_str("E004")
@@ -3322,23 +3338,40 @@ impl Parser {
                                 .with_suggestion("add a variant name after `::`, e.g. `Option::Some(val)`")
                                 .with_span(self.span(),));
                         }
-                    });
-                    let inner = if matches!(self.peek(), Ok(Token::LParen)) {
+                    };
+                    // Struct variant pattern: `TypeInfo::Int { bits, .. }`
+                    if matches!(self.peek(), Ok(Token::LBrace)) {
+                        let (fields, rest, _) = self.parse_struct_pattern_fields()?;
+                        path.push(variant_sym);
+                        let end = self.span().end;
+                        Ok(Pattern::Struct {
+                            path,
+                            fields,
+                            rest,
+                            span: Span::new(start, end),
+                        })
+                    } else if matches!(self.peek(), Ok(Token::LParen)) {
+                        // Tuple variant pattern: `Option::Some(val)`
                         self.advance().ok();
                         let p = self.parse_pattern()?;
                         self.expect(Token::RParen)?;
-                        Some(Box::new(p))
+                        let end = self.span().end;
+                        Ok(Pattern::Enum {
+                            path,
+                            variant: variant_sym,
+                            inner: Some(Box::new(p)),
+                            span: Span::new(start, end),
+                        })
                     } else {
-                        None
-                    };
-                    let variant = path.pop().expect("Enum pattern must have a variant");
-                    let end = self.span().end;
-                    Ok(Pattern::Enum {
-                        path,
-                        variant,
-                        inner,
-                        span: Span::new(start, end),
-                    })
+                        // Unit variant: `Option::None`
+                        let end = self.span().end;
+                        Ok(Pattern::Enum {
+                            path,
+                            variant: variant_sym,
+                            inner: None,
+                            span: Span::new(start, end),
+                        })
+                    }
                 } else {
                     Ok(Pattern::Ident(name, Span::new(start, self.span().end)))
                 }
@@ -3379,6 +3412,62 @@ impl Parser {
 
     fn parse_expr(&mut self) -> Result<Expr, Diagnostic> {
         self.parse_expr_bp(0)
+    }
+
+    /// Parse the body of a struct pattern `{ field1, field2: pat, .. }`.
+    /// Returns `(fields, has_rest, span)` where `has_rest` is true if `..`
+    /// appeared as the last element.
+    fn parse_struct_pattern_fields(
+        &mut self,
+    ) -> Result<(Vec<(Symbol, Pattern)>, bool, Span), Diagnostic> {
+        let start = self.span().start;
+        self.expect(Token::LBrace)?;
+        let mut fields = Vec::new();
+        let mut rest = false;
+        loop {
+            if matches!(self.peek(), Ok(Token::RBrace)) {
+                self.advance().ok();
+                break;
+            }
+            // `..` rest pattern — must appear at most once, as the last element.
+            if matches!(self.peek(), Ok(Token::DotDot)) {
+                self.advance().ok();
+                rest = true;
+                // Allow trailing comma after `..`
+                if matches!(self.peek(), Ok(Token::Comma)) {
+                    self.advance().ok();
+                }
+                continue;
+            }
+            let field_tok = self.advance();
+            match field_tok {
+                Ok(tok) if tok.as_ident_symbol().is_some() => {
+                    let field_name = tok.as_ident_symbol().unwrap();
+                    let field_pattern = if matches!(self.peek(), Ok(Token::Colon)) {
+                        self.advance().ok();
+                        self.parse_pattern()?
+                    } else {
+                        Pattern::Ident(field_name, self.span())
+                    };
+                    fields.push((field_name, field_pattern));
+                }
+                _ => {
+                    return Err(Diagnostic::error("expected field name or `..`")
+                        .with_code_str("E004")
+                        .with_help("pattern fields must have a name — e.g. `Point { x, y }`, or use `..` for remaining fields")
+                        .with_suggestion("add a field name like `x`, `name`, or `value`, or add `..` to ignore the rest")
+                        .with_span(self.span(),));
+                }
+            }
+            if matches!(self.peek(), Ok(Token::Comma)) {
+                self.advance().ok();
+            } else {
+                self.expect(Token::RBrace)?;
+                break;
+            }
+        }
+        let end = self.span().end;
+        Ok((fields, rest, Span::new(start, end)))
     }
 
     fn parse_expr_bp(&mut self, min_bp: u8) -> Result<Expr, Diagnostic> {
@@ -3869,6 +3958,22 @@ impl Parser {
                     self.expect(Token::RParen)?;
                     let end = self.span().end;
                     Ok(Expr::TypeInfo(Box::new(ty), Span::new(start, end)))
+                } else if name.eq_str("compile_error") {
+                    // `@compile_error("msg")` — `!` is optional (the spec description
+                    // omits it, but the spec example uses it).  Accept both forms.
+                    if matches!(self.peek(), Ok(Token::Bang)) {
+                        self.advance().ok();
+                    }
+                    self.expect(Token::LParen)?;
+                    let msg = match self.advance() {
+                        Ok(Token::StringLiteral(Ok(s))) => s,
+                        _ => return Err(Diagnostic::error(
+                            "@compile_error expects a string literal argument, e.g. `@compile_error(\"message\")`",
+                        ).with_span(self.span())),
+                    };
+                    self.expect(Token::RParen)?;
+                    let end = self.span().end;
+                    Ok(Expr::CompileError(msg, Span::new(start, end)))
                 } else {
                     Err(Diagnostic::error(format!("unknown built-in `@{name}`"))
                         .with_help("available built-ins: `@typeInfo!(Type)`")
@@ -3971,16 +4076,19 @@ impl Parser {
         path.push(name);
         while matches!(self.peek(), Ok(Token::ColonColon)) {
             self.advance().ok();
-            if let Ok(Token::Ident(part)) = self.advance() {
-                path.push(part);
-            } else {
-                return Err(Diagnostic::error("expected identifier after '::'")
-                    .with_code_str("E004")
-                    .with_help(
-                        "`::` must be followed by an identifier — e.g. `std::collections::HashMap`",
-                    )
-                    .with_suggestion("add an identifier after `::`, e.g. `MyModule::MyType`")
-                    .with_span(self.span()));
+            match self.advance() {
+                Ok(tok) if tok.as_ident_symbol().is_some() => {
+                    path.push(tok.as_ident_symbol().unwrap());
+                }
+                _ => {
+                    return Err(Diagnostic::error("expected identifier after '::'")
+                        .with_code_str("E004")
+                        .with_help(
+                            "`::` must be followed by an identifier — e.g. `std::collections::HashMap`",
+                        )
+                        .with_suggestion("add an identifier after `::`, e.g. `MyModule::MyType`")
+                        .with_span(self.span()));
+                }
             }
         }
         let restrict = self
@@ -4651,8 +4759,10 @@ impl Parser {
             });
             if matches!(self.peek(), Ok(Token::Comma)) {
                 self.advance().ok();
-            } else {
-                self.expect(Token::RBrace)?;
+            }
+            // Accept `}` (end of match) or another pattern (newline-separated arms).
+            if matches!(self.peek(), Ok(Token::RBrace)) {
+                self.advance().ok();
                 break;
             }
         }
@@ -5067,15 +5177,81 @@ mod tests {
 
     #[test]
     fn test_constraint() {
-        let src = "constraint MyConstraint { Display + Debug }";
+        // Proper colon-based syntax: `Subject: Bound1 + Bound2`
+        let src = "constraint MyConstraint { T: Display + Debug }";
         let program = check_parse(src);
         assert_eq!(program.items.len(), 1);
         match &program.items[0] {
-            Stmt::Constraint { name, bounds, .. } => {
+            Stmt::Constraint { name, predicates, .. } => {
                 assert!(name.eq_str("MyConstraint"));
-                assert_eq!(bounds.len(), 2);
+                assert_eq!(predicates.len(), 1);
+                assert!(matches!(predicates[0].ty, Type::Path(_, _)));
+                assert_eq!(predicates[0].bounds.len(), 2);
             }
             _ => panic!("expected Constraint"),
+        }
+    }
+
+    #[test]
+    fn test_constraint_rejects_flat_format() {
+        // Flat format `{ Display + Debug }` without colon must be rejected.
+        let src = "constraint MyConstraint { Display + Debug }";
+        let errs = check_parse_err(src);
+        assert!(!errs.is_empty(), "flat constraint format must be rejected");
+    }
+
+    #[test]
+    fn test_constraint_with_generic_params() {
+        // Generic constraint with type params and colon-based predicates.
+        let src = "constraint SortableContainer<C> { C: Container, C::Item: Ord, C::Item: Default }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+        match &program.items[0] {
+            Stmt::Constraint { name, params, predicates, .. } => {
+                assert!(name.eq_str("SortableContainer"));
+                assert_eq!(params.len(), 1);
+                assert!(params[0].name.eq_str("C"));
+                assert_eq!(predicates.len(), 3);
+                // First predicate: C: Container
+                assert_eq!(predicates[0].bounds.len(), 1);
+                // Second predicate: C::Item: Ord
+                assert_eq!(predicates[1].bounds.len(), 1);
+            }
+            _ => panic!("expected Constraint"),
+        }
+    }
+
+    #[test]
+    fn test_compile_error_without_bang() {
+        // `@compile_error("msg")` — no exclamation mark, per the spec
+        let src = r#"def f() { @compile_error("oops"); }"#;
+        let _program = check_parse(src);
+    }
+
+    #[test]
+    fn test_keyword_as_path_ident() {
+        // Track‑A: keyword tokens are accepted after `::` as identifiers.
+        // `default`, `move`, `copy`, `type`, `Self` are keywords that can
+        // appear as method / variant / associated-type names.
+        //
+        // IMPORTANT: `T::default()` parses as a 2-segment path followed by
+        // `()`, which `parse_path_or_literal` routes to `parse_enum_lit`
+        // (empty payload).  This is a pre-existing parser design choice:
+        // 2-segment `Path::ident(args)` is always treated as enum variant
+        // construction, not an associated-function call.  The test verifies
+        // the KEYWORD-AS-IDENTIFIER aspect, not the call-semantics aspect.
+        let cases = &[
+            // Path-only (no call parens) — the most direct keyword test.
+            "def f() { let x = Enum::default; }",
+            "def f() { let x = Mod::move; }",
+            "def f() { let x = Mod::copy; }",
+            "def f() { let x = Mod::type; }",
+            // With empty parens (→ enum construction with empty payload).
+            "def f() { let x = Mod::none(); }",
+        ];
+        for src in cases {
+            let program = check_parse(src);
+            assert_eq!(program.items.len(), 1, "failed to parse: {src}");
         }
     }
 

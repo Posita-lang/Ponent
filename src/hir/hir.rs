@@ -346,6 +346,9 @@ pub enum HirExpr {
         span: Span,
     },
     TypeInfo(TypeId, Span),
+    /// Compile-time error: `@compile_error!("msg")`.
+    /// Produced when the comptime evaluator encounters this expression.
+    CompileError(String, Span),
     Error(Span),
 }
 
@@ -382,6 +385,7 @@ pub enum HirPattern {
     Struct {
         path: Vec<Symbol>,
         fields: Vec<(Symbol, Box<HirPattern>)>,
+        rest: bool,
         span: Span,
     },
     Enum {
@@ -435,6 +439,7 @@ impl HirExpr {
             HirExpr::Old { ty, .. } => *ty,
             HirExpr::Task { ty, .. } => *ty,
             HirExpr::TypeInfo(_, _) => TypeId(0),
+            HirExpr::CompileError(_, _) => TypeId(0),
             HirExpr::Error(_) => TypeId(0),
         }
     }
@@ -473,6 +478,7 @@ impl HirExpr {
             HirExpr::Old { span, .. } => *span,
             HirExpr::Task { span, .. } => *span,
             HirExpr::TypeInfo(_, span) => *span,
+            HirExpr::CompileError(_, span) => *span,
             HirExpr::Error(span) => *span,
         }
     }

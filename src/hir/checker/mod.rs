@@ -675,11 +675,35 @@ impl<'a> TypeChecker<'a> {
                                     .add_constraint(Constraint::Impl(pred_ty, trait_id, pred.span));
                             } else if let Some(name) = TypeChecker::extract_bound_name(bound) {
                                 if let Some(constraint) = guard.checker.symbols.lookup_constraint(name) {
-                                    for &bound_ty in &constraint.bounds {
-                                        if let Some(trait_id) = guard.checker.ctx.get_def_id_for_type(bound_ty) {
-                                            guard.checker.add_constraint(
-                                                Constraint::Impl(pred_ty, trait_id, pred.span),
-                                            );
+                                    // Build a substitution that maps the constraint's own
+                                    // generic params (e.g. `T` in `constraint Foo<T> { ... }`)
+                                    // to the actual constrained type (`pred_ty`).
+                                    let mut subst = crate::hir::types::Subst::new();
+                                    for (i, _) in constraint.params.iter().enumerate() {
+                                        subst.insert(i, pred_ty);
+                                    }
+                                    for predicate in &constraint.predicates {
+                                        for &bound_ty in &predicate.bounds {
+                                            let substituted =
+                                                guard.checker.ctx.subst(bound_ty, &subst);
+                                            if let Some(trait_id) =
+                                                guard.checker.ctx.get_def_id_for_type(substituted)
+                                            {
+                                                guard.checker.add_constraint(
+                                                    Constraint::Impl(pred_ty, trait_id, pred.span),
+                                                );
+                                            } else {
+                                                // The substituted bound does not resolve
+                                                // to a known trait — emit a warning so the
+                                                // user knows the bound is ineffective.
+                                                guard.checker.diagnostics.push(
+                                                    Diagnostic::warning(format!(
+                                                        "bound `{:?}` does not resolve to a trait",
+                                                        bound
+                                                    ))
+                                                    .with_span(pred.span),
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -1382,13 +1406,20 @@ impl<'a> TypeChecker<'a> {
                     attributes: attributes.clone(),
                 })
             }
-            Stmt::Constraint { name, bounds, span } => {
-                let resolved_bounds: Vec<TypeId> = bounds
+            Stmt::Constraint { name, params, predicates, span } => {
+                let resolved_bounds: Vec<TypeId> = predicates
                     .iter()
-                    .map(|b| self.resolve_type(b))
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .flat_map(|p| {
+                        let subject = self.resolve_type(&p.ty);
+                        let mut bs: Vec<TypeId> = p.bounds.iter().map(|b| self.resolve_type(b)).collect::<Result<_, _>>().unwrap_or_default();
+                        if subject.is_ok() {
+                            bs.insert(0, subject.unwrap());
+                        }
+                        bs
+                    })
+                    .collect();
                 Ok(HirStmt::Constraint {
-                    name: name.clone(),
+                    name: *name,
                     bounds: resolved_bounds,
                     span: *span,
                 })

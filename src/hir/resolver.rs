@@ -652,11 +652,36 @@ impl<'a> NameResolver<'a> {
                     self.layout_aliases.insert(name.clone(), attributes.clone());
                 }
             }
-            Stmt::Constraint { name, bounds, span } => {
-                let resolved_bounds: Vec<TypeId> =
-                    bounds.iter().map(|b| self.resolve_type_expr(b)).collect();
+            Stmt::Constraint { name, params, predicates, span, .. } => {
+                // Register type parameters so T resolves in constraint body.
+                let mut param_map = HashMap::default();
+                for (i, tp) in params.iter().enumerate() {
+                    let ty_id = self.ctx.generic_param(i, tp.name.clone());
+                    param_map.insert(tp.name, ty_id);
+                }
+                self.current_impl_type_params = Some(param_map);
+                let resolved_predicates: Vec<ConstraintPredicate> =
+                    predicates.iter().map(|p| {
+                        let subject = self.resolve_type_expr(&p.ty);
+                        let bounds: Vec<TypeId> = p.bounds.iter().map(|b| {
+                            // Before attempting type resolution, check whether this
+                            // bound is a trait name — traits are not registered as
+                            // types, so resolve_type_expr would produce an error.
+                            if let Type::Path(path, _) = b {
+                                if path.len() == 1 {
+                                    if let Some(trait_binding) = self.symbols.lookup_trait(path[0]) {
+                                        return self.ctx.dyn_trait(vec![trait_binding.def_id]);
+                                    }
+                                }
+                            }
+                            self.resolve_type_expr(b)
+                        }).collect();
+                        ConstraintPredicate { subject, bounds }
+                    }).collect();
+                self.current_impl_type_params = None;
                 let binding = ConstraintBinding {
-                    bounds: resolved_bounds,
+                    predicates: resolved_predicates,
+                    params: params.clone(),
                     span: *span,
                 };
                 if let Err(diag) = self.symbols.insert_constraint(name.clone(), binding, *span) {
@@ -1287,6 +1312,10 @@ impl<'a> NameResolver<'a> {
                 // @typeInfo!(Type) — resolve the type argument, return Unit.
                 self.resolve_type_expr(ty);
                 Some(self.ctx.unit())
+            }
+            Expr::CompileError(msg, span) => {
+                // @compile_error!("msg") — emit an error and continue (deferred to checker).
+                Some(self.ctx.error())
             }
             Expr::Task { body, .. } => {
                 for s in body { self.resolve_stmt(s); }

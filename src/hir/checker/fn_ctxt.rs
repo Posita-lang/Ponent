@@ -1456,6 +1456,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let ty_id = self.resolve_type(ty)?;
                 Ok((HirExpr::TypeInfo(ty_id, *span), self.checker.ctx.unit()))
             }
+            Expr::CompileError(msg, span) => {
+                let diag = Diagnostic::error(msg.clone())
+                    .with_code_str("E099")
+                    .with_help("`@compile_error` halts compilation unconditionally when evaluated")
+                    .with_span(*span);
+                self.checker.diagnostics.push(diag);
+                Ok((HirExpr::CompileError(msg.clone(), *span), self.checker.ctx.error()))
+            }
             Expr::Task { body, span } => {
                 let block = self.check_block(body)?;
                 let ty = self.checker.ctx.unit();
@@ -2172,7 +2180,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 Ok(HirPattern::Slice(hir_before, hir_slice, hir_after, *span))
             }
             Pattern::Error(span) => Ok(HirPattern::Error(*span)),
-            Pattern::Struct { path, fields, span } => {
+            Pattern::Struct { path, fields, span, .. } => {
                 let def_id = self.checker.resolve_def_id(path)?;
                 let binding = self
                     .checker
@@ -2209,6 +2217,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 Ok(HirPattern::Struct {
                     path: path.clone(),
                     fields: hir_fields,
+                    rest: false, // lower_irrelevance is a type-level concern; rest is informational
                     span: *span,
                 })
             }

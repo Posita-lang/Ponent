@@ -1940,11 +1940,14 @@ impl InferenceContext {
                         if matches!(data, TypeData::Error) {
                             return Ok(());
                         }
-                        // If still an infer var, delay Impl checking until the type
-                        // is resolved — push to the `delayed` queue instead of
-                        // returning Ok(()) or re-pushing to `heap` (which would
-                        // cause immediate re-pop and an infinite loop).
-                        if matches!(data, TypeData::InferVar { .. }) {
+                        // If still an infer var or generic param, delay Impl
+                        // checking until the type is resolved — push to the
+                        // `delayed` queue instead of returning Ok(()) or
+                        // re-pushing to `heap` (which would cause immediate
+                        // re-pop and an infinite loop).
+                        if matches!(data, TypeData::InferVar { .. })
+                            || matches!(data, TypeData::GenericParam { .. })
+                        {
                             delayed.push(PrioritizedConstraint {
                                 priority: 7,
                                 constraint: pc.constraint.clone(),
@@ -2462,6 +2465,12 @@ impl InferenceContext {
                         trait_name: format!("{:?}", trait_id),
                         span: *span,
                     });
+                }
+                // GenericParam remains unresolved (the function was never
+                // instantiated with concrete types).  That's fine — the
+                // constraint will be checked at the monomorphization site.
+                if matches!(data, TypeData::GenericParam { .. }) {
+                    continue;
                 }
                 let impl_found = if trait_env.lookup_impl(*trait_id, resolved).is_some() {
                     true

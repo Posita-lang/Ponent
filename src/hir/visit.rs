@@ -177,6 +177,7 @@ pub fn walk_hir_expr<V: HirVisitor>(visitor: &mut V, expr: &HirExpr) -> V::Resul
             visitor.visit_type_id(*ty)?;
             V::Result::output()
         }
+        HirExpr::CompileError(_, _) => V::Result::output(),
         HirExpr::Task { block, ty, .. } => {
             visitor.visit_type_id(*ty)?;
             for s in block { visitor.visit_hir_stmt(s)?; }

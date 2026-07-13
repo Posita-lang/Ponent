@@ -189,6 +189,7 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
             visitor.visit_expr(body)
         }
         Expr::Error(_) => V::Result::output(),
+        Expr::CompileError(_, _) => V::Result::output(),
         Expr::TypeInfo(ty, _) => visitor.visit_ty(ty),
     }
 }
@@ -449,7 +450,7 @@ pub trait MutVisitor: Sized {
 
 pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
     match expr {
-        Expr::Literal(_, _) | Expr::Ident(_, _) | Expr::Path(_, _) | Expr::Task { .. } | Expr::Error(_) | Expr::TypeInfo(_, _) => {}
+        Expr::Literal(_, _) | Expr::Ident(_, _) | Expr::Path(_, _) | Expr::Task { .. } | Expr::Error(_) | Expr::CompileError(_, _) | Expr::TypeInfo(_, _) => {}
         Expr::TypeAnnotated { expr: e, ty: _, .. } => visitor.visit_expr_mut(e),
         Expr::BinaryOp { left, right, .. } => {
             visitor.visit_expr_mut(left);
