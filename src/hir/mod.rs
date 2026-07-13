@@ -11,6 +11,10 @@ mod traits;
 mod types;
 pub mod visit;
 
+// (｡•̀ᴗ-)✧  Waku waku!  Only compiles in debug builds.
+#[cfg(debug_assertions)]
+pub mod anya;
+
 pub use checker::*;
 pub use comptime::*;
 pub use generate::*;
