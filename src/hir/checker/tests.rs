@@ -2072,3 +2072,48 @@ fn test_generic_constraint_parses_and_resolves() {
         result.err()
     );
 }
+
+// ── Tuple subject in where clause (Track‑B) ──────────────────────
+
+#[test]
+fn test_where_tuple_subject_parses_and_resolves() {
+    // `where (T, U): Rel` with a multi-param constraint should parse,
+    // resolve, and type-check without crashing.  The positional
+    // substitution maps constraint params to tuple elements.
+    let result = check_source(
+        "
+            trait Foo { }
+            trait Bar { }
+            impl Foo for Int<32> { }
+            impl Bar for Bool { }
+            constraint Rel<T, U> { T: Foo, U: Bar }
+            def rel_fn<X, Y>(x: X, y: Y) -> Y where (X, Y): Rel { return y; }
+            def main() -> Bool {
+                return rel_fn(42, true);
+            }
+        ",
+    );
+    assert!(
+        result.is_ok(),
+        "tuple subject in where clause should not crash: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_where_tuple_subject_direct_trait_rejected() {
+    // Applying a direct trait bound (not a constraint alias) to a
+    // tuple subject should be rejected — it's ambiguous.
+    let result = check_source(
+        "
+            trait Foo { }
+            def bad_fn<X, Y>(x: X, y: Y) where (X, Y): Foo { }
+            def main() -> Int<32> { return 0; }
+        ",
+    );
+    assert!(
+        result.is_err(),
+        "direct trait bound on tuple subject should be rejected: {:?}",
+        result
+    );
+}

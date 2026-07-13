@@ -665,46 +665,117 @@ impl<'a> TypeChecker<'a> {
                 // so the solver can verify trait bounds on generic parameters.
                 // Also expand constraint aliases (e.g. `where C: SortableContainer`
                 // → Impl(C, Container) + Impl(C::Item, Ord) + ...).
+                //
+                // Track‑B (Tuple subjects):
+                //   `where (X, Y): Rel` with `constraint Rel<T, U> { T: Foo<U> }`
+                //   builds Subst{ 0 → X, 1 → Y }, substitutes every predicate's
+                //   subject and bounds, and emits Impl(substituted_subject, trait, span).
                 if let Some(wc) = where_clause {
                     for pred in &wc.predicates {
-                        let pred_ty = guard.checker.resolve_type(&pred.ty)?;
+                        // Resolve the subject(s).  A `Type::Tuple` means
+                        // `where (A, B, …): Bound` — resolve each element.
+                        let subject_tys: Vec<TypeId> =
+                            if let Type::Tuple(elems, _) = &pred.ty {
+                                elems
+                                    .iter()
+                                    .map(|e| guard.checker.resolve_type(e))
+                                    .collect::<Result<Vec<_>, _>>()?
+                            } else {
+                                vec![guard.checker.resolve_type(&pred.ty)?]
+                            };
+
                         for bound in &pred.bounds {
+                            // ── Direct trait bound ──────────────────────────
                             if let Some(trait_id) = guard.checker.resolve_trait_path(bound) {
-                                guard
-                                    .checker
-                                    .add_constraint(Constraint::Impl(pred_ty, trait_id, pred.span));
-                            } else if let Some(name) = TypeChecker::extract_bound_name(bound) {
-                                if let Some(constraint) = guard.checker.symbols.lookup_constraint(name) {
-                                    // Build a substitution that maps the constraint's own
-                                    // generic params (e.g. `T` in `constraint Foo<T> { ... }`)
-                                    // to the actual constrained type (`pred_ty`).
-                                    let mut subst = crate::hir::types::Subst::new();
-                                    for (i, _) in constraint.params.iter().enumerate() {
-                                        subst.insert(i, pred_ty);
-                                    }
-                                    for predicate in &constraint.predicates {
-                                        for &bound_ty in &predicate.bounds {
-                                            let substituted =
-                                                guard.checker.ctx.subst(bound_ty, &subst);
-                                            if let Some(trait_id) =
-                                                guard.checker.ctx.get_def_id_for_type(substituted)
-                                            {
-                                                guard.checker.add_constraint(
-                                                    Constraint::Impl(pred_ty, trait_id, pred.span),
-                                                );
-                                            } else {
-                                                // The substituted bound does not resolve
-                                                // to a known trait — emit a warning so the
-                                                // user knows the bound is ineffective.
-                                                guard.checker.diagnostics.push(
-                                                    Diagnostic::warning(format!(
-                                                        "bound `{:?}` does not resolve to a trait",
-                                                        bound
-                                                    ))
-                                                    .with_span(pred.span),
-                                                );
-                                            }
-                                        }
+                                if subject_tys.len() > 1 {
+                                    // A single trait bound applied to multiple
+                                    // types is ambiguous — reject it.
+                                    guard.checker.diagnostics.push(
+                                        Diagnostic::error(
+                                            "a single trait bound cannot be applied \
+                                             to multiple types in a tuple subject; \
+                                             use separate `where` clauses"
+                                        )
+                                        .with_code_str("E004")
+                                        .with_span(pred.span),
+                                    );
+                                } else {
+                                    guard.checker.add_constraint(
+                                        Constraint::Impl(
+                                            subject_tys[0],
+                                            trait_id,
+                                            pred.span,
+                                        ),
+                                    );
+                                }
+                                continue;
+                            }
+
+                            // ── Constraint alias ────────────────────────────
+                            let Some(name) = TypeChecker::extract_bound_name(bound)
+                            else { continue };
+
+                            let Some(constraint) =
+                                guard.checker.symbols.lookup_constraint(name)
+                            else { continue };
+
+                            // Validate arity: tuple-element count must match
+                            // the constraint's type-param count.
+                            if subject_tys.len() != constraint.params.len() {
+                                guard.checker.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "constraint `{}` expects {} type parameter(s), \
+                                         but {} {} given",
+                                        name,
+                                        constraint.params.len(),
+                                        subject_tys.len(),
+                                        if subject_tys.len() > 1 {
+                                            "were"
+                                        } else {
+                                            "was"
+                                        },
+                                    ))
+                                    .with_code_str("E004")
+                                    .with_span(pred.span),
+                                );
+                                continue;
+                            }
+
+                            // Build a positional substitution:
+                            //   Subst{ 0 → subject_tys[0], 1 → subject_tys[1], … }
+                            let mut subst = crate::hir::types::Subst::new();
+                            for (i, &ty) in subject_tys.iter().enumerate() {
+                                subst.insert(i, ty);
+                            }
+
+                            for cp in &constraint.predicates {
+                                // Substitute the predicate's subject too, so
+                                // that generic-param references in the subject
+                                // (or bounds) are replaced by the actual types.
+                                let subst_subject =
+                                    guard.checker.ctx.subst(cp.subject, &subst);
+                                for &bound_ty in &cp.bounds {
+                                    let substituted =
+                                        guard.checker.ctx.subst(bound_ty, &subst);
+                                    if let Some(trait_id) =
+                                        guard.checker.ctx.get_def_id_for_type(substituted)
+                                    {
+                                        guard.checker.add_constraint(
+                                            Constraint::Impl(
+                                                subst_subject,
+                                                trait_id,
+                                                pred.span,
+                                            ),
+                                        );
+                                    } else {
+                                        guard.checker.diagnostics.push(
+                                            Diagnostic::warning(format!(
+                                                "bound `{:?}` does not resolve \
+                                                 to a trait",
+                                                bound
+                                            ))
+                                            .with_span(pred.span),
+                                        );
                                     }
                                 }
                             }

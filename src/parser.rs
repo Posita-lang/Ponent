@@ -5229,6 +5229,31 @@ mod tests {
     }
 
     #[test]
+    fn test_where_tuple_subject() {
+        // Track‑B: `where (T, U): Constraint` syntax — tuple subjects
+        // in where clauses apply a multi-type constraint positionally.
+        let src = "def f<T, U>(x: T, y: U) where (T, U): MyConstraint { }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+        match &program.items[0] {
+            Stmt::FunctionDef { where_clause, .. } => {
+                let wc = where_clause.as_ref()
+                    .expect("where clause should be parsed");
+                assert_eq!(wc.predicates.len(), 1);
+                // Subject should be a tuple type
+                assert!(
+                    matches!(&wc.predicates[0].ty, Type::Tuple(_, _)),
+                    "subject should be a tuple, got {:?}",
+                    wc.predicates[0].ty
+                );
+                // The bound should be the constraint name
+                assert_eq!(wc.predicates[0].bounds.len(), 1);
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
     fn test_keyword_as_path_ident() {
         // Track‑A: keyword tokens are accepted after `::` as identifiers.
         // `default`, `move`, `copy`, `type`, `Self` are keywords that can
