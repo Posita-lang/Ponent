@@ -3,6 +3,10 @@ name = "ponent"
 version = "0.0.0"
 edition = "2024"
 
+[features]
+default = []
+omniml_pool = []
+
 [dependencies]
 bitflags = "2.13.0"
 clap = { version = "4.6.1", features = ["derive"] }

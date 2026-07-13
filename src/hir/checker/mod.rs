@@ -327,21 +327,35 @@ impl<'a> TypeChecker<'a> {
         // a safety net for any `Generate` nodes that might survive — but in
         // normal operation the list should already be fully expanded.)
         // Solve all queued constraints, finalize inference variables,
-        // and commit the transaction. On failure the transaction is
+        // and commit the transaction.  On failure the transaction is
         // rolled back and the region tree is restored to its pre-scope state.
-        {
-            let (prev, saved_tree) = self.infer_stack.pop().expect(
-                "check_program: infer_stack is empty — \
-                 enter_inference_scope was never called",
-            );
-            let mut current = mem::replace(&mut self.infer, prev);
-            if let Err(diags) = self.solve_current_ctx(&mut current) {
+        // Generalization runs AFTER commit so that its side-effects
+        // (gen_statuses, pool membership) are not split across a transaction
+        // boundary — if the commit failed, there is nothing to roll back.
+        let (prev, saved_tree) = self.infer_stack.pop().expect(
+            "check_program: infer_stack is empty — \
+             enter_inference_scope was never called",
+        );
+        let mut current = mem::replace(&mut self.infer, prev);
+        let result = self.solve_current_ctx(&mut current);
+        match result {
+            Ok(()) => {
+                self.ctx.commit_transaction();
+                // Generalize all regions (OmniML §6 force_root_generalization),
+                // AFTER the transaction is committed.  This is safe because
+                // generalization only mutates the inference context (gen_statuses,
+                // pools), which will be discarded along with `current` when this
+                // function returns.  The TypeContext bindings are already finalized
+                // by commit_transaction and are not affected by generalization.
+                let _generalized = current.force_root_generalization(self.ctx);
+            }
+            Err(diags) => {
                 self.ctx.rollback_transaction();
+                current.region_tree.rollback_pool();
                 self.region_tree = saved_tree;
                 return Err(diags);
             }
         }
-        self.ctx.commit_transaction();
 
         if self.diagnostics.has_errors() {
             Err(mem::take(&mut self.diagnostics))

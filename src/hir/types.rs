@@ -441,12 +441,13 @@ impl TypeContext {
     }
 
     pub fn alloc(&mut self, data: TypeData) -> TypeId {
-        // InferVar types must NOT be cached: the same id value can be reused
-        // across inference scopes (each function body gets a fresh
-        // InferenceContext with next_var_id = 0).  Caching would cause the
-        // second function body to get the same TypeId as the first, but with
-        // stale bindings still attached.
-        if !matches!(data, TypeData::InferVar { .. }) {
+        // Types that transitively contain any InferVar must NOT be cached:
+        // the same InferVar id can be reused across inference scopes, but
+        // the old bindings would leak into the new scope.  A top-level
+        // InferVar is already excluded below; we also need to exclude any
+        // composite type (Fn, Adt, Tuple, etc.) that embeds an InferVar.
+        let can_cache = !self.type_contains_infer_var(&data);
+        if can_cache {
             if let Some(&id) = self.type_map.get(&data) {
                 return id;
             }
@@ -455,10 +456,74 @@ impl TypeContext {
         let index = self.types.len();
         let id = TypeId((index << TypeId::TAG_BITS) | tag);
         self.types.push(Arc::new(data.clone()));
-        if !matches!(data, TypeData::InferVar { .. }) {
+        if can_cache {
             self.type_map.insert(data, id);
         }
         id
+    }
+
+    /// Check whether a `TypeData` transitively contains any `InferVar`.
+    /// Needed to prevent interning types that embed inference variables
+    /// across scopes — a composite type containing an InferVar from a
+    /// previous scope would carry stale bindings into the new scope.
+    fn type_contains_infer_var(&self, data: &TypeData) -> bool {
+        match data {
+            TypeData::InferVar { .. } => true,
+            // Leaf / primitive types never contain InferVar
+            TypeData::Int { .. }
+            | TypeData::UInt { .. }
+            | TypeData::Float { .. }
+            | TypeData::Bool
+            | TypeData::Char
+            | TypeData::Byte
+            | TypeData::USize
+            | TypeData::Unit
+            | TypeData::Never
+            | TypeData::Error
+            | TypeData::Rational { .. }
+            | TypeData::GenericParam { .. }
+            | TypeData::SkolemVar { .. } => false,
+            // Composite types: check each child TypeId
+            TypeData::Fn { params, ret } => {
+                params.iter().any(|&p| self.type_contains_infer_var_by_id(p))
+                    || self.type_contains_infer_var_by_id(*ret)
+            }
+            TypeData::Adt { args, .. } => {
+                args.iter().any(|&a| self.type_contains_infer_var_by_id(a))
+            }
+            TypeData::Tuple { elems } => {
+                elems.iter().any(|&e| self.type_contains_infer_var_by_id(e))
+            }
+            TypeData::Array { elem, .. } => self.type_contains_infer_var_by_id(*elem),
+            TypeData::Slice { elem } => self.type_contains_infer_var_by_id(*elem),
+            TypeData::Ref { ty, .. } => self.type_contains_infer_var_by_id(*ty),
+            TypeData::Pointer { ty } => self.type_contains_infer_var_by_id(*ty),
+            TypeData::Ptr { size, pointee } => {
+                self.type_contains_infer_var_by_id(*size)
+                    || self.type_contains_infer_var_by_id(*pointee)
+            }
+            TypeData::Forall { body, .. }
+            | TypeData::Exists { base: body, .. }
+            | TypeData::Poly { body, .. }
+            | TypeData::Mu { body, .. }
+            | TypeData::Nu { body, .. } => self.type_contains_infer_var_by_id(*body),
+            TypeData::Coproduct { alternatives } => {
+                alternatives.iter().any(|&a| self.type_contains_infer_var_by_id(a))
+            }
+            TypeData::AssociatedType { self_ty, .. } => {
+                self.type_contains_infer_var_by_id(*self_ty)
+            }
+            TypeData::DynTrait { .. } => false,
+        }
+    }
+
+    /// Look up a TypeId and check if its TypeData transitively contains
+    /// an InferVar.  Recursive helper for `type_contains_infer_var`.
+    fn type_contains_infer_var_by_id(&self, id: TypeId) -> bool {
+        let resolved = self.resolve_binding(id);
+        // Don't re-check the same TypeId — use the types array directly
+        // to avoid infinite recursion from cyclic bindings.
+        self.type_contains_infer_var(&self.types[resolved.index()])
     }
 
     pub fn get(&self, id: TypeId) -> &TypeData {
