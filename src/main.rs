@@ -26,7 +26,7 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 use clap::Parser;
-use diagnostics::{ColoredEmitter, Diagnostic, DiagnosticEmitter};
+use diagnostics::{ColoredEmitter, Diagnostic, DiagnosticEmitter, JsonEmitter};
 use hir::checker::TypeChecker;
 use hir::resolver::NameResolver;
 use hir::types::{CrateId, DefId, TypeContext};
@@ -41,6 +41,14 @@ fn attach_source_to_diags(diags: &mut [Diagnostic], source: &str) {
         if diag.source.is_none() {
             diag.source = Some(source.to_string());
         }
+    }
+}
+
+fn make_emitter(json: bool) -> Box<dyn DiagnosticEmitter> {
+    if json {
+        Box::new(JsonEmitter::new_compact())
+    } else {
+        Box::new(ColoredEmitter::new())
     }
 }
 
@@ -61,7 +69,7 @@ fn main() {
                 }
             }
         }
-        cli::Command::Parse { file, ast } => {
+        cli::Command::Parse { file, ast, json } => {
             let source = fs::read_to_string(&file).expect("failed to read file");
             let mut parser = parser::Parser::new(&source);
             match parser.parse_program() {
@@ -107,7 +115,7 @@ fn main() {
                                     Err(errors) => {
                                         let mut diags = errors.into_inner();
                                         attach_source_to_diags(&mut diags, &source);
-                                        let mut emitter = ColoredEmitter::new();
+                                        let mut emitter = make_emitter(json);
                                         emitter.emit_all(&diags);
                                         process::exit(1);
                                     }
@@ -116,7 +124,7 @@ fn main() {
                             Err(errors) => {
                                 let mut diags = errors.into_inner();
                                 attach_source_to_diags(&mut diags, &source);
-                                let mut emitter = ColoredEmitter::new();
+                                let mut emitter = make_emitter(json);
                                 emitter.emit_all(&diags);
                                 process::exit(1);
                             }
@@ -125,7 +133,7 @@ fn main() {
                 }
                 Err(mut diagnostics) => {
                     attach_source_to_diags(&mut diagnostics, &source);
-                    let mut emitter = ColoredEmitter::new();
+                    let mut emitter = make_emitter(json);
                     emitter.emit_all(&diagnostics);
                     process::exit(1);
                 }

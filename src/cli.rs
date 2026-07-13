@@ -18,5 +18,7 @@ pub enum Command {
         file: String,
         #[arg(long)]
         ast: bool,
+        #[arg(long, help = "Output diagnostics as JSON (instead of colored text)")]
+        json: bool,
     },
 }

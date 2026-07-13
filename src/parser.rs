@@ -646,7 +646,7 @@ impl Parser {
                     .with_span(self.span(),);
                 // "Did you mean?" for common keyword typos (Rust-style)
                 if let Some(Token::Ident(name)) = &tok {
-                    if let Some(suggestion) = did_you_mean_keyword(&name.as_str()) {
+                    if let Some(suggestion) = did_you_mean_keyword(&name.as_str(), KeywordContext::TopLevel) {
                         diag = diag.with_suggestion(suggestion);
                     } else {
                         diag = diag.with_suggestion("move this token inside a function body, or start a new top-level declaration");
@@ -1651,10 +1651,17 @@ impl Parser {
                             .with_span(self.span())),
                     }
                 }
+                Ok(Token::Ident(name)) => Err(Diagnostic::error(format!("expected type, found `{}`", name))
+                    .with_code_str("E004")
+                    .with_help("expected a valid type expression — try `Int<32>`, `&T`, `[T]`, `(A, B)`, etc.")
+                    .with_suggestion(
+                        did_you_mean_keyword(&name.as_str(), KeywordContext::Type)
+                            .unwrap_or_else(|| "use a type name like `Int<32>`, `Bool`, or `String`".into())
+                    )
+                    .with_span(self.span(),)),
                 Ok(tok) => Err(Diagnostic::error(format!("expected type, found {:?}", tok))
                     .with_code_str("E004")
                     .with_help("expected a valid type expression — try `Int<32>`, `&T`, `[T]`, `(A, B)`, etc.")
-                    .with_suggestion("use a type name like `Int<32>`, `Bool`, or `String`")
                     .with_span(self.span(),)),
                 Err(()) => Err(Diagnostic::error("unexpected end of file in type")
                     .with_code_str("E002")
@@ -3354,6 +3361,14 @@ impl Parser {
                 }
                 Ok(Pattern::Tuple(patterns, Span::new(start, self.span().end)))
             }
+            Token::Ident(name) => Err(Diagnostic::error(format!("expected pattern, found `{}`", name))
+                .with_code_str("E004")
+                .with_help("expected a valid pattern — try a literal, variable name, `_`, struct pattern, or tuple pattern")
+                .with_suggestion(
+                    did_you_mean_keyword(&name.as_str(), KeywordContext::Expression)
+                        .unwrap_or_else(|| "try `x`, `_`, `42`, `true`, `Point { x, y }`, or `Some(val)`".into())
+                )
+                .with_span(self.span(),)),
             _ => Err(Diagnostic::error("expected pattern")
                 .with_code_str("E004")
                 .with_help("expected a valid pattern — try a literal, variable name, `_`, struct pattern, or tuple pattern")
@@ -3860,6 +3875,14 @@ impl Parser {
                         .with_span(self.span()))
                 }
             }
+            Ok(Token::Ident(name)) => Err(Diagnostic::error(format!("expected expression, found `{}`", name))
+                .with_code_str("E007")
+                .with_help("expected a valid expression — try a literal, variable, `if`, `match`, `|...| { }` closure, or prefix operator")
+                .with_suggestion(
+                    did_you_mean_keyword(&name.as_str(), KeywordContext::Expression)
+                        .unwrap_or_else(|| "try `42`, `true`, `x`, `if cond { a } else { b }`, or `|x| { x + 1 }`".into())
+                )
+                .with_span(self.span(),)),
             _ => Err(Diagnostic::error("expected expression")
                 .with_code_str("E007")
                 .with_help("expected a valid expression — try a literal, variable, `if`, `match`, `|...| { }` closure, or prefix operator")
@@ -4664,25 +4687,84 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b_len]
 }
 
+/// The syntactic context in which keyword suggestions are made.
+/// Restricts the keyword candidate set to reduce false positives.
+#[derive(Clone, Copy)]
+pub enum KeywordContext {
+    /// Top-level item position: expects `def`, `type`, `trait`, `import`, etc.
+    TopLevel,
+    /// Expression position: expects `if`, `while`, `match`, `return`, etc.
+    Expression,
+    /// Statement position: expects `set`, `let`, `return`, `leave`, etc.
+    Statement,
+    /// Type position: expects `Int`, `Bool`, `ref`, etc.
+    Type,
+    /// Fallback: all keywords.
+    Generic,
+}
+
 /// Suggest a close-matching keyword when an unknown identifier is encountered.
 /// Returns `Some("did you mean `def`?")` or similar.
-fn did_you_mean_keyword(input: &str) -> Option<String> {
-    let keywords = [
-        "def", "type", "trait", "import", "from", "edition",
-        "constraint", "extern", "impl", "comptime", "async",
-        "set", "let", "if", "else", "while", "for", "return",
-        "leave", "continue", "match", "ghost", "propagates", "overrides",
-        "trigger", "scope_cleanup", "true", "false",
-    ];
+///
+/// `context` restricts the candidate keyword set to the current syntactic
+/// position, so that e.g. `fn` at top level suggests `def` rather than `for`.
+fn did_you_mean_keyword(input: &str, context: KeywordContext) -> Option<String> {
+    let keywords: &[&str] = match context {
+        KeywordContext::TopLevel => &[
+            "def", "type", "trait", "import", "from", "edition",
+            "constraint", "extern", "impl", "comptime", "async",
+            "set", "let", "layout", "generate",
+        ],
+        KeywordContext::Expression => &[
+            "true", "false", "if", "else", "match", "for", "while",
+            "return", "leave", "continue", "move", "not", "and", "or",
+            "sizeof", "alignof", "catch", "panic", "unsafe", "old",
+            "exists", "forall", "poly", "unbox", "await", "task",
+        ],
+        KeywordContext::Statement => &[
+            "set", "let", "return", "leave", "continue",
+            "if", "else", "while", "for", "unsafe",
+            "ghost", "scope_cleanup", "trigger", "isolate",
+        ],
+        KeywordContext::Type => &[
+            "Int", "UInt", "Float", "Bool", "Char", "Byte",
+            "USize", "Unit", "Never", "Rational",
+            "dyn", "ref", "mut",
+        ],
+        KeywordContext::Generic => &[
+            "def", "type", "trait", "import", "from", "edition",
+            "constraint", "extern", "impl", "comptime", "async",
+            "set", "let", "if", "else", "while", "for", "return",
+            "leave", "continue", "match", "ghost", "propagates", "overrides",
+            "trigger", "scope_cleanup", "true", "false",
+        ],
+    };
     let input_lower = input.to_lowercase();
+    let first = input_lower.chars().next();
     let mut best = None;
-    for &kw in &keywords {
+    // Strict pass: first-char match + distance <= 2
+    for &kw in keywords {
         let d = edit_distance(&input_lower, kw);
-        if d <= 2 && input_lower.chars().next() == kw.chars().next() {
+        if d <= 2 && first == kw.chars().next() {
             match best {
                 None => best = Some((kw, d)),
                 Some((_, db)) if d < db => best = Some((kw, d)),
                 _ => {}
+            }
+        }
+    }
+    // Lenient pass: if no candidate found, allow wider distance for short inputs.
+    // This catches cases like `fn` → `def` (distance 3, but the only sensible match).
+    if best.is_none() {
+        for &kw in keywords {
+            let d = edit_distance(&input_lower, kw);
+            let threshold = input.len().max(3);
+            if d <= threshold {
+                match best {
+                    None => best = Some((kw, d)),
+                    Some((_, db)) if d < db => best = Some((kw, d)),
+                    _ => {}
+                }
             }
         }
     }
@@ -4706,6 +4788,13 @@ mod tests {
             }
             Err(diags) => panic!("parse failed with diagnostics: {:?}", diags),
         }
+    }
+
+    fn check_parse_err(source: &str) -> Vec<Diagnostic> {
+        let mut parser = Parser::new(source);
+        parser.parse_program().err().unwrap_or_else(|| {
+            panic!("expected parse error, but parsing succeeded: {:?}", parser.diagnostics)
+        })
     }
 
     #[test]
@@ -4904,6 +4993,22 @@ mod tests {
     fn test_pattern_literal() {
         let program = check_parse("def main() { match x { 1 => {}, _ => {} }; }");
         assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_keyword_suggestion_toplevel_fn() {
+        let diags = check_parse_err("fn main(){}");
+        let has = diags.iter().any(|d| d.suggestions.iter().any(|s| s.contains("def")));
+        assert!(has, "expected 'did you mean `def`?' for `fn`, got: {:?}", diags);
+    }
+
+    #[test]
+    fn test_keyword_suggestion_pattern_frue() {
+        // A non-identifier token in pattern position triggers the suggestion path.
+        // Users might accidentally type `Frue` (inspired by `fn` → `def` style typos).
+        let diags = check_parse_err("def main() { match x { $ => {} }; }");
+        let has = diags.iter().any(|d| d.suggestions.iter().any(|s| s.contains("try")));
+        assert!(has, "expected a suggestion for bad pattern token, got: {:?}", diags);
     }
 
     #[test]
