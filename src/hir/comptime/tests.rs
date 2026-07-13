@@ -9,11 +9,11 @@ fn make_int_val(n: i128, ty: TypeId) -> HirExpr {
 }
 
 fn make_int(n: i128) -> HirExpr {
-    make_int_val(n, TypeId(0))
+    make_int_val(n, TypeId::NONE)
 }
 
 fn make_bool(b: bool) -> HirExpr {
-    HirExpr::Literal(Literal::Bool(b), TypeId(0), Span::new(0, 0))
+    HirExpr::Literal(Literal::Bool(b), TypeId::NONE, Span::new(0, 0))
 }
 
 fn make_binop_ty(l: HirExpr, op: BinOp, r: HirExpr, ty: TypeId) -> HirExpr {
@@ -27,7 +27,7 @@ fn make_binop_ty(l: HirExpr, op: BinOp, r: HirExpr, ty: TypeId) -> HirExpr {
 }
 
 fn make_binop(l: HirExpr, op: BinOp, r: HirExpr) -> HirExpr {
-    make_binop_ty(l, op, r, TypeId(0))
+    make_binop_ty(l, op, r, TypeId::NONE)
 }
 
 /// Create an Int<32> type and wrap a value in a Literal with that type.
@@ -45,7 +45,7 @@ fn make_binop32(ctx: &mut TypeContext, l: HirExpr, op: BinOp, r: HirExpr) -> Hir
 fn make_block(stmts: Vec<HirStmt>, last: HirExpr) -> HirExpr {
     let mut all = stmts;
     all.push(HirStmt::Expression(Box::new(last)));
-    HirExpr::Block(all, TypeId(0), Span::new(0, 0))
+    HirExpr::Block(all, TypeId::NONE, Span::new(0, 0))
 }
 
 fn make_if(cond: HirExpr, then: HirExpr, els: Option<HirExpr>) -> HirExpr {
@@ -56,7 +56,7 @@ fn make_if(cond: HirExpr, then: HirExpr, els: Option<HirExpr>) -> HirExpr {
         then_branch: then_block,
         else_branch: else_block,
         is_expression: true,
-        ty: TypeId(0),
+        ty: TypeId::NONE,
         span: Span::new(0, 0),
     }
 }
@@ -213,7 +213,7 @@ fn test_eval_variable_def() {
         pattern: None,
         else_branch: None,
         kind: crate::ast::VariableKind::Set,
-        ty: TypeId(0),
+        ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
         span: Span::new(0, 0),
@@ -231,7 +231,7 @@ fn test_eval_variable_assign() {
     ec.variables.insert("x".into(), ComptimeValue::Int(10));
 
     let assign = HirStmt::Assign {
-        target: Box::new(HirExpr::Ident("x".into(), TypeId(0), Span::new(0, 0))),
+        target: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
         value: Box::new(make_int(20)),
         op: None,
         span: Span::new(0, 0),
@@ -248,7 +248,7 @@ fn test_eval_assign_unknown_variable() {
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
 
     let assign = HirStmt::Assign {
-        target: Box::new(HirExpr::Ident("nonexistent".into(), TypeId(0), Span::new(0, 0))),
+        target: Box::new(HirExpr::Ident("nonexistent".into(), TypeId::NONE, Span::new(0, 0))),
         value: Box::new(make_int(20)),
         op: None,
         span: Span::new(0, 0),
@@ -266,7 +266,7 @@ fn test_eval_ident_resolves_local_var() {
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
     ec.variables.insert("x".into(), ComptimeValue::Int(99));
 
-    let expr = HirExpr::Ident("x".into(), TypeId(0), Span::new(0, 0));
+    let expr = HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0));
     let r = ec.eval_expr(&expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(99))));
 }
@@ -277,7 +277,7 @@ fn test_eval_ident_unknown() {
     let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(crate::hir::types::DefId(0)));
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
 
-    let expr = HirExpr::Ident("unknown".into(), TypeId(0), Span::new(0, 0));
+    let expr = HirExpr::Ident("unknown".into(), TypeId::NONE, Span::new(0, 0));
     let r = ec.eval_expr(&expr);
     assert!(matches!(r, Err(ComptimeError::UnknownIdentifier(_))));
 }
@@ -320,10 +320,10 @@ fn test_eval_comptime_fn_call_unknown() {
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
 
     let call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("undefined_fn".into(), TypeId(0), Span::new(0, 0))),
+        callee: Box::new(HirExpr::Ident("undefined_fn".into(), TypeId::NONE, Span::new(0, 0))),
         args: vec![],
         comptime: true,
-        ty: TypeId(0),
+        ty: TypeId::NONE,
         span: Span::new(0, 0),
     };
     let r = ec.eval_expr(&call);
@@ -416,7 +416,7 @@ fn test_eval_fn_call_scope_isolation() {
 
     // Register a function that assigns to its own param, not the outer scope
     let body = vec![HirStmt::Assign {
-        target: Box::new(HirExpr::Ident("x".into(), TypeId(0), Span::new(0, 0))),
+        target: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
         value: Box::new(make_int(99)),
         op: None,
         span: Span::new(0, 0),
@@ -424,10 +424,10 @@ fn test_eval_fn_call_scope_isolation() {
     ec.register_fn("mutate_x".into(), vec!["x".into()], body);
 
     let call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("mutate_x".into(), TypeId(0), Span::new(0, 0))),
+        callee: Box::new(HirExpr::Ident("mutate_x".into(), TypeId::NONE, Span::new(0, 0))),
         args: vec![make_int(10)],
         comptime: true,
-        ty: TypeId(0),
+        ty: TypeId::NONE,
         span: Span::new(0, 0),
     };
     let _ = ec.eval_expr(&call);

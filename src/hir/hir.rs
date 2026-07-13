@@ -438,9 +438,9 @@ impl HirExpr {
             HirExpr::Quantified { ty, .. } => *ty,
             HirExpr::Old { ty, .. } => *ty,
             HirExpr::Task { ty, .. } => *ty,
-            HirExpr::TypeInfo(_, _) => TypeId(0),
-            HirExpr::CompileError(_, _) => TypeId(0),
-            HirExpr::Error(_) => TypeId(0),
+            HirExpr::TypeInfo(_, _) => TypeId::NONE,
+            HirExpr::CompileError(_, _) => TypeId::NONE,
+            HirExpr::Error(_) => TypeId::NONE,
         }
     }
 

@@ -3270,13 +3270,13 @@ mod tests {
         let c = Constraint::Let {
             expr_var: "x".into(),
             def_constraint: Box::new(Constraint::Eq(
-                TypeId(0),
-                TypeId(1),
+                TypeId::from_raw(1),
+                TypeId::from_raw(2),
                 crate::ast::Span::new(0, 0),
             )),
             body_constraint: Box::new(Constraint::Eq(
-                TypeId(0),
-                TypeId(0),
+                TypeId::from_raw(1),
+                TypeId::from_raw(1),
                 crate::ast::Span::new(0, 0),
             )),
             span: crate::ast::Span::new(0, 0),

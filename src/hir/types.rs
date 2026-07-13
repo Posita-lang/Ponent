@@ -2,6 +2,7 @@ use rustc_hash::FxHashMap as HashMap;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::ast::OverflowPolicy;
@@ -33,7 +34,7 @@ impl Edition {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TypeId(pub usize);
+pub struct TypeId(NonZeroUsize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(usize)]
@@ -119,12 +120,46 @@ impl TypeId {
     /// The maximum discriminant value that fits in TAG_BITS.
     const TAG_MAX: usize = Self::TAG_MASK;
 
+    /// Sentinel representing "no type" (error nodes, untyped expressions).
+    /// Occupies the `NonZeroUsize` niche so that `Option<TypeId>` is 8 bytes
+    /// instead of 16 — every type allocated through `TypeContext::alloc` has
+    /// `raw >= 32` (since `index` is offset by 1), leaving values 1..31 as
+    /// niche candidates.
+    pub const NONE: TypeId = TypeId(unsafe { NonZeroUsize::new_unchecked(1) });
+
+    /// Create a `TypeId` from a raw encoded value.
+    /// Panics if `raw` is zero (which can never be a valid `NonZeroUsize`).
+    #[inline]
+    pub fn from_raw(raw: usize) -> Self {
+        TypeId(NonZeroUsize::new(raw).expect("TypeId raw value must be non-zero"))
+    }
+
+    /// Return the raw underlying encoded value.
+    #[inline]
+    pub fn raw(self) -> usize {
+        self.0.get()
+    }
+
+    /// Decode the arena index.
+    ///
+    /// The index stored in the raw encoding is biased by +1 so that the
+    /// base value is never zero (guaranteeing `NonZeroUsize` validity).
+    /// This method subtracts the bias to recover the true 0-based index.
     pub fn index(self) -> usize {
-        self.0 >> Self::TAG_BITS
+        debug_assert!(
+            self.0.get() > Self::TAG_MASK,
+            "TypeId::index() called on sentinel NONE"
+        );
+        (self.0.get() >> Self::TAG_BITS) - 1
     }
 
     pub fn tag(self) -> TypeTag {
-        let tag_val = self.0 & Self::TAG_MASK;
+        let raw = self.0.get();
+        debug_assert!(
+            raw > Self::TAG_MASK,
+            "TypeId::tag() called on sentinel NONE"
+        );
+        let tag_val = raw & Self::TAG_MASK;
         // Catch tag overflow in debug builds: if a new TypeTag variant pushes
         // the discriminant past TAG_MAX, this assert fires immediately rather
         // than silently producing an invalid transmute.
@@ -384,15 +419,15 @@ impl TypeContext {
             bindings: RefCell::new(HashMap::default()),
             meta: HashMap::default(),
             def_id_to_type_id: HashMap::default(),
-            builtin_unit: TypeId(0),
-            builtin_never: TypeId(0),
-            builtin_error: TypeId(0),
-            builtin_bool: TypeId(0),
-            builtin_char: TypeId(0),
-            builtin_byte: TypeId(0),
-            builtin_usize: TypeId(0),
-            builtin_str: TypeId(0),
-            builtin_str_ref: TypeId(0),
+            builtin_unit: TypeId::NONE,
+            builtin_never: TypeId::NONE,
+            builtin_error: TypeId::NONE,
+            builtin_bool: TypeId::NONE,
+            builtin_char: TypeId::NONE,
+            builtin_byte: TypeId::NONE,
+            builtin_usize: TypeId::NONE,
+            builtin_str: TypeId::NONE,
+            builtin_str_ref: TypeId::NONE,
             variance_cache: RefCell::new(HashMap::default()),
             variance_edges: RefCell::new(HashMap::default()),
             transaction_stack: RefCell::new(Vec::new()),
@@ -455,7 +490,9 @@ impl TypeContext {
         }
         let tag = TypeTag::from(&data) as usize;
         let index = self.types.len();
-        let id = TypeId((index << TypeId::TAG_BITS) | tag);
+        // Offset index by +1 so the encoded raw value is never zero,
+        // enabling NonZeroUsize niche optimization for Option<TypeId>.
+        let id = TypeId::from_raw(((index + 1) << TypeId::TAG_BITS) | tag);
         self.types.push(Arc::new(data.clone()));
         if can_cache {
             self.type_map.insert(data, id);

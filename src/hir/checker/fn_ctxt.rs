@@ -1946,7 +1946,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         }
                     }
                     // Deduplicate alternatives
-                    alternatives.sort_by_key(|t| t.0);
+                    alternatives.sort_by_key(|t| t.raw());
                     alternatives.dedup();
                     if alternatives.len() == 1 {
                         Ok(alternatives[0])
