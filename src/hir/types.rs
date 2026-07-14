@@ -72,6 +72,15 @@ pub enum TypeTag {
     /// rather than separate `Struct`/`Enum` variants.
     Adt = 28,
     SkolemVar = 29,
+    /// Reserved discriminant 30 — ensures every 5-bit value maps to a valid
+    /// variant, preventing UB in `transmute<usize, TypeTag>` if a corrupt or
+    /// adversarially-constructed `TypeId` carries tag value 30.
+    #[doc(hidden)]
+    Reserved30 = 30,
+    /// Reserved discriminant 31 — same rationale as `Reserved30`; covers the
+    /// remaining bit pattern so all 32 values of the 5-bit tag field are safe.
+    #[doc(hidden)]
+    Reserved31 = 31,
 }
 
 impl From<&TypeData> for TypeTag {
@@ -113,12 +122,17 @@ impl From<&TypeData> for TypeTag {
 
 impl TypeId {
     /// Number of bits reserved for the type tag in the lower bits of TypeId.
-    /// Must be large enough to hold all TypeTag variants (currently 30, max 31
+    /// Must be large enough to hold all TypeTag variants (currently 32, max 31
     /// with 5 bits).  Bump to 6 if more than 31 variants are needed.
     pub const TAG_BITS: usize = 5;
     const TAG_MASK: usize = (1 << Self::TAG_BITS) - 1;
-    /// The maximum discriminant value that fits in TAG_BITS.
-    const TAG_MAX: usize = Self::TAG_MASK;
+    /// The last valid discriminant value (not the mask — those differ when
+    /// reserved variants fill the gap to the bit boundary).  Set to the
+    /// highest *real* variant; `Reserved30`/`Reserved31` exist only to make
+    /// every 5-bit pattern a valid `TypeTag` for transmute safety.
+    const TAG_LAST_VARIANT: usize = TypeTag::SkolemVar as usize;
+    /// Bounds check: every valid tag must be ≤ `TAG_LAST_VARIANT`.
+    const TAG_MAX: usize = Self::TAG_LAST_VARIANT;
 
     /// Sentinel representing "no type" (error nodes, untyped expressions).
     /// Occupies the `NonZeroUsize` niche so that `Option<TypeId>` is 8 bytes
@@ -127,10 +141,11 @@ impl TypeId {
     ///
     /// Chosen as `usize::MAX` so that a stray call to `tag()` or `index()`
     /// on this sentinel produces an obviously-wrong value: `tag()` returns
-    /// discriminant 31 (past the last real variant `SkolemVar = 29`), and
-    /// `index()` returns `usize::MAX >> 5 - 1`, an unreachable index.
+    /// discriminant 31 (past the last real variant `SkolemVar = 29`, but
+    /// within the reserved range `Reserved31 = 31`), and `index()` returns
+    /// `usize::MAX >> 5 - 1`, an unreachable index.
     /// Both paths are guarded by `debug_assert!` checks that fire before
-    /// any unsound transmute or index access.
+    /// any unsound action.
     pub const NONE: TypeId = TypeId(unsafe { NonZeroUsize::new_unchecked(usize::MAX) });
 
     /// Create a `TypeId` from a raw encoded value.
@@ -167,18 +182,20 @@ impl TypeId {
         );
         let tag_val = raw & Self::TAG_MASK;
         // Catch tag overflow in debug builds: if a new TypeTag variant pushes
-        // the discriminant past TAG_MAX, this assert fires immediately rather
-        // than silently producing an invalid transmute.
+        // the discriminant past TAG_LAST_VARIANT, this assert fires immediately
+        // rather than silently producing a value outside the intended range.
         debug_assert!(
             tag_val <= Self::TAG_MAX,
-            "TypeTag discriminant {} exceeds TAG_MASK={}; \
+            "TypeTag discriminant {} exceeds TAG_LAST_VARIANT={}; \
              increase TAG_BITS to accommodate more variants",
             tag_val,
-            Self::TAG_MASK,
+            Self::TAG_MAX,
         );
         // SAFETY: every TypeId created through TypeContext::alloc has a valid
-        // tag in 0..TAG_MAX, enforced by TypeTag's explicit discriminants and
-        // debug_assert above.  TAG_MASK covers all current discriminants.
+        // tag in 0..TAG_LAST_VARIANT, enforced by TypeTag's explicit discriminants
+        // and debug_assert above.  TAG_MASK covers all 5-bit patterns, and
+        // Reserved30/Reserved31 ensure that even out-of-range values (30, 31)
+        // produce a valid, albeit unreachable, variant — never UB.
         unsafe { std::mem::transmute::<usize, TypeTag>(tag_val) }
     }
 }

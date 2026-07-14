@@ -32,9 +32,16 @@ impl GuardSet {
     pub fn add_transitive_guard(&mut self, region_id: usize) { *self.transitive_guards.entry(region_id).or_insert(0) += 1; }
     pub fn remove_transitive_guard(&mut self, region_id: usize) {
         if let Some(count) = self.transitive_guards.get_mut(&region_id) {
+            debug_assert!(
+                *count > 0,
+                "remove_transitive_guard: count == 0 for region_id={} — \
+                 removal without matching addition; this is an invariant violation \
+                 that indicates a guard-set lifecycle bug",
+                region_id,
+            );
             if *count == 0 {
-                // Invariant violation: removal without matching addition.
-                // Bail out to prevent usize underflow -> silent state corruption.
+                // Usize underflow guard (release builds): prevent silent state
+                // corruption.  The debug_assert! above catches this in debug builds.
                 self.transitive_guards.remove(&region_id);
                 return;
             }
@@ -1202,8 +1209,11 @@ impl InferenceContext {
                 true
             }
             _ => {
-                self.discharge_match(ctx, scrutinee, branches_id, heap);
-                true
+                // Propagate the result — if discharge_match fails (no branch
+                // matches and no else_ fallback), the caller falls through to
+                // unicity check and re-push logic instead of silently losing
+                // the constraint.
+                self.discharge_match(ctx, scrutinee, branches_id, heap)
             }
         }
     }
@@ -2171,7 +2181,7 @@ impl InferenceContext {
                     Constraint::Match {
                         scrutinee,
                         branches_id,
-                        span: _,
+                        span: match_span,
                     } => {
                         // OmniML §4.1: Try to discharge suspended match constraints.
                         // Check unicity — if the scrutinee's shape is uniquely determined,
@@ -2181,7 +2191,16 @@ impl InferenceContext {
 
                         if !matches!(resolved_data, TypeData::InferVar { .. }) {
                             // Scrutinee is resolved — shape is known (UNI-TYPE).
-                            let _ = self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
+                            if !self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap) {
+                                // No branch matched and no else_ fallback for a
+                                // fully-resolved scrutinee.  This is a type error:
+                                // the pattern match is non-exhaustive.  Terminate
+                                // the solver immediately — re-pushing would cause
+                                // a deterministic infinite loop.
+                                return Err(TypeError::PatternNotExhaustive {
+                                    span: *match_span,
+                                });
+                            }
                         } else {
                             // Try shape variable (OmniML §6): register a callback on the
                             // scrutinee's shape variable, if any.
@@ -2202,15 +2221,21 @@ impl InferenceContext {
                                     Self::unicity_check(self, ctx, *scrutinee, &active)
                                 {
                                     // Re-push active constraints before discharging
-                                    for c in active {
-                                        heap.push(c);
+                                    for c in &active {
+                                        heap.push(c.clone());
                                     }
-                                    let _ = self.discharge_match(
+                                    if !self.discharge_match(
                                         ctx,
                                         *scrutinee,
                                         *branches_id,
                                         &mut heap,
-                                    );
+                                    ) {
+                                        // Unicity succeeded but no branch matched.
+                                        // Same as above: type error, not retryable.
+                                        return Err(TypeError::PatternNotExhaustive {
+                                            span: *match_span,
+                                        });
+                                    }
                                 } else {
                                     // Re-push active constraints
                                     for c in active {
@@ -2417,14 +2442,22 @@ impl InferenceContext {
                     // Only attempt discharge if scrutinee is resolved (not an InferVar)
                     if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
                         if let Some(shape) = Self::unicity_check(self, ctx, *scrutinee, &active) {
-                            let _discharged =
+                            let discharged =
                                 self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
+                            // If discharge succeeded, the Match constraint is still in the
+                            // original heap (we cloned above).  It will be re-processed in
+                            // the next iteration, but discharge_match is idempotent — the
+                            // continuation constraints are enqueued once and the second call
+                            // is a no-op.  If discharge failed, the constraint remains in the
+                            // heap and the convergence path below handles it.
+                            let _ = discharged;
                         }
                     } else {
                         // Scrutinee is still an InferVar — check unicity via bounds
                         if let Some(_shape) = Self::unicity_check(self, ctx, *scrutinee, &active) {
-                            let _discharged =
+                            let discharged =
                                 self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
+                            let _ = discharged;
                         }
                     }
                 }
@@ -2488,18 +2521,18 @@ impl InferenceContext {
                 // #2: Solver exhaustion — check for remaining undischarged Match
                 // constraints and fire their else_continuation as a fallback.
                 let remaining: Vec<PrioritizedConstraint> = heap.drain().collect();
-                let match_elses: Vec<(TypeId, (usize, usize))> = remaining
+                let match_elses: Vec<(TypeId, (usize, usize), crate::ast::Span)> = remaining
                     .iter()
                     .filter_map(|pc| {
                         if let Constraint::Match {
                             scrutinee,
                             branches_id,
-                            ..
+                            span,
                         } = &pc.constraint
                         {
                             let resolved = ctx.resolve_binding(*scrutinee);
                             if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
-                                Some((*scrutinee, *branches_id))
+                                Some((*scrutinee, *branches_id, *span))
                             } else {
                                 None
                             }
@@ -2509,8 +2542,20 @@ impl InferenceContext {
                     })
                     .collect();
                 let mut else_heap = BinaryHeap::new();
-                for (scrutinee, branches_id) in match_elses {
-                    self.discharge_match(ctx, scrutinee, branches_id, &mut else_heap);
+                let mut match_errors = Vec::new();
+                for (scrutinee, branches_id, match_span) in match_elses {
+                    if !self.discharge_match(ctx, scrutinee, branches_id, &mut else_heap) {
+                        // No branch matched and no else_ fallback for a fully-resolved
+                        // scrutinee.  This is a type error — the pattern match is
+                        // non-exhaustive.  Accumulate the error; the heap is about to
+                        // be dropped so pushing into it would be dead code.
+                        match_errors.push(TypeError::PatternNotExhaustive {
+                            span: match_span,
+                        });
+                    }
+                }
+                if !match_errors.is_empty() {
+                    return Err(match_errors.into_iter().next().unwrap());
                 }
                 break; // converged: no more constraints to wake
             }
@@ -3423,14 +3468,14 @@ mod tests {
 
         let int_ty = ctx.int(32, true);
         let branches = vec![MatchBranchSet {
-            shape_pattern: PrincipalShape::Arrow,
+            shape_pattern: PrincipalShape::Scalar,
             continuation: Vec::new(),
             else_continuation: Vec::new(),
         }];
         let id = infer.register_match_branches(branches);
 
         let handled = infer.try_match_via_shape_var(&mut ctx, int_ty, id, &mut heap);
-        assert!(handled, "concrete type should discharge");
+        assert!(handled, "concrete type with matching shape should discharge");
     }
 
     #[test]
