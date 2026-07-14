@@ -608,6 +608,18 @@ impl TypeContext {
         matches!(self.get(id), TypeData::InferVar { .. })
     }
 
+    /// Check if the RAW TypeId slot (ignoring bindings) is an InferVar,
+    /// and return its id if so.  Unlike `is_infer_var`, this does NOT
+    /// follow `set_binding` chains, so it correctly identifies the
+    /// original InferVar even after it has been unified with a concrete type.
+    pub(crate) fn get_infer_var_id(&self, id: TypeId) -> Option<usize> {
+        if let TypeData::InferVar { id: raw_id } = &*self.types[id.index()] {
+            Some(*raw_id)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn resolve_binding(&self, id: TypeId) -> TypeId {
         // Safety: guard against infinite loops from circular bindings.
         // 10 000 is generous enough for any real program while preventing
@@ -2071,6 +2083,12 @@ impl TypeContext {
         self.transaction_stack.borrow_mut().push(Vec::new());
     }
 
+    /// Return the current transaction nesting depth.
+    /// 0 means no transaction is active.
+    pub fn transaction_depth(&self) -> usize {
+        self.transaction_stack.borrow().len()
+    }
+
     /// Commit the current transaction: discard the undo log.
     pub fn commit_transaction(&self) {
         // Pop the current (innermost) transaction's undo log.
@@ -3146,6 +3164,7 @@ impl TypeContext {
     }
 
     /// κ1 + κ2
+    #[inline(always)]
     fn kappa_add(a: Characteristic, b: Characteristic) -> Characteristic {
         use Characteristic::*;
         match (a, b) {
@@ -3161,6 +3180,7 @@ impl TypeContext {
     }
 
     /// κ2 ^ κ1
+    #[inline(always)]
     fn kappa_pow(base: Characteristic, exp: Characteristic) -> Characteristic {
         use Characteristic::*;
         match (base, exp) {

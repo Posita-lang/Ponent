@@ -398,6 +398,26 @@ impl ShapeVarContext {
             .map(|sv| sv.id)
             .collect()
     }
+
+    /// Number of shape variables allocated (for snapshot truncation).
+    pub(crate) fn vars_len(&self) -> usize {
+        self.vars.len()
+    }
+
+    /// The next fresh shape variable ID (for snapshot restoration).
+    pub(crate) fn next_id_val(&self) -> usize {
+        self.next_id
+    }
+
+    /// Truncate shape variables to a saved length (rollback).
+    pub(crate) fn truncate_vars(&mut self, len: usize) {
+        self.vars.truncate(len);
+    }
+
+    /// Restore the next_id counter (rollback).
+    pub(crate) fn set_next_id(&mut self, id: usize) {
+        self.next_id = id;
+    }
 }
 
 /// Check whether two `TypeShape` values are compatible for unification.

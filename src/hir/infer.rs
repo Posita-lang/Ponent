@@ -7,6 +7,7 @@ use crate::hir::symbol::SymbolTable;
 use crate::hir::traits::TraitEnv;
 use crate::hir::types::*;
 use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet;
 use std::collections::BinaryHeap;
 
 /// ── Inline GuardSet (ported from OmniML guard_set.ml) ───────────
@@ -282,6 +283,94 @@ impl InferRegionTree {
             }
         }
         self.pool_undo_log.clear();
+    }
+}
+
+// ── UndoLog (rustc-style) ──────────────────────────────────────
+// A single enum of reversible operations.  Recorded when a snapshot
+// is open; popped and `reverse()`'d on rollback.
+
+/// A single reversible operation on `InferenceContext` state.
+#[derive(Debug, Clone)]
+pub(crate) enum InferUndoLog {
+    PushConstraint,
+    PushTypeVar,
+    PushVarTypeId,
+    PushMatchBranch,
+    PushResolution,
+    PushWaitList,
+    PushGuardSet,
+    PushGenStatus,
+    PushForwardRef,
+    /// An instance was pushed into an existing forward_refs[pg].  Reverse: pop.
+    ForwardRefPush(usize),
+    PushReverseRef,
+    SetReverseRef(usize, Option<usize>),
+    PushLowerBound,
+    PushUpperBound,
+    SetGenStatus(usize, GenStatus),
+    AddGuard(usize),
+    RemoveGuard(usize),
+    AddTransitiveGuard(usize, usize),
+    RemoveTransitiveGuard(usize, usize),
+    InsertGenericParamBinding(usize, Option<TypeId>),
+    PushShapeVar,
+    PoolRegister { region_idx: usize, old_var_len: usize, old_rigid_len: usize },
+    PoolUnregister { region_idx: usize, var_id: usize },
+}
+
+impl InferenceContext {
+    fn reverse(&mut self, undo: InferUndoLog) {
+        match undo {
+            InferUndoLog::PushConstraint => { self.constraints.pop(); }
+            InferUndoLog::PushTypeVar => { self.type_vars.pop(); }
+            InferUndoLog::PushVarTypeId => { self.var_type_ids.pop(); }
+            InferUndoLog::PushMatchBranch => { self.match_branches.pop(); }
+            InferUndoLog::PushResolution => { self.resolutions.pop(); }
+            InferUndoLog::PushWaitList => { self.wait_lists.pop(); }
+            InferUndoLog::PushGuardSet => { self.guard_sets.pop(); }
+            InferUndoLog::PushGenStatus => { self.gen_statuses.pop(); }
+            InferUndoLog::PushForwardRef => { self.forward_refs.pop(); }
+            InferUndoLog::ForwardRefPush(pg) => {
+                if pg < self.forward_refs.len() { self.forward_refs[pg].pop(); }
+            }
+            InferUndoLog::PushReverseRef => { self.reverse_refs.pop(); }
+            InferUndoLog::SetReverseRef(i, old) => { if i < self.reverse_refs.len() { self.reverse_refs[i] = old; } }
+            InferUndoLog::PushLowerBound => { self.lower_bounds.pop(); }
+            InferUndoLog::PushUpperBound => { self.upper_bounds.pop(); }
+            InferUndoLog::SetGenStatus(i, old) => {
+                if i < self.gen_statuses.len() { self.gen_statuses[i] = old; }
+            }
+            InferUndoLog::AddGuard(i) => {
+                if i < self.guard_sets.len() { self.guard_sets[i].remove_guard(); }
+            }
+            InferUndoLog::RemoveGuard(i) => {
+                if i < self.guard_sets.len() { self.guard_sets[i].add_guard(); }
+            }
+            InferUndoLog::AddTransitiveGuard(i, region_id) => {
+                if i < self.guard_sets.len() { self.guard_sets[i].remove_transitive_guard(region_id); }
+            }
+            InferUndoLog::RemoveTransitiveGuard(i, region_id) => {
+                if i < self.guard_sets.len() { self.guard_sets[i].add_transitive_guard(region_id); }
+            }
+            InferUndoLog::InsertGenericParamBinding(key, old) => {
+                match old { Some(v) => self.generic_param_bindings.insert(key, v), None => self.generic_param_bindings.remove(&key) };
+            }
+            InferUndoLog::PushShapeVar => {
+                self.shape_vars.truncate_vars(self.shape_vars.vars_len().saturating_sub(1));
+            }
+            InferUndoLog::PoolRegister { region_idx, old_var_len, old_rigid_len } => {
+                if region_idx < self.region_tree.nodes.len() {
+                    self.region_tree.nodes[region_idx].pool.var_ids.truncate(old_var_len);
+                    self.region_tree.nodes[region_idx].pool.rigid_var_ids.truncate(old_rigid_len);
+                }
+            }
+            InferUndoLog::PoolUnregister { region_idx, var_id } => {
+                if region_idx < self.region_tree.nodes.len() {
+                    self.region_tree.nodes[region_idx].pool.var_ids.push(var_id);
+                }
+            }
+        }
     }
 }
 
@@ -574,6 +663,19 @@ pub struct InferenceContext {
     resolutions: Vec<Option<TypeId>>,
     /// Local bindings for GenericParam indices during instantiation.
     generic_param_bindings: HashMap<usize, TypeId>,
+    /// Variables resolved since last solver wake-up (avoids O(N) scan).
+    resolved_ids: Vec<usize>,
+    /// Parallel set for O(1) dedup with `resolved_ids`.
+    resolved_set: FxHashSet<usize>,
+    /// Undo log (rustc-style).  Records reversible operations when a
+    /// snapshot is open.  Popped and `reverse()`'d on rollback.
+    undo_log: Vec<InferUndoLog>,
+    /// Current snapshot nesting depth.  0 = no snapshot open.
+    snapshot_depth: usize,
+    /// Stack of snapshot states: for each open snapshot, records the
+    /// `resolved_ids` length, `resolved_set`, and `dirty_set` so they
+    /// can be restored on rollback (not covered by the undo log).
+    resolved_snapshot_stack: Vec<(usize, FxHashSet<usize>, std::collections::HashSet<usize>)>,
 }
 
 /// A set of pattern alternatives for a suspended match constraint.
@@ -610,6 +712,11 @@ impl InferenceContext {
             dirty_set: std::collections::HashSet::new(),
             resolutions: Vec::new(),
             generic_param_bindings: HashMap::default(),
+            resolved_ids: Vec::new(),
+            resolved_set: FxHashSet::default(),
+            undo_log: Vec::new(),
+            snapshot_depth: 0,
+            resolved_snapshot_stack: Vec::new(),
         }
     }
 
@@ -628,7 +735,9 @@ impl InferenceContext {
             shape: PrincipalShape::Unknown,
             region_id,
         });
+        self.push_undo(InferUndoLog::PushTypeVar);
         self.var_type_ids.push(ty_id);
+        self.push_undo(InferUndoLog::PushVarTypeId);
         // Register the variable in the current region's pool
         self.region_tree.register_var(id);
         // Grow bounds vectors to match the new variable id
@@ -872,7 +981,9 @@ impl InferenceContext {
         if var_id < self.wait_lists.len() {
             self.wait_lists[var_id].push(c);
             if var_id < self.gen_statuses.len() {
+                let old = self.gen_statuses[var_id];
                 self.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
+                self.push_undo(InferUndoLog::SetGenStatus(var_id, old));
             }
             // Add a guard: the variable is now blocked until this constraint
             // is woken and processed.  This is essential for the PG→G lifecycle
@@ -880,6 +991,7 @@ impl InferenceContext {
             self.add_guard(var_id);
         } else {
             self.constraints.push(c);
+            self.push_undo(InferUndoLog::PushConstraint);
         }
     }
 
@@ -1044,6 +1156,7 @@ impl InferenceContext {
         for b in branches {
             self.match_branches.push(b);
         }
+        self.push_undo(InferUndoLog::PushMatchBranch);
         (start, count)
     }
 
@@ -1288,14 +1401,19 @@ impl InferenceContext {
         }
         if !self.forward_refs[pg_var_id].contains(&instance_id) {
             self.forward_refs[pg_var_id].push(instance_id);
+            self.push_undo(InferUndoLog::ForwardRefPush(pg_var_id));
         }
+        let old_rev = self.reverse_refs[instance_id];
         self.reverse_refs[instance_id] = Some(pg_var_id);
+        self.push_undo(InferUndoLog::SetReverseRef(instance_id, old_rev));
 
         // Mark the instance as PI (PartialInstance)
         while self.gen_statuses.len() <= instance_id {
             self.gen_statuses.push(GenStatus::Ungeneralized);
         }
+        let old_gs = self.gen_statuses[instance_id];
         self.gen_statuses[instance_id] = GenStatus::PartialInstance;
+        self.push_undo(InferUndoLog::SetGenStatus(instance_id, old_gs));
     }
 
     /// ── S-Inst-Copy (OmniML §5.3) ──────────────────────────────────
@@ -1635,6 +1753,49 @@ impl InferenceContext {
         self.dirty_set.insert(var_id);
     }
 
+    // ── Snapshot / Rollback (rustc-style UndoLog) ────────────────
+
+    /// Open a new snapshot.  While open, reversible operations record
+    /// an `InferUndoLog` entry.  Returns the current log length.
+    pub fn start_snapshot(&mut self) -> usize {
+        self.snapshot_depth += 1;
+        self.resolved_snapshot_stack
+            .push((self.resolved_ids.len(), self.resolved_set.clone(), self.dirty_set.clone()));
+        self.undo_log.len()
+    }
+
+    /// Roll back to a snapshot: pop entries and call `reverse()`.
+    pub fn rollback_to(&mut self, snapshot_len: usize) {
+        while self.undo_log.len() > snapshot_len {
+            let undo = self.undo_log.pop().unwrap();
+            self.reverse(undo);
+        }
+        // Restore resolved_ids/resolved_set/dirty_set from snapshot stack.
+        if let Some((ids_len, set, dirty)) = self.resolved_snapshot_stack.pop() {
+            self.resolved_ids.truncate(ids_len);
+            self.resolved_set = set;
+            self.dirty_set = dirty;
+        }
+        self.snapshot_depth -= 1;
+    }
+
+    /// Commit a snapshot: discard undo entries without reversing.
+    /// At the outermost snapshot, the log is cleared.
+    pub fn commit_snapshot(&mut self, snapshot_len: usize) {
+        if self.snapshot_depth == 1 {
+            self.undo_log.truncate(snapshot_len);
+        }
+        self.resolved_snapshot_stack.pop();
+        self.snapshot_depth -= 1;
+    }
+
+    /// Push an undo entry if a snapshot is currently open.
+    fn push_undo(&mut self, undo: InferUndoLog) {
+        if self.snapshot_depth > 0 {
+            self.undo_log.push(undo);
+        }
+    }
+
     /// Check if a variable has any forward references (instances).
     pub fn has_instances(&self, var_id: usize) -> bool {
         var_id < self.forward_refs.len() && !self.forward_refs[var_id].is_empty()
@@ -1711,9 +1872,12 @@ impl InferenceContext {
         while self.guard_sets.len() <= var_id {
             self.guard_sets.push(GuardSet::empty());
         }
+        self.push_undo(InferUndoLog::AddGuard(var_id));
         self.guard_sets[var_id].add_guard();
         if var_id < self.gen_statuses.len() {
+            let old = self.gen_statuses[var_id];
             self.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
+            self.push_undo(InferUndoLog::SetGenStatus(var_id, old));
         }
     }
 
@@ -1722,10 +1886,13 @@ impl InferenceContext {
     /// re-generalised (PG → G transition, OmniML §6).
     pub fn remove_guard(&mut self, var_id: usize) {
         if var_id < self.guard_sets.len() {
+            self.push_undo(InferUndoLog::RemoveGuard(var_id));
             self.guard_sets[var_id].remove_guard();
             if self.guard_sets[var_id].is_empty() && var_id < self.gen_statuses.len() {
                 if self.gen_statuses[var_id] == GenStatus::PartiallyGeneralizable {
+                    let old = self.gen_statuses[var_id];
                     self.gen_statuses[var_id] = GenStatus::Generalized;
+                    self.push_undo(InferUndoLog::SetGenStatus(var_id, old));
                 }
             }
         }
