@@ -176,6 +176,25 @@ pub struct TypeChecker<'a> {
     resolution_map: ResolutionMap,
     /// Local cache of generic type parameter types (e.g. `T` in `def foo<T>(x: T)`).
     /// Populated when processing function definitions with type_params.
+    /// Also used by `set auto<T> = expr` to bind captured type names.
+    ///
+    /// # Scope leak note
+    /// `auto<T>` inserts entries that are never removed when the block scope
+    /// exits.  This is safe because the **resolver** uses lexical scoping
+    /// (a `Scope` stack in `SymbolTable`), so `T` is unresolvable after the
+    /// block exits — the checker never runs.  Example:
+    /// ```posita
+    /// def foo() {
+    ///     {
+    ///         set auto<T> = 42;  // cache: T → Int<32>
+    ///     }                        // resolver: T no longer in scope
+    ///     set x: T = 1;            // RESOLVER ERROR — unreachable path
+    /// }
+    /// ```
+    /// Function generic parameters (`def bar<T>(...)`) **do** clean up after
+    /// themselves via `local_type_param_cache.remove(name)`, so any stale
+    /// `auto<T>` entry is overwritten when a later function declares its own
+    /// `T` as a generic parameter.  The leak is real but unexploitable.
     local_type_param_cache: HashMap<Symbol, TypeId>,
     /// SCAP-style guarantee chain: tracks outstanding postconditions that must
     /// be discharged on function return (Feng & Shao 2006 §4).
@@ -490,24 +509,12 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
 
-                // `set auto<T> = expr` — bind captured type names to the inferred type.
+                // `set auto<T, N> = expr` — bind captured type names to the inferred type.
                 // Each name in `type_captures` becomes available as a type alias in
                 // comptime reflection (e.g., `@typeInfo!(T)`).
-                if !type_captures.is_empty() {
-                    if let Some(capture) = type_captures.first() {
-                        self.local_type_param_cache
-                            .insert(capture.name.clone(), final_ty);
-                    }
-                    // Future: support multiple captures (T, N, L) with compile-time
-                    // constant extraction for non-type captures.
-                    if type_captures.len() > 1 {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                "multiple type captures not yet supported; only the first name is bound",
-                            )
-                            .with_span(*span),
-                        );
-                    }
+                for capture in type_captures {
+                    self.local_type_param_cache
+                        .insert(capture.name.clone(), final_ty);
                 }
 
                 Ok(HirStmt::VariableDef {

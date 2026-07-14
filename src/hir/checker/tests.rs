@@ -1648,6 +1648,75 @@ fn test_type_capture_auto_with_struct() {
     );
 }
 
+#[test]
+fn test_type_capture_auto_multi() {
+    // `set auto<T, N, L> = expr` captures the inferred type of expr into
+    // all named bindings, making each available for comptime reflection.
+    let result = check_source(
+        "def main() -> Int<32> {
+             set auto<T, N, L> = 42;
+             // T, N, L should all be bound to Int<32> here.
+             return 0;
+         }",
+    );
+    assert!(
+        result.is_ok(),
+        "multi type capture auto<T, N, L>: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_type_capture_auto_four() {
+    // Four captures — no limit on the number of capture names.
+    let result = check_source(
+        "def main() -> Int<32> {
+             set auto<A, B, C, D> = true;
+             return 0;
+         }",
+    );
+    assert!(
+        result.is_ok(),
+        "four type captures: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_type_capture_correct_type() {
+    // Verify that the captured type is actually correct by using T
+    // as a type annotation in a subsequent variable declaration.
+    let result = check_source(
+        "def main() -> Int<32> {
+             set auto<T> = 42;
+             set x: T = 10;
+             return x;
+         }",
+    );
+    assert!(
+        result.is_ok(),
+        "captured type verification: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_type_capture_correct_type_bool() {
+    // Verify that Bool capture works correctly.
+    let result = check_source(
+        "def main() -> Bool {
+             set auto<T> = true;
+             set x: T = false;
+             return x;
+         }",
+    );
+    assert!(
+        result.is_ok(),
+        "captured bool type: {:?}",
+        result.err()
+    );
+}
+
 // ── Top-level inference scope ────────────────────────────────────
 
 #[test]

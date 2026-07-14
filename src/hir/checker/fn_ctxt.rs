@@ -1547,9 +1547,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 .alias_ast
                                 .as_ref()
                                 .map(|ast| self.resolve_type(ast))
-                                .unwrap_or(Err(
-                                    Diagnostic::error("alias has no body").with_span(*span)
-                                ));
+                                .unwrap_or_else(|| {
+                                    // Check if this is a type capture name (auto<T>).
+                                    // The resolver creates a placeholder alias with no body;
+                                    // the actual type is in local_type_param_cache.
+                                    if path.len() == 1 {
+                                        if let Some(&ty) = self.checker.local_type_param_cache.get(&path[0]) {
+                                            return Ok(ty);
+                                        }
+                                    }
+                                    Err(Diagnostic::error("alias has no body").with_span(*span))
+                                });
                             self.checker.resolving_aliases.remove(&def_id);
                             result
                         }
