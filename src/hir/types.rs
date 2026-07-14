@@ -123,9 +123,15 @@ impl TypeId {
     /// Sentinel representing "no type" (error nodes, untyped expressions).
     /// Occupies the `NonZeroUsize` niche so that `Option<TypeId>` is 8 bytes
     /// instead of 16 — every type allocated through `TypeContext::alloc` has
-    /// `raw >= 32` (since `index` is offset by 1), leaving values 1..31 as
-    /// niche candidates.
-    pub const NONE: TypeId = TypeId(unsafe { NonZeroUsize::new_unchecked(1) });
+    /// `raw >= 32` (since `index` is offset by 1).
+    ///
+    /// Chosen as `usize::MAX` so that a stray call to `tag()` or `index()`
+    /// on this sentinel produces an obviously-wrong value: `tag()` returns
+    /// discriminant 31 (past the last real variant `SkolemVar = 29`), and
+    /// `index()` returns `usize::MAX >> 5 - 1`, an unreachable index.
+    /// Both paths are guarded by `debug_assert!` checks that fire before
+    /// any unsound transmute or index access.
+    pub const NONE: TypeId = TypeId(unsafe { NonZeroUsize::new_unchecked(usize::MAX) });
 
     /// Create a `TypeId` from a raw encoded value.
     /// Panics if `raw` is zero (which can never be a valid `NonZeroUsize`).
@@ -147,7 +153,7 @@ impl TypeId {
     /// This method subtracts the bias to recover the true 0-based index.
     pub fn index(self) -> usize {
         debug_assert!(
-            self.0.get() > Self::TAG_MASK,
+            self.0.get() != usize::MAX,
             "TypeId::index() called on sentinel NONE"
         );
         (self.0.get() >> Self::TAG_BITS) - 1
@@ -156,7 +162,7 @@ impl TypeId {
     pub fn tag(self) -> TypeTag {
         let raw = self.0.get();
         debug_assert!(
-            raw > Self::TAG_MASK,
+            raw != usize::MAX,
             "TypeId::tag() called on sentinel NONE"
         );
         let tag_val = raw & Self::TAG_MASK;

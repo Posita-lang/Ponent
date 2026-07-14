@@ -2039,62 +2039,157 @@ impl<'a> TypeChecker<'a> {
         right: TypeId,
         span: Span,
     ) -> Result<TypeId, Diagnostic> {
-        self.unify_with(left, right, span, TypingContext::None)?;
-
-        // Helper: check if a type is or may become numeric (handles InferVar).
-        let is_or_may_be_numeric = |ty: TypeId| -> bool {
-            self.ctx.is_numeric(ty)
-                || matches!(self.ctx.get(ty), TypeData::InferVar { id }
-                    if self.infer.get_var_kind(*id) == Some(TypeVariableKind::Numeric)
-                        || self.infer.get_var_kind(*id) == Some(TypeVariableKind::Integer)
-                        || self.infer.get_var_kind(*id) == Some(TypeVariableKind::Float))
-        };
-        let is_or_may_be_integer = |ty: TypeId| -> bool {
-            self.ctx.is_integer(ty)
-                || matches!(self.ctx.get(ty), TypeData::InferVar { id }
-                    if self.infer.get_var_kind(*id) == Some(TypeVariableKind::Integer)
-                        || self.infer.get_var_kind(*id) == Some(TypeVariableKind::Numeric))
-        };
-        let is_or_may_be_bool = |ty: TypeId| -> bool {
-            self.ctx.is_bool(ty)
-                || matches!(self.ctx.get(ty), TypeData::InferVar { id }
-                    if self.infer.get_var_kind(*id) == Some(TypeVariableKind::Bool))
-        };
-
-        match op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
-                if is_or_may_be_numeric(left) =>
-            {
-                Ok(left)
+        // Logical And/Or are NOT trait-routed in the desugaring table.
+        // They stay as hard-coded bool operators.
+        if matches!(op, BinOp::And | BinOp::Or) {
+            let ok = self.ctx.is_bool(left)
+                || matches!(self.ctx.get(left), TypeData::InferVar { .. });
+            if !ok {
+                return Err(
+                    Diagnostic::error("logical operators require bool operands").with_span(span),
+                );
             }
-            BinOp::AddWrap
-            | BinOp::SubWrap
-            | BinOp::MulWrap
-            | BinOp::AddSaturate
-            | BinOp::SubSaturate
-            | BinOp::MulSaturate
-            | BinOp::AddTrap
-            | BinOp::SubTrap
-            | BinOp::MulTrap
-                if is_or_may_be_integer(left) =>
-            {
-                Ok(left)
-            }
-            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
-                if is_or_may_be_integer(left) =>
-            {
-                Ok(left)
-            }
-            BinOp::Eq | BinOp::Neq => Ok(self.ctx.bool()),
-            BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge if is_or_may_be_numeric(left) => {
-                Ok(self.ctx.bool())
-            }
-            BinOp::And | BinOp::Or if is_or_may_be_bool(left) => {
-                self.unify_with(left, right, span, TypingContext::None)?;
-                Ok(self.ctx.bool())
-            }
-            _ => Err(Diagnostic::error("invalid operands for binary operator").with_span(span)),
+            // Check kind compatibility early so that e.g. `true and infer_var(Integer)`
+            // produces "type mismatch: expected integer type, found Bool" at the operator
+            // site rather than a confusing unification failure later.
+            self.check_kind_compat(left, right, span)?;
+            self.check_kind_compat(right, left, span)?;
+            self.unify_with(left, right, span, TypingContext::None)?;
+            return Ok(self.ctx.bool());
         }
+
+        // Overflow-suffixed operators (+%, +?, +!, -%, etc.) are compiler
+        // intrinsics — not overloadable via traits (§Spec: Operator Desugaring).
+        // They require integer types.
+        if matches!(
+            op,
+            BinOp::AddWrap
+                | BinOp::SubWrap
+                | BinOp::MulWrap
+                | BinOp::AddSaturate
+                | BinOp::SubSaturate
+                | BinOp::MulSaturate
+                | BinOp::AddTrap
+                | BinOp::SubTrap
+                | BinOp::MulTrap
+        ) {
+            let is_int = self.ctx.is_integer(left)
+                || matches!(self.ctx.get(left), TypeData::InferVar { .. });
+            if !is_int {
+                return Err(Diagnostic::error(
+                    "overflow-suffixed operators require integer operands",
+                )
+                .with_span(span));
+            }
+            // Check kind compatibility early, before unify, so that
+            // e.g. `infer_var(Float) +% 1` produces "expected integer type, found Float"
+            // at the operator site rather than a confusing error later.
+            self.check_kind_compat(left, right, span)?;
+            self.check_kind_compat(right, left, span)?;
+            self.unify_with(left, right, span, TypingContext::None)?;
+            return Ok(left);
+        }
+
+        // Trait-routed operators: check kind compatibility early so that
+        // e.g. `1 + "hello"` produces a clear diagnostic at the operator
+        // site rather than a confusing inference failure later.
+        self.check_kind_compat(left, right, span)?;
+        self.check_kind_compat(right, left, span)?;
+
+        // All other operators route through traits (§Spec: Operator Desugaring).
+        let Some(trait_id) = self.get_trait_id_for_binop(op, span)? else {
+            return Err(
+                Diagnostic::error("operator not supported via traits").with_span(span),
+            );
+        };
+
+        self.add_constraint(Constraint::Impl(left, trait_id, span));
+        self.add_constraint(Constraint::Impl(right, trait_id, span));
+
+        // Comparison operators return bool.
+        if matches!(
+            op,
+            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
+        ) {
+            return Ok(self.ctx.bool());
+        }
+
+        // Arithmetic/bitwise: unify operands, create infer var for result.
+        // The Impl constraint verifies the trait exists; the infer var is
+        // unified with the expected result type downstream.
+        self.unify_with(left, right, span, TypingContext::None)?;
+        Ok(self.new_infer_var(TypeVariableKind::Numeric))
+    }
+
+    /// Check that an inference variable's kind constraint is compatible with the
+    /// resolved type of another type.  This prevents situations like
+    /// `true` (InferVar with kind Bool) being unified with `Int<32>`.
+    /// Only fires when the other side resolves to a concrete (non-type-variable) type.
+    fn check_kind_compat(
+        &self,
+        maybe_var: TypeId,
+        other: TypeId,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        if let TypeData::InferVar { id } = self.ctx.get(maybe_var) {
+            let kind = self.infer.get_var_kind(*id);
+            let resolved_other = self.ctx.resolve_binding(other);
+            // Only check when the other side is a concrete type (not a type variable).
+            // Type variables (InferVar, GenericParam, SkolemVar) are placeholders
+            // that can be unified with any compatible type.
+            match self.ctx.get(resolved_other) {
+                TypeData::InferVar { .. }
+                | TypeData::GenericParam { .. }
+                | TypeData::SkolemVar { .. } => return Ok(()),
+                _ => {}
+            }
+            match kind {
+                Some(TypeVariableKind::Bool) => {
+                    if !self.ctx.is_bool(resolved_other) {
+                        return Err(Diagnostic::error(format!(
+                            "type mismatch: expected `Bool`, found `{:?}`",
+                            self.ctx.get(resolved_other),
+                        ))
+                        .with_span(span));
+                    }
+                }
+                Some(TypeVariableKind::Integer) => {
+                    if !self.ctx.is_integer(resolved_other)
+                        && !matches!(
+                            self.ctx.get(resolved_other),
+                            TypeData::Rational { .. }
+                        )
+                    {
+                        return Err(Diagnostic::error(format!(
+                            "type mismatch: expected integer type, found `{:?}`",
+                            self.ctx.get(resolved_other),
+                        ))
+                        .with_span(span));
+                    }
+                }
+                Some(TypeVariableKind::Float) => {
+                    if !self.ctx.is_float(resolved_other) {
+                        return Err(Diagnostic::error(format!(
+                            "type mismatch: expected float type, found `{:?}`",
+                            self.ctx.get(resolved_other),
+                        ))
+                        .with_span(span));
+                    }
+                }
+                Some(TypeVariableKind::Numeric) => {
+                    if !self.ctx.is_numeric(resolved_other) {
+                        return Err(Diagnostic::error(format!(
+                            "type mismatch: expected numeric type, found `{:?}`",
+                            self.ctx.get(resolved_other),
+                        ))
+                        .with_span(span));
+                    }
+                }
+                // Any / Unconstrained are compatible with everything
+                Some(TypeVariableKind::Any) | Some(TypeVariableKind::Unconstrained) | None => {}
+            }
+        }
+        Ok(())
     }
 
     fn check_cast(
@@ -2809,14 +2904,13 @@ impl<'a> TypeChecker<'a> {
             BinOp::BitXor => "BitXor",
             BinOp::Shl => "Shl",
             BinOp::Shr => "Shr",
-            BinOp::Eq => "Eq",
-            BinOp::Neq => "Neq",
-            BinOp::Lt => "Lt",
-            BinOp::Gt => "Gt",
-            BinOp::Le => "Le",
-            BinOp::Ge => "Ge",
-            BinOp::And => "And",
-            BinOp::Or => "Or",
+            // Eq/Neq both desugar to Eq::eq (§Spec: Operator Desugaring)
+            BinOp::Eq | BinOp::Neq => "Eq",
+            // Lt/Gt/Le/Ge all desugar to Ord methods (§Spec: Operator Desugaring)
+            BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => "Ord",
+            // And/Or are NOT trait-routed — handled directly by binary_op_type
+            BinOp::And | BinOp::Or => return Ok(None),
+            // Overflow-suffixed operators are compiler intrinsics, not overloadable
             _ => {
                 return Err(
                     Diagnostic::error("overflow operators not yet supported via traits")

@@ -11,6 +11,7 @@ fn insert_trait(symbols: &mut SymbolTable, name: &str, def_id: &mut DefId) {
         def_id: *def_id,
         methods: vec![],
         associated_types: vec![],
+        super_traits: vec![],
         span: Span::new(0, 0),
         crate_id: symbols.local_crate_id,
     };
@@ -31,6 +32,7 @@ fn insert_trait_with_assoc_types(
         def_id: *def_id,
         methods: vec![],
         associated_types,
+        super_traits: vec![],
         span: Span::new(0, 0),
         crate_id: symbols.local_crate_id,
     };
@@ -62,6 +64,9 @@ pub fn register_builtins(
     let mut ge_id = DefId(0);
     let mut and_id = DefId(0);
     let mut or_id = DefId(0);
+    let mut ord_id = DefId(0);
+    let mut neg_id = DefId(0);
+    let mut not_id = DefId(0);
 
     insert_trait(symbols, "Add", &mut add_id);
     insert_trait(symbols, "Sub", &mut sub_id);
@@ -81,10 +86,13 @@ pub fn register_builtins(
     insert_trait(symbols, "Ge", &mut ge_id);
     insert_trait(symbols, "And", &mut and_id);
     insert_trait(symbols, "Or", &mut or_id);
+    insert_trait(symbols, "Ord", &mut ord_id);
+    insert_trait(symbols, "Neg", &mut neg_id);
+    insert_trait(symbols, "Not", &mut not_id);
 
     let int_arith_traits = [
         add_id, sub_id, mul_id, div_id, rem_id, bitand_id, bitor_id, bitxor_id, shl_id, shr_id,
-        eq_id, neq_id, lt_id, gt_id, le_id, ge_id, and_id, or_id,
+        eq_id, ord_id, not_id,
     ];
     // Register arithmetic/bitwise trait impls for all common integer types.
     // Signed: Int<8>, Int<16>, Int<32>, Int<64>
@@ -113,13 +121,32 @@ pub fn register_builtins(
                 )
                 .ok();
         }
+        // Neg (unary `-`) only applies to signed integers.
+        if signed {
+            trait_env
+                .add_impl(
+                    ImplCandidate {
+                        trait_id: neg_id,
+                        for_type: int_ty,
+                        methods: vec![],
+                        resolved_methods: vec![],
+                        assoc_tys: vec![],
+                        has_auto_deref: false,
+                        context: vec![],
+                        span: Span::new(0, 0),
+                    },
+                    symbols,
+                    ctx,
+                    false,
+                )
+                .ok();
+        }
     }
 
-    // Register And/Or impls for Bool.  The type checker handles `and`/`or`
-    // for booleans directly, but registering the trait impls is necessary
-    // for operator overloading consistency and downstream trait resolution.
+    // Register Not impl for Bool.  And/Or are handled directly by the
+    // type checker and do not route through traits.
     let bool_ty = ctx.bool();
-    for &trait_id in &[and_id, or_id] {
+    for &trait_id in &[not_id] {
         trait_env
             .add_impl(
                 ImplCandidate {
@@ -141,7 +168,7 @@ pub fn register_builtins(
 
     let float64 = ctx.float(64);
     for &trait_id in &[
-        add_id, sub_id, mul_id, div_id, rem_id, eq_id, neq_id, lt_id, gt_id, le_id, ge_id,
+        add_id, sub_id, mul_id, div_id, rem_id, eq_id, ord_id, neg_id,
     ] {
         trait_env
             .add_impl(
@@ -164,7 +191,7 @@ pub fn register_builtins(
 
     // Register built-in Rational<p,q> types with arithmetic trait impls.
     let rational_arith_traits = [
-        add_id, sub_id, mul_id, div_id, rem_id, eq_id, neq_id, lt_id, gt_id, le_id, ge_id,
+        add_id, sub_id, mul_id, div_id, rem_id, eq_id, ord_id, neg_id,
     ];
     for &(p, q) in &[(8, 8), (16, 16), (32, 16), (32, 32)] {
         let rty = ctx.rational(p, q);

@@ -198,43 +198,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 right,
                 span,
             } => {
-                let result_ty = match op {
-                    BinOp::Eq
-                    | BinOp::Neq
-                    | BinOp::Lt
-                    | BinOp::Gt
-                    | BinOp::Le
-                    | BinOp::Ge
-                    | BinOp::And
-                    | BinOp::Or => self.checker.ctx.bool(),
-                    _ => self.new_infer_var(TypeVariableKind::Numeric),
-                };
                 let (left_hir, left_ty) = self.infer_expr(left)?;
                 let (right_hir, right_ty) = self.infer_expr(right)?;
-                // Check kind compatibility before unifying operands, so that
-                // e.g. `1 + "2"` (InferVar(Integer) vs InferVar(Any)) is rejected
-                // when one side resolves to a concrete type incompatible with
-                // the other side's kind constraint.
-                self.check_kind_compat(left_ty, right_ty, *span)?;
-                self.check_kind_compat(right_ty, left_ty, *span)?;
-                self.unify_with(left_ty, right_ty, *span, TypingContext::None)?;
-                if let Ok(Some(trait_id)) = self.checker.get_trait_id_for_binop(*op, *span) {
-                    self.add_constraint(Constraint::Impl(left_ty, trait_id, *span));
-                    self.add_constraint(Constraint::Impl(right_ty, trait_id, *span));
-                }
-                if !matches!(
-                    op,
-                    BinOp::Eq
-                        | BinOp::Neq
-                        | BinOp::Lt
-                        | BinOp::Gt
-                        | BinOp::Le
-                        | BinOp::Ge
-                        | BinOp::And
-                        | BinOp::Or
-                ) {
-                    self.add_constraint(Constraint::Eq(result_ty, left_ty, *span));
-                }
+                let result_ty =
+                    self.checker.binary_op_type(*op, left_ty, right_ty, *span)?;
                 Ok((
                     HirExpr::BinaryOp {
                         left: Box::new(left_hir),
@@ -1532,65 +1499,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         other: TypeId,
         span: Span,
     ) -> Result<(), Diagnostic> {
-        if let TypeData::InferVar { id } = self.checker.ctx.get(maybe_var) {
-            let kind = self.checker.infer.get_var_kind(*id);
-            let resolved_other = self.checker.ctx.resolve_binding(other);
-            // Only check when the other side is a concrete type (not a type variable).
-            // Type variables (InferVar, GenericParam, SkolemVar) are placeholders
-            // that can be unified with any compatible type.
-            match self.checker.ctx.get(resolved_other) {
-                TypeData::InferVar { .. }
-                | TypeData::GenericParam { .. }
-                | TypeData::SkolemVar { .. } => return Ok(()),
-                _ => {}
-            }
-            match kind {
-                Some(TypeVariableKind::Bool) => {
-                    if !self.checker.ctx.is_bool(resolved_other) {
-                        return Err(Diagnostic::error(format!(
-                            "type mismatch: expected `Bool`, found `{:?}`",
-                            self.checker.ctx.get(resolved_other),
-                        ))
-                        .with_span(span));
-                    }
-                }
-                Some(TypeVariableKind::Integer) => {
-                    if !self.checker.ctx.is_integer(resolved_other)
-                        && !matches!(
-                            self.checker.ctx.get(resolved_other),
-                            TypeData::Rational { .. }
-                        )
-                    {
-                        return Err(Diagnostic::error(format!(
-                            "type mismatch: expected integer type, found `{:?}`",
-                            self.checker.ctx.get(resolved_other),
-                        ))
-                        .with_span(span));
-                    }
-                }
-                Some(TypeVariableKind::Float) => {
-                    if !self.checker.ctx.is_float(resolved_other) {
-                        return Err(Diagnostic::error(format!(
-                            "type mismatch: expected float type, found `{:?}`",
-                            self.checker.ctx.get(resolved_other),
-                        ))
-                        .with_span(span));
-                    }
-                }
-                Some(TypeVariableKind::Numeric) => {
-                    if !self.checker.ctx.is_numeric(resolved_other) {
-                        return Err(Diagnostic::error(format!(
-                            "type mismatch: expected numeric type, found `{:?}`",
-                            self.checker.ctx.get(resolved_other),
-                        ))
-                        .with_span(span));
-                    }
-                }
-                // Any / Unconstrained are compatible with everything
-                Some(TypeVariableKind::Any) | Some(TypeVariableKind::Unconstrained) | None => {}
-            }
-        }
-        Ok(())
+        self.checker.check_kind_compat(maybe_var, other, span)
     }
 
     /// Resolve a syntactic type to a TypeId — actual implementation.

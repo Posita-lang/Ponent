@@ -463,6 +463,7 @@ impl<'a> NameResolver<'a> {
                         .iter()
                         .map(|at| (at.name.clone(), at.default.clone()))
                         .collect(),
+                    super_traits: vec![],
                     span: *span,
                     crate_id: self.symbols.local_crate_id,
                 };

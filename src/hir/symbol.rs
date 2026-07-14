@@ -107,6 +107,9 @@ pub struct TraitBinding {
     pub def_id: DefId,
     pub methods: Vec<(Symbol, FunctionSignature)>,
     pub associated_types: Vec<(Symbol, Option<Type>)>,
+    /// Direct supertraits this trait extends, e.g. `trait Copy: Clone { }`
+    /// stores `Clone`'s DefId here.
+    pub super_traits: Vec<DefId>,
     pub span: Span,
     pub crate_id: CrateId,
 }
