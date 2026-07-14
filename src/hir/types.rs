@@ -483,12 +483,11 @@ impl TypeContext {
     }
 
     pub fn alloc(&mut self, data: TypeData) -> TypeId {
-        // Types that transitively contain any InferVar must NOT be cached:
-        // the same InferVar id can be reused across inference scopes, but
-        // the old bindings would leak into the new scope.  A top-level
-        // InferVar is already excluded below; we also need to exclude any
-        // composite type (Fn, Adt, Tuple, etc.) that embeds an InferVar.
-        let can_cache = !self.type_contains_infer_var(&data);
+        // Types that transitively contain any volatile type (InferVar, SkolemVar)
+        // must NOT be cached: InferVar ids can be reused across inference scopes
+        // (stale bindings would leak), and SkolemVar ids are single-use per
+        // enter_universe call (caching them just bloats the type_map).
+        let can_cache = !self.type_is_volatile(&data);
         if can_cache {
             if let Some(&id) = self.type_map.get(&data) {
                 return id;
@@ -506,14 +505,20 @@ impl TypeContext {
         id
     }
 
-    /// Check whether a `TypeData` transitively contains any `InferVar`.
-    /// Needed to prevent interning types that embed inference variables
-    /// across scopes — a composite type containing an InferVar from a
-    /// previous scope would carry stale bindings into the new scope.
-    fn type_contains_infer_var(&self, data: &TypeData) -> bool {
+    /// Check whether a `TypeData` transitively contains any volatile type
+    /// (`InferVar` or `SkolemVar`).  Volatile types are scope-sensitive —
+    /// they must not be interned because:
+    ///
+    /// - **InferVar**: the same id can be reused across inference scopes;
+    ///   caching a composite that embeds an InferVar would let stale
+    ///   bindings leak into the new scope.
+    /// - **SkolemVar**: each `enter_universe()` call creates a fresh id;
+    ///   caching composities that embed them would bloat the `type_map`
+    ///   with single-use entries that never hit the cache.
+    fn type_is_volatile(&self, data: &TypeData) -> bool {
         match data {
-            TypeData::InferVar { .. } => true,
-            // Leaf / primitive types never contain InferVar
+            TypeData::InferVar { .. } | TypeData::SkolemVar { .. } => true,
+            // Leaf / primitive types are never volatile
             TypeData::Int { .. }
             | TypeData::UInt { .. }
             | TypeData::Float { .. }
@@ -525,49 +530,64 @@ impl TypeContext {
             | TypeData::Never
             | TypeData::Error
             | TypeData::Rational { .. }
-            | TypeData::GenericParam { .. }
-            | TypeData::SkolemVar { .. } => false,
+            | TypeData::GenericParam { .. } => false,
             // Composite types: check each child TypeId
             TypeData::Fn { params, ret } => {
-                params.iter().any(|&p| self.type_contains_infer_var_by_id(p))
-                    || self.type_contains_infer_var_by_id(*ret)
+                params.iter().any(|&p| self.type_is_volatile_by_id(p))
+                    || self.type_is_volatile_by_id(*ret)
             }
             TypeData::Adt { args, .. } => {
-                args.iter().any(|&a| self.type_contains_infer_var_by_id(a))
+                args.iter().any(|&a| self.type_is_volatile_by_id(a))
             }
             TypeData::Tuple { elems } => {
-                elems.iter().any(|&e| self.type_contains_infer_var_by_id(e))
+                elems.iter().any(|&e| self.type_is_volatile_by_id(e))
             }
-            TypeData::Array { elem, .. } => self.type_contains_infer_var_by_id(*elem),
-            TypeData::Slice { elem } => self.type_contains_infer_var_by_id(*elem),
-            TypeData::Ref { ty, .. } => self.type_contains_infer_var_by_id(*ty),
-            TypeData::Pointer { ty } => self.type_contains_infer_var_by_id(*ty),
+            TypeData::Array { elem, .. } => self.type_is_volatile_by_id(*elem),
+            TypeData::Slice { elem } => self.type_is_volatile_by_id(*elem),
+            TypeData::Ref { ty, .. } => self.type_is_volatile_by_id(*ty),
+            TypeData::Pointer { ty } => self.type_is_volatile_by_id(*ty),
             TypeData::Ptr { size, pointee } => {
-                self.type_contains_infer_var_by_id(*size)
-                    || self.type_contains_infer_var_by_id(*pointee)
+                self.type_is_volatile_by_id(*size)
+                    || self.type_is_volatile_by_id(*pointee)
             }
             TypeData::Forall { body, .. }
             | TypeData::Exists { base: body, .. }
             | TypeData::Poly { body, .. }
             | TypeData::Mu { body, .. }
-            | TypeData::Nu { body, .. } => self.type_contains_infer_var_by_id(*body),
+            | TypeData::Nu { body, .. } => self.type_is_volatile_by_id(*body),
             TypeData::Coproduct { alternatives } => {
-                alternatives.iter().any(|&a| self.type_contains_infer_var_by_id(a))
+                alternatives.iter().any(|&a| self.type_is_volatile_by_id(a))
             }
             TypeData::AssociatedType { self_ty, .. } => {
-                self.type_contains_infer_var_by_id(*self_ty)
+                self.type_is_volatile_by_id(*self_ty)
             }
             TypeData::DynTrait { .. } => false,
         }
     }
 
     /// Look up a TypeId and check if its TypeData transitively contains
-    /// an InferVar.  Recursive helper for `type_contains_infer_var`.
-    fn type_contains_infer_var_by_id(&self, id: TypeId) -> bool {
+    /// a volatile type (InferVar or SkolemVar).
+    /// Recursive helper for `type_is_volatile`.
+    fn type_is_volatile_by_id(&self, id: TypeId) -> bool {
+        // First check the RAW slot — if this TypeId was originally allocated as
+        // an InferVar or SkolemVar, it IS volatile regardless of any bindings.
+        // Using resolve_binding first would skip this check when a volatile type
+        // happens to be bound to a concrete type, allowing composite types
+        // containing the raw volatile TypeId to be incorrectly cached.
+        if matches!(
+            &*self.types[id.index()],
+            TypeData::InferVar { .. } | TypeData::SkolemVar { .. }
+        ) {
+            return true;
+        }
+        // Follow bindings and check the resolved type.
+        // This catches the case where a non-volatile type (e.g. GenericParam)
+        // has been bound to a volatile type.
         let resolved = self.resolve_binding(id);
-        // Don't re-check the same TypeId — use the types array directly
-        // to avoid infinite recursion from cyclic bindings.
-        self.type_contains_infer_var(&self.types[resolved.index()])
+        if resolved == id {
+            return false;
+        }
+        self.type_is_volatile(&self.types[resolved.index()])
     }
 
     pub fn get(&self, id: TypeId) -> &TypeData {
