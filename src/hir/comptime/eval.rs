@@ -173,6 +173,12 @@ impl<'a> ComptimeEvalContext<'a> {
                                 self.eval_block(body)?;
                             }
                             ComptimeValue::Bool(false) => break,
+                            ComptimeValue::Float(_) => return Err(ComptimeError::type_error(
+                                "while condition must be a boolean, found Float",
+                            )),
+                            ComptimeValue::String(_) => return Err(ComptimeError::type_error(
+                                "while condition must be a boolean, found String",
+                            )),
                             _ => return Err(ComptimeError::type_error(
                                 "while condition must be a boolean",
                             )),
@@ -275,6 +281,12 @@ impl<'a> ComptimeEvalContext<'a> {
                             Ok(ComptimeValue::Unit)
                         }
                     }
+                    ComptimeValue::Float(_) => Err(ComptimeError::type_error(
+                        "if condition must be a boolean, found Float",
+                    )),
+                    ComptimeValue::String(_) => Err(ComptimeError::type_error(
+                        "if condition must be a boolean, found String",
+                    )),
                     _ => Err(ComptimeError::type_error("if condition must be a boolean")),
                 }
             }
@@ -297,10 +309,28 @@ impl<'a> ComptimeEvalContext<'a> {
                         "comptime call target must be a simple function name",
                     )),
                 };
-                // Look up the function in the registry.
-                let (params, body) = self.fn_registry.get(&fn_name).ok_or_else(|| {
-                    ComptimeError::UnknownIdentifier(fn_name.as_str())
-                })?.clone();
+                // Built-in: assert(condition)
+                if fn_name.as_str() == "assert" {
+                    if args.len() != 1 {
+                        return Err(ComptimeError::type_error(
+                            "assert takes exactly one argument",
+                        ));
+                    }
+                    let cond = self.eval_expr(&args[0])?;
+                    match cond {
+                        ComptimeValue::Bool(true) => Ok(ComptimeValue::Unit),
+                        ComptimeValue::Bool(false) => Err(ComptimeError::AssertionFailed(
+                            "assertion failed".into(),
+                        )),
+                        _ => Err(ComptimeError::type_error(
+                            "assert argument must be a boolean",
+                        )),
+                    }
+                } else {
+                    // Look up the function in the registry.
+                    let (params, body) = self.fn_registry.get(&fn_name).ok_or_else(|| {
+                        ComptimeError::UnknownIdentifier(fn_name.as_str())
+                    })?.clone();
                 // Evaluate arguments.
                 let arg_vals: Vec<ComptimeValue> = args
                     .iter()
@@ -322,6 +352,7 @@ impl<'a> ComptimeEvalContext<'a> {
                 // Restore the previous variable scope.
                 self.variables = saved;
                 result
+                }
             }
             HirExpr::TypeInfo(ty, _) => {
                 // @typeInfo(T) returns the type itself as a comptime value.

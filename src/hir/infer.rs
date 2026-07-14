@@ -1757,6 +1757,7 @@ impl InferenceContext {
 
     /// Open a new snapshot.  While open, reversible operations record
     /// an `InferUndoLog` entry.  Returns the current log length.
+    #[must_use = "start_snapshot returns a snapshot token that must be consumed by rollback_to or commit_snapshot"]
     pub fn start_snapshot(&mut self) -> usize {
         self.snapshot_depth += 1;
         self.resolved_snapshot_stack
