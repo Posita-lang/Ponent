@@ -1179,6 +1179,7 @@ impl InferenceContext {
         scrutinee: TypeId,
         branches_id: (usize, usize),
         heap: &mut BinaryHeap<PrioritizedConstraint>,
+        span: crate::ast::Span,
     ) -> bool {
         let resolved = ctx.resolve_binding(scrutinee);
         match ctx.get(resolved) {
@@ -1191,21 +1192,16 @@ impl InferenceContext {
                 let match_c = Constraint::Match {
                     scrutinee,
                     branches_id,
-                    span: crate::ast::Span::new(0, 0),
+                    span,
                 };
-                // #3: Register on this var AND all vars sharing its
-                // binding root (transitive wait_list).
-                let root = ctx.resolve_binding(scrutinee);
-                let targets: Vec<usize> = self
-                    .var_type_ids
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, ty_id)| ctx.resolve_binding(**ty_id) == root)
-                    .map(|(i, _)| i)
-                    .collect();
-                for other_id in targets {
-                    self.suspend_on_var(match_c.clone(), other_id);
-                }
+                // Suspend on this variable only.  When the variable is later
+                // unified to another, the solve loop's wake_var_incremental
+                // mechanism will move the constraint to the working heap.
+                // On re-processing, resolve_binding follows the binding chain
+                // to the new root, so the constraint is not lost even across
+                // multiple unification steps — and the O(N) scan of all
+                // var_type_ids to find transitive roots is eliminated.
+                self.suspend_on_var(match_c, *id);
                 true
             }
             _ => {
@@ -2209,6 +2205,7 @@ impl InferenceContext {
                                 *scrutinee,
                                 *branches_id,
                                 &mut heap,
+                                *match_span,
                             );
                             if !shape_known {
                                 // Scrutinee is still an InferVar — try unicity via bounds
@@ -3448,7 +3445,7 @@ mod tests {
         }];
         let id = infer.register_match_branches(branches);
 
-        let handled = infer.try_match_via_shape_var(&mut ctx, var, id, &mut heap);
+        let handled = infer.try_match_via_shape_var(&mut ctx, var, id, &mut heap, crate::ast::Span::new(0, 0));
         assert!(handled, "should register the match on the wait list");
 
         let var_id = 0;
@@ -3474,7 +3471,7 @@ mod tests {
         }];
         let id = infer.register_match_branches(branches);
 
-        let handled = infer.try_match_via_shape_var(&mut ctx, int_ty, id, &mut heap);
+        let handled = infer.try_match_via_shape_var(&mut ctx, int_ty, id, &mut heap, crate::ast::Span::new(0, 0));
         assert!(handled, "concrete type with matching shape should discharge");
     }
 
@@ -4181,9 +4178,12 @@ mod tests {
             _ => unreachable!(),
         };
         let mut heap = std::collections::BinaryHeap::new();
-        let _handled = infer.try_match_via_shape_var(&mut ctx, infer_var, bid, &mut heap);
-        // try_match_via_shape_var always returns true (handled) but for an InferVar
-        // it should suspend on the wait list, not discharge
+        let _handled = infer.try_match_via_shape_var(&mut ctx, infer_var, bid, &mut heap, crate::ast::Span::new(0, 0));
+        // For an InferVar, try_match_via_shape_var suspends the Match constraint
+        // on the wait list (returns true) rather than discharging immediately.
+        // For a concrete (non-InferVar) type, it delegates to discharge_match and
+        // returns the actual result — true if a branch pattern matched or else_
+        // fallback fired, false if neither.
         assert!(
             var_id < infer.wait_lists.len() && !infer.wait_lists[var_id].is_empty(),
             "match should be suspended on the infer var's wait list"
