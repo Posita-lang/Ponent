@@ -136,7 +136,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         TypeVariableKind::Any
                     }
                 };
-                let ty = self.new_infer_var(kind);
+                let ty = self.new_infer_var(kind, crate::hir::infer::VarOrigin::Expression(Some(*span)));
                 Ok((HirExpr::Literal(lit.clone(), ty, *span), ty))
             }
             Expr::Ident(name, span) => {
@@ -851,7 +851,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         .ty
                         .as_ref()
                         .map(|t| self.resolve_type(t))
-                        .unwrap_or_else(|| Ok(self.new_infer_var(TypeVariableKind::Any)))?;
+                        .unwrap_or_else(|| Ok(self.new_infer_var(TypeVariableKind::Any, crate::hir::infer::VarOrigin::Expression(Some(param.span)))))?;
                     hir_params.push(HirParam {
                         name: param.name.clone(),
                         ty,
@@ -1362,6 +1362,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 let fresh = self.checker.infer.new_type_var(
                                     self.checker.ctx,
                                     crate::hir::infer::TypeVariableKind::Any,
+                                    crate::hir::infer::VarOrigin::Synthetic,
                                 );
                                 (*idx, fresh)
                             })
@@ -1375,6 +1376,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         let root = self.checker.infer.new_type_var(
                             self.checker.ctx,
                             crate::hir::infer::TypeVariableKind::Any,
+                            crate::hir::infer::VarOrigin::Synthetic,
                         );
                         self.checker.ctx.unify(root, inst_ty).ok();
                         Ok((
@@ -1390,6 +1392,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         let result_ty = self.checker.infer.new_type_var(
                             self.checker.ctx,
                             crate::hir::infer::TypeVariableKind::Any,
+                            crate::hir::infer::VarOrigin::Synthetic,
                         );
                         Ok((
                             HirExpr::PolyUnbox {
@@ -1566,7 +1569,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 Ok(self.checker.ctx.struct_ty(def_id, vec![]))
                             } else {
                                 let args: Vec<TypeId> = (0..binding.params.len())
-                                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained))
+                                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained, crate::hir::infer::VarOrigin::Synthetic))
                                     .collect();
                                 Ok(self.checker.ctx.struct_ty(def_id, args))
                             }
@@ -1576,7 +1579,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 Ok(self.checker.ctx.enum_ty(def_id, vec![]))
                             } else {
                                 let args: Vec<TypeId> = (0..binding.params.len())
-                                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained))
+                                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained, crate::hir::infer::VarOrigin::Synthetic))
                                     .collect();
                                 Ok(self.checker.ctx.enum_ty(def_id, args))
                             }
@@ -1908,8 +1911,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     /// Create a fresh inference variable with the given kind.
-    pub fn new_infer_var(&mut self, kind: TypeVariableKind) -> TypeId {
-        self.checker.infer.new_type_var(self.checker.ctx, kind)
+    pub fn new_infer_var(&mut self, kind: TypeVariableKind, origin: crate::hir::infer::VarOrigin) -> TypeId {
+        self.checker.infer.new_type_var(self.checker.ctx, kind, origin)
     }
 
     /// Add a constraint to the inference context.
@@ -2023,7 +2026,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 Pattern::Tuple(patterns, span) => {
                     let elem_tys: Vec<TypeId> = patterns
                         .iter()
-                        .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained))
+                        .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained, crate::hir::infer::VarOrigin::Synthetic))
                         .collect();
                     let tuple_ty = self.checker.ctx.tuple(elem_tys.clone());
                     self.unify_with(expected_ty, tuple_ty, *span, TypingContext::None)?;
@@ -2063,7 +2066,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
             Pattern::Slice(before, slice, after, span) => {
                 let elem_ty = if self.checker.ctx.is_infer_var(expected_ty) {
-                    let elem = self.new_infer_var(TypeVariableKind::Any);
+                    let elem = self.new_infer_var(TypeVariableKind::Any, crate::hir::infer::VarOrigin::Synthetic);
                     let slice_ty = self.checker.ctx.slice(elem);
                     self.unify_with(expected_ty, slice_ty, *span, TypingContext::None)?;
                     elem
@@ -2108,7 +2111,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     return Err(Diagnostic::error("pattern type is not a struct").with_span(*span));
                 }
                 let type_args: Vec<TypeId> = (0..binding.params.len())
-                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained))
+                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained, crate::hir::infer::VarOrigin::Synthetic))
                     .collect();
                 let struct_ty = self.checker.ctx.struct_ty(def_id, type_args.clone());
                 self.unify_with(expected_ty, struct_ty, *span, TypingContext::None)?;
@@ -2168,7 +2171,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     return Err(Diagnostic::error("pattern type is not an enum").with_span(*span));
                 }
                 let type_args: Vec<TypeId> = (0..binding.params.len())
-                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained))
+                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained, crate::hir::infer::VarOrigin::Synthetic))
                     .collect();
                 let enum_ty = self.checker.ctx.enum_ty(def_id, type_args.clone());
                 self.unify_with(expected_ty, enum_ty, *span, TypingContext::None)?;

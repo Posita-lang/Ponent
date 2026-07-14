@@ -431,6 +431,27 @@ pub enum GenState {
     PartialInstance(usize), // id of the PG variable
 }
 
+/// Origin of a type inference variable, used in the defaulting phase to
+/// distinguish between "should have been resolved" and "expected to remain
+/// unresolved" variables.  When solver exhaustion leaves a variable of kind
+/// `Unconstrained` or `Any` unresolved, the origin determines whether the
+/// compiler reports `CannotInfer` or silently defaults to `Error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VarOrigin {
+    /// Variable created for an expression or binding whose type should be
+    /// fully inferred.  Carries the source span of the expression, if known.
+    /// Unresolved at solver exhaustion indicates a type inference failure.
+    Expression(Option<crate::ast::Span>),
+    /// Variable created as a placeholder for a generic parameter
+    /// (e.g., `T` in `def foo<T>(x: T)`).  Expected to remain unresolved
+    /// until the function is instantiated at a call site.
+    GenericParam,
+    /// Synthetic variable created during generic instantiation, promotion,
+    /// or other internal compiler operations.  Not expected to require
+    /// resolution at the current scope.
+    Synthetic,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeVariableKind {
     Unconstrained,
@@ -668,6 +689,12 @@ pub struct InferenceContext {
     dirty_set: std::collections::HashSet<usize>,
     /// Per-InferenceContext resolution table (TypeOrVar pattern).
     resolutions: Vec<Option<TypeId>>,
+    /// Per-variable origin, indexed by the same `id` used in `InferVar { id }`.
+    /// Captured at variable creation time so the defaulting phase can
+    /// distinguish between expression-level variables that should have been
+    /// resolved and generic/synthetic variables that are expected to remain
+    /// unresolved.
+    var_origins: Vec<VarOrigin>,
     /// Local bindings for GenericParam indices during instantiation.
     generic_param_bindings: HashMap<usize, TypeId>,
     /// Variables resolved since last solver wake-up (avoids O(N) scan).
@@ -718,6 +745,7 @@ impl InferenceContext {
             reverse_refs: Vec::new(),
             dirty_set: std::collections::HashSet::new(),
             resolutions: Vec::new(),
+            var_origins: Vec::new(),
             generic_param_bindings: HashMap::default(),
             resolved_ids: Vec::new(),
             resolved_set: FxHashSet::default(),
@@ -727,13 +755,22 @@ impl InferenceContext {
         }
     }
 
-    pub fn new_type_var(&mut self, ctx: &mut TypeContext, kind: TypeVariableKind) -> TypeId {
+    pub fn new_type_var(
+        &mut self,
+        ctx: &mut TypeContext,
+        kind: TypeVariableKind,
+        origin: VarOrigin,
+    ) -> TypeId {
         let id = self.next_var_id;
         self.next_var_id += 1;
         let ty_id = ctx.alloc_infer_var(id);
         if id >= self.resolutions.len() {
             self.resolutions.resize(id + 1, None);
         }
+        if id >= self.var_origins.len() {
+            self.var_origins.resize(id + 1, VarOrigin::Synthetic);
+        }
+        self.var_origins[id] = origin;
         let region_id = self.region_tree.current;
         self.type_vars.push(TypeVar {
             id,
@@ -897,7 +934,7 @@ impl InferenceContext {
         // `new_type_var` registers the var in the *current* region's pool,
         // but we need it in the target (outer) region's pool. We unregister
         // from the current pool and re-register in the target pool.
-        let new_ty_id = self.new_type_var(ctx, TypeVariableKind::Any);
+        let new_ty_id = self.new_type_var(ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let new_id = self.next_var_id - 1;
         let current_region = self.region_tree.current;
         self.region_tree.unregister_var(new_id, current_region);
@@ -2359,7 +2396,7 @@ impl InferenceContext {
                                     let mut instantiated = body_ty;
                                     for &idx in binder_indices.iter().rev() {
                                         let fv =
-                                            self.new_type_var(ctx, TypeVariableKind::Any);
+                                            self.new_type_var(ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
                                         instantiated =
                                             ctx.replace_generic(instantiated, idx, fv);
                                     }
@@ -2376,7 +2413,7 @@ impl InferenceContext {
                                     let mut instantiated = body_ty;
                                     for &idx in binder_indices.iter() {
                                         let fv =
-                                            self.new_type_var(ctx, TypeVariableKind::Any);
+                                            self.new_type_var(ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
                                         instantiated =
                                             ctx.replace_generic(instantiated, idx, fv);
                                     }
@@ -2629,23 +2666,82 @@ impl InferenceContext {
 
         // Defaulting: unfilled infer vars get default types,
         // UNLESS they are PartiallyGeneralizable (guarded by suspended constraints).
+        //
+        // The defaulting runs in TWO passes to handle the case where an
+        // Unconstrained variable (e.g. `set x = 10`) is unified with a guided
+        // variable (e.g. Integer from the literal `10`).  Pass 1 defaults the
+        // guided kinds first, which resolves the leaf variables and transitively
+        // resolves the Unconstrained variables unified with them.  Pass 2 then
+        // checks only truly unresolved Unconstrained/Any variables.
+        //
+        // The VarOrigin recorded at variable creation time determines the behaviour:
+        //
+        //   Expression(Some(span))  → Err(CannotInfer { span })
+        //     An expression-level variable that should have been resolved.
+        //
+        //   Expression(None)        → silently default to Error
+        //     Inferred variable without source span (defensive fallback).
+        //
+        //   GenericParam            → silently default to Error
+        //     Generic parameter placeholder — expected to remain unresolved
+        //     until the function is instantiated at a call site.
+        //
+        //   Synthetic               → silently default to Error
+        //     Internal compiler variable (promotion, instantiation, etc.).
+
+        // ── Pass 1: default guided kinds (Integer, Float, Bool, Numeric) ──
         for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
             let resolved = ctx.resolve_binding(ty_id);
             if let TypeData::InferVar { .. } = ctx.get(resolved) {
-                // Skip variables that are PG — they still have suspended constraints
-                // and will be re-generalized when those constraints are discharged.
                 if i < self.gen_statuses.len()
                     && self.gen_statuses[i] == GenStatus::PartiallyGeneralizable
                 {
                     continue;
                 }
+                match self.type_vars[i].kind {
+                    TypeVariableKind::Integer => {
+                        let default_ty = ctx.int(32, true);
+                        ctx.set_binding(ty_id, default_ty);
+                    }
+                    TypeVariableKind::Float => {
+                        let default_ty = ctx.float(64);
+                        ctx.set_binding(ty_id, default_ty);
+                    }
+                    TypeVariableKind::Bool => {
+                        let default_ty = ctx.bool();
+                        ctx.set_binding(ty_id, default_ty);
+                    }
+                    TypeVariableKind::Numeric => {
+                        let default_ty = ctx.int(32, true);
+                        ctx.set_binding(ty_id, default_ty);
+                    }
+                    _ => {} // Unconstrained / Any handled in Pass 2
+                }
+            }
+        }
+
+        // ── Pass 2: check Unconstrained / Any for Expression errors ─────
+        for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
+            let resolved = ctx.resolve_binding(ty_id);
+            if let TypeData::InferVar { .. } = ctx.get(resolved) {
+                if i < self.gen_statuses.len()
+                    && self.gen_statuses[i] == GenStatus::PartiallyGeneralizable
+                {
+                    continue;
+                }
+                // Expression-level Unconstrained/Any that was never resolved
+                // is a type inference failure — report it.
+                if matches!(self.type_vars[i].kind,
+                    TypeVariableKind::Unconstrained | TypeVariableKind::Any)
+                {
+                    if let VarOrigin::Expression(Some(span)) = self.var_origins.get(i).copied().unwrap_or(VarOrigin::Synthetic) {
+                        return Err(TypeError::CannotInfer { span });
+                    }
+                }
                 let default_ty = match self.type_vars[i].kind {
-                    TypeVariableKind::Integer => ctx.int(32, true),
-                    TypeVariableKind::Float => ctx.float(64),
-                    TypeVariableKind::Bool => ctx.bool(),
-                    TypeVariableKind::Numeric => ctx.int(32, true),
                     TypeVariableKind::Unconstrained => ctx.error(),
                     TypeVariableKind::Any => ctx.error(),
+                    _ => continue,
                 };
                 ctx.set_binding(ty_id, default_ty);
             }
@@ -3144,7 +3240,7 @@ mod tests {
     fn test_suspend_and_wake_var() {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
-        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained, VarOrigin::Synthetic);
         // Extract the var ID from the InferVar type
         let var_id = match ctx.get(var) {
             TypeData::InferVar { id } => *id,
@@ -3164,7 +3260,7 @@ mod tests {
     fn test_wake_var_incremental() {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
-        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -3195,7 +3291,7 @@ mod tests {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
         let prev = infer.enter_level();
-        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -3276,12 +3372,12 @@ mod tests {
     fn test_register_instance_and_propagate() {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
-        let pg_var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let pg_var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained, VarOrigin::Synthetic);
         let pg_id = match ctx.get(pg_var) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
         };
-        let inst1 = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let inst1 = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained, VarOrigin::Synthetic);
         let inst1_id = match ctx.get(inst1) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -3326,7 +3422,7 @@ mod tests {
     fn test_match_priority_change_on_resolve() {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
-        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained, VarOrigin::Synthetic);
         let match_c = Constraint::Match {
             scrutinee: var,
             branches_id: (0, 0),
@@ -3392,7 +3488,7 @@ mod tests {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
 
-        let _var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let _var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained, VarOrigin::Synthetic);
         let var_id = 0;
         if var_id < infer.gen_statuses.len() {
             infer.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
@@ -3412,7 +3508,7 @@ mod tests {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
 
-        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained, VarOrigin::Synthetic);
         let var_id = 0;
         if var_id < infer.gen_statuses.len() {
             infer.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
@@ -3437,7 +3533,7 @@ mod tests {
         let mut infer = InferenceContext::new();
         let mut heap = std::collections::BinaryHeap::new();
 
-        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained);
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained, VarOrigin::Synthetic);
         let branches = vec![MatchBranchSet {
             shape_pattern: PrincipalShape::Arrow,
             continuation: Vec::new(),
@@ -3713,7 +3809,7 @@ mod tests {
         let _prev = infer.enter_level();
         let _prev2 = infer.enter_level();
         // Create a variable at the current deep level
-        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -3737,7 +3833,7 @@ mod tests {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
         // Variable at level 0 (default)
-        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -3764,7 +3860,7 @@ mod tests {
         let _prev2 = infer.enter_level();
 
         // Create a variable at a deep level
-        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -3799,7 +3895,7 @@ mod tests {
         );
 
         // Also set up a forward reference (simulating instance tracking)
-        let inst = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let inst = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let inst_id = match ctx.get(inst) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -3899,7 +3995,7 @@ mod tests {
     fn test_force_generalize_pg_with_waitlist_stays_pg() {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
-        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -3931,7 +4027,7 @@ mod tests {
     fn test_force_generalize_dirty_set_triggers_generalization() {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
-        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -3955,7 +4051,7 @@ mod tests {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
         let prev = infer.enter_level();
-        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -4008,13 +4104,13 @@ mod tests {
     fn test_s_inst_copy_deepen_follows_aliases() {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
-        let pg = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let pg = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let pg_id = match ctx.get(pg) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
         };
         // Create an instance
-        let inst = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let inst = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let inst_id = match ctx.get(inst) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -4051,12 +4147,12 @@ mod tests {
     fn test_s_inst_copy_pg_alias_resolved() {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
-        let pg = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let pg = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let pg_id = match ctx.get(pg) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
         };
-        let inst = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let inst = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let inst_id = match ctx.get(inst) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -4082,7 +4178,7 @@ mod tests {
         let mut infer = InferenceContext::new();
         // Enter a deeper level so the var's level > current_level
         let prev = infer.enter_level();
-        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -4111,8 +4207,8 @@ mod tests {
         let symbols = SymbolTable::new(crate::hir::types::CrateId(DefId(0)));
         let trait_env = TraitEnv::new();
 
-        let a = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
-        let b = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let a = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let b = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         // Add constraint: Eq(a, b)
         infer.add_constraint(Constraint::Eq(a, b, crate::ast::Span::new(0, 0)));
         // Unify a with Int<32>
@@ -4135,8 +4231,8 @@ mod tests {
 
         // Create a variable at a deeper level
         let prev = infer.enter_level();
-        let deep_var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
-        let shallow_var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let deep_var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let shallow_var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         infer.exit_level(prev);
 
         // Eq(deep, shallow) — should promote deep to shallow's level
@@ -4172,7 +4268,7 @@ mod tests {
         let bid = infer.register_match_branches(branches);
 
         // Create an infer var and try_match via shape var (should suspend)
-        let infer_var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let infer_var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(infer_var) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -4221,7 +4317,7 @@ mod tests {
 
         // Create variables at deeper scope (simulating let-polymorphism)
         let _prev = infer.enter_level();
-        let x = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let x = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let x_id = match ctx.get(x) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -4260,7 +4356,7 @@ mod tests {
         // promoted variable in the WRONG branch, breaking scoping.
         let _r0 = infer.enter_level(); // → branch_A
         let _r1 = infer.enter_level(); // → leaf_A1
-        let a_deep = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let a_deep = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let a_deep_id = match ctx.get(a_deep) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -4271,7 +4367,7 @@ mod tests {
         // Now enter branch_B → leaf_B1
         let _r2 = infer.enter_level(); // → branch_B
         let _r3 = infer.enter_level(); // → leaf_B1
-        let b_deep = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let b_deep = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let b_deep_id = match ctx.get(b_deep) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),
@@ -4337,11 +4433,11 @@ mod tests {
         // types should still fail (smoke test that NCA doesn't paper over
         // real type errors).
         let _r0 = infer.enter_level(); // → branch_A
-        let a = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let a = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         infer.exit_level(_r0);
 
         let _r1 = infer.enter_level(); // → branch_B
-        let b = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let b = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         infer.exit_level(_r1);
 
         // Bind a to Bool, b to Int<32>, then constrain Eq(a, b)
@@ -4372,7 +4468,7 @@ mod tests {
         // enter_level() returns the parent region, sets current to child.
         let _parent = infer.enter_level();
         let child_region = infer.region_tree.current;
-        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any);
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
             TypeData::InferVar { id } => *id,
             _ => unreachable!(),

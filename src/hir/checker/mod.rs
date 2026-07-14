@@ -425,7 +425,7 @@ impl<'a> TypeChecker<'a> {
                 let declared_ty = if let Some(ty) = ty {
                     self.resolve_type(ty)?
                 } else {
-                    self.new_infer_var(TypeVariableKind::Unconstrained)
+                    self.new_infer_var(TypeVariableKind::Unconstrained, crate::hir::infer::VarOrigin::Expression(Some(*span)))
                 };
 
                 // Determine the actual initializer (value) and its type.
@@ -1466,7 +1466,7 @@ impl<'a> TypeChecker<'a> {
                     let p_ty = if let Some(ref ty) = p.ty {
                         self.resolve_type(ty)?
                     } else {
-                        self.new_infer_var(TypeVariableKind::Unconstrained)
+                        self.new_infer_var(TypeVariableKind::Unconstrained, crate::hir::infer::VarOrigin::Expression(Some(p.span)))
                     };
                     hir_params.push(HirParam {
                         name: p.name.clone(),
@@ -2125,7 +2125,7 @@ impl<'a> TypeChecker<'a> {
         // The Impl constraint verifies the trait exists; the infer var is
         // unified with the expected result type downstream.
         self.unify_with(left, right, span, TypingContext::None)?;
-        Ok(self.new_infer_var(TypeVariableKind::Numeric))
+        Ok(self.new_infer_var(TypeVariableKind::Numeric, crate::hir::infer::VarOrigin::Expression(Some(span))))
     }
 
     /// Check that an inference variable's kind constraint is compatible with the
@@ -2458,7 +2458,7 @@ impl<'a> TypeChecker<'a> {
         // Create fresh InferVars for each GenericParam index
         let mut infer_var_for_index: Vec<TypeId> = Vec::new();
         for _ in &generic_indices {
-            let var = self.new_infer_var(TypeVariableKind::Any);
+            let var = self.new_infer_var(TypeVariableKind::Any, crate::hir::infer::VarOrigin::GenericParam);
             infer_var_for_index.push(var);
         }
 
@@ -2940,8 +2940,8 @@ impl<'a> TypeChecker<'a> {
         None
     }
 
-    fn new_infer_var(&mut self, kind: TypeVariableKind) -> TypeId {
-        self.infer.new_type_var(self.ctx, kind)
+    fn new_infer_var(&mut self, kind: TypeVariableKind, origin: crate::hir::infer::VarOrigin) -> TypeId {
+        self.infer.new_type_var(self.ctx, kind, origin)
     }
     fn add_constraint(&mut self, c: Constraint) {
         self.infer.add_constraint(c);
