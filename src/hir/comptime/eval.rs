@@ -7,6 +7,7 @@ use super::error::ComptimeError;
 use super::value::ComptimeValue;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A registered comptime function: (parameter_names, body_statements).
 type ComptimeFn = (Vec<Symbol>, Vec<HirStmt>);
@@ -206,8 +207,15 @@ impl<'a> ComptimeEvalContext<'a> {
         match expr {
             HirExpr::Literal(lit, _ty, _span) => match lit {
                 crate::ast::Literal::Int(n) => Ok(ComptimeValue::Int(*n)),
+                crate::ast::Literal::Float(f) => Ok(ComptimeValue::Float(*f)),
+                crate::ast::Literal::Char(c) => Ok(ComptimeValue::Int(*c as i128)),
                 crate::ast::Literal::Bool(b) => Ok(ComptimeValue::Bool(*b)),
-                _ => Err(ComptimeError::Deferred),
+                crate::ast::Literal::String(s) => Ok(ComptimeValue::String(Arc::from(s.as_str()))),
+                crate::ast::Literal::ByteString(b) => {
+                    Ok(ComptimeValue::String(
+                        Arc::from(String::from_utf8_lossy(b).as_ref()),
+                    ))
+                }
             },
             HirExpr::Block(stmts, _ty, _span) => self.eval_block(stmts),
             HirExpr::BinaryOp { left, op, right, ty, .. } => {
@@ -267,6 +275,52 @@ impl<'a> ComptimeEvalContext<'a> {
                     (ComptimeValue::Int(a), ComptimeValue::Int(b), crate::ast::BinOp::Ge) => {
                         Ok(ComptimeValue::Bool(a >= b))
                     }
+                    // ── Float arithmetic ───────────────────────────────
+                    (ComptimeValue::Float(a), ComptimeValue::Float(b), crate::ast::BinOp::Add) => {
+                        Ok(ComptimeValue::Float(a + b))
+                    }
+                    (ComptimeValue::Float(a), ComptimeValue::Float(b), crate::ast::BinOp::Sub) => {
+                        Ok(ComptimeValue::Float(a - b))
+                    }
+                    (ComptimeValue::Float(a), ComptimeValue::Float(b), crate::ast::BinOp::Mul) => {
+                        Ok(ComptimeValue::Float(a * b))
+                    }
+                    (ComptimeValue::Float(a), ComptimeValue::Float(b), crate::ast::BinOp::Div) => {
+                        Ok(ComptimeValue::Float(a / b))
+                    }
+                    // ── Float comparisons ──────────────────────────────
+                    (ComptimeValue::Float(a), ComptimeValue::Float(b), crate::ast::BinOp::Eq) => {
+                        Ok(ComptimeValue::Bool(a == b))
+                    }
+                    (ComptimeValue::Float(a), ComptimeValue::Float(b), crate::ast::BinOp::Neq) => {
+                        Ok(ComptimeValue::Bool(a != b))
+                    }
+                    (ComptimeValue::Float(a), ComptimeValue::Float(b), crate::ast::BinOp::Lt) => {
+                        Ok(ComptimeValue::Bool(a < b))
+                    }
+                    (ComptimeValue::Float(a), ComptimeValue::Float(b), crate::ast::BinOp::Gt) => {
+                        Ok(ComptimeValue::Bool(a > b))
+                    }
+                    (ComptimeValue::Float(a), ComptimeValue::Float(b), crate::ast::BinOp::Le) => {
+                        Ok(ComptimeValue::Bool(a <= b))
+                    }
+                    (ComptimeValue::Float(a), ComptimeValue::Float(b), crate::ast::BinOp::Ge) => {
+                        Ok(ComptimeValue::Bool(a >= b))
+                    }
+                    // ── String concatenation ───────────────────────────
+                    (ComptimeValue::String(a), ComptimeValue::String(b), crate::ast::BinOp::Add) => {
+                        let mut result = String::with_capacity(a.len() + b.len());
+                        result.push_str(&a);
+                        result.push_str(&b);
+                        Ok(ComptimeValue::String(Arc::from(result)))
+                    }
+                    // ── String equality ────────────────────────────────
+                    (ComptimeValue::String(a), ComptimeValue::String(b), crate::ast::BinOp::Eq) => {
+                        Ok(ComptimeValue::Bool(a == b))
+                    }
+                    (ComptimeValue::String(a), ComptimeValue::String(b), crate::ast::BinOp::Neq) => {
+                        Ok(ComptimeValue::Bool(a != b))
+                    }
                     _ => Err(ComptimeError::type_error("unsupported binary operation")),
                 }
             }
@@ -295,7 +349,17 @@ impl<'a> ComptimeEvalContext<'a> {
                 if let Some(val) = self.variables.get(name) {
                     return Ok(val.clone());
                 }
-                // 2. Check the symbol table for comptime-known values.
+                // 2. Check if the name is a zero-argument comptime function
+                //    (e.g. `comptime def N() -> Int<32> { 5 }` referenced as `N`).
+                if let Some((params, body)) = self.fn_registry.get(name).cloned() {
+                    if params.is_empty() {
+                        let saved = std::mem::take(&mut self.variables);
+                        let result = self.eval_block(&body);
+                        self.variables = saved;
+                        return result;
+                    }
+                }
+                // 3. Check the symbol table for comptime-known values.
                 //    (e.g. comptime function parameters, imported constants).
                 //    For now, this is a placeholder — full symbol table integration
                 //    will be added in a later phase.

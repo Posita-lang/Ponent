@@ -1,5 +1,6 @@
 use super::*;
 use crate::ast::visit::replace_ident_in_expr;
+use crate::hir::comptime::{ComptimeEvalContext, ComptimeValue};
 
 /// Context for type-checking a single function body.
 /// Holds the mutable borrows needed for expression/statement inference
@@ -1729,10 +1730,37 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 if let Expr::Literal(Literal::Int(size_val), _) = size.as_ref() {
                     Ok(self.checker.ctx.array(inner, *size_val as u64))
                 } else {
-                    Err(
-                        Diagnostic::error("array size must be a compile-time constant integer")
-                            .with_span(*span),
-                    )
+                    // Non-literal size: try to evaluate it as a comptime expression.
+                    match self.infer_expr(size) {
+                        Ok((size_hir, _size_ty)) => {
+                            let mut eval = ComptimeEvalContext::new(
+                                self.checker.ctx,
+                                self.checker.symbols,
+                            );
+                            for (name, (params, body)) in &self.checker.comptime_fn_registry {
+                                eval.register_fn(name.clone(), params.clone(), body.clone());
+                            }
+                            match eval.eval_expr(&size_hir) {
+                                Ok(ComptimeValue::Int(n)) if n >= 0 => {
+                                    Ok(self.checker.ctx.array(inner, n as u64))
+                                }
+                                Ok(ComptimeValue::Int(n)) => {
+                                    Err(Diagnostic::error(
+                                        format!("array size must be a non-negative integer, found {}", n),
+                                    ).with_span(*span))
+                                }
+                                Ok(_) => Err(Diagnostic::error(
+                                    "array size must evaluate to an integer at compile time",
+                                ).with_span(*span)),
+                                Err(e) => Err(Diagnostic::error(
+                                    format!("array size evaluation failed: {}", e),
+                                ).with_span(*span)),
+                            }
+                        }
+                        Err(e) => Err(Diagnostic::error(
+                            "array size must be a compile-time constant integer",
+                        ).with_span(*span)),
+                    }
                 }
             }
             Type::Tuple(tys, _) => {

@@ -418,6 +418,8 @@ pub struct TypeContext {
     /// in reverse order; on commit the log is discarded.
     /// This is O(changes) instead of O(total_bindings) — a significant saving
     /// when the binding table is large and transactions are frequent.
+    /// Note: the types arena (self.types) is NOT truncated on rollback because
+    /// TypeId values may be held externally; the arena is append-only.
     transaction_stack: RefCell<Vec<Vec<(TypeId, Option<TypeId>)>>>,
     /// Cache for unification with variance: prevents infinite recursion on
     /// self-referential types.  Keyed by (a, b, variance_tag) where
@@ -2132,6 +2134,8 @@ impl TypeContext {
     /// Rollback the current transaction: reverse-apply every binding change
     /// recorded in this transaction's undo log.
     /// Also clears the unification cache so subsequent attempts re-evaluate.
+    /// Note: the types arena (self.types) is NOT truncated — TypeId values
+    /// may be held externally, and the arena is logically append-only.
     pub fn rollback_transaction(&self) {
         if let Some(log) = self.transaction_stack.borrow_mut().pop() {
             let mut bindings = self.bindings.borrow_mut();

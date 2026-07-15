@@ -3,6 +3,7 @@ use crate::hir::symbol::{SymbolTable, TypeKind};
 use crate::hir::types::{DefId, Subst, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
 use rustc_hash::FxHashMap as HashMap;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static GENERIC_MATCH_VAR_ID: AtomicUsize = AtomicUsize::new(1_000_000);
@@ -44,6 +45,20 @@ pub struct TraitEnv {
     impls: Vec<ImplCandidate>,
     /// Inherent (non-trait) methods indexed by the DefId of the type they're implemented on.
     inherent_methods: HashMap<DefId, Vec<MethodInfo>>,
+    /// Cache for `lookup_impl_generic`: (trait_id, target_ty) → Some(cand_idx, subst)
+    /// on match, None on miss (negative cache).  Stores the candidate index alongside
+    /// the substitution so that a cache hit returns the exact same candidate that
+    /// originally produced the subst — avoiding mismatches when multiple impls
+    /// share the same trait_id.
+    /// Uses RefCell for interior mutability so that lookup_impl_generic can remain
+    /// `&self` (the cache is transparent to callers).
+    impl_generic_cache: RefCell<HashMap<(DefId, TypeId), Option<(usize, Subst)>>>,
+}
+
+impl Default for TraitEnv {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TraitEnv {
@@ -51,6 +66,7 @@ impl TraitEnv {
         TraitEnv {
             impls: Vec::new(),
             inherent_methods: HashMap::default(),
+            impl_generic_cache: RefCell::new(HashMap::default()),
         }
     }
 
@@ -65,7 +81,7 @@ impl TraitEnv {
         symbols: &SymbolTable,
         ctx: &crate::hir::types::TypeContext,
         is_trusted: bool,
-    ) -> Result<(), OrphanError> {
+    ) -> Result<(), TraitError> {
         // Check termination conditions BEFORE the orphan rule, so that
         // generic impls get clear errors about Paterson/Coverage violations
         // rather than a misleading "orphan rule" error.
@@ -91,10 +107,11 @@ impl TraitEnv {
                         }
                     }
                 }
-                return Err(OrphanError {
+                return Err(TraitError::Orphan {
                     trait_id: candidate.trait_id,
                     type_id: candidate.for_type,
                     span: candidate.span,
+                    kind: OrphanKind::PatersonViolation,
                 });
             }
         }
@@ -108,10 +125,11 @@ impl TraitEnv {
                 context_vars.extend(collect_generic_params(ctx_ty, ctx));
             }
             if !bare_vars.is_subset(&context_vars) {
-                return Err(OrphanError {
+                return Err(TraitError::Orphan {
                     trait_id: candidate.trait_id,
                     type_id: candidate.for_type,
                     span: candidate.span,
+                    kind: OrphanKind::CoverageViolation,
                 });
             }
         }
@@ -131,15 +149,20 @@ impl TraitEnv {
             let type_local = type_crate == Some(local);
 
             if !is_trusted && !trait_local && !type_local {
-                return Err(OrphanError {
+                return Err(TraitError::Orphan {
                     trait_id: candidate.trait_id,
                     type_id: candidate.for_type,
                     span: candidate.span,
+                    kind: OrphanKind::OrphanRule,
                 });
             }
         }
 
         self.impls.push(candidate);
+        // Invalidate the generic impl cache: a new impl may change the
+        // result of future lookups, and stale entries could produce
+        // incorrect candidate matches.
+        self.impl_generic_cache.borrow_mut().clear();
         Ok(())
     }
 }
@@ -289,12 +312,26 @@ impl TraitEnv {
         ctx: &mut TypeContext,
         symbols: &SymbolTable,
     ) -> Option<(&'b ImplCandidate, Subst)> {
-        for cand in &self.impls {
-            if cand.trait_id != trait_id {
+        let resolved = ctx.resolve_binding(target_ty);
+        let cache_key = (trait_id, resolved);
+        // Negative cache check.
+        if self.impl_generic_cache.borrow().get(&cache_key).map_or(false, |v| v.is_none()) {
+            return None;
+        }
+        // Positive cache check: use the stored candidate index to retrieve
+        // the exact same candidate that produced the cached substitution,
+        // avoiding mismatches when multiple impls share the same trait_id.
+        if let Some(Some((cached_idx, cached_subst))) = self.impl_generic_cache.borrow().get(&cache_key) {
+            if *cached_idx < self.impls.len() {
+                return Some((&self.impls[*cached_idx], cached_subst.clone()));
+            }
+        }
+        for cand_idx in 0..self.impls.len() {
+            if self.impls[cand_idx].trait_id != trait_id {
                 continue;
             }
             // Get the type binding for the candidate's for_type
-            let def_id = match ctx.get(cand.for_type) {
+            let def_id = match ctx.get(self.impls[cand_idx].for_type) {
                 TypeData::Adt { def_id, .. } => *def_id,
                 _ => continue,
             };
@@ -329,8 +366,12 @@ impl TraitEnv {
                 continue; // unification failed, not a match
             }
             ctx.commit_transaction();
-            return Some((cand, subst));
+            // Cache the positive result with the candidate index.
+            self.impl_generic_cache.borrow_mut().insert(cache_key, Some((cand_idx, subst.clone())));
+            return Some((&self.impls[cand_idx], subst));
         }
+        // Negative cache: no match found for this (trait_id, resolved) pair.
+        self.impl_generic_cache.borrow_mut().insert(cache_key, None);
         None
     }
 
@@ -399,25 +440,63 @@ impl TraitEnv {
 }
 
 #[derive(Debug, Clone)]
-pub struct OrphanError {
-    pub trait_id: DefId,
-    pub type_id: TypeId,
-    pub span: Span,
+pub enum TraitError {
+    /// Paterson condition / Coverage condition / orphan rule violation
+    /// during impl registration.
+    Orphan {
+        trait_id: DefId,
+        type_id: TypeId,
+        span: Span,
+        kind: OrphanKind,
+    },
+    /// No matching impl found for the given trait and type.
+    NotFound {
+        trait_id: DefId,
+        type_id: TypeId,
+        span: Span,
+    },
+    /// Multiple impl candidates matched (incoherent overlap).
+    Ambiguous {
+        candidates: Vec<ImplCandidate>,
+        span: Span,
+    },
 }
 
-impl Default for TraitEnv {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Specific violation kind for `TraitError::Orphan`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanKind {
+    /// Paterson condition: a context type is not strictly smaller than the head.
+    PatersonViolation,
+    /// Coverage condition: a bare type variable in the head is not covered.
+    CoverageViolation,
+    /// Neither the trait nor the type is local to the current crate.
+    OrphanRule,
 }
 
-impl std::fmt::Display for OrphanError {
+impl std::fmt::Display for TraitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "orphan rule violation: impl for trait {:?} on type {:?} is not allowed because neither the trait nor the type is local",
-            self.trait_id, self.type_id
-        )
+        match self {
+            TraitError::Orphan { kind, trait_id, type_id, .. } => {
+                let msg = match kind {
+                    OrphanKind::PatersonViolation => {
+                        "impl violates Paterson condition: a context type is not strictly smaller than the head type"
+                    }
+                    OrphanKind::CoverageViolation => {
+                        "impl violates Coverage condition: a bare type variable in the head is not covered by context types"
+                    }
+                    OrphanKind::OrphanRule => {
+                        "orphan rule violation: impl for trait on type is not allowed because neither the trait nor the type is local"
+                    }
+                };
+                write!(f, "{} (trait={:?}, type={:?})", msg, trait_id, type_id)
+            }
+            TraitError::NotFound { trait_id, type_id, .. } => {
+                write!(f, "trait impl not found for trait={:?} on type={:?}", trait_id, type_id)
+            }
+            TraitError::Ambiguous { candidates, .. } => {
+                write!(f, "multiple matching impl candidates found ({} candidates)", candidates.len())
+            }
+        }
     }
 }
 

@@ -593,7 +593,7 @@ impl<'a> NameResolver<'a> {
                         self.trait_env
                             .add_impl(candidate, &self.symbols, self.ctx, false)
                     {
-                        // Convert OrphanError to a diagnostic for proper error reporting
+                        // Convert TraitError to a diagnostic for proper error reporting
                         self.diagnostics.push(
                             Diagnostic::error(format!(
                                 "impl for trait on type violates termination rules: {}",
