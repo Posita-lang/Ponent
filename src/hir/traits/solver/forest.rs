@@ -35,6 +35,11 @@ pub struct ObligationNode {
     pub parent: Option<usize>,
     /// Children that have been registered from selection.
     pub children: Vec<usize>,
+    /// Inference variables that are blocking this obligation from being
+    /// resolved.  Populated when the node is marked as `Deferred`.
+    /// Used by the fulfillment context to selectively re-evaluate nodes
+    /// when inference variables are resolved.
+    pub stalled_on: Vec<TypeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +75,7 @@ impl ObligationForest {
             state: ObligationState::Pending,
             parent: None,
             children: Vec::new(),
+            stalled_on: Vec::new(),
         });
         self.pending.push_back(idx);
         idx
@@ -88,6 +94,7 @@ impl ObligationForest {
             state: ObligationState::Pending,
             parent: Some(parent_idx),
             children: Vec::new(),
+            stalled_on: Vec::new(),
         });
         self.nodes[parent_idx].children.push(idx);
         self.pending.push_back(idx);
@@ -96,16 +103,51 @@ impl ObligationForest {
 
     /// Get the next pending obligation to process.
     /// Returns `None` if no pending obligations remain.
+    ///
+    /// Only returns nodes in the `Pending` state.  `Deferred` nodes are
+    /// not returned — they must first be recycled back to `Pending` by
+    /// [`recycle_ready_deferred`] when their `stalled_on` variables are
+    /// resolved.
     pub fn next_pending(&mut self) -> Option<usize> {
         while let Some(idx) = self.pending.pop_front() {
-            if matches!(
-                self.nodes[idx].state,
-                ObligationState::Pending | ObligationState::Deferred
-            ) {
+            if matches!(self.nodes[idx].state, ObligationState::Pending) {
                 return Some(idx);
             }
+            // Skip resolved/error/cycle-detected/deferred nodes.
         }
         None
+    }
+
+    /// Move deferred nodes whose `stalled_on` variables have been resolved
+    /// (are no longer inference variables) back to the `Pending` state and
+    /// push them onto the pending queue for re-evaluation.
+    ///
+    /// Returns `true` if any node was recycled.
+    ///
+    /// This is the bridge between the selective re-evaluation tracked by
+    /// `stalled_on` and the fulfillment loop: the loop calls this method
+    /// before checking for progress, so that ready deferred nodes are
+    /// picked up by `next_pending`.
+    pub fn recycle_ready_deferred(&mut self, ctx: &TypeContext) -> bool {
+        let mut any_ready = false;
+        for node in &mut self.nodes {
+            if matches!(node.state, ObligationState::Deferred) {
+                if node.stalled_on.iter().any(|&ty| !ctx.is_infer_var(ty)) {
+                    node.state = ObligationState::Pending;
+                    any_ready = true;
+                }
+            }
+        }
+        if any_ready {
+            // Re-queue all nodes that are now Pending (including those
+            // just recycled and any that were already Pending).
+            for (idx, node) in self.nodes.iter().enumerate() {
+                if matches!(node.state, ObligationState::Pending) {
+                    self.pending.push_back(idx);
+                }
+            }
+        }
+        any_ready
     }
 
     /// Mark a node as resolved.
@@ -121,8 +163,10 @@ impl ObligationForest {
     /// Mark a node as deferred — cannot be resolved yet because the
     /// self_ty is still an inference variable.  The node will be retried
     /// after the type is resolved by the old solver.
-    pub fn mark_deferred(&mut self, idx: usize) {
+    /// `stalled_on` records which inference variables are blocking resolution.
+    pub fn mark_deferred(&mut self, idx: usize, stalled_on: Vec<TypeId>) {
         self.nodes[idx].state = ObligationState::Deferred;
+        self.nodes[idx].stalled_on = stalled_on;
         self.pending.push_back(idx);
     }
 
@@ -199,6 +243,19 @@ impl ObligationForest {
     pub fn has_pending(&self) -> bool {
         self.pending.iter().any(|&idx| {
             matches!(self.nodes[idx].state, ObligationState::Pending)
+        })
+    }
+
+    /// Check if any deferred node has a resolved `stalled_on` variable.
+    ///
+    /// When a deferred node's blocking inference variable gets bound to a
+    /// concrete type, the node is ready for re-evaluation.  The fulfillment
+    /// loop uses this to avoid stalling while there is still progress to
+    /// be made by re-evaluating unblocked deferred nodes.
+    pub fn has_ready_deferred(&self, ctx: &TypeContext) -> bool {
+        self.nodes.iter().any(|n| {
+            matches!(n.state, ObligationState::Deferred)
+                && n.stalled_on.iter().any(|&ty| !ctx.is_infer_var(ty))
         })
     }
 

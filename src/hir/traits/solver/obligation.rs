@@ -116,9 +116,28 @@ pub enum ImplSource {
         nested: Vec<Obligation>,
     },
     /// The obligation cannot be resolved yet because the self_ty is still
-    /// an inference variable.  The solver should retry after the type is
-    /// resolved.  Contains no sub-obligations.
-    Deferred,
+    /// an inference variable.  `stalled_on` records which inference variables
+    /// are blocking resolution, enabling selective re-evaluation when those
+    /// variables are bound.  Contains no sub-obligations.
+    Deferred {
+        /// Inference variable TypeIds that are blocking resolution.
+        stalled_on: Vec<TypeId>,
+    },
+}
+
+/// How certain we are that a selected impl source is correct.
+///
+/// Analogous to rustc's `Certainty::Yes` vs `Certainty::Maybe(Ambiguity)`.
+/// When a goal is `Maybe`, it provisionally succeeded but may fail once
+/// inference variables are resolved.  The caller can decide whether to
+/// accept provisional results or require definite resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Certainty {
+    /// Definitely resolved — the impl is sound and complete.
+    Yes,
+    /// Provisionally resolved — the impl holds if the inference variables
+    /// in `stalled_on` are resolved compatibly.
+    Maybe,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

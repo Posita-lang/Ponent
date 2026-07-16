@@ -351,7 +351,7 @@ impl VfsNode {
                         }
                         VfsNodeKind::File => {
                             // Only include .ps files
-                            if child_path.extension().map_or(false, |ext| ext == "ps") {
+                            if child_path.extension().is_some_and(|ext| ext == "ps") {
                                 let mut f = VfsNode::new_file(*id_counter, &entry.name);
                                 *id_counter += 1;
                                 f.abs_path = Some(child_path_str.clone());

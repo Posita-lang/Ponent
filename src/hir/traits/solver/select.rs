@@ -6,7 +6,6 @@ use crate::hir::traits::solver::builtins::{self, BuiltinTrait, BuiltinTraitRegis
 use crate::hir::traits::solver::project::{self, ProjectionCache};
 use crate::hir::traits::TraitEnv;
 use crate::hir::types::{DefId, Subst, TypeContext, TypeData, TypeId};
-use crate::hir::infer::InferenceContext;
 use crate::hir::symbol::SymbolTable;
 use crate::symbol::Symbol;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,7 +24,6 @@ static GENERIC_MATCH_VAR_ID: AtomicUsize = AtomicUsize::new(2_000_000);
 /// Does NOT modify `TraitEnv` — all state mutations go through `TypeContext` transactions.
 pub struct SelectionContext<'a> {
     pub ctx: &'a mut TypeContext,
-    pub infer: &'a mut InferenceContext,
     pub trait_env: &'a TraitEnv,
     pub symbols: &'a SymbolTable,
     pub builtin_registry: &'a BuiltinTraitRegistry,
@@ -33,9 +31,7 @@ pub struct SelectionContext<'a> {
     pub caller_bounds: &'a [Predicate],
     /// Projection cache for associated type normalization.
     pub proj_cache: &'a ProjectionCache,
-    /// Current recursion depth.
-    recursion_depth: usize,
-}
+    }
 
 /// Maximum recursion depth for trait resolution before overflow.
 const MAX_RECURSION_DEPTH: usize = 64;
@@ -109,12 +105,15 @@ pub struct ResolvedObligation {
     /// Whether the self_ty is still an inference variable, meaning the
     /// obligation cannot be resolved yet and should be retried later.
     pub ambiguous: bool,
+    /// The recursion depth of the parent obligation that produced this one.
+    /// Used to propagate depth when creating nested obligations during
+    /// confirmation (e.g., `Candidate::Poly`).
+    pub parent_depth: usize,
 }
 
 impl<'a> SelectionContext<'a> {
     pub fn new(
         ctx: &'a mut TypeContext,
-        infer: &'a mut InferenceContext,
         trait_env: &'a TraitEnv,
         symbols: &'a SymbolTable,
         builtin_registry: &'a BuiltinTraitRegistry,
@@ -123,13 +122,11 @@ impl<'a> SelectionContext<'a> {
     ) -> Self {
         SelectionContext {
             ctx,
-            infer,
             trait_env,
             symbols,
             builtin_registry,
             proj_cache,
             caller_bounds,
-            recursion_depth: 0,
         }
     }
 
@@ -137,26 +134,22 @@ impl<'a> SelectionContext<'a> {
     ///
     /// Returns the resolved `ImplSource` on success, or a `SolveError` on failure.
     pub fn select(&mut self, obligation: &Obligation) -> Result<ImplSource, SolveError> {
-        if self.recursion_depth >= MAX_RECURSION_DEPTH {
+        if obligation.recursion_depth >= MAX_RECURSION_DEPTH {
             return Err(SolveError::Overflow {
                 trait_id: DefId(0),
-                self_ty: TypeId::from_raw(0),
-                depth: self.recursion_depth,
+                self_ty: self.ctx.error(),
+                depth: obligation.recursion_depth,
             });
         }
-        self.recursion_depth += 1;
 
         // ── Handle ProjectionEq / ProjectionNormalize directly ──
         // These are not trait obligations — they are resolved by looking up
         // the associated type in the impl and unifying with the target.
-        // Must decrement recursion_depth before returning to avoid leaks.
         match &obligation.predicate {
             Predicate::ProjectionEq { trait_id, self_ty, assoc_name, value } => {
-                self.recursion_depth -= 1;
                 return self.handle_projection_eq(*trait_id, *self_ty, assoc_name, *value, &obligation.cause);
             }
             Predicate::ProjectionNormalize { projection, target } => {
-                self.recursion_depth -= 1;
                 return self.handle_projection_normalize(projection, *target, &obligation.cause);
             }
             _ => {}
@@ -167,11 +160,12 @@ impl<'a> SelectionContext<'a> {
 
         // ── If self_ty is still an infer var, defer ──
         // The obligation cannot be resolved until the type variable is
-        // bound to a concrete type.  Return Deferred so the caller can
-        // retry after the type is resolved.
+        // bound to a concrete type.  Record which inference variables
+        // are blocking so the caller can selectively re-evaluate when
+        // they are resolved.
         if resolved.ambiguous {
-            self.recursion_depth -= 1;
-            return Ok(ImplSource::Deferred);
+            let stalled_on = vec![resolved.self_ty];
+            return Ok(ImplSource::Deferred { stalled_on });
         }
 
         // ── Candidate assembly ──
@@ -188,8 +182,6 @@ impl<'a> SelectionContext<'a> {
 
         // ── Winnowing ──
         self.winnow(&mut candidates, &resolved)?;
-
-        self.recursion_depth -= 1;
 
         // ── Confirmation ──
         match candidates.vec.len() {
@@ -234,6 +226,7 @@ impl<'a> SelectionContext<'a> {
                     self_ty: resolved_self,
                     args: resolved_args,
                     ambiguous,
+                    parent_depth: obligation.recursion_depth,
                 }
             }
             Predicate::AutoTrait { trait_id, self_ty } => {
@@ -244,6 +237,7 @@ impl<'a> SelectionContext<'a> {
                     self_ty: resolved_self,
                     args: vec![],
                     ambiguous,
+                    parent_depth: obligation.recursion_depth,
                 }
             }
             Predicate::Sized { ty } => {
@@ -254,6 +248,7 @@ impl<'a> SelectionContext<'a> {
                     self_ty: resolved_ty,
                     args: vec![],
                     ambiguous,
+                    parent_depth: obligation.recursion_depth,
                 }
             }
             _ => {
@@ -263,6 +258,7 @@ impl<'a> SelectionContext<'a> {
                     self_ty: self.ctx.error(),
                     args: vec![],
                     ambiguous: false,
+                    parent_depth: obligation.recursion_depth,
                 }
             }
         }
@@ -374,7 +370,7 @@ impl<'a> SelectionContext<'a> {
                     self_ty: substituted_self,
                     args: substituted_args,
                 },
-                recursion_depth: 0,
+                recursion_depth: obligation.parent_depth + 1,
             });
         }
 
@@ -750,7 +746,7 @@ impl<'a> SelectionContext<'a> {
                         self_ty: unboxed_body,
                         args: obligation.args.clone(),
                     },
-                    recursion_depth: self.recursion_depth,
+                    recursion_depth: obligation.parent_depth + 1,
                 };
                 self.ctx.commit_transaction();
                 Ok(ImplSource::Poly {
@@ -759,5 +755,243 @@ impl<'a> SelectionContext<'a> {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::traits::solver::builtins::BuiltinTraitRegistry;
+    use crate::hir::traits::solver::obligation::{ObligationCause, ObligationCauseCode, Predicate};
+    use crate::hir::traits::solver::project::ProjectionCache;
+    use crate::hir::traits::TraitEnv;
+    use crate::hir::types::{CrateId, DefId};
+
+    #[test]
+    fn test_overflow_at_max_depth() {
+        let mut ctx = TypeContext::new();
+        let trait_env = TraitEnv::new();
+        let symbols = crate::hir::symbol::SymbolTable::new(CrateId(DefId(0)));
+        let builtin_registry = BuiltinTraitRegistry::new();
+        let proj_cache = ProjectionCache::new();
+        let caller_bounds: [Predicate; 0] = [];
+
+        // Create the type BEFORE passing &mut ctx to SelectionContext.
+        let int_ty = ctx.int(32, true);
+
+        let mut selcx = SelectionContext::new(
+            &mut ctx,
+            &trait_env,
+            &symbols,
+            &builtin_registry,
+            &proj_cache,
+            &caller_bounds,
+        );
+
+        // Obligation at exactly MAX_RECURSION_DEPTH: must overflow
+        let obligation = Obligation {
+            cause: ObligationCause {
+                span: crate::ast::Span::new(0, 0),
+                code: ObligationCauseCode::Misc,
+            },
+            predicate: Predicate::Sized { ty: int_ty },
+            recursion_depth: MAX_RECURSION_DEPTH,
+        };
+
+        let result = selcx.select(&obligation);
+        match result {
+            Err(SolveError::Overflow { depth, .. }) => {
+                assert_eq!(depth, MAX_RECURSION_DEPTH);
+            }
+            other => {
+                panic!("expected Overflow at depth {}, got {:?}", MAX_RECURSION_DEPTH, other);
+            }
+        }
+    }
+
+    #[test]
+    fn test_no_overflow_below_max_depth() {
+        let mut ctx = TypeContext::new();
+        let trait_env = TraitEnv::new();
+        let symbols = crate::hir::symbol::SymbolTable::new(CrateId(DefId(0)));
+        let builtin_registry = BuiltinTraitRegistry::new();
+        let proj_cache = ProjectionCache::new();
+        let caller_bounds: [Predicate; 0] = [];
+
+        // Create the type BEFORE passing &mut ctx to SelectionContext.
+        let int_ty = ctx.int(32, true);
+
+        let mut selcx = SelectionContext::new(
+            &mut ctx,
+            &trait_env,
+            &symbols,
+            &builtin_registry,
+            &proj_cache,
+            &caller_bounds,
+        );
+
+        // Obligation at MAX_RECURSION_DEPTH - 1: must NOT overflow.
+        let obligation = Obligation {
+            cause: ObligationCause {
+                span: crate::ast::Span::new(0, 0),
+                code: ObligationCauseCode::Misc,
+            },
+            predicate: Predicate::Sized { ty: int_ty },
+            recursion_depth: MAX_RECURSION_DEPTH - 1,
+        };
+
+        let result = selcx.select(&obligation);
+        match result {
+            Err(SolveError::Overflow { .. }) => {
+                panic!("should NOT overflow at depth {} < MAX_RECURSION_DEPTH ({})",
+                    MAX_RECURSION_DEPTH - 1, MAX_RECURSION_DEPTH);
+            }
+            _ => {
+                // Any other result (NotFound, Ambiguous, Deferred, Ok) is fine —
+                // the point is that it did NOT overflow.
+            }
+        }
+    }
+
+    #[test]
+    fn test_deferred_stalled_on_populated() {
+        let mut ctx = TypeContext::new();
+        let trait_env = TraitEnv::new();
+        let symbols = crate::hir::symbol::SymbolTable::new(CrateId(DefId(0)));
+        let builtin_registry = BuiltinTraitRegistry::new();
+        let proj_cache = ProjectionCache::new();
+        let caller_bounds: [Predicate; 0] = [];
+
+        // Create an inference variable as the self_ty — this guarantees
+        // select() returns Deferred { stalled_on }.
+        let infer_var = ctx.alloc_infer_var(999);
+
+        let mut selcx = SelectionContext::new(
+            &mut ctx,
+            &trait_env,
+            &symbols,
+            &builtin_registry,
+            &proj_cache,
+            &caller_bounds,
+        );
+
+        let obligation = Obligation {
+            cause: ObligationCause {
+                span: crate::ast::Span::new(0, 0),
+                code: ObligationCauseCode::Misc,
+            },
+            predicate: Predicate::Sized { ty: infer_var },
+            recursion_depth: 0,
+        };
+
+        let result = selcx.select(&obligation);
+        match result {
+            Ok(ImplSource::Deferred { stalled_on }) => {
+                // stalled_on must contain the inference variable that
+                // was blocking resolution.
+                assert!(!stalled_on.is_empty(), "stalled_on should not be empty");
+                assert!(
+                    stalled_on.contains(&infer_var),
+                    "stalled_on should contain the blocking infer var (id=999), got {:?}",
+                    stalled_on,
+                );
+            }
+            other => {
+                panic!("expected Deferred {{ stalled_on }} for infer var self_ty, got {:?}", other);
+            }
+        }
+    }
+
+    #[test]
+    fn test_forest_next_pending_skips_unresolved_deferred() {
+        // Verify that next_pending skips a deferred node whose stalled_on
+        // variables are still unresolved inference variables.
+        let mut ctx = TypeContext::new();
+        let mut forest = crate::hir::traits::solver::forest::ObligationForest::new();
+
+        let infer_var = ctx.alloc_infer_var(1001);
+        let obligation = Obligation {
+            cause: ObligationCause {
+                span: crate::ast::Span::new(0, 0),
+                code: ObligationCauseCode::Misc,
+            },
+            predicate: Predicate::Sized { ty: infer_var },
+            recursion_depth: 0,
+        };
+
+        let idx = forest.register(obligation);
+        // Mark it as deferred — simulating what select() + mark_deferred does.
+        forest.mark_deferred(idx, vec![infer_var]);
+
+        // next_pending should skip this node because the infer var is unresolved.
+        assert!(
+            forest.next_pending().is_none(),
+            "next_pending should skip deferred node with unresolved stalled_on"
+        );
+    }
+
+    #[test]
+    fn test_forest_next_pending_returns_resolved_deferred() {
+        // Verify that next_pending returns a deferred node when at least one
+        // stalled_on variable has been resolved (bound to a concrete type).
+        let mut ctx = TypeContext::new();
+        let mut forest = crate::hir::traits::solver::forest::ObligationForest::new();
+
+        let infer_var = ctx.alloc_infer_var(1002);
+        let int_ty = ctx.int(32, true);
+        let obligation = Obligation {
+            cause: ObligationCause {
+                span: crate::ast::Span::new(0, 0),
+                code: ObligationCauseCode::Misc,
+            },
+            predicate: Predicate::Sized { ty: infer_var },
+            recursion_depth: 0,
+        };
+
+        let idx = forest.register(obligation);
+        forest.mark_deferred(idx, vec![infer_var]);
+
+        // Resolve the inference variable by binding it to Int<32>.
+        ctx.set_binding(infer_var, int_ty);
+
+        // Now next_pending should return the node because the stalled_on
+        // variable is no longer an inference variable (it was recycled
+        // to Pending by recycle_ready_deferred).
+        forest.recycle_ready_deferred(&ctx);
+        assert!(
+            forest.next_pending().is_some(),
+            "next_pending should return deferred node when stalled_on is resolved"
+        );
+    }
+
+    #[test]
+    fn test_forest_has_ready_deferred() {
+        // Verify that has_ready_deferred correctly identifies whether any
+        // deferred node has a resolved stalled_on variable.
+        let mut ctx = TypeContext::new();
+        let mut forest = crate::hir::traits::solver::forest::ObligationForest::new();
+
+        let infer_var = ctx.alloc_infer_var(1003);
+        let obligation = Obligation {
+            cause: ObligationCause {
+                span: crate::ast::Span::new(0, 0),
+                code: ObligationCauseCode::Misc,
+            },
+            predicate: Predicate::Sized { ty: infer_var },
+            recursion_depth: 0,
+        };
+
+        let idx = forest.register(obligation);
+        forest.mark_deferred(idx, vec![infer_var]);
+
+        // Before resolution: no ready deferred nodes.
+        assert!(!forest.has_ready_deferred(&ctx));
+
+        // Resolve the inference variable.
+        let int_ty = ctx.int(32, true);
+        ctx.set_binding(infer_var, int_ty);
+
+        // After resolution: has_ready_deferred should return true.
+        assert!(forest.has_ready_deferred(&ctx));
     }
 }

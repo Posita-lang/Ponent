@@ -5,7 +5,6 @@ use crate::hir::traits::solver::project::ProjectionCache;
 use crate::hir::traits::solver::select::SelectionContext;
 use crate::hir::traits::TraitEnv;
 use crate::hir::types::TypeContext;
-use crate::hir::infer::InferenceContext;
 use crate::hir::symbol::SymbolTable;
 
 /// Drives iterative trait resolution.
@@ -17,7 +16,7 @@ use crate::hir::symbol::SymbolTable;
 ///
 /// Usage:
 /// ```ignore
-/// let mut fulfill = FulfillmentContext::new(ctx, infer, trait_env, &caller_bounds);
+/// let mut fulfill = FulfillmentContext::new(ctx, trait_env, &caller_bounds);
 /// fulfill.register_obligation(obligation);
 /// match fulfill.evaluate_all() {
 ///     Ok(()) => { /* all obligations resolved */ }
@@ -32,7 +31,6 @@ pub struct FulfillmentContext<'a> {
 impl<'a> FulfillmentContext<'a> {
     pub fn new(
         ctx: &'a mut TypeContext,
-        infer: &'a mut InferenceContext,
         trait_env: &'a TraitEnv,
         symbols: &'a SymbolTable,
         builtin_registry: &'a BuiltinTraitRegistry,
@@ -41,7 +39,7 @@ impl<'a> FulfillmentContext<'a> {
     ) -> Self {
         FulfillmentContext {
             forest: ObligationForest::new(),
-            selcx: SelectionContext::new(ctx, infer, trait_env, symbols, builtin_registry, proj_cache, caller_bounds),
+            selcx: SelectionContext::new(ctx, trait_env, symbols, builtin_registry, proj_cache, caller_bounds),
         }
     }
 
@@ -79,7 +77,6 @@ impl<'a> FulfillmentContext<'a> {
     fn evaluate_all_inner(&mut self, error_on_deferred: bool) -> Result<(), Vec<SolveError>> {
         let mut errors = Vec::new();
         let mut iteration_count: usize = 0;
-        let mut last_deferred_count: usize = 0;
 
         loop {
             // Compact the forest periodically to prevent unbounded memory growth.
@@ -89,24 +86,20 @@ impl<'a> FulfillmentContext<'a> {
             }
 
             // ── Progress check (BEFORE next_pending) ──
-            // If the only remaining pending nodes are Deferred and the count
-            // hasn't changed since the last iteration, we are stalled — no
-            // progress can be made until the types are resolved by the old
-            // solver.  Exit the loop and return the deferred obligations.
+            // If no pending nodes remain and no deferred node has a resolved
+            // stalled_on variable, we are stalled — no progress can be made
+            // until the old solver resolves more inference variables.
             //
-            // IMPORTANT: This check must happen BEFORE next_pending() to avoid
-            // dequeuing a node that would be leaked if the loop exits here.
-            // Also, we must verify that pending_count == 0 (no non-deferred
-            // pending nodes remain) — the deferred_count alone is not enough,
-            // because there could be Pending nodes that haven't been tried yet.
-            let deferred_count = self.forest.deferred_count();
+            // If there ARE ready deferred nodes, recycle them back to Pending
+            // so next_pending can pick them up.
             let pending_count = self.forest.pending_count();
-            if pending_count == 0 && deferred_count > 0 && deferred_count == last_deferred_count {
-                // All remaining nodes are deferred and no progress was made.
-                // Exit — the checker will retry after the old solver runs.
-                break;
+            if pending_count == 0 {
+                if self.forest.has_ready_deferred(self.selcx.ctx) {
+                    self.forest.recycle_ready_deferred(self.selcx.ctx);
+                } else {
+                    break;
+                }
             }
-            last_deferred_count = deferred_count;
 
             // Get the next pending obligation
             let Some(idx) = self.forest.next_pending() else {
@@ -149,10 +142,12 @@ impl<'a> FulfillmentContext<'a> {
             match result {
                 Ok(impl_source) => {
                     match impl_source {
-                        ImplSource::Deferred => {
+                        ImplSource::Deferred { stalled_on } => {
                             // Cannot resolve yet — defer and retry later.
-                            // The node's state is still Evaluating; reset to Deferred.
-                            self.forest.mark_deferred(idx);
+                            // Store the blocking inference variables so the
+                            // caller can selectively re-evaluate when they
+                            // are resolved.
+                            self.forest.mark_deferred(idx, stalled_on);
                         }
                         _ => {
                             // Register sub-obligations
@@ -229,7 +224,7 @@ impl NestedObligations for crate::hir::traits::solver::obligation::ImplSource {
             }
             crate::hir::traits::solver::obligation::ImplSource::Auto { nested } => nested.clone(),
             crate::hir::traits::solver::obligation::ImplSource::Poly { nested, .. } => nested.clone(),
-            crate::hir::traits::solver::obligation::ImplSource::Deferred => vec![],
+            crate::hir::traits::solver::obligation::ImplSource::Deferred { .. } => vec![],
         }
     }
 }

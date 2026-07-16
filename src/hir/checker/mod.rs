@@ -406,10 +406,8 @@ impl<'a> TypeChecker<'a> {
         let top_obligations: Vec<TraitPredicate> = self.trait_obligations.drain(..).collect();
         if !top_obligations.is_empty() {
             let ctx: &mut TypeContext = &mut self.ctx;
-            let infer: &mut InferenceContext = &mut self.infer;
             let mut fulfill = FulfillmentContext::new(
                 ctx,
-                infer,
                 self.trait_env,
                 self.symbols,
                 &self.builtin_registry,
@@ -480,10 +478,8 @@ impl<'a> TypeChecker<'a> {
                 // transient FulfillmentContext was dropped.
                 if !top_obligations.is_empty() {
                     let ctx: &mut TypeContext = &mut self.ctx;
-                    let infer: &mut InferenceContext = &mut self.infer;
                     let mut fulfill = FulfillmentContext::new(
                         ctx,
-                        infer,
                         self.trait_env,
                         self.symbols,
                         &self.builtin_registry,
@@ -1107,12 +1103,10 @@ impl<'a> TypeChecker<'a> {
                 };
                 let has_obligations = !all_bounds.is_empty();
                 if has_obligations {
-                    // We need separate borrows of ctx and infer for the solver.
+                    // We need separate borrows of ctx for the solver.
                     let ctx: &mut TypeContext = guard.checker.ctx;
-                    let infer: &mut InferenceContext = &mut guard.checker.infer;
                     let mut fulfill = FulfillmentContext::new(
                         ctx,
-                        infer,
                         guard.checker.trait_env,
                         guard.checker.symbols,
                         &guard.checker.builtin_registry,
@@ -1265,10 +1259,8 @@ impl<'a> TypeChecker<'a> {
                 let final_obs: Vec<TraitPredicate> = self.trait_obligations.drain(..).collect();
                 if !final_obs.is_empty() {
                     let ctx: &mut TypeContext = &mut self.ctx;
-                    let infer: &mut InferenceContext = &mut self.infer;
                     let mut fulfill = FulfillmentContext::new(
                         ctx,
-                        infer,
                         self.trait_env,
                         self.symbols,
                         &self.builtin_registry,
