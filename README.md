@@ -1,4 +1,3 @@
 # Ponent
 
-ponent: official Posita compiler, translating source to native code via Cranelift with an optional strict mode for SMT‑based contract verification. The compiler frontend is well under development — a fully tested lexer, a recursive‑descent parser (5300+ lines, 100+ tests), a rich type system (3000+ lines), a type checker with trait resolution and region checking (2300+ lines), a name resolver, and an SMT solver bridge (Z3) for contract verification are all in place.
-
+The official Posita compiler uses Cranelift to turn source code into native code, and it also offers an optional strict mode for SMT‑based contract verification. The frontend development hasn't been going all that well, and it looks like I need your help—if you're willing to take a bit of break time to pitch in on the next‑gen safe systems programming language, that would be awesome.
