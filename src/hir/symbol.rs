@@ -463,9 +463,7 @@ impl SymbolTable {
     }
 
     pub fn allocate_def_id(&mut self) -> DefId {
-        let id = DefId(self.next_def_id);
-        self.next_def_id += 1;
-        id
+        crate::hir::types::alloc_def_id()
     }
 
     pub fn allocate_crate_id(&mut self) -> CrateId {

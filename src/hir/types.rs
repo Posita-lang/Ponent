@@ -3,11 +3,33 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use crate::ast::OverflowPolicy;
 use crate::symbol::Symbol;
 use std::cmp::Ordering;
+
+/// Global atomic counter for DefId allocation.
+/// Used by `SymbolTable::allocate_def_id()` to ensure globally unique DefId
+/// values across all SymbolTable instances.  Without this, each SymbolTable
+/// starts its own counter from 0, causing DefId collisions between different
+/// traits/types in different symbol tables (e.g., test isolation breaks).
+static NEXT_DEF_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// Allocate a globally unique DefId.
+/// DefId(0) is reserved as a sentinel for the local crate.
+pub fn alloc_def_id() -> DefId {
+    DefId(NEXT_DEF_ID.fetch_add(1, AtomicOrdering::Relaxed))
+}
+
+/// Reset the global DefId allocator back to its initial state.
+/// This is intended for test use only — calling it outside of tests
+/// would break DefId uniqueness guarantees across the entire program.
+#[cfg(test)]
+pub fn reset_def_id_allocator() {
+    NEXT_DEF_ID.store(1, AtomicOrdering::Relaxed);
+}
 
 /// Posita language edition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1620,6 +1642,22 @@ impl TypeContext {
                 Err(e)
             }
         }
+    }
+
+    /// Try to unify two types WITHOUT managing a transaction.
+    ///
+    /// Unlike `unify()`, this method does NOT call `begin_transaction`/
+    /// `commit_transaction`/`rollback_transaction`.  The caller is responsible
+    /// for managing the transaction lifecycle.  This is useful for operations
+    /// like overlap checking where the caller already has an outer transaction
+    /// and does not want nested transaction management.
+    ///
+    /// If unification succeeds, the type bindings are modified in place.
+    /// The caller MUST call `rollback_transaction()` to undo them if the
+    /// result is only being used for a check (like overlap detection).
+    pub fn try_unify(&mut self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
+        self.unify_seen.borrow_mut().clear();
+        self.unify_internal(a, b, Variance::Invariant)
     }
 
     fn variance_tag(v: Variance) -> u8 {

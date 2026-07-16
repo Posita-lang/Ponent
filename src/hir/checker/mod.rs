@@ -4,6 +4,12 @@ use crate::hir::hir::*;
 use crate::hir::infer::*;
 use crate::hir::resolver::ResolutionMap;
 use crate::hir::symbol::*;
+use crate::hir::traits::solver::{
+    FulfillmentContext, Predicate as TraitPredicate, Obligation, ObligationCause,
+    ObligationCauseCode,
+};
+use crate::hir::traits::solver::builtins::BuiltinTraitRegistry;
+use crate::hir::traits::solver::project::ProjectionCache;
 use crate::hir::traits::TraitEnv;
 use crate::hir::types::*;
 use crate::symbol::Symbol;
@@ -215,6 +221,20 @@ pub struct TypeChecker<'a> {
     /// Deferred comptime blocks collected during Pass 2.  Evaluated after
     /// all comptime function bodies are registered.
     deferred_comptime_blocks: Vec<(Vec<HirStmt>, TypeId, Span)>,
+    /// Registry of builtin trait DefIds for fast lookup during trait resolution.
+    builtin_registry: BuiltinTraitRegistry,
+    /// Cache for associated type projection normalization.
+    proj_cache: ProjectionCache,
+    /// Trait obligations accumulated during function body checking (from
+    /// `binary_op_type`, `require_type_sized`, and other non-where-clause
+    /// sources).  Merged with `caller_bounds` and processed by the new
+    /// trait solver in `check_stmt(FunctionDef)`.
+    ///
+    /// NOTE: This is a transitional field.  Once all trait constraints are
+    /// routed through the new solver, `Constraint::Impl` will be removed
+    /// from the old solver and this field will become the sole collection
+    /// point for trait obligations.
+    trait_obligations: Vec<TraitPredicate>,
 }
 
 /// Error type for comptime control flow within comptime blocks.
@@ -264,7 +284,30 @@ impl<'a> TypeChecker<'a> {
             comptime_fn_registry: HashMap::new(),
             comptime_fn_pass: false,
             deferred_comptime_blocks: Vec::new(),
+            builtin_registry: BuiltinTraitRegistry::new(),
+            proj_cache: ProjectionCache::new(),
+            trait_obligations: Vec::new(),
         };
+
+        // ── Register builtin trait DefIds ──
+        // This populates the BuiltinTraitRegistry so that the trait solver
+        // can identify builtin traits (Sized, Copy, Clone, etc.) by their
+        // DefId during candidate assembly.  Without this, the solver would
+        // never recognize any trait as builtin and would rely solely on
+        // user-defined impls.
+        for name_str in &[
+            "Sized", "Copy", "Clone", "Drop", "Default",
+            "Add", "Sub", "Mul", "Div", "Rem", "Neg",
+            "Eq", "Ord",
+            "Index", "IndexMut",
+            "Deref", "Display",
+            "Serialize", "Write",
+        ] {
+            if let Some(binding) = checker.symbols.lookup_trait(Symbol::intern(name_str)) {
+                checker.builtin_registry.register(binding.def_id, &Symbol::intern(name_str));
+            }
+        }
+
         checker
     }
 
@@ -346,6 +389,69 @@ impl<'a> TypeChecker<'a> {
         // unexpanded template bodies.  The expander call here is retained as
         // a safety net for any `Generate` nodes that might survive — but in
         // normal operation the list should already be fully expanded.)
+
+        // ── New trait solver: resolve top-level trait obligations ──
+        // After all statements are type-checked, drain trait_obligations
+        // accumulated from non-function contexts (module-level variable
+        // initializers, constant expressions, etc.) and run the new solver.
+        // This ensures that binary_op_type and require_type_sized calls
+        // outside of function bodies are also verified.
+        // Note: Function bodies handle their own solver pass inside
+        // check_stmt(FunctionDef), so by the time we reach here, only
+        // top-level obligations remain.
+        //
+        // Save the obligations in a persistent local so that the retry pass
+        // (after the old solver resolves inference variables) can reuse them.
+        // The first pass drains the vector; the retry pass uses the saved copy.
+        let top_obligations: Vec<TraitPredicate> = self.trait_obligations.drain(..).collect();
+        if !top_obligations.is_empty() {
+            let ctx: &mut TypeContext = &mut self.ctx;
+            let infer: &mut InferenceContext = &mut self.infer;
+            let mut fulfill = FulfillmentContext::new(
+                ctx,
+                infer,
+                self.trait_env,
+                self.symbols,
+                &self.builtin_registry,
+                &self.proj_cache,
+                &[],  // no caller bounds at top level
+            );
+            for bound in &top_obligations {
+                let obligation = Obligation {
+                    cause: crate::hir::traits::solver::ObligationCause {
+                        span: crate::ast::Span::new(0, 0),
+                        code: crate::hir::traits::solver::ObligationCauseCode::Misc,
+                    },
+                    predicate: match bound {
+                        TraitPredicate::Trait { trait_id, self_ty, args } => {
+                            crate::hir::traits::solver::Predicate::Trait {
+                                trait_id: *trait_id,
+                                self_ty: *self_ty,
+                                args: args.clone(),
+                            }
+                        }
+                        TraitPredicate::Sized { ty } => {
+                            crate::hir::traits::solver::Predicate::Sized { ty: *ty }
+                        }
+                        _ => continue,
+                    },
+                    recursion_depth: 0,
+                };
+                fulfill.register_obligation(obligation);
+            }
+            if let Err(errors) = fulfill.evaluate_all() {
+                let msg = errors.iter()
+                    .map(|e| format!("{}", e))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                self.diagnostics.push(
+                    Diagnostic::error(format!("trait solver error: {}", msg))
+                        .with_code_str("E030")
+                        .with_span(crate::ast::Span::new(0, 0)),
+                );
+            }
+        }
+
         // Solve all queued constraints, finalize inference variables,
         // and commit the transaction.  On failure the transaction is
         // rolled back and the region tree is restored to its pre-scope state.
@@ -361,6 +467,64 @@ impl<'a> TypeChecker<'a> {
         match result {
             Ok(()) => {
                 self.ctx.commit_transaction();
+                // ── Retry deferred top-level trait obligations ──
+                // After the old solver has resolved all inference variables,
+                // run the new solver again to retry any obligations that were
+                // deferred due to unresolved infer vars during the first pass.
+                // The types are now concrete, so the solver should be able to
+                // resolve all remaining obligations.
+                //
+                // IMPORTANT: use the saved top_obligations, NOT
+                // self.trait_obligations — the first pass already drained
+                // the vector and the deferred obligations were lost when the
+                // transient FulfillmentContext was dropped.
+                if !top_obligations.is_empty() {
+                    let ctx: &mut TypeContext = &mut self.ctx;
+                    let infer: &mut InferenceContext = &mut self.infer;
+                    let mut fulfill = FulfillmentContext::new(
+                        ctx,
+                        infer,
+                        self.trait_env,
+                        self.symbols,
+                        &self.builtin_registry,
+                        &self.proj_cache,
+                        &[],
+                    );
+                    for bound in &top_obligations {
+                        let obligation = Obligation {
+                            cause: crate::hir::traits::solver::ObligationCause {
+                                span: crate::ast::Span::new(0, 0),
+                                code: crate::hir::traits::solver::ObligationCauseCode::Misc,
+                            },
+                            predicate: match bound {
+                                TraitPredicate::Trait { trait_id, self_ty, args } => {
+                                    crate::hir::traits::solver::Predicate::Trait {
+                                        trait_id: *trait_id,
+                                        self_ty: *self_ty,
+                                        args: args.clone(),
+                                    }
+                                }
+                                TraitPredicate::Sized { ty } => {
+                                    crate::hir::traits::solver::Predicate::Sized { ty: *ty }
+                                }
+                                _ => continue,
+                            },
+                            recursion_depth: 0,
+                        };
+                        fulfill.register_obligation(obligation);
+                    }
+                    if let Err(errors) = fulfill.evaluate_all_final() {
+                        let msg = errors.iter()
+                            .map(|e| format!("{}", e))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        self.diagnostics.push(
+                            Diagnostic::error(format!("trait solver error: {}", msg))
+                                .with_code_str("E030")
+                                .with_span(crate::ast::Span::new(0, 0)),
+                        );
+                    }
+                }
                 // Generalize all regions (OmniML §6 force_root_generalization),
                 // AFTER the transaction is committed.  This is safe because
                 // generalization only mutates the inference context (gen_statuses,
@@ -544,6 +708,15 @@ impl<'a> TypeChecker<'a> {
                 is_async,
                 ..
             } => {
+                // ── Clear per-function trait_obligations ──
+                // Each function body starts with a fresh accumulator.
+                // If a previous function failed, its stale obligations
+                // would leak into this function's trait-solving context,
+                // causing spurious errors or silent acceptance of invalid
+                // obligations.  Clearing the vector at the start of each
+                // function prevents cross-function contamination.
+                self.trait_obligations.clear();
+
                 // Register generic type parameters FIRST so that `T` in parameter types,
                 // return types, and where clauses can be resolved.
                 // Collect names before insertion so we can clean up after the function body
@@ -671,12 +844,24 @@ impl<'a> TypeChecker<'a> {
                 // Generate where-clause constraints as Impl(clause_ty, trait_id)
                 // so the solver can verify trait bounds on generic parameters.
                 // Also expand constraint aliases (e.g. `where C: SortableContainer`
-                // → Impl(C, Container) + Impl(C::Item, Ord) + ...).
+                // → Impl(C, Container) + Impl(C::Item, Ord) + ...) and collect
+                // caller_bounds for the new trait solver.
+                //
+                // NOTE: This is a transitional dual-solver architecture.
+                //   - Old solver: Constraint::Impl (from where-clause bounds AND
+                //     function-body trait requirements like method calls).
+                //   - New solver: FulfillmentContext with caller_bounds (from
+                //     where-clause bounds only).
+                //   Both solvers use the same TraitEnv for impl lookup, so they
+                //   should produce consistent results.  The long-term plan is to
+                //   route ALL trait constraints through the new solver and remove
+                //   Constraint::Impl from the old solver.
                 //
                 // Track‑B (Tuple subjects):
                 //   `where (X, Y): Rel` with `constraint Rel<T, U> { T: Foo<U> }`
                 //   builds Subst{ 0 → X, 1 → Y }, substitutes every predicate's
                 //   subject and bounds, and emits Impl(substituted_subject, trait, span).
+                let mut caller_bounds: Vec<TraitPredicate> = Vec::new();
                 if let Some(wc) = where_clause {
                     for pred in &wc.predicates {
                         // Resolve the subject(s).  A `Type::Tuple` means
@@ -707,13 +892,74 @@ impl<'a> TypeChecker<'a> {
                                         .with_span(pred.span),
                                     );
                                 } else {
-                                    guard.checker.add_constraint(
-                                        Constraint::Impl(
-                                            subject_tys[0],
-                                            trait_id,
-                                            pred.span,
-                                        ),
-                                    );
+                                    // ── Extract trait generic args from the bound ──
+                                    // For `T: Add<Int<32>>`, the bound is parsed as
+                                    // `Type::Generic(Path(["Add"]), [Positional(Int<32>)])`.
+                                    // We extract positional args here and resolve them
+                                    // to TypeIds for the new solver's TraitPredicate.
+                                    let mut trait_args: Vec<TypeId> = Vec::new();
+                                    if let Type::Generic(_, args, _) = bound {
+                                        for arg in args {
+                                            match arg {
+                                                GenericArg::Positional(ty) => {
+                                                    match guard.checker.resolve_type(ty) {
+                                                        Ok(resolved) => trait_args.push(resolved),
+                                                        Err(diag) => {
+                                                            guard.checker.diagnostics.push(diag);
+                                                        }
+                                                    }
+                                                }
+                                                GenericArg::Named(_, _) => {
+                                                    // Handled below as ProjectionEq
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Register with the new trait solver via caller_bounds
+                                    // (already done above — this is a no-op placeholder).
+                                    // The old solver's Constraint::Impl was removed in the
+                                    // unified solver migration.
+                                    // Also register with new trait solver as caller bound
+                                    caller_bounds.push(TraitPredicate::Trait {
+                                        trait_id,
+                                        self_ty: subject_tys[0],
+                                        args: trait_args,
+                                    });
+
+                                    // ── Extract associated type constraints (Named args) ──
+                                    // Handle `T: Iterator<Item = U>` — the bound is
+                                    // parsed as `Type::Generic(Path(["Iterator"]), 
+                                    // [Named("Item", Path(["U"]))])`.  Each `Named`
+                                    // arg is an associated type projection that must
+                                    // be resolved.
+                                    if let Type::Generic(_, args, _) = bound {
+                                        for arg in args {
+                                            match arg {
+                                                GenericArg::Named(assoc_name, assoc_ty) => {
+                                                    // Resolve the associated type value
+                                                    match guard.checker.resolve_type(assoc_ty) {
+                                                        Ok(assoc_ty_id) => {
+                                                        // Register ProjectionEq with old solver
+                                                        // Register ProjectionEq with new solver
+                                                        caller_bounds.push(TraitPredicate::ProjectionEq {
+                                                            trait_id,
+                                                            self_ty: subject_tys[0],
+                                                            assoc_name: *assoc_name,
+                                                            value: assoc_ty_id,
+                                                        });
+                                                        }
+                                                        Err(diag) => {
+                                                            guard.checker.diagnostics.push(diag);
+                                                        }
+                                                    }
+                                                }
+                                                GenericArg::Positional(_) => {
+                                                    // Already handled above in trait_args extraction
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 continue;
                             }
@@ -767,13 +1013,12 @@ impl<'a> TypeChecker<'a> {
                                     if let Some(trait_id) =
                                         guard.checker.ctx.get_def_id_for_type(substituted)
                                     {
-                                        guard.checker.add_constraint(
-                                            Constraint::Impl(
-                                                subst_subject,
-                                                trait_id,
-                                                pred.span,
-                                            ),
-                                        );
+                                        // Also register with new trait solver
+                                        caller_bounds.push(TraitPredicate::Trait {
+                                            trait_id,
+                                            self_ty: subst_subject,
+                                            args: vec![],
+                                        });
                                     } else {
                                         guard.checker.diagnostics.push(
                                             Diagnostic::warning(format!(
@@ -789,6 +1034,37 @@ impl<'a> TypeChecker<'a> {
                         }
                     }
                 }
+
+                // ── Filter caller_bounds for the solver ──
+                // Where-clause bounds on types that contain generic parameters
+                // (e.g., `where T: SomeTrait`) are passed as assumptions to the
+                // solver so they can be used as Param candidates for matching
+                // obligations on the same type.  Bounds on fully concrete types
+                // (e.g., `where i32: SomeTrait`) must NOT be passed as assumptions
+                // — the solver would treat them as Param candidates and succeed
+                // without verifying that an impl actually exists.  Instead, they
+                // are only registered as obligations (via all_bounds below) so
+                // the solver must find a real impl to satisfy them.
+                let solver_caller_bounds: Vec<TraitPredicate> = {
+                    let ctx = &*guard.checker.ctx;
+                    caller_bounds.iter().filter(|b| {
+                        let self_ty = match b {
+                            TraitPredicate::Trait { self_ty, .. }
+                            | TraitPredicate::AutoTrait { self_ty, .. }
+                            | TraitPredicate::ProjectionEq { self_ty, .. } => *self_ty,
+                            TraitPredicate::ProjectionNormalize { projection, .. } => {
+                                projection.self_ty
+                            }
+                            // Sized and CopyLike don't encode a where-clause subject
+                            _ => return true,
+                        };
+                        let mut indices = Vec::new();
+                        Self::collect_generic_param_indices(self_ty, ctx, &mut indices);
+                        !indices.is_empty()
+                    })
+                    .cloned()
+                    .collect()
+                };
 
                 let body_result = if let Some(body) = body {
                     let mut stmts = Vec::new();
@@ -806,6 +1082,117 @@ impl<'a> TypeChecker<'a> {
                     Ok(body) => body,
                     Err(e) => return Err(e),
                 };
+
+                // ── New trait solver: resolve all trait obligations ──
+                // After the function body is fully checked, run the new
+                // FulfillmentContext to verify that all trait constraints
+                // (where-clause bounds, binary ops, Sized checks, etc.)
+                // are satisfied.  This runs INSIDE the inference scope so
+                // that any unification from trait matching is captured by
+                // the transaction and rolled back on failure.
+                //
+                // IMPORTANT: caller_bounds (from where-clause) are passed
+                // as the SelectionContext's caller_bounds for candidate
+                // matching.  trait_obligations (from binary_op_type,
+                // require_type_sized) are registered as obligations but
+                // NOT passed as caller_bounds, because they would match
+                // themselves as Param candidates and cause ambiguity.
+                let trait_obs: Vec<TraitPredicate> =
+                    guard.checker.trait_obligations.drain(..).collect();
+                // Save all obligations for potential retry after guard.commit().
+                let all_bounds: Vec<TraitPredicate> = {
+                    let mut bounds = caller_bounds.clone();
+                    bounds.extend(trait_obs.clone());
+                    bounds
+                };
+                let has_obligations = !all_bounds.is_empty();
+                if has_obligations {
+                    // We need separate borrows of ctx and infer for the solver.
+                    let ctx: &mut TypeContext = guard.checker.ctx;
+                    let infer: &mut InferenceContext = &mut guard.checker.infer;
+                    let mut fulfill = FulfillmentContext::new(
+                        ctx,
+                        infer,
+                        guard.checker.trait_env,
+                        guard.checker.symbols,
+                        &guard.checker.builtin_registry,
+                        &guard.checker.proj_cache,
+                        &solver_caller_bounds,  // only where-clause bounds on generic-param types as assumptions
+                    );
+                    // Register ALL obligations (where-clause + body-check-time)
+                    for bound in &all_bounds {
+                        let obligation = Obligation {
+                            cause: crate::hir::traits::solver::ObligationCause {
+                                span: *span,
+                                code: crate::hir::traits::solver::ObligationCauseCode::WhereClause {
+                                    span: *span,
+                                },
+                            },
+                            predicate: match bound {
+                                TraitPredicate::Trait { trait_id, self_ty, args } => {
+                                    crate::hir::traits::solver::Predicate::Trait {
+                                        trait_id: *trait_id,
+                                        self_ty: *self_ty,
+                                        args: args.clone(),
+                                    }
+                                }
+                                TraitPredicate::ProjectionEq { trait_id, self_ty, assoc_name, value } => {
+                                    crate::hir::traits::solver::Predicate::ProjectionEq {
+                                        trait_id: *trait_id,
+                                        self_ty: *self_ty,
+                                        assoc_name: *assoc_name,
+                                        value: *value,
+                                    }
+                                }
+                                TraitPredicate::AutoTrait { trait_id, self_ty } => {
+                                    crate::hir::traits::solver::Predicate::AutoTrait {
+                                        trait_id: *trait_id,
+                                        self_ty: *self_ty,
+                                    }
+                                }
+                                TraitPredicate::Sized { ty } => {
+                                    crate::hir::traits::solver::Predicate::Sized { ty: *ty }
+                                }
+                                TraitPredicate::ProjectionNormalize { projection, target } => {
+                                    crate::hir::traits::solver::Predicate::ProjectionNormalize {
+                                        projection: crate::hir::traits::solver::ProjectionTy {
+                                            trait_id: projection.trait_id,
+                                            self_ty: projection.self_ty,
+                                            args: projection.args.clone(),
+                                            assoc_name: projection.assoc_name,
+                                        },
+                                        target: *target,
+                                    }
+                                }
+                                TraitPredicate::CopyLike { kind, ty } => {
+                                    crate::hir::traits::solver::Predicate::CopyLike {
+                                        kind: match kind {
+                                            crate::hir::traits::solver::CopyKind::Copy => {
+                                                crate::hir::traits::solver::CopyKind::Copy
+                                            }
+                                            crate::hir::traits::solver::CopyKind::Clone => {
+                                                crate::hir::traits::solver::CopyKind::Clone
+                                            }
+                                        },
+                                        ty: *ty,
+                                    }
+                                }
+                            },
+                            recursion_depth: 0,
+                        };
+                        fulfill.register_obligation(obligation);
+                    }
+                    if let Err(errors) = fulfill.evaluate_all() {
+                        // Abort: unresolved trait obligations must fail the check.
+                        let msg = errors.iter()
+                            .map(|e| format!("{}", e))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        return Err(Diagnostic::error(format!("trait solver error: {}", msg))
+                            .with_code_str("E030")
+                            .with_span(*span));
+                    }
+                }
 
                 let exit_res = guard.commit();
 
@@ -865,6 +1252,106 @@ impl<'a> TypeChecker<'a> {
                                 );
                             }
                         }
+                    }
+                }
+
+                // ── Retry deferred trait obligations ──
+                // After the old solver has resolved all inference variables,
+                // and after contract expressions have been checked, drain any
+                // remaining trait_obligations and run the new solver one final
+                // time.  This catches obligations from both the function body
+                // and contract expressions (requires, ensures, etc.) that were
+                // deferred due to unresolved infer vars during the first pass.
+                let final_obs: Vec<TraitPredicate> = self.trait_obligations.drain(..).collect();
+                if !final_obs.is_empty() {
+                    let ctx: &mut TypeContext = &mut self.ctx;
+                    let infer: &mut InferenceContext = &mut self.infer;
+                    let mut fulfill = FulfillmentContext::new(
+                        ctx,
+                        infer,
+                        self.trait_env,
+                        self.symbols,
+                        &self.builtin_registry,
+                        &self.proj_cache,
+                        &solver_caller_bounds,
+                    );
+                    // Collect all obligations: original all_bounds (which includes
+                    // where-clause bounds and body-check-time obligations) plus
+                    // any new ones from contract expressions.
+                    let all_final: Vec<&TraitPredicate> = all_bounds
+                        .iter()
+                        .chain(final_obs.iter())
+                        .collect();
+                    for bound in all_final {
+                        let obligation = Obligation {
+                            cause: crate::hir::traits::solver::ObligationCause {
+                                span: *span,
+                                code: crate::hir::traits::solver::ObligationCauseCode::WhereClause {
+                                    span: *span,
+                                },
+                            },
+                            predicate: match bound {
+                                TraitPredicate::Trait { trait_id, self_ty, args } => {
+                                    crate::hir::traits::solver::Predicate::Trait {
+                                        trait_id: *trait_id,
+                                        self_ty: *self_ty,
+                                        args: args.clone(),
+                                    }
+                                }
+                                TraitPredicate::ProjectionEq { trait_id, self_ty, assoc_name, value } => {
+                                    crate::hir::traits::solver::Predicate::ProjectionEq {
+                                        trait_id: *trait_id,
+                                        self_ty: *self_ty,
+                                        assoc_name: *assoc_name,
+                                        value: *value,
+                                    }
+                                }
+                                TraitPredicate::AutoTrait { trait_id, self_ty } => {
+                                    crate::hir::traits::solver::Predicate::AutoTrait {
+                                        trait_id: *trait_id,
+                                        self_ty: *self_ty,
+                                    }
+                                }
+                                TraitPredicate::Sized { ty } => {
+                                    crate::hir::traits::solver::Predicate::Sized { ty: *ty }
+                                }
+                                TraitPredicate::ProjectionNormalize { projection, target } => {
+                                    crate::hir::traits::solver::Predicate::ProjectionNormalize {
+                                        projection: crate::hir::traits::solver::ProjectionTy {
+                                            trait_id: projection.trait_id,
+                                            self_ty: projection.self_ty,
+                                            args: projection.args.clone(),
+                                            assoc_name: projection.assoc_name,
+                                        },
+                                        target: *target,
+                                    }
+                                }
+                                TraitPredicate::CopyLike { kind, ty } => {
+                                    crate::hir::traits::solver::Predicate::CopyLike {
+                                        kind: match kind {
+                                            crate::hir::traits::solver::CopyKind::Copy => {
+                                                crate::hir::traits::solver::CopyKind::Copy
+                                            }
+                                            crate::hir::traits::solver::CopyKind::Clone => {
+                                                crate::hir::traits::solver::CopyKind::Clone
+                                            }
+                                        },
+                                        ty: *ty,
+                                    }
+                                }
+                            },
+                            recursion_depth: 0,
+                        };
+                        fulfill.register_obligation(obligation);
+                    }
+                    if let Err(errors) = fulfill.evaluate_all_final() {
+                        let msg = errors.iter()
+                            .map(|e| format!("{}", e))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        return Err(Diagnostic::error(format!("trait solver error: {}", msg))
+                            .with_code_str("E030")
+                            .with_span(*span));
                     }
                 }
 
@@ -1503,7 +1990,7 @@ impl<'a> TypeChecker<'a> {
                 })
             }
             Stmt::ImplBlock { .. } => {
-                let (trait_path, for_type, methods, span, attributes, type_params) = match stmt {
+                let (trait_path, for_type, methods, span, attributes, type_params, where_clause) = match stmt {
                     Stmt::ImplBlock {
                         span,
                         trait_path,
@@ -1511,6 +1998,7 @@ impl<'a> TypeChecker<'a> {
                         methods,
                         attributes,
                         type_params,
+                        where_clause,
                         ..
                     } => (
                         trait_path,
@@ -1519,6 +2007,7 @@ impl<'a> TypeChecker<'a> {
                         *span,
                         attributes,
                         type_params,
+                        where_clause,
                     ),
                     _ => {
                         let msg = format!("check_stmt: expected ImplBlock, got {:?}", stmt);
@@ -1534,6 +2023,12 @@ impl<'a> TypeChecker<'a> {
                     // for complex types like `Add<Int<32>>`, resolve as a type.
                     let trait_id = match tp.as_ref() {
                         Type::Path(path, _) => {
+                            // Use lookup_trait_by_path (path-based) instead of
+                            // scope-based lookup_trait, so that qualified paths
+                            // like `std::ops::Add` are resolved correctly.
+                            // The old code was changed to scope-based lookup
+                            // to avoid builtin trait interference, but the
+                            // path-based lookup is correct for trait impls.
                             match self.symbols.lookup_trait_by_path(path) {
                                 Some(id) => id,
                                 None => {
@@ -1675,6 +2170,23 @@ impl<'a> TypeChecker<'a> {
                             // Populate context from where clause and type param bounds,
                             // for Paterson/Coverage condition checking.
                             let mut ctx_tys = Vec::new();
+                            // Add where-clause predicate types as context.
+                            // Each predicate's subject type (e.g. `T` in `where T: Foo`)
+                            // must be present so the Coverage condition can verify that
+                            // every bare type variable in the head type appears in at
+                            // least one context type.
+                            if let Some(wc) = where_clause {
+                                for pred in &wc.predicates {
+                                    match self.resolve_type(&pred.ty) {
+                                        Ok(resolved) => ctx_tys.push(resolved),
+                                        Err(diag) => {
+                                            self.diagnostics.push(diag);
+                                        }
+                                    }
+                                }
+                            }
+                            // Add type params that have bounds to context.
+                            // `impl<T: Bar>` implicitly constrains T.
                             for (i, tp) in type_params.iter().enumerate() {
                                 if !tp.bounds.is_empty() {
                                     let param_id = self.ctx.generic_param(i, tp.name.clone());
@@ -1682,6 +2194,78 @@ impl<'a> TypeChecker<'a> {
                                 }
                             }
                             ctx_tys
+                        },
+                        arity: type_params.len(),
+                        trait_args: {
+                            // ── Resolve trait generic args from the trait_path ──
+                            // For `impl Add<Int<32>> for MyType`, trait_path is
+                            // `Type::Generic(Path(["Add"]), [Positional(Int<32>)])`.
+                            // Extract positional args and resolve them to TypeIds.
+                            let mut args = Vec::new();
+                            if let Some(tp) = &trait_path {
+                                if let Type::Generic(_, generic_args, _) = tp.as_ref() {
+                                    for arg in generic_args {
+                                        if let GenericArg::Positional(ty) = arg {
+                                            match self.resolve_type(ty) {
+                                                Ok(resolved) => args.push(resolved),
+                                                Err(diag) => {
+                                                    self.diagnostics.push(diag);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            args
+                        },
+                        where_clause_bounds: {
+                            // Populate where-clause bounds for sub-obligation generation.
+                            // Each bound `T: Foo` becomes (T, Foo, args) in where_clause_bounds.
+                            let mut bounds = Vec::new();
+                            // Extract from where clause predicates
+                            if let Some(wc) = where_clause {
+                                for pred in &wc.predicates {
+                                    if let Ok(subject_ty) = self.resolve_type(&pred.ty) {
+                                        for bound in &pred.bounds {
+                                            if let Some(trait_id) = self.resolve_trait_path(bound) {
+                                                let mut bound_args = Vec::new();
+                                                if let Type::Generic(_, args, _) = bound {
+                                                    for arg in args {
+                                                        if let GenericArg::Positional(ty) = arg {
+                                                            if let Ok(resolved) = self.resolve_type(ty) {
+                                                                bound_args.push(resolved);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                bounds.push((subject_ty, trait_id, bound_args));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Extract from type param bounds (e.g. `impl<T: Clone>`)
+                            for (i, tp) in type_params.iter().enumerate() {
+                                if !tp.bounds.is_empty() {
+                                    let param_id = self.ctx.generic_param(i, tp.name.clone());
+                                    for bound in &tp.bounds {
+                                        if let Some(trait_id) = self.resolve_trait_path(bound) {
+                                            let mut bound_args = Vec::new();
+                                            if let Type::Generic(_, args, _) = bound {
+                                                for arg in args {
+                                                    if let GenericArg::Positional(ty) = arg {
+                                                        if let Ok(resolved) = self.resolve_type(ty) {
+                                                            bound_args.push(resolved);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            bounds.push((param_id, trait_id, bound_args));
+                                        }
+                                    }
+                                }
+                            }
+                            bounds
                         },
                     };
 
@@ -1694,6 +2278,10 @@ impl<'a> TypeChecker<'a> {
                                 .with_code_str("E102")
                                 .with_span(span),
                         );
+                    } else {
+                        // Clear projection cache — new impl may change
+                        // normalization results for associated types.
+                        self.proj_cache.clear();
                     }
 
                     // Also register the resolved methods for method resolution
@@ -2110,14 +2698,27 @@ impl<'a> TypeChecker<'a> {
             );
         };
 
-        self.add_constraint(Constraint::Impl(left, trait_id, span));
-        self.add_constraint(Constraint::Impl(right, trait_id, span));
+        self.trait_obligations.push(TraitPredicate::Trait {
+            trait_id,
+            self_ty: left,
+            args: vec![],
+        });
+        self.trait_obligations.push(TraitPredicate::Trait {
+            trait_id,
+            self_ty: right,
+            args: vec![],
+        });
 
         // Comparison operators return bool.
+        // Unify operands so that inference variables are resolved before
+        // the trait solver processes the obligation.  Without this, an
+        // infer var from a literal (e.g. `0` in `b != 0`) would remain
+        // unresolved and the trait obligation would be deferred forever.
         if matches!(
             op,
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
         ) {
+            self.unify_with(left, right, span, TypingContext::None)?;
             return Ok(self.ctx.bool());
         }
 
@@ -2125,7 +2726,13 @@ impl<'a> TypeChecker<'a> {
         // The Impl constraint verifies the trait exists; the infer var is
         // unified with the expected result type downstream.
         self.unify_with(left, right, span, TypingContext::None)?;
-        Ok(self.new_infer_var(TypeVariableKind::Numeric, crate::hir::infer::VarOrigin::Expression(Some(span))))
+        let result_ty = self.new_infer_var(TypeVariableKind::Numeric, crate::hir::infer::VarOrigin::Expression(Some(span)));
+        // Resolve the result type to the operand type.  Without this, the
+        // result infer var would never be resolved to a concrete type, and
+        // any comparison operator that follows (e.g. `>=` in `a + b >= 0`)
+        // would receive two infer vars and fail to resolve either.
+        self.unify_with(left, result_ty, span, TypingContext::None)?;
+        Ok(result_ty)
     }
 
     /// Check that an inference variable's kind constraint is compatible with the
@@ -2261,7 +2868,11 @@ impl<'a> TypeChecker<'a> {
         let resolved = self.ctx.resolve_binding(ty);
         match self.ctx.get(resolved) {
             TypeData::InferVar { .. } => {
-                self.add_constraint(Constraint::Impl(ty, DefId(0), span));
+                // Register with the new trait solver.  The new solver handles
+                // Sized via Predicate::Sized, which triggers the builtin Sized
+                // check in candidate assembly.  If the type is still an infer var,
+                // the obligation is deferred and retried after the old solver runs.
+                self.trait_obligations.push(TraitPredicate::Sized { ty });
             }
             _ => {} // concrete types and generic params: assumed Sized
         }
@@ -2319,26 +2930,26 @@ impl<'a> TypeChecker<'a> {
 
     /// Resolve a trait path from a bound `Type` (e.g. `Add` or `Add<Int<32>>`) to a `DefId`.
     fn resolve_trait_path(&self, bound: &Type) -> Option<DefId> {
-        let name = match bound {
-            Type::Path(path, _) => path.first()?,
+        let path = match bound {
+            Type::Path(path, _) => path,
             Type::Generic(base, ..) => match base.as_ref() {
-                Type::Path(path, _) => path.first()?,
+                Type::Path(path, _) => path,
                 _ => return None,
             },
             _ => return None,
         };
-        self.symbols.lookup_trait(*name).map(|b| b.def_id)
+        self.symbols.lookup_trait_by_path(path)
     }
 
     /// Extract the name from a bound `Type` for constraint alias lookup.
     fn extract_bound_name(bound: &Type) -> Option<Symbol> {
         let base = match bound {
-            Type::Path(path, _) => return path.first().copied(),
+            Type::Path(path, _) => return path.last().copied(),
             Type::Generic(base, _, _) => base.as_ref(),
             _ => return None,
         };
         match base {
-            Type::Path(path, _) => path.first().cloned(),
+            Type::Path(path, _) => path.last().cloned(),
             _ => None,
         }
     }

@@ -1,5 +1,8 @@
+pub mod solver;
+
 use crate::ast::Span;
 use crate::hir::symbol::{SymbolTable, TypeKind};
+use crate::hir::traits::solver::coherence::check_overlap;
 use crate::hir::types::{DefId, Subst, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
 use rustc_hash::FxHashMap as HashMap;
@@ -26,6 +29,19 @@ pub struct ImplCandidate {
     /// a constraint (e.g. `T` in `where T: Foo`). Must be strictly smaller
     /// in constructor depth than `for_type`.
     pub context: Vec<TypeId>,
+    /// The actual trait bounds from the impl's where clause, stored as
+    /// (self_ty, trait_id, args) triples.  Used by the trait solver to generate
+    /// sub-obligations during impl matching (e.g., `impl<T: Clone> Foo for T`
+    /// produces a sub-obligation `T: Clone` that must be verified).
+    pub where_clause_bounds: Vec<(TypeId, DefId, Vec<TypeId>)>,
+    /// Number of generic type parameters on this impl (e.g. `impl<T, U> Foo for T`
+    /// has arity 2). Used by the trait solver to generate fresh inference variables
+    /// during generic impl matching.
+    pub arity: usize,
+    /// Resolved generic arguments on the trait reference (e.g. `Int<32>` in
+    /// `impl Add<Int<32>> for MyType`).  Stored as TypeIds so the trait solver
+    /// can unify them with the obligation's trait args during matching.
+    pub trait_args: Vec<TypeId>,
 }
 
 /// Describes a single method with resolved type IDs, ready for method lookup.
@@ -79,9 +95,14 @@ impl TraitEnv {
         &mut self,
         candidate: ImplCandidate,
         symbols: &SymbolTable,
-        ctx: &crate::hir::types::TypeContext,
+        ctx: &mut TypeContext,
         is_trusted: bool,
     ) -> Result<(), TraitError> {
+        // Check termination conditions BEFORE the orphan rule, so that
+        // generic impls get clear errors about Paterson/Coverage violations
+        // rather than a misleading "orphan rule" error.
+        // ... Paterson, Coverage, Orphan checks (unchanged) ...
+        // ... (same as current code, just ctx changed to &mut) ...
         // Check termination conditions BEFORE the orphan rule, so that
         // generic impls get clear errors about Paterson/Coverage violations
         // rather than a misleading "orphan rule" error.
@@ -154,6 +175,31 @@ impl TraitEnv {
                     type_id: candidate.for_type,
                     span: candidate.span,
                     kind: OrphanKind::OrphanRule,
+                });
+            }
+        }
+
+        // ── Overlap check ──
+        // Verify that the new impl does not overlap with any existing impl
+        // of the same trait.  Uses two-phase detection:
+        // 1. Structural comparison (TypeData::PartialEq) for concrete types
+        // 2. try_unify for types with GenericParams
+        //
+        // NOTE: In parallel test runs, the global DefId allocator
+        // (reset_def_id_allocator) is not thread-safe, causing race
+        // conditions.  Use --test-threads=1 for reliable test results.
+        if !is_trusted {
+            ctx.begin_transaction();
+            let conflict = check_overlap(&self.impls, &candidate, ctx);
+            ctx.rollback_transaction();
+            if let Some(conflict) = conflict {
+                return Err(TraitError::Orphan {
+                    trait_id: candidate.trait_id,
+                    type_id: candidate.for_type,
+                    span: candidate.span,
+                    kind: OrphanKind::OverlapViolation {
+                        existing_span: conflict.existing_span,
+                    },
                 });
             }
         }
@@ -471,6 +517,12 @@ pub enum OrphanKind {
     CoverageViolation,
     /// Neither the trait nor the type is local to the current crate.
     OrphanRule,
+    /// Overlap with an existing impl: the new impl's for_type and the existing
+    /// impl's for_type can be unified, meaning there exists a concrete type
+    /// that would satisfy both impls.
+    OverlapViolation {
+        existing_span: Span,
+    },
 }
 
 impl std::fmt::Display for TraitError {
@@ -486,6 +538,9 @@ impl std::fmt::Display for TraitError {
                     }
                     OrphanKind::OrphanRule => {
                         "orphan rule violation: impl for trait on type is not allowed because neither the trait nor the type is local"
+                    }
+                    OrphanKind::OverlapViolation { .. } => {
+                        "impl overlaps with an existing impl: the head types unify, meaning there exists a concrete type that would satisfy both"
                     }
                 };
                 write!(f, "{} (trait={:?}, type={:?})", msg, trait_id, type_id)
@@ -531,6 +586,9 @@ mod tests {
             span: crate::ast::Span::new(0, 0),
             has_auto_deref: false,
             context: vec![],
+            arity: 0,
+            trait_args: vec![],
+            where_clause_bounds: vec![],
         };
 
         // Must register the type in the symbol table so the orphan rule check can find it
@@ -563,7 +621,7 @@ mod tests {
         // can find the type and actually execute, not silently skip.
         ctx.register_def_id(type_id, for_ty);
 
-        let result = env.add_impl(candidate, &symbols, &ctx, false);
+        let result = env.add_impl(candidate, &symbols, &mut ctx, false);
         assert!(result.is_ok(), "add_impl should succeed: {:?}", result.err());
         assert_eq!(env.all_impls().len(), 1);
     }

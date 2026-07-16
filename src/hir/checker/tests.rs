@@ -1,10 +1,18 @@
 use super::*;
 use crate::hir::builtins;
 use crate::hir::resolver::NameResolver;
+use crate::hir::types::reset_def_id_allocator;
 use crate::parser::Parser;
 
 /// Run the full pipeline (parse → resolve → builtins → type-check) on Posita source.
 fn check_source(source: &str) -> Result<HirProgram, Vec<String>> {
+    // NOTE: Do NOT reset the global DefId allocator here.  Tests run in
+    // parallel by default, and reset_def_id_allocator() is not thread-safe.
+    // The overlap check in add_impl compares DefId values within the same
+    // TraitEnv, which are always unique because the global counter only
+    // increments.  Parallel tests get their own TraitEnv instances, so
+    // there is no cross-test DefId collision.
+
     let mut parser = Parser::new(source);
     let program = parser
         .parse_program()
@@ -22,7 +30,12 @@ fn check_source(source: &str) -> Result<HirProgram, Vec<String>> {
                 .collect::<Vec<_>>()
         })?;
 
-    builtins::register_builtins(&mut symbols, &mut trait_env, &mut ctx);
+    // NOTE: register_builtins is called inside NameResolver::new (resolver.rs:83),
+    // so the builtin types and traits are already registered at this point.
+    // The duplicate call below was removed to prevent double registration of
+    // builtin impls with different DefId values, which caused the overlap check
+    // in add_impl to detect false positives.
+    // builtins::register_builtins(&mut symbols, &mut trait_env, &mut ctx);
 
     let mut checker = TypeChecker::new(&mut ctx, &symbols, &mut trait_env, resolution_map);
     checker.check_program(&program).map_err(|diags| {
@@ -1296,6 +1309,30 @@ fn test_method_call_on_struct() {
          }",
     );
     assert!(result.is_ok(), "method call: {:?}", result.err());
+}
+
+#[test]
+fn test_deferred_impl_registration_trait_method_call() {
+    // Audit test: verify that trait method resolution works correctly
+    // with the deferred impl registration architecture (impl registered
+    // by the checker, not the resolver).  The resolver no longer calls
+    // add_impl — registration happens in the type checker instead.
+    let result = check_source(
+        "trait Show {
+             def show(&self) -> Int<32>;
+         }
+         type MyInt = Int<32> with default = 0;
+         impl Show for MyInt {
+             def show(&self) -> Int<32> {
+                 return *self;
+             }
+         }
+         def main() -> Int<32> {
+             set x: MyInt = 42;
+             return x.show();
+         }",
+    );
+    assert!(result.is_ok(), "deferred impl trait method call: {:?}", result.err());
 }
 
 #[test]

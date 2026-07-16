@@ -507,28 +507,6 @@ impl<'a> NameResolver<'a> {
                         }
                     });
 
-                // Collect context types from where clause for Paterson/Coverage checking
-                let mut context = Vec::new();
-                if let Some(wc) = where_clause {
-                    for pred in &wc.predicates {
-                        let pred_ty = self.resolve_type_expr(&pred.ty);
-                        context.push(pred_ty);
-                    }
-                }
-                // Also add type params that have bounds to the context,
-                // since `impl<T: Bar>` implicitly constrains T.
-                for tp in type_params {
-                    if !tp.bounds.is_empty() {
-                        if let Some(ty_id) = self
-                            .current_impl_type_params
-                            .as_ref()
-                            .and_then(|m| m.get(&tp.name))
-                        {
-                            context.push(*ty_id);
-                        }
-                    }
-                }
-
                 self.enter_scope();
                 let binding = ImplBinding {
                     def_id: self.allocate_def_id(),
@@ -550,8 +528,6 @@ impl<'a> NameResolver<'a> {
                     let mut param_tys = Vec::with_capacity(method.params.len());
                     for p in &method.params {
                         if let Some(ref param_ty) = p.ty {
-                            // Substitute `Self` with the concrete for_type AST before resolving,
-                            // since resolve_type_expr cannot resolve `Self` on its own.
                             let resolved_ty = self.resolve_self_in_type(param_ty, for_type);
                             param_tys.push(self.resolve_type_expr(&resolved_ty));
                         } else {
@@ -586,22 +562,24 @@ impl<'a> NameResolver<'a> {
                         resolved_methods,
                         assoc_tys,
                         has_auto_deref,
-                        context,
+                        // context, arity, trait_args, where_clause_bounds are
+                        // populated by the checker (checker/mod.rs) which
+                        // performs the actual add_impl call.  The resolver
+                        // no longer registers impls — it only resolves method
+                        // signatures for method lookup.  See the deferral
+                        // NOTE below.
+                        context: vec![],
+                        arity: 0,
+                        trait_args: vec![],
+                        where_clause_bounds: vec![],
                         span: *span,
                     };
-                    if let Err(err) =
-                        self.trait_env
-                            .add_impl(candidate, &self.symbols, self.ctx, false)
-                    {
-                        // Convert TraitError to a diagnostic for proper error reporting
-                        self.diagnostics.push(
-                            Diagnostic::error(format!(
-                                "impl for trait on type violates termination rules: {}",
-                                err
-                            ))
-                            .with_span(*span),
-                        );
-                    }
+                    // NOTE: Impl registration is deferred to the type checker
+                    // (checker/mod.rs).  Registering here AND in the checker
+                    // would cause double registration, triggering false
+                    // positives in the overlap check.  The candidate is
+                    // discarded after resolution.
+                    let _ = candidate;
                 }
 
                 // Clear impl type params so they don't leak into subsequent statements.
@@ -1600,6 +1578,20 @@ impl<'a> NameResolver<'a> {
             return None;
         }
         self.symbols.lookup_trait_by_path(path)
+    }
+
+    /// Resolve a trait path from a bound `Type` (e.g. `Foo` or `Add<Int<32>>`).
+    /// Extracts the path from the `Type` and calls `resolve_trait_path`.
+    fn resolve_trait_path_from_bound(&mut self, bound: &Type) -> Option<DefId> {
+        let path = match bound {
+            Type::Path(path, _) => path,
+            Type::Generic(base, _, _) => match base.as_ref() {
+                Type::Path(path, _) => path,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        self.resolve_trait_path(path)
     }
 
     fn extract_int_from_type(&self, ty: &Type) -> Option<u8> {
