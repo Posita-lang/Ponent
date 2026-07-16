@@ -34,7 +34,7 @@ pub struct SelectionContext<'a> {
     }
 
 /// Maximum recursion depth for trait resolution before overflow.
-const MAX_RECURSION_DEPTH: usize = 64;
+pub(crate) const MAX_RECURSION_DEPTH: usize = 64;
 
 /// A set of selection candidates.
 #[derive(Clone, Debug)]
@@ -136,8 +136,7 @@ impl<'a> SelectionContext<'a> {
     pub fn select(&mut self, obligation: &Obligation) -> Result<ImplSource, SolveError> {
         if obligation.recursion_depth >= MAX_RECURSION_DEPTH {
             return Err(SolveError::Overflow {
-                trait_id: DefId(0),
-                self_ty: self.ctx.error(),
+                obligation: Box::new(obligation.clone()),
                 depth: obligation.recursion_depth,
             });
         }

@@ -1,4 +1,5 @@
 use crate::hir::traits::solver::builtins::BuiltinTraitRegistry;
+use crate::hir::traits::solver::eval::evaluate_goal;
 use crate::hir::traits::solver::forest::{ObligationForest, MAX_NODES};
 use crate::hir::traits::solver::obligation::{ImplSource, Obligation, ObligationCause, ObligationCauseCode, Predicate, SolveError};
 use crate::hir::traits::solver::project::ProjectionCache;
@@ -132,31 +133,25 @@ impl<'a> FulfillmentContext<'a> {
                 continue;
             }
 
-            // Select a candidate
+            // Select a candidate and recursively evaluate nested goals.
             let obligation = self.forest.obligation_at(idx).clone();
-            let result = self.selcx.select(&obligation);
+            let result = evaluate_goal(&mut self.selcx, &obligation);
 
             // Leave the evaluating state
             self.forest.leave_evaluating(idx);
 
             match result {
-                Ok(impl_source) => {
-                    match impl_source {
-                        ImplSource::Deferred { stalled_on } => {
-                            // Cannot resolve yet — defer and retry later.
-                            // Store the blocking inference variables so the
-                            // caller can selectively re-evaluate when they
-                            // are resolved.
-                            self.forest.mark_deferred(idx, stalled_on);
-                        }
-                        _ => {
-                            // Register sub-obligations
-                            for sub in impl_source.nested_obligations() {
-                                self.forest.register_child(sub, idx);
-                            }
-                            self.forest.mark_resolved(idx);
-                        }
-                    }
+                Ok(ImplSource::Deferred { stalled_on }) => {
+                    // Cannot resolve yet — defer and retry later.
+                    // Store the blocking inference variables so the
+                    // caller can selectively re-evaluate when they
+                    // are resolved.
+                    self.forest.mark_deferred(idx, stalled_on);
+                }
+                Ok(_) => {
+                    // All nested goals were resolved recursively inside
+                    // evaluate_goal — no need to register children here.
+                    self.forest.mark_resolved(idx);
                 }
                 Err(e) => {
                     self.forest.mark_error(idx, e.clone());
@@ -203,28 +198,5 @@ impl<'a> FulfillmentContext<'a> {
     /// Get a reference to the underlying obligation forest.
     pub fn forest(&self) -> &ObligationForest {
         &self.forest
-    }
-}
-
-/// Helper: extract nested obligations from an ImplSource.
-trait NestedObligations {
-    fn nested_obligations(&self) -> Vec<Obligation>;
-}
-
-impl NestedObligations for crate::hir::traits::solver::obligation::ImplSource {
-    fn nested_obligations(&self) -> Vec<Obligation> {
-        match self {
-            crate::hir::traits::solver::obligation::ImplSource::UserDefined { nested, .. } => {
-                nested.clone()
-            }
-            crate::hir::traits::solver::obligation::ImplSource::Param(nested) => nested.clone(),
-            crate::hir::traits::solver::obligation::ImplSource::Builtin(_) => vec![],
-            crate::hir::traits::solver::obligation::ImplSource::Object { nested, .. } => {
-                nested.clone()
-            }
-            crate::hir::traits::solver::obligation::ImplSource::Auto { nested } => nested.clone(),
-            crate::hir::traits::solver::obligation::ImplSource::Poly { nested, .. } => nested.clone(),
-            crate::hir::traits::solver::obligation::ImplSource::Deferred { .. } => vec![],
-        }
     }
 }

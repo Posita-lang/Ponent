@@ -636,6 +636,14 @@ impl TypeContext {
         &self.types[resolved.index()]
     }
 
+    /// Returns the raw `TypeData` for a `TypeId` WITHOUT following bindings.
+    /// Unlike `get()`, this does not resolve inference variable bindings,
+    /// so it can inspect the original type before any substitution.
+    /// Useful for binder-scope checks where the raw type identity matters.
+    pub fn get_raw(&self, id: TypeId) -> &TypeData {
+        &self.types[id.index()]
+    }
+
     /// Returns an `Arc<TypeData>` instead of a borrow, enabling cheap clone via
     /// `Arc::clone` (reference-count bump only).  Use this instead of
     /// `self.get(ty).clone()` on hot paths (substitution, Yoneda reduction,
@@ -1480,32 +1488,108 @@ impl TypeContext {
                 param_name,
                 body,
             } => {
-                let new_body = self.replace_generic(*body, param_index, replacement);
-                self.forall(*pi, param_name.clone(), new_body)
+                // Binder shadowing: if the binder's param_index matches the
+                // parameter being substituted, the binder shadows it — do NOT
+                // recurse into the body.
+                if *pi == param_index {
+                    ty
+                } else {
+                    let new_body = self.replace_generic(*body, param_index, replacement);
+                    self.forall(*pi, param_name.clone(), new_body)
+                }
+            }
+            TypeData::Exists {
+                param_index: pi,
+                name,
+                base,
+            } => {
+                // Binder shadowing: same as Forall.
+                if *pi == param_index {
+                    ty
+                } else {
+                    let new_base = self.replace_generic(*base, param_index, replacement);
+                    let new_id = self.alloc(TypeData::Exists {
+                        param_index: *pi,
+                        name: name.clone(),
+                        base: new_base,
+                    });
+                    // Preserve Exists metadata (invariant, default_value), matching
+                    // the same invariant in subst()'s Exists arm.
+                    if let Some(meta) = self.meta.get(&ty).cloned() {
+                        self.meta.entry(new_id).or_insert(meta);
+                    }
+                    new_id
+                }
             }
             TypeData::Mu {
                 param_index: pi,
                 param_name,
                 body,
             } => {
-                let new_body = self.replace_generic(*body, param_index, replacement);
-                self.alloc(TypeData::Mu {
-                    param_index: *pi,
-                    param_name: param_name.clone(),
-                    body: new_body,
-                })
+                // Binder shadowing: same as Forall.
+                if *pi == param_index {
+                    ty
+                } else {
+                    let new_body = self.replace_generic(*body, param_index, replacement);
+                    self.alloc(TypeData::Mu {
+                        param_index: *pi,
+                        param_name: param_name.clone(),
+                        body: new_body,
+                    })
+                }
             }
             TypeData::Nu {
                 param_index: pi,
                 param_name,
                 body,
             } => {
-                let new_body = self.replace_generic(*body, param_index, replacement);
-                self.alloc(TypeData::Nu {
-                    param_index: *pi,
-                    param_name: param_name.clone(),
-                    body: new_body,
-                })
+                // Binder shadowing: same as Forall.
+                if *pi == param_index {
+                    ty
+                } else {
+                    let new_body = self.replace_generic(*body, param_index, replacement);
+                    self.alloc(TypeData::Nu {
+                        param_index: *pi,
+                        param_name: param_name.clone(),
+                        body: new_body,
+                    })
+                }
+            }
+            TypeData::Poly { quantifiers, body } => {
+                // Poly is a binder over all its quantifiers.  If any quantifier
+                // shadows the target param_index, do not recurse.
+                if quantifiers.iter().any(|(idx, _)| *idx == param_index) {
+                    ty
+                } else {
+                    let new_body = self.replace_generic(*body, param_index, replacement);
+                    self.poly(quantifiers.clone(), new_body)
+                }
+            }
+            // ── Composite types: recurse into all sub-components ──
+            TypeData::Ref { ty: inner, mutable } => {
+                let new_inner = self.replace_generic(*inner, param_index, replacement);
+                self.reference(new_inner, *mutable)
+            }
+            TypeData::Pointer { ty: inner } => {
+                let new_inner = self.replace_generic(*inner, param_index, replacement);
+                self.pointer(new_inner)
+            }
+            TypeData::Ptr { size, pointee } => {
+                let new_size = self.replace_generic(*size, param_index, replacement);
+                let new_pointee = self.replace_generic(*pointee, param_index, replacement);
+                self.ptr(new_size, new_pointee)
+            }
+            TypeData::Array { elem, size } => {
+                let new_elem = self.replace_generic(*elem, param_index, replacement);
+                self.array(new_elem, *size)
+            }
+            TypeData::Slice { elem } => {
+                let new_elem = self.replace_generic(*elem, param_index, replacement);
+                self.slice(new_elem)
+            }
+            TypeData::AssociatedType { trait_id, name, self_ty } => {
+                let new_self = self.replace_generic(*self_ty, param_index, replacement);
+                self.associated_type(*trait_id, name.clone(), new_self)
             }
             TypeData::Tuple { elems } => {
                 let new_elems: Vec<TypeId> = elems
@@ -1537,10 +1621,6 @@ impl TypeContext {
                         alternatives: new_alts,
                     })
                 }
-            }
-            TypeData::Poly { quantifiers, body } => {
-                let new_body = self.replace_generic(*body, param_index, replacement);
-                self.poly(quantifiers.clone(), new_body)
             }
             _ => ty,
         }
@@ -2352,15 +2432,23 @@ impl TypeContext {
                 // - &mut T <: &T allowed (borrow shortening), invariant inner type
                 // - &T <: &mut T NEVER allowed
                 // - same mutability → invariant inner type
+                //
+                // Resolve bindings so that inference variables that have been
+                // bound to concrete types are compared by their resolved form.
+                let r1 = self.resolve_binding(*t1);
+                let r2 = self.resolve_binding(*t2);
                 if *m1 == *m2 {
-                    *t1 == *t2 // same mutability, invariant
+                    r1 == r2 // same mutability, invariant
                 } else if *m1 == true && *m2 == false {
-                    *t1 == *t2 // &mut T <: &T, invariant
+                    r1 == r2 // &mut T <: &T, invariant
                 } else {
                     false // &T <: &mut T: never allowed
                 }
             }
-            (TypeData::Pointer { ty: t1 }, TypeData::Pointer { ty: t2 }) => *t1 == *t2, // invariant — exact equality required
+            (TypeData::Pointer { ty: t1 }, TypeData::Pointer { ty: t2 }) => {
+                // Invariant — exact equality required after resolving bindings.
+                self.resolve_binding(*t1) == self.resolve_binding(*t2)
+            }
             (
                 TypeData::Fn {
                     params: p1,
@@ -2434,7 +2522,7 @@ impl TypeContext {
                     frac_bits: q2,
                 },
             ) => *p1 == *p2 && *q1 == *q2,
-            // Ptr: invariant on both size and pointee
+            // Ptr: invariant on both size and pointee — resolve bindings first.
             (
                 TypeData::Ptr {
                     size: s1,
@@ -2444,7 +2532,10 @@ impl TypeContext {
                     size: s2,
                     pointee: p2,
                 },
-            ) => *s1 == *s2 && *p1 == *p2,
+            ) => {
+                self.resolve_binding(*s1) == self.resolve_binding(*s2)
+                    && self.resolve_binding(*p1) == self.resolve_binding(*p2)
+            }
             // Poly: α-convert quantifiers → covariant body
             (
                 TypeData::Poly {
@@ -2544,8 +2635,25 @@ impl TypeContext {
                 self.function(new_params, new_ret)
             }
             TypeData::Poly { quantifiers, body } => {
-                let new_body = self.subst(*body, subst);
-                self.poly(quantifiers.clone(), new_body)
+                // Poly is a binder over all its quantifiers.  Remove shadowed
+                // keys from the substitution map and recurse, so that other
+                // free variables in the body are still substituted.
+                let shadowed_indices: Vec<usize> = quantifiers.iter()
+                    .map(|(idx, _)| *idx)
+                    .filter(|idx| subst.get(*idx).is_some())
+                    .collect();
+                if shadowed_indices.is_empty() {
+                    let new_body = self.subst(*body, subst);
+                    self.poly(quantifiers.clone(), new_body)
+                } else {
+                    let filtered = subst.without_all(&shadowed_indices);
+                    if filtered.is_empty() {
+                        ty
+                    } else {
+                        let new_body = self.subst(*body, &filtered);
+                        self.poly(quantifiers.clone(), new_body)
+                    }
+                }
             }
             TypeData::DynTrait { .. } => ty,
             TypeData::Forall {
@@ -2553,53 +2661,117 @@ impl TypeContext {
                 param_name,
                 body,
             } => {
-                let new_body = self.subst(*body, subst);
-                self.alloc(TypeData::Forall {
-                    param_index: *param_index,
-                    param_name: param_name.clone(),
-                    body: new_body,
-                })
+                // Binder shadowing: remove the shadowed key from the subst
+                // map and recurse, so that other free variables in the body
+                // are still substituted.
+                if subst.get(*param_index).is_some() {
+                    let filtered = subst.without(*param_index);
+                    if filtered.is_empty() {
+                        ty
+                    } else {
+                        let new_body = self.subst(*body, &filtered);
+                        self.alloc(TypeData::Forall {
+                            param_index: *param_index,
+                            param_name: param_name.clone(),
+                            body: new_body,
+                        })
+                    }
+                } else {
+                    let new_body = self.subst(*body, subst);
+                    self.alloc(TypeData::Forall {
+                        param_index: *param_index,
+                        param_name: param_name.clone(),
+                        body: new_body,
+                    })
+                }
             }
             TypeData::Mu {
                 param_index,
                 param_name,
                 body,
             } => {
-                let new_body = self.subst(*body, subst);
-                self.alloc(TypeData::Mu {
-                    param_index: *param_index,
-                    param_name: param_name.clone(),
-                    body: new_body,
-                })
+                if subst.get(*param_index).is_some() {
+                    let filtered = subst.without(*param_index);
+                    if filtered.is_empty() {
+                        ty
+                    } else {
+                        let new_body = self.subst(*body, &filtered);
+                        self.alloc(TypeData::Mu {
+                            param_index: *param_index,
+                            param_name: param_name.clone(),
+                            body: new_body,
+                        })
+                    }
+                } else {
+                    let new_body = self.subst(*body, subst);
+                    self.alloc(TypeData::Mu {
+                        param_index: *param_index,
+                        param_name: param_name.clone(),
+                        body: new_body,
+                    })
+                }
             }
             TypeData::Nu {
                 param_index,
                 param_name,
                 body,
             } => {
-                let new_body = self.subst(*body, subst);
-                self.alloc(TypeData::Nu {
-                    param_index: *param_index,
-                    param_name: param_name.clone(),
-                    body: new_body,
-                })
+                if subst.get(*param_index).is_some() {
+                    let filtered = subst.without(*param_index);
+                    if filtered.is_empty() {
+                        ty
+                    } else {
+                        let new_body = self.subst(*body, &filtered);
+                        self.alloc(TypeData::Nu {
+                            param_index: *param_index,
+                            param_name: param_name.clone(),
+                            body: new_body,
+                        })
+                    }
+                } else {
+                    let new_body = self.subst(*body, subst);
+                    self.alloc(TypeData::Nu {
+                        param_index: *param_index,
+                        param_name: param_name.clone(),
+                        body: new_body,
+                    })
+                }
             }
             TypeData::Exists {
                 param_index,
                 name,
                 base,
             } => {
-                let new_base = self.subst(*base, subst);
-                let new_id = self.alloc(TypeData::Exists {
-                    param_index: *param_index,
-                    name: name.clone(),
-                    base: new_base,
-                });
-                // Copy the original Exists meta (invariant, default_value) to the new node
-                if let Some(meta) = self.meta.get(&ty).cloned() {
-                    self.meta.entry(new_id).or_insert(meta);
+                if subst.get(*param_index).is_some() {
+                    let filtered = subst.without(*param_index);
+                    if filtered.is_empty() {
+                        ty
+                    } else {
+                        let new_base = self.subst(*base, &filtered);
+                        let new_id = self.alloc(TypeData::Exists {
+                            param_index: *param_index,
+                            name: name.clone(),
+                            base: new_base,
+                        });
+                        // Copy the original Exists meta (invariant, default_value) to the new node
+                        if let Some(meta) = self.meta.get(&ty).cloned() {
+                            self.meta.entry(new_id).or_insert(meta);
+                        }
+                        new_id
+                    }
+                } else {
+                    let new_base = self.subst(*base, subst);
+                    let new_id = self.alloc(TypeData::Exists {
+                        param_index: *param_index,
+                        name: name.clone(),
+                        base: new_base,
+                    });
+                    // Copy the original Exists meta (invariant, default_value) to the new node
+                    if let Some(meta) = self.meta.get(&ty).cloned() {
+                        self.meta.entry(new_id).or_insert(meta);
+                    }
+                    new_id
                 }
-                new_id
             }
             TypeData::Coproduct { alternatives } => {
                 let new_alts: Vec<TypeId> =
@@ -3047,6 +3219,23 @@ impl Subst {
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+
+    /// Return a new `Subst` with the given index removed.
+    /// If the index is not present, returns a clone of `self`.
+    pub fn without(&self, index: usize) -> Self {
+        let mut map = self.map.clone();
+        map.remove(&index);
+        Subst { map }
+    }
+
+    /// Return a new `Subst` with all the given indices removed.
+    pub fn without_all(&self, indices: &[usize]) -> Self {
+        let mut map = self.map.clone();
+        for idx in indices {
+            map.remove(idx);
+        }
+        Subst { map }
+    }
 }
 
 impl Default for Subst {
@@ -3068,6 +3257,7 @@ pub enum Characteristic {
 
 /// A variance-annotated type graph used for κ(A) computation.
 /// Nodes are TypeIds; edges carry a variance sign (+1 covariant, -1 contravariant, 0 invariant).
+#[allow(dead_code)]
 struct KappaGraph {
     nodes: Vec<TypeId>,
     /// (from_idx, to_idx, sign)
@@ -3271,6 +3461,7 @@ impl TypeContext {
 
     /// Build the type graph from root, collecting all reachable nodes,
     /// variance edges, and axiom links for bound GenericParam occurrences.
+    #[allow(dead_code)]
     fn build_kappa_graph(&self, root: TypeId) -> KappaGraph {
         use std::collections::HashSet as Set;
 
@@ -3431,6 +3622,7 @@ impl TypeContext {
 
     /// Solve κ for a graph using fixed-point iteration.
     /// Returns the κ of the root node (graph.nodes[0]).
+    #[allow(dead_code)]
     fn solve_kappa(&self, graph: &KappaGraph) -> Characteristic {
         let n = graph.nodes.len();
         // result[i] = None (unknown) or Some(κ)
@@ -3518,6 +3710,7 @@ impl TypeContext {
     }
 
     /// Return the κ of a leaf type (no outgoing edges).
+    #[allow(dead_code)]
     fn leaf_kappa(&self, ty: TypeId) -> Characteristic {
         // Does NOT go through `characteristic_body` — this is the base case.
         let data = self.get(ty);
@@ -3572,6 +3765,7 @@ impl TypeContext {
     /// Combine children κ values into a node's κ, given the type constructor.
     /// Called when all of a node's outgoing edges point to determined nodes.
     /// `kappa_map` maps child TypeId → determined Characteristic.
+    #[allow(dead_code)]
     fn combine_kappa(
         &self,
         ty: TypeId,

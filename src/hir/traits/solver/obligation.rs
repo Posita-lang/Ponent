@@ -125,19 +125,60 @@ pub enum ImplSource {
     },
 }
 
+impl ImplSource {
+    /// Extract nested obligations from any ImplSource variant.
+    /// Returns an empty vec for `Builtin` and `Deferred`.
+    pub fn nested_obligations(&self) -> Vec<Obligation> {
+        match self {
+            ImplSource::UserDefined { nested, .. } => nested.clone(),
+            ImplSource::Param(nested) => nested.clone(),
+            ImplSource::Builtin(_) => vec![],
+            ImplSource::Object { nested, .. } => nested.clone(),
+            ImplSource::Auto { nested } => nested.clone(),
+            ImplSource::Poly { nested, .. } => nested.clone(),
+            ImplSource::Deferred { .. } => vec![],
+        }
+    }
+}
+
 /// How certain we are that a selected impl source is correct.
 ///
-/// Analogous to rustc's `Certainty::Yes` vs `Certainty::Maybe(Ambiguity)`.
+/// Analogous to rustc's `Certainty::Yes` vs `Certainty::Maybe(MaybeCause)`.
 /// When a goal is `Maybe`, it provisionally succeeded but may fail once
-/// inference variables are resolved.  The caller can decide whether to
-/// accept provisional results or require definite resolution.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// inference variables are resolved or due to other provisional conditions.
+/// The caller (e.g. `FulfillmentContext`) can use the `MaybeCause` to
+/// decide whether to report the ambiguity to the user or silently retry.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Certainty {
     /// Definitely resolved — the impl is sound and complete.
     Yes,
-    /// Provisionally resolved — the impl holds if the inference variables
-    /// in `stalled_on` are resolved compatibly.
-    Maybe,
+    /// Provisionally resolved — the goal may still fail once inference
+    /// variables are resolved, or due to overflow / coinductive cycles.
+    /// The `MaybeCause` describes why the result is provisional.
+    Maybe(MaybeCause),
+}
+
+/// Why a goal is only provisionally resolved (`Certainty::Maybe`).
+///
+/// Analogous to rustc's `MaybeCause`.  Distinguishes between:
+/// - Inference variables that are still unresolved (retry later)
+/// - Recursion depth exceeded (overflow — bail out)
+/// - Coinductive cycle detected (auto traits — treat as success)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MaybeCause {
+    /// Inference variables are not yet resolved.
+    /// `stalled_on` records which variables are blocking resolution,
+    /// enabling selective re-evaluation when those variables are bound.
+    Unresolved {
+        stalled_on: Vec<TypeId>,
+    },
+    /// The recursion depth was exceeded during trait resolution.
+    /// This is a hard ambiguity — the goal should be reported as an error.
+    Overflow,
+    /// A coinductive cycle was detected (e.g. `Send: Send`).
+    /// Auto traits and `Sized` are coinductive, so cycles are expected
+    /// and treated as provisional success.
+    CoinductiveCycle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -164,8 +205,9 @@ pub enum SolveError {
         num_candidates: usize,
     },
     Overflow {
-        trait_id: DefId,
-        self_ty: TypeId,
+        /// The obligation that exceeded the recursion limit.
+        obligation: Box<Obligation>,
+        /// The recursion depth at which overflow occurred.
         depth: usize,
     },
     CycleDetected {

@@ -22,6 +22,7 @@
 
 pub mod builtins;
 pub mod coherence;
+pub mod eval;
 pub mod forest;
 pub mod fulfill;
 pub mod obligation;
@@ -37,4 +38,5 @@ pub use obligation::{
     ProjectionTy, SolveError,
 };
 pub use select::SelectionContext;
+pub use eval::evaluate_goal;
 pub use fulfill::FulfillmentContext;
