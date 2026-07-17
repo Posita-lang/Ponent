@@ -64,6 +64,7 @@ impl<'a> FulfillmentContext<'a> {
         self.forest.register(obligation);
     }
 
+    #[must_use]
     pub fn evaluate_all(&mut self) -> Result<(), Vec<SolveError>> {
         self.evaluate_all_inner(false)
     }
@@ -71,6 +72,7 @@ impl<'a> FulfillmentContext<'a> {
     /// Like `evaluate_all`, but returns an error if any obligations remain
     /// deferred after the solver stalls.  This is the version to use for the
     /// final pass, after the old solver has resolved all inference variables.
+    #[must_use]
     pub fn evaluate_all_final(&mut self) -> Result<(), Vec<SolveError>> {
         self.evaluate_all_inner(true)
     }

@@ -126,6 +126,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     // ── Infer expression type ─────────────────────────────────────────────
+    #[must_use]
     pub fn infer_expr(&mut self, expr: &Expr) -> Result<(HirExpr, TypeId), Diagnostic> {
         match expr {
             Expr::Literal(lit, span) => {
@@ -1507,6 +1508,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     /// Resolve a syntactic type to a TypeId — actual implementation.
+    #[must_use]
     pub fn resolve_type(&mut self, ty: &Type) -> Result<TypeId, Diagnostic> {
         match ty {
             Type::Path(path, span) => {
@@ -1912,6 +1914,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     /// Expand type aliases: if `ty` is an alias, resolve it to its body.
+    #[must_use]
     pub fn expand_base_type(&mut self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
         if let Some(def_id) = self.checker.ctx.get_def_id_for_type(ty) {
             if let Some(binding) = self.checker.symbols.lookup_type_by_def_id(def_id) {
@@ -2016,11 +2019,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     /// Check a statement (delegates to TypeChecker).
+    #[must_use]
     pub fn check_stmt(&mut self, stmt: &Stmt) -> Result<HirStmt, Diagnostic> {
         self.checker.check_stmt(stmt)
     }
 
     /// Check a block — actual implementation, not delegation.
+    #[must_use]
     pub fn check_block(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, Diagnostic> {
         let _scope = self.checker.enter_var_scope();
         let mut result = Vec::new();

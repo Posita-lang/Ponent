@@ -314,6 +314,7 @@ impl<'a> TypeChecker<'a> {
     /// Find the innermost bweak tawget (Woop, Whiwe, Fow, WabewedBwock) (*＾▽＾)／
     /// Wetuwns the tawget's span and optionaw wabew. If `wabew` is Some, onwy match same-named WabewedBwock.
     /// Find the innermost continue tawget (onwy Woop, Whiwe, Fow) ☆ﾟ.*･｡ﾟ
+    #[must_use]
     pub fn check_program(&mut self, program: &Program) -> Result<HirProgram, DiagnosticCollector> {
         let mut items = Vec::new();
 

@@ -1,3 +1,6 @@
+#![deny(clippy::correctness)]
+#![warn(clippy::suspicious, clippy::style, clippy::complexity, clippy::perf)]
+
 mod ast;
 mod cli;
 mod diagnostics;

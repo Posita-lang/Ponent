@@ -243,6 +243,7 @@ impl VfsNode {
     }
 
     /// Ensure the source text is loaded via the given backend.
+    #[must_use]
     pub fn ensure_src(&mut self, backend: &dyn VfsBackend) -> Result<(), VfsError> {
         if self.src.is_some() {
             return Ok(());
@@ -260,6 +261,7 @@ impl VfsNode {
     }
 
     /// Ensure tokens are lexed from the source text.
+    #[must_use]
     pub fn ensure_tokens(&mut self, backend: &dyn VfsBackend) -> Result<(), VfsError> {
         if self.tokens.is_some() {
             return Ok(());
@@ -282,6 +284,7 @@ impl VfsNode {
     }
 
     /// Ensure the AST is parsed from the source text.
+    #[must_use]
     pub fn ensure_ast(&mut self, backend: &dyn VfsBackend) -> Result<(), VfsError> {
         if self.ast.is_some() {
             return Ok(());

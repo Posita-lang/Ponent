@@ -1702,6 +1702,7 @@ impl TypeContext {
         }
     }
 
+    #[must_use]
     pub fn unify(&mut self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
         // ── Transaction: capture current bindings for rollback ──
         self.begin_transaction();
@@ -1735,6 +1736,7 @@ impl TypeContext {
     /// If unification succeeds, the type bindings are modified in place.
     /// The caller MUST call `rollback_transaction()` to undo them if the
     /// result is only being used for a check (like overlap detection).
+    #[must_use]
     pub fn try_unify(&mut self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
         self.unify_seen.borrow_mut().clear();
         self.unify_internal(a, b, Variance::Invariant)

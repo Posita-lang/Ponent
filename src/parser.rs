@@ -224,7 +224,7 @@ impl Parser {
         let expected_str = if let Some(tok) = expected {
             format!("{:?}", tok)
         } else if !self.expected_token_types.is_empty() {
-            self.expected_token_types.last().unwrap().desc.to_string()
+            self.expected_token_types.last().expect("expected_token_types should be non-empty when formatting error — push_expected was not called before expect_one_of").desc.to_string()
         } else {
             "something".to_string()
         };
@@ -538,6 +538,7 @@ impl Parser {
         }
     }
 
+    #[must_use]
     pub fn parse_program(&mut self) -> Result<Program, Vec<Diagnostic>> {
         let start = self.span().start;
         let mut items = Vec::new();
@@ -3330,7 +3331,7 @@ impl Parser {
                     let mut path = vec![name];
                     self.advance().ok();
                     let variant_sym = match self.advance() {
-                        Ok(tok) if tok.as_ident_symbol().is_some() => tok.as_ident_symbol().unwrap(),
+                        Ok(tok) if tok.as_ident_symbol().is_some() => tok.as_ident_symbol().expect("guarded by is_some() above"),
                         _ => {
                             return Err(Diagnostic::error("expected variant name")
                                 .with_code_str("E004")
@@ -3442,7 +3443,7 @@ impl Parser {
             let field_tok = self.advance();
             match field_tok {
                 Ok(tok) if tok.as_ident_symbol().is_some() => {
-                    let field_name = tok.as_ident_symbol().unwrap();
+                    let field_name = tok.as_ident_symbol().expect("guarded by is_some() above");
                     let field_pattern = if matches!(self.peek(), Ok(Token::Colon)) {
                         self.advance().ok();
                         self.parse_pattern()?
@@ -4078,7 +4079,7 @@ impl Parser {
             self.advance().ok();
             match self.advance() {
                 Ok(tok) if tok.as_ident_symbol().is_some() => {
-                    path.push(tok.as_ident_symbol().unwrap());
+                    path.push(tok.as_ident_symbol().expect("guarded by is_some() above"));
                 }
                 _ => {
                     return Err(Diagnostic::error("expected identifier after '::'")

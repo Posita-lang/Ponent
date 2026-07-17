@@ -133,6 +133,7 @@ impl<'a> SelectionContext<'a> {
     /// Select a candidate for the given obligation.
     ///
     /// Returns the resolved `ImplSource` on success, or a `SolveError` on failure.
+    #[must_use]
     pub fn select(&mut self, obligation: &Obligation) -> Result<ImplSource, SolveError> {
         if obligation.recursion_depth >= MAX_RECURSION_DEPTH {
             return Err(SolveError::Overflow {
