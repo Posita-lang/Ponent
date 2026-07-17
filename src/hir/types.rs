@@ -1653,7 +1653,7 @@ impl TypeContext {
     /// to guard against infinite recursion.  **Do not.**  It would add O(n)
     /// memory overhead and mask the fact that the real cycle-safety proof
     /// lives upstream, in the binding layer.
-    fn occurs_check(&self, param: TypeId, ty: TypeId) -> bool {
+    pub(crate) fn occurs_check(&self, param: TypeId, ty: TypeId) -> bool {
         if param == ty {
             return true;
         }

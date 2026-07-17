@@ -59,6 +59,11 @@ impl GuardSet {
         GuardSet { direct_guards: self.direct_guards + other.direct_guards, transitive_guards: transitive }
     }
     pub fn clear(&mut self) { self.direct_guards = 0; self.transitive_guards.clear(); }
+    /// Clear only the direct guards, preserving transitive guards.
+    /// Used by wake-up code: `suspend_on_var` adds direct guards, and
+    /// waking should remove only those — not transitive guards that may
+    /// have been added by cross-region dependency tracking.
+    pub fn clear_direct_guards(&mut self) { self.direct_guards = 0; }
 }
 
 /// ── Inline InferRegionTree (ported from OmniML tree.ml + generalization.ml InferPool) ──
@@ -390,10 +395,22 @@ impl InferenceContext {
 ///   Priority 4: Sub(concrete, infer) / Sub(infer, concrete)
 ///   Priority 5: Sub(infer, infer)
 ///   Priority 6: Impl constraints
-#[derive(Debug, Clone)]
+/// A scoped environment carried with each delayed constraint, mapping
+/// inference variable IDs to Skolem TypeIds introduced by enclosing
+/// Forall binders.  The solver consults this environment before falling
+/// through to the global resolution tables, enabling properly scoped
+/// rigid variable semantics for universally quantified constraints.
+pub(crate) type SkolemEnv = HashMap<usize, TypeId>;
+
+#[derive(Clone)]
 struct PrioritizedConstraint {
     priority: u8,
     constraint: Constraint,
+    /// Scoped skolem environment: maps var_id → Skolem TypeId for
+    /// Forall-bound rigid variables that apply to this constraint.
+    /// Inherited from the parent constraint and extended by new Forall
+    /// binders.  Empty unless the constraint is inside a Forall body.
+    env: SkolemEnv,
 }
 
 impl PartialEq for PrioritizedConstraint {
@@ -652,7 +669,9 @@ pub struct InferenceContext {
     /// Per-variable wait lists (OmniML §3.2): constraints suspended on this var.
     /// When the var is bound (unified with a concrete type), these constraints
     /// are woken and reprocessed, enabling bidirectional type information flow.
-    wait_lists: Vec<Vec<Constraint>>,
+    /// Each entry carries the constraint together with its scoped SkolemEnv
+    /// so that Forall-bound rigid variables remain rigid after suspension/wake.
+    wait_lists: Vec<Vec<(Constraint, SkolemEnv)>>,
     /// Guard sets (OmniML §6): reference-counted guards tracking whether a
     /// variable is captured by suspended constraints. A non-empty guard set
     /// means the variable is PG (PartiallyGeneralizable). When all guards are
@@ -710,6 +729,34 @@ pub struct InferenceContext {
     resolved_snapshot_stack: Vec<(usize, FxHashSet<usize>, std::collections::HashSet<usize>)>,
 }
 
+// ── Test accessors ────────────────────────────────────────────────
+// These are only used by infer_tests.rs; they expose private fields
+// to the test module as read-only references, preserving encapsulation
+// while allowing test assertions on internal state.
+#[cfg(test)]
+impl InferenceContext {
+    pub(crate) fn forward_refs(&self) -> &[Vec<usize>] {
+        &self.forward_refs
+    }
+    pub(crate) fn reverse_refs(&self) -> &[Option<usize>] {
+        &self.reverse_refs
+    }
+    pub(crate) fn constraints(&self) -> &[Constraint] {
+        &self.constraints
+    }
+    pub(crate) fn wait_lists(&self) -> &[Vec<(Constraint, SkolemEnv)>] {
+        &self.wait_lists
+    }
+    /// Test helper: wake suspended constraints into a local heap and return
+    /// the number of woken constraints.  Does not expose the internal
+    /// PrioritizedConstraint type to tests.
+    pub(crate) fn wake_var_for_test(&mut self, var_id: usize, ctx: &TypeContext) -> usize {
+        let mut heap = std::collections::BinaryHeap::new();
+        self.wake_var_incremental(var_id, &mut heap, ctx);
+        heap.len()
+    }
+}
+
 /// A set of pattern alternatives for a suspended match constraint.
 #[derive(Debug, Clone)]
 pub struct MatchBranchSet {
@@ -725,6 +772,31 @@ pub struct MatchBranchSet {
 }
 
 impl InferenceContext {
+    /// Resolve a type through the scoped environment first, falling back to
+    /// ctx.resolve_binding() for ordinary bindings.  Env-mapped (skolemized)
+    /// variables are replaced with their Skolem TypeId so that all constraint
+    /// forms (Eq, Sub, etc.) operate on the rigid type, not the raw InferVar.
+    fn resolve_with_env(&self, ty: TypeId, ctx: &TypeContext, env: &SkolemEnv) -> TypeId {
+        let r = ctx.resolve_binding(ty);
+        if let TypeData::InferVar { id } = ctx.get(r) {
+            if let Some(skolem) = env.get(id) {
+                return *skolem;
+            }
+        }
+        r
+    }
+
+    /// If the given type is an InferVar that is NOT bound in the scoped
+    /// environment, return its var_id.  Returns None for concrete types,
+    /// Skolem-bound variables, or variables bound in ctx.bindings.
+    fn free_infer_var_id(&self, ty: TypeId, ctx: &TypeContext, env: &SkolemEnv) -> Option<usize> {
+        let r = ctx.resolve_binding(ty);
+        match ctx.get(r) {
+            TypeData::InferVar { id } if !env.contains_key(id) => Some(*id),
+            _ => None,
+        }
+    }
+
     pub fn new() -> Self {
         InferenceContext {
             type_vars: Vec::new(),
@@ -1019,9 +1091,17 @@ impl InferenceContext {
     /// When the var is bound, the constraint will be woken and reprocessed.
     /// Also marks the variable as PartiallyGeneralizable (PG) and adds a
     /// guard entry so the variable stays PG until the guard is released.
+    /// Uses an empty SkolemEnv — constraints suspended through the public
+    /// API are not inside a Forall scope.
     pub fn suspend_on_var(&mut self, c: Constraint, var_id: usize) {
+        self.suspend_on_var_with_env(c, SkolemEnv::default(), var_id)
+    }
+
+    /// Internal variant: suspend a constraint with a scoped SkolemEnv so
+    /// that Forall-bound rigid variables remain rigid after suspension/wake.
+    fn suspend_on_var_with_env(&mut self, c: Constraint, env: SkolemEnv, var_id: usize) {
         if var_id < self.wait_lists.len() {
-            self.wait_lists[var_id].push(c);
+            self.wait_lists[var_id].push((c, env));
             if var_id < self.gen_statuses.len() {
                 let old = self.gen_statuses[var_id];
                 self.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
@@ -1089,10 +1169,17 @@ impl InferenceContext {
 
     /// Wake all constraints suspended on the given var_id, moving them
     /// back into the active constraint list for reprocessing.
-    fn wake_var(&mut self, var_id: usize) {
+    fn wake_var(&mut self, var_id: usize, ctx: &TypeContext, heap: &mut BinaryHeap<PrioritizedConstraint>) {
         if var_id < self.wait_lists.len() {
-            let mut suspended = std::mem::take(&mut self.wait_lists[var_id]);
-            self.constraints.append(&mut suspended);
+            let suspended = std::mem::take(&mut self.wait_lists[var_id]);
+            for (c, env) in suspended {
+                let p = c.priority(ctx);
+                heap.push(PrioritizedConstraint {
+                    priority: p,
+                    constraint: c,
+                    env,
+                });
+            }
         }
     }
 
@@ -1148,11 +1235,12 @@ impl InferenceContext {
     ) {
         if var_id < self.wait_lists.len() && !self.wait_lists[var_id].is_empty() {
             let suspended = std::mem::take(&mut self.wait_lists[var_id]);
-            for c in suspended {
+            for (c, env) in suspended {
                 let p = c.priority(ctx);
                 heap.push(PrioritizedConstraint {
                     priority: p,
                     constraint: c,
+                    env,
                 });
             }
             // Clear all guards for this variable: every constraint placed
@@ -1162,7 +1250,7 @@ impl InferenceContext {
             // match constraint is solved, it removes the guards it
             // introduced").
             if var_id < self.guard_sets.len() {
-                self.guard_sets[var_id].clear();
+                self.guard_sets[var_id].clear_direct_guards();
             }
             // All constraints woken and guards cleared — transition to
             // Generalized if no further guards remain.
@@ -1207,8 +1295,11 @@ impl InferenceContext {
         branches_id: (usize, usize),
         heap: &mut BinaryHeap<PrioritizedConstraint>,
         span: crate::ast::Span,
+        env: &SkolemEnv,
     ) -> bool {
-        let resolved = ctx.resolve_binding(scrutinee);
+        // Use env-aware resolution so that Forall-bound Skolems are not
+        // treated as free inference variables.
+        let resolved = self.resolve_with_env(scrutinee, ctx, env);
         match ctx.get(resolved) {
             TypeData::InferVar { id } => {
                 // Always suspend the Match constraint, regardless of whether
@@ -1221,14 +1312,9 @@ impl InferenceContext {
                     branches_id,
                     span,
                 };
-                // Suspend on this variable only.  When the variable is later
-                // unified to another, the solve loop's wake_var_incremental
-                // mechanism will move the constraint to the working heap.
-                // On re-processing, resolve_binding follows the binding chain
-                // to the new root, so the constraint is not lost even across
-                // multiple unification steps — and the O(N) scan of all
-                // var_type_ids to find transitive roots is eliminated.
-                self.suspend_on_var(match_c, *id);
+                // Suspend on this variable only.  Preserve the scoped SkolemEnv
+                // so that Forall-bound rigid variables remain rigid after wake.
+                self.suspend_on_var_with_env(match_c, env.clone(), *id);
                 true
             }
             _ => {
@@ -1236,7 +1322,7 @@ impl InferenceContext {
                 // matches and no else_ fallback), the caller falls through to
                 // unicity check and re-push logic instead of silently losing
                 // the constraint.
-                self.discharge_match(ctx, scrutinee, branches_id, heap)
+                self.discharge_match(ctx, scrutinee, branches_id, heap, env)
             }
         }
     }
@@ -1262,9 +1348,10 @@ impl InferenceContext {
         &self,
         ctx: &TypeContext,
         ty: TypeId,
+        env: &SkolemEnv,
         active_constraints: &[PrioritizedConstraint],
     ) -> Option<PrincipalShape> {
-        let resolved = ctx.resolve_binding(ty);
+        let resolved = self.resolve_with_env(ty, ctx, env);
         let data = ctx.get(resolved);
 
         // ── UNI-TYPE: non-variable type ──────────────────────────
@@ -1282,10 +1369,12 @@ impl InferenceContext {
         // ── UNI-VAR: α is unified with a concrete type ───────────
         // Scan all Eq constraints in the active set. If any equality
         // binds α to a non-variable type, that determines the shape.
+        // Use each constraint's own env to resolve types (env-mapped
+        // skolems from Forall must not be treated as free infer vars).
         for pc in active_constraints {
             if let Constraint::Eq(a, b, _) = &pc.constraint {
-                let ra = ctx.resolve_binding(*a);
-                let rb = ctx.resolve_binding(*b);
+                let ra = self.resolve_with_env(*a, ctx, &pc.env);
+                let rb = self.resolve_with_env(*b, ctx, &pc.env);
                 // Check if this Eq constraint involves our variable
                 let other = if ra == resolved {
                     Some(rb)
@@ -1741,7 +1830,7 @@ impl InferenceContext {
     /// an outer scope.  SkolemVar is the runtime representation of a universally
     /// quantified variable bound by a `Constraint::Forall` — detecting it here
     /// prevents skolem constants from leaking into generalized type schemes.
-    fn check_rigid_escape(ctx: &TypeContext, ty: TypeId, max_level: usize) -> bool {
+    pub(crate) fn check_rigid_escape(ctx: &TypeContext, ty: TypeId, max_level: usize) -> bool {
         let resolved = ctx.resolve_binding(ty);
         match ctx.get(resolved) {
             TypeData::GenericParam { .. } | TypeData::SkolemVar { .. } => true, // escape detected
@@ -1853,8 +1942,11 @@ impl InferenceContext {
         scrutinee_ty: TypeId,
         branches_id: (usize, usize),
         heap: &mut BinaryHeap<PrioritizedConstraint>,
+        env: &SkolemEnv,
     ) -> bool {
-        let resolved = ctx.resolve_binding(scrutinee_ty);
+        // Use env-aware resolution so that Forall-bound Skolems are not
+        // treated as free inference variables when computing shape.
+        let resolved = self.resolve_with_env(scrutinee_ty, ctx, env);
         let shape = Self::shape_of_type(ctx, resolved);
 
         // Find the branch that matches this shape.
@@ -1866,12 +1958,14 @@ impl InferenceContext {
                 let matches_pattern = shape == branch.shape_pattern;
 
                 if matches_pattern {
-                    // Enqueue continuation constraints.
+                    // Enqueue continuation constraints with the scoped env
+                    // so that Forall-bound rigid variables remain rigid.
                     for c in &branch.continuation {
                         let p = c.priority(ctx);
                         heap.push(PrioritizedConstraint {
                             priority: p,
                             constraint: c.clone(),
+                            env: env.clone(),
                         });
                     }
                     return true;
@@ -1886,6 +1980,7 @@ impl InferenceContext {
                     heap.push(PrioritizedConstraint {
                         priority: p,
                         constraint: c.clone(),
+                        env: env.clone(),
                     });
                 }
                 return true;
@@ -1913,6 +2008,13 @@ impl InferenceContext {
             self.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
             self.push_undo(InferUndoLog::SetGenStatus(var_id, old));
         }
+    }
+
+    /// Check whether a variable has any active guards.
+    /// A guarded variable is PartiallyGeneralizable (PG) and cannot be
+    /// generalized until all guards are removed.
+    pub(crate) fn is_guarded(&self, var_id: usize) -> bool {
+        var_id < self.guard_sets.len() && !self.guard_sets[var_id].is_empty()
     }
 
     /// Remove a guard from a variable when its suspended constraint is discharged.
@@ -1945,6 +2047,7 @@ impl InferenceContext {
             heap.push(PrioritizedConstraint {
                 priority,
                 constraint: c.clone(),
+                env: HashMap::default(),
             });
         }
 
@@ -1963,34 +2066,44 @@ impl InferenceContext {
         let mut delayed: Vec<PrioritizedConstraint> = Vec::new();
         let mut delayed_retried: bool = false;
         loop {
-            let mut active_count = heap.len();
             while let Some(pc) = heap.pop() {
-                active_count -= 1;
                 match &pc.constraint {
                     Constraint::Eq(a, b, _) => {
                         // Check if either side is an InferVar before unifying
                         let ra = ctx.resolve_binding(*a);
                         let rb = ctx.resolve_binding(*b);
-                        let a_is_infer = matches!(ctx.get(ra), TypeData::InferVar { .. });
-                        let b_is_infer = matches!(ctx.get(rb), TypeData::InferVar { .. });
-                        let a_var_id = if a_is_infer {
-                            if let TypeData::InferVar { id } = ctx.get(ra) {
-                                Some(*id)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
+                        // Compute var_ids unconditionally from the raw TypeData
+                        // so they are available for Skolem env lookups even when
+                        // the variable is treated as rigid (not a free InferVar).
+                        let a_var_id = match ctx.get(ra) {
+                            TypeData::InferVar { id } => Some(*id),
+                            _ => None,
                         };
-                        let b_var_id = if b_is_infer {
-                            if let TypeData::InferVar { id } = ctx.get(rb) {
-                                Some(*id)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
+                        let b_var_id = match ctx.get(rb) {
+                            TypeData::InferVar { id } => Some(*id),
+                            _ => None,
                         };
+                        let mut a_is_infer = a_var_id.is_some();
+                        let mut b_is_infer = b_var_id.is_some();
+
+                        // If the InferVar is a Forall-bound Skolem in the constraint's
+                        // scoped environment (pc.env), it is NOT a free InferVar
+                        // — treat it as rigid so the unifier rejects illegal
+                        // unification with concrete types.
+                        if a_is_infer {
+                            if let Some(id) = a_var_id {
+                                if pc.env.contains_key(&id) {
+                                    a_is_infer = false;
+                                }
+                            }
+                        }
+                        if b_is_infer {
+                            if let Some(id) = b_var_id {
+                                if pc.env.contains_key(&id) {
+                                    b_is_infer = false;
+                                }
+                            }
+                        }
 
                         // Level-based promotion (Fan, Xu & Xie 2025 §6.2):
                         // If unifying two InferVars at different regions, promote
@@ -2000,7 +2113,8 @@ impl InferenceContext {
                         // from both original branches — critical when the two
                         // variables live in sibling branches, not just on the same
                         // ancestor-descendant line.
-                        if let (Some(avid), Some(bvid)) = (a_var_id, b_var_id) {
+                        if a_is_infer && b_is_infer {
+                            if let (Some(avid), Some(bvid)) = (a_var_id, b_var_id) {
                             let a_region = self.type_vars[avid].region_id;
                             let b_region = self.type_vars[bvid].region_id;
                             let a_lvl = self.region_tree.get_level(a_region);
@@ -2053,8 +2167,71 @@ impl InferenceContext {
                                     self.unify_and_track(a_promoted, b_promoted, ctx)?;
                                 }
                             }
+                            } else {
+                                // Both are genuine free InferVars but the inner
+                                // pattern didn't match (shouldn't happen).
+                                self.unify_and_track(*a, *b, ctx)?;
+                            }
                         } else {
-                            self.unify_and_track(*a, *b, ctx)?;
+                            // At least one side is not a free InferVar.
+                            // If either side is a Forall-bound Skolem, resolve
+                            // BOTH sides through the scoped environment and
+                            // use ctx.unify directly.  This handles nested
+                            // Forall (e.g. ∀α. ∀β. Eq(α, β)) correctly:
+                            // both sides are resolved to their Skolem TypeIds
+                            // before unification, so ctx.unify sees two
+                            // distinct Skolems and rejects the unification.
+                            let lhs = a_var_id
+                                .and_then(|id| pc.env.get(&id).copied())
+                                .unwrap_or(*a);
+                            let rhs = b_var_id
+                                .and_then(|id| pc.env.get(&id).copied())
+                                .unwrap_or(*b);
+                            if a_var_id.and_then(|id| pc.env.get(&id)).is_some()
+                                || b_var_id.and_then(|id| pc.env.get(&id)).is_some()
+                            {
+                                // At least one side is a scoped skolem.
+                                // If exactly one side is a skolem and the other
+                                // is a free inference variable (not in the env),
+                                // reject the unification — ctx.unify would bind the
+                                // free variable to the skolem, leaking it.
+                                let a_skolem = a_var_id.and_then(|id| pc.env.get(&id).copied());
+                                let b_skolem = b_var_id.and_then(|id| pc.env.get(&id).copied());
+                                match (a_skolem, b_skolem) {
+                                    (Some(sa), Some(sb)) => {
+                                        // Two rigid vars: only identical skolems unify.
+                                        ctx.unify(sa, sb)?;
+                                    }
+                                    (Some(_), None) if b_var_id.is_some() => {
+                                        // Skolem vs free infer var: reject to prevent
+                                        // the free var from being bound to the skolem.
+                                        return Err(TypeError::Mismatch {
+                                            expected: lhs,
+                                            found: rhs,
+                                            span: crate::ast::Span::new(0, 0),
+                                        });
+                                    }
+                                    (None, Some(_)) if a_var_id.is_some() => {
+                                        // Free infer var vs skolem: reject.
+                                        return Err(TypeError::Mismatch {
+                                            expected: rhs,
+                                            found: lhs,
+                                            span: crate::ast::Span::new(0, 0),
+                                        });
+                                    }
+                                    (Some(sa), None) => {
+                                        ctx.unify(sa, *b)?;
+                                    }
+                                    (None, Some(sb)) => {
+                                        ctx.unify(*a, sb)?;
+                                    }
+                                    (None, None) => {
+                                        self.unify_and_track(*a, *b, ctx)?;
+                                    }
+                                }
+                            } else {
+                                self.unify_and_track(*a, *b, ctx)?;
+                            }
                         }
 
                         // Mark dirty for drain_dirty tracking.
@@ -2101,30 +2278,31 @@ impl InferenceContext {
                         }
                     }
                     Constraint::Sub(sub, sup, _span) => {
-                        let resolved_sub = ctx.resolve_binding(*sub);
-                        let resolved_sup = ctx.resolve_binding(*sup);
+                        // Resolve both sides through the scoped env so that
+                        // Forall-bound Skolems are used instead of raw InferVars.
+                        let resolved_sub = self.resolve_with_env(*sub, ctx, &pc.env);
+                        let resolved_sup = self.resolve_with_env(*sup, ctx, &pc.env);
 
-                        // If sup is an InferVar, record sub as a lower bound of sup
-                        if let TypeData::InferVar { id } = ctx.get(resolved_sup) {
-                            if *id < self.lower_bounds.len() {
-                                self.lower_bounds[*id].push(resolved_sub);
-                                self.mark_dirty(*id);
+                        // Record bounds only for genuinely free InferVars
+                        // (not Forall-bound Skolems).
+                        if let Some(id) = self.free_infer_var_id(*sup, ctx, &pc.env) {
+                            if id < self.lower_bounds.len() {
+                                self.lower_bounds[id].push(resolved_sub);
+                                self.mark_dirty(id);
                             }
                         }
-                        // If sub is an InferVar, record sup as an upper bound of sub
-                        if let TypeData::InferVar { id } = ctx.get(resolved_sub) {
-                            if *id < self.upper_bounds.len() {
-                                self.upper_bounds[*id].push(resolved_sup);
-                                self.mark_dirty(*id);
+                        if let Some(id) = self.free_infer_var_id(*sub, ctx, &pc.env) {
+                            if id < self.upper_bounds.len() {
+                                self.upper_bounds[id].push(resolved_sup);
+                                self.mark_dirty(id);
                             }
                         }
 
-                        // If both sides are resolved (not InferVar), check the subtype relationship now
-                        let sub_is_infer =
-                            matches!(ctx.get(resolved_sub), TypeData::InferVar { .. });
-                        let sup_is_infer =
-                            matches!(ctx.get(resolved_sup), TypeData::InferVar { .. });
-                        if !sub_is_infer && !sup_is_infer {
+                        // If both sides are resolved (not free InferVars), check
+                        // the subtype relationship using the env-resolved types.
+                        let sub_is_free = self.free_infer_var_id(*sub, ctx, &pc.env).is_some();
+                        let sup_is_free = self.free_infer_var_id(*sup, ctx, &pc.env).is_some();
+                        if !sub_is_free && !sup_is_free {
                             if !ctx.subtype(resolved_sub, resolved_sup) {
                                 return Err(TypeError::Mismatch {
                                     expected: resolved_sup,
@@ -2142,12 +2320,14 @@ impl InferenceContext {
                         // OmniML §4.1: Try to discharge suspended match constraints.
                         // Check unicity — if the scrutinee's shape is uniquely determined,
                         // discharge the match and enqueue continuation constraints.
-                        let resolved = ctx.resolve_binding(*scrutinee);
+                        // Use env-aware resolution so that Forall-bound Skolems are not
+                        // treated as free inference variables.
+                        let resolved = self.resolve_with_env(*scrutinee, ctx, &pc.env);
                         let resolved_data = ctx.get(resolved);
 
                         if !matches!(resolved_data, TypeData::InferVar { .. }) {
                             // Scrutinee is resolved — shape is known (UNI-TYPE).
-                            if !self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap) {
+                            if !self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap, &pc.env) {
                                 // No branch matched and no else_ fallback for a
                                 // fully-resolved scrutinee.  This is a type error:
                                 // the pattern match is non-exhaustive.  Terminate
@@ -2166,6 +2346,7 @@ impl InferenceContext {
                                 *branches_id,
                                 &mut heap,
                                 *match_span,
+                                &pc.env,
                             );
                             if !shape_known {
                                 // Scrutinee is still an InferVar — try unicity via bounds
@@ -2175,7 +2356,7 @@ impl InferenceContext {
                                 // disabled UNI-VAR entirely.
                                 let active: Vec<PrioritizedConstraint> = heap.drain().collect();
                                 if let Some(_shape) =
-                                    Self::unicity_check(self, ctx, *scrutinee, &active)
+                                    Self::unicity_check(self, ctx, *scrutinee, &pc.env, &active)
                                 {
                                     // Re-push active constraints before discharging
                                     for c in &active {
@@ -2186,6 +2367,7 @@ impl InferenceContext {
                                         *scrutinee,
                                         *branches_id,
                                         &mut heap,
+                                        &pc.env,
                                     ) {
                                         // Unicity succeeded but no branch matched.
                                         // Same as above: type error, not retryable.
@@ -2203,6 +2385,7 @@ impl InferenceContext {
                                     heap.push(PrioritizedConstraint {
                                         priority: p,
                                         constraint: pc.constraint.clone(),
+                                        env: pc.env.clone(),
                                     });
                                 }
                             }
@@ -2220,6 +2403,7 @@ impl InferenceContext {
                         heap.push(PrioritizedConstraint {
                             priority: p,
                             constraint: inner,
+                            env: pc.env.clone(),
                         });
                     }
                     Constraint::Forall {
@@ -2238,20 +2422,41 @@ impl InferenceContext {
                         // `universe_num` can be checked by `check_skolem_escape`
                         // on TypeContext, preventing the skolem from leaking
                         // into outer scopes via generalization.
+                        //
+                        // The Skolem mapping is recorded in the constraint's
+                        // scoped environment (pc.env) rather than in global
+                        // self.resolutions.  This ensures the rigid binding
+                        // applies only to the Forall body and is automatically
+                        // cleaned up when the constraint is popped from the heap.
+                        debug_assert!(
+                            *var_id < self.var_type_ids.len(),
+                            "Forall var_id {} out of range (var_type_ids.len = {})",
+                            *var_id,
+                            self.var_type_ids.len(),
+                        );
                         if *var_id < self.var_type_ids.len() {
                             let (_universe, skolem_ty) = ctx.enter_universe();
-                            let infer_ty = self.var_type_ids[*var_id];
-                            // Use the local `unify` (not `ctx.unify`) so that
-                            // the resolution is recorded in `self.resolutions`,
-                            // keeping `self.resolve()` consistent.
-                            let _ = self.unify(infer_ty, skolem_ty, ctx);
+                            let mut child_env = pc.env.clone();
+                            child_env.insert(*var_id, skolem_ty);
+                            let inner = constraint.as_ref().clone();
+                            let p = inner.priority(ctx);
+                            heap.push(PrioritizedConstraint {
+                                priority: p,
+                                constraint: inner,
+                                env: child_env,
+                            });
+                        } else {
+                            // Invariant violated: push the body with an
+                            // empty (or inherited) environment rather than
+                            // silently dropping the constraint.
+                            let inner = constraint.as_ref().clone();
+                            let p = inner.priority(ctx);
+                            heap.push(PrioritizedConstraint {
+                                priority: p,
+                                constraint: inner,
+                                env: pc.env.clone(),
+                            });
                         }
-                        let inner = constraint.as_ref().clone();
-                        let p = inner.priority(ctx);
-                        heap.push(PrioritizedConstraint {
-                            priority: p,
-                            constraint: inner,
-                        });
                     }
                     Constraint::Instance {
                         scheme_ty,
@@ -2356,6 +2561,7 @@ impl InferenceContext {
                             heap.push(PrioritizedConstraint {
                                 priority: p,
                                 constraint: eq_c,
+                                env: pc.env.clone(),
                             });
                         }
                     }
@@ -2370,11 +2576,13 @@ impl InferenceContext {
                         heap.push(PrioritizedConstraint {
                             priority: def_p,
                             constraint: def_constraint.as_ref().clone(),
+                            env: pc.env.clone(),
                         });
                         let body_p = body_constraint.priority(ctx).max(4);
                         heap.push(PrioritizedConstraint {
                             priority: body_p,
                             constraint: body_constraint.as_ref().clone(),
+                            env: pc.env.clone(),
                         });
                         self.exit_level(prev_level);
                     }
@@ -2398,9 +2606,9 @@ impl InferenceContext {
                     let active: Vec<PrioritizedConstraint> = heap.iter().cloned().collect();
                     // Only attempt discharge if scrutinee is resolved (not an InferVar)
                     if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
-                        if let Some(shape) = Self::unicity_check(self, ctx, *scrutinee, &active) {
+                        if let Some(shape) = Self::unicity_check(self, ctx, *scrutinee, &pc.env, &active) {
                             let discharged =
-                                self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
+                                self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap, &pc.env);
                             // If discharge succeeded, the Match constraint is still in the
                             // original heap (we cloned above).  It will be re-processed in
                             // the next iteration, but discharge_match is idempotent — the
@@ -2411,9 +2619,9 @@ impl InferenceContext {
                         }
                     } else {
                         // Scrutinee is still an InferVar — check unicity via bounds
-                        if let Some(_shape) = Self::unicity_check(self, ctx, *scrutinee, &active) {
+                        if let Some(_shape) = Self::unicity_check(self, ctx, *scrutinee, &pc.env, &active) {
                             let discharged =
-                                self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap);
+                                self.discharge_match(ctx, *scrutinee, *branches_id, &mut heap, &pc.env);
                             let _ = discharged;
                         }
                     }
@@ -2432,11 +2640,12 @@ impl InferenceContext {
                     if i < self.wait_lists.len() && !self.wait_lists[i].is_empty() {
                         let suspended = std::mem::take(&mut self.wait_lists[i]);
                         let count = suspended.len();
-                        for c in suspended {
+                        for (c, env) in suspended {
                             let p = c.priority(ctx);
                             heap.push(PrioritizedConstraint {
                                 priority: p,
                                 constraint: c,
+                                env,
                             });
                         }
                         // Clear guards for this variable — every constraint
@@ -2445,7 +2654,7 @@ impl InferenceContext {
                         // remains permanently in PG and can never become
                         // Generalized.
                         if i < self.guard_sets.len() {
-                            self.guard_sets[i].clear();
+                            self.guard_sets[i].clear_direct_guards();
                         }
                         // If guards are now empty and status was PG,
                         // transition to Generalized (OmniML §6).
@@ -2478,7 +2687,7 @@ impl InferenceContext {
                 // #2: Solver exhaustion — check for remaining undischarged Match
                 // constraints and fire their else_continuation as a fallback.
                 let remaining: Vec<PrioritizedConstraint> = heap.drain().collect();
-                let match_elses: Vec<(TypeId, (usize, usize), crate::ast::Span)> = remaining
+                let match_elses: Vec<(TypeId, (usize, usize), crate::ast::Span, SkolemEnv)> = remaining
                     .iter()
                     .filter_map(|pc| {
                         if let Constraint::Match {
@@ -2489,7 +2698,7 @@ impl InferenceContext {
                         {
                             let resolved = ctx.resolve_binding(*scrutinee);
                             if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
-                                Some((*scrutinee, *branches_id, *span))
+                                Some((*scrutinee, *branches_id, *span, pc.env.clone()))
                             } else {
                                 None
                             }
@@ -2500,8 +2709,8 @@ impl InferenceContext {
                     .collect();
                 let mut else_heap = BinaryHeap::new();
                 let mut match_errors = Vec::new();
-                for (scrutinee, branches_id, match_span) in match_elses {
-                    if !self.discharge_match(ctx, scrutinee, branches_id, &mut else_heap) {
+                for (scrutinee, branches_id, match_span, env) in match_elses {
+                    if !self.discharge_match(ctx, scrutinee, branches_id, &mut else_heap, &env) {
                         // No branch matched and no else_ fallback for a fully-resolved
                         // scrutinee.  This is a type error — the pattern match is
                         // non-exhaustive.  Accumulate the error; the heap is about to
@@ -2513,6 +2722,13 @@ impl InferenceContext {
                 }
                 if !match_errors.is_empty() {
                     return Err(match_errors.into_iter().next().unwrap());
+                }
+                // Merge else continuations back into the main heap so they
+                // are processed by the solver loop (not silently dropped).
+                if !else_heap.is_empty() {
+                    heap.extend(else_heap.into_iter());
+                    delayed_retried = false;
+                    continue;
                 }
                 break; // converged: no more constraints to wake
             }
@@ -2668,17 +2884,6 @@ impl InferenceContext {
                 };
                 ctx.set_binding(ty_id, default_ty);
             }
-        }
-
-        // ── Re-check delayed Impl constraints after defaulting ──────
-        // Variables that were unresolved during the solver loop may have
-        // been defaulted above.  Any remaining delayed Impl constraints
-        // must now be checked against the concrete (defaulted) types.
-        // Without this, trait obligations could be silently dropped while
-        // the solver reports success — a soundness hole.
-        for pc in &delayed {
-            // Constraint::Impl was removed in the unified solver migration.
-                // All trait obligations now go through the new FulfillmentContext.
         }
 
         Ok(())
@@ -3134,9 +3339,9 @@ mod tests {
             var_id,
         );
         // Waking moves suspended constraints back to the active list
-        infer.wake_var(var_id);
-        // The active constraints list should now have the suspended constraint
-        assert!(!infer.constraints.is_empty());
+        let woken = infer.wake_var_for_test(var_id, &ctx);
+        // The heap should now have the woken constraint
+        assert!(woken > 0);
     }
 
     #[test]
@@ -3249,7 +3454,7 @@ mod tests {
         let infer = InferenceContext::new();
         // Use pre-allocated built-in types
         let int_ty = ctx.int(32, true);
-        let shape = InferenceContext::unicity_check(&infer, &ctx, int_ty, &[]);
+        let shape = InferenceContext::unicity_check(&infer, &ctx, int_ty, &HashMap::default(), &[]);
         assert!(shape.is_some(), "non-variable type should have known shape");
     }
 
@@ -3259,7 +3464,7 @@ mod tests {
         let infer = InferenceContext::new();
         let int_ty = ctx.int(32, true);
         let fn_ty = ctx.function(vec![int_ty], int_ty);
-        let shape = InferenceContext::unicity_check(&infer, &ctx, fn_ty, &[]);
+        let shape = InferenceContext::unicity_check(&infer, &ctx, fn_ty, &HashMap::default(), &[]);
         assert!(shape.is_some(), "function type should have known shape");
         assert_eq!(shape.unwrap(), PrincipalShape::Arrow);
     }
@@ -3353,7 +3558,7 @@ mod tests {
         let id = infer.register_match_branches(branches);
         let int_ty2 = ctx.int(64, false);
 
-        let result = infer.discharge_match(&mut ctx, int_ty2, id, &mut heap);
+        let result = infer.discharge_match(&mut ctx, int_ty2, id, &mut heap, &HashMap::default());
         assert!(result, "else_ fallback should return true");
         assert!(!heap.is_empty(), "else_ continuation should be enqueued");
     }
@@ -3372,7 +3577,7 @@ mod tests {
         let id = infer.register_match_branches(branches);
         let int_ty = ctx.int(32, true);
 
-        let result = infer.discharge_match(&mut ctx, int_ty, id, &mut heap);
+        let result = infer.discharge_match(&mut ctx, int_ty, id, &mut heap, &HashMap::default());
         assert!(!result, "no else_ fallback should still fail");
         assert!(heap.is_empty(), "no constraints should be enqueued");
     }
@@ -3437,7 +3642,7 @@ mod tests {
         }];
         let id = infer.register_match_branches(branches);
 
-        let handled = infer.try_match_via_shape_var(&mut ctx, var, id, &mut heap, crate::ast::Span::new(0, 0));
+        let handled = infer.try_match_via_shape_var(&mut ctx, var, id, &mut heap, crate::ast::Span::new(0, 0), &HashMap::default());
         assert!(handled, "should register the match on the wait list");
 
         let var_id = 0;
@@ -3463,7 +3668,7 @@ mod tests {
         }];
         let id = infer.register_match_branches(branches);
 
-        let handled = infer.try_match_via_shape_var(&mut ctx, int_ty, id, &mut heap, crate::ast::Span::new(0, 0));
+        let handled = infer.try_match_via_shape_var(&mut ctx, int_ty, id, &mut heap, crate::ast::Span::new(0, 0), &HashMap::default());
         assert!(handled, "concrete type with matching shape should discharge");
     }
 
@@ -4170,7 +4375,7 @@ mod tests {
             _ => unreachable!(),
         };
         let mut heap = std::collections::BinaryHeap::new();
-        let _handled = infer.try_match_via_shape_var(&mut ctx, infer_var, bid, &mut heap, crate::ast::Span::new(0, 0));
+        let _handled = infer.try_match_via_shape_var(&mut ctx, infer_var, bid, &mut heap, crate::ast::Span::new(0, 0), &HashMap::default());
         // For an InferVar, try_match_via_shape_var suspends the Match constraint
         // on the wait list (returns true) rather than discharging immediately.
         // For a concrete (non-InferVar) type, it delegates to discharge_match and
@@ -4197,7 +4402,7 @@ mod tests {
 
         // Discharge it directly
         let fn_ty2 = ctx.function(vec![ctx.bool()], ctx.bool());
-        let discharged = infer.discharge_match(&mut ctx, fn_ty2, bid, &mut heap);
+        let discharged = infer.discharge_match(&mut ctx, fn_ty2, bid, &mut heap, &HashMap::default());
         assert!(discharged, "match on fn type should discharge");
         // The continuation Eq(int32, int32) should be in the heap now
         assert!(
