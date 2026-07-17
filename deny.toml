@@ -26,9 +26,11 @@ feature-depth = 1
 # ─────────────────────────────────────────────────────────────────────────────
 [advisories]
 vulnerability = "deny"      # Block known CVEs
-unmaintained = "warn"       # Warn on unmaintained crates
 yanked = "deny"             # Block yanked versions
 notice = "warn"             # Warn on informational notices
+
+[advisories.unmaintained]
+level = "warn"              # Warn on unmaintained crates
 ignore = [
     #"RUSTSEC-0000-0000",
     #{ id = "RUSTSEC-0000-0000", reason = "known false positive for our usage" },

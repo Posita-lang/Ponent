@@ -2197,3 +2197,32 @@ fn test_where_tuple_subject_direct_trait_rejected() {
         result
     );
 }
+#[cfg(test)]
+mod test_infer_return {
+    use super::*;
+    
+    #[test]
+    fn test_infer_return_from_literal() {
+        let result = check_source("def main() { return 42; }");
+        // Should succeed: infer return type as Int<32>
+        assert!(result.is_ok(), "infer return from literal: {:?}", result.err());
+    }
+    
+    #[test]
+    fn test_infer_return_from_bool() {
+        let result = check_source("def main() { return true; }");
+        assert!(result.is_ok(), "infer return from bool: {:?}", result.err());
+    }
+    
+    #[test]
+    fn test_infer_return_no_return_defaults_to_never() {
+        let result = check_source("def main() { }");
+        assert!(result.is_ok(), "no return defaults to never: {:?}", result.err());
+    }
+    
+    #[test]
+    fn test_infer_return_empty_return_defaults_to_unit() {
+        let result = check_source("def main() { return; }");
+        assert!(result.is_ok(), "empty return defaults to unit: {:?}", result.err());
+    }
+}

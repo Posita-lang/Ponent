@@ -3,6 +3,8 @@ use crate::diagnostics::Diagnostic;
 use crate::hir::types::*;
 use crate::symbol::Symbol;
 use indexmap::IndexMap;
+use std::cell::Cell;
+use std::rc::Rc;
 use rustc_hash::FxBuildHasher;
 use rustc_hash::FxHashMap as HashMap;
 
@@ -43,7 +45,7 @@ pub struct Parameter {
 #[derive(Debug, Clone)]
 pub struct FunctionSignature {
     pub params: Vec<Parameter>,
-    pub return_type: TypeId,
+    pub return_type: Rc<Cell<TypeId>>,
     pub type_params: Vec<TypeParam>,
     pub where_clause: Option<WhereClause>,
 }
@@ -243,6 +245,30 @@ impl SymbolTable {
         }
         scope.functions.insert(name, binding);
         Ok(())
+    }
+
+    /// Update the return type of a previously registered function binding.
+    /// Used by the type checker to patch the resolver's placeholder type
+    /// (e.g. `unit()`) with the actual inferred return type after inference
+    /// completes.  This is critical for cross‑function call sites: without it,
+    /// a call to an inferred‑return‑type function would see the placeholder
+    /// instead of the real type, causing spurious type mismatches.
+    pub fn update_function_return_type(&self, name: Symbol, return_type: TypeId) {
+        let mut idx = self.current_scope;
+        let mut found = false;
+        while let Some(scope) = self.scopes.get(idx) {
+            if let Some(binding) = scope.functions.get(&name) {
+                binding.signature.return_type.set(return_type);
+                found = true;
+                break;
+            }
+            if let Some(parent) = scope.parent {
+                idx = parent;
+            } else {
+                break;
+            }
+        }
+        debug_assert!(found, "update_function_return_type: function '{}' not found in any scope", name.as_str());
     }
 
     pub fn insert_type(

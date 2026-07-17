@@ -28,7 +28,7 @@ pub enum HirStmt {
         doc: Option<String>,
         name: Symbol,
         params: Vec<HirParam>,
-        return_type: TypeId,
+        return_type: Option<TypeId>,
         body: Option<Vec<HirStmt>>,
         type_params: Vec<TypeParam>,
         where_clause: Option<()>,

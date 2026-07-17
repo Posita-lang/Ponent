@@ -1,4 +1,6 @@
 use crate::ast::visit::replace_ident_in_expr;
+use std::cell::Cell;
+use std::rc::Rc;
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticCollector, DiagnosticLevel};
 use crate::hir::builtins;
@@ -151,7 +153,7 @@ impl<'a> NameResolver<'a> {
                 }
                 self.current_impl_type_params = Some(param_map);
 
-                let sig = self.collect_function_signature(*name, params, return_type, type_params);
+                let sig = self.collect_function_signature(*name, params, return_type.as_ref(), type_params);
 
                 let binding = FunctionBinding {
                     def_id,
@@ -718,7 +720,7 @@ impl<'a> NameResolver<'a> {
                 ..
             } => {
                 let def_id = self.allocate_def_id();
-                let sig = self.collect_function_signature(*name, params, return_type, &[]);
+                let sig = self.collect_function_signature(*name, params, Some(return_type), &[]);
                 let binding = FunctionBinding {
                     def_id,
                     signature: sig,
@@ -1015,7 +1017,7 @@ impl<'a> NameResolver<'a> {
                     let sig = func.signature.clone();
                     let ty = self
                         .ctx
-                        .function(sig.params.iter().map(|p| p.ty).collect(), sig.return_type);
+                        .function(sig.params.iter().map(|p| p.ty).collect(), sig.return_type.get());
                     Some(ty)
                 } else if let Some(_ty_binding) = self.symbols.lookup_type(*name) {
                     None
@@ -1741,7 +1743,7 @@ impl<'a> NameResolver<'a> {
         &mut self,
         name: Symbol,
         params: &[Param],
-        return_type: &Type,
+        return_type: Option<&Type>,
         type_params: &[TypeParam],
     ) -> FunctionSignature {
         FunctionSignature {
@@ -1759,7 +1761,10 @@ impl<'a> NameResolver<'a> {
                     }
                 })
                 .collect(),
-            return_type: self.resolve_type_expr(return_type),
+            return_type: Rc::new(Cell::new(match return_type {
+                Some(t) => self.resolve_type_expr(t),
+                None => self.ctx.unit(),
+            })),
             type_params: type_params.to_vec(),
             where_clause: None,
         }
@@ -1782,7 +1787,7 @@ impl<'a> NameResolver<'a> {
                     }
                 })
                 .collect(),
-            return_type: self.resolve_type_expr(&method.return_type),
+            return_type: Rc::new(Cell::new(self.resolve_type_expr(&method.return_type))),
             type_params: Vec::new(),
             where_clause: None,
         }

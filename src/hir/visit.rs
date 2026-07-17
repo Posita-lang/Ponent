@@ -200,7 +200,7 @@ pub fn walk_hir_stmt<V: HirVisitor>(visitor: &mut V, stmt: &HirStmt) -> V::Resul
         }
         HirStmt::FunctionDef { name, params, body, finally, return_type, .. } => {
             visitor.visit_ident(name)?;
-            visitor.visit_type_id(*return_type)?;
+            if let Some(rt) = return_type { visitor.visit_type_id(*rt)?; }
             for p in params { visitor.visit_hir_param(p)?; }
             if let Some(b) = body { for s in b { visitor.visit_hir_stmt(s)?; } }
             if let Some(f) = finally { for s in f { visitor.visit_hir_stmt(s)?; } }

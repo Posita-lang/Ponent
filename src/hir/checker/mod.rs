@@ -776,7 +776,6 @@ impl<'a> TypeChecker<'a> {
                         .insert(tp.name.clone(), generic_id);
                 }
 
-                let return_ty = self.resolve_type(return_type)?;
                 let mut hir_params = Vec::new();
                 for param in params {
                     let param_ty = if let Some(ty) = &param.ty {
@@ -793,12 +792,32 @@ impl<'a> TypeChecker<'a> {
                     });
                 }
 
+                let guard = ScopeGuard::new(self);
+                guard.checker.current_function = Some(DefId(0));
+                guard.checker.current_function_trusted =
+                    attributes.iter().any(|a| a.name.eq_str("trusted"));
+
+                // Enter inference scope BEFORE creating return_ty so that the
+                // return‑type inference variable lives in the fresh context
+                // (not the old one pushed onto the infer stack).
+                guard.checker.enter_inference_scope();
+
+                let return_ty = if let Some(rt) = return_type {
+                    guard.checker.resolve_type(rt)?
+                } else {
+                    guard.checker.new_infer_var(
+                        TypeVariableKind::Any,
+                        VarOrigin::Expression(Some(*span)),
+                    )
+                };
+                guard.checker.current_return_type = Some(return_ty);
+
                 // ── @interrupt handler checks ─────────────────────────
                 let is_interrupt = attributes.iter().any(|a| a.name.eq_str("interrupt"));
                 if is_interrupt {
                     // Rule 1: return type must be Never (!)
-                    if !self.ctx.is_never(return_ty) {
-                        self.diagnostics.push(
+                    if return_type.is_none() || !guard.checker.ctx.is_never(return_ty) {
+                        guard.checker.diagnostics.push(
                             Diagnostic::error("@interrupt handler must return `!` (never type)")
                                 .with_code_str("E050")
                                 .with_span(*span)
@@ -807,7 +826,7 @@ impl<'a> TypeChecker<'a> {
                     }
                     // Rule 2: no custom parameters
                     if !params.is_empty() {
-                        self.diagnostics.push(
+                        guard.checker.diagnostics.push(
                             Diagnostic::error("@interrupt handler cannot have parameters")
                                 .with_code_str("E051")
                                 .with_span(*span)
@@ -818,7 +837,7 @@ impl<'a> TypeChecker<'a> {
                     let has_no_alloc = attributes.iter().any(|a| a.name.eq_str("no_alloc"));
                     let has_no_panic = attributes.iter().any(|a| a.name.eq_str("no_panic"));
                     if !has_no_alloc {
-                        self.diagnostics.push(
+                        guard.checker.diagnostics.push(
                             Diagnostic::error("@interrupt handler must satisfy @no_alloc")
                                 .with_code_str("E052")
                                 .with_span(*span)
@@ -826,7 +845,7 @@ impl<'a> TypeChecker<'a> {
                         );
                     }
                     if !has_no_panic {
-                        self.diagnostics.push(
+                        guard.checker.diagnostics.push(
                             Diagnostic::error("@interrupt handler must satisfy @no_panic")
                                 .with_code_str("E053")
                                 .with_span(*span)
@@ -835,7 +854,7 @@ impl<'a> TypeChecker<'a> {
                     }
                     // Rule 4: @interrupt + @alloc is incompatible
                     if attributes.iter().any(|a| a.name.eq_str("alloc")) {
-                        self.diagnostics.push(
+                        guard.checker.diagnostics.push(
                             Diagnostic::error("@interrupt handler cannot have @alloc")
                                 .with_code_str("E054")
                                 .with_span(*span)
@@ -844,7 +863,7 @@ impl<'a> TypeChecker<'a> {
                     }
                     // Rule 5: @interrupt + @io is incompatible
                     if attributes.iter().any(|a| a.name.eq_str("io")) {
-                        self.diagnostics.push(
+                        guard.checker.diagnostics.push(
                             Diagnostic::error("@interrupt handler cannot have @io")
                                 .with_code_str("E055")
                                 .with_span(*span)
@@ -853,12 +872,6 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
 
-                let guard = ScopeGuard::new(self);
-                guard.checker.current_function = Some(DefId(0));
-                guard.checker.current_function_trusted =
-                    attributes.iter().any(|a| a.name.eq_str("trusted"));
-                guard.checker.current_return_type = Some(return_ty);
-                guard.checker.enter_inference_scope();
                 guard.checker.push_ctx(CtxKind::Function, *span, None);
 
                 // Enter a variable scope for the function body
@@ -1130,6 +1143,20 @@ impl<'a> TypeChecker<'a> {
                     Err(e) => return Err(e),
                 };
 
+                // If no explicit return type was written and the body has no
+                // return statements, default the inferred return type to Never.
+                // This must happen BEFORE the solver runs (inside the inference
+                // scope) so the solver doesn't see an unresolved Any-kind
+                // infer var and report CannotInfer.
+                if return_type.is_none() {
+                    if let Some(ref body_stmts) = body_hir {
+                        let has_return = body_stmts.iter().any(|s| matches!(s, HirStmt::Return { .. }));
+                        if !has_return {
+                            let _ = guard.checker.ctx.unify(return_ty, guard.checker.ctx.never());
+                        }
+                    }
+                }
+
                 // ── New trait solver: resolve all trait obligations ──
                 // After the function body is fully checked, run the new
                 // FulfillmentContext to verify that all trait constraints
@@ -1258,9 +1285,14 @@ impl<'a> TypeChecker<'a> {
                 }
 
                 if let Some(ref body_stmts) = body_hir {
-                    // Function bodies require explicit `return` — no implicit trailing expression.
-                    let body_ty = self.block_type_impl(body_stmts, false);
-                    self.unify_with(return_ty, body_ty, *span, TypingContext::ReturnValue)?;
+                    if return_type.is_some() {
+                        // User wrote an explicit return type — check body against it.
+                        let body_ty = self.block_type_impl(body_stmts, false);
+                        self.unify_with(return_ty, body_ty, *span, TypingContext::ReturnValue)?;
+                    }
+                    // When return_type is None, the infer var was already unified
+                    // with return values during body checking (via current_return_type),
+                    // or defaulted to Never before the solver ran (see above).
                 }
 
                 // Contract verification skeleton: check that requires/ensures are bool,
@@ -1447,6 +1479,14 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
 
+                // Patch the resolver's placeholder return type (unit()) with the
+                // actual inferred/concrete type so that cross‑function call sites
+                // see the correct return type rather than the stale placeholder.
+                // Using Cell<TypeId> allows mutation through the shared &SymbolTable
+                // reference that the checker holds.
+                self.symbols
+                    .update_function_return_type(*name, return_ty);
+
                 Ok(HirStmt::FunctionDef {
                     span: *span,
                     attributes: attributes.clone(),
@@ -1454,7 +1494,7 @@ impl<'a> TypeChecker<'a> {
                     doc: None,
                     name: name.clone(),
                     params: hir_params,
-                    return_type: return_ty,
+                    return_type: Some(return_ty),
                     body: body_hir,
                     type_params: type_params.clone(),
                     where_clause: where_clause.clone().map(|_| ()),
@@ -1817,7 +1857,10 @@ impl<'a> TypeChecker<'a> {
                     }
                 } else {
                     if let Some(ret_ty) = self.current_return_type {
-                        if !self.ctx.is_unit(ret_ty) && !self.ctx.is_never(ret_ty) {
+                        if self.ctx.is_infer_var(ret_ty) {
+                            // Infer var — unify with unit
+                            let _ = self.unify(ret_ty, self.ctx.unit(), *span);
+                        } else if !self.ctx.is_unit(ret_ty) && !self.ctx.is_never(ret_ty) {
                             self.diagnostics.push(
                                 Diagnostic::error("return without value in non-unit function")
                                     .with_span(*span),

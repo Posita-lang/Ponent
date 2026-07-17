@@ -166,7 +166,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     let mut fn_ty = self
                         .checker
                         .ctx
-                        .function(sig.params.iter().map(|p| p.ty).collect(), sig.return_type);
+                        .function(sig.params.iter().map(|p| p.ty).collect(), sig.return_type.get());
                     // If the function has type parameters, wrap with Forall:
                     // def foo<T, U>(x: T, y: U) → Forall(0, "T", Forall(1, "U", Fn(...)))
                     if !sig.type_params.is_empty() {

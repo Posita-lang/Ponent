@@ -297,7 +297,7 @@ pub enum Stmt {
         doc: Option<String>,
         name: Symbol,
         params: Vec<Param>,
-        return_type: Type,
+        return_type: Option<Type>,
         body: Option<Vec<Stmt>>,
         type_params: Vec<TypeParam>,
         where_clause: Option<WhereClause>,

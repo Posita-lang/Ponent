@@ -832,9 +832,9 @@ impl Parser {
         }
         let return_type = if matches!(self.peek(), Ok(Token::Arrow)) {
             self.advance().ok();
-            self.parse_type()?
+            Some(self.parse_type()?)
         } else {
-            Type::Never(self.span())
+            None
         };
         let mut contracts = Vec::new();
         while matches!(
@@ -5678,8 +5678,9 @@ mod tests {
         let program = check_parse(src);
         match &program.items[0] {
             Stmt::FunctionDef { return_type, .. } => {
+                let rt = return_type.as_ref().expect("return_type should be Some");
                 assert!(
-                    matches!(return_type, Type::Path(path, _) if path.len() == 1 && path[0].eq_str("type"))
+                    matches!(rt, Type::Path(path, _) if path.len() == 1 && path[0].eq_str("type"))
                 );
             }
             _ => panic!("expected FunctionDef"),
