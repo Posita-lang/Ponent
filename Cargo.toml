@@ -7,6 +7,9 @@ edition = "2024"
 default = []
 omniml_pool = []
 
+[package.metadata.cargo-machete]
+ignored = ["z3"]
+
 [dependencies]
 bitflags = "2.13.0"
 clap = { version = "4.6.1", features = ["derive"] }
