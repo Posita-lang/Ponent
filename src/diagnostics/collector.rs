@@ -55,6 +55,11 @@ impl DiagnosticCollector {
 
     /// Drain all diagnostics and return them as a Result.
     /// Returns Ok(()) if no errors, Err(self) if any errors present.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(self)` if any errors were collected.  The caller can
+    /// inspect the diagnostics via `self.errors()` or `self.warnings()`.
     #[must_use]
     pub fn check(self) -> Result<(), Self> {
         if self.has_errors() {

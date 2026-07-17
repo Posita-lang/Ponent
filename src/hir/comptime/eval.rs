@@ -125,6 +125,11 @@ impl<'a> ComptimeEvalContext<'a> {
     }
 
     /// Evaluate a comptime block (sequence of statements) and return the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(ComptimeError)` if the step limit is exceeded, a variable
+    /// is not found, a type mismatch occurs, or division by zero is attempted.
     #[must_use]
     pub fn eval_block(&mut self, stmts: &[HirStmt]) -> Result<ComptimeValue, ComptimeError> {
         let mut result = ComptimeValue::Unit;
@@ -199,6 +204,11 @@ impl<'a> ComptimeEvalContext<'a> {
     }
 
     /// Evaluate a comptime expression to a value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(ComptimeError)` if the step limit is exceeded, a variable
+    /// is not found, a type mismatch occurs, or division by zero is attempted.
     #[must_use]
     pub fn eval_expr(&mut self, expr: &HirExpr) -> Result<ComptimeValue, ComptimeError> {
         if self.steps >= self.step_limit {

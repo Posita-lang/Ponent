@@ -1400,7 +1400,13 @@ impl<'a> NameResolver<'a> {
                     } else if name.eq_str("USize") {
                         self.ctx.usize()
                     } else if name.eq_str("Unit") {
-                        self.ctx.unit()
+                        self.diagnostics.push(
+                            Diagnostic::error("use `()` instead of `Unit`")
+                                .with_code_str("E031")
+                                .with_help("Posita uses `()` (empty tuple) to express the unit type")
+                                .with_suggestion("replace `Unit` with `()`")
+                        );
+                        self.ctx.error()
                     } else if name.eq_str("Never") {
                         self.ctx.never()
                     } else if name.eq_str("Int") || name.eq_str("UInt") || name.eq_str("Float") || name.eq_str("Rational") {

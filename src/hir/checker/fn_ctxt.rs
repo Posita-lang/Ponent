@@ -1600,7 +1600,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     } else if path[0].eq_str("USize") {
                         Ok(self.checker.ctx.usize())
                     } else if path[0].eq_str("Unit") {
-                        Ok(self.checker.ctx.unit())
+                        return Err(Diagnostic::error("use `()` instead of `Unit`")
+                            .with_code_str("E031")
+                            .with_help("Posita uses `()` (empty tuple) to express the unit type")
+                            .with_suggestion("replace `Unit` with `()`")
+                            .with_span(*span));
                     } else if path[0].eq_str("Never") {
                         Ok(self.checker.ctx.never())
                     } else {

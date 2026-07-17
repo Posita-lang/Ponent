@@ -121,7 +121,7 @@ pub fn pre_intern_builtins() {
     let builtins = &[
         "true", "false", "def", "set", "return", "if", "else", "for", "while",
         "type", "enum", "struct", "impl", "trait", "fn", "let", "mut",
-        "Int", "UInt", "Float", "Bool", "Char", "Byte", "USize", "Unit",
+        "Int", "UInt", "Float", "Bool", "Char", "Byte", "USize",
         "Result", "Option", "Ok", "Err", "Some", "None",
         "Self", "self",
     ];

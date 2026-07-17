@@ -538,6 +538,13 @@ impl Parser {
         }
     }
 
+    /// Parse the full program source into an AST.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Vec<Diagnostic>)` with one or more parse errors if the
+    /// source contains syntax errors.  The parser attempts to recover and
+    /// continue after each error, so multiple diagnostics may be returned.
     #[must_use]
     pub fn parse_program(&mut self) -> Result<Program, Vec<Diagnostic>> {
         let start = self.span().start;
@@ -4839,7 +4846,7 @@ fn did_you_mean_keyword(input: &str, context: KeywordContext) -> Option<String> 
         ],
         KeywordContext::Type => &[
             "Int", "UInt", "Float", "Bool", "Char", "Byte",
-            "USize", "Unit", "Never", "Rational",
+            "USize", "Never", "Rational",
             "dyn", "ref", "mut",
         ],
         KeywordContext::Generic => &[
