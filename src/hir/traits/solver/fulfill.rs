@@ -1,12 +1,14 @@
+use crate::hir::symbol::SymbolTable;
+use crate::hir::traits::TraitEnv;
 use crate::hir::traits::solver::builtins::BuiltinTraitRegistry;
 use crate::hir::traits::solver::eval::evaluate_goal;
-use crate::hir::traits::solver::forest::{ObligationForest, MAX_NODES};
-use crate::hir::traits::solver::obligation::{ImplSource, Obligation, ObligationCause, ObligationCauseCode, Predicate, SolveError};
+use crate::hir::traits::solver::forest::{MAX_NODES, ObligationForest};
+use crate::hir::traits::solver::obligation::{
+    ImplSource, Obligation, ObligationCause, ObligationCauseCode, Predicate, SolveError,
+};
 use crate::hir::traits::solver::project::ProjectionCache;
 use crate::hir::traits::solver::select::SelectionContext;
-use crate::hir::traits::TraitEnv;
 use crate::hir::types::TypeContext;
-use crate::hir::symbol::SymbolTable;
 
 /// Drives iterative trait resolution.
 ///
@@ -40,7 +42,14 @@ impl<'a> FulfillmentContext<'a> {
     ) -> Self {
         FulfillmentContext {
             forest: ObligationForest::new(),
-            selcx: SelectionContext::new(ctx, trait_env, symbols, builtin_registry, proj_cache, caller_bounds),
+            selcx: SelectionContext::new(
+                ctx,
+                trait_env,
+                symbols,
+                builtin_registry,
+                proj_cache,
+                caller_bounds,
+            ),
         }
     }
 

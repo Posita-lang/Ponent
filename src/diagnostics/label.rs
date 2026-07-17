@@ -132,9 +132,7 @@ impl<'a> Diagnostic for MietteDiag<'a> {
                     Some(lbl.message.clone())
                 };
                 match lbl.kind {
-                    AnnotationKind::Primary => {
-                        LabeledSpan::new_primary_with_span(label, span)
-                    }
+                    AnnotationKind::Primary => LabeledSpan::new_primary_with_span(label, span),
                     _ => LabeledSpan::new_with_span(label, span),
                 }
             })
@@ -176,12 +174,7 @@ impl SourceContext {
     ///
     /// `primary_span` is the main error location, `labels` are additional
     /// annotations (secondary/note).  Both are rendered as underlines.
-    pub fn render(
-        &self,
-        primary_span: Span,
-        labels: &[Label],
-        use_color: bool,
-    ) -> String {
+    pub fn render(&self, primary_span: Span, labels: &[Label], use_color: bool) -> String {
         // Merge primary_span into the labels list as a primary label
         // so miette can render the main error location underline.
         let mut all_labels: Vec<Label> = Vec::with_capacity(labels.len() + 1);
@@ -198,8 +191,7 @@ impl SourceContext {
         };
 
         let handler = if use_color {
-            GraphicalReportHandler::new()
-                .with_context_lines(self.context_lines)
+            GraphicalReportHandler::new().with_context_lines(self.context_lines)
         } else {
             GraphicalReportHandler::new_themed(GraphicalTheme::ascii())
                 .with_context_lines(self.context_lines)

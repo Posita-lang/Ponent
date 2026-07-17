@@ -4,16 +4,19 @@
 //! constraint solving, region management, guard sets, generalization,
 //! shape variables, and the full solve pipeline.
 
+use crate::ast::Span;
 use crate::hir::infer::*;
 use crate::hir::shape_var::TypeShape;
-use crate::hir::types::*;
 use crate::hir::symbol::SymbolTable;
 use crate::hir::traits::TraitEnv;
+use crate::hir::types::*;
 use crate::symbol::Symbol;
-use crate::ast::Span;
 
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 // ── Helpers ──
 
@@ -49,7 +52,10 @@ fn test_infer_var_creation() {
     let mut ctx = new_ctx();
     let mut infer = new_infer();
     let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
-    assert!(ctx.is_infer_var(var), "new_type_var should create an InferVar");
+    assert!(
+        ctx.is_infer_var(var),
+        "new_type_var should create an InferVar"
+    );
     let id = infer_var_id(&ctx, var);
     assert!(infer.get_var_level(id).is_some(), "var should have a level");
 }
@@ -58,20 +64,41 @@ fn test_infer_var_creation() {
 fn test_infer_var_kind_tracking() {
     let mut ctx = new_ctx();
     let mut infer = new_infer();
-    let numeric = infer.new_type_var(&mut ctx, TypeVariableKind::Numeric, VarOrigin::Expression(Some(span())));
+    let numeric = infer.new_type_var(
+        &mut ctx,
+        TypeVariableKind::Numeric,
+        VarOrigin::Expression(Some(span())),
+    );
     let any = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
-    let unconstrained = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained, VarOrigin::GenericParam);
+    let unconstrained = infer.new_type_var(
+        &mut ctx,
+        TypeVariableKind::Unconstrained,
+        VarOrigin::GenericParam,
+    );
 
-    assert_eq!(infer.get_var_kind(infer_var_id(&ctx, numeric)), Some(TypeVariableKind::Numeric));
-    assert_eq!(infer.get_var_kind(infer_var_id(&ctx, any)), Some(TypeVariableKind::Any));
-    assert_eq!(infer.get_var_kind(infer_var_id(&ctx, unconstrained)), Some(TypeVariableKind::Unconstrained));
+    assert_eq!(
+        infer.get_var_kind(infer_var_id(&ctx, numeric)),
+        Some(TypeVariableKind::Numeric)
+    );
+    assert_eq!(
+        infer.get_var_kind(infer_var_id(&ctx, any)),
+        Some(TypeVariableKind::Any)
+    );
+    assert_eq!(
+        infer.get_var_kind(infer_var_id(&ctx, unconstrained)),
+        Some(TypeVariableKind::Unconstrained)
+    );
 }
 
 #[test]
 fn test_var_creation_with_origins_preserves_kind() {
     let mut ctx = new_ctx();
     let mut infer = new_infer();
-    let _expr_var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Expression(Some(span())));
+    let _expr_var = infer.new_type_var(
+        &mut ctx,
+        TypeVariableKind::Any,
+        VarOrigin::Expression(Some(span())),
+    );
     let _synthetic = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let _gp = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::GenericParam);
 
@@ -81,9 +108,18 @@ fn test_var_creation_with_origins_preserves_kind() {
     // should all be Any.
     // We can verify the public API works by checking type_var creation.
     // (VarOrigin is an internal detail used for defaulting.)
-    assert_eq!(infer.get_var_kind(infer_var_id(&ctx, _expr_var)), Some(TypeVariableKind::Any));
-    assert_eq!(infer.get_var_kind(infer_var_id(&ctx, _synthetic)), Some(TypeVariableKind::Any));
-    assert_eq!(infer.get_var_kind(infer_var_id(&ctx, _gp)), Some(TypeVariableKind::Any));
+    assert_eq!(
+        infer.get_var_kind(infer_var_id(&ctx, _expr_var)),
+        Some(TypeVariableKind::Any)
+    );
+    assert_eq!(
+        infer.get_var_kind(infer_var_id(&ctx, _synthetic)),
+        Some(TypeVariableKind::Any)
+    );
+    assert_eq!(
+        infer.get_var_kind(infer_var_id(&ctx, _gp)),
+        Some(TypeVariableKind::Any)
+    );
 }
 
 // ── Region / Level Tests ──
@@ -99,7 +135,10 @@ fn test_region_enter_exit_basic() {
     assert_ne!(child, root, "entering should change current region");
 
     infer.exit_level(parent);
-    assert_eq!(infer.region_tree.current, parent, "exiting should restore parent");
+    assert_eq!(
+        infer.region_tree.current, parent,
+        "exiting should restore parent"
+    );
 }
 
 #[test]
@@ -300,18 +339,27 @@ fn test_suspend_on_var_basic() {
 
     // After suspend_on_var, the constraint is moved to the wait list
     // (the constraints vec is cleared of the suspended constraint)
-    assert!(infer.constraints().is_empty(), "active constraints should be empty after suspend");
+    assert!(
+        infer.constraints().is_empty(),
+        "active constraints should be empty after suspend"
+    );
     assert!(
         id < infer.wait_lists().len(),
         "suspend_on_var should have grown wait_lists for id={}",
         id,
     );
-    assert!(!infer.wait_lists()[id].is_empty(), "var should have suspended constraints in wait list");
+    assert!(
+        !infer.wait_lists()[id].is_empty(),
+        "var should have suspended constraints in wait list"
+    );
 
     // Waking moves suspended constraints back to active
     let woken = infer.wake_var_for_test(id, &ctx);
     assert!(woken > 0, "woken constraints should be active");
-    assert!(infer.wait_lists()[id].is_empty(), "wait list should be empty after wake");
+    assert!(
+        infer.wait_lists()[id].is_empty(),
+        "wait list should be empty after wake"
+    );
 }
 
 #[test]
@@ -325,7 +373,10 @@ fn test_suspend_on_var_adds_guard() {
     infer.suspend_on_var(cst, id);
 
     // Suspending a constraint should add a guard (PG state)
-    assert!(infer.is_guarded(id), "var should be guarded after suspension");
+    assert!(
+        infer.is_guarded(id),
+        "var should be guarded after suspension"
+    );
 }
 
 // ── Generalization Tests ──
@@ -361,7 +412,10 @@ fn test_force_generalize_pg_with_guard_not_generalized() {
         !generalized.iter().any(|&(gid, _)| gid == id),
         "guarded var should NOT be generalized",
     );
-    assert_eq!(infer.get_gen_status(id), Some(GenStatus::PartiallyGeneralizable));
+    assert_eq!(
+        infer.get_gen_status(id),
+        Some(GenStatus::PartiallyGeneralizable)
+    );
 }
 
 #[test]
@@ -380,7 +434,10 @@ fn test_force_generalize_pg_with_waitlist_stays_pg() {
         !generalized.iter().any(|&(gid, _)| gid == id),
         "var with wait list should NOT be generalized",
     );
-    assert_eq!(infer.get_gen_status(id), Some(GenStatus::PartiallyGeneralizable));
+    assert_eq!(
+        infer.get_gen_status(id),
+        Some(GenStatus::PartiallyGeneralizable)
+    );
 }
 
 // ── Instance / Forward Reference Tests ──
@@ -409,7 +466,10 @@ fn test_register_instance_basic() {
     assert!(infer.forward_refs()[pg_id].contains(&inst_id));
 
     // Instance status should be PartialInstance
-    assert_eq!(infer.get_gen_status(inst_id), Some(GenStatus::PartialInstance));
+    assert_eq!(
+        infer.get_gen_status(inst_id),
+        Some(GenStatus::PartialInstance)
+    );
 }
 
 // ── Shape Variable Tests ──
@@ -461,13 +521,22 @@ fn test_shape_var_callback_on_resolve() {
     let sv = infer.shape_vars.new_var(level);
     let called = Arc::new(AtomicBool::new(false));
     let called_cb = Arc::clone(&called);
-    infer.shape_vars.on_resolve(sv, Box::new(move |_| {
-        called_cb.store(true, Ordering::SeqCst);
-    }));
-    assert!(!called.load(Ordering::SeqCst), "callback should not fire before resolve");
+    infer.shape_vars.on_resolve(
+        sv,
+        Box::new(move |_| {
+            called_cb.store(true, Ordering::SeqCst);
+        }),
+    );
+    assert!(
+        !called.load(Ordering::SeqCst),
+        "callback should not fire before resolve"
+    );
 
     infer.shape_vars.try_set(sv, TypeShape::Tuple(2));
-    assert!(called.load(Ordering::SeqCst), "callback should fire after resolve");
+    assert!(
+        called.load(Ordering::SeqCst),
+        "callback should fire after resolve"
+    );
 }
 
 // ── Try Promote Var Tests ──
@@ -487,7 +556,10 @@ fn test_try_promote_var_to_root() {
 
     let promoted_id = infer_var_id(&ctx, promoted.unwrap());
     assert!(
-        infer.region_tree.nodes[root.0].pool.var_ids.contains(&promoted_id),
+        infer.region_tree.nodes[root.0]
+            .pool
+            .var_ids
+            .contains(&promoted_id),
         "promoted var should be in root pool",
     );
 }
@@ -522,7 +594,10 @@ fn test_rigid_escape_generic_param_detected() {
     // a compound type (e.g. a function type).
     let fn_ty = ctx.function(vec![gp], gp);
     let fn_escaped = InferenceContext::check_rigid_escape(&ctx, fn_ty, 0);
-    assert!(fn_escaped, "Fn type containing GenericParam should be detected as rigid escape");
+    assert!(
+        fn_escaped,
+        "Fn type containing GenericParam should be detected as rigid escape"
+    );
 }
 
 // ── s_inst_copy Tests ──
@@ -605,7 +680,10 @@ fn test_s_exists_lower_forall() {
     infer.exit_level(prev);
 
     let result = infer.s_exists_lower(&ctx, id);
-    assert!(result, "s_exists_lower should succeed for variable with Forall shape");
+    assert!(
+        result,
+        "s_exists_lower should succeed for variable with Forall shape"
+    );
 }
 
 // ── Full Solve Pipeline Tests ──
@@ -628,8 +706,14 @@ fn test_solve_multiple_eq() {
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
     assert!(result.is_ok(), "chain solve should succeed: {:?}", result);
-    assert!(ctx.is_integer(ctx.resolve_binding(a)), "a should resolve to Int<32>");
-    assert!(ctx.is_integer(ctx.resolve_binding(b)), "b should resolve to Int<32>");
+    assert!(
+        ctx.is_integer(ctx.resolve_binding(a)),
+        "a should resolve to Int<32>"
+    );
+    assert!(
+        ctx.is_integer(ctx.resolve_binding(b)),
+        "b should resolve to Int<32>"
+    );
 }
 
 #[test]
@@ -653,7 +737,11 @@ fn test_solve_eq_with_guard() {
 
     // Solve should handle guarded variables correctly
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(result.is_ok(), "solve with guarded var should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "solve with guarded var should succeed: {:?}",
+        result
+    );
     let resolved = ctx.resolve_binding(a);
     assert!(ctx.is_integer(resolved), "a should resolve to Int<32>");
 }
@@ -696,9 +784,16 @@ fn test_solve_with_promotion() {
     ctx.set_binding(shallow, int32);
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(result.is_ok(), "solve with promotion should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "solve with promotion should succeed: {:?}",
+        result
+    );
     let resolved = ctx.resolve_binding(deep);
-    assert!(ctx.is_integer(resolved), "deep var should resolve to Int<32>");
+    assert!(
+        ctx.is_integer(resolved),
+        "deep var should resolve to Int<32>"
+    );
 }
 
 #[test]
@@ -726,11 +821,21 @@ fn test_solve_cross_branch_promotion() {
     ctx.set_binding(b_deep, int32);
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(result.is_ok(), "cross-branch solve should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "cross-branch solve should succeed: {:?}",
+        result
+    );
     let a_resolved = ctx.resolve_binding(a_deep);
     let b_resolved = ctx.resolve_binding(b_deep);
-    assert!(ctx.is_integer(a_resolved), "a_deep should resolve to Int<32>");
-    assert!(ctx.is_integer(b_resolved), "b_deep should resolve to Int<32>");
+    assert!(
+        ctx.is_integer(a_resolved),
+        "a_deep should resolve to Int<32>"
+    );
+    assert!(
+        ctx.is_integer(b_resolved),
+        "b_deep should resolve to Int<32>"
+    );
 }
 
 #[test]
@@ -771,13 +876,13 @@ fn test_snapshot_rollback_restores_guards() {
     let snap = infer.start_snapshot();
     // Add a guard — tracked by the undo log
     infer.add_guard(id);
-    assert!(infer.is_guarded(id), "guard should be added inside snapshot");
+    assert!(
+        infer.is_guarded(id),
+        "guard should be added inside snapshot"
+    );
 
     infer.rollback_to(snap);
-    assert!(
-        !infer.is_guarded(id),
-        "guard should be rolled back",
-    );
+    assert!(!infer.is_guarded(id), "guard should be rolled back",);
 }
 
 #[test]
@@ -808,12 +913,24 @@ fn test_type_contains_param() {
     let p1 = ctx.generic_param(1, "Y".into());
     let int32 = ctx.int(32, true);
 
-    assert!(ctx.type_contains_param(0, p0), "GenericParam should contain itself");
-    assert!(!ctx.type_contains_param(0, p1), "different param should NOT contain");
-    assert!(!ctx.type_contains_param(0, int32), "concrete type should NOT contain");
+    assert!(
+        ctx.type_contains_param(0, p0),
+        "GenericParam should contain itself"
+    );
+    assert!(
+        !ctx.type_contains_param(0, p1),
+        "different param should NOT contain"
+    );
+    assert!(
+        !ctx.type_contains_param(0, int32),
+        "concrete type should NOT contain"
+    );
 
     let fn_ty = ctx.function(vec![p0], int32);
-    assert!(ctx.type_contains_param(0, fn_ty), "Fn with param should contain param");
+    assert!(
+        ctx.type_contains_param(0, fn_ty),
+        "Fn with param should contain param"
+    );
 }
 
 // ── Edge Cases ──
@@ -863,19 +980,35 @@ fn test_solve_pipeline_end_to_end() {
     ctx.set_binding(c, int32);
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(result.is_ok(), "pipeline solve should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "pipeline solve should succeed: {:?}",
+        result
+    );
 
     // All three should resolve to Int<32>
     let a_resolved = ctx.resolve_binding(a);
     let b_resolved = ctx.resolve_binding(b);
     let c_resolved = ctx.resolve_binding(c);
-    assert!(ctx.is_integer(a_resolved), "terminal a should resolve to Int<32>");
-    assert!(ctx.is_integer(b_resolved), "terminal b should resolve to Int<32>");
-    assert!(ctx.is_integer(c_resolved), "terminal c should resolve to Int<32>");
+    assert!(
+        ctx.is_integer(a_resolved),
+        "terminal a should resolve to Int<32>"
+    );
+    assert!(
+        ctx.is_integer(b_resolved),
+        "terminal b should resolve to Int<32>"
+    );
+    assert!(
+        ctx.is_integer(c_resolved),
+        "terminal c should resolve to Int<32>"
+    );
 
     // finalize should produce a complete solution map
     let solution = infer.finalize(&mut ctx);
-    assert!(!solution.is_empty(), "finalize should produce a non-empty solution map");
+    assert!(
+        !solution.is_empty(),
+        "finalize should produce a non-empty solution map"
+    );
 }
 
 #[test]
@@ -897,13 +1030,26 @@ fn test_solve_pipeline_with_promotion_and_generalization() {
     ctx.set_binding(shallow, int32);
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(result.is_ok(), "solve with promotion should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "solve with promotion should succeed: {:?}",
+        result
+    );
 
     let deep_resolved = ctx.resolve_binding(deep);
     let shallow_resolved = ctx.resolve_binding(shallow);
-    assert!(ctx.is_integer(deep_resolved), "deep var should resolve to Int<32>");
-    assert!(ctx.is_integer(shallow_resolved), "shallow var should resolve to Int<32>");
-    assert_eq!(deep_resolved, shallow_resolved, "both should resolve to the same type");
+    assert!(
+        ctx.is_integer(deep_resolved),
+        "deep var should resolve to Int<32>"
+    );
+    assert!(
+        ctx.is_integer(shallow_resolved),
+        "shallow var should resolve to Int<32>"
+    );
+    assert_eq!(
+        deep_resolved, shallow_resolved,
+        "both should resolve to the same type"
+    );
 }
 
 // ── Defaulting Tests ──
@@ -917,10 +1063,17 @@ fn test_defaulting_integer_kind() {
     // An Integer variable with no constraints should default to Int<32>
     let var = infer.new_type_var(&mut ctx, TypeVariableKind::Integer, VarOrigin::Synthetic);
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(result.is_ok(), "solve with Integer var should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "solve with Integer var should succeed: {:?}",
+        result
+    );
 
     let resolved = ctx.resolve_binding(var);
-    assert!(ctx.is_integer(resolved), "Integer var should default to Int<32>");
+    assert!(
+        ctx.is_integer(resolved),
+        "Integer var should default to Int<32>"
+    );
 }
 
 #[test]
@@ -931,10 +1084,17 @@ fn test_defaulting_float_kind() {
 
     let var = infer.new_type_var(&mut ctx, TypeVariableKind::Float, VarOrigin::Synthetic);
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(result.is_ok(), "solve with Float var should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "solve with Float var should succeed: {:?}",
+        result
+    );
 
     let resolved = ctx.resolve_binding(var);
-    assert!(matches!(ctx.get(resolved), TypeData::Float { .. }), "Float var should default to Float");
+    assert!(
+        matches!(ctx.get(resolved), TypeData::Float { .. }),
+        "Float var should default to Float"
+    );
 }
 
 #[test]
@@ -945,10 +1105,18 @@ fn test_defaulting_bool_kind() {
 
     let var = infer.new_type_var(&mut ctx, TypeVariableKind::Bool, VarOrigin::Synthetic);
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(result.is_ok(), "solve with Bool var should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "solve with Bool var should succeed: {:?}",
+        result
+    );
 
     let resolved = ctx.resolve_binding(var);
-    assert_eq!(ctx.get(resolved), &TypeData::Bool, "Bool var should default to Bool");
+    assert_eq!(
+        ctx.get(resolved),
+        &TypeData::Bool,
+        "Bool var should default to Bool"
+    );
 }
 
 #[test]
@@ -959,10 +1127,17 @@ fn test_defaulting_numeric_kind() {
 
     let var = infer.new_type_var(&mut ctx, TypeVariableKind::Numeric, VarOrigin::Synthetic);
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(result.is_ok(), "solve with Numeric var should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "solve with Numeric var should succeed: {:?}",
+        result
+    );
 
     let resolved = ctx.resolve_binding(var);
-    assert!(ctx.is_integer(resolved), "Numeric var should default to Int<32>");
+    assert!(
+        ctx.is_integer(resolved),
+        "Numeric var should default to Int<32>"
+    );
 }
 
 #[test]
@@ -971,12 +1146,23 @@ fn test_defaulting_unconstrained_kind() {
     let mut infer = new_infer();
     let (symbols, trait_env) = default_env();
 
-    let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained, VarOrigin::Synthetic);
+    let var = infer.new_type_var(
+        &mut ctx,
+        TypeVariableKind::Unconstrained,
+        VarOrigin::Synthetic,
+    );
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(result.is_ok(), "solve with Unconstrained var should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "solve with Unconstrained var should succeed: {:?}",
+        result
+    );
 
     let resolved = ctx.resolve_binding(var);
-    assert!(matches!(ctx.get(resolved), TypeData::Error), "Unconstrained var should default to Error");
+    assert!(
+        matches!(ctx.get(resolved), TypeData::Error),
+        "Unconstrained var should default to Error"
+    );
 }
 
 #[test]
@@ -987,10 +1173,17 @@ fn test_defaulting_expression_var_returns_cannot_infer() {
 
     // An expression-level variable with Unconstrained kind and no constraints
     // should produce CannotInfer
-    let var = infer.new_type_var(&mut ctx, TypeVariableKind::Unconstrained, VarOrigin::Expression(Some(span())));
+    let var = infer.new_type_var(
+        &mut ctx,
+        TypeVariableKind::Unconstrained,
+        VarOrigin::Expression(Some(span())),
+    );
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(matches!(result, Err(TypeError::CannotInfer { .. })),
-        "expression-level var without constraints should return CannotInfer, got {:?}", result);
+    assert!(
+        matches!(result, Err(TypeError::CannotInfer { .. })),
+        "expression-level var without constraints should return CannotInfer, got {:?}",
+        result
+    );
 }
 
 // ── Kind Checking Tests ──
@@ -1021,7 +1214,10 @@ fn test_kind_check_float_unified_with_int_fails() {
 
     infer.add_constraint(Constraint::Eq(float_var, int32, span()));
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(result.is_err(), "Float var unified with Int<32> should fail");
+    assert!(
+        result.is_err(),
+        "Float var unified with Int<32> should fail"
+    );
 }
 
 // ── Forall / Exists Constraint Tests ──
@@ -1072,7 +1268,11 @@ fn test_forall_skolem_does_not_leak_after_body() {
     });
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(result.is_ok(), "Forall body Eq(α, α) should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Forall body Eq(α, α) should succeed: {:?}",
+        result
+    );
 
     // After the Forall body is solved, the Skolem is scoped to the
     // body constraint's environment (pc.env), which is destroyed when
@@ -1110,7 +1310,10 @@ fn test_forall_skolem_restored_after_body_error() {
     });
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(result.is_err(), "Forall rigid variable must not unify with Int<32>");
+    assert!(
+        result.is_err(),
+        "Forall rigid variable must not unify with Int<32>"
+    );
 
     // After the failing solve, the Scoped Skolem is in the constraint's
     // environment (pc.env), which is destroyed when the constraint is
@@ -1142,10 +1345,17 @@ fn test_exists_constraint_foralls_skolem_escape() {
     });
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(result.is_ok(), "Exists with Eq(α, Int<32>) should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Exists with Eq(α, Int<32>) should succeed: {:?}",
+        result
+    );
 
     let resolved = ctx.resolve_binding(alpha);
-    assert!(ctx.is_integer(resolved), "α should resolve to Int<32> under Exists");
+    assert!(
+        ctx.is_integer(resolved),
+        "α should resolve to Int<32> under Exists"
+    );
 }
 
 // ── Instance Constraint Test ──
@@ -1234,8 +1444,11 @@ fn test_error_type_mismatch_on_incompatible_types() {
     ctx.set_binding(a, int32);
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(matches!(result, Err(TypeError::Mismatch { .. })),
-        "incompatible types should produce Mismatch error, got {:?}", result);
+    assert!(
+        matches!(result, Err(TypeError::Mismatch { .. })),
+        "incompatible types should produce Mismatch error, got {:?}",
+        result
+    );
 }
 
 #[test]
@@ -1253,8 +1466,11 @@ fn test_error_pattern_not_exhaustive() {
     });
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
-    assert!(matches!(result, Err(TypeError::PatternNotExhaustive { .. })),
-        "empty match branches should produce PatternNotExhaustive, got {:?}", result);
+    assert!(
+        matches!(result, Err(TypeError::PatternNotExhaustive { .. })),
+        "empty match branches should produce PatternNotExhaustive, got {:?}",
+        result
+    );
 }
 
 #[test]

@@ -3,8 +3,8 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use crate::ast::OverflowPolicy;
 use crate::symbol::Symbol;
@@ -198,10 +198,7 @@ impl TypeId {
 
     pub fn tag(self) -> TypeTag {
         let raw = self.0.get();
-        debug_assert!(
-            raw != usize::MAX,
-            "TypeId::tag() called on sentinel NONE"
-        );
+        debug_assert!(raw != usize::MAX, "TypeId::tag() called on sentinel NONE");
         let tag_val = raw & Self::TAG_MASK;
         // Catch tag overflow in debug builds: if a new TypeTag variant pushes
         // the discriminant past TAG_LAST_VARIANT, this assert fires immediately
@@ -577,19 +574,14 @@ impl TypeContext {
                 params.iter().any(|&p| self.type_is_volatile_by_id(p))
                     || self.type_is_volatile_by_id(*ret)
             }
-            TypeData::Adt { args, .. } => {
-                args.iter().any(|&a| self.type_is_volatile_by_id(a))
-            }
-            TypeData::Tuple { elems } => {
-                elems.iter().any(|&e| self.type_is_volatile_by_id(e))
-            }
+            TypeData::Adt { args, .. } => args.iter().any(|&a| self.type_is_volatile_by_id(a)),
+            TypeData::Tuple { elems } => elems.iter().any(|&e| self.type_is_volatile_by_id(e)),
             TypeData::Array { elem, .. } => self.type_is_volatile_by_id(*elem),
             TypeData::Slice { elem } => self.type_is_volatile_by_id(*elem),
             TypeData::Ref { ty, .. } => self.type_is_volatile_by_id(*ty),
             TypeData::Pointer { ty } => self.type_is_volatile_by_id(*ty),
             TypeData::Ptr { size, pointee } => {
-                self.type_is_volatile_by_id(*size)
-                    || self.type_is_volatile_by_id(*pointee)
+                self.type_is_volatile_by_id(*size) || self.type_is_volatile_by_id(*pointee)
             }
             TypeData::Forall { body, .. }
             | TypeData::Exists { base: body, .. }
@@ -599,9 +591,7 @@ impl TypeContext {
             TypeData::Coproduct { alternatives } => {
                 alternatives.iter().any(|&a| self.type_is_volatile_by_id(a))
             }
-            TypeData::AssociatedType { self_ty, .. } => {
-                self.type_is_volatile_by_id(*self_ty)
-            }
+            TypeData::AssociatedType { self_ty, .. } => self.type_is_volatile_by_id(*self_ty),
             TypeData::DynTrait { .. } => false,
         }
     }
@@ -755,27 +745,46 @@ impl TypeContext {
     }
 
     pub fn int(&mut self, bits: u8, signed: bool) -> TypeId {
-        self.alloc(TypeData::Int { bits, signed, overflow_policy: OverflowPolicy::Trap })
+        self.alloc(TypeData::Int {
+            bits,
+            signed,
+            overflow_policy: OverflowPolicy::Trap,
+        })
     }
 
     pub fn uint(&mut self, bits: u8) -> TypeId {
-        self.alloc(TypeData::UInt { bits, overflow_policy: OverflowPolicy::Trap })
+        self.alloc(TypeData::UInt {
+            bits,
+            overflow_policy: OverflowPolicy::Trap,
+        })
     }
 
     /// Create an Int type with a specific overflow policy.
     pub fn int_with_overflow(&mut self, bits: u8, signed: bool, policy: OverflowPolicy) -> TypeId {
-        self.alloc(TypeData::Int { bits, signed, overflow_policy: policy })
+        self.alloc(TypeData::Int {
+            bits,
+            signed,
+            overflow_policy: policy,
+        })
     }
 
     /// Create a UInt type with a specific overflow policy.
     pub fn uint_with_overflow(&mut self, bits: u8, policy: OverflowPolicy) -> TypeId {
-        self.alloc(TypeData::UInt { bits, overflow_policy: policy })
+        self.alloc(TypeData::UInt {
+            bits,
+            overflow_policy: policy,
+        })
     }
 
     /// Get the overflow policy for an integer type (defaults to Trap for non-integers).
     pub fn overflow_policy_of(&self, ty: TypeId) -> OverflowPolicy {
         match self.get(ty) {
-            TypeData::Int { overflow_policy, .. } | TypeData::UInt { overflow_policy, .. } => *overflow_policy,
+            TypeData::Int {
+                overflow_policy, ..
+            }
+            | TypeData::UInt {
+                overflow_policy, ..
+            } => *overflow_policy,
             _ => OverflowPolicy::Trap,
         }
     }
@@ -1413,8 +1422,7 @@ impl TypeContext {
                 self.type_contains_param(param, *ty)
             }
             TypeData::Ptr { size, pointee, .. } => {
-                self.type_contains_param(param, *pointee)
-                    || self.type_contains_param(param, *size)
+                self.type_contains_param(param, *pointee) || self.type_contains_param(param, *size)
             }
             TypeData::AssociatedType { self_ty, .. } => self.type_contains_param(param, *self_ty),
             TypeData::Poly { body, .. } => self.type_contains_param(param, *body),
@@ -1587,7 +1595,11 @@ impl TypeContext {
                 let new_elem = self.replace_generic(*elem, param_index, replacement);
                 self.slice(new_elem)
             }
-            TypeData::AssociatedType { trait_id, name, self_ty } => {
+            TypeData::AssociatedType {
+                trait_id,
+                name,
+                self_ty,
+            } => {
                 let new_self = self.replace_generic(*self_ty, param_index, replacement);
                 self.associated_type(*trait_id, name.clone(), new_self)
             }
@@ -2414,7 +2426,9 @@ impl TypeContext {
                 // The skolem must not escape into sup.  The subtype check
                 // is currently read-only (no bindings), so escape cannot
                 // happen today — this is defense-in-depth for future changes.
-                ok && self.check_skolem_escape(sup, universe.saturating_sub(1)).is_none()
+                ok && self
+                    .check_skolem_escape(sup, universe.saturating_sub(1))
+                    .is_none()
             }
             // T <: ∀X.U: peel the right-side binder.
             (_, TypeData::Forall { body, .. }) => self.subtype(sub, *body),
@@ -2586,8 +2600,15 @@ impl TypeContext {
         let data = self.types[resolved.index()].clone();
         match &*data {
             TypeData::GenericParam { index, .. } => subst.get(*index).copied().unwrap_or(ty),
-            TypeData::Int { bits, signed, overflow_policy } => self.int_with_overflow(*bits, *signed, *overflow_policy),
-            TypeData::UInt { bits, overflow_policy } => self.uint_with_overflow(*bits, *overflow_policy),
+            TypeData::Int {
+                bits,
+                signed,
+                overflow_policy,
+            } => self.int_with_overflow(*bits, *signed, *overflow_policy),
+            TypeData::UInt {
+                bits,
+                overflow_policy,
+            } => self.uint_with_overflow(*bits, *overflow_policy),
             TypeData::Float { bits } => self.float(*bits),
             TypeData::Bool
             | TypeData::Char
@@ -2640,7 +2661,8 @@ impl TypeContext {
                 // Poly is a binder over all its quantifiers.  Remove shadowed
                 // keys from the substitution map and recurse, so that other
                 // free variables in the body are still substituted.
-                let shadowed_indices: Vec<usize> = quantifiers.iter()
+                let shadowed_indices: Vec<usize> = quantifiers
+                    .iter()
                     .map(|(idx, _)| *idx)
                     .filter(|idx| subst.get(*idx).is_some())
                     .collect();
@@ -2969,7 +2991,9 @@ impl TypeContext {
                 1 + self.type_constructor_depth(*ty)
             }
             TypeData::Ptr { size, pointee, .. } => {
-                2 + self.type_constructor_depth(*pointee).max(self.type_constructor_depth(*size))
+                2 + self
+                    .type_constructor_depth(*pointee)
+                    .max(self.type_constructor_depth(*size))
             }
             TypeData::Fn { params, ret } => {
                 1 + params
@@ -3302,9 +3326,14 @@ impl TypeContext {
                 FiniteExhaustible(1usize.checked_shl(*bits as u32).unwrap_or(usize::MAX))
             }
             TypeData::Float { .. } => InfiniteEnumerable,
-            TypeData::Rational { int_bits, frac_bits } => {
-                FiniteExhaustible(1usize.checked_shl((*int_bits + *frac_bits) as u32).unwrap_or(usize::MAX))
-            }
+            TypeData::Rational {
+                int_bits,
+                frac_bits,
+            } => FiniteExhaustible(
+                1usize
+                    .checked_shl((*int_bits + *frac_bits) as u32)
+                    .unwrap_or(usize::MAX),
+            ),
 
             // ── Composite types: recurse combinatorially ─────
             TypeData::Tuple { elems } => {
@@ -3331,7 +3360,10 @@ impl TypeContext {
             }
             TypeData::Array { elem, size } => {
                 // |[T; N]| = |T| ^ N
-                Self::kappa_pow(self.characteristic_of_reduced(*elem), FiniteExhaustible(*size as usize))
+                Self::kappa_pow(
+                    self.characteristic_of_reduced(*elem),
+                    FiniteExhaustible(*size as usize),
+                )
             }
             TypeData::Slice { elem } => {
                 // [T] is an unsized type — any length, so infinitely enumerable.
@@ -3364,8 +3396,12 @@ impl TypeContext {
             }
 
             // ── Fixpoints: μX.T / νX.T ─────────────────────
-            TypeData::Mu { param_index, body, .. }
-            | TypeData::Nu { param_index, body, .. } => {
+            TypeData::Mu {
+                param_index, body, ..
+            }
+            | TypeData::Nu {
+                param_index, body, ..
+            } => {
                 if !self.type_contains_param(*param_index, *body) {
                     // X does not appear in body — degenerate, just compute body.
                     self.characteristic_of_reduced(*body)
@@ -3379,7 +3415,9 @@ impl TypeContext {
             }
 
             // ── Existentials: produced by Yoneda reduction ─────
-            TypeData::Exists { param_index, base, .. } => {
+            TypeData::Exists {
+                param_index, base, ..
+            } => {
                 // ∃Z.A: if Z does not appear in A, the quantifier is vacuous.
                 if !self.type_contains_param(*param_index, *base) {
                     self.characteristic_of_reduced(*base)
@@ -3390,8 +3428,10 @@ impl TypeContext {
             }
 
             // ── Should not remain after Yoneda reduction ────
-            TypeData::Forall { .. } | TypeData::Poly { .. }
-            | TypeData::GenericParam { .. } | TypeData::InferVar { .. }
+            TypeData::Forall { .. }
+            | TypeData::Poly { .. }
+            | TypeData::GenericParam { .. }
+            | TypeData::InferVar { .. }
             | TypeData::SkolemVar { .. } => Undecidable,
 
             // ── Fallback ────────────────────────────────────
@@ -3404,9 +3444,9 @@ impl TypeContext {
         use Characteristic::*;
         match (a, b) {
             (FiniteExhaustible(0), _) | (_, FiniteExhaustible(0)) => FiniteExhaustible(0),
-            (FiniteExhaustible(a), FiniteExhaustible(b)) => {
-                a.checked_mul(b).map_or(FiniteExhaustible(usize::MAX), FiniteExhaustible)
-            }
+            (FiniteExhaustible(a), FiniteExhaustible(b)) => a
+                .checked_mul(b)
+                .map_or(FiniteExhaustible(usize::MAX), FiniteExhaustible),
             (FiniteExhaustible(_), InfiniteEnumerable)
             | (InfiniteEnumerable, FiniteExhaustible(_))
             | (InfiniteEnumerable, InfiniteEnumerable) => InfiniteEnumerable,
@@ -3420,9 +3460,9 @@ impl TypeContext {
         use Characteristic::*;
         match (a, b) {
             (FiniteExhaustible(0), x) | (x, FiniteExhaustible(0)) => x,
-            (FiniteExhaustible(a), FiniteExhaustible(b)) => {
-                a.checked_add(b).map_or(FiniteExhaustible(usize::MAX), FiniteExhaustible)
-            }
+            (FiniteExhaustible(a), FiniteExhaustible(b)) => a
+                .checked_add(b)
+                .map_or(FiniteExhaustible(usize::MAX), FiniteExhaustible),
             (FiniteExhaustible(_), InfiniteEnumerable)
             | (InfiniteEnumerable, FiniteExhaustible(_))
             | (InfiniteEnumerable, InfiniteEnumerable) => InfiniteEnumerable,
@@ -3444,9 +3484,9 @@ impl TypeContext {
             // |A|^1 = |A|
             (x, FiniteExhaustible(1)) => x,
             // |A|^|B| = finite
-            (FiniteExhaustible(b), FiniteExhaustible(e)) => {
-                b.checked_pow(e as u32).map_or(FiniteExhaustible(usize::MAX), FiniteExhaustible)
-            }
+            (FiniteExhaustible(b), FiniteExhaustible(e)) => b
+                .checked_pow(e as u32)
+                .map_or(FiniteExhaustible(usize::MAX), FiniteExhaustible),
             // |A|^∞ = ∞ (if |A| > 1) or 0 (if |A| = 0) or 1 (if |A| = 1)
             (FiniteExhaustible(n), InfiniteEnumerable) if n > 1 => InfiniteEnumerable,
             (FiniteExhaustible(0), InfiniteEnumerable) => FiniteExhaustible(0),
@@ -3718,9 +3758,11 @@ impl TypeContext {
         let data = self.get(ty);
         match data {
             TypeData::Int { bits, .. } => Characteristic::FiniteExhaustible(
-                1usize.checked_shl(*bits as u32).unwrap_or(usize::MAX)),
+                1usize.checked_shl(*bits as u32).unwrap_or(usize::MAX),
+            ),
             TypeData::UInt { bits, .. } => Characteristic::FiniteExhaustible(
-                1usize.checked_shl(*bits as u32).unwrap_or(usize::MAX)),
+                1usize.checked_shl(*bits as u32).unwrap_or(usize::MAX),
+            ),
             TypeData::Float { .. } | TypeData::USize => {
                 Characteristic::FiniteExhaustible(usize::MAX)
             }
@@ -4912,66 +4954,74 @@ mod tests {
     }
 }
 
-    // ── α-conversion with capture avoidance ──────────────────────
+// ── α-conversion with capture avoidance ──────────────────────
 
-    #[test]
-    fn test_alpha_conv_forall_different_indices() {
-        // ∀X{0}.X <: ∀Y{7}.Y — structurally identical, different indices
-        let mut ctx = TypeContext::new();
-        let p0 = ctx.generic_param(0, "X".into());
-        let p7 = ctx.generic_param(7, "Y".into());
-        let fx = ctx.forall(0, "X".into(), p0);
-        let fy = ctx.forall(7, "Y".into(), p7);
+#[test]
+fn test_alpha_conv_forall_different_indices() {
+    // ∀X{0}.X <: ∀Y{7}.Y — structurally identical, different indices
+    let mut ctx = TypeContext::new();
+    let p0 = ctx.generic_param(0, "X".into());
+    let p7 = ctx.generic_param(7, "Y".into());
+    let fx = ctx.forall(0, "X".into(), p0);
+    let fy = ctx.forall(7, "Y".into(), p7);
 
-        assert!(ctx.subtype(fx, fy));
-        assert!(ctx.subtype(fy, fx));
-        assert!(ctx.unify(fx, fy).is_ok());
-    }
+    assert!(ctx.subtype(fx, fy));
+    assert!(ctx.subtype(fy, fx));
+    assert!(ctx.unify(fx, fy).is_ok());
+}
 
-    #[test]
-    fn test_alpha_conv_forall_no_capture() {
-        // Forall(2, "X", body=GP(2)) vs Forall(0, "Y", body=GP(2)).
-        // Without capture avoidance, renaming Y→X captures the free GP(2).
-        let mut ctx = TypeContext::new();
-        let gp2 = ctx.generic_param(2, "X".into());
-        let fsub = ctx.forall(2, "X".into(), gp2);
-        let fsup = ctx.forall(0, "Y".into(), gp2);
-        assert!(!ctx.subtype(fsub, fsup),
-            "∀X(2).X <: ∀Y(0).X(free) must NOT hold — capture would be incorrect");
-    }
+#[test]
+fn test_alpha_conv_forall_no_capture() {
+    // Forall(2, "X", body=GP(2)) vs Forall(0, "Y", body=GP(2)).
+    // Without capture avoidance, renaming Y→X captures the free GP(2).
+    let mut ctx = TypeContext::new();
+    let gp2 = ctx.generic_param(2, "X".into());
+    let fsub = ctx.forall(2, "X".into(), gp2);
+    let fsup = ctx.forall(0, "Y".into(), gp2);
+    assert!(
+        !ctx.subtype(fsub, fsup),
+        "∀X(2).X <: ∀Y(0).X(free) must NOT hold — capture would be incorrect"
+    );
+}
 
-    #[test]
-    fn test_alpha_conv_mu_different_indices() {
-        let mut ctx = TypeContext::new();
-        let int_ty = ctx.int(32, true);
-        let mu0 = ctx.alloc(TypeData::Mu {
-            param_index: 0, param_name: "X".into(), body: int_ty,
-        });
-        let mu5 = ctx.alloc(TypeData::Mu {
-            param_index: 5, param_name: "Y".into(), body: int_ty,
-        });
-        assert!(ctx.unify(mu0, mu5).is_ok());
-    }
+#[test]
+fn test_alpha_conv_mu_different_indices() {
+    let mut ctx = TypeContext::new();
+    let int_ty = ctx.int(32, true);
+    let mu0 = ctx.alloc(TypeData::Mu {
+        param_index: 0,
+        param_name: "X".into(),
+        body: int_ty,
+    });
+    let mu5 = ctx.alloc(TypeData::Mu {
+        param_index: 5,
+        param_name: "Y".into(),
+        body: int_ty,
+    });
+    assert!(ctx.unify(mu0, mu5).is_ok());
+}
 
-    #[test]
-    fn test_alpha_conv_poly_unify_and_subtype() {
-        let mut ctx = TypeContext::new();
-        let p0 = ctx.generic_param(0, "X".into());
-        let p3 = ctx.generic_param(3, "Z".into());
-        let poly1 = ctx.poly(vec![(0, "X".into())], p0);
-        let poly2 = ctx.poly(vec![(3, "Z".into())], p3);
-        assert!(ctx.subtype(poly1, poly2));
-        assert!(ctx.unify(poly1, poly2).is_ok());
-    }
+#[test]
+fn test_alpha_conv_poly_unify_and_subtype() {
+    let mut ctx = TypeContext::new();
+    let p0 = ctx.generic_param(0, "X".into());
+    let p3 = ctx.generic_param(3, "Z".into());
+    let poly1 = ctx.poly(vec![(0, "X".into())], p0);
+    let poly2 = ctx.poly(vec![(3, "Z".into())], p3);
+    assert!(ctx.subtype(poly1, poly2));
+    assert!(ctx.unify(poly1, poly2).is_ok());
+}
 
-    #[test]
-    fn test_occurs_check_through_binding() {
-        let mut ctx = TypeContext::new();
-        let param = ctx.alloc(TypeData::InferVar { id: 0 });
-        let mid = ctx.alloc(TypeData::InferVar { id: 1 });
-        let ty = ctx.alloc(TypeData::InferVar { id: 2 });
-        ctx.set_binding(ty, mid);
-        ctx.set_binding(mid, param);
-        assert!(ctx.occurs_check(param, ty),
-            "occurs_check should find param through binding chain ty→mid→param");
-    }
+#[test]
+fn test_occurs_check_through_binding() {
+    let mut ctx = TypeContext::new();
+    let param = ctx.alloc(TypeData::InferVar { id: 0 });
+    let mid = ctx.alloc(TypeData::InferVar { id: 1 });
+    let ty = ctx.alloc(TypeData::InferVar { id: 2 });
+    ctx.set_binding(ty, mid);
+    ctx.set_binding(mid, param);
+    assert!(
+        ctx.occurs_check(param, ty),
+        "occurs_check should find param through binding chain ty→mid→param"
+    );
+}

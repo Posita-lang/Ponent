@@ -1,5 +1,5 @@
-use logos::Logos;
 use crate::symbol::Symbol;
+use logos::Logos;
 
 fn parse_char_literal(s: &str) -> Result<u8, String> {
     let inner = &s[1..s.len() - 1];
@@ -1262,7 +1262,10 @@ mod tests {
         }
         assert_eq!(
             toks,
-            vec![Token::Ident(Symbol::intern("a")), Token::Ident(Symbol::intern("b"))]
+            vec![
+                Token::Ident(Symbol::intern("a")),
+                Token::Ident(Symbol::intern("b"))
+            ]
         );
     }
 
@@ -1292,7 +1295,10 @@ mod tests {
     fn ascii_identifier() {
         check_tokens(
             "hello world",
-            vec![Token::Ident(Symbol::intern("hello")), Token::Ident(Symbol::intern("world"))],
+            vec![
+                Token::Ident(Symbol::intern("hello")),
+                Token::Ident(Symbol::intern("world")),
+            ],
         );
     }
 
@@ -1443,7 +1449,10 @@ mod tests {
             .collect();
         assert_eq!(
             tokens,
-            vec![Token::Ident(Symbol::intern("a")), Token::Ident(Symbol::intern("b"))]
+            vec![
+                Token::Ident(Symbol::intern("a")),
+                Token::Ident(Symbol::intern("b"))
+            ]
         );
     }
 
@@ -1639,7 +1648,10 @@ mod tests {
             .collect();
         assert_eq!(
             tokens,
-            vec![Token::Ident(Symbol::intern("a")), Token::Ident(Symbol::intern("b"))]
+            vec![
+                Token::Ident(Symbol::intern("a")),
+                Token::Ident(Symbol::intern("b"))
+            ]
         );
     }
 
@@ -1782,7 +1794,10 @@ mod tests {
             .collect();
         assert_eq!(
             tokens,
-            vec![Token::Ident(Symbol::intern("a")), Token::Ident(Symbol::intern("b"))]
+            vec![
+                Token::Ident(Symbol::intern("a")),
+                Token::Ident(Symbol::intern("b"))
+            ]
         );
     }
 
@@ -1818,8 +1833,14 @@ mod tests {
 
     #[test]
     fn integer_max_values() {
-        check_tokens("9223372036854775807", vec![Token::IntLiteral(Ok(9223372036854775807))]);
-        check_tokens("0x7FFFFFFFFFFFFFFF", vec![Token::HexLiteral(Ok(0x7FFFFFFFFFFFFFFF))]);
+        check_tokens(
+            "9223372036854775807",
+            vec![Token::IntLiteral(Ok(9223372036854775807))],
+        );
+        check_tokens(
+            "0x7FFFFFFFFFFFFFFF",
+            vec![Token::HexLiteral(Ok(0x7FFFFFFFFFFFFFFF))],
+        );
     }
 
     #[test]

@@ -104,9 +104,10 @@ impl SmtSolver {
                 TypeData::Fn { .. } => PrincipalShape::Arrow,
                 TypeData::Tuple { elems } => PrincipalShape::Tuple(elems.len()),
                 TypeData::Adt { args, .. } => PrincipalShape::Constructor(args.len()),
-                TypeData::Forall { .. } | TypeData::Exists { .. } | TypeData::Poly { .. } | TypeData::SkolemVar { .. } => {
-                    PrincipalShape::Poly
-                }
+                TypeData::Forall { .. }
+                | TypeData::Exists { .. }
+                | TypeData::Poly { .. }
+                | TypeData::SkolemVar { .. } => PrincipalShape::Poly,
                 TypeData::Int { .. }
                 | TypeData::UInt { .. }
                 | TypeData::Float { .. }
@@ -349,7 +350,11 @@ impl SmtSolver {
                     "type-unknown".into()
                 }
             }
-            TypeData::Adt { kind: _, def_id, args } => {
+            TypeData::Adt {
+                kind: _,
+                def_id,
+                args,
+            } => {
                 // Encode as (type-struct def_id first_arg) for the first arg
                 if let Some(&arg) = args.first() {
                     let a = Self::type_to_smt_term(ctx, arg);
@@ -455,7 +460,9 @@ impl SmtSolver {
         };
 
         // Cache the result before returning.
-        self.query_cache.borrow_mut().insert(smt.to_string(), result.clone());
+        self.query_cache
+            .borrow_mut()
+            .insert(smt.to_string(), result.clone());
         result
     }
 

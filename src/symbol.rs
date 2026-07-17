@@ -118,11 +118,9 @@ thread_local! {
 /// Call this once at compiler startup (e.g., in main()).
 pub fn pre_intern_builtins() {
     let builtins = &[
-        "true", "false", "def", "set", "return", "if", "else", "for", "while",
-        "type", "enum", "struct", "impl", "trait", "fn", "let", "mut",
-        "Int", "UInt", "Float", "Bool", "Char", "Byte", "USize",
-        "Result", "Option", "Ok", "Err", "Some", "None",
-        "Self", "self",
+        "true", "false", "def", "set", "return", "if", "else", "for", "while", "type", "enum",
+        "struct", "impl", "trait", "fn", "let", "mut", "Int", "UInt", "Float", "Bool", "Char",
+        "Byte", "USize", "Result", "Option", "Ok", "Err", "Some", "None", "Self", "self",
     ];
     for s in builtins {
         Symbol::intern(s);

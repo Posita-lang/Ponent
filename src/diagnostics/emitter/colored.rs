@@ -25,7 +25,10 @@ impl super::DiagnosticEmitter for ColoredEmitter {
         let reset = DiagnosticLevel::ansi_reset();
 
         // Line 1: bold error code + colored level + message
-        let span_str = diag.span.map(|s| format!(" at {}{}{}", color, s, reset)).unwrap_or_default();
+        let span_str = diag
+            .span
+            .map(|s| format!(" at {}{}{}", color, s, reset))
+            .unwrap_or_default();
         eprintln!(
             "{bold}[{code} {level}]{reset} {msg}{span}",
             bold = bold,
@@ -38,7 +41,8 @@ impl super::DiagnosticEmitter for ColoredEmitter {
 
         // Source context with ^-underline rendering (Rust-style)
         if let (Some(span), Some(source)) = (diag.span, diag.source.as_ref()) {
-            let ctx = crate::diagnostics::label::SourceContext::new(source.as_str(), span, "<input>", 2);
+            let ctx =
+                crate::diagnostics::label::SourceContext::new(source.as_str(), span, "<input>", 2);
             let rendered = ctx.render(span, &diag.labels, true);
             if !rendered.is_empty() {
                 eprintln!("{}", rendered);

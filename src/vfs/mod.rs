@@ -58,10 +58,7 @@ impl VfsBackend for FsBackend {
         for entry in dir {
             let entry = entry.map_err(|e| VfsError::Io(format!("entry error: {}", e)))?;
             let ft = entry.file_type().map_err(|e| VfsError::Io(e.to_string()))?;
-            let name = entry
-                .file_name()
-                .to_string_lossy()
-                .into_owned();
+            let name = entry.file_name().to_string_lossy().into_owned();
             let kind = if ft.is_dir() {
                 VfsNodeKind::Directory
             } else {
@@ -116,7 +113,10 @@ impl MemoryBackend {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let entries = self.dirs.entry(parent_str.clone()).or_default();
-            if !entries.iter().any(|e| e.name == fname && e.kind == VfsNodeKind::File) {
+            if !entries
+                .iter()
+                .any(|e| e.name == fname && e.kind == VfsNodeKind::File)
+            {
                 entries.push(DirEntry {
                     name: fname,
                     kind: VfsNodeKind::File,
@@ -159,10 +159,9 @@ impl VfsBackend for MemoryBackend {
     }
 
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError> {
-        self.dirs
-            .get(path)
-            .cloned()
-            .ok_or_else(|| VfsError::Io(format!("directory '{}' not found in memory backend", path)))
+        self.dirs.get(path).cloned().ok_or_else(|| {
+            VfsError::Io(format!("directory '{}' not found in memory backend", path))
+        })
     }
 
     fn path_type(&self, path: &str) -> Option<VfsNodeKind> {
@@ -360,8 +359,7 @@ impl VfsNode {
 
                     match entry.kind {
                         VfsNodeKind::Directory => {
-                            let child =
-                                Self::scan(backend, &child_path_str, id_counter)?;
+                            let child = Self::scan(backend, &child_path_str, id_counter)?;
                             children.push(child);
                         }
                         VfsNodeKind::File => {

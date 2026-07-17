@@ -87,7 +87,12 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
             }
             V::Result::output()
         }
-        Expr::EnumLit { variant, payload, span, .. } => {
+        Expr::EnumLit {
+            variant,
+            payload,
+            span,
+            ..
+        } => {
             visitor.visit_ident(*variant, span);
             if let Some(e) = payload {
                 visitor.visit_expr(e)
@@ -343,7 +348,9 @@ pub fn walk_stmt<'ast, V: Visitor<'ast>>(visitor: &mut V, stmt: &'ast Stmt) -> V
         | Stmt::LayoutDef { .. }
         | Stmt::Error(_) => V::Result::output(),
         Stmt::Generate { body, .. } => {
-            for s in body { visitor.visit_stmt(s); }
+            for s in body {
+                visitor.visit_stmt(s);
+            }
             V::Result::output()
         }
         Stmt::TypeDef { .. }
@@ -450,7 +457,13 @@ pub trait MutVisitor: Sized {
 
 pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
     match expr {
-        Expr::Literal(_, _) | Expr::Ident(_, _) | Expr::Path(_, _) | Expr::Task { .. } | Expr::Error(_) | Expr::CompileError(_, _) | Expr::TypeInfo(_, _) => {}
+        Expr::Literal(_, _)
+        | Expr::Ident(_, _)
+        | Expr::Path(_, _)
+        | Expr::Task { .. }
+        | Expr::Error(_)
+        | Expr::CompileError(_, _)
+        | Expr::TypeInfo(_, _) => {}
         Expr::TypeAnnotated { expr: e, ty: _, .. } => visitor.visit_expr_mut(e),
         Expr::BinaryOp { left, right, .. } => {
             visitor.visit_expr_mut(left);
@@ -490,7 +503,9 @@ pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
             }
             // NOTE: field names are String, not ident — not visited.
         }
-        Expr::EnumLit { variant, payload, .. } => {
+        Expr::EnumLit {
+            variant, payload, ..
+        } => {
             visitor.visit_ident_mut(variant);
             if let Some(e) = payload {
                 visitor.visit_expr_mut(e);
@@ -508,9 +523,7 @@ pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
                 visitor.visit_expr_mut(e);
             }
         }
-        Expr::Closure {
-            params, body, ..
-        } => {
+        Expr::Closure { params, body, .. } => {
             for p in params {
                 visitor.visit_param_mut(p);
             }
@@ -726,7 +739,9 @@ pub fn walk_stmt_mut<V: MutVisitor>(visitor: &mut V, stmt: &mut Stmt) {
         | Stmt::ExternFunction { .. }
         | Stmt::Constraint { .. } => {}
         Stmt::Generate { body, .. } => {
-            for s in body { visitor.visit_stmt_mut(s); }
+            for s in body {
+                visitor.visit_stmt_mut(s);
+            }
         }
     }
 }
@@ -814,18 +829,12 @@ impl MutVisitor for ReplaceIdentVisitor {
 
 /// Rename all occurrences of `old_name` to `new_name` in an expression tree.
 pub fn replace_ident_in_expr(expr: &mut Expr, old_name: Symbol, new_name: Symbol) {
-    let mut v = ReplaceIdentVisitor {
-        old_name,
-        new_name,
-    };
+    let mut v = ReplaceIdentVisitor { old_name, new_name };
     v.visit_expr_mut(expr);
 }
 
 /// Rename all occurrences of `old_name` to `new_name` in a statement tree.
 pub fn replace_ident_in_stmt(stmt: &mut Stmt, old_name: Symbol, new_name: Symbol) {
-    let mut v = ReplaceIdentVisitor {
-        old_name,
-        new_name,
-    };
+    let mut v = ReplaceIdentVisitor { old_name, new_name };
     v.visit_stmt_mut(stmt);
 }

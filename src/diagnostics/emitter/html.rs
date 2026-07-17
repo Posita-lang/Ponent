@@ -84,10 +84,7 @@ impl HtmlEmitter {
             .map(|c| format!("<span class='code'>{}</span> ", c.code()))
             .unwrap_or_default();
 
-        html.push_str(&format!(
-            "<div class='diag {}'>\n",
-            level_class
-        ));
+        html.push_str(&format!("<div class='diag {}'>\n", level_class));
 
         // Main message
         html.push_str(&format!(
@@ -98,15 +95,13 @@ impl HtmlEmitter {
 
         // Span location
         if let Some(span) = diag.span {
-            html.push_str(&format!(
-                "<div class='span'>at {}</div>\n",
-                span
-            ));
+            html.push_str(&format!("<div class='span'>at {}</div>\n", span));
         }
 
         // Source context
         if let (Some(span), Some(source)) = (diag.span, diag.source.as_ref()) {
-            let ctx = crate::diagnostics::label::SourceContext::new(source.as_str(), span, "<input>", 2);
+            let ctx =
+                crate::diagnostics::label::SourceContext::new(source.as_str(), span, "<input>", 2);
             let rendered = ctx.render(span, &diag.labels, false);
             if !rendered.is_empty() {
                 let escaped = self.escape(
@@ -116,10 +111,7 @@ impl HtmlEmitter {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 );
-                html.push_str(&format!(
-                    "<pre class='source-line'>{}</pre>\n",
-                    escaped
-                ));
+                html.push_str(&format!("<pre class='source-line'>{}</pre>\n", escaped));
             }
         }
 

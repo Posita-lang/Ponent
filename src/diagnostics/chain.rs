@@ -94,10 +94,7 @@ impl CallChain {
                     entry.message, label
                 ));
             } else {
-                out.push_str(&format!(
-                    "    {}: {}\n",
-                    entry.message, label
-                ));
+                out.push_str(&format!("    {}: {}\n", entry.message, label));
             }
         }
 

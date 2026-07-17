@@ -760,7 +760,6 @@ fn test_region_tree_basic_ops() {
     assert_eq!(rt.current_frames().len(), 0);
 }
 
-
 // -- Bidirectional if-expression --
 #[test]
 fn test_if_expression_type_inference() {
@@ -1332,7 +1331,11 @@ fn test_deferred_impl_registration_trait_method_call() {
              return x.show();
          }",
     );
-    assert!(result.is_ok(), "deferred impl trait method call: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "deferred impl trait method call: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -1712,11 +1715,7 @@ fn test_type_capture_auto_four() {
              return 0;
          }",
     );
-    assert!(
-        result.is_ok(),
-        "four type captures: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "four type captures: {:?}", result.err());
 }
 
 #[test]
@@ -1747,11 +1746,7 @@ fn test_type_capture_correct_type_bool() {
              return x;
          }",
     );
-    assert!(
-        result.is_ok(),
-        "captured bool type: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "captured bool type: {:?}", result.err());
 }
 
 // ── Top-level inference scope ────────────────────────────────────
@@ -1770,11 +1765,7 @@ fn test_top_level_type_def_and_function() {
         "type Point = struct { x: Int<32>, y: Int<32> }
          def origin() -> Point { return Point { x = 0, y = 0 }; }",
     );
-    assert!(
-        result.is_ok(),
-        "top-level type + def: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "top-level type + def: {:?}", result.err());
 }
 
 #[test]
@@ -1785,11 +1776,7 @@ fn test_top_level_multi_function_cross_ref() {
          def double(x: Int<32>) -> Int<32> { return add(x, x); }
          def main() -> Int<32> { return double(21); }",
     );
-    assert!(
-        result.is_ok(),
-        "cross-ref functions: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "cross-ref functions: {:?}", result.err());
 }
 
 #[test]
@@ -1811,11 +1798,7 @@ fn test_top_level_impl_and_trait() {
         "trait Show { }
          impl Show for Int<32> { }",
     );
-    assert!(
-        result.is_ok(),
-        "top-level trait + impl: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "top-level trait + impl: {:?}", result.err());
 }
 
 // ── Overflow policy ──────────────────────────────────────────────
@@ -1913,11 +1896,7 @@ fn test_layout_c_on_type() {
          type CStruct = struct { x: Int<32>, y: Int<64> }
          def main() -> Int<32> { return 0; }",
     );
-    assert!(
-        result.is_ok(),
-        "@layout(C) on type: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "@layout(C) on type: {:?}", result.err());
 }
 
 #[test]
@@ -1928,11 +1907,7 @@ fn test_transparent_on_type() {
          type Wrapper = struct { inner: Int<32> }
          def main() -> Int<32> { return 0; }",
     );
-    assert!(
-        result.is_ok(),
-        "@transparent on type: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "@transparent on type: {:?}", result.err());
 }
 
 #[test]
@@ -1949,11 +1924,7 @@ fn test_layout_alias_usage() {
 
          def main() -> Int<32> { return 0; }",
     );
-    assert!(
-        result.is_ok(),
-        "@layout(AliasName): {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "@layout(AliasName): {:?}", result.err());
 }
 
 #[test]
@@ -1969,11 +1940,7 @@ fn test_layout_alias_with_function() {
 
          def main() -> Int<32> { return 0; }",
     );
-    assert!(
-        result.is_ok(),
-        "layout with function: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "layout with function: {:?}", result.err());
 }
 
 // ── Task expression ──────────────────────────────────────────────
@@ -2010,7 +1977,9 @@ fn test_interrupt_valid() {
             // Accept "Never vs Unit" mismatch as a known limitation
             // until loop type inference is implemented.
             let msgs: Vec<&str> = errors.iter().map(|s| s.as_str()).collect();
-            let known_issue = msgs.iter().any(|m| m.contains("Never") || m.contains("Unreachable"));
+            let known_issue = msgs
+                .iter()
+                .any(|m| m.contains("Never") || m.contains("Unreachable"));
             assert!(
                 known_issue,
                 "unexpected error: {:?} (known: infinite loops may not infer ! yet)",
@@ -2073,11 +2042,16 @@ fn test_channel_type_parses() {
     // is registered in register_builtins which runs after resolution.
     // So we use a direct API check instead of a source-level test.
     let mut ctx = TypeContext::new();
-    let mut symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(crate::hir::types::DefId(0)));
+    let mut symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
     let mut trait_env = crate::hir::traits::TraitEnv::new();
     crate::hir::builtins::register_builtins(&mut symbols, &mut trait_env, &mut ctx);
     let binding = symbols.lookup_type(Symbol::intern("Channel"));
-    assert!(binding.is_some(), "Channel should be registered as a built-in type");
+    assert!(
+        binding.is_some(),
+        "Channel should be registered as a built-in type"
+    );
     assert!(
         !binding.unwrap().params.is_empty(),
         "Channel should have at least one type parameter T",

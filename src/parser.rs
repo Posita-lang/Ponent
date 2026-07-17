@@ -1,7 +1,7 @@
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
-use crate::symbol::Symbol;
 use crate::lexer::Token;
+use crate::symbol::Symbol;
 
 // ── Track‑A (Engineering Canon) ──────────────────────────────────────────────
 // Keyword-as-identifier policy (see `Token::as_ident_symbol` in lexer.rs):
@@ -204,7 +204,8 @@ impl Parser {
 
     /// Push an expected token type onto the stack (for error recovery).
     fn push_expected(&mut self, tok: Token, desc: &'static str) {
-        self.expected_token_types.push(ExpectedToken::new(tok, desc));
+        self.expected_token_types
+            .push(ExpectedToken::new(tok, desc));
     }
 
     /// Pop the last expected token type.
@@ -248,11 +249,7 @@ impl Parser {
     /// Expect one of the given edible tokens. If the next token matches,
     /// consume it. Otherwise, report an error and try to recover.
     /// Returns `Ok(Recovered::Yes)` if recovery was needed, `Ok(Recovered::No)` otherwise.
-    fn expect_one_of(
-        &mut self,
-        edible: &[Token],
-        inedible: &[Token],
-    ) -> Result<Recovered, ()> {
+    fn expect_one_of(&mut self, edible: &[Token], inedible: &[Token]) -> Result<Recovered, ()> {
         // Check edible tokens first.
         for exp in edible {
             if matches!(self.peek(), Ok(tok) if tok == exp) {
@@ -339,20 +336,41 @@ impl Parser {
                 Ok(tok) => format!("{:?}", tok),
                 Err(()) => "end of file".to_string(),
             };
-            Err(Diagnostic::error(format!("expected {:?}, found {}", expected, found))
-                .with_code_str("E001")
-                .with_help(format!("expected `{:?}` but saw `{}` — check for missing or extra tokens", expected, found))
-                .with_suggestion(format!("try adding `{:?}` before the `{}`", expected, found))
-                .with_span(self.span()))
+            Err(
+                Diagnostic::error(format!("expected {:?}, found {}", expected, found))
+                    .with_code_str("E001")
+                    .with_help(format!(
+                        "expected `{:?}` but saw `{}` — check for missing or extra tokens",
+                        expected, found
+                    ))
+                    .with_suggestion(format!(
+                        "try adding `{:?}` before the `{}`",
+                        expected, found
+                    ))
+                    .with_span(self.span()),
+            )
         }
     }
 
     fn synchronize(&mut self) {
         let sync_tokens = [
-            Token::Semicolon, Token::RBrace, Token::Def, Token::Set, Token::Let,
-            Token::Type, Token::Import, Token::From, Token::Extern, Token::Edition,
-            Token::At, Token::Comptime, Token::Generate, Token::Async, Token::Trait,
-            Token::Impl, Token::Constraint,
+            Token::Semicolon,
+            Token::RBrace,
+            Token::Def,
+            Token::Set,
+            Token::Let,
+            Token::Type,
+            Token::Import,
+            Token::From,
+            Token::Extern,
+            Token::Edition,
+            Token::At,
+            Token::Comptime,
+            Token::Generate,
+            Token::Async,
+            Token::Trait,
+            Token::Impl,
+            Token::Constraint,
         ];
         // Consume semicolon if present (it's a statement terminator).
         if matches!(self.peek(), Ok(Token::Semicolon)) {
@@ -368,7 +386,9 @@ impl Parser {
             match self.peek() {
                 Err(()) => return,
                 Ok(tok) if sync_tokens.contains(tok) => return,
-                _ => { self.advance().ok(); }
+                _ => {
+                    self.advance().ok();
+                }
             }
         }
     }
@@ -670,7 +690,9 @@ impl Parser {
                     .with_span(self.span(),);
                 // "Did you mean?" for common keyword typos (Rust-style)
                 if let Some(Token::Ident(name)) = &tok {
-                    if let Some(suggestion) = did_you_mean_keyword(&name.as_str(), KeywordContext::TopLevel) {
+                    if let Some(suggestion) =
+                        did_you_mean_keyword(&name.as_str(), KeywordContext::TopLevel)
+                    {
                         diag = diag.with_suggestion(suggestion);
                     } else {
                         diag = diag.with_suggestion("move this token inside a function body, or start a new top-level declaration");
@@ -1023,12 +1045,8 @@ impl Parser {
                     "expected `:` after subject type in constraint predicate",
                 )
                 .with_code_str("E004")
-                .with_help(
-                    "constraint predicates must have the form `Subject: Bound1 + Bound2`",
-                )
-                .with_suggestion(
-                    "add a colon after the subject type, e.g. `T: Display + Debug`",
-                )
+                .with_help("constraint predicates must have the form `Subject: Bound1 + Bound2`")
+                .with_suggestion("add a colon after the subject type, e.g. `T: Display + Debug`")
                 .with_span(self.span()));
             }
             self.advance().ok(); // consume ':'
@@ -1037,7 +1055,11 @@ impl Parser {
                 self.advance().ok();
                 bs.push(self.parse_type()?);
             }
-            predicates.push(WherePredicate { ty: subject, bounds: bs, span: Span::new(pred_start, self.span().end) });
+            predicates.push(WherePredicate {
+                ty: subject,
+                bounds: bs,
+                span: Span::new(pred_start, self.span().end),
+            });
             if !matches!(self.peek(), Ok(Token::Comma)) {
                 break;
             }
@@ -1817,11 +1839,18 @@ impl Parser {
                 self.advance().ok();
                 // expect `for` keyword
                 match self.advance() {
-                    Ok(Token::For) => {},
-                    Ok(tok) => return Err(Diagnostic::error(format!("expected `for` after `generate`, found {:?}", tok))
-                        .with_span(self.span())),
-                    Err(()) => return Err(Diagnostic::error("expected `for` after `generate`")
-                        .with_span(self.span())),
+                    Ok(Token::For) => {}
+                    Ok(tok) => {
+                        return Err(Diagnostic::error(format!(
+                            "expected `for` after `generate`, found {:?}",
+                            tok
+                        ))
+                        .with_span(self.span()));
+                    }
+                    Err(()) => {
+                        return Err(Diagnostic::error("expected `for` after `generate`")
+                            .with_span(self.span()));
+                    }
                 }
                 let for_type = Box::new(self.parse_type()?);
                 self.expect(Token::LBrace)?;
@@ -1946,10 +1975,16 @@ impl Parser {
         let start = self.span().start;
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
-            Ok(tok) => self.keyword_to_ident(&tok).unwrap_or_else(|| Symbol::intern(&format!("{:?}", tok))),
-            Err(()) => return Err(Diagnostic::error("unexpected end of file in layout definition")
-                .with_code_str("E002")
-                .with_span(self.span())),
+            Ok(tok) => self
+                .keyword_to_ident(&tok)
+                .unwrap_or_else(|| Symbol::intern(&format!("{:?}", tok))),
+            Err(()) => {
+                return Err(
+                    Diagnostic::error("unexpected end of file in layout definition")
+                        .with_code_str("E002")
+                        .with_span(self.span()),
+                );
+            }
         };
         self.expect(Token::LBrace)?;
         loop {
@@ -1966,7 +2001,9 @@ impl Parser {
             // Expect an identifier naming a built-in layout attribute.
             let attr_name = match self.advance() {
                 Ok(Token::Ident(name)) => name,
-                Ok(tok) => self.keyword_to_ident(&tok).unwrap_or_else(|| Symbol::intern(&format!("{:?}", tok))),
+                Ok(tok) => self
+                    .keyword_to_ident(&tok)
+                    .unwrap_or_else(|| Symbol::intern(&format!("{:?}", tok))),
                 Err(()) => break,
             };
             // Check for parenthesized arguments, e.g. `bit_order(lsb_to_msb)`.
@@ -1975,7 +2012,9 @@ impl Parser {
                 self.advance().ok();
                 let arg_name = match self.advance() {
                     Ok(Token::Ident(name)) => name,
-                    Ok(tok) => self.keyword_to_ident(&tok).unwrap_or_else(|| Symbol::intern(&format!("{:?}", tok))),
+                    Ok(tok) => self
+                        .keyword_to_ident(&tok)
+                        .unwrap_or_else(|| Symbol::intern(&format!("{:?}", tok))),
                     Err(()) => Symbol::INVALID,
                 };
                 args.push(crate::ast::Expr::Ident(arg_name, self.span()));
@@ -2026,7 +2065,11 @@ impl Parser {
                     Some(Token::LBrace) | Some(Token::LParen) | Some(Token::ColonColon)
                 );
                 if !next_is_pattern
-                    && (s.eq_str("_") || s.as_str().chars().next().map_or(false, |c| c.is_alphabetic()))
+                    && (s.eq_str("_")
+                        || s.as_str()
+                            .chars()
+                            .next()
+                            .map_or(false, |c| c.is_alphabetic()))
                 {
                     let ident = s;
                     self.advance().ok();
@@ -2171,7 +2214,10 @@ impl Parser {
             self.advance().ok();
             let pattern = self.parse_pattern()?;
             self.expect(Token::Assign)?;
-            let scrutinee = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
+            let scrutinee = self
+                .with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+                    this.parse_expr()
+                })?;
             self.expect(Token::LBrace)?;
             let then_branch = self.parse_block()?;
             self.expect(Token::RBrace)?;
@@ -2197,7 +2243,9 @@ impl Parser {
                 span: Span::new(start, end),
             });
         }
-        let cond = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
+        let cond = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+            this.parse_expr()
+        })?;
         self.expect(Token::LBrace)?;
         let then_branch = self.parse_block()?;
         self.expect(Token::RBrace)?;
@@ -2230,7 +2278,10 @@ impl Parser {
             self.advance().ok();
             let pattern = self.parse_pattern()?;
             self.expect(Token::Assign)?;
-            let scrutinee = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
+            let scrutinee = self
+                .with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+                    this.parse_expr()
+                })?;
             let mut invariant: Option<Expr> = None;
             let mut decreases: Option<Expr> = None;
             while matches!(self.peek(), Ok(Token::Invariant) | Ok(Token::Decreases)) {
@@ -2267,7 +2318,9 @@ impl Parser {
                 span: Span::new(start, end),
             });
         }
-        let cond = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
+        let cond = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+            this.parse_expr()
+        })?;
         let mut invariant: Option<Expr> = None;
         let mut decreases: Option<Expr> = None;
         while matches!(self.peek(), Ok(Token::Invariant) | Ok(Token::Decreases)) {
@@ -2309,7 +2362,9 @@ impl Parser {
         self.advance().ok();
         let pattern = self.parse_pattern()?;
         self.expect(Token::In)?;
-        let iterable = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
+        let iterable = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+            this.parse_expr()
+        })?;
         let mut invariant: Option<Expr> = None;
         let mut decreases: Option<Expr> = None;
         while matches!(self.peek(), Ok(Token::Invariant) | Ok(Token::Decreases)) {
@@ -2791,12 +2846,8 @@ impl Parser {
                         _ => {
                             return Err(Diagnostic::error("expected field name")
                                 .with_code_str("E004")
-                                .with_help(
-                                    "struct fields must have a name — e.g. `name: String`",
-                                )
-                                .with_suggestion(
-                                    "add a field name like `name`, `age`, or `value`",
-                                )
+                                .with_help("struct fields must have a name — e.g. `name: String`")
+                                .with_suggestion("add a field name like `name`, `age`, or `value`")
                                 .with_span(self.span()));
                         }
                     };
@@ -2834,85 +2885,82 @@ impl Parser {
                 });
             } else if s.eq_str("enum") {
                 self.advance().ok();
-                    self.expect(Token::LBrace)?;
-                    let mut variants = Vec::new();
-                    loop {
-                        if matches!(self.peek(), Ok(Token::RBrace)) {
-                            self.advance().ok();
-                            break;
-                        }
-                        let v_name = match self.advance() {
-                            Ok(Token::Ident(n)) => n,
-                            _ => {
-                                return Err(Diagnostic::error("expected variant name")
-                                    .with_code_str("E004")
-                                    .with_help(
-                                        "enum variants must have a name — e.g. `enum { A, B }`",
-                                    )
-                                    .with_suggestion(
-                                        "add a variant name like `VariantA`, `None`, or `Some`",
-                                    )
-                                    .with_span(self.span()));
-                            }
-                        };
-                        let payload = if matches!(self.peek(), Ok(Token::LParen)) {
-                            self.advance().ok();
-                            let ty = self.parse_type()?;
-                            self.expect(Token::RParen)?;
-                            Some(ty)
-                        } else {
-                            None
-                        };
-                        variants.push(EnumVariant {
-                            name: v_name,
-                            payload,
-                            span: Span::new(start, self.span().end),
-                        });
-                        if matches!(self.peek(), Ok(Token::Comma)) {
-                            self.advance().ok();
-                        } else {
-                            self.expect(Token::RBrace)?;
-                            break;
-                        }
-                    }
-                    let missing_match = if matches!(self.peek(), Ok(Token::With))
-                        && matches!(self.peek_next(), Some(Token::MissingMatch))
-                    {
+                self.expect(Token::LBrace)?;
+                let mut variants = Vec::new();
+                loop {
+                    if matches!(self.peek(), Ok(Token::RBrace)) {
                         self.advance().ok();
-                        self.expect(Token::MissingMatch)?;
-                        self.expect(Token::Assign)?;
-                        let msg = match self.advance() {
-                            Ok(Token::StringLiteral(Ok(s))) => s,
-                            _ => {
-                                return Err(Diagnostic::error("expected string for missing_match")
+                        break;
+                    }
+                    let v_name = match self.advance() {
+                        Ok(Token::Ident(n)) => n,
+                        _ => {
+                            return Err(Diagnostic::error("expected variant name")
+                                .with_code_str("E004")
+                                .with_help("enum variants must have a name — e.g. `enum { A, B }`")
+                                .with_suggestion(
+                                    "add a variant name like `VariantA`, `None`, or `Some`",
+                                )
+                                .with_span(self.span()));
+                        }
+                    };
+                    let payload = if matches!(self.peek(), Ok(Token::LParen)) {
+                        self.advance().ok();
+                        let ty = self.parse_type()?;
+                        self.expect(Token::RParen)?;
+                        Some(ty)
+                    } else {
+                        None
+                    };
+                    variants.push(EnumVariant {
+                        name: v_name,
+                        payload,
+                        span: Span::new(start, self.span().end),
+                    });
+                    if matches!(self.peek(), Ok(Token::Comma)) {
+                        self.advance().ok();
+                    } else {
+                        self.expect(Token::RBrace)?;
+                        break;
+                    }
+                }
+                let missing_match = if matches!(self.peek(), Ok(Token::With))
+                    && matches!(self.peek_next(), Some(Token::MissingMatch))
+                {
+                    self.advance().ok();
+                    self.expect(Token::MissingMatch)?;
+                    self.expect(Token::Assign)?;
+                    let msg = match self.advance() {
+                        Ok(Token::StringLiteral(Ok(s))) => s,
+                        _ => {
+                            return Err(Diagnostic::error("expected string for missing_match")
                                     .with_code_str("E004")
                                     .with_help("`missing_match` expects a string literal — e.g. `with missing_match = \"message\"`")
                                     .with_suggestion("use a string literal like `\"not all variants covered\"`")
                                     .with_span(self.span(),));
-                            }
-                        };
-                        // Consume the trailing semicolon to keep the stream clean.
-                        // If more `with` modifiers follow, parse_type_modifiers will
-                        // pick them up on the next peek.
-                        self.expect(Token::Semicolon)?;
-                        Some(msg)
-                    } else {
-                        None
+                        }
                     };
-                    let enum_modifiers = self.parse_type_modifiers()?;
-                    let definition = TypeDefinition::Enum(variants, missing_match, enum_modifiers);
-                    let end = self.span().end;
-                    return Ok(Stmt::TypeDef {
-                        span: Span::new(start, end),
-                        attributes,
-                        doc,
-                        name,
-                        params,
-                        definition,
-                        contracts: Vec::new(),
-                    });
-                }
-            else {
+                    // Consume the trailing semicolon to keep the stream clean.
+                    // If more `with` modifiers follow, parse_type_modifiers will
+                    // pick them up on the next peek.
+                    self.expect(Token::Semicolon)?;
+                    Some(msg)
+                } else {
+                    None
+                };
+                let enum_modifiers = self.parse_type_modifiers()?;
+                let definition = TypeDefinition::Enum(variants, missing_match, enum_modifiers);
+                let end = self.span().end;
+                return Ok(Stmt::TypeDef {
+                    span: Span::new(start, end),
+                    attributes,
+                    doc,
+                    name,
+                    params,
+                    definition,
+                    contracts: Vec::new(),
+                });
+            } else {
                 let ty = self.parse_type()?;
                 ty
             }
@@ -4665,9 +4713,7 @@ impl Parser {
         // peek() ensures cursor is at the current token; the next
         // unconsumed token is always at cursor (peeked advances cursor by 1).
         self.peek();
-        self.tokens
-            .get(self.cursor)
-            .map(|st| st.token.clone())
+        self.tokens.get(self.cursor).map(|st| st.token.clone())
     }
 
     fn parse_if_expr(&mut self) -> Result<Expr, Diagnostic> {
@@ -4677,7 +4723,10 @@ impl Parser {
             self.advance().ok();
             let pattern = self.parse_pattern()?;
             self.expect(Token::Assign)?;
-            let scrutinee = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
+            let scrutinee = self
+                .with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+                    this.parse_expr()
+                })?;
             self.expect(Token::LBrace)?;
             let then_branch =
                 self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block())?;
@@ -4706,7 +4755,9 @@ impl Parser {
                 span: Span::new(start, end),
             });
         }
-        let cond = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
+        let cond = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+            this.parse_expr()
+        })?;
         self.expect(Token::LBrace)?;
         let then_branch =
             self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block())?;
@@ -4738,7 +4789,9 @@ impl Parser {
     fn parse_match_expr(&mut self) -> Result<Expr, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
-        let scrutinee = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
+        let scrutinee = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+            this.parse_expr()
+        })?;
         self.expect(Token::LBrace)?;
         let mut arms = Vec::new();
         loop {
@@ -4787,18 +4840,20 @@ impl Parser {
 fn edit_distance(a: &str, b: &str) -> usize {
     let a_len = a.len();
     let b_len = b.len();
-    if a_len == 0 { return b_len; }
-    if b_len == 0 { return a_len; }
+    if a_len == 0 {
+        return b_len;
+    }
+    if b_len == 0 {
+        return a_len;
+    }
     let mut prev: Vec<usize> = (0..=b_len).collect();
     let mut curr = vec![0usize; b_len + 1];
     for (i, ca) in a.chars().enumerate() {
         curr[0] = i + 1;
         for (j, cb) in b.chars().enumerate() {
             let cost = if ca == cb { 0 } else { 1 };
-            curr[j + 1] = std::cmp::min(
-                std::cmp::min(curr[j] + 1, prev[j + 1] + 1),
-                prev[j] + cost,
-            );
+            curr[j + 1] =
+                std::cmp::min(std::cmp::min(curr[j] + 1, prev[j + 1] + 1), prev[j] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -4829,32 +4884,76 @@ pub enum KeywordContext {
 fn did_you_mean_keyword(input: &str, context: KeywordContext) -> Option<String> {
     let keywords: &[&str] = match context {
         KeywordContext::TopLevel => &[
-            "def", "type", "trait", "import", "from", "edition",
-            "constraint", "extern", "impl", "comptime", "async",
-            "set", "let", "layout", "generate",
+            "def",
+            "type",
+            "trait",
+            "import",
+            "from",
+            "edition",
+            "constraint",
+            "extern",
+            "impl",
+            "comptime",
+            "async",
+            "set",
+            "let",
+            "layout",
+            "generate",
         ],
         KeywordContext::Expression => &[
-            "true", "false", "if", "else", "match", "for", "while",
-            "return", "leave", "continue", "move", "not", "and", "or",
-            "sizeof", "alignof", "catch", "panic", "unsafe", "old",
+            "true", "false", "if", "else", "match", "for", "while", "return", "leave", "continue",
+            "move", "not", "and", "or", "sizeof", "alignof", "catch", "panic", "unsafe", "old",
             "exists", "forall", "poly", "unbox", "await", "task",
         ],
         KeywordContext::Statement => &[
-            "set", "let", "return", "leave", "continue",
-            "if", "else", "while", "for", "unsafe",
-            "ghost", "scope_cleanup", "trigger", "isolate",
+            "set",
+            "let",
+            "return",
+            "leave",
+            "continue",
+            "if",
+            "else",
+            "while",
+            "for",
+            "unsafe",
+            "ghost",
+            "scope_cleanup",
+            "trigger",
+            "isolate",
         ],
         KeywordContext::Type => &[
-            "Int", "UInt", "Float", "Bool", "Char", "Byte",
-            "USize", "Never", "Rational",
-            "dyn", "ref", "mut",
+            "Int", "UInt", "Float", "Bool", "Char", "Byte", "USize", "Never", "Rational", "dyn",
+            "ref", "mut",
         ],
         KeywordContext::Generic => &[
-            "def", "type", "trait", "import", "from", "edition",
-            "constraint", "extern", "impl", "comptime", "async",
-            "set", "let", "if", "else", "while", "for", "return",
-            "leave", "continue", "match", "ghost", "propagates", "overrides",
-            "trigger", "scope_cleanup", "true", "false",
+            "def",
+            "type",
+            "trait",
+            "import",
+            "from",
+            "edition",
+            "constraint",
+            "extern",
+            "impl",
+            "comptime",
+            "async",
+            "set",
+            "let",
+            "if",
+            "else",
+            "while",
+            "for",
+            "return",
+            "leave",
+            "continue",
+            "match",
+            "ghost",
+            "propagates",
+            "overrides",
+            "trigger",
+            "scope_cleanup",
+            "true",
+            "false",
         ],
     };
     let input_lower = input.to_lowercase();
@@ -4911,7 +5010,10 @@ mod tests {
     fn check_parse_err(source: &str) -> Vec<Diagnostic> {
         let mut parser = Parser::new(source);
         parser.parse_program().err().unwrap_or_else(|| {
-            panic!("expected parse error, but parsing succeeded: {:?}", parser.diagnostics)
+            panic!(
+                "expected parse error, but parsing succeeded: {:?}",
+                parser.diagnostics
+            )
         })
     }
 
@@ -5116,8 +5218,14 @@ mod tests {
     #[test]
     fn test_keyword_suggestion_toplevel_fn() {
         let diags = check_parse_err("fn main(){}");
-        let has = diags.iter().any(|d| d.suggestions.iter().any(|s| s.contains("def")));
-        assert!(has, "expected 'did you mean `def`?' for `fn`, got: {:?}", diags);
+        let has = diags
+            .iter()
+            .any(|d| d.suggestions.iter().any(|s| s.contains("def")));
+        assert!(
+            has,
+            "expected 'did you mean `def`?' for `fn`, got: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -5125,8 +5233,14 @@ mod tests {
         // A non-identifier token in pattern position triggers the suggestion path.
         // Users might accidentally type `Frue` (inspired by `fn` → `def` style typos).
         let diags = check_parse_err("def main() { match x { $ => {} }; }");
-        let has = diags.iter().any(|d| d.suggestions.iter().any(|s| s.contains("try")));
-        assert!(has, "expected a suggestion for bad pattern token, got: {:?}", diags);
+        let has = diags
+            .iter()
+            .any(|d| d.suggestions.iter().any(|s| s.contains("try")));
+        assert!(
+            has,
+            "expected a suggestion for bad pattern token, got: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -5190,7 +5304,9 @@ mod tests {
         let program = check_parse(src);
         assert_eq!(program.items.len(), 1);
         match &program.items[0] {
-            Stmt::Constraint { name, predicates, .. } => {
+            Stmt::Constraint {
+                name, predicates, ..
+            } => {
                 assert!(name.eq_str("MyConstraint"));
                 assert_eq!(predicates.len(), 1);
                 assert!(matches!(predicates[0].ty, Type::Path(_, _)));
@@ -5211,11 +5327,17 @@ mod tests {
     #[test]
     fn test_constraint_with_generic_params() {
         // Generic constraint with type params and colon-based predicates.
-        let src = "constraint SortableContainer<C> { C: Container, C::Item: Ord, C::Item: Default }";
+        let src =
+            "constraint SortableContainer<C> { C: Container, C::Item: Ord, C::Item: Default }";
         let program = check_parse(src);
         assert_eq!(program.items.len(), 1);
         match &program.items[0] {
-            Stmt::Constraint { name, params, predicates, .. } => {
+            Stmt::Constraint {
+                name,
+                params,
+                predicates,
+                ..
+            } => {
                 assert!(name.eq_str("SortableContainer"));
                 assert_eq!(params.len(), 1);
                 assert!(params[0].name.eq_str("C"));
@@ -5245,7 +5367,8 @@ mod tests {
         assert_eq!(program.items.len(), 1);
         match &program.items[0] {
             Stmt::FunctionDef { where_clause, .. } => {
-                let wc = where_clause.as_ref()
+                let wc = where_clause
+                    .as_ref()
                     .expect("where clause should be parsed");
                 assert_eq!(wc.predicates.len(), 1);
                 // Subject should be a tuple type
@@ -5555,7 +5678,9 @@ mod tests {
         let program = check_parse(src);
         match &program.items[0] {
             Stmt::FunctionDef { return_type, .. } => {
-                assert!(matches!(return_type, Type::Path(path, _) if path.len() == 1 && path[0].eq_str("type")));
+                assert!(
+                    matches!(return_type, Type::Path(path, _) if path.len() == 1 && path[0].eq_str("type"))
+                );
             }
             _ => panic!("expected FunctionDef"),
         }
@@ -5653,7 +5778,9 @@ mod tests {
                     ..
                 } => {
                     assert!(matches!(**expr, Expr::Literal(Literal::Int(1), _)));
-                    assert!(matches!(**ty, Type::Path(ref path, _) if path.len() == 1 && path[0].eq_str("PositiveInt")));
+                    assert!(
+                        matches!(**ty, Type::Path(ref path, _) if path.len() == 1 && path[0].eq_str("PositiveInt"))
+                    );
                 }
                 _ => panic!("expected TypeAnnotated"),
             },

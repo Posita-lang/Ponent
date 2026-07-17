@@ -55,19 +55,11 @@ pub enum Predicate {
         target: TypeId,
     },
     /// `T: AutoTrait` (future: Send/Sync-like marker traits)
-    AutoTrait {
-        trait_id: DefId,
-        self_ty: TypeId,
-    },
+    AutoTrait { trait_id: DefId, self_ty: TypeId },
     /// `T: Sized` — special builtin
-    Sized {
-        ty: TypeId,
-    },
+    Sized { ty: TypeId },
     /// `T: Copy` / `T: Clone` — special builtins
-    CopyLike {
-        kind: CopyKind,
-        ty: TypeId,
-    },
+    CopyLike { kind: CopyKind, ty: TypeId },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -105,9 +97,7 @@ pub enum ImplSource {
         nested: Vec<Obligation>,
     },
     /// Auto-derived (future: Send-like)
-    Auto {
-        nested: Vec<Obligation>,
-    },
+    Auto { nested: Vec<Obligation> },
     /// Poly/unbox resolved (Posita-specific).
     /// Unlike UserDefined, there is no real impl — the obligation is
     /// satisfied by unboxing a polymorphic value.
@@ -169,9 +159,7 @@ pub enum MaybeCause {
     /// Inference variables are not yet resolved.
     /// `stalled_on` records which variables are blocking resolution,
     /// enabling selective re-evaluation when those variables are bound.
-    Unresolved {
-        stalled_on: Vec<TypeId>,
-    },
+    Unresolved { stalled_on: Vec<TypeId> },
     /// The recursion depth was exceeded during trait resolution.
     /// This is a hard ambiguity — the goal should be reported as an error.
     Overflow,
@@ -223,8 +211,14 @@ pub enum SolveError {
 impl std::fmt::Display for SolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SolveError::NotFound { trait_id, self_ty, .. } => {
-                write!(f, "trait impl not found for trait={:?} on type={:?}", trait_id, self_ty)
+            SolveError::NotFound {
+                trait_id, self_ty, ..
+            } => {
+                write!(
+                    f,
+                    "trait impl not found for trait={:?} on type={:?}",
+                    trait_id, self_ty
+                )
             }
             SolveError::Ambiguous { num_candidates, .. } => {
                 write!(f, "ambiguous trait impl ({} candidates)", num_candidates)
@@ -235,8 +229,14 @@ impl std::fmt::Display for SolveError {
             SolveError::CycleDetected { .. } => {
                 write!(f, "cycle detected during trait resolution")
             }
-            SolveError::Mismatch { expected, found, .. } => {
-                write!(f, "type mismatch: expected {:?}, found {:?}", expected, found)
+            SolveError::Mismatch {
+                expected, found, ..
+            } => {
+                write!(
+                    f,
+                    "type mismatch: expected {:?}, found {:?}",
+                    expected, found
+                )
             }
         }
     }

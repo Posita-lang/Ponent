@@ -1,6 +1,6 @@
 use crate::hir::symbol::SymbolTable;
-use crate::hir::traits::solver::obligation::ProjectionTy;
 use crate::hir::traits::TraitEnv;
+use crate::hir::traits::solver::obligation::ProjectionTy;
 use crate::hir::types::{DefId, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
 use rustc_hash::FxHashMap as HashMap;
@@ -41,7 +41,13 @@ impl ProjectionCache {
     }
 
     /// Try to get a cached normalized type.
-    pub fn get(&self, trait_id: DefId, self_ty: TypeId, assoc_name: &Symbol, ctx: &TypeContext) -> Option<TypeId> {
+    pub fn get(
+        &self,
+        trait_id: DefId,
+        self_ty: TypeId,
+        assoc_name: &Symbol,
+        ctx: &TypeContext,
+    ) -> Option<TypeId> {
         let resolved = ctx.resolve_binding(self_ty);
         let map = self.map.borrow();
         match map.get(&(trait_id, resolved, *assoc_name)) {
@@ -52,23 +58,42 @@ impl ProjectionCache {
 
     /// Insert a normalized type into the cache.
     /// If the cache exceeds MAX_CACHE_SIZE, it is fully cleared first.
-    pub fn insert(&self, trait_id: DefId, self_ty: TypeId, assoc_name: Symbol, ty: TypeId, ctx: &TypeContext) {
+    pub fn insert(
+        &self,
+        trait_id: DefId,
+        self_ty: TypeId,
+        assoc_name: Symbol,
+        ty: TypeId,
+        ctx: &TypeContext,
+    ) {
         let resolved = ctx.resolve_binding(self_ty);
         let mut map = self.map.borrow_mut();
         if map.len() >= MAX_CACHE_SIZE {
             map.clear();
         }
-        map.insert((trait_id, resolved, assoc_name), ProjectionCacheEntry::Normalized(ty));
+        map.insert(
+            (trait_id, resolved, assoc_name),
+            ProjectionCacheEntry::Normalized(ty),
+        );
     }
 
     /// Mark a projection as ambiguous (should not be cached permanently).
-    pub fn mark_ambiguous(&self, trait_id: DefId, self_ty: TypeId, assoc_name: Symbol, ctx: &TypeContext) {
+    pub fn mark_ambiguous(
+        &self,
+        trait_id: DefId,
+        self_ty: TypeId,
+        assoc_name: Symbol,
+        ctx: &TypeContext,
+    ) {
         let resolved = ctx.resolve_binding(self_ty);
         let mut map = self.map.borrow_mut();
         if map.len() >= MAX_CACHE_SIZE {
             map.clear();
         }
-        map.insert((trait_id, resolved, assoc_name), ProjectionCacheEntry::Ambiguous);
+        map.insert(
+            (trait_id, resolved, assoc_name),
+            ProjectionCacheEntry::Ambiguous,
+        );
     }
 
     /// Clear the cache. Called when new impls are added.
@@ -141,19 +166,29 @@ pub fn normalize_projection(
     }
 
     // Resolve the projection
-    let resolved = resolve_projection(trait_env, proj.trait_id, proj.self_ty, &proj.assoc_name, ctx, symbols)?;
+    let resolved = resolve_projection(
+        trait_env,
+        proj.trait_id,
+        proj.self_ty,
+        &proj.assoc_name,
+        ctx,
+        symbols,
+    )?;
 
     // Recursively normalize the result (in case it's itself a projection)
     let result = match ctx.get(resolved) {
-        TypeData::AssociatedType { trait_id, name, self_ty } => {
+        TypeData::AssociatedType {
+            trait_id,
+            name,
+            self_ty,
+        } => {
             let inner_proj = ProjectionTy {
                 trait_id: *trait_id,
                 self_ty: *self_ty,
                 args: proj.args.clone(),
                 assoc_name: *name,
             };
-            normalize_projection(&inner_proj, trait_env, ctx, cache, symbols)
-                .unwrap_or(resolved)
+            normalize_projection(&inner_proj, trait_env, ctx, cache, symbols).unwrap_or(resolved)
         }
         _ => resolved,
     };

@@ -1,8 +1,8 @@
 use super::*;
+use crate::ast::{BinOp, Literal, Span};
 use crate::hir::hir::{HirExpr, HirStmt};
 use crate::hir::types::{TypeContext, TypeId};
 use crate::symbol::Symbol;
-use crate::ast::{BinOp, Literal, Span};
 
 fn make_int_val(n: i128, ty: TypeId) -> HirExpr {
     HirExpr::Literal(Literal::Int(n), ty, Span::new(0, 0))
@@ -62,8 +62,8 @@ fn make_if(cond: HirExpr, then: HirExpr, els: Option<HirExpr>) -> HirExpr {
 }
 
 fn eval(ctx: &mut TypeContext, expr: &HirExpr) -> Result<ComptimeValue, ComptimeError> {
-    use crate::hir::types::{CrateId, DefId};
     use crate::hir::symbol::SymbolTable;
+    use crate::hir::types::{CrateId, DefId};
     let symbols = SymbolTable::new(CrateId(DefId(0)));
     let mut ec = ComptimeEvalContext::new(ctx, &symbols);
     ec.eval_expr(expr)
@@ -192,7 +192,9 @@ fn test_eval_block() {
 #[test]
 fn test_eval_step_limit() {
     let mut ctx = TypeContext::new();
-    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(crate::hir::types::DefId(0)));
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
     ec.set_step_limit(0);
     let r = ec.eval_expr(&make_int(42));
@@ -204,7 +206,9 @@ fn test_eval_step_limit() {
 #[test]
 fn test_eval_variable_def() {
     let mut ctx = TypeContext::new();
-    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(crate::hir::types::DefId(0)));
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
 
     let block = HirStmt::VariableDef {
@@ -220,13 +224,18 @@ fn test_eval_variable_def() {
     };
     let r = ec.eval_block(&[block]);
     assert!(matches!(r, Ok(ComptimeValue::Int(42))));
-    assert!(matches!(ec.variables.get(&Symbol::intern("x")), Some(ComptimeValue::Int(42))));
+    assert!(matches!(
+        ec.variables.get(&Symbol::intern("x")),
+        Some(ComptimeValue::Int(42))
+    ));
 }
 
 #[test]
 fn test_eval_variable_assign() {
     let mut ctx = TypeContext::new();
-    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(crate::hir::types::DefId(0)));
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
     ec.variables.insert("x".into(), ComptimeValue::Int(10));
 
@@ -238,17 +247,26 @@ fn test_eval_variable_assign() {
     };
     let r = ec.eval_block(&[assign]);
     assert!(matches!(r, Ok(ComptimeValue::Int(20))));
-    assert!(matches!(ec.variables.get(&Symbol::intern("x")), Some(ComptimeValue::Int(20))));
+    assert!(matches!(
+        ec.variables.get(&Symbol::intern("x")),
+        Some(ComptimeValue::Int(20))
+    ));
 }
 
 #[test]
 fn test_eval_assign_unknown_variable() {
     let mut ctx = TypeContext::new();
-    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(crate::hir::types::DefId(0)));
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
 
     let assign = HirStmt::Assign {
-        target: Box::new(HirExpr::Ident("nonexistent".into(), TypeId::NONE, Span::new(0, 0))),
+        target: Box::new(HirExpr::Ident(
+            "nonexistent".into(),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
         value: Box::new(make_int(20)),
         op: None,
         span: Span::new(0, 0),
@@ -262,7 +280,9 @@ fn test_eval_assign_unknown_variable() {
 #[test]
 fn test_eval_ident_resolves_local_var() {
     let mut ctx = TypeContext::new();
-    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(crate::hir::types::DefId(0)));
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
     ec.variables.insert("x".into(), ComptimeValue::Int(99));
 
@@ -274,7 +294,9 @@ fn test_eval_ident_resolves_local_var() {
 #[test]
 fn test_eval_ident_unknown() {
     let mut ctx = TypeContext::new();
-    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(crate::hir::types::DefId(0)));
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
 
     let expr = HirExpr::Ident("unknown".into(), TypeId::NONE, Span::new(0, 0));
@@ -288,18 +310,18 @@ fn test_eval_ident_unknown() {
 fn test_eval_comptime_fn_call() {
     let mut ctx = TypeContext::new();
     let int32 = ctx.int(32, true);
-    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(crate::hir::types::DefId(0)));
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
 
     // Register a comptime function: def double(x: Int<32>) -> Int<32> { 2 * x }
-    let body = vec![HirStmt::Expression(Box::new(
-        make_binop_ty(
-            make_int_val(2, int32),
-            BinOp::Mul,
-            HirExpr::Ident("x".into(), int32, Span::new(0, 0)),
-            int32,
-        )
-    ))];
+    let body = vec![HirStmt::Expression(Box::new(make_binop_ty(
+        make_int_val(2, int32),
+        BinOp::Mul,
+        HirExpr::Ident("x".into(), int32, Span::new(0, 0)),
+        int32,
+    )))];
     ec.register_fn("double".into(), vec!["x".into()], body);
 
     let call = HirExpr::Call {
@@ -310,17 +332,27 @@ fn test_eval_comptime_fn_call() {
         span: Span::new(0, 0),
     };
     let r = ec.eval_expr(&call);
-    assert!(matches!(r, Ok(ComptimeValue::Int(42))), "double(21) = {:?}", r);
+    assert!(
+        matches!(r, Ok(ComptimeValue::Int(42))),
+        "double(21) = {:?}",
+        r
+    );
 }
 
 #[test]
 fn test_eval_comptime_fn_call_unknown() {
     let mut ctx = TypeContext::new();
-    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(crate::hir::types::DefId(0)));
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
 
     let call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("undefined_fn".into(), TypeId::NONE, Span::new(0, 0))),
+        callee: Box::new(HirExpr::Ident(
+            "undefined_fn".into(),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
         args: vec![],
         comptime: true,
         ty: TypeId::NONE,
@@ -336,7 +368,9 @@ fn test_eval_comptime_fn_call_unknown() {
 fn test_eval_while_loop() {
     let mut ctx = TypeContext::new();
     let int32 = ctx.int(32, true);
-    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(crate::hir::types::DefId(0)));
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
 
     ec.variables.insert("i".into(), ComptimeValue::Int(0));
@@ -345,7 +379,12 @@ fn test_eval_while_loop() {
     let cond = make_binop_ty(i_expr(), BinOp::Lt, make_int_val(5, int32), int32);
     let body = vec![HirStmt::Assign {
         target: Box::new(i_expr()),
-        value: Box::new(make_binop_ty(i_expr(), BinOp::Add, make_int_val(1, int32), int32)),
+        value: Box::new(make_binop_ty(
+            i_expr(),
+            BinOp::Add,
+            make_int_val(1, int32),
+            int32,
+        )),
         op: None,
         span: Span::new(0, 0),
     }];
@@ -359,14 +398,19 @@ fn test_eval_while_loop() {
     };
     let _ = ec.eval_block(&[while_stmt]);
     // After the loop, i should be 5
-    assert!(matches!(ec.variables.get(&Symbol::intern("i")), Some(ComptimeValue::Int(5))));
+    assert!(matches!(
+        ec.variables.get(&Symbol::intern("i")),
+        Some(ComptimeValue::Int(5))
+    ));
 }
 
 #[test]
 fn test_eval_while_step_limit() {
     let mut ctx = TypeContext::new();
     let int32 = ctx.int(32, true);
-    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(crate::hir::types::DefId(0)));
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
     ec.set_step_limit(5);
 
@@ -375,7 +419,12 @@ fn test_eval_while_step_limit() {
     let cond = make_binop_ty(i_expr(), BinOp::Lt, make_int_val(100, int32), int32);
     let body = vec![HirStmt::Assign {
         target: Box::new(i_expr()),
-        value: Box::new(make_binop_ty(i_expr(), BinOp::Add, make_int_val(1, int32), int32)),
+        value: Box::new(make_binop_ty(
+            i_expr(),
+            BinOp::Add,
+            make_int_val(1, int32),
+            int32,
+        )),
         op: None,
         span: Span::new(0, 0),
     }];
@@ -397,7 +446,9 @@ fn test_eval_while_step_limit() {
 fn test_eval_type_info() {
     let mut ctx = TypeContext::new();
     let int32 = ctx.int(32, true);
-    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(crate::hir::types::DefId(0)));
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
 
     let expr = HirExpr::TypeInfo(int32, Span::new(0, 0));
@@ -410,7 +461,9 @@ fn test_eval_type_info() {
 #[test]
 fn test_eval_fn_call_scope_isolation() {
     let mut ctx = TypeContext::new();
-    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(crate::hir::types::DefId(0)));
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
     let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
     ec.variables.insert("x".into(), ComptimeValue::Int(1));
 
@@ -424,7 +477,11 @@ fn test_eval_fn_call_scope_isolation() {
     ec.register_fn("mutate_x".into(), vec!["x".into()], body);
 
     let call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("mutate_x".into(), TypeId::NONE, Span::new(0, 0))),
+        callee: Box::new(HirExpr::Ident(
+            "mutate_x".into(),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
         args: vec![make_int(10)],
         comptime: true,
         ty: TypeId::NONE,
@@ -432,5 +489,8 @@ fn test_eval_fn_call_scope_isolation() {
     };
     let _ = ec.eval_expr(&call);
     // Outer x should still be 1, not 99
-    assert!(matches!(ec.variables.get(&Symbol::intern("x")), Some(ComptimeValue::Int(1))));
+    assert!(matches!(
+        ec.variables.get(&Symbol::intern("x")),
+        Some(ComptimeValue::Int(1))
+    ));
 }

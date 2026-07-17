@@ -554,7 +554,9 @@ pub mod tree {
 
     impl Level {
         pub const ZERO: Level = Level(0);
-        pub fn succ(self) -> Level { Level(self.0 + 1) }
+        pub fn succ(self) -> Level {
+            Level(self.0 + 1)
+        }
     }
 
     /// A node in the tree.
@@ -567,7 +569,9 @@ pub mod tree {
     }
 
     impl<T> Node<T> {
-        pub fn value(&self) -> &T { &self.value }
+        pub fn value(&self) -> &T {
+            &self.value
+        }
     }
 
     /// The root tree.
@@ -580,24 +584,46 @@ pub mod tree {
     impl<T> Tree<T> {
         pub fn new(value: T) -> (Self, usize) {
             let id = 0;
-            let node = Node { id, level: Level::ZERO, value, parent: None };
-            (Tree { root: id, nodes: vec![node] }, id)
+            let node = Node {
+                id,
+                level: Level::ZERO,
+                value,
+                parent: None,
+            };
+            (
+                Tree {
+                    root: id,
+                    nodes: vec![node],
+                },
+                id,
+            )
         }
 
         pub fn create_child(&mut self, parent_id: usize, value: T) -> usize {
             let id = self.nodes.len();
             let parent_level = self.nodes[parent_id].level;
-            let node = Node { id, level: parent_level.succ(), value, parent: Some(parent_id) };
+            let node = Node {
+                id,
+                level: parent_level.succ(),
+                value,
+                parent: Some(parent_id),
+            };
             self.nodes.push(node);
             id
         }
 
-        pub fn get(&self, id: usize) -> &Node<T> { &self.nodes[id] }
+        pub fn get(&self, id: usize) -> &Node<T> {
+            &self.nodes[id]
+        }
 
-        pub fn get_mut(&mut self, id: usize) -> &mut Node<T> { &mut self.nodes[id] }
+        pub fn get_mut(&mut self, id: usize) -> &mut Node<T> {
+            &mut self.nodes[id]
+        }
 
         pub fn nearest_common_ancestor(&self, id1: usize, id2: usize) -> usize {
-            if id1 == id2 { return id1; }
+            if id1 == id2 {
+                return id1;
+            }
             let n1 = &self.nodes[id1];
             let n2 = &self.nodes[id2];
             if n1.level < n2.level {
@@ -632,10 +658,20 @@ pub mod tree {
         }
 
         impl Dirty {
-            pub fn new() -> Self { Dirty { children: HashMap::new() } }
-            pub fn is_empty(&self) -> bool { self.children.is_empty() }
-            pub fn add_child(&mut self, child_id: usize) { self.children.insert(child_id, child_id); }
-            pub fn remove_child(&mut self, id: usize) { self.children.remove(&id); }
+            pub fn new() -> Self {
+                Dirty {
+                    children: HashMap::new(),
+                }
+            }
+            pub fn is_empty(&self) -> bool {
+                self.children.is_empty()
+            }
+            pub fn add_child(&mut self, child_id: usize) {
+                self.children.insert(child_id, child_id);
+            }
+            pub fn remove_child(&mut self, id: usize) {
+                self.children.remove(&id);
+            }
         }
 
         #[derive(Debug, Clone)]
@@ -660,20 +696,31 @@ pub mod tree {
         impl<T> DirtyTree<T> {
             pub fn new(value: T) -> Self {
                 let (tree, _root_id) = super::Tree::new(create_desc(value));
-                DirtyTree { tree, dirty_roots: Dirty::new() }
+                DirtyTree {
+                    tree,
+                    dirty_roots: Dirty::new(),
+                }
             }
 
             pub fn create_child(&mut self, parent_id: usize, value: T) -> usize {
                 self.tree.create_child(parent_id, create_desc(value))
             }
 
-            pub fn get(&self, id: usize) -> &DirtyNode<T> { self.tree.get(id) }
+            pub fn get(&self, id: usize) -> &DirtyNode<T> {
+                self.tree.get(id)
+            }
 
-            pub fn get_mut(&mut self, id: usize) -> &mut DirtyNode<T> { self.tree.get_mut(id) }
+            pub fn get_mut(&mut self, id: usize) -> &mut DirtyNode<T> {
+                self.tree.get_mut(id)
+            }
 
-            pub fn root(&self) -> &DirtyNode<T> { self.tree.get(self.tree.root) }
+            pub fn root(&self) -> &DirtyNode<T> {
+                self.tree.get(self.tree.root)
+            }
 
-            pub fn is_empty(&self) -> bool { self.dirty_roots.is_empty() }
+            pub fn is_empty(&self) -> bool {
+                self.dirty_roots.is_empty()
+            }
 
             fn find_closest_dirty_ancestor(&self, node_id: usize) -> &Dirty {
                 let node = self.tree.get(node_id);
@@ -712,14 +759,17 @@ pub mod tree {
 
             pub fn mark_dirty(&mut self, node_id: usize) {
                 let node = self.tree.get(node_id);
-                if node.value.dirty.is_some() { return; }
+                if node.value.dirty.is_some() {
+                    return;
+                }
 
                 // Find the closest dirty ancestor (or dirty_roots).
                 // We need to collect reparent candidates BEFORE getting the
                 // mutable reference to the ancestor, to avoid borrow conflicts.
                 let to_reparent: Vec<usize> = {
                     let anc_dirty = self.find_closest_dirty_ancestor(node_id);
-                    anc_dirty.children
+                    anc_dirty
+                        .children
                         .keys()
                         .filter(|&&child_id| self.is_ancestor(node_id, child_id))
                         .copied()
@@ -750,7 +800,8 @@ pub mod tree {
             }
 
             pub fn drain_dirty<F>(&mut self, node_id: usize, before: &F, after: &F, f: &F)
-            where F: Fn()
+            where
+                F: Fn(),
             {
                 // We need to process nodes in a depth-first order.
                 // Since we need mutable access to self, we collect the children first.
@@ -786,7 +837,8 @@ pub mod tree {
             }
 
             pub fn drain_dirty_roots<F>(&mut self, before: &F, after: &F, f: &F)
-            where F: Fn()
+            where
+                F: Fn(),
             {
                 before();
                 let roots: Vec<usize> = self.dirty_roots.children.keys().copied().collect();
@@ -832,9 +884,7 @@ impl Status {
             (Status::Generic, _) | (_, Status::Generic) => {
                 panic!("Cannot merge Generic nodes")
             }
-            (Status::Instance { .. }, Status::Instance { .. }) => {
-                Status::Instance { dirty: true }
-            }
+            (Status::Instance { .. }, Status::Instance { .. }) => Status::Instance { dirty: true },
         }
     }
 }
@@ -869,7 +919,10 @@ pub mod pool {
                 .field("rigid_vars", &self.rigid_vars)
                 .field("shape_var_region", &self.shape_var_region)
                 .field("parent_shape_var_region", &self.parent_shape_var_region)
-                .field("raise_scope_escape", &self.raise_scope_escape.as_ref().map(|_| "<fn>"))
+                .field(
+                    "raise_scope_escape",
+                    &self.raise_scope_escape.as_ref().map(|_| "<fn>"),
+                )
                 .finish()
         }
     }

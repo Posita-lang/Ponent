@@ -1,10 +1,10 @@
 pub mod error;
-pub mod value;
 pub mod eval;
+pub mod value;
 
 pub use error::ComptimeError;
-pub use value::ComptimeValue;
 pub use eval::ComptimeEvalContext;
+pub use value::ComptimeValue;
 
 #[cfg(test)]
 mod tests;

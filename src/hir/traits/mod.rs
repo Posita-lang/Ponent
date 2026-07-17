@@ -361,13 +361,20 @@ impl TraitEnv {
         let resolved = ctx.resolve_binding(target_ty);
         let cache_key = (trait_id, resolved);
         // Negative cache check.
-        if self.impl_generic_cache.borrow().get(&cache_key).map_or(false, |v| v.is_none()) {
+        if self
+            .impl_generic_cache
+            .borrow()
+            .get(&cache_key)
+            .map_or(false, |v| v.is_none())
+        {
             return None;
         }
         // Positive cache check: use the stored candidate index to retrieve
         // the exact same candidate that produced the cached substitution,
         // avoiding mismatches when multiple impls share the same trait_id.
-        if let Some(Some((cached_idx, cached_subst))) = self.impl_generic_cache.borrow().get(&cache_key) {
+        if let Some(Some((cached_idx, cached_subst))) =
+            self.impl_generic_cache.borrow().get(&cache_key)
+        {
             if *cached_idx < self.impls.len() {
                 return Some((&self.impls[*cached_idx], cached_subst.clone()));
             }
@@ -413,7 +420,9 @@ impl TraitEnv {
             }
             ctx.commit_transaction();
             // Cache the positive result with the candidate index.
-            self.impl_generic_cache.borrow_mut().insert(cache_key, Some((cand_idx, subst.clone())));
+            self.impl_generic_cache
+                .borrow_mut()
+                .insert(cache_key, Some((cand_idx, subst.clone())));
             return Some((&self.impls[cand_idx], subst));
         }
         // Negative cache: no match found for this (trait_id, resolved) pair.
@@ -520,15 +529,18 @@ pub enum OrphanKind {
     /// Overlap with an existing impl: the new impl's for_type and the existing
     /// impl's for_type can be unified, meaning there exists a concrete type
     /// that would satisfy both impls.
-    OverlapViolation {
-        existing_span: Span,
-    },
+    OverlapViolation { existing_span: Span },
 }
 
 impl std::fmt::Display for TraitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TraitError::Orphan { kind, trait_id, type_id, .. } => {
+            TraitError::Orphan {
+                kind,
+                trait_id,
+                type_id,
+                ..
+            } => {
                 let msg = match kind {
                     OrphanKind::PatersonViolation => {
                         "impl violates Paterson condition: a context type is not strictly smaller than the head type"
@@ -545,11 +557,21 @@ impl std::fmt::Display for TraitError {
                 };
                 write!(f, "{} (trait={:?}, type={:?})", msg, trait_id, type_id)
             }
-            TraitError::NotFound { trait_id, type_id, .. } => {
-                write!(f, "trait impl not found for trait={:?} on type={:?}", trait_id, type_id)
+            TraitError::NotFound {
+                trait_id, type_id, ..
+            } => {
+                write!(
+                    f,
+                    "trait impl not found for trait={:?} on type={:?}",
+                    trait_id, type_id
+                )
             }
             TraitError::Ambiguous { candidates, .. } => {
-                write!(f, "multiple matching impl candidates found ({} candidates)", candidates.len())
+                write!(
+                    f,
+                    "multiple matching impl candidates found ({} candidates)",
+                    candidates.len()
+                )
             }
         }
     }
@@ -615,14 +637,20 @@ mod tests {
             align: None,
             pad: None,
         };
-        symbols.insert_type("TestType".into(), binding, crate::ast::Span::new(0, 0)).ok();
+        symbols
+            .insert_type("TestType".into(), binding, crate::ast::Span::new(0, 0))
+            .ok();
 
         // Register the def_id → type_id mapping so the orphan rule check
         // can find the type and actually execute, not silently skip.
         ctx.register_def_id(type_id, for_ty);
 
         let result = env.add_impl(candidate, &symbols, &mut ctx, false);
-        assert!(result.is_ok(), "add_impl should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "add_impl should succeed: {:?}",
+            result.err()
+        );
         assert_eq!(env.all_impls().len(), 1);
     }
 

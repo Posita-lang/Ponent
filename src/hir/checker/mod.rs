@@ -4,20 +4,20 @@ use crate::hir::hir::*;
 use crate::hir::infer::*;
 use crate::hir::resolver::ResolutionMap;
 use crate::hir::symbol::*;
-use crate::hir::traits::solver::{
-    FulfillmentContext, Predicate as TraitPredicate, Obligation, ObligationCause,
-    ObligationCauseCode,
-};
+use crate::hir::traits::TraitEnv;
 use crate::hir::traits::solver::builtins::BuiltinTraitRegistry;
 use crate::hir::traits::solver::project::ProjectionCache;
-use crate::hir::traits::TraitEnv;
+use crate::hir::traits::solver::{
+    FulfillmentContext, Obligation, ObligationCause, ObligationCauseCode,
+    Predicate as TraitPredicate,
+};
 use crate::hir::types::*;
 use crate::symbol::Symbol;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::rc::Rc;
 use std::mem;
+use std::rc::Rc;
 
 pub mod autoderef;
 pub mod context;
@@ -99,7 +99,11 @@ impl ScopedVarMap {
 
     /// Insert a binding into the innermost scope frame.
     pub fn insert(&self, name: Symbol, ty: TypeId) {
-        self.frames.borrow_mut().last_mut().unwrap().insert(name, ty);
+        self.frames
+            .borrow_mut()
+            .last_mut()
+            .unwrap()
+            .insert(name, ty);
     }
 
     /// Insert a binding into the base (outermost) scope frame.
@@ -296,15 +300,30 @@ impl<'a> TypeChecker<'a> {
         // never recognize any trait as builtin and would rely solely on
         // user-defined impls.
         for name_str in &[
-            "Sized", "Copy", "Clone", "Drop", "Default",
-            "Add", "Sub", "Mul", "Div", "Rem", "Neg",
-            "Eq", "Ord",
-            "Index", "IndexMut",
-            "Deref", "Display",
-            "Serialize", "Write",
+            "Sized",
+            "Copy",
+            "Clone",
+            "Drop",
+            "Default",
+            "Add",
+            "Sub",
+            "Mul",
+            "Div",
+            "Rem",
+            "Neg",
+            "Eq",
+            "Ord",
+            "Index",
+            "IndexMut",
+            "Deref",
+            "Display",
+            "Serialize",
+            "Write",
         ] {
             if let Some(binding) = checker.symbols.lookup_trait(Symbol::intern(name_str)) {
-                checker.builtin_registry.register(binding.def_id, &Symbol::intern(name_str));
+                checker
+                    .builtin_registry
+                    .register(binding.def_id, &Symbol::intern(name_str));
             }
         }
 
@@ -336,15 +355,31 @@ impl<'a> TypeChecker<'a> {
         // WITHOUT checking bodies, so that forward references between comptime
         // functions work correctly (e.g. `comptime def f() { g() }` followed by
         // `comptime def g() { 42 }`).
-        let comptime_fn_indices: Vec<usize> = program.items.iter().enumerate().filter_map(|(i, stmt)| {
-            if let Stmt::FunctionDef { name, params, is_comptime, .. } = stmt {
-                if *is_comptime {
-                    let param_names: Vec<Symbol> = params.iter().map(|p| p.name).collect();
-                    self.comptime_fn_registry.insert(*name, (param_names, Vec::new()));
-                    Some(i)
-                } else { None }
-            } else { None }
-        }).collect();
+        let comptime_fn_indices: Vec<usize> = program
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, stmt)| {
+                if let Stmt::FunctionDef {
+                    name,
+                    params,
+                    is_comptime,
+                    ..
+                } = stmt
+                {
+                    if *is_comptime {
+                        let param_names: Vec<Symbol> = params.iter().map(|p| p.name).collect();
+                        self.comptime_fn_registry
+                            .insert(*name, (param_names, Vec::new()));
+                        Some(i)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         // Pass 2: type-check all comptime function bodies (all signatures are now available).
         // During this pass, comptime blocks inside comptime function bodies are deferred
@@ -420,7 +455,7 @@ impl<'a> TypeChecker<'a> {
                 self.symbols,
                 &self.builtin_registry,
                 &self.proj_cache,
-                &[],  // no caller bounds at top level
+                &[], // no caller bounds at top level
             );
             for bound in &top_obligations {
                 let obligation = Obligation {
@@ -429,13 +464,15 @@ impl<'a> TypeChecker<'a> {
                         code: crate::hir::traits::solver::ObligationCauseCode::Misc,
                     },
                     predicate: match bound {
-                        TraitPredicate::Trait { trait_id, self_ty, args } => {
-                            crate::hir::traits::solver::Predicate::Trait {
-                                trait_id: *trait_id,
-                                self_ty: *self_ty,
-                                args: args.clone(),
-                            }
-                        }
+                        TraitPredicate::Trait {
+                            trait_id,
+                            self_ty,
+                            args,
+                        } => crate::hir::traits::solver::Predicate::Trait {
+                            trait_id: *trait_id,
+                            self_ty: *self_ty,
+                            args: args.clone(),
+                        },
                         TraitPredicate::Sized { ty } => {
                             crate::hir::traits::solver::Predicate::Sized { ty: *ty }
                         }
@@ -446,7 +483,8 @@ impl<'a> TypeChecker<'a> {
                 fulfill.register_obligation(obligation);
             }
             if let Err(errors) = fulfill.evaluate_all() {
-                let msg = errors.iter()
+                let msg = errors
+                    .iter()
                     .map(|e| format!("{}", e))
                     .collect::<Vec<_>>()
                     .join("; ");
@@ -501,13 +539,15 @@ impl<'a> TypeChecker<'a> {
                                 code: crate::hir::traits::solver::ObligationCauseCode::Misc,
                             },
                             predicate: match bound {
-                                TraitPredicate::Trait { trait_id, self_ty, args } => {
-                                    crate::hir::traits::solver::Predicate::Trait {
-                                        trait_id: *trait_id,
-                                        self_ty: *self_ty,
-                                        args: args.clone(),
-                                    }
-                                }
+                                TraitPredicate::Trait {
+                                    trait_id,
+                                    self_ty,
+                                    args,
+                                } => crate::hir::traits::solver::Predicate::Trait {
+                                    trait_id: *trait_id,
+                                    self_ty: *self_ty,
+                                    args: args.clone(),
+                                },
                                 TraitPredicate::Sized { ty } => {
                                     crate::hir::traits::solver::Predicate::Sized { ty: *ty }
                                 }
@@ -518,7 +558,8 @@ impl<'a> TypeChecker<'a> {
                         fulfill.register_obligation(obligation);
                     }
                     if let Err(errors) = fulfill.evaluate_all_final() {
-                        let msg = errors.iter()
+                        let msg = errors
+                            .iter()
                             .map(|e| format!("{}", e))
                             .collect::<Vec<_>>()
                             .join("; ");
@@ -593,7 +634,10 @@ impl<'a> TypeChecker<'a> {
                 let declared_ty = if let Some(ty) = ty {
                     self.resolve_type(ty)?
                 } else {
-                    self.new_infer_var(TypeVariableKind::Unconstrained, crate::hir::infer::VarOrigin::Expression(Some(*span)))
+                    self.new_infer_var(
+                        TypeVariableKind::Unconstrained,
+                        crate::hir::infer::VarOrigin::Expression(Some(*span)),
+                    )
                 };
 
                 // Determine the actual initializer (value) and its type.
@@ -786,7 +830,7 @@ impl<'a> TypeChecker<'a> {
                             Diagnostic::error("@interrupt handler must satisfy @no_panic")
                                 .with_code_str("E053")
                                 .with_span(*span)
-                                .with_suggestion("add `@no_panic` to this function")
+                                .with_suggestion("add `@no_panic` to this function"),
                         );
                     }
                     // Rule 4: @interrupt + @alloc is incompatible
@@ -870,15 +914,14 @@ impl<'a> TypeChecker<'a> {
                     for pred in &wc.predicates {
                         // Resolve the subject(s).  A `Type::Tuple` means
                         // `where (A, B, …): Bound` — resolve each element.
-                        let subject_tys: Vec<TypeId> =
-                            if let Type::Tuple(elems, _) = &pred.ty {
-                                elems
-                                    .iter()
-                                    .map(|e| guard.checker.resolve_type(e))
-                                    .collect::<Result<Vec<_>, _>>()?
-                            } else {
-                                vec![guard.checker.resolve_type(&pred.ty)?]
-                            };
+                        let subject_tys: Vec<TypeId> = if let Type::Tuple(elems, _) = &pred.ty {
+                            elems
+                                .iter()
+                                .map(|e| guard.checker.resolve_type(e))
+                                .collect::<Result<Vec<_>, _>>()?
+                        } else {
+                            vec![guard.checker.resolve_type(&pred.ty)?]
+                        };
 
                         for bound in &pred.bounds {
                             // ── Direct trait bound ──────────────────────────
@@ -890,7 +933,7 @@ impl<'a> TypeChecker<'a> {
                                         Diagnostic::error(
                                             "a single trait bound cannot be applied \
                                              to multiple types in a tuple subject; \
-                                             use separate `where` clauses"
+                                             use separate `where` clauses",
                                         )
                                         .with_code_str("E004")
                                         .with_span(pred.span),
@@ -933,7 +976,7 @@ impl<'a> TypeChecker<'a> {
 
                                     // ── Extract associated type constraints (Named args) ──
                                     // Handle `T: Iterator<Item = U>` — the bound is
-                                    // parsed as `Type::Generic(Path(["Iterator"]), 
+                                    // parsed as `Type::Generic(Path(["Iterator"]),
                                     // [Named("Item", Path(["U"]))])`.  Each `Named`
                                     // arg is an associated type projection that must
                                     // be resolved.
@@ -944,14 +987,16 @@ impl<'a> TypeChecker<'a> {
                                                     // Resolve the associated type value
                                                     match guard.checker.resolve_type(assoc_ty) {
                                                         Ok(assoc_ty_id) => {
-                                                        // Register ProjectionEq with old solver
-                                                        // Register ProjectionEq with new solver
-                                                        caller_bounds.push(TraitPredicate::ProjectionEq {
-                                                            trait_id,
-                                                            self_ty: subject_tys[0],
-                                                            assoc_name: *assoc_name,
-                                                            value: assoc_ty_id,
-                                                        });
+                                                            // Register ProjectionEq with old solver
+                                                            // Register ProjectionEq with new solver
+                                                            caller_bounds.push(
+                                                                TraitPredicate::ProjectionEq {
+                                                                    trait_id,
+                                                                    self_ty: subject_tys[0],
+                                                                    assoc_name: *assoc_name,
+                                                                    value: assoc_ty_id,
+                                                                },
+                                                            );
                                                         }
                                                         Err(diag) => {
                                                             guard.checker.diagnostics.push(diag);
@@ -969,12 +1014,14 @@ impl<'a> TypeChecker<'a> {
                             }
 
                             // ── Constraint alias ────────────────────────────
-                            let Some(name) = TypeChecker::extract_bound_name(bound)
-                            else { continue };
+                            let Some(name) = TypeChecker::extract_bound_name(bound) else {
+                                continue;
+                            };
 
-                            let Some(constraint) =
-                                guard.checker.symbols.lookup_constraint(name)
-                            else { continue };
+                            let Some(constraint) = guard.checker.symbols.lookup_constraint(name)
+                            else {
+                                continue;
+                            };
 
                             // Validate arity: tuple-element count must match
                             // the constraint's type-param count.
@@ -986,11 +1033,7 @@ impl<'a> TypeChecker<'a> {
                                         name,
                                         constraint.params.len(),
                                         subject_tys.len(),
-                                        if subject_tys.len() > 1 {
-                                            "were"
-                                        } else {
-                                            "was"
-                                        },
+                                        if subject_tys.len() > 1 { "were" } else { "was" },
                                     ))
                                     .with_code_str("E004")
                                     .with_span(pred.span),
@@ -1009,11 +1052,9 @@ impl<'a> TypeChecker<'a> {
                                 // Substitute the predicate's subject too, so
                                 // that generic-param references in the subject
                                 // (or bounds) are replaced by the actual types.
-                                let subst_subject =
-                                    guard.checker.ctx.subst(cp.subject, &subst);
+                                let subst_subject = guard.checker.ctx.subst(cp.subject, &subst);
                                 for &bound_ty in &cp.bounds {
-                                    let substituted =
-                                        guard.checker.ctx.subst(bound_ty, &subst);
+                                    let substituted = guard.checker.ctx.subst(bound_ty, &subst);
                                     if let Some(trait_id) =
                                         guard.checker.ctx.get_def_id_for_type(substituted)
                                     {
@@ -1051,23 +1092,25 @@ impl<'a> TypeChecker<'a> {
                 // the solver must find a real impl to satisfy them.
                 let solver_caller_bounds: Vec<TraitPredicate> = {
                     let ctx = &*guard.checker.ctx;
-                    caller_bounds.iter().filter(|b| {
-                        let self_ty = match b {
-                            TraitPredicate::Trait { self_ty, .. }
-                            | TraitPredicate::AutoTrait { self_ty, .. }
-                            | TraitPredicate::ProjectionEq { self_ty, .. } => *self_ty,
-                            TraitPredicate::ProjectionNormalize { projection, .. } => {
-                                projection.self_ty
-                            }
-                            // Sized and CopyLike don't encode a where-clause subject
-                            _ => return true,
-                        };
-                        let mut indices = Vec::new();
-                        Self::collect_generic_param_indices(self_ty, ctx, &mut indices);
-                        !indices.is_empty()
-                    })
-                    .cloned()
-                    .collect()
+                    caller_bounds
+                        .iter()
+                        .filter(|b| {
+                            let self_ty = match b {
+                                TraitPredicate::Trait { self_ty, .. }
+                                | TraitPredicate::AutoTrait { self_ty, .. }
+                                | TraitPredicate::ProjectionEq { self_ty, .. } => *self_ty,
+                                TraitPredicate::ProjectionNormalize { projection, .. } => {
+                                    projection.self_ty
+                                }
+                                // Sized and CopyLike don't encode a where-clause subject
+                                _ => return true,
+                            };
+                            let mut indices = Vec::new();
+                            Self::collect_generic_param_indices(self_ty, ctx, &mut indices);
+                            !indices.is_empty()
+                        })
+                        .cloned()
+                        .collect()
                 };
 
                 let body_result = if let Some(body) = body {
@@ -1119,33 +1162,39 @@ impl<'a> TypeChecker<'a> {
                         guard.checker.symbols,
                         &guard.checker.builtin_registry,
                         &guard.checker.proj_cache,
-                        &solver_caller_bounds,  // only where-clause bounds on generic-param types as assumptions
+                        &solver_caller_bounds, // only where-clause bounds on generic-param types as assumptions
                     );
                     // Register ALL obligations (where-clause + body-check-time)
                     for bound in &all_bounds {
                         let obligation = Obligation {
                             cause: crate::hir::traits::solver::ObligationCause {
                                 span: *span,
-                                code: crate::hir::traits::solver::ObligationCauseCode::WhereClause {
-                                    span: *span,
-                                },
+                                code:
+                                    crate::hir::traits::solver::ObligationCauseCode::WhereClause {
+                                        span: *span,
+                                    },
                             },
                             predicate: match bound {
-                                TraitPredicate::Trait { trait_id, self_ty, args } => {
-                                    crate::hir::traits::solver::Predicate::Trait {
-                                        trait_id: *trait_id,
-                                        self_ty: *self_ty,
-                                        args: args.clone(),
-                                    }
-                                }
-                                TraitPredicate::ProjectionEq { trait_id, self_ty, assoc_name, value } => {
-                                    crate::hir::traits::solver::Predicate::ProjectionEq {
-                                        trait_id: *trait_id,
-                                        self_ty: *self_ty,
-                                        assoc_name: *assoc_name,
-                                        value: *value,
-                                    }
-                                }
+                                TraitPredicate::Trait {
+                                    trait_id,
+                                    self_ty,
+                                    args,
+                                } => crate::hir::traits::solver::Predicate::Trait {
+                                    trait_id: *trait_id,
+                                    self_ty: *self_ty,
+                                    args: args.clone(),
+                                },
+                                TraitPredicate::ProjectionEq {
+                                    trait_id,
+                                    self_ty,
+                                    assoc_name,
+                                    value,
+                                } => crate::hir::traits::solver::Predicate::ProjectionEq {
+                                    trait_id: *trait_id,
+                                    self_ty: *self_ty,
+                                    assoc_name: *assoc_name,
+                                    value: *value,
+                                },
                                 TraitPredicate::AutoTrait { trait_id, self_ty } => {
                                     crate::hir::traits::solver::Predicate::AutoTrait {
                                         trait_id: *trait_id,
@@ -1186,7 +1235,8 @@ impl<'a> TypeChecker<'a> {
                     }
                     if let Err(errors) = fulfill.evaluate_all() {
                         // Abort: unresolved trait obligations must fail the check.
-                        let msg = errors.iter()
+                        let msg = errors
+                            .iter()
                             .map(|e| format!("{}", e))
                             .collect::<Vec<_>>()
                             .join("; ");
@@ -1224,7 +1274,10 @@ impl<'a> TypeChecker<'a> {
                                     Diagnostic::error("contract condition must be boolean")
                                         .with_code_str("E020")
                                         .with_span(*cspan)
-                                        .with_label(expr.span(), format!("got {:?}", self.ctx.get(ty))),
+                                        .with_label(
+                                            expr.span(),
+                                            format!("got {:?}", self.ctx.get(ty)),
+                                        ),
                                 );
                             }
                         }
@@ -1237,7 +1290,10 @@ impl<'a> TypeChecker<'a> {
                                     Diagnostic::error("ensures clause must be boolean")
                                         .with_code_str("E020")
                                         .with_span(*cspan)
-                                        .with_label(expr.span(), format!("got {:?}", self.ctx.get(ty))),
+                                        .with_label(
+                                            expr.span(),
+                                            format!("got {:?}", self.ctx.get(ty)),
+                                        ),
                                 );
                             }
                         }
@@ -1278,34 +1334,38 @@ impl<'a> TypeChecker<'a> {
                     // Collect all obligations: original all_bounds (which includes
                     // where-clause bounds and body-check-time obligations) plus
                     // any new ones from contract expressions.
-                    let all_final: Vec<&TraitPredicate> = all_bounds
-                        .iter()
-                        .chain(final_obs.iter())
-                        .collect();
+                    let all_final: Vec<&TraitPredicate> =
+                        all_bounds.iter().chain(final_obs.iter()).collect();
                     for bound in all_final {
                         let obligation = Obligation {
                             cause: crate::hir::traits::solver::ObligationCause {
                                 span: *span,
-                                code: crate::hir::traits::solver::ObligationCauseCode::WhereClause {
-                                    span: *span,
-                                },
+                                code:
+                                    crate::hir::traits::solver::ObligationCauseCode::WhereClause {
+                                        span: *span,
+                                    },
                             },
                             predicate: match bound {
-                                TraitPredicate::Trait { trait_id, self_ty, args } => {
-                                    crate::hir::traits::solver::Predicate::Trait {
-                                        trait_id: *trait_id,
-                                        self_ty: *self_ty,
-                                        args: args.clone(),
-                                    }
-                                }
-                                TraitPredicate::ProjectionEq { trait_id, self_ty, assoc_name, value } => {
-                                    crate::hir::traits::solver::Predicate::ProjectionEq {
-                                        trait_id: *trait_id,
-                                        self_ty: *self_ty,
-                                        assoc_name: *assoc_name,
-                                        value: *value,
-                                    }
-                                }
+                                TraitPredicate::Trait {
+                                    trait_id,
+                                    self_ty,
+                                    args,
+                                } => crate::hir::traits::solver::Predicate::Trait {
+                                    trait_id: *trait_id,
+                                    self_ty: *self_ty,
+                                    args: args.clone(),
+                                },
+                                TraitPredicate::ProjectionEq {
+                                    trait_id,
+                                    self_ty,
+                                    assoc_name,
+                                    value,
+                                } => crate::hir::traits::solver::Predicate::ProjectionEq {
+                                    trait_id: *trait_id,
+                                    self_ty: *self_ty,
+                                    assoc_name: *assoc_name,
+                                    value: *value,
+                                },
                                 TraitPredicate::AutoTrait { trait_id, self_ty } => {
                                     crate::hir::traits::solver::Predicate::AutoTrait {
                                         trait_id: *trait_id,
@@ -1345,7 +1405,8 @@ impl<'a> TypeChecker<'a> {
                         fulfill.register_obligation(obligation);
                     }
                     if let Err(errors) = fulfill.evaluate_all_final() {
-                        let msg = errors.iter()
+                        let msg = errors
+                            .iter()
                             .map(|e| format!("{}", e))
                             .collect::<Vec<_>>()
                             .join("; ");
@@ -1381,10 +1442,8 @@ impl<'a> TypeChecker<'a> {
                 if *is_comptime {
                     let param_names: Vec<Symbol> = params.iter().map(|p| p.name).collect();
                     if let Some(ref body) = body_hir {
-                        self.comptime_fn_registry.insert(
-                            name.clone(),
-                            (param_names, body.clone()),
-                        );
+                        self.comptime_fn_registry
+                            .insert(name.clone(), (param_names, body.clone()));
                     }
                 }
 
@@ -1822,10 +1881,13 @@ impl<'a> TypeChecker<'a> {
                         self.pop_ctx();
                         // Extract the type of the comptime block from its last expression,
                         // so that `def f() -> Int<32> { comptime { 42 } }` type-checks.
-                        let ty = hir.last().and_then(|s| match s {
-                            HirStmt::Expression(e) => Some(e.ty()),
-                            _ => None,
-                        }).unwrap_or_else(|| self.ctx.unit());
+                        let ty = hir
+                            .last()
+                            .and_then(|s| match s {
+                                HirStmt::Expression(e) => Some(e.ty()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| self.ctx.unit());
                         if self.comptime_fn_pass {
                             // During Pass 2 (comptime function body checking), defer
                             // evaluation so that forward references to comptime functions
@@ -1834,7 +1896,10 @@ impl<'a> TypeChecker<'a> {
                             self.deferred_comptime_blocks.push((hir.clone(), ty, *span));
                         } else {
                             // Evaluate the comptime block at compile time.
-                            let mut eval = crate::hir::comptime::ComptimeEvalContext::new(self.ctx, self.symbols);
+                            let mut eval = crate::hir::comptime::ComptimeEvalContext::new(
+                                self.ctx,
+                                self.symbols,
+                            );
                             // Register pre-collected comptime functions.
                             for (name, (params, body)) in &self.comptime_fn_registry {
                                 eval.register_fn(name.clone(), params.clone(), body.clone());
@@ -1901,7 +1966,11 @@ impl<'a> TypeChecker<'a> {
                     span: *span,
                 })
             }
-            Stmt::LayoutDef { name, attributes, span } => {
+            Stmt::LayoutDef {
+                name,
+                attributes,
+                span,
+            } => {
                 // Layout alias definitions are handled by the resolver.
                 // The checker just passes them through.
                 Ok(HirStmt::LayoutDef {
@@ -1953,7 +2022,10 @@ impl<'a> TypeChecker<'a> {
                     let p_ty = if let Some(ref ty) = p.ty {
                         self.resolve_type(ty)?
                     } else {
-                        self.new_infer_var(TypeVariableKind::Unconstrained, crate::hir::infer::VarOrigin::Expression(Some(p.span)))
+                        self.new_infer_var(
+                            TypeVariableKind::Unconstrained,
+                            crate::hir::infer::VarOrigin::Expression(Some(p.span)),
+                        )
                     };
                     hir_params.push(HirParam {
                         name: p.name.clone(),
@@ -1971,12 +2043,22 @@ impl<'a> TypeChecker<'a> {
                     attributes: attributes.clone(),
                 })
             }
-            Stmt::Constraint { name, params, predicates, span } => {
+            Stmt::Constraint {
+                name,
+                params,
+                predicates,
+                span,
+            } => {
                 let resolved_bounds: Vec<TypeId> = predicates
                     .iter()
                     .flat_map(|p| {
                         let subject = self.resolve_type(&p.ty);
-                        let mut bs: Vec<TypeId> = p.bounds.iter().map(|b| self.resolve_type(b)).collect::<Result<_, _>>().unwrap_or_default();
+                        let mut bs: Vec<TypeId> = p
+                            .bounds
+                            .iter()
+                            .map(|b| self.resolve_type(b))
+                            .collect::<Result<_, _>>()
+                            .unwrap_or_default();
                         if subject.is_ok() {
                             bs.insert(0, subject.unwrap());
                         }
@@ -1990,32 +2072,33 @@ impl<'a> TypeChecker<'a> {
                 })
             }
             Stmt::ImplBlock { .. } => {
-                let (trait_path, for_type, methods, span, attributes, type_params, where_clause) = match stmt {
-                    Stmt::ImplBlock {
-                        span,
-                        trait_path,
-                        for_type,
-                        methods,
-                        attributes,
-                        type_params,
-                        where_clause,
-                        ..
-                    } => (
-                        trait_path,
-                        for_type,
-                        methods,
-                        *span,
-                        attributes,
-                        type_params,
-                        where_clause,
-                    ),
-                    _ => {
-                        let msg = format!("check_stmt: expected ImplBlock, got {:?}", stmt);
-                        self.diagnostics
-                            .push(Diagnostic::error(&msg).with_span(stmt.span()));
-                        return Ok(HirStmt::Error);
-                    }
-                };
+                let (trait_path, for_type, methods, span, attributes, type_params, where_clause) =
+                    match stmt {
+                        Stmt::ImplBlock {
+                            span,
+                            trait_path,
+                            for_type,
+                            methods,
+                            attributes,
+                            type_params,
+                            where_clause,
+                            ..
+                        } => (
+                            trait_path,
+                            for_type,
+                            methods,
+                            *span,
+                            attributes,
+                            type_params,
+                            where_clause,
+                        ),
+                        _ => {
+                            let msg = format!("check_stmt: expected ImplBlock, got {:?}", stmt);
+                            self.diagnostics
+                                .push(Diagnostic::error(&msg).with_span(stmt.span()));
+                            return Ok(HirStmt::Error);
+                        }
+                    };
                 if let Some(tp) = &trait_path {
                     // ── Trait impl block ─────────────────────────────────
                     // Resolve the trait path to get its DefId.
@@ -2071,7 +2154,8 @@ impl<'a> TypeChecker<'a> {
                     // Register generic type parameters so `T` in `impl<T> Foo for T` resolves
                     // Collect names before insertion so we can clean up after the impl block
                     // is fully processed, preventing cross-impl cache pollution.
-                    let impl_param_names: Vec<Symbol> = type_params.iter().map(|tp| tp.name).collect();
+                    let impl_param_names: Vec<Symbol> =
+                        type_params.iter().map(|tp| tp.name).collect();
                     for (i, tp) in type_params.iter().enumerate() {
                         let generic_id = self.ctx.generic_param(i, tp.name.clone());
                         self.local_type_param_cache
@@ -2232,7 +2316,9 @@ impl<'a> TypeChecker<'a> {
                                                 if let Type::Generic(_, args, _) = bound {
                                                     for arg in args {
                                                         if let GenericArg::Positional(ty) = arg {
-                                                            if let Ok(resolved) = self.resolve_type(ty) {
+                                                            if let Ok(resolved) =
+                                                                self.resolve_type(ty)
+                                                            {
                                                                 bound_args.push(resolved);
                                                             }
                                                         }
@@ -2254,7 +2340,8 @@ impl<'a> TypeChecker<'a> {
                                             if let Type::Generic(_, args, _) = bound {
                                                 for arg in args {
                                                     if let GenericArg::Positional(ty) = arg {
-                                                        if let Ok(resolved) = self.resolve_type(ty) {
+                                                        if let Ok(resolved) = self.resolve_type(ty)
+                                                        {
                                                             bound_args.push(resolved);
                                                         }
                                                     }
@@ -2285,8 +2372,7 @@ impl<'a> TypeChecker<'a> {
                     }
 
                     // Also register the resolved methods for method resolution
-                    if let TypeData::Adt { def_id, .. } = self.ctx.get(for_ty)
-                    {
+                    if let TypeData::Adt { def_id, .. } = self.ctx.get(for_ty) {
                         self.trait_env.add_inherent_methods(*def_id, method_infos);
                     }
 
@@ -2362,8 +2448,10 @@ impl<'a> TypeChecker<'a> {
             // Stmt::Generate is expanded before name resolution, so it
             // should never reach the checker.  If it does, the pipeline
             // is misconfigured.
-            Stmt::Generate { span, .. } => Err(Diagnostic::error("generate block not expanded before type checking")
-                .with_span(*span)),
+            Stmt::Generate { span, .. } => Err(Diagnostic::error(
+                "generate block not expanded before type checking",
+            )
+            .with_span(*span)),
         }
     }
 
@@ -2492,7 +2580,11 @@ impl<'a> TypeChecker<'a> {
     ) -> Result<(DefId, Vec<TypeId>), Diagnostic> {
         let resolved = self.ctx.resolve_binding(ty);
         match self.ctx.get(resolved) {
-            TypeData::Adt { kind: _, def_id, args } => Ok((*def_id, args.clone())),
+            TypeData::Adt {
+                kind: _,
+                def_id,
+                args,
+            } => Ok((*def_id, args.clone())),
             TypeData::Error => Err(Diagnostic::error("type error").with_span(span)),
             _ => Err(Diagnostic::error("expected struct or enum type").with_span(span)),
         }
@@ -2521,7 +2613,8 @@ impl<'a> TypeChecker<'a> {
             .map(|b| b.def_id)
             .or_else(|| self.symbols.lookup_trait(path[0]).map(|b| b.def_id))
             .ok_or_else(|| {
-                Diagnostic::error(format!("'{}' not found", path[0].as_str())).with_span(Span::new(0, 0))
+                Diagnostic::error(format!("'{}' not found", path[0].as_str()))
+                    .with_span(Span::new(0, 0))
             })
     }
 
@@ -2617,9 +2710,7 @@ impl<'a> TypeChecker<'a> {
                         format!("index must be an integer, got {:?}", self.ctx.get(actual))
                     }
                 };
-                let mut diag = Diagnostic::error(msg)
-                    .with_code_str("E030")
-                    .with_span(span);
+                let mut diag = Diagnostic::error(msg).with_code_str("E030").with_span(span);
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
                     diag = diag.with_suggestion(suggestion);
                 }
@@ -2637,11 +2728,11 @@ impl<'a> TypeChecker<'a> {
         // Logical And/Or are NOT trait-routed in the desugaring table.
         // They stay as hard-coded bool operators.
         if matches!(op, BinOp::And | BinOp::Or) {
-            let ok = self.ctx.is_bool(left)
-                || matches!(self.ctx.get(left), TypeData::InferVar { .. });
+            let ok =
+                self.ctx.is_bool(left) || matches!(self.ctx.get(left), TypeData::InferVar { .. });
             if !ok {
                 return Err(
-                    Diagnostic::error("logical operators require bool operands").with_span(span),
+                    Diagnostic::error("logical operators require bool operands").with_span(span)
                 );
             }
             // Check kind compatibility early so that e.g. `true and infer_var(Integer)`
@@ -2693,9 +2784,7 @@ impl<'a> TypeChecker<'a> {
 
         // All other operators route through traits (§Spec: Operator Desugaring).
         let Some(trait_id) = self.get_trait_id_for_binop(op, span)? else {
-            return Err(
-                Diagnostic::error("operator not supported via traits").with_span(span),
-            );
+            return Err(Diagnostic::error("operator not supported via traits").with_span(span));
         };
 
         self.trait_obligations.push(TraitPredicate::Trait {
@@ -2726,7 +2815,10 @@ impl<'a> TypeChecker<'a> {
         // The Impl constraint verifies the trait exists; the infer var is
         // unified with the expected result type downstream.
         self.unify_with(left, right, span, TypingContext::None)?;
-        let result_ty = self.new_infer_var(TypeVariableKind::Numeric, crate::hir::infer::VarOrigin::Expression(Some(span)));
+        let result_ty = self.new_infer_var(
+            TypeVariableKind::Numeric,
+            crate::hir::infer::VarOrigin::Expression(Some(span)),
+        );
         // Resolve the result type to the operand type.  Without this, the
         // result infer var would never be resolved to a concrete type, and
         // any comparison operator that follows (e.g. `>=` in `a + b >= 0`)
@@ -2769,10 +2861,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 Some(TypeVariableKind::Integer) => {
                     if !self.ctx.is_integer(resolved_other)
-                        && !matches!(
-                            self.ctx.get(resolved_other),
-                            TypeData::Rational { .. }
-                        )
+                        && !matches!(self.ctx.get(resolved_other), TypeData::Rational { .. })
                     {
                         return Err(Diagnostic::error(format!(
                             "type mismatch: expected integer type, found `{:?}`",
@@ -2895,7 +2984,12 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn extract_ok_type(&self, ty: TypeId) -> Option<TypeId> {
-        if let TypeData::Adt { kind: _, def_id: did, args } = self.ctx.get(ty) {
+        if let TypeData::Adt {
+            kind: _,
+            def_id: did,
+            args,
+        } = self.ctx.get(ty)
+        {
             if let Some(result_id) = self.known_def_id(Symbol::intern("Result")) {
                 if *did == result_id && args.len() == 2 {
                     return Some(args[0]);
@@ -2914,7 +3008,12 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn extract_result_types(&self, ty: TypeId, span: Span) -> Result<(TypeId, TypeId), Diagnostic> {
-        if let TypeData::Adt { kind: _, def_id: did, args } = self.ctx.get(ty) {
+        if let TypeData::Adt {
+            kind: _,
+            def_id: did,
+            args,
+        } = self.ctx.get(ty)
+        {
             if let Some(result_id) = self.known_def_id(Symbol::intern("Result")) {
                 if *did == result_id && args.len() == 2 {
                     return Ok((args[0], args[1]));
@@ -2975,7 +3074,10 @@ impl<'a> TypeChecker<'a> {
 
     /// Attempt to dereference through a `Deref` trait impl marked `@auto_deref`.
     fn try_deref_trait_step(&self, ty: TypeId) -> Option<TypeId> {
-        let deref_trait_id = self.symbols.lookup_trait(Symbol::intern("Deref")).map(|b| b.def_id)?;
+        let deref_trait_id = self
+            .symbols
+            .lookup_trait(Symbol::intern("Deref"))
+            .map(|b| b.def_id)?;
         let candidates = self.trait_env.lookup_impls_for_type(ty);
         // Check Deref first
         for cand in &candidates {
@@ -2991,7 +3093,10 @@ impl<'a> TypeChecker<'a> {
             }
         }
         // Also try DerefMut: same Target as Deref
-        let deref_mut_id = self.symbols.lookup_trait(Symbol::intern("DerefMut")).map(|b| b.def_id);
+        let deref_mut_id = self
+            .symbols
+            .lookup_trait(Symbol::intern("DerefMut"))
+            .map(|b| b.def_id);
         if let Some(deref_mut_id) = deref_mut_id {
             for cand in &candidates {
                 if cand.trait_id == deref_mut_id && cand.has_auto_deref {
@@ -3069,7 +3174,10 @@ impl<'a> TypeChecker<'a> {
         // Create fresh InferVars for each GenericParam index
         let mut infer_var_for_index: Vec<TypeId> = Vec::new();
         for _ in &generic_indices {
-            let var = self.new_infer_var(TypeVariableKind::Any, crate::hir::infer::VarOrigin::GenericParam);
+            let var = self.new_infer_var(
+                TypeVariableKind::Any,
+                crate::hir::infer::VarOrigin::GenericParam,
+            );
             infer_var_for_index.push(var);
         }
 
@@ -3434,9 +3542,16 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn lookup_attr(&self, ty: TypeId, name: Symbol, span: Span) -> Result<TypeId, Diagnostic> {
-        if name.eq_str("len") && (self.ctx.is_array(ty) || self.ctx.is_slice(ty) || ty == self.ctx.builtin_str || ty == self.ctx.builtin_str_ref) {
+        if name.eq_str("len")
+            && (self.ctx.is_array(ty)
+                || self.ctx.is_slice(ty)
+                || ty == self.ctx.builtin_str
+                || ty == self.ctx.builtin_str_ref)
+        {
             Ok(self.ctx.usize())
-        } else if name.eq_str("size") && (self.ctx.is_integer(ty) || self.ctx.is_float(ty) || self.ctx.is_pointer(ty)) {
+        } else if name.eq_str("size")
+            && (self.ctx.is_integer(ty) || self.ctx.is_float(ty) || self.ctx.is_pointer(ty))
+        {
             Ok(self.ctx.usize())
         } else if name.eq_str("align") {
             Ok(self.ctx.usize())
@@ -3536,7 +3651,10 @@ impl<'a> TypeChecker<'a> {
                 );
             }
         };
-        Ok(self.symbols.lookup_trait(Symbol::intern(trait_name)).map(|b| b.def_id))
+        Ok(self
+            .symbols
+            .lookup_trait(Symbol::intern(trait_name))
+            .map(|b| b.def_id))
     }
 
     fn extract_int_from_type(&self, ty: &Type) -> Option<u8> {
@@ -3551,7 +3669,11 @@ impl<'a> TypeChecker<'a> {
         None
     }
 
-    fn new_infer_var(&mut self, kind: TypeVariableKind, origin: crate::hir::infer::VarOrigin) -> TypeId {
+    fn new_infer_var(
+        &mut self,
+        kind: TypeVariableKind,
+        origin: crate::hir::infer::VarOrigin,
+    ) -> TypeId {
         self.infer.new_type_var(self.ctx, kind, origin)
     }
     fn add_constraint(&mut self, c: Constraint) {
@@ -3570,13 +3692,22 @@ impl<'a> TypeChecker<'a> {
     /// Convert an AST type to a user-friendly string for diagnostics.
     fn type_to_string(ty: &Type) -> String {
         match ty {
-            Type::Path(path, _) => path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
+            Type::Path(path, _) => path
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("::"),
             Type::Generic(base, args, _) => {
                 let base_str = Self::type_to_string(base);
-                let args_str: Vec<String> = args.iter().map(|a| match a {
-                    crate::ast::GenericArg::Positional(t) => Self::type_to_string(t),
-                    crate::ast::GenericArg::Named(n, t) => format!("{} = {}", n, Self::type_to_string(t)),
-                }).collect();
+                let args_str: Vec<String> = args
+                    .iter()
+                    .map(|a| match a {
+                        crate::ast::GenericArg::Positional(t) => Self::type_to_string(t),
+                        crate::ast::GenericArg::Named(n, t) => {
+                            format!("{} = {}", n, Self::type_to_string(t))
+                        }
+                    })
+                    .collect();
                 format!("{}<{}>", base_str, args_str.join(", "))
             }
             Type::Reference { inner, mutable, .. } => {

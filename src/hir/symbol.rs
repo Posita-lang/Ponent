@@ -220,7 +220,8 @@ impl SymbolTable {
         let scope = &mut self.scopes[self.current_scope];
         if !scope.ordered && scope.variables.contains_key(&name) {
             return Err(
-                Diagnostic::error(format!("variable '{}' already defined", name.as_str())).with_span(span),
+                Diagnostic::error(format!("variable '{}' already defined", name.as_str()))
+                    .with_span(span),
             );
         }
         scope.variables.insert(name, binding);
@@ -236,7 +237,8 @@ impl SymbolTable {
         let scope = &mut self.scopes[self.current_scope];
         if scope.functions.contains_key(&name) {
             return Err(
-                Diagnostic::error(format!("function '{}' already defined", name.as_str())).with_span(span),
+                Diagnostic::error(format!("function '{}' already defined", name.as_str()))
+                    .with_span(span),
             );
         }
         scope.functions.insert(name, binding);
@@ -252,7 +254,8 @@ impl SymbolTable {
         let scope = &mut self.scopes[self.current_scope];
         if scope.types.contains_key(&name) {
             return Err(
-                Diagnostic::error(format!("type '{}' already defined", name.as_str())).with_span(span),
+                Diagnostic::error(format!("type '{}' already defined", name.as_str()))
+                    .with_span(span),
             );
         }
         let def_id = binding.def_id;
@@ -282,7 +285,8 @@ impl SymbolTable {
         let scope = &mut self.scopes[self.current_scope];
         if scope.traits.contains_key(&name) {
             return Err(
-                Diagnostic::error(format!("trait '{}' already defined", name.as_str())).with_span(span),
+                Diagnostic::error(format!("trait '{}' already defined", name.as_str()))
+                    .with_span(span),
             );
         }
         let def_id = binding.def_id;
@@ -304,9 +308,11 @@ impl SymbolTable {
     ) -> Result<(), Diagnostic> {
         let scope = &mut self.scopes[self.current_scope];
         if scope.constraints.contains_key(&name) {
-            return Err(
-                Diagnostic::error(format!("constraint '{}' already defined", name.as_str())).with_span(span),
-            );
+            return Err(Diagnostic::error(format!(
+                "constraint '{}' already defined",
+                name.as_str()
+            ))
+            .with_span(span));
         }
         scope.constraints.insert(name, binding);
         Ok(())

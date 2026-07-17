@@ -60,10 +60,16 @@ pub fn check_overlap(
         let new_data = ctx.get(new_impl.for_type);
         let existing_data = ctx.get(existing.for_type);
 
-        let both_concrete = !contains_generic_param(new_data, ctx)
-            && !contains_generic_param(existing_data, ctx);
-        let args_concrete = new_impl.trait_args.iter().all(|a| !contains_generic_param(ctx.get(*a), ctx))
-            && existing.trait_args.iter().all(|a| !contains_generic_param(ctx.get(*a), ctx));
+        let both_concrete =
+            !contains_generic_param(new_data, ctx) && !contains_generic_param(existing_data, ctx);
+        let args_concrete = new_impl
+            .trait_args
+            .iter()
+            .all(|a| !contains_generic_param(ctx.get(*a), ctx))
+            && existing
+                .trait_args
+                .iter()
+                .all(|a| !contains_generic_param(ctx.get(*a), ctx));
 
         if both_concrete && args_concrete {
             // All types are concrete: compare for_type AND trait_args structurally.
@@ -127,17 +133,23 @@ pub fn check_overlap(
         // Step 3: Normalize both for_type and trait_args with the substitution.
         let new_for_ty = ctx.subst(new_impl.for_type, &subst);
         let existing_for_ty = ctx.subst(existing.for_type, &subst);
-        let new_trait_args: Vec<TypeId> = new_impl.trait_args.iter()
+        let new_trait_args: Vec<TypeId> = new_impl
+            .trait_args
+            .iter()
             .map(|a| ctx.subst(*a, &subst))
             .collect();
-        let existing_trait_args: Vec<TypeId> = existing.trait_args.iter()
+        let existing_trait_args: Vec<TypeId> = existing
+            .trait_args
+            .iter()
             .map(|a| ctx.subst(*a, &subst))
             .collect();
 
         // Step 4: Unify the normalized for_type and trait_args.
         let for_type_ok = ctx.try_unify(new_for_ty, existing_for_ty).is_ok();
         let trait_args_ok = new_trait_args.len() == existing_trait_args.len()
-            && new_trait_args.iter().zip(existing_trait_args.iter())
+            && new_trait_args
+                .iter()
+                .zip(existing_trait_args.iter())
                 .all(|(a, b)| ctx.try_unify(*a, *b).is_ok());
 
         if for_type_ok && trait_args_ok {
@@ -166,16 +178,22 @@ fn contains_generic_param(data: &TypeData, ctx: &TypeContext) -> bool {
             params.iter().any(|p| contains_generic_param_by_id(*p, ctx))
                 || contains_generic_param_by_id(*ret, ctx)
         }
-        TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => contains_generic_param_by_id(*ty, ctx),
+        TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+            contains_generic_param_by_id(*ty, ctx)
+        }
         TypeData::Ptr { pointee, .. } => contains_generic_param_by_id(*pointee, ctx),
-        TypeData::Array { elem, .. } | TypeData::Slice { elem } => contains_generic_param_by_id(*elem, ctx),
-        TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. }
-        | TypeData::Mu { body, .. } | TypeData::Nu { body, .. }
+        TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
+            contains_generic_param_by_id(*elem, ctx)
+        }
+        TypeData::Forall { body, .. }
+        | TypeData::Exists { base: body, .. }
+        | TypeData::Mu { body, .. }
+        | TypeData::Nu { body, .. }
         | TypeData::Poly { body, .. } => contains_generic_param_by_id(*body, ctx),
         TypeData::AssociatedType { self_ty, .. } => contains_generic_param_by_id(*self_ty, ctx),
-        TypeData::Coproduct { alternatives } => {
-            alternatives.iter().any(|a| contains_generic_param_by_id(*a, ctx))
-        }
+        TypeData::Coproduct { alternatives } => alternatives
+            .iter()
+            .any(|a| contains_generic_param_by_id(*a, ctx)),
         // All other types (Int, Bool, etc.) have no GenericParams.
         _ => false,
     }
@@ -222,10 +240,14 @@ fn collect_generic_param_indices_data(data: &TypeData, ctx: &TypeContext, out: &
         TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
             collect_generic_param_indices(*elem, ctx, out);
         }
-        TypeData::Forall { body, .. } | TypeData::Exists { base: body, .. }
-        | TypeData::Mu { body, .. } | TypeData::Nu { body, .. }
+        TypeData::Forall { body, .. }
+        | TypeData::Exists { base: body, .. }
+        | TypeData::Mu { body, .. }
+        | TypeData::Nu { body, .. }
         | TypeData::Poly { body, .. } => collect_generic_param_indices(*body, ctx, out),
-        TypeData::AssociatedType { self_ty, .. } => collect_generic_param_indices(*self_ty, ctx, out),
+        TypeData::AssociatedType { self_ty, .. } => {
+            collect_generic_param_indices(*self_ty, ctx, out)
+        }
         TypeData::Coproduct { alternatives } => {
             for &a in alternatives {
                 collect_generic_param_indices(a, ctx, out);

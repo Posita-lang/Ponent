@@ -49,7 +49,10 @@ fn test_concrete_same_type_overlaps() {
     let conflict = check_overlap(&[existing], &new, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_some(), "identical concrete types should overlap");
+    assert!(
+        conflict.is_some(),
+        "identical concrete types should overlap"
+    );
 }
 
 #[test]
@@ -69,7 +72,10 @@ fn test_concrete_different_types_no_overlap() {
     let conflict = check_overlap(&[existing], &new, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_none(), "different concrete types should NOT overlap");
+    assert!(
+        conflict.is_none(),
+        "different concrete types should NOT overlap"
+    );
 }
 
 #[test]
@@ -109,7 +115,10 @@ fn test_generic_param_top_level_overlaps() {
     let conflict = check_overlap(&[existing], &new, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_some(), "top-level GenericParam with same index should overlap");
+    assert!(
+        conflict.is_some(),
+        "top-level GenericParam with same index should overlap"
+    );
 }
 
 #[test]
@@ -129,7 +138,10 @@ fn test_generic_param_top_level_different_index_overlaps() {
     let conflict = check_overlap(&[existing], &new, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_some(), "top-level GenericParam with different indices should overlap (alpha-equivalent)");
+    assert!(
+        conflict.is_some(),
+        "top-level GenericParam with different indices should overlap (alpha-equivalent)"
+    );
 }
 
 // ── GenericParam inside composite types (the original bug) ─────────
@@ -154,7 +166,10 @@ fn test_tuple_with_generic_param_overlaps_same_index() {
     let conflict = check_overlap(&[existing], &new, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_some(), "Tuple([GenericParam]) with same index should overlap");
+    assert!(
+        conflict.is_some(),
+        "Tuple([GenericParam]) with same index should overlap"
+    );
 }
 
 #[test]
@@ -177,7 +192,10 @@ fn test_tuple_with_generic_param_overlaps_different_index() {
     let conflict = check_overlap(&[existing], &new, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_some(), "Tuple([GenericParam]) with different indices should overlap (alpha-equivalent)");
+    assert!(
+        conflict.is_some(),
+        "Tuple([GenericParam]) with different indices should overlap (alpha-equivalent)"
+    );
 }
 
 #[test]
@@ -201,7 +219,10 @@ fn test_adt_with_generic_param_overlaps() {
     let conflict = check_overlap(&[existing], &new, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_some(), "Adt(Vec, [GenericParam]) should overlap — same def_id, same index");
+    assert!(
+        conflict.is_some(),
+        "Adt(Vec, [GenericParam]) should overlap — same def_id, same index"
+    );
 }
 
 #[test]
@@ -225,7 +246,10 @@ fn test_adt_with_generic_param_different_index_overlaps() {
     let conflict = check_overlap(&[existing], &new, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_some(), "Adt(Vec, [GenericParam]) with different indices should overlap (alpha-equivalent)");
+    assert!(
+        conflict.is_some(),
+        "Adt(Vec, [GenericParam]) with different indices should overlap (alpha-equivalent)"
+    );
 }
 
 // ── Non-overlap: different trait_args ──────────────────────────────
@@ -249,7 +273,10 @@ fn test_same_head_type_different_trait_args_no_overlap() {
     let conflict = check_overlap(&[existing], &new, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_none(), "same head type but different trait args should NOT overlap");
+    assert!(
+        conflict.is_none(),
+        "same head type but different trait args should NOT overlap"
+    );
 }
 
 // ── Non-overlap: different concrete parts inside composite types ───
@@ -276,7 +303,10 @@ fn test_composite_different_concrete_elem_no_overlap() {
     let conflict = check_overlap(&[existing], &new, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_none(), "different concrete elements in composite should NOT overlap");
+    assert!(
+        conflict.is_none(),
+        "different concrete elements in composite should NOT overlap"
+    );
 }
 
 // ── Overlap: generic vs concrete (param can be instantiated) ───────
@@ -300,7 +330,10 @@ fn test_generic_param_vs_concrete_overlaps() {
     let conflict = check_overlap(&[existing], &new, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_some(), "generic param vs concrete type should overlap (param can be instantiated)");
+    assert!(
+        conflict.is_some(),
+        "generic param vs concrete type should overlap (param can be instantiated)"
+    );
 }
 
 // ── Multiple existing impls ───────────────────────────────────────
@@ -327,7 +360,10 @@ fn test_overlap_against_multiple_existing() {
     let conflict = check_overlap(&[existing_a.clone(), existing_b.clone()], &new, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_none(), "different concrete type against multiple existing");
+    assert!(
+        conflict.is_none(),
+        "different concrete type against multiple existing"
+    );
 
     // Now try a new impl that matches one of the existing ones
     let new_matching = make_candidate(trait_id, for_ty_a, vec![]);
@@ -336,7 +372,10 @@ fn test_overlap_against_multiple_existing() {
     let conflict = check_overlap(&[existing_a, existing_b], &new_matching, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_some(), "overlap against one of multiple existing should be detected");
+    assert!(
+        conflict.is_some(),
+        "overlap against one of multiple existing should be detected"
+    );
 }
 
 // ── Edge: different GenericParam indices in nested ADT ─────────────
@@ -365,7 +404,10 @@ fn test_adt_nested_generic_param_different_index_overlaps() {
     let conflict = check_overlap(&[existing], &new, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_some(), "nested ADT with different GenericParam indices should overlap");
+    assert!(
+        conflict.is_some(),
+        "nested ADT with different GenericParam indices should overlap"
+    );
 }
 
 // ── Binder types (Forall, Exists, Mu, Nu, Poly) ───────────────────
@@ -398,7 +440,10 @@ fn test_forall_with_generic_param_body_overlaps() {
     let conflict = check_overlap(&[existing], &new, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_some(), "alpha-equivalent Forall types should overlap");
+    assert!(
+        conflict.is_some(),
+        "alpha-equivalent Forall types should overlap"
+    );
 }
 
 #[test]
@@ -422,7 +467,10 @@ fn test_forall_different_param_index_overlaps() {
     let conflict = check_overlap(&[existing], &new, &mut ctx);
     ctx.rollback_transaction();
 
-    assert!(conflict.is_some(), "alpha-equivalent Forall with different param_index should overlap");
+    assert!(
+        conflict.is_some(),
+        "alpha-equivalent Forall with different param_index should overlap"
+    );
 }
 
 #[test]
@@ -451,6 +499,8 @@ fn test_forall_vs_concrete_no_overlap() {
 
     // The new normalization code correctly reports NO overlap here.
     // Forall(0, $v0) and Int<32> are structurally different types.
-    assert!(conflict.is_none(),
-        "Forall vs concrete: normalization correctly distinguishes binder types from concrete types");
+    assert!(
+        conflict.is_none(),
+        "Forall vs concrete: normalization correctly distinguishes binder types from concrete types"
+    );
 }

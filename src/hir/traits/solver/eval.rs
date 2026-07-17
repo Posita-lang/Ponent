@@ -34,7 +34,9 @@
 //! are identified by their nesting depth rather than a global index.
 
 use crate::ast::OverflowPolicy;
-use crate::hir::traits::solver::obligation::{BuiltinImplSource, ImplSource, Obligation, Predicate, SolveError};
+use crate::hir::traits::solver::obligation::{
+    BuiltinImplSource, ImplSource, Obligation, Predicate, SolveError,
+};
 use crate::hir::traits::solver::select::{MAX_RECURSION_DEPTH, SelectionContext};
 use crate::hir::types::{AdtKind, DefId, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
@@ -49,9 +51,18 @@ use crate::symbol::Symbol;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CanonTy {
     // ── Primitives ──
-    Int { bits: u8, signed: bool, overflow_policy: OverflowPolicy },
-    UInt { bits: u8, overflow_policy: OverflowPolicy },
-    Float { bits: u8 },
+    Int {
+        bits: u8,
+        signed: bool,
+        overflow_policy: OverflowPolicy,
+    },
+    UInt {
+        bits: u8,
+        overflow_policy: OverflowPolicy,
+    },
+    Float {
+        bits: u8,
+    },
     Bool,
     Char,
     Byte,
@@ -59,28 +70,75 @@ enum CanonTy {
     Unit,
     Never,
     // ── Variables (not resolved further) ──
-    InferVar { id: usize },
-    GenericParam { index: usize },
-    SkolemVar { id: usize, universe_num: usize },
+    InferVar {
+        id: usize,
+    },
+    GenericParam {
+        index: usize,
+    },
+    SkolemVar {
+        id: usize,
+        universe_num: usize,
+    },
     // ── Composites ──
-    Adt { kind: AdtKind, def_id: DefId, args: Vec<CanonTy> },
+    Adt {
+        kind: AdtKind,
+        def_id: DefId,
+        args: Vec<CanonTy>,
+    },
     Tuple(Vec<CanonTy>),
-    Ref { ty: Box<CanonTy>, mutable: bool },
+    Ref {
+        ty: Box<CanonTy>,
+        mutable: bool,
+    },
     Pointer(Box<CanonTy>),
-    Ptr { size: Box<CanonTy>, pointee: Box<CanonTy> },
-    Fn { params: Vec<CanonTy>, ret: Box<CanonTy> },
-    Array { elem: Box<CanonTy>, size: u64 },
+    Ptr {
+        size: Box<CanonTy>,
+        pointee: Box<CanonTy>,
+    },
+    Fn {
+        params: Vec<CanonTy>,
+        ret: Box<CanonTy>,
+    },
+    Array {
+        elem: Box<CanonTy>,
+        size: u64,
+    },
     Slice(Box<CanonTy>),
     // Binders: the bound variable is preserved as GenericParam, not resolved.
-    Forall { param_index: usize, body: Box<CanonTy> },
-    Exists { param_index: usize, base: Box<CanonTy> },
-    Mu { param_index: usize, body: Box<CanonTy> },
-    Nu { param_index: usize, body: Box<CanonTy> },
-    Poly { quantifiers: Vec<usize>, body: Box<CanonTy> },
+    Forall {
+        param_index: usize,
+        body: Box<CanonTy>,
+    },
+    Exists {
+        param_index: usize,
+        base: Box<CanonTy>,
+    },
+    Mu {
+        param_index: usize,
+        body: Box<CanonTy>,
+    },
+    Nu {
+        param_index: usize,
+        body: Box<CanonTy>,
+    },
+    Poly {
+        quantifiers: Vec<usize>,
+        body: Box<CanonTy>,
+    },
     Coproduct(Vec<CanonTy>),
-    AssociatedType { trait_id: DefId, name: Symbol, self_ty: Box<CanonTy> },
-    DynTrait { traits: Vec<DefId> },
-    Rational { int_bits: u8, frac_bits: u8 },
+    AssociatedType {
+        trait_id: DefId,
+        name: Symbol,
+        self_ty: Box<CanonTy>,
+    },
+    DynTrait {
+        traits: Vec<DefId>,
+    },
+    Rational {
+        int_bits: u8,
+        frac_bits: u8,
+    },
     Error,
     // Sentinel for types we can't canonicalize (should not appear in practice).
     Unknown,
@@ -111,12 +169,22 @@ fn canonicalize_type(ctx: &TypeContext, ty: TypeId, bound: &mut Vec<usize>) -> C
     let resolved = ctx.resolve_binding(ty);
     match ctx.get(resolved) {
         // ── Primitives ──
-        TypeData::Int { bits, signed, overflow_policy } => {
-            CanonTy::Int { bits: *bits, signed: *signed, overflow_policy: *overflow_policy }
-        }
-        TypeData::UInt { bits, overflow_policy } => {
-            CanonTy::UInt { bits: *bits, overflow_policy: *overflow_policy }
-        }
+        TypeData::Int {
+            bits,
+            signed,
+            overflow_policy,
+        } => CanonTy::Int {
+            bits: *bits,
+            signed: *signed,
+            overflow_policy: *overflow_policy,
+        },
+        TypeData::UInt {
+            bits,
+            overflow_policy,
+        } => CanonTy::UInt {
+            bits: *bits,
+            overflow_policy: *overflow_policy,
+        },
         TypeData::Float { bits } => CanonTy::Float { bits: *bits },
         TypeData::Bool => CanonTy::Bool,
         TypeData::Char => CanonTy::Char,
@@ -133,19 +201,26 @@ fn canonicalize_type(ctx: &TypeContext, ty: TypeId, bound: &mut Vec<usize>) -> C
         }
         TypeData::InferVar { id } => CanonTy::InferVar { id: *id },
         TypeData::GenericParam { index, .. } => CanonTy::GenericParam { index: *index },
-        TypeData::SkolemVar { id, universe_num } => {
-            CanonTy::SkolemVar { id: *id, universe_num: *universe_num }
-        }
+        TypeData::SkolemVar { id, universe_num } => CanonTy::SkolemVar {
+            id: *id,
+            universe_num: *universe_num,
+        },
 
         // ── Composites: recurse into children ──
         TypeData::Adt { kind, def_id, args } => CanonTy::Adt {
             kind: *kind,
             def_id: *def_id,
-            args: args.iter().map(|&a| canonicalize_type(ctx, a, bound)).collect(),
+            args: args
+                .iter()
+                .map(|&a| canonicalize_type(ctx, a, bound))
+                .collect(),
         },
-        TypeData::Tuple { elems } => {
-            CanonTy::Tuple(elems.iter().map(|&e| canonicalize_type(ctx, e, bound)).collect())
-        }
+        TypeData::Tuple { elems } => CanonTy::Tuple(
+            elems
+                .iter()
+                .map(|&e| canonicalize_type(ctx, e, bound))
+                .collect(),
+        ),
         TypeData::Ref { ty, mutable } => CanonTy::Ref {
             ty: Box::new(canonicalize_type(ctx, *ty, bound)),
             mutable: *mutable,
@@ -156,7 +231,10 @@ fn canonicalize_type(ctx: &TypeContext, ty: TypeId, bound: &mut Vec<usize>) -> C
             pointee: Box::new(canonicalize_type(ctx, *pointee, bound)),
         },
         TypeData::Fn { params, ret } => CanonTy::Fn {
-            params: params.iter().map(|&p| canonicalize_type(ctx, p, bound)).collect(),
+            params: params
+                .iter()
+                .map(|&p| canonicalize_type(ctx, p, bound))
+                .collect(),
             ret: Box::new(canonicalize_type(ctx, *ret, bound)),
         },
         TypeData::Array { elem, size } => CanonTy::Array {
@@ -166,29 +244,49 @@ fn canonicalize_type(ctx: &TypeContext, ty: TypeId, bound: &mut Vec<usize>) -> C
         TypeData::Slice { elem } => CanonTy::Slice(Box::new(canonicalize_type(ctx, *elem, bound))),
 
         // ── Binders: push the bound variable, recurse, pop ──
-        TypeData::Forall { param_index, body, .. } => {
+        TypeData::Forall {
+            param_index, body, ..
+        } => {
             bound.push(*param_index);
             let body = canonicalize_type(ctx, *body, bound);
             bound.pop();
-            CanonTy::Forall { param_index: *param_index, body: Box::new(body) }
+            CanonTy::Forall {
+                param_index: *param_index,
+                body: Box::new(body),
+            }
         }
-        TypeData::Exists { param_index, base, .. } => {
+        TypeData::Exists {
+            param_index, base, ..
+        } => {
             bound.push(*param_index);
             let base = canonicalize_type(ctx, *base, bound);
             bound.pop();
-            CanonTy::Exists { param_index: *param_index, base: Box::new(base) }
+            CanonTy::Exists {
+                param_index: *param_index,
+                base: Box::new(base),
+            }
         }
-        TypeData::Mu { param_index, body, .. } => {
+        TypeData::Mu {
+            param_index, body, ..
+        } => {
             bound.push(*param_index);
             let body = canonicalize_type(ctx, *body, bound);
             bound.pop();
-            CanonTy::Mu { param_index: *param_index, body: Box::new(body) }
+            CanonTy::Mu {
+                param_index: *param_index,
+                body: Box::new(body),
+            }
         }
-        TypeData::Nu { param_index, body, .. } => {
+        TypeData::Nu {
+            param_index, body, ..
+        } => {
             bound.push(*param_index);
             let body = canonicalize_type(ctx, *body, bound);
             bound.pop();
-            CanonTy::Nu { param_index: *param_index, body: Box::new(body) }
+            CanonTy::Nu {
+                param_index: *param_index,
+                body: Box::new(body),
+            }
         }
         TypeData::Poly { quantifiers, body } => {
             for (idx, _) in quantifiers {
@@ -205,18 +303,31 @@ fn canonicalize_type(ctx: &TypeContext, ty: TypeId, bound: &mut Vec<usize>) -> C
         }
 
         // ── Other composites ──
-        TypeData::Coproduct { alternatives } => {
-            CanonTy::Coproduct(alternatives.iter().map(|&a| canonicalize_type(ctx, a, bound)).collect())
-        }
-        TypeData::AssociatedType { trait_id, name, self_ty } => CanonTy::AssociatedType {
+        TypeData::Coproduct { alternatives } => CanonTy::Coproduct(
+            alternatives
+                .iter()
+                .map(|&a| canonicalize_type(ctx, a, bound))
+                .collect(),
+        ),
+        TypeData::AssociatedType {
+            trait_id,
+            name,
+            self_ty,
+        } => CanonTy::AssociatedType {
             trait_id: *trait_id,
             name: name.clone(),
             self_ty: Box::new(canonicalize_type(ctx, *self_ty, bound)),
         },
-        TypeData::DynTrait { traits } => CanonTy::DynTrait { traits: traits.clone() },
-        TypeData::Rational { int_bits, frac_bits } => {
-            CanonTy::Rational { int_bits: *int_bits, frac_bits: *frac_bits }
-        }
+        TypeData::DynTrait { traits } => CanonTy::DynTrait {
+            traits: traits.clone(),
+        },
+        TypeData::Rational {
+            int_bits,
+            frac_bits,
+        } => CanonTy::Rational {
+            int_bits: *int_bits,
+            frac_bits: *frac_bits,
+        },
     }
 }
 
@@ -370,30 +481,31 @@ fn compute_goal_key(obligation: &Obligation, ctx: &TypeContext) -> Option<GoalKe
 fn compute_goal_key_for_predicate(predicate: &Predicate, ctx: &TypeContext) -> Option<GoalKey> {
     let mut bound = Vec::new();
     match predicate {
-        Predicate::Trait { trait_id, self_ty, args } => {
-            Some(GoalKey {
-                kind: GoalKind::Trait,
-                trait_id: Some(*trait_id),
-                self_ty: canonicalize_type(ctx, *self_ty, &mut bound),
-                args: args.iter().map(|a| canonicalize_type(ctx, *a, &mut bound)).collect(),
-            })
-        }
-        Predicate::AutoTrait { trait_id, self_ty } => {
-            Some(GoalKey {
-                kind: GoalKind::AutoTrait,
-                trait_id: Some(*trait_id),
-                self_ty: canonicalize_type(ctx, *self_ty, &mut bound),
-                args: vec![],
-            })
-        }
-        Predicate::Sized { ty } => {
-            Some(GoalKey {
-                kind: GoalKind::Sized,
-                trait_id: None,
-                self_ty: canonicalize_type(ctx, *ty, &mut bound),
-                args: vec![],
-            })
-        }
+        Predicate::Trait {
+            trait_id,
+            self_ty,
+            args,
+        } => Some(GoalKey {
+            kind: GoalKind::Trait,
+            trait_id: Some(*trait_id),
+            self_ty: canonicalize_type(ctx, *self_ty, &mut bound),
+            args: args
+                .iter()
+                .map(|a| canonicalize_type(ctx, *a, &mut bound))
+                .collect(),
+        }),
+        Predicate::AutoTrait { trait_id, self_ty } => Some(GoalKey {
+            kind: GoalKind::AutoTrait,
+            trait_id: Some(*trait_id),
+            self_ty: canonicalize_type(ctx, *self_ty, &mut bound),
+            args: vec![],
+        }),
+        Predicate::Sized { ty } => Some(GoalKey {
+            kind: GoalKind::Sized,
+            trait_id: None,
+            self_ty: canonicalize_type(ctx, *ty, &mut bound),
+            args: vec![],
+        }),
         _ => None,
     }
 }

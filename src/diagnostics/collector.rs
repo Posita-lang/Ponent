@@ -62,11 +62,7 @@ impl DiagnosticCollector {
     /// inspect the diagnostics via `self.errors()` or `self.warnings()`.
     #[must_use]
     pub fn check(self) -> Result<(), Self> {
-        if self.has_errors() {
-            Err(self)
-        } else {
-            Ok(())
-        }
+        if self.has_errors() { Err(self) } else { Ok(()) }
     }
 
     /// Returns all error-level diagnostics as a slice.
@@ -76,10 +72,7 @@ impl DiagnosticCollector {
 
     /// Returns all warning-level diagnostics as a slice.
     pub fn warnings(&self) -> Vec<&Diagnostic> {
-        self.diagnostics
-            .iter()
-            .filter(|d| d.is_warning())
-            .collect()
+        self.diagnostics.iter().filter(|d| d.is_warning()).collect()
     }
 
     /// Iterate over diagnostics, yielding them with 1-based index for display.
@@ -106,9 +99,7 @@ impl Default for DiagnosticCollector {
 
 impl From<Vec<Diagnostic>> for DiagnosticCollector {
     fn from(diags: Vec<Diagnostic>) -> Self {
-        DiagnosticCollector {
-            diagnostics: diags,
-        }
+        DiagnosticCollector { diagnostics: diags }
     }
 }
 

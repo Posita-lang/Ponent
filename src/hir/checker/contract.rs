@@ -167,8 +167,7 @@ impl GuaranteeChain {
             debug_assert!(
                 ok,
                 "WFST(0): expected unsatisfiable guarantee, but got pre={:?} post={:?}",
-                current_guarantee.pre,
-                current_guarantee.post
+                current_guarantee.pre, current_guarantee.post
             );
             ok
         } else {

@@ -98,8 +98,14 @@ pub fn register_builtins(
     // Signed: Int<8>, Int<16>, Int<32>, Int<64>
     // Unsigned: UInt<8>, UInt<16>, UInt<32>, UInt<64>
     for &(bits, signed) in &[
-        (8, true), (16, true), (32, true), (64, true),
-        (8, false), (16, false), (32, false), (64, false),
+        (8, true),
+        (16, true),
+        (32, true),
+        (64, true),
+        (8, false),
+        (16, false),
+        (32, false),
+        (64, false),
     ] {
         let int_ty = ctx.int(bits, signed);
         for &trait_id in &int_arith_traits {
@@ -273,8 +279,8 @@ pub fn register_builtins(
             missing_match: None,
             exhaustive: false,
             c_layout: false,
-                        transparent: false,
-                        expanded_layout_attrs: vec![],
+            transparent: false,
+            expanded_layout_attrs: vec![],
             packed: false,
             endian: None,
             bit_order: None,
@@ -320,8 +326,8 @@ pub fn register_builtins(
             missing_match: None,
             exhaustive: false,
             c_layout: false,
-                        transparent: false,
-                        expanded_layout_attrs: vec![],
+            transparent: false,
+            expanded_layout_attrs: vec![],
             packed: false,
             endian: None,
             bit_order: None,
@@ -377,8 +383,8 @@ pub fn register_builtins(
             missing_match: None,
             exhaustive: false,
             c_layout: false,
-                        transparent: false,
-                        expanded_layout_attrs: vec![],
+            transparent: false,
+            expanded_layout_attrs: vec![],
             packed: false,
             endian: None,
             bit_order: None,

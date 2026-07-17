@@ -33,10 +33,10 @@ pub mod select;
 pub mod test;
 
 // Re-export the most commonly used types at the solver level.
-pub use obligation::{
-    BuiltinImplSource, CopyKind, ImplSource, Obligation, ObligationCause, ObligationCauseCode, Predicate,
-    ProjectionTy, SolveError,
-};
-pub use select::SelectionContext;
 pub use eval::evaluate_goal;
 pub use fulfill::FulfillmentContext;
+pub use obligation::{
+    BuiltinImplSource, CopyKind, ImplSource, Obligation, ObligationCause, ObligationCauseCode,
+    Predicate, ProjectionTy, SolveError,
+};
+pub use select::SelectionContext;

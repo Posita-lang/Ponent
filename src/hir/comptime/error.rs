@@ -26,12 +26,16 @@ pub enum ComptimeError {
 impl std::fmt::Display for ComptimeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ComptimeError::StepLimitExceeded => write!(f, "comptime step limit exceeded (possible infinite loop)"),
+            ComptimeError::StepLimitExceeded => {
+                write!(f, "comptime step limit exceeded (possible infinite loop)")
+            }
             ComptimeError::DivisionByZero => write!(f, "division by zero in comptime expression"),
             ComptimeError::Overflow => write!(f, "integer overflow in comptime expression"),
             ComptimeError::TypeError(msg) => write!(f, "comptime type error: {}", msg),
             ComptimeError::AssertionFailed(msg) => write!(f, "comptime assertion failed: {}", msg),
-            ComptimeError::UnknownIdentifier(name) => write!(f, "unknown identifier in comptime: {}", name),
+            ComptimeError::UnknownIdentifier(name) => {
+                write!(f, "unknown identifier in comptime: {}", name)
+            }
             ComptimeError::NotComptimeAllowed(msg) => write!(f, "{}", msg),
             ComptimeError::Deferred => write!(f, "expression cannot be evaluated at compile time"),
             ComptimeError::Internal(msg) => write!(f, "internal comptime error: {}", msg),

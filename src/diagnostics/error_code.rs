@@ -38,7 +38,7 @@ impl ErrorCategory {
     pub fn ansi_color(&self) -> &'static str {
         match self {
             ErrorCategory::Internal => "\x1b[31;1m", // bright red
-            _ => "\x1b[31m",                          // normal red
+            _ => "\x1b[31m",                         // normal red
         }
     }
 }
@@ -230,28 +230,57 @@ impl ErrorCode {
     pub fn category(&self) -> ErrorCategory {
         use ErrorCode::*;
         match self {
-            ExpectedToken | UnexpectedEOF | UnexpectedToken | ParseError
-            | ExpectedIdentifier | RecursionLimitExceeded => ErrorCategory::Parse,
+            ExpectedToken
+            | UnexpectedEOF
+            | UnexpectedToken
+            | ParseError
+            | ExpectedIdentifier
+            | RecursionLimitExceeded => ErrorCategory::Parse,
 
-            NoSuchField | TypeNotFound | NameNotFound | UndefinedType
-            | GenericArgsOnNonGeneric | CannotResolveImport | NoDefaultValue
-            | ArraySizeNotConstant | UnexpectedTopLevel => ErrorCategory::Resolution,
+            NoSuchField
+            | TypeNotFound
+            | NameNotFound
+            | UndefinedType
+            | GenericArgsOnNonGeneric
+            | CannotResolveImport
+            | NoDefaultValue
+            | ArraySizeNotConstant
+            | UnexpectedTopLevel => ErrorCategory::Resolution,
 
-            ContractNonBool | EnsuresNonBool | DecreasesNonInt
-            | ContractBoolAtReturn => ErrorCategory::Contract,
+            ContractNonBool | EnsuresNonBool | DecreasesNonInt | ContractBoolAtReturn => {
+                ErrorCategory::Contract
+            }
 
-            TraitNotFound | ImplMissingMethod | ImplMissingAssocType
-            | ImplSignatureMismatch | OrphanImpl | InherentImplOnNonAdt
+            TraitNotFound
+            | ImplMissingMethod
+            | ImplMissingAssocType
+            | ImplSignatureMismatch
+            | OrphanImpl
+            | InherentImplOnNonAdt
             | TraitViolatesTermination => ErrorCategory::Trait,
 
-            TypeMismatch | InvalidBinaryOp | InvalidUnaryOp | WrongNumberOfArgs
-            | ExpectedBool | ExpectedInteger | ExpectedResult | ExpectedFuture
-            | ReturnOutsideFunction | ReturnWithoutValue | LeaveOutsideLoop
-            | ContinueOutsideLoop | CannotLeaveClosure | SetNoPattern
-            | LetNeedsInit | InvalidLValue => ErrorCategory::Type,
+            TypeMismatch
+            | InvalidBinaryOp
+            | InvalidUnaryOp
+            | WrongNumberOfArgs
+            | ExpectedBool
+            | ExpectedInteger
+            | ExpectedResult
+            | ExpectedFuture
+            | ReturnOutsideFunction
+            | ReturnWithoutValue
+            | LeaveOutsideLoop
+            | ContinueOutsideLoop
+            | CannotLeaveClosure
+            | SetNoPattern
+            | LetNeedsInit
+            | InvalidLValue => ErrorCategory::Type,
 
-            SafeCastFromRef | SafeCastNonPrimitive | UnsafeCastRefToInt
-            | UnsafeCastIncompatible | UnknownAttribute => ErrorCategory::Type,
+            SafeCastFromRef
+            | SafeCastNonPrimitive
+            | UnsafeCastRefToInt
+            | UnsafeCastIncompatible
+            | UnknownAttribute => ErrorCategory::Type,
         }
     }
 
@@ -260,7 +289,8 @@ impl ErrorCode {
     /// and suggested fixes.
     pub fn explain(&self) -> &'static str {
         match self {
-            Self::ExpectedToken => "A specific token was expected at the current parse position but not found.
+            Self::ExpectedToken => {
+                "A specific token was expected at the current parse position but not found.
 
 This typically occurs due to:
   - Missing closing delimiters: `)`, `}`, `]`
@@ -275,9 +305,11 @@ Example of invalid code:
 Fix: add the missing token:
   def foo(x: Int<32>) {
     return x;
-  }",
+  }"
+            }
 
-            Self::UnexpectedEOF => "The source file ends before the parser expected it to.
+            Self::UnexpectedEOF => {
+                "The source file ends before the parser expected it to.
 
 This usually means:
   - A block, parentheses, or bracket was left unclosed
@@ -288,9 +320,11 @@ Example:
     return x;
   // Missing `}` at end
 
-Fix: ensure all `{`, `(`, `[` are properly closed.",
+Fix: ensure all `{`, `(`, `[` are properly closed."
+            }
 
-            Self::UnexpectedToken => "An unexpected token was encountered during parsing.
+            Self::UnexpectedToken => {
+                "An unexpected token was encountered during parsing.
 
 The parser found a token that does not fit the grammar at the current position.
 This may be a typo, a keyword used as an identifier, or misplaced syntax.
@@ -300,16 +334,20 @@ Example:
     return x;
   } def // stray `def`
 
-Fix: remove or reposition the stray token.",
+Fix: remove or reposition the stray token."
+            }
 
-            Self::ParseError => "A general parse error — the input does not conform to the language grammar.
+            Self::ParseError => {
+                "A general parse error — the input does not conform to the language grammar.
 
 Check for:
   - Missing keywords
   - Incorrect punctuation
-  - Malformed expressions or types",
+  - Malformed expressions or types"
+            }
 
-            Self::NoSuchField => "A field access was attempted on a struct or enum type that does not have
+            Self::NoSuchField => {
+                "A field access was attempted on a struct or enum type that does not have
 a field with that name.
 
 Example:
@@ -319,13 +357,17 @@ Example:
     return p.z; // error: no field `z` on type Point
   }
 
-Fix: use an existing field name. Available fields are listed in the error message.",
+Fix: use an existing field name. Available fields are listed in the error message."
+            }
 
-            Self::TypeNotFound => "A type definition that was referenced could not be found in the symbol table.
+            Self::TypeNotFound => {
+                "A type definition that was referenced could not be found in the symbol table.
 
-This is an internal compiler error if it occurs after successful name resolution.",
+This is an internal compiler error if it occurs after successful name resolution."
+            }
 
-            Self::ContractNonBool => "A contract condition (`requires` or `invariant`) must evaluate to a boolean
+            Self::ContractNonBool => {
+                "A contract condition (`requires` or `invariant`) must evaluate to a boolean
 value (`Bool`), but a non-boolean expression was provided.
 
 Example:
@@ -335,18 +377,22 @@ Example:
     return x;
   }
 
-Fix: change the condition to a boolean expression, e.g. `requires x > 0`.",
+Fix: change the condition to a boolean expression, e.g. `requires x > 0`."
+            }
 
-            Self::EnsuresNonBool => "An `ensures` clause must evaluate to a boolean value (`Bool`).
+            Self::EnsuresNonBool => {
+                "An `ensures` clause must evaluate to a boolean value (`Bool`).
 
 Example:
   def foo(x: Int<32>) -> Int<32>
     ensures x * 2  // error
   { return x; }
 
-Fix: `ensures result > 0` or another boolean predicate.",
+Fix: `ensures result > 0` or another boolean predicate."
+            }
 
-            Self::DecreasesNonInt => "A `decreases` or `terminates` expression must evaluate to an integer type,
+            Self::DecreasesNonInt => {
+                "A `decreases` or `terminates` expression must evaluate to an integer type,
 as it is used as a termination metric for recursive functions.
 
 Example:
@@ -356,9 +402,11 @@ Example:
     ...
   }
 
-Fix: use an integer metric: `decreases n`.",
+Fix: use an integer metric: `decreases n`."
+            }
 
-            Self::TypeMismatch => "A type mismatch occurred: the compiler expected a value of one type but
+            Self::TypeMismatch => {
+                "A type mismatch occurred: the compiler expected a value of one type but
 found a value of a different type.
 
 This is the most common kind of error in Posita. It can happen when:
@@ -375,18 +423,22 @@ Example:
     set result = add(10, true); // error: Bool != Int<32>
   }
 
-Fix: ensure the types match. Use explicit casts with `as` if needed.",
+Fix: ensure the types match. Use explicit casts with `as` if needed."
+            }
 
-            Self::WrongNumberOfArgs => "A function was called with the wrong number of arguments.
+            Self::WrongNumberOfArgs => {
+                "A function was called with the wrong number of arguments.
 
 Example:
   def add(a: Int<32>, b: Int<32>) -> Int<32> { ... }
   add(10);      // error: expected 2 args, found 1
   add(10, 20, 30); // error: expected 2 args, found 3
 
-Fix: provide exactly the number of parameters declared in the function signature.",
+Fix: provide exactly the number of parameters declared in the function signature."
+            }
 
-            Self::ExpectedBool => "A boolean value was expected but a non-boolean expression was provided.
+            Self::ExpectedBool => {
+                "A boolean value was expected but a non-boolean expression was provided.
 This commonly occurs in:
   - `if` and `while` conditions
   - Contract clauses (`requires`, `ensures`, `invariant`)
@@ -394,9 +446,11 @@ This commonly occurs in:
 Example:
   if 42 { ... }  // error: expected Bool, found Int<32>
 
-Fix: use a comparison: `if x != 0 { ... }`.",
+Fix: use a comparison: `if x != 0 { ... }`."
+            }
 
-            Self::ReturnOutsideFunction => "A `return` statement was used outside of a function body.
+            Self::ReturnOutsideFunction => {
+                "A `return` statement was used outside of a function body.
 
 `return` is only valid inside `def` function bodies. It cannot appear at the
 top level of a module or inside a `type` definition.
@@ -404,9 +458,11 @@ top level of a module or inside a `type` definition.
 Example:
   return 42; // error: top-level return
 
-Fix: wrap the code in a function, or remove the `return`.",
+Fix: wrap the code in a function, or remove the `return`."
+            }
 
-            Self::LeaveOutsideLoop => "A `leave` statement was used outside of a loop construct
+            Self::LeaveOutsideLoop => {
+                "A `leave` statement was used outside of a loop construct
 (`while`, `for`, `loop`, or a labeled block).
 
 `leave` is used to exit loops early. Use `return` to exit a function.
@@ -416,9 +472,11 @@ Example:
     leave; // error: no loop to leave
   }
 
-Fix: use `return` instead, or enclose the code in a loop.",
+Fix: use `return` instead, or enclose the code in a loop."
+            }
 
-            Self::ImplMissingMethod => "An `impl` block is missing a required method from the trait it implements.
+            Self::ImplMissingMethod => {
+                "An `impl` block is missing a required method from the trait it implements.
 
 Every method declared in the trait must have a corresponding `def` in the impl block.
 
@@ -430,12 +488,15 @@ Example:
     // error: missing method `format`
   }
 
-Fix: add the missing method to the impl block.",
+Fix: add the missing method to the impl block."
+            }
 
-            Self::OrphanImpl => "An `impl` block violates the orphan rule: the type and trait must be
+            Self::OrphanImpl => {
+                "An `impl` block violates the orphan rule: the type and trait must be
 defined in the current crate, or the trait must be from the current crate.
 
-This restriction prevents conflicting implementations across crates.",
+This restriction prevents conflicting implementations across crates."
+            }
 
             _ => "No detailed explanation is available for this error code yet.",
         }
@@ -444,7 +505,10 @@ This restriction prevents conflicting implementations across crates.",
     /// Returns a URL to the online error code documentation,
     /// matching the pattern of rustc's `https://doc.rust-lang.org/error_codes/E030.html`.
     pub fn url(&self) -> String {
-        format!("https://doc.posita-lang.org/error_codes/{}.html", self.code())
+        format!(
+            "https://doc.posita-lang.org/error_codes/{}.html",
+            self.code()
+        )
     }
 
     /// The diagnostic URL, formatted as an ANSI hyperlink if the terminal supports it.

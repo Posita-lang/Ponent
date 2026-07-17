@@ -16,13 +16,10 @@ pub mod level;
 pub use chain::CallChain;
 pub use collector::DiagnosticCollector;
 pub use emitter::{
-    DiagnosticEmitter,
+    DiagnosticEmitter, colored::ColoredEmitter, html::HtmlEmitter, json::JsonEmitter,
     plain::PlainEmitter,
-    colored::ColoredEmitter,
-    json::JsonEmitter,
-    html::HtmlEmitter,
 };
-pub use error_code::{ErrorCode, ErrorCategory};
+pub use error_code::{ErrorCategory, ErrorCode};
 pub use label::{AnnotationKind, Label, SourceContext};
 pub use level::DiagnosticLevel;
 
@@ -241,9 +238,7 @@ impl Diagnostic {
 
     /// Get the main location string for display.
     pub fn location_string(&self) -> String {
-        self.span
-            .map(|s| format!("at {}", s))
-            .unwrap_or_default()
+        self.span.map(|s| format!("at {}", s)).unwrap_or_default()
     }
 }
 
@@ -313,7 +308,9 @@ impl fmt::Display for Diagnostic {
         let level_str = self.level.label().to_uppercase();
         let span_str = self.location_string();
 
-        writeln!(f, "[{code} {level}] {msg} {span}",
+        writeln!(
+            f,
+            "[{code} {level}] {msg} {span}",
             code = code_str,
             level = level_str,
             msg = self.message,
@@ -322,7 +319,13 @@ impl fmt::Display for Diagnostic {
 
         // Labels
         for lbl in &self.labels {
-            writeln!(f, "  {}--> {}: {}", lbl.underline_char(), lbl.span, lbl.message)?;
+            writeln!(
+                f,
+                "  {}--> {}: {}",
+                lbl.underline_char(),
+                lbl.span,
+                lbl.message
+            )?;
         }
 
         // Call chain
@@ -350,12 +353,7 @@ impl fmt::Display for Diagnostic {
 pub fn explain_error_code(code_str: &str) -> String {
     match ErrorCode::from_str(code_str) {
         Some(code) => {
-            format!(
-                "{}: {}\n\n{}",
-                code.code(),
-                code.title(),
-                code.explain()
-            )
+            format!("{}: {}\n\n{}", code.code(), code.title(), code.explain())
         }
         None => format!("Unknown error code: {}", code_str),
     }
@@ -428,8 +426,7 @@ mod tests {
 
     #[test]
     fn test_from_string_code() {
-        let diag = Diagnostic::error("test")
-            .with_code_str("E030");
+        let diag = Diagnostic::error("test").with_code_str("E030");
         assert_eq!(diag.code.unwrap().code(), "E030");
     }
 
@@ -457,8 +454,7 @@ mod tests {
 
     #[test]
     fn test_help_text() {
-        let diag = Diagnostic::error("test")
-            .with_help("try adding a type annotation");
+        let diag = Diagnostic::error("test").with_help("try adding a type annotation");
         assert_eq!(diag.help.as_deref(), Some("try adding a type annotation"));
         let text = diag.to_string();
         assert!(text.contains("try adding a type annotation"));
@@ -468,7 +464,13 @@ mod tests {
     fn test_error_category() {
         assert_eq!(ErrorCode::TypeMismatch.category(), ErrorCategory::Type);
         assert_eq!(ErrorCode::ExpectedToken.category(), ErrorCategory::Parse);
-        assert_eq!(ErrorCode::ContractNonBool.category(), ErrorCategory::Contract);
-        assert_eq!(ErrorCode::ImplMissingMethod.category(), ErrorCategory::Trait);
+        assert_eq!(
+            ErrorCode::ContractNonBool.category(),
+            ErrorCategory::Contract
+        );
+        assert_eq!(
+            ErrorCode::ImplMissingMethod.category(),
+            ErrorCategory::Trait
+        );
     }
 }

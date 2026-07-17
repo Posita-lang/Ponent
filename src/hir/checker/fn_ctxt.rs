@@ -115,9 +115,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         self.checker.ctx.get(actual)
                     ),
                 };
-                let mut diag = Diagnostic::error(msg)
-                    .with_code_str("E030")
-                    .with_span(span);
+                let mut diag = Diagnostic::error(msg).with_code_str("E030").with_span(span);
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
                     diag = diag.with_suggestion(suggestion);
                 }
@@ -138,14 +136,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         TypeVariableKind::Any
                     }
                 };
-                let ty = self.new_infer_var(kind, crate::hir::infer::VarOrigin::Expression(Some(*span)));
+                let ty =
+                    self.new_infer_var(kind, crate::hir::infer::VarOrigin::Expression(Some(*span)));
                 Ok((HirExpr::Literal(lit.clone(), ty, *span), ty))
             }
             Expr::Ident(name, span) => {
                 // Check the local variable type cache first (set by VariableDef)
                 if let Some(ty) = self.checker.local_variable_types.get(*name) {
                     // Reading a mutable global outside @trusted is forbidden
-                    if self.checker.mutable_globals.contains(name) && !self.checker.current_function_trusted {
+                    if self.checker.mutable_globals.contains(name)
+                        && !self.checker.current_function_trusted
+                    {
                         self.checker.diagnostics.push(
                             Diagnostic::error(format!(
                                 "cannot read mutable global `{}` outside `@trusted` function",
@@ -202,8 +203,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             } => {
                 let (left_hir, left_ty) = self.infer_expr(left)?;
                 let (right_hir, right_ty) = self.infer_expr(right)?;
-                let result_ty =
-                    self.checker.binary_op_type(*op, left_ty, right_ty, *span)?;
+                let result_ty = self.checker.binary_op_type(*op, left_ty, right_ty, *span)?;
                 Ok((
                     HirExpr::BinaryOp {
                         left: Box::new(left_hir),
@@ -347,7 +347,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         if !method_names.is_empty() {
                             diag = diag.with_suggestion(format!(
                                 "available methods: {}",
-                                method_names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                                method_names
+                                    .iter()
+                                    .map(|s| s.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
                             ));
                         }
                         self.checker.diagnostics.push(diag);
@@ -365,7 +369,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         if let Ok(ty) = self.resolve_type(&type_path) {
                             // Look up the method on the resolved type.
                             // lookup_method also handles inherent methods.
-                            if let Some((param_tys, ret_ty)) = self.checker.lookup_method(ty, method_name) {
+                            if let Some((param_tys, ret_ty)) =
+                                self.checker.lookup_method(ty, method_name)
+                            {
                                 // Static method call: no self parameter to skip.
                                 // The method's param_tys already reflect the full signature.
                                 if param_tys.len() != args.len() {
@@ -719,7 +725,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         let mut hir_args = Vec::new();
                         // Pass the payload (if any) as the argument.
                         if let Some(p) = &payload {
-                            let expected = method_param_tys.first().copied().unwrap_or(self.checker.ctx.error());
+                            let expected = method_param_tys
+                                .first()
+                                .copied()
+                                .unwrap_or(self.checker.ctx.error());
                             let hir_arg = self.check_expr(
                                 p,
                                 Expectation::HasType(expected),
@@ -773,7 +782,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         // with the concrete args works correctly.
                         if let Type::Path(p, _) = ty {
                             if p.len() == 1 {
-                                if let Some((i, _)) = binding.params.iter().enumerate().find(|(_, tp)| tp.name == p[0]) {
+                                if let Some((i, _)) = binding
+                                    .params
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(_, tp)| tp.name == p[0])
+                                {
                                     let gp = self.checker.ctx.generic_param(i, p[0].clone());
                                     let result = self.checker.ctx.subst(gp, &subst);
                                     return Ok(result);
@@ -853,7 +867,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         .ty
                         .as_ref()
                         .map(|t| self.resolve_type(t))
-                        .unwrap_or_else(|| Ok(self.new_infer_var(TypeVariableKind::Any, crate::hir::infer::VarOrigin::Expression(Some(param.span)))))?;
+                        .unwrap_or_else(|| {
+                            Ok(self.new_infer_var(
+                                TypeVariableKind::Any,
+                                crate::hir::infer::VarOrigin::Expression(Some(param.span)),
+                            ))
+                        })?;
                     hir_params.push(HirParam {
                         name: param.name.clone(),
                         ty,
@@ -866,7 +885,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // into the enclosing function's scope.
                 let _closure_scope = self.checker.enter_var_scope();
                 for p in &hir_params {
-                    self.checker.local_variable_types.insert(p.name.clone(), p.ty);
+                    self.checker
+                        .local_variable_types
+                        .insert(p.name.clone(), p.ty);
                 }
                 self.checker.push_ctx(CtxKind::Closure, *span, None);
                 let body_hir = self.check_block(body)?;
@@ -1416,8 +1437,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
             Expr::Path(path, span) => {
                 self.checker.diagnostics.push(
-                    Diagnostic::error(format!("unresolved path: {}", path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")))
-                        .with_span(*span),
+                    Diagnostic::error(format!(
+                        "unresolved path: {}",
+                        path.iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join("::")
+                    ))
+                    .with_span(*span),
                 );
                 Ok((HirExpr::Error(*span), self.checker.ctx.error()))
             }
@@ -1434,12 +1461,22 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     .with_help("`@compile_error` halts compilation unconditionally when evaluated")
                     .with_span(*span);
                 self.checker.diagnostics.push(diag);
-                Ok((HirExpr::CompileError(msg.clone(), *span), self.checker.ctx.error()))
+                Ok((
+                    HirExpr::CompileError(msg.clone(), *span),
+                    self.checker.ctx.error(),
+                ))
             }
             Expr::Task { body, span } => {
                 let block = self.check_block(body)?;
                 let ty = self.checker.ctx.unit();
-                Ok((HirExpr::Task { block, ty, span: *span }, ty))
+                Ok((
+                    HirExpr::Task {
+                        block,
+                        ty,
+                        span: *span,
+                    },
+                    ty,
+                ))
             }
         }
     }
@@ -1558,7 +1595,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                     // The resolver creates a placeholder alias with no body;
                                     // the actual type is in local_type_param_cache.
                                     if path.len() == 1 {
-                                        if let Some(&ty) = self.checker.local_type_param_cache.get(&path[0]) {
+                                        if let Some(&ty) =
+                                            self.checker.local_type_param_cache.get(&path[0])
+                                        {
                                             return Ok(ty);
                                         }
                                     }
@@ -1572,7 +1611,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 Ok(self.checker.ctx.struct_ty(def_id, vec![]))
                             } else {
                                 let args: Vec<TypeId> = (0..binding.params.len())
-                                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained, crate::hir::infer::VarOrigin::Synthetic))
+                                    .map(|_| {
+                                        self.new_infer_var(
+                                            TypeVariableKind::Unconstrained,
+                                            crate::hir::infer::VarOrigin::Synthetic,
+                                        )
+                                    })
                                     .collect();
                                 Ok(self.checker.ctx.struct_ty(def_id, args))
                             }
@@ -1582,7 +1626,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 Ok(self.checker.ctx.enum_ty(def_id, vec![]))
                             } else {
                                 let args: Vec<TypeId> = (0..binding.params.len())
-                                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained, crate::hir::infer::VarOrigin::Synthetic))
+                                    .map(|_| {
+                                        self.new_infer_var(
+                                            TypeVariableKind::Unconstrained,
+                                            crate::hir::infer::VarOrigin::Synthetic,
+                                        )
+                                    })
                                     .collect();
                                 Ok(self.checker.ctx.enum_ty(def_id, args))
                             }
@@ -1608,18 +1657,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     } else if path[0].eq_str("Never") {
                         Ok(self.checker.ctx.never())
                     } else {
-                            // Check if this is a generic type parameter registered in the local cache
-                            if path.len() == 1 {
-                                if let Some(&ty) = self.checker.local_type_param_cache.get(&path[0])
-                                {
-                                    return Ok(ty);
-                                }
+                        // Check if this is a generic type parameter registered in the local cache
+                        if path.len() == 1 {
+                            if let Some(&ty) = self.checker.local_type_param_cache.get(&path[0]) {
+                                return Ok(ty);
                             }
-                            Err(Diagnostic::error(format!("type '{}' not found", path[0]))
-                                .with_span(*span))
                         }
+                        Err(Diagnostic::error(format!("type '{}' not found", path[0]))
+                            .with_span(*span))
                     }
                 }
+            }
             Type::Generic(base, args, span) => {
                 if let Type::Path(path, _) = base.as_ref() {
                     if path.len() == 1 {
@@ -1647,33 +1695,31 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             let q = args.get(1).and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
                                 .ok_or_else(|| Diagnostic::error("Rational requires a compile-time constant integer bit count for the fractional part").with_span(*span))?;
                             if p == 0 || p > 64 || q == 0 || q > 64 {
-                                return Err(Diagnostic::error(
-                                    "Rational bit counts must be 1..64",
-                                )
-                                .with_span(*span));
+                                return Err(Diagnostic::error("Rational bit counts must be 1..64")
+                                    .with_span(*span));
                             }
                             return Ok(self.checker.ctx.rational(p, q));
                         } else if path[0].eq_str("Ptr") {
-                                let mut size = self.checker.ctx.usize();
-                                let mut pointee = self.checker.ctx.error();
-                                for arg in args {
-                                    let ty = self.resolve_type(arg.ty())?;
-                                    match arg {
-                                        GenericArg::Named(name, _) if name.eq_str("size") => size = ty,
-                                        GenericArg::Named(name, _) if name.eq_str("pointee") => {
-                                            pointee = ty
-                                        }
-                                        GenericArg::Positional(_) => {
-                                            if self.checker.ctx.is_error(pointee) {
-                                                pointee = ty;
-                                            } else {
-                                                size = ty;
-                                            }
-                                        }
-                                        _ => {}
+                            let mut size = self.checker.ctx.usize();
+                            let mut pointee = self.checker.ctx.error();
+                            for arg in args {
+                                let ty = self.resolve_type(arg.ty())?;
+                                match arg {
+                                    GenericArg::Named(name, _) if name.eq_str("size") => size = ty,
+                                    GenericArg::Named(name, _) if name.eq_str("pointee") => {
+                                        pointee = ty
                                     }
+                                    GenericArg::Positional(_) => {
+                                        if self.checker.ctx.is_error(pointee) {
+                                            pointee = ty;
+                                        } else {
+                                            size = ty;
+                                        }
+                                    }
+                                    _ => {}
                                 }
-                                return Ok(self.checker.ctx.ptr(size, pointee));
+                            }
+                            return Ok(self.checker.ctx.ptr(size, pointee));
                         } else if path[0].eq_str("USize") {
                             return Ok(self.checker.ctx.usize());
                         }
@@ -1739,10 +1785,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     // Non-literal size: try to evaluate it as a comptime expression.
                     match self.infer_expr(size) {
                         Ok((size_hir, _size_ty)) => {
-                            let mut eval = ComptimeEvalContext::new(
-                                self.checker.ctx,
-                                self.checker.symbols,
-                            );
+                            let mut eval =
+                                ComptimeEvalContext::new(self.checker.ctx, self.checker.symbols);
                             for (name, (params, body)) in &self.checker.comptime_fn_registry {
                                 eval.register_fn(name.clone(), params.clone(), body.clone());
                             }
@@ -1750,22 +1794,26 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 Ok(ComptimeValue::Int(n)) if n >= 0 => {
                                     Ok(self.checker.ctx.array(inner, n as u64))
                                 }
-                                Ok(ComptimeValue::Int(n)) => {
-                                    Err(Diagnostic::error(
-                                        format!("array size must be a non-negative integer, found {}", n),
-                                    ).with_span(*span))
-                                }
+                                Ok(ComptimeValue::Int(n)) => Err(Diagnostic::error(format!(
+                                    "array size must be a non-negative integer, found {}",
+                                    n
+                                ))
+                                .with_span(*span)),
                                 Ok(_) => Err(Diagnostic::error(
                                     "array size must evaluate to an integer at compile time",
-                                ).with_span(*span)),
-                                Err(e) => Err(Diagnostic::error(
-                                    format!("array size evaluation failed: {}", e),
-                                ).with_span(*span)),
+                                )
+                                .with_span(*span)),
+                                Err(e) => Err(Diagnostic::error(format!(
+                                    "array size evaluation failed: {}",
+                                    e
+                                ))
+                                .with_span(*span)),
                             }
                         }
                         Err(e) => Err(Diagnostic::error(
                             "array size must be a compile-time constant integer",
-                        ).with_span(*span)),
+                        )
+                        .with_span(*span)),
                     }
                 }
             }
@@ -1848,10 +1896,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         .diagnostics
                         .push(Diagnostic::error("invariant must be boolean").with_span(*span));
                 }
-                Ok(self
-                    .checker
-                    .ctx
-                    .exists(self.checker.ctx.fresh_param_index(), name.clone(), base_ty, *invariant.clone()))
+                Ok(self.checker.ctx.exists(
+                    self.checker.ctx.fresh_param_index(),
+                    name.clone(),
+                    base_ty,
+                    *invariant.clone(),
+                ))
             }
             Type::WhereShorthand {
                 base,
@@ -1869,7 +1919,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         .diagnostics
                         .push(Diagnostic::error("invariant must be boolean").with_span(*span));
                 }
-                Ok(self.checker.ctx.exists(self.checker.ctx.fresh_param_index(), name, base_ty, inv))
+                Ok(self.checker.ctx.exists(
+                    self.checker.ctx.fresh_param_index(),
+                    name,
+                    base_ty,
+                    inv,
+                ))
             }
             Type::Literal(expr, _) => {
                 let (_, ty) = self.infer_expr(expr)?;
@@ -1946,8 +2001,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     /// Create a fresh inference variable with the given kind.
-    pub fn new_infer_var(&mut self, kind: TypeVariableKind, origin: crate::hir::infer::VarOrigin) -> TypeId {
-        self.checker.infer.new_type_var(self.checker.ctx, kind, origin)
+    pub fn new_infer_var(
+        &mut self,
+        kind: TypeVariableKind,
+        origin: crate::hir::infer::VarOrigin,
+    ) -> TypeId {
+        self.checker
+            .infer
+            .new_type_var(self.checker.ctx, kind, origin)
     }
 
     /// Add a constraint to the inference context.
@@ -2063,7 +2124,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 Pattern::Tuple(patterns, span) => {
                     let elem_tys: Vec<TypeId> = patterns
                         .iter()
-                        .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained, crate::hir::infer::VarOrigin::Synthetic))
+                        .map(|_| {
+                            self.new_infer_var(
+                                TypeVariableKind::Unconstrained,
+                                crate::hir::infer::VarOrigin::Synthetic,
+                            )
+                        })
                         .collect();
                     let tuple_ty = self.checker.ctx.tuple(elem_tys.clone());
                     self.unify_with(expected_ty, tuple_ty, *span, TypingContext::None)?;
@@ -2103,7 +2169,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
             Pattern::Slice(before, slice, after, span) => {
                 let elem_ty = if self.checker.ctx.is_infer_var(expected_ty) {
-                    let elem = self.new_infer_var(TypeVariableKind::Any, crate::hir::infer::VarOrigin::Synthetic);
+                    let elem = self.new_infer_var(
+                        TypeVariableKind::Any,
+                        crate::hir::infer::VarOrigin::Synthetic,
+                    );
                     let slice_ty = self.checker.ctx.slice(elem);
                     self.unify_with(expected_ty, slice_ty, *span, TypingContext::None)?;
                     elem
@@ -2137,7 +2206,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 Ok(HirPattern::Slice(hir_before, hir_slice, hir_after, *span))
             }
             Pattern::Error(span) => Ok(HirPattern::Error(*span)),
-            Pattern::Struct { path, fields, span, .. } => {
+            Pattern::Struct {
+                path, fields, span, ..
+            } => {
                 let def_id = self.checker.resolve_def_id(path)?;
                 let binding = self
                     .checker
@@ -2148,7 +2219,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     return Err(Diagnostic::error("pattern type is not a struct").with_span(*span));
                 }
                 let type_args: Vec<TypeId> = (0..binding.params.len())
-                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained, crate::hir::infer::VarOrigin::Synthetic))
+                    .map(|_| {
+                        self.new_infer_var(
+                            TypeVariableKind::Unconstrained,
+                            crate::hir::infer::VarOrigin::Synthetic,
+                        )
+                    })
                     .collect();
                 let struct_ty = self.checker.ctx.struct_ty(def_id, type_args.clone());
                 self.unify_with(expected_ty, struct_ty, *span, TypingContext::None)?;
@@ -2208,7 +2284,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     return Err(Diagnostic::error("pattern type is not an enum").with_span(*span));
                 }
                 let type_args: Vec<TypeId> = (0..binding.params.len())
-                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained, crate::hir::infer::VarOrigin::Synthetic))
+                    .map(|_| {
+                        self.new_infer_var(
+                            TypeVariableKind::Unconstrained,
+                            crate::hir::infer::VarOrigin::Synthetic,
+                        )
+                    })
                     .collect();
                 let enum_ty = self.checker.ctx.enum_ty(def_id, type_args.clone());
                 self.unify_with(expected_ty, enum_ty, *span, TypingContext::None)?;
@@ -2231,7 +2312,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         // Same logic as EnumLit: substitute type params with concrete args.
                         if let Type::Path(p, _) = ty {
                             if p.len() == 1 {
-                                if let Some((i, _)) = binding.params.iter().enumerate().find(|(_, tp)| tp.name == p[0]) {
+                                if let Some((i, _)) = binding
+                                    .params
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(_, tp)| tp.name == p[0])
+                                {
                                     let gp = self.checker.ctx.generic_param(i, p[0].clone());
                                     return Ok(self.checker.ctx.subst(gp, &subst));
                                 }

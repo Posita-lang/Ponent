@@ -1,4 +1,4 @@
-use crate::diagnostics::{Diagnostic, level::DiagnosticLevel, error_code::ErrorCode};
+use crate::diagnostics::{Diagnostic, error_code::ErrorCode, level::DiagnosticLevel};
 
 /// Plain text emitter — minimal output without ANSI colors.
 /// Used for non-interactive terminals or CI environments.
@@ -37,7 +37,8 @@ impl super::DiagnosticEmitter for PlainEmitter {
 
         // Source context rendering with ^-underline (if source available)
         if let (Some(span), Some(source)) = (diag.span, diag.source.as_ref()) {
-            let ctx = crate::diagnostics::label::SourceContext::new(source.as_str(), span, "<input>", 2);
+            let ctx =
+                crate::diagnostics::label::SourceContext::new(source.as_str(), span, "<input>", 2);
             let rendered = ctx.render(span, &diag.labels, false);
             if !rendered.is_empty() {
                 eprintln!("{}", rendered);

@@ -1,12 +1,12 @@
+use crate::hir::symbol::SymbolTable;
+use crate::hir::traits::TraitEnv;
+use crate::hir::traits::solver::builtins::{self, BuiltinTrait, BuiltinTraitRegistry};
 use crate::hir::traits::solver::obligation::{
     BuiltinImplSource, ImplSource, Obligation, ObligationCause, ObligationCauseCode, Predicate,
     ProjectionTy, SolveError,
 };
-use crate::hir::traits::solver::builtins::{self, BuiltinTrait, BuiltinTraitRegistry};
 use crate::hir::traits::solver::project::{self, ProjectionCache};
-use crate::hir::traits::TraitEnv;
 use crate::hir::types::{DefId, Subst, TypeContext, TypeData, TypeId};
-use crate::hir::symbol::SymbolTable;
 use crate::symbol::Symbol;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -31,7 +31,7 @@ pub struct SelectionContext<'a> {
     pub caller_bounds: &'a [Predicate],
     /// Projection cache for associated type normalization.
     pub proj_cache: &'a ProjectionCache,
-    }
+}
 
 /// Maximum recursion depth for trait resolution before overflow.
 pub(crate) const MAX_RECURSION_DEPTH: usize = 64;
@@ -67,17 +67,11 @@ pub enum Candidate {
     ///    or type resolution without re-confirmation.
     /// 2. The `idx` is the sole source of truth for identifying which impl
     ///    was matched.
-    Impl {
-        idx: usize,
-        impl_source: ImplSource,
-    },
+    Impl { idx: usize, impl_source: ImplSource },
     /// Caller-provided bound (where-clause).
     /// Stores the (self_ty, args) that were matched during assembly so that
     /// confirm_candidate can re-apply the unification in a fresh transaction.
-    Param {
-        self_ty: TypeId,
-        args: Vec<TypeId>,
-    },
+    Param { self_ty: TypeId, args: Vec<TypeId> },
     /// Builtin trait (Sized, Copy, Clone, etc.).
     Builtin(BuiltinImplSource),
     /// Object type bound (dyn Trait).
@@ -146,8 +140,19 @@ impl<'a> SelectionContext<'a> {
         // These are not trait obligations — they are resolved by looking up
         // the associated type in the impl and unifying with the target.
         match &obligation.predicate {
-            Predicate::ProjectionEq { trait_id, self_ty, assoc_name, value } => {
-                return self.handle_projection_eq(*trait_id, *self_ty, assoc_name, *value, &obligation.cause);
+            Predicate::ProjectionEq {
+                trait_id,
+                self_ty,
+                assoc_name,
+                value,
+            } => {
+                return self.handle_projection_eq(
+                    *trait_id,
+                    *self_ty,
+                    assoc_name,
+                    *value,
+                    &obligation.cause,
+                );
             }
             Predicate::ProjectionNormalize { projection, target } => {
                 return self.handle_projection_normalize(projection, *target, &obligation.cause);
@@ -217,9 +222,14 @@ impl<'a> SelectionContext<'a> {
     /// Resolve the self_ty through bindings and extract the trait predicate.
     fn resolve_obligation(&self, obligation: &Obligation) -> ResolvedObligation {
         match &obligation.predicate {
-            Predicate::Trait { trait_id, self_ty, args } => {
+            Predicate::Trait {
+                trait_id,
+                self_ty,
+                args,
+            } => {
                 let resolved_self = self.ctx.resolve_binding(*self_ty);
-                let resolved_args: Vec<TypeId> = args.iter().map(|a| self.ctx.resolve_binding(*a)).collect();
+                let resolved_args: Vec<TypeId> =
+                    args.iter().map(|a| self.ctx.resolve_binding(*a)).collect();
                 let ambiguous = self.ctx.is_infer_var(resolved_self);
                 ResolvedObligation {
                     trait_id: *trait_id,
@@ -288,7 +298,6 @@ impl<'a> SelectionContext<'a> {
                 Err(_) => {}
             }
         }
-        
     }
 
     fn try_match_impl(
@@ -311,13 +320,13 @@ impl<'a> SelectionContext<'a> {
         let substituted_for_type = self.ctx.subst(impl_cand.for_type, &subst);
 
         // Unify substituted for_type with obligation's self_ty
-        self.ctx.unify(obligation.self_ty, substituted_for_type).map_err(|_| {
-            SolveError::NotFound {
+        self.ctx
+            .unify(obligation.self_ty, substituted_for_type)
+            .map_err(|_| SolveError::NotFound {
                 trait_id: obligation.trait_id,
                 self_ty: obligation.self_ty,
                 span: crate::ast::Span::new(0, 0),
-            }
-        })?;
+            })?;
 
         // ── Unify trait generic args ──
         // Match the impl's trait args (e.g. `Int<32>` in `impl Add<Int<32>> for T`)
@@ -325,7 +334,8 @@ impl<'a> SelectionContext<'a> {
         // (e.g. `Add<Rhs = Int<32>>`).  Each impl trait_arg is substituted with
         // fresh infer vars so that generic params (e.g. `impl<R> Add<R> for T`)
         // are correctly matched.
-        let substituted_trait_args: Vec<TypeId> = impl_cand.trait_args
+        let substituted_trait_args: Vec<TypeId> = impl_cand
+            .trait_args
             .iter()
             .map(|&arg| self.ctx.subst(arg, &subst))
             .collect();
@@ -341,13 +351,13 @@ impl<'a> SelectionContext<'a> {
         }
 
         for (impl_arg, ob_arg) in substituted_trait_args.iter().zip(obligation.args.iter()) {
-            self.ctx.unify(*impl_arg, *ob_arg).map_err(|_| {
-                SolveError::Mismatch {
+            self.ctx
+                .unify(*impl_arg, *ob_arg)
+                .map_err(|_| SolveError::Mismatch {
                     expected: *ob_arg,
                     found: *impl_arg,
                     span: crate::ast::Span::new(0, 0),
-                }
-            })?;
+                })?;
         }
 
         // ── Generate sub-obligations from impl's where-clause ──
@@ -363,7 +373,9 @@ impl<'a> SelectionContext<'a> {
             nested.push(Obligation {
                 cause: crate::hir::traits::solver::obligation::ObligationCause {
                     span: impl_cand.span,
-                    code: ObligationCauseCode::ImplBound { impl_def_id: impl_cand.trait_id },
+                    code: ObligationCauseCode::ImplBound {
+                        impl_def_id: impl_cand.trait_id,
+                    },
                 },
                 predicate: Predicate::Trait {
                     trait_id: bound_trait_id,
@@ -388,7 +400,11 @@ impl<'a> SelectionContext<'a> {
     ) {
         for bound in self.caller_bounds {
             let (trait_id, self_ty, args) = match bound {
-                Predicate::Trait { trait_id, self_ty, args } => (trait_id, self_ty, Some(args)),
+                Predicate::Trait {
+                    trait_id,
+                    self_ty,
+                    args,
+                } => (trait_id, self_ty, Some(args)),
                 Predicate::AutoTrait { trait_id, self_ty } => (trait_id, self_ty, None),
                 _ => continue,
             };
@@ -402,7 +418,9 @@ impl<'a> SelectionContext<'a> {
                 let args_ok = if ok {
                     if let Some(bound_args) = args {
                         if bound_args.len() == obligation.args.len() {
-                            bound_args.iter().zip(obligation.args.iter())
+                            bound_args
+                                .iter()
+                                .zip(obligation.args.iter())
                                 .all(|(ba, oa)| self.ctx.unify(*ba, *oa).is_ok())
                         } else {
                             false
@@ -445,14 +463,18 @@ impl<'a> SelectionContext<'a> {
                 if self.ctx.is_infer_var(self_ty) {
                     candidates.ambiguous = true;
                 } else if builtins::compute_sized(self_ty, self.ctx) {
-                    candidates.vec.push(Candidate::Builtin(BuiltinImplSource::Sized));
+                    candidates
+                        .vec
+                        .push(Candidate::Builtin(BuiltinImplSource::Sized));
                 }
                 // If unsized, no candidate is added — the obligation fails
                 // (which is correct: unsized types do not satisfy `Sized`).
             }
             Some(BuiltinTrait::Copy) => {
                 if builtins::compute_copy(obligation.self_ty, self.ctx) {
-                    candidates.vec.push(Candidate::Builtin(BuiltinImplSource::Copy));
+                    candidates
+                        .vec
+                        .push(Candidate::Builtin(BuiltinImplSource::Copy));
                 }
             }
             Some(BuiltinTrait::Clone) => {
@@ -460,7 +482,9 @@ impl<'a> SelectionContext<'a> {
                 // This covers both explicit Clone impls (from from_impls) and the
                 // automatic derive (SYNTAX.md § Automatic Clone for Copy Types).
                 if builtins::compute_clone(obligation.self_ty, self.ctx) {
-                    candidates.vec.push(Candidate::Builtin(BuiltinImplSource::Clone));
+                    candidates
+                        .vec
+                        .push(Candidate::Builtin(BuiltinImplSource::Clone));
                 }
             }
             Some(BuiltinTrait::Drop) => {
@@ -510,9 +534,7 @@ impl<'a> SelectionContext<'a> {
             _ => return,
         };
 
-        candidates.vec.push(Candidate::Poly {
-            quantifier_count,
-        });
+        candidates.vec.push(Candidate::Poly { quantifier_count });
     }
 
     // ── Winnowing ──
@@ -599,17 +621,21 @@ impl<'a> SelectionContext<'a> {
             assoc_name: *assoc_name,
         };
         let normalized = project::normalize_projection(
-            &proj, self.trait_env, self.ctx, self.proj_cache, self.symbols,
+            &proj,
+            self.trait_env,
+            self.ctx,
+            self.proj_cache,
+            self.symbols,
         );
         match normalized {
             Some(concrete_ty) => {
-                self.ctx.unify(value, concrete_ty).map_err(|_| {
-                    SolveError::Mismatch {
+                self.ctx
+                    .unify(value, concrete_ty)
+                    .map_err(|_| SolveError::Mismatch {
                         expected: value,
                         found: concrete_ty,
                         span: cause.span,
-                    }
-                })?;
+                    })?;
                 Ok(ImplSource::Param(vec![]))
             }
             None => Err(SolveError::NotFound {
@@ -636,17 +662,21 @@ impl<'a> SelectionContext<'a> {
             assoc_name: projection.assoc_name,
         };
         let normalized = project::normalize_projection(
-            &proj, self.trait_env, self.ctx, self.proj_cache, self.symbols,
+            &proj,
+            self.trait_env,
+            self.ctx,
+            self.proj_cache,
+            self.symbols,
         );
         match normalized {
             Some(concrete_ty) => {
-                self.ctx.unify(target, concrete_ty).map_err(|_| {
-                    SolveError::Mismatch {
+                self.ctx
+                    .unify(target, concrete_ty)
+                    .map_err(|_| SolveError::Mismatch {
                         expected: target,
                         found: concrete_ty,
                         span: cause.span,
-                    }
-                })?;
+                    })?;
                 Ok(ImplSource::Param(vec![]))
             }
             None => Err(SolveError::NotFound {
@@ -691,7 +721,9 @@ impl<'a> SelectionContext<'a> {
                 self.ctx.begin_transaction();
                 let ok = self.ctx.unify(obligation.self_ty, *self_ty).is_ok()
                     && args.len() == obligation.args.len()
-                    && args.iter().zip(obligation.args.iter())
+                    && args
+                        .iter()
+                        .zip(obligation.args.iter())
                         .all(|(a, b)| self.ctx.unify(*a, *b).is_ok());
                 if ok {
                     self.ctx.commit_transaction();
@@ -705,15 +737,14 @@ impl<'a> SelectionContext<'a> {
                     })
                 }
             }
-            Candidate::Builtin(kind) => {
-                Ok(ImplSource::Builtin(*kind))
-            }
-            Candidate::Object { object_trait_id, nested } => {
-                Ok(ImplSource::Object {
-                    object_trait_id: *object_trait_id,
-                    nested: nested.clone(),
-                })
-            }
+            Candidate::Builtin(kind) => Ok(ImplSource::Builtin(*kind)),
+            Candidate::Object {
+                object_trait_id,
+                nested,
+            } => Ok(ImplSource::Object {
+                object_trait_id: *object_trait_id,
+                nested: nested.clone(),
+            }),
             Candidate::Poly { quantifier_count } => {
                 // Re-apply the allocation inside a fresh transaction.
                 // The assembly phase rolled back, so the infer vars are stale.
@@ -739,7 +770,9 @@ impl<'a> SelectionContext<'a> {
                 let confirmed_obligation = Obligation {
                     cause: ObligationCause {
                         span: crate::ast::Span::new(0, 0),
-                        code: ObligationCauseCode::PolyUnbox { span: crate::ast::Span::new(0, 0) },
+                        code: ObligationCauseCode::PolyUnbox {
+                            span: crate::ast::Span::new(0, 0),
+                        },
                     },
                     predicate: Predicate::Trait {
                         trait_id: obligation.trait_id,
@@ -761,10 +794,10 @@ impl<'a> SelectionContext<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hir::traits::TraitEnv;
     use crate::hir::traits::solver::builtins::BuiltinTraitRegistry;
     use crate::hir::traits::solver::obligation::{ObligationCause, ObligationCauseCode, Predicate};
     use crate::hir::traits::solver::project::ProjectionCache;
-    use crate::hir::traits::TraitEnv;
     use crate::hir::types::{CrateId, DefId};
 
     #[test]
@@ -804,7 +837,10 @@ mod tests {
                 assert_eq!(depth, MAX_RECURSION_DEPTH);
             }
             other => {
-                panic!("expected Overflow at depth {}, got {:?}", MAX_RECURSION_DEPTH, other);
+                panic!(
+                    "expected Overflow at depth {}, got {:?}",
+                    MAX_RECURSION_DEPTH, other
+                );
             }
         }
     }
@@ -843,8 +879,11 @@ mod tests {
         let result = selcx.select(&obligation);
         match result {
             Err(SolveError::Overflow { .. }) => {
-                panic!("should NOT overflow at depth {} < MAX_RECURSION_DEPTH ({})",
-                    MAX_RECURSION_DEPTH - 1, MAX_RECURSION_DEPTH);
+                panic!(
+                    "should NOT overflow at depth {} < MAX_RECURSION_DEPTH ({})",
+                    MAX_RECURSION_DEPTH - 1,
+                    MAX_RECURSION_DEPTH
+                );
             }
             _ => {
                 // Any other result (NotFound, Ambiguous, Deferred, Ok) is fine —
@@ -897,7 +936,10 @@ mod tests {
                 );
             }
             other => {
-                panic!("expected Deferred {{ stalled_on }} for infer var self_ty, got {:?}", other);
+                panic!(
+                    "expected Deferred {{ stalled_on }} for infer var self_ty, got {:?}",
+                    other
+                );
             }
         }
     }

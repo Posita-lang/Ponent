@@ -83,11 +83,7 @@ impl ObligationForest {
 
     /// Register a child obligation for a given parent.
     /// Returns the child node index.
-    pub fn register_child(
-        &mut self,
-        obligation: Obligation,
-        parent_idx: usize,
-    ) -> usize {
+    pub fn register_child(&mut self, obligation: Obligation, parent_idx: usize) -> usize {
         let idx = self.nodes.len();
         self.nodes.push(ObligationNode {
             obligation,
@@ -172,7 +168,10 @@ impl ObligationForest {
 
     /// Count the number of deferred nodes in the forest.
     pub fn deferred_count(&self) -> usize {
-        self.nodes.iter().filter(|n| matches!(n.state, ObligationState::Deferred)).count()
+        self.nodes
+            .iter()
+            .filter(|n| matches!(n.state, ObligationState::Deferred))
+            .count()
     }
 
     /// Mark a node as evaluating (entering cycle detection).
@@ -198,9 +197,10 @@ impl ObligationForest {
         // This catches the case where an inference variable was unified during
         // evaluation of a parent, making two syntactically different obligations
         // semantically identical.
-        let is_cycle = self.active_path.iter().any(|(_, t, s, a)| {
-            (*t, *s, *a) == resolved_key
-        });
+        let is_cycle = self
+            .active_path
+            .iter()
+            .any(|(_, t, s, a)| (*t, *s, *a) == resolved_key);
 
         if is_cycle {
             // Cycle detected
@@ -214,11 +214,9 @@ impl ObligationForest {
                 false
             } else {
                 // Non-coinductive cycle is an error
-                self.nodes[idx].state = ObligationState::Error(
-                    SolveError::CycleDetected {
-                        predicate: node.obligation.predicate.clone(),
-                    }
-                );
+                self.nodes[idx].state = ObligationState::Error(SolveError::CycleDetected {
+                    predicate: node.obligation.predicate.clone(),
+                });
                 false
             }
         } else {
@@ -236,14 +234,15 @@ impl ObligationForest {
     /// Note: this is O(n) in the active path size, but the active path is
     /// bounded by the obligation nesting depth (typically < 10).
     pub fn leave_evaluating(&mut self, idx: usize) {
-        self.active_path.retain(|(stored_idx, _, _, _)| *stored_idx != idx);
+        self.active_path
+            .retain(|(stored_idx, _, _, _)| *stored_idx != idx);
     }
 
     /// Check if there are still pending obligations.
     pub fn has_pending(&self) -> bool {
-        self.pending.iter().any(|&idx| {
-            matches!(self.nodes[idx].state, ObligationState::Pending)
-        })
+        self.pending
+            .iter()
+            .any(|&idx| matches!(self.nodes[idx].state, ObligationState::Pending))
     }
 
     /// Check if any deferred node has a resolved `stalled_on` variable.
@@ -266,9 +265,10 @@ impl ObligationForest {
 
     /// Get the number of pending obligations.
     pub fn pending_count(&self) -> usize {
-        self.pending.iter().filter(|&&idx| {
-            matches!(self.nodes[idx].state, ObligationState::Pending)
-        }).count()
+        self.pending
+            .iter()
+            .filter(|&&idx| matches!(self.nodes[idx].state, ObligationState::Pending))
+            .count()
     }
 
     /// Get a reference to a node by index.
@@ -293,23 +293,27 @@ impl ObligationForest {
 
     /// Collect all errors from the forest.
     pub fn collect_errors(&self) -> Vec<&SolveError> {
-        self.nodes.iter().filter_map(|n| {
-            match &n.state {
-                ObligationState::Error(e) => Some(e),
-                ObligationState::CycleDetected => {
-                    // Non-coinductive cycles become errors
-                    if !matches!(&n.obligation.predicate,
-                        Predicate::AutoTrait { .. } | Predicate::Sized { .. }
-                    ) {
-                        // This shouldn't happen — cycles are detected in mark_evaluating
-                        None
-                    } else {
-                        None
+        self.nodes
+            .iter()
+            .filter_map(|n| {
+                match &n.state {
+                    ObligationState::Error(e) => Some(e),
+                    ObligationState::CycleDetected => {
+                        // Non-coinductive cycles become errors
+                        if !matches!(
+                            &n.obligation.predicate,
+                            Predicate::AutoTrait { .. } | Predicate::Sized { .. }
+                        ) {
+                            // This shouldn't happen — cycles are detected in mark_evaluating
+                            None
+                        } else {
+                            None
+                        }
                     }
+                    _ => None,
                 }
-                _ => None,
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     /// Compact the forest by removing resolved and errored nodes.
@@ -353,7 +357,11 @@ impl ObligationForest {
             if let Some(new_idx) = old_to_new[old_idx] {
                 let mut new_node = node.clone();
                 new_node.parent = node.parent.and_then(|p| old_to_new[p]);
-                new_node.children = node.children.iter().filter_map(|c| old_to_new[*c]).collect();
+                new_node.children = node
+                    .children
+                    .iter()
+                    .filter_map(|c| old_to_new[*c])
+                    .collect();
                 new_nodes.push(new_node);
                 if matches!(node.state, ObligationState::Pending) {
                     new_pending.push_back(new_idx);
@@ -374,7 +382,11 @@ impl ObligationForest {
         ctx: &TypeContext,
     ) -> Option<(DefId, TypeId, u64)> {
         match &node.obligation.predicate {
-            Predicate::Trait { trait_id, self_ty, args } => {
+            Predicate::Trait {
+                trait_id,
+                self_ty,
+                args,
+            } => {
                 let resolved_self = ctx.resolve_binding(*self_ty);
                 let resolved_args_hash = resolved_args_hash(ctx, args);
                 Some((*trait_id, resolved_self, resolved_args_hash))

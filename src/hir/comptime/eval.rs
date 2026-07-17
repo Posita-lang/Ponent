@@ -1,6 +1,6 @@
 use crate::hir::hir::{HirExpr, HirPattern, HirProgram, HirStmt};
-use crate::hir::types::{TypeContext, TypeId};
 use crate::hir::symbol::SymbolTable;
+use crate::hir::types::{TypeContext, TypeId};
 use crate::symbol::Symbol;
 
 use super::error::ComptimeError;
@@ -37,7 +37,12 @@ fn unsigned_range(bits: u8) -> (i128, i128) {
 
 /// Apply the overflow policy to `result` given the type's representable range.
 /// Returns the corrected value, or `Overflow` error if the policy is `Trap`.
-fn apply_overflow_policy(result: i128, min: i128, max: i128, policy: &crate::ast::OverflowPolicy) -> Result<i128, ComptimeError> {
+fn apply_overflow_policy(
+    result: i128,
+    min: i128,
+    max: i128,
+    policy: &crate::ast::OverflowPolicy,
+) -> Result<i128, ComptimeError> {
     if result >= min && result <= max {
         return Ok(result);
     }
@@ -48,10 +53,17 @@ fn apply_overflow_policy(result: i128, min: i128, max: i128, policy: &crate::ast
             if range == 0 {
                 return Ok(result);
             }
-            Ok(result.wrapping_sub(min).wrapping_rem_euclid(range).wrapping_add(min))
+            Ok(result
+                .wrapping_sub(min)
+                .wrapping_rem_euclid(range)
+                .wrapping_add(min))
         }
         crate::ast::OverflowPolicy::Saturate => {
-            if result < min { Ok(min) } else { Ok(max) }
+            if result < min {
+                Ok(min)
+            } else {
+                Ok(max)
+            }
         }
         crate::ast::OverflowPolicy::Trap => Err(ComptimeError::Overflow),
     }
@@ -61,11 +73,19 @@ fn apply_overflow_policy(result: i128, min: i128, max: i128, policy: &crate::ast
 /// Returns the (possibly adjusted) value, or `Overflow` if the policy is `Trap`.
 fn check_range(result: i128, ty: TypeId, ctx: &TypeContext) -> Result<i128, ComptimeError> {
     match ctx.get(ty) {
-        crate::hir::types::TypeData::Int { bits, overflow_policy, .. } => {
+        crate::hir::types::TypeData::Int {
+            bits,
+            overflow_policy,
+            ..
+        } => {
             let (min, max) = signed_range(*bits);
             apply_overflow_policy(result, min, max, overflow_policy)
         }
-        crate::hir::types::TypeData::UInt { bits, overflow_policy, .. } => {
+        crate::hir::types::TypeData::UInt {
+            bits,
+            overflow_policy,
+            ..
+        } => {
             let (min, max) = unsigned_range(*bits);
             apply_overflow_policy(result, min, max, overflow_policy)
         }
@@ -141,9 +161,11 @@ impl<'a> ComptimeEvalContext<'a> {
                 HirStmt::VariableDef { name, value, .. } => {
                     let val = match value {
                         Some(e) => self.eval_expr(e)?,
-                        None => return Err(ComptimeError::not_allowed(
-                            "variable definitions in comptime blocks must have a value",
-                        )),
+                        None => {
+                            return Err(ComptimeError::not_allowed(
+                                "variable definitions in comptime blocks must have a value",
+                            ));
+                        }
                     };
                     if let Some(n) = name {
                         self.variables.insert(n.clone(), val.clone());
@@ -180,15 +202,21 @@ impl<'a> ComptimeEvalContext<'a> {
                                 self.eval_block(body)?;
                             }
                             ComptimeValue::Bool(false) => break,
-                            ComptimeValue::Float(_) => return Err(ComptimeError::type_error(
-                                "while condition must be a boolean, found Float",
-                            )),
-                            ComptimeValue::String(_) => return Err(ComptimeError::type_error(
-                                "while condition must be a boolean, found String",
-                            )),
-                            _ => return Err(ComptimeError::type_error(
-                                "while condition must be a boolean",
-                            )),
+                            ComptimeValue::Float(_) => {
+                                return Err(ComptimeError::type_error(
+                                    "while condition must be a boolean, found Float",
+                                ));
+                            }
+                            ComptimeValue::String(_) => {
+                                return Err(ComptimeError::type_error(
+                                    "while condition must be a boolean, found String",
+                                ));
+                            }
+                            _ => {
+                                return Err(ComptimeError::type_error(
+                                    "while condition must be a boolean",
+                                ));
+                            }
                         }
                     }
                     result = ComptimeValue::Unit;
@@ -223,14 +251,18 @@ impl<'a> ComptimeEvalContext<'a> {
                 crate::ast::Literal::Char(c) => Ok(ComptimeValue::Int(*c as i128)),
                 crate::ast::Literal::Bool(b) => Ok(ComptimeValue::Bool(*b)),
                 crate::ast::Literal::String(s) => Ok(ComptimeValue::String(Arc::from(s.as_str()))),
-                crate::ast::Literal::ByteString(b) => {
-                    Ok(ComptimeValue::String(
-                        Arc::from(String::from_utf8_lossy(b).as_ref()),
-                    ))
-                }
+                crate::ast::Literal::ByteString(b) => Ok(ComptimeValue::String(Arc::from(
+                    String::from_utf8_lossy(b).as_ref(),
+                ))),
             },
             HirExpr::Block(stmts, _ty, _span) => self.eval_block(stmts),
-            HirExpr::BinaryOp { left, op, right, ty, .. } => {
+            HirExpr::BinaryOp {
+                left,
+                op,
+                right,
+                ty,
+                ..
+            } => {
                 let l = self.eval_expr(left)?;
                 let r = self.eval_expr(right)?;
                 match (l, r, op) {
@@ -320,7 +352,11 @@ impl<'a> ComptimeEvalContext<'a> {
                         Ok(ComptimeValue::Bool(a >= b))
                     }
                     // ── String concatenation ───────────────────────────
-                    (ComptimeValue::String(a), ComptimeValue::String(b), crate::ast::BinOp::Add) => {
+                    (
+                        ComptimeValue::String(a),
+                        ComptimeValue::String(b),
+                        crate::ast::BinOp::Add,
+                    ) => {
                         let mut result = String::with_capacity(a.len() + b.len());
                         result.push_str(&a);
                         result.push_str(&b);
@@ -330,13 +366,20 @@ impl<'a> ComptimeEvalContext<'a> {
                     (ComptimeValue::String(a), ComptimeValue::String(b), crate::ast::BinOp::Eq) => {
                         Ok(ComptimeValue::Bool(a == b))
                     }
-                    (ComptimeValue::String(a), ComptimeValue::String(b), crate::ast::BinOp::Neq) => {
-                        Ok(ComptimeValue::Bool(a != b))
-                    }
+                    (
+                        ComptimeValue::String(a),
+                        ComptimeValue::String(b),
+                        crate::ast::BinOp::Neq,
+                    ) => Ok(ComptimeValue::Bool(a != b)),
                     _ => Err(ComptimeError::type_error("unsupported binary operation")),
                 }
             }
-            HirExpr::If { cond, then_branch, else_branch, .. } => {
+            HirExpr::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 let cond_val = self.eval_expr(cond)?;
                 match cond_val {
                     ComptimeValue::Bool(true) => self.eval_block(then_branch),
@@ -377,13 +420,20 @@ impl<'a> ComptimeEvalContext<'a> {
                 //    will be added in a later phase.
                 Err(ComptimeError::UnknownIdentifier(name.as_str()))
             }
-            HirExpr::Call { callee, args, comptime, .. } if *comptime => {
+            HirExpr::Call {
+                callee,
+                args,
+                comptime,
+                ..
+            } if *comptime => {
                 // Resolve the callee to a function name.
                 let fn_name = match callee.as_ref() {
                     HirExpr::Ident(name, _, _) => *name,
-                    _ => return Err(ComptimeError::type_error(
-                        "comptime call target must be a simple function name",
-                    )),
+                    _ => {
+                        return Err(ComptimeError::type_error(
+                            "comptime call target must be a simple function name",
+                        ));
+                    }
                 };
                 // Built-in: assert(condition)
                 if fn_name.as_str() == "assert" {
@@ -395,48 +445,50 @@ impl<'a> ComptimeEvalContext<'a> {
                     let cond = self.eval_expr(&args[0])?;
                     match cond {
                         ComptimeValue::Bool(true) => Ok(ComptimeValue::Unit),
-                        ComptimeValue::Bool(false) => Err(ComptimeError::AssertionFailed(
-                            "assertion failed".into(),
-                        )),
+                        ComptimeValue::Bool(false) => {
+                            Err(ComptimeError::AssertionFailed("assertion failed".into()))
+                        }
                         _ => Err(ComptimeError::type_error(
                             "assert argument must be a boolean",
                         )),
                     }
                 } else {
                     // Look up the function in the registry.
-                    let (params, body) = self.fn_registry.get(&fn_name).ok_or_else(|| {
-                        ComptimeError::UnknownIdentifier(fn_name.as_str())
-                    })?.clone();
-                // Evaluate arguments.
-                let arg_vals: Vec<ComptimeValue> = args
-                    .iter()
-                    .map(|a| self.eval_expr(a))
-                    .collect::<Result<Vec<_>, _>>()?;
-                if arg_vals.len() != params.len() {
-                    return Err(ComptimeError::type_error(format!(
-                        "comptime function `{}` expected {} arguments, got {}",
-                        fn_name, params.len(), arg_vals.len(),
-                    )));
-                }
-                // Save the current variable scope and bind parameters.
-                let saved = std::mem::take(&mut self.variables);
-                for (param, val) in params.iter().zip(arg_vals.into_iter()) {
-                    self.variables.insert(param.clone(), val);
-                }
-                // Evaluate the function body.
-                let result = self.eval_block(&body);
-                // Restore the previous variable scope.
-                self.variables = saved;
-                result
+                    let (params, body) = self
+                        .fn_registry
+                        .get(&fn_name)
+                        .ok_or_else(|| ComptimeError::UnknownIdentifier(fn_name.as_str()))?
+                        .clone();
+                    // Evaluate arguments.
+                    let arg_vals: Vec<ComptimeValue> = args
+                        .iter()
+                        .map(|a| self.eval_expr(a))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if arg_vals.len() != params.len() {
+                        return Err(ComptimeError::type_error(format!(
+                            "comptime function `{}` expected {} arguments, got {}",
+                            fn_name,
+                            params.len(),
+                            arg_vals.len(),
+                        )));
+                    }
+                    // Save the current variable scope and bind parameters.
+                    let saved = std::mem::take(&mut self.variables);
+                    for (param, val) in params.iter().zip(arg_vals.into_iter()) {
+                        self.variables.insert(param.clone(), val);
+                    }
+                    // Evaluate the function body.
+                    let result = self.eval_block(&body);
+                    // Restore the previous variable scope.
+                    self.variables = saved;
+                    result
                 }
             }
             HirExpr::TypeInfo(ty, _) => {
                 // @typeInfo(T) returns the type itself as a comptime value.
                 Ok(ComptimeValue::Type(*ty))
             }
-            HirExpr::CompileError(msg, _) => {
-                Err(ComptimeError::AssertionFailed(msg.clone()))
-            }
+            HirExpr::CompileError(msg, _) => Err(ComptimeError::AssertionFailed(msg.clone())),
             _ => Err(ComptimeError::Deferred),
         }
     }

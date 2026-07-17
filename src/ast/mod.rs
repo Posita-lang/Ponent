@@ -1,6 +1,6 @@
 pub mod visit;
-use std::fmt;
 use crate::symbol::Symbol;
+use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {

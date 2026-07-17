@@ -1,9 +1,9 @@
 use crate::ast::visit::replace_ident_in_expr;
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticCollector, DiagnosticLevel};
+use crate::hir::builtins;
 use crate::hir::symbol::*;
 use crate::hir::traits::{ImplCandidate, TraitEnv};
-use crate::hir::builtins;
 use crate::symbol::Symbol;
 use rustc_hash::FxHashMap;
 
@@ -292,7 +292,8 @@ impl<'a> NameResolver<'a> {
                                     c_layout = true;
                                 } else if let Some(alias_attrs) = self.layout_aliases.get(&name) {
                                     for alias_attr in alias_attrs {
-                                        if !expanded_attrs.iter().any(|a| a.name == alias_attr.name) {
+                                        if !expanded_attrs.iter().any(|a| a.name == alias_attr.name)
+                                        {
                                             expanded_attrs.push(alias_attr.clone());
                                         }
                                     }
@@ -300,8 +301,12 @@ impl<'a> NameResolver<'a> {
                             }
                         }
                     }
-                    if attr.name.eq_str("transparent") { transparent = true; }
-                    if attr.name.eq_str("packed") { packed = true; }
+                    if attr.name.eq_str("transparent") {
+                        transparent = true;
+                    }
+                    if attr.name.eq_str("packed") {
+                        packed = true;
+                    }
                     if attr.name.eq_str("endian") {
                         match attr.args.first() {
                             Some(crate::ast::Expr::Ident(name, _)) if name.eq_str("little") => {
@@ -312,10 +317,13 @@ impl<'a> NameResolver<'a> {
                             }
                             Some(crate::ast::Expr::Ident(name, _)) => {
                                 self.diagnostics.push(
-                                    Diagnostic::error(format!("`@endian` expects `little` or `big`, got `{}`", name))
-                                        .with_code_str("E061")
-                                        .with_span(attr.span)
-                                        .with_suggestion("write `@endian(little)` or `@endian(big)`"),
+                                    Diagnostic::error(format!(
+                                        "`@endian` expects `little` or `big`, got `{}`",
+                                        name
+                                    ))
+                                    .with_code_str("E061")
+                                    .with_span(attr.span)
+                                    .with_suggestion("write `@endian(little)` or `@endian(big)`"),
                                 );
                             }
                             Some(_) => {
@@ -331,7 +339,9 @@ impl<'a> NameResolver<'a> {
                                     Diagnostic::error("`@endian` requires an argument")
                                         .with_code_str("E061")
                                         .with_span(attr.span)
-                                        .with_suggestion("write `@endian(little)` or `@endian(big)`"),
+                                        .with_suggestion(
+                                            "write `@endian(little)` or `@endian(big)`",
+                                        ),
                                 );
                             }
                         }
@@ -373,23 +383,36 @@ impl<'a> NameResolver<'a> {
                     if attr.name.eq_str("align") || attr.name.eq_str("pad") {
                         match attr.args.first() {
                             Some(crate::ast::Expr::Literal(crate::ast::Literal::Int(n), _)) => {
-                                if attr.name.eq_str("align") { align = Some(*n as u64); }
-                                if attr.name.eq_str("pad") { pad = Some(*n as u64); }
+                                if attr.name.eq_str("align") {
+                                    align = Some(*n as u64);
+                                }
+                                if attr.name.eq_str("pad") {
+                                    pad = Some(*n as u64);
+                                }
                             }
                             Some(_) => {
                                 self.diagnostics.push(
-                                    Diagnostic::error(format!("`@{}` requires an integer argument", attr.name))
-                                        .with_code_str("E060")
-                                        .with_span(attr.span)
-                                        .with_suggestion(format!("write `@{}(N)` where N is a power of two", attr.name)),
+                                    Diagnostic::error(format!(
+                                        "`@{}` requires an integer argument",
+                                        attr.name
+                                    ))
+                                    .with_code_str("E060")
+                                    .with_span(attr.span)
+                                    .with_suggestion(format!(
+                                        "write `@{}(N)` where N is a power of two",
+                                        attr.name
+                                    )),
                                 );
                             }
                             None => {
                                 self.diagnostics.push(
-                                    Diagnostic::error(format!("`@{}` requires an integer argument", attr.name))
-                                        .with_code_str("E060")
-                                        .with_span(attr.span)
-                                        .with_suggestion(format!("write `@{}(128)`", attr.name)),
+                                    Diagnostic::error(format!(
+                                        "`@{}` requires an integer argument",
+                                        attr.name
+                                    ))
+                                    .with_code_str("E060")
+                                    .with_span(attr.span)
+                                    .with_suggestion(format!("write `@{}(128)`", attr.name)),
                                 );
                             }
                         }
@@ -426,7 +449,13 @@ impl<'a> NameResolver<'a> {
                 {
                     let mut full_path = self.module_path.clone();
                     full_path.push(name.clone());
-                    let full = Symbol::intern(&full_path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"));
+                    let full = Symbol::intern(
+                        &full_path
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join("::"),
+                    );
                     self.symbols.register_full_path(full, def_id);
                 }
                 // Populate the resolution map for the type checker
@@ -492,20 +521,18 @@ impl<'a> NameResolver<'a> {
 
                 let resolved_for = self.resolve_type_expr(for_type);
                 self.current_impl_for_type = Some(resolved_for);
-                let resolved_trait = trait_path
-                    .as_ref()
-                    .and_then(|tp| {
-                        // Extract the path from the trait type for lookup.
-                        match tp.as_ref() {
-                            Type::Path(path, _) => self.resolve_trait_path(path),
-                            _ => {
-                                // For complex trait types (e.g. `Add<Int<32>>`),
-                                // resolve as a type expression and get the DefId.
-                                let ty = self.resolve_type_expr(tp);
-                                self.ctx.get_def_id_for_type(ty)
-                            }
+                let resolved_trait = trait_path.as_ref().and_then(|tp| {
+                    // Extract the path from the trait type for lookup.
+                    match tp.as_ref() {
+                        Type::Path(path, _) => self.resolve_trait_path(path),
+                        _ => {
+                            // For complex trait types (e.g. `Add<Int<32>>`),
+                            // resolve as a type expression and get the DefId.
+                            let ty = self.resolve_type_expr(tp);
+                            self.ctx.get_def_id_for_type(ty)
                         }
-                    });
+                    }
+                });
 
                 self.enter_scope();
                 let binding = ImplBinding {
@@ -607,20 +634,20 @@ impl<'a> NameResolver<'a> {
                     self.diagnostics.push(diag);
                 }
             }
-            Stmt::Edition(version, span) => {
-                match crate::hir::types::Edition::from_str(version) {
-                    Some(ed) => self.ctx.set_edition(ed),
-                    None => {
-                        self.diagnostics.push(
-                            Diagnostic::error(format!("unknown edition `{}`", version))
-                                .with_code_str("E070")
-                                .with_span(*span)
-                                .with_suggestion("use a valid edition: `\"2024\"` or `\"2026\"`"),
-                        );
-                    }
+            Stmt::Edition(version, span) => match crate::hir::types::Edition::from_str(version) {
+                Some(ed) => self.ctx.set_edition(ed),
+                None => {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!("unknown edition `{}`", version))
+                            .with_code_str("E070")
+                            .with_span(*span)
+                            .with_suggestion("use a valid edition: `\"2024\"` or `\"2026\"`"),
+                    );
                 }
-            }
-            Stmt::LayoutDef { name, attributes, .. } => {
+            },
+            Stmt::LayoutDef {
+                name, attributes, ..
+            } => {
                 // Register a layout alias so that @layout(AliasName) can be expanded.
                 if self.layout_aliases.contains_key(name) {
                     self.diagnostics.push(
@@ -631,7 +658,13 @@ impl<'a> NameResolver<'a> {
                     self.layout_aliases.insert(name.clone(), attributes.clone());
                 }
             }
-            Stmt::Constraint { name, params, predicates, span, .. } => {
+            Stmt::Constraint {
+                name,
+                params,
+                predicates,
+                span,
+                ..
+            } => {
                 // Register type parameters so T resolves in constraint body.
                 let mut param_map = HashMap::default();
                 for (i, tp) in params.iter().enumerate() {
@@ -639,24 +672,32 @@ impl<'a> NameResolver<'a> {
                     param_map.insert(tp.name, ty_id);
                 }
                 self.current_impl_type_params = Some(param_map);
-                let resolved_predicates: Vec<ConstraintPredicate> =
-                    predicates.iter().map(|p| {
+                let resolved_predicates: Vec<ConstraintPredicate> = predicates
+                    .iter()
+                    .map(|p| {
                         let subject = self.resolve_type_expr(&p.ty);
-                        let bounds: Vec<TypeId> = p.bounds.iter().map(|b| {
-                            // Before attempting type resolution, check whether this
-                            // bound is a trait name — traits are not registered as
-                            // types, so resolve_type_expr would produce an error.
-                            if let Type::Path(path, _) = b {
-                                if path.len() == 1 {
-                                    if let Some(trait_binding) = self.symbols.lookup_trait(path[0]) {
-                                        return self.ctx.dyn_trait(vec![trait_binding.def_id]);
+                        let bounds: Vec<TypeId> = p
+                            .bounds
+                            .iter()
+                            .map(|b| {
+                                // Before attempting type resolution, check whether this
+                                // bound is a trait name — traits are not registered as
+                                // types, so resolve_type_expr would produce an error.
+                                if let Type::Path(path, _) = b {
+                                    if path.len() == 1 {
+                                        if let Some(trait_binding) =
+                                            self.symbols.lookup_trait(path[0])
+                                        {
+                                            return self.ctx.dyn_trait(vec![trait_binding.def_id]);
+                                        }
                                     }
                                 }
-                            }
-                            self.resolve_type_expr(b)
-                        }).collect();
+                                self.resolve_type_expr(b)
+                            })
+                            .collect();
                         ConstraintPredicate { subject, bounds }
-                    }).collect();
+                    })
+                    .collect();
                 self.current_impl_type_params = None;
                 let binding = ConstraintBinding {
                     predicates: resolved_predicates,
@@ -773,11 +814,11 @@ impl<'a> NameResolver<'a> {
                         c_layout: false,
                         transparent: false,
                         expanded_layout_attrs: vec![],
-            packed: false,
-            endian: None,
-            bit_order: None,
-            align: None,
-            pad: None,
+                        packed: false,
+                        endian: None,
+                        bit_order: None,
+                        align: None,
+                        pad: None,
                     };
                     self.symbols
                         .insert_type(cap.name.clone(), binding, *span)
@@ -1281,8 +1322,14 @@ impl<'a> NameResolver<'a> {
             }
             Expr::Path(path, _) => {
                 self.diagnostics.push(
-                    Diagnostic::error(format!("unresolved path: {}", path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")))
-                        .with_span(Span::new(0, 0)),
+                    Diagnostic::error(format!(
+                        "unresolved path: {}",
+                        path.iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join("::")
+                    ))
+                    .with_span(Span::new(0, 0)),
                 );
                 Some(self.ctx.error())
             }
@@ -1297,7 +1344,9 @@ impl<'a> NameResolver<'a> {
                 Some(self.ctx.error())
             }
             Expr::Task { body, .. } => {
-                for s in body { self.resolve_stmt(s); }
+                for s in body {
+                    self.resolve_stmt(s);
+                }
                 Some(self.ctx.unit())
             }
         }
@@ -1403,19 +1452,31 @@ impl<'a> NameResolver<'a> {
                         self.diagnostics.push(
                             Diagnostic::error("use `()` instead of `Unit`")
                                 .with_code_str("E031")
-                                .with_help("Posita uses `()` (empty tuple) to express the unit type")
-                                .with_suggestion("replace `Unit` with `()`")
+                                .with_help(
+                                    "Posita uses `()` (empty tuple) to express the unit type",
+                                )
+                                .with_suggestion("replace `Unit` with `()`"),
                         );
                         self.ctx.error()
                     } else if name.eq_str("Never") {
                         self.ctx.never()
-                    } else if name.eq_str("Int") || name.eq_str("UInt") || name.eq_str("Float") || name.eq_str("Rational") {
+                    } else if name.eq_str("Int")
+                        || name.eq_str("UInt")
+                        || name.eq_str("Float")
+                        || name.eq_str("Rational")
+                    {
                         // These require type arguments; handled in Type::Generic
                         self.ctx.error()
                     } else {
                         self.diagnostics.push(
-                            Diagnostic::error(format!("undefined type: {}", path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")))
-                                .with_span(*span),
+                            Diagnostic::error(format!(
+                                "undefined type: {}",
+                                path.iter()
+                                    .map(|s| s.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("::")
+                            ))
+                            .with_span(*span),
                         );
                         self.ctx.error()
                     }
@@ -1439,15 +1500,15 @@ impl<'a> NameResolver<'a> {
                             let q = self.extract_int_from_type(args[1].ty()).unwrap_or(16);
                             return self.ctx.rational(p, q);
                         } else if path[0].eq_str("Ptr") {
-                                let size = args
-                                    .get(0)
-                                    .map(|a| self.resolve_type_expr(a.ty()))
-                                    .unwrap_or(self.ctx.usize());
-                                let pointee = args
-                                    .get(1)
-                                    .map(|a| self.resolve_type_expr(a.ty()))
-                                    .unwrap_or(self.ctx.error());
-                                return self.ctx.ptr(size, pointee);
+                            let size = args
+                                .get(0)
+                                .map(|a| self.resolve_type_expr(a.ty()))
+                                .unwrap_or(self.ctx.usize());
+                            let pointee = args
+                                .get(1)
+                                .map(|a| self.resolve_type_expr(a.ty()))
+                                .unwrap_or(self.ctx.error());
+                            return self.ctx.ptr(size, pointee);
                         } else if path[0].eq_str("USize") {
                             return self.ctx.usize();
                         }
@@ -1549,8 +1610,12 @@ impl<'a> NameResolver<'a> {
                 ..
             } => {
                 let base_ty = self.resolve_type_expr(base);
-                self.ctx
-                    .exists(self.ctx.fresh_param_index(), name.clone(), base_ty, invariant.as_ref().clone())
+                self.ctx.exists(
+                    self.ctx.fresh_param_index(),
+                    name.clone(),
+                    base_ty,
+                    invariant.as_ref().clone(),
+                )
             }
             Type::WhereShorthand {
                 base,
@@ -1562,7 +1627,8 @@ impl<'a> NameResolver<'a> {
                 let mut inv = invariant.as_ref().clone();
                 replace_ident_in_expr(&mut inv, Symbol::intern("value"), name);
                 let base_ty = self.resolve_type_expr(base);
-                self.ctx.exists(self.ctx.fresh_param_index(), name, base_ty, inv)
+                self.ctx
+                    .exists(self.ctx.fresh_param_index(), name, base_ty, inv)
             }
             Type::Literal(expr, ..) => self.resolve_expr(expr).unwrap_or(self.ctx.error()),
             Type::Never(..) => self.ctx.never(),
@@ -1647,7 +1713,9 @@ impl<'a> NameResolver<'a> {
     }
 
     fn has_ieee_contracts_attribute(&self, attributes: &[Attribute]) -> bool {
-        attributes.iter().any(|attr| attr.name.eq_str("ieee_contracts"))
+        attributes
+            .iter()
+            .any(|attr| attr.name.eq_str("ieee_contracts"))
     }
 
     fn extract_hints(&self, attributes: &[Attribute]) -> Vec<Expr> {
@@ -1826,14 +1894,18 @@ impl<'a> NameResolver<'a> {
         // First try to resolve as a type.
         if let Some(def_id) = self.symbols.lookup_type_by_path(path) {
             if let Some(name) = &import_name {
-                self.resolution_map
-                    .type_def_ids
-                    .insert(*name, def_id);
+                self.resolution_map.type_def_ids.insert(*name, def_id);
                 if let Some(binding) = self.symbols.lookup_type_by_def_id(def_id).cloned() {
                     self.symbols.insert_type(*name, binding, span).ok();
                 }
                 // Register the import's original full path for re-export resolution.
-                let full_path = Symbol::intern(&path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"));
+                let full_path = Symbol::intern(
+                    &path
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("::"),
+                );
                 self.symbols.register_full_path(full_path, def_id);
             }
             // `from path import { items }`
@@ -1841,9 +1913,7 @@ impl<'a> NameResolver<'a> {
                 for item in item_list {
                     let item_path = [*item];
                     if let Some(item_def_id) = self.symbols.lookup_type_by_path(&item_path) {
-                        self.resolution_map
-                            .type_def_ids
-                            .insert(*item, item_def_id);
+                        self.resolution_map.type_def_ids.insert(*item, item_def_id);
                         if let Some(binding) =
                             self.symbols.lookup_type_by_def_id(item_def_id).cloned()
                         {
@@ -1852,9 +1922,14 @@ impl<'a> NameResolver<'a> {
                         // Register the full path: path::to::item
                         let mut full_item_path = path.to_vec();
                         full_item_path.push(*item);
-                        let full_item_str = Symbol::intern(&full_item_path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"));
-                        self.symbols
-                            .register_full_path(full_item_str, item_def_id);
+                        let full_item_str = Symbol::intern(
+                            &full_item_path
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join("::"),
+                        );
+                        self.symbols.register_full_path(full_item_str, item_def_id);
                     }
                 }
             }
@@ -1863,11 +1938,10 @@ impl<'a> NameResolver<'a> {
 
         // Try as a trait — supports multi-segment paths.
         if let Some(trait_def_id) = self.symbols.lookup_trait_by_path(path) {
-            if let Some(trait_binding) = self.symbols.lookup_trait_by_def_id(trait_def_id).cloned() {
+            if let Some(trait_binding) = self.symbols.lookup_trait_by_def_id(trait_def_id).cloned()
+            {
                 if let Some(name) = &import_name {
-                    self.symbols
-                        .insert_trait(*name, trait_binding, span)
-                        .ok();
+                    self.symbols.insert_trait(*name, trait_binding, span).ok();
                 }
                 // `from path import { items }` — also import traits
                 if let Some(item_list) = items {
@@ -1877,9 +1951,7 @@ impl<'a> NameResolver<'a> {
                             if let Some(item_binding) =
                                 self.symbols.lookup_trait_by_def_id(item_def_id).cloned()
                             {
-                                self.symbols
-                                    .insert_trait(*item, item_binding, span)
-                                    .ok();
+                                self.symbols.insert_trait(*item, item_binding, span).ok();
                             }
                         }
                     }
@@ -1893,10 +1965,7 @@ impl<'a> NameResolver<'a> {
         if path.len() == 1 {
             if let Some(func_binding) = self.symbols.lookup_function(path[0]).cloned() {
                 if let Some(name) = &import_name {
-                    if let Err(diag) =
-                        self.symbols
-                            .insert_function(*name, func_binding, span)
-                    {
+                    if let Err(diag) = self.symbols.insert_function(*name, func_binding, span) {
                         self.diagnostics.push(diag);
                     }
                 }
@@ -1904,10 +1973,14 @@ impl<'a> NameResolver<'a> {
             }
         }
 
-        Err(
-            Diagnostic::error(format!("cannot resolve import `{}`", path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),))
-                .with_span(span),
-        )
+        Err(Diagnostic::error(format!(
+            "cannot resolve import `{}`",
+            path.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("::"),
+        ))
+        .with_span(span))
     }
 }
 
@@ -1917,7 +1990,9 @@ mod tests {
     use crate::parser::Parser;
 
     /// Parse and resolve a Posita source, returning the resolver's symbol table.
-    fn resolve_source(source: &str) -> Result<(SymbolTable, TraitEnv, ResolutionMap, TypeContext), Vec<String>> {
+    fn resolve_source(
+        source: &str,
+    ) -> Result<(SymbolTable, TraitEnv, ResolutionMap, TypeContext), Vec<String>> {
         let mut ctx = TypeContext::new();
         let mut parser = Parser::new(source);
         let program = parser
@@ -1925,9 +2000,8 @@ mod tests {
             .map_err(|diags| diags.into_iter().map(|d| d.message).collect::<Vec<_>>())?;
         let local_crate_id = CrateId(DefId(0));
         let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
-        let (symbols, trait_env, _diags, resolution_map) = resolver
-            .resolve_program(&program)
-            .map_err(|diags| {
+        let (symbols, trait_env, _diags, resolution_map) =
+            resolver.resolve_program(&program).map_err(|diags| {
                 diags
                     .into_inner()
                     .into_iter()
@@ -1984,7 +2058,10 @@ mod tests {
         let (symbols, _, _, _) = result.unwrap();
         let binding = symbols.lookup_type(Symbol::intern("MyInt"));
         assert!(binding.is_some(), "MyInt should be registered");
-        assert!(binding.unwrap().alias_ast.is_some(), "MyInt should have an alias AST");
+        assert!(
+            binding.unwrap().alias_ast.is_some(),
+            "MyInt should have an alias AST"
+        );
     }
 
     #[test]
@@ -2007,7 +2084,10 @@ mod tests {
         assert!(result.is_ok(), "transparent: {:?}", result.err());
         let (symbols, _, _, _) = result.unwrap();
         let binding = symbols.lookup_type(Symbol::intern("Wrapper"));
-        assert!(binding.unwrap().transparent, "Wrapper should be transparent");
+        assert!(
+            binding.unwrap().transparent,
+            "Wrapper should be transparent"
+        );
     }
 
     #[test]
@@ -2029,7 +2109,10 @@ mod tests {
         let (symbols, _, _, _) = result.unwrap();
         let func = symbols.lookup_function(Symbol::intern("id"));
         assert!(func.is_some(), "id should be registered");
-        assert!(!func.unwrap().signature.type_params.is_empty(), "id should have type params");
+        assert!(
+            !func.unwrap().signature.type_params.is_empty(),
+            "id should have type params"
+        );
     }
 
     #[test]
