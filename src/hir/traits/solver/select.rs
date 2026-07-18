@@ -1,17 +1,14 @@
 use crate::hir::symbol::SymbolTable;
 use crate::hir::traits::TraitEnv;
-use crate::hir::traits::solver::builtins::{self, BuiltinTrait, BuiltinTraitRegistry};
+use crate::hir::traits::solver::delegate::SolverDelegate;
+use crate::hir::traits::solver::builtins::{BuiltinTrait, BuiltinTraitRegistry};
 use crate::hir::traits::solver::obligation::{
     BuiltinImplSource, ImplSource, Obligation, ObligationCause, ObligationCauseCode, Predicate,
     ProjectionTy, SolveError,
 };
 use crate::hir::traits::solver::project::{self, ProjectionCache};
-use crate::hir::types::{DefId, Subst, TypeContext, TypeData, TypeId};
+use crate::hir::types::{DefId, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// Counter for fresh inference variables used during generic impl matching.
-static GENERIC_MATCH_VAR_ID: AtomicUsize = AtomicUsize::new(2_000_000);
 
 /// The core trait resolution engine.
 ///
@@ -22,6 +19,14 @@ static GENERIC_MATCH_VAR_ID: AtomicUsize = AtomicUsize::new(2_000_000);
 ///
 /// Uses `TraitEnv` as a read-only data source for registered impls.
 /// Does NOT modify `TraitEnv` — all state mutations go through `TypeContext` transactions.
+///
+/// ## Refactoring Note
+/// Candidate assembly (impls, caller_bounds, builtins, object_ty, poly) has been
+/// moved to the `assembly` module via the `GoalKind` trait.  The `select` method
+/// now delegates to `assembly::assemble_and_evaluate_candidates`.
+/// The old private assembly methods (`assemble_candidates_from_*`, `try_match_impl`,
+/// `winnow`, `specificity`, `confirm_candidate`) have been removed from this file.
+/// See `src/hir/traits/solver/assembly/mod.rs` for the new implementation.
 pub struct SelectionContext<'a> {
     pub ctx: &'a mut TypeContext,
     pub trait_env: &'a TraitEnv,
@@ -103,6 +108,8 @@ pub struct ResolvedObligation {
     /// Used to propagate depth when creating nested obligations during
     /// confirmation (e.g., `Candidate::Poly`).
     pub parent_depth: usize,
+    /// The source span from the original obligation, preserved for error reporting.
+    pub span: crate::ast::Span,
 }
 
 impl<'a> SelectionContext<'a> {
@@ -127,96 +134,23 @@ impl<'a> SelectionContext<'a> {
     /// Select a candidate for the given obligation.
     ///
     /// Returns the resolved `ImplSource` on success, or a `SolveError` on failure.
+    ///
+    /// This method now delegates to the `GoalKind`-based assembly engine
+    /// (see `assembly::assemble_and_evaluate_candidates`), which replaces
+    /// the old inline candidate assembly → winnowing → confirmation pipeline.
+    /// The engine uses the `GoalKind` trait to dispatch assembly logic per
+    /// predicate type, making it extensible without modifying the core engine.
     #[must_use]
     pub fn select(&mut self, obligation: &Obligation) -> Result<ImplSource, SolveError> {
-        if obligation.recursion_depth >= MAX_RECURSION_DEPTH {
-            return Err(SolveError::Overflow {
-                obligation: Box::new(obligation.clone()),
-                depth: obligation.recursion_depth,
-            });
-        }
-
-        // ── Handle ProjectionEq / ProjectionNormalize directly ──
-        // These are not trait obligations — they are resolved by looking up
-        // the associated type in the impl and unifying with the target.
-        match &obligation.predicate {
-            Predicate::ProjectionEq {
-                trait_id,
-                self_ty,
-                assoc_name,
-                value,
-            } => {
-                return self.handle_projection_eq(
-                    *trait_id,
-                    *self_ty,
-                    assoc_name,
-                    *value,
-                    &obligation.cause,
-                );
-            }
-            Predicate::ProjectionNormalize { projection, target } => {
-                return self.handle_projection_normalize(projection, *target, &obligation.cause);
-            }
-            _ => {}
-        }
-
-        // ── Resolve self_ty ──
-        let resolved = self.resolve_obligation(obligation);
-
-        // ── If self_ty is still an infer var, defer ──
-        // The obligation cannot be resolved until the type variable is
-        // bound to a concrete type.  Record which inference variables
-        // are blocking so the caller can selectively re-evaluate when
-        // they are resolved.
-        if resolved.ambiguous {
-            let stalled_on = vec![resolved.self_ty];
-            return Ok(ImplSource::Deferred { stalled_on });
-        }
-
-        // ── Candidate assembly ──
-        let mut candidates = Candidates {
-            vec: Vec::new(),
-            ambiguous: false,
-        };
-
-        self.assemble_candidates_from_impls(&resolved, &mut candidates);
-        self.assemble_candidates_from_caller_bounds(&resolved, &mut candidates);
-        self.assemble_candidates_from_builtins(&resolved, &mut candidates);
-        self.assemble_candidates_from_object_ty(&resolved, &mut candidates);
-        self.assemble_candidates_from_poly(&resolved, &mut candidates);
-
-        // ── Winnowing ──
-        self.winnow(&mut candidates, &resolved)?;
-
-        // ── Confirmation ──
-        match candidates.vec.len() {
-            0 => {
-                if candidates.ambiguous {
-                    Err(SolveError::Ambiguous {
-                        trait_id: resolved.trait_id,
-                        self_ty: resolved.self_ty,
-                        span: obligation.cause.span,
-                        num_candidates: 0,
-                    })
-                } else {
-                    Err(SolveError::NotFound {
-                        trait_id: resolved.trait_id,
-                        self_ty: resolved.self_ty,
-                        span: obligation.cause.span,
-                    })
-                }
-            }
-            1 => self.confirm_candidate(&resolved, &candidates.vec[0]),
-            _ => {
-                // Multiple candidates survived winnowing → ambiguity
-                Err(SolveError::Ambiguous {
-                    trait_id: resolved.trait_id,
-                    self_ty: resolved.self_ty,
-                    span: obligation.cause.span,
-                    num_candidates: candidates.vec.len(),
-                })
-            }
-        }
+        // Create an EvalCtxt wrapping self and delegate to the assembly engine.
+        let mut search_graph = crate::hir::traits::solver::search_graph::SearchGraph::new();
+        let span = obligation.cause.span;
+        let mut ecx = crate::hir::traits::solver::eval_ctxt::EvalCtxt::new(
+            self,
+            &mut search_graph,
+            span,
+        );
+        crate::hir::traits::solver::assembly::assemble_and_evaluate_candidates(&mut ecx, obligation)
     }
 
     /// Resolve the self_ty through bindings and extract the trait predicate.
@@ -237,6 +171,7 @@ impl<'a> SelectionContext<'a> {
                     args: resolved_args,
                     ambiguous,
                     parent_depth: obligation.recursion_depth,
+                    span: obligation.cause.span,
                 }
             }
             Predicate::AutoTrait { trait_id, self_ty } => {
@@ -248,6 +183,7 @@ impl<'a> SelectionContext<'a> {
                     args: vec![],
                     ambiguous,
                     parent_depth: obligation.recursion_depth,
+                    span: obligation.cause.span,
                 }
             }
             Predicate::Sized { ty } => {
@@ -259,6 +195,7 @@ impl<'a> SelectionContext<'a> {
                     args: vec![],
                     ambiguous,
                     parent_depth: obligation.recursion_depth,
+                    span: obligation.cause.span,
                 }
             }
             _ => {
@@ -269,336 +206,10 @@ impl<'a> SelectionContext<'a> {
                     args: vec![],
                     ambiguous: false,
                     parent_depth: obligation.recursion_depth,
+                    span: obligation.cause.span,
                 }
             }
         }
-    }
-
-    // ── Candidate assembly ──
-
-    fn assemble_candidates_from_impls(
-        &mut self,
-        obligation: &ResolvedObligation,
-        candidates: &mut Candidates,
-    ) {
-        let mut impl_count = 0;
-        for (idx, impl_cand) in self.trait_env.all_impls().iter().enumerate() {
-            if impl_cand.trait_id != obligation.trait_id {
-                continue;
-            }
-            impl_count += 1;
-            // Try unification inside a transaction, then ROLL BACK regardless.
-            self.ctx.begin_transaction();
-            let result = self.try_match_impl(idx, impl_cand, obligation);
-            self.ctx.rollback_transaction();
-            match result {
-                Ok(impl_source) => {
-                    candidates.vec.push(Candidate::Impl { idx, impl_source });
-                }
-                Err(_) => {}
-            }
-        }
-    }
-
-    fn try_match_impl(
-        &mut self,
-        cand_idx: usize,
-        impl_cand: &crate::hir::traits::ImplCandidate,
-        obligation: &ResolvedObligation,
-    ) -> Result<ImplSource, SolveError> {
-        let arity = impl_cand.arity;
-
-        // Generate fresh infer vars for each generic param
-        let mut subst = Subst::new();
-        for i in 0..arity {
-            let id = GENERIC_MATCH_VAR_ID.fetch_add(1, Ordering::Relaxed);
-            let fresh = self.ctx.alloc_infer_var(id);
-            subst.insert(i, fresh);
-        }
-
-        // Substitute the candidate's for_type with fresh infer vars.
-        let substituted_for_type = self.ctx.subst(impl_cand.for_type, &subst);
-
-        // Unify substituted for_type with obligation's self_ty
-        self.ctx
-            .unify(obligation.self_ty, substituted_for_type)
-            .map_err(|_| SolveError::NotFound {
-                trait_id: obligation.trait_id,
-                self_ty: obligation.self_ty,
-                span: crate::ast::Span::new(0, 0),
-            })?;
-
-        // ── Unify trait generic args ──
-        // Match the impl's trait args (e.g. `Int<32>` in `impl Add<Int<32>> for T`)
-        // against the obligation's args from the where-clause bound
-        // (e.g. `Add<Rhs = Int<32>>`).  Each impl trait_arg is substituted with
-        // fresh infer vars so that generic params (e.g. `impl<R> Add<R> for T`)
-        // are correctly matched.
-        let substituted_trait_args: Vec<TypeId> = impl_cand
-            .trait_args
-            .iter()
-            .map(|&arg| self.ctx.subst(arg, &subst))
-            .collect();
-
-        // Both impl and obligation must agree on the number of trait args.
-        // If they differ, the impl cannot match this obligation.
-        if substituted_trait_args.len() != obligation.args.len() {
-            return Err(SolveError::NotFound {
-                trait_id: obligation.trait_id,
-                self_ty: obligation.self_ty,
-                span: crate::ast::Span::new(0, 0),
-            });
-        }
-
-        for (impl_arg, ob_arg) in substituted_trait_args.iter().zip(obligation.args.iter()) {
-            self.ctx
-                .unify(*impl_arg, *ob_arg)
-                .map_err(|_| SolveError::Mismatch {
-                    expected: *ob_arg,
-                    found: *impl_arg,
-                    span: crate::ast::Span::new(0, 0),
-                })?;
-        }
-
-        // ── Generate sub-obligations from impl's where-clause ──
-        // Each bound `T: Foo` in `impl<T: Foo> Bar for T` becomes a
-        // Predicate::Trait obligation after applying the substitution.
-        let mut nested: Vec<Obligation> = Vec::new();
-        for &(ref_self_ty, bound_trait_id, ref bound_args) in &impl_cand.where_clause_bounds {
-            let substituted_self = self.ctx.subst(ref_self_ty, &subst);
-            let substituted_args: Vec<TypeId> = bound_args
-                .iter()
-                .map(|&arg| self.ctx.subst(arg, &subst))
-                .collect();
-            nested.push(Obligation {
-                cause: crate::hir::traits::solver::obligation::ObligationCause {
-                    span: impl_cand.span,
-                    code: ObligationCauseCode::ImplBound {
-                        impl_def_id: impl_cand.trait_id,
-                    },
-                },
-                predicate: Predicate::Trait {
-                    trait_id: bound_trait_id,
-                    self_ty: substituted_self,
-                    args: substituted_args,
-                },
-                recursion_depth: obligation.parent_depth + 1,
-            });
-        }
-
-        Ok(ImplSource::UserDefined {
-            cand_idx,
-            subst,
-            nested,
-        })
-    }
-
-    fn assemble_candidates_from_caller_bounds(
-        &mut self,
-        obligation: &ResolvedObligation,
-        candidates: &mut Candidates,
-    ) {
-        for bound in self.caller_bounds {
-            let (trait_id, self_ty, args) = match bound {
-                Predicate::Trait {
-                    trait_id,
-                    self_ty,
-                    args,
-                } => (trait_id, self_ty, Some(args)),
-                Predicate::AutoTrait { trait_id, self_ty } => (trait_id, self_ty, None),
-                _ => continue,
-            };
-            if *trait_id == obligation.trait_id {
-                self.ctx.begin_transaction();
-
-                // Unify self_ty
-                let ok = self.ctx.unify(obligation.self_ty, *self_ty).is_ok();
-
-                // Also unify trait generic args (e.g. Add<i32> vs Add<i64>)
-                let args_ok = if ok {
-                    if let Some(bound_args) = args {
-                        if bound_args.len() == obligation.args.len() {
-                            bound_args
-                                .iter()
-                                .zip(obligation.args.iter())
-                                .all(|(ba, oa)| self.ctx.unify(*ba, *oa).is_ok())
-                        } else {
-                            false
-                        }
-                    } else {
-                        true
-                    }
-                } else {
-                    false
-                };
-
-                // Roll back — candidate assembly must be side-effect-free.
-                // confirm_candidate will re-apply the unification.
-                self.ctx.rollback_transaction();
-                if args_ok {
-                    candidates.vec.push(Candidate::Param {
-                        self_ty: *self_ty,
-                        args: args.cloned().unwrap_or_default(),
-                    });
-                    // Do NOT return here — continue checking all bounds.
-                    // Multiple matching bounds for the same trait should
-                    // be collected and winnowed, producing an Ambiguous
-                    // error if more than one survives.
-                }
-            }
-        }
-    }
-
-    fn assemble_candidates_from_builtins(
-        &mut self,
-        obligation: &ResolvedObligation,
-        candidates: &mut Candidates,
-    ) {
-        let builtin_kind = self.builtin_registry.lookup(obligation.trait_id);
-
-        match builtin_kind {
-            Some(BuiltinTrait::Sized) => {
-                let self_ty = obligation.self_ty;
-                // If the self_ty is an inference var, we don't know yet — mark ambiguous
-                if self.ctx.is_infer_var(self_ty) {
-                    candidates.ambiguous = true;
-                } else if builtins::compute_sized(self_ty, self.ctx) {
-                    candidates
-                        .vec
-                        .push(Candidate::Builtin(BuiltinImplSource::Sized));
-                }
-                // If unsized, no candidate is added — the obligation fails
-                // (which is correct: unsized types do not satisfy `Sized`).
-            }
-            Some(BuiltinTrait::Copy) => {
-                if builtins::compute_copy(obligation.self_ty, self.ctx) {
-                    candidates
-                        .vec
-                        .push(Candidate::Builtin(BuiltinImplSource::Copy));
-                }
-            }
-            Some(BuiltinTrait::Clone) => {
-                // Clone auto-derives from Copy: if the type is Copy, it's also Clone.
-                // This covers both explicit Clone impls (from from_impls) and the
-                // automatic derive (SYNTAX.md § Automatic Clone for Copy Types).
-                if builtins::compute_clone(obligation.self_ty, self.ctx) {
-                    candidates
-                        .vec
-                        .push(Candidate::Builtin(BuiltinImplSource::Clone));
-                }
-            }
-            Some(BuiltinTrait::Drop) => {
-                // Drop is a user-implemented trait — rely on from_impls.
-            }
-            Some(BuiltinTrait::Default) => {
-                // Default is a user-implemented trait — rely on from_impls.
-            }
-            Some(_) => {
-                // Other builtins (Add, Sub, Eq, Ord, Deref, etc.) have no automatic
-                // structural derivation — they require a user-defined impl.
-                // Rely on from_impls for these.
-            }
-            None => {}
-        }
-    }
-
-    fn assemble_candidates_from_object_ty(
-        &mut self,
-        obligation: &ResolvedObligation,
-        candidates: &mut Candidates,
-    ) {
-        // If the self_ty is a dyn Trait, extract bounds from the vtable.
-        if let TypeData::DynTrait { traits, .. } = self.ctx.get(obligation.self_ty) {
-            for trait_id in traits {
-                if *trait_id == obligation.trait_id {
-                    candidates.vec.push(Candidate::Object {
-                        object_trait_id: *trait_id,
-                        nested: vec![],
-                    });
-                }
-            }
-        }
-    }
-
-    fn assemble_candidates_from_poly(
-        &mut self,
-        obligation: &ResolvedObligation,
-        candidates: &mut Candidates,
-    ) {
-        // Poly types: `Poly { quantifiers, body }` — a boxed polymorphic value.
-        // Check that the self_ty is a poly type, and record the quantifier count.
-        // The actual unboxing happens in confirm_candidate inside a committed
-        // transaction.
-        let quantifier_count = match self.ctx.get(obligation.self_ty) {
-            TypeData::Poly { quantifiers, .. } => quantifiers.len(),
-            _ => return,
-        };
-
-        candidates.vec.push(Candidate::Poly { quantifier_count });
-    }
-
-    // ── Winnowing ──
-
-    fn winnow(
-        &mut self,
-        candidates: &mut Candidates,
-        _obligation: &ResolvedObligation,
-    ) -> Result<(), SolveError> {
-        if candidates.vec.len() <= 1 {
-            return Ok(());
-        }
-
-        // Sort by specificity: concrete > generic, impl > param > builtin
-        candidates.vec.sort_by(|a, b| self.specificity(a, b));
-
-        // Keep only the most specific ones
-        let mut i = 1;
-        while i < candidates.vec.len() {
-            if self.candidate_should_be_dropped(&candidates.vec[i], &candidates.vec[0]) {
-                candidates.vec.swap_remove(i);
-            } else {
-                i += 1;
-            }
-        }
-
-        if candidates.vec.len() > 1 {
-            candidates.ambiguous = true;
-        }
-
-        Ok(())
-    }
-
-    /// Order candidates by specificity (most specific first).
-    fn specificity(&self, a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
-        match (a, b) {
-            // Param candidates are most specific (caller knows best)
-            (Candidate::Param { .. }, _) => std::cmp::Ordering::Less,
-            (_, Candidate::Param { .. }) => std::cmp::Ordering::Greater,
-            // Impl candidates are more specific than builtins
-            (Candidate::Impl { .. }, Candidate::Builtin(_)) => std::cmp::Ordering::Less,
-            (Candidate::Builtin(_), Candidate::Impl { .. }) => std::cmp::Ordering::Greater,
-            // Impl vs Impl: compare constructor depth of for_type.
-            // A concrete type (depth ≥ 1) is more specific than a generic
-            // parameter (depth 0).  Equal depths means equally specific,
-            // which should be treated as ambiguous.
-            (Candidate::Impl { idx: ai, .. }, Candidate::Impl { idx: bi, .. }) => {
-                let a_cand = &self.trait_env.all_impls()[*ai];
-                let b_cand = &self.trait_env.all_impls()[*bi];
-                let a_depth = self.ctx.type_constructor_depth(a_cand.for_type);
-                let b_depth = self.ctx.type_constructor_depth(b_cand.for_type);
-                b_depth.cmp(&a_depth) // higher depth = more specific = Ordering::Less
-            }
-            // Otherwise equal
-            _ => std::cmp::Ordering::Equal,
-        }
-    }
-
-    /// Check if a candidate should be dropped in favor of another.
-    /// Only strictly less specific candidates are dropped.  Equally specific
-    /// candidates survive — they will trigger an Ambiguous error, which is
-    /// the correct behaviour for overlapping impls.
-    fn candidate_should_be_dropped(&self, victim: &Candidate, other: &Candidate) -> bool {
-        self.specificity(victim, other) == std::cmp::Ordering::Greater
     }
 
     // ── Projection handling ──
@@ -687,107 +298,72 @@ impl<'a> SelectionContext<'a> {
         }
     }
 
-    // ── Confirmation ──
+    // ── Projection handling ──
+}
 
-    fn confirm_candidate(
+// ── SolverDelegate implementation ───────────────────────────────────
+
+impl SolverDelegate for SelectionContext<'_> {
+    fn ctx(&mut self) -> &mut TypeContext {
+        self.ctx
+    }
+
+    fn trait_env(&self) -> &TraitEnv {
+        self.trait_env
+    }
+
+    fn symbols(&self) -> &SymbolTable {
+        self.symbols
+    }
+
+    fn builtin_registry(&self) -> &BuiltinTraitRegistry {
+        self.builtin_registry
+    }
+
+    fn proj_cache(&self) -> &ProjectionCache {
+        self.proj_cache
+    }
+
+    fn caller_bounds(&self) -> &[Predicate] {
+        self.caller_bounds
+    }
+
+    fn resolve_obligation(&self, obligation: &Obligation) -> ResolvedObligation {
+        SelectionContext::resolve_obligation(self, obligation)
+    }
+
+    fn trait_is_coinductive(&self, def_id: DefId) -> bool {
+        self.builtin_registry
+            .lookup(def_id)
+            .is_some_and(|bt| bt.is_coinductive())
+    }
+
+    fn is_builtin_trait(&self, def_id: DefId) -> Option<BuiltinTrait> {
+        self.builtin_registry.lookup(def_id)
+    }
+
+    fn handle_projection_eq(
         &mut self,
-        obligation: &ResolvedObligation,
-        candidate: &Candidate,
+        trait_id: DefId,
+        self_ty: TypeId,
+        assoc_name: crate::symbol::Symbol,
+        target: TypeId,
+        cause: &ObligationCause,
     ) -> Result<ImplSource, SolveError> {
-        match candidate {
-            Candidate::Impl { idx, .. } => {
-                // Re-apply the bindings for the winning candidate.
-                // The candidate assembly phase rolled back all transactions,
-                // so we must re-run the matching inside a fresh transaction
-                // and commit it here.
-                let impl_cand = &self.trait_env.all_impls()[*idx];
-                self.ctx.begin_transaction();
-                let result = self.try_match_impl(*idx, impl_cand, obligation);
-                match result {
-                    Ok(impl_source) => {
-                        self.ctx.commit_transaction();
-                        Ok(impl_source)
-                    }
-                    Err(e) => {
-                        self.ctx.rollback_transaction();
-                        Err(e)
-                    }
-                }
-            }
-            Candidate::Param { self_ty, args } => {
-                // Re-apply the unification for the matched caller bound.
-                // The candidate assembly phase rolled back the transaction,
-                // so we must re-unify in a fresh transaction and commit.
-                self.ctx.begin_transaction();
-                let ok = self.ctx.unify(obligation.self_ty, *self_ty).is_ok()
-                    && args.len() == obligation.args.len()
-                    && args
-                        .iter()
-                        .zip(obligation.args.iter())
-                        .all(|(a, b)| self.ctx.unify(*a, *b).is_ok());
-                if ok {
-                    self.ctx.commit_transaction();
-                    Ok(ImplSource::Param(vec![]))
-                } else {
-                    self.ctx.rollback_transaction();
-                    Err(SolveError::NotFound {
-                        trait_id: obligation.trait_id,
-                        self_ty: obligation.self_ty,
-                        span: crate::ast::Span::new(0, 0),
-                    })
-                }
-            }
-            Candidate::Builtin(kind) => Ok(ImplSource::Builtin(*kind)),
-            Candidate::Object {
-                object_trait_id,
-                nested,
-            } => Ok(ImplSource::Object {
-                object_trait_id: *object_trait_id,
-                nested: nested.clone(),
-            }),
-            Candidate::Poly { quantifier_count } => {
-                // Re-apply the allocation inside a fresh transaction.
-                // The assembly phase rolled back, so the infer vars are stale.
-                // We need to re-create them and commit only if the candidate wins.
-                let body = match self.ctx.get(obligation.self_ty) {
-                    TypeData::Poly { body, .. } => *body,
-                    _ => {
-                        return Err(SolveError::NotFound {
-                            trait_id: obligation.trait_id,
-                            self_ty: obligation.self_ty,
-                            span: crate::ast::Span::new(0, 0),
-                        });
-                    }
-                };
-                self.ctx.begin_transaction();
-                let mut fresh_subst = Subst::new();
-                for i in 0..*quantifier_count {
-                    let id = GENERIC_MATCH_VAR_ID.fetch_add(1, Ordering::Relaxed);
-                    let fresh = self.ctx.alloc_infer_var(id);
-                    fresh_subst.insert(i, fresh);
-                }
-                let unboxed_body = self.ctx.subst(body, &fresh_subst);
-                let confirmed_obligation = Obligation {
-                    cause: ObligationCause {
-                        span: crate::ast::Span::new(0, 0),
-                        code: ObligationCauseCode::PolyUnbox {
-                            span: crate::ast::Span::new(0, 0),
-                        },
-                    },
-                    predicate: Predicate::Trait {
-                        trait_id: obligation.trait_id,
-                        self_ty: unboxed_body,
-                        args: obligation.args.clone(),
-                    },
-                    recursion_depth: obligation.parent_depth + 1,
-                };
-                self.ctx.commit_transaction();
-                Ok(ImplSource::Poly {
-                    subst: fresh_subst,
-                    nested: vec![confirmed_obligation],
-                })
-            }
-        }
+        SelectionContext::handle_projection_eq(self, trait_id, self_ty, &assoc_name, target, cause)
+    }
+
+    fn handle_projection_normalize(
+        &mut self,
+        projection: &ProjectionTy,
+        target: TypeId,
+        cause: &ObligationCause,
+    ) -> Result<ImplSource, SolveError> {
+        SelectionContext::handle_projection_normalize(self, projection, target, cause)
+    }
+
+    fn default_variables(&mut self) -> Result<(), crate::hir::types::TypeError> {
+        Ok(())
     }
 }
 

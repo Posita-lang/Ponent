@@ -1,9 +1,9 @@
+use crate::hir::query::{DefaultCache as QueryCache, QueryCacheType};
 use crate::hir::symbol::SymbolTable;
 use crate::hir::traits::TraitEnv;
 use crate::hir::traits::solver::obligation::ProjectionTy;
 use crate::hir::types::{DefId, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
-use rustc_hash::FxHashMap as HashMap;
 use std::cell::RefCell;
 
 /// Maximum number of entries in the projection cache.
@@ -16,12 +16,24 @@ const MAX_CACHE_SIZE: usize = 1024;
 /// Cache for normalized projection types.
 ///
 /// Prevents infinite recursion and redundant work during
-/// `<T as Trait>::Assoc` resolution.  Uses `FxHashMap` for O(1) lookup
-/// with no overhead.  When the cache exceeds `MAX_CACHE_SIZE`, it is
-/// fully cleared to prevent unbounded memory growth.
+/// `<T as Trait>::Assoc` resolution.  Uses `QueryCache` for O(1) lookup
+/// with capacity-limited eviction.
+///
+/// Migrated from `RefCell<HashMap>` to `QueryCache` — the query system's
+/// generic cache provides the same functionality with built-in eviction
+/// and a consistent API for all compiler caches.
 pub struct ProjectionCache {
-    map: RefCell<HashMap<(DefId, TypeId, Symbol), ProjectionCacheEntry>>,
+    cache: QueryCache<ProjectionKey, ProjectionCacheEntry>,
+    /// For marking ambiguous entries — we need a separate tracking
+    /// mechanism because `QueryCache` doesn't support the "ambiguous"
+    /// state natively.  This is a temporary wrapper until the query
+    /// system is extended to support multi-state entries.
+    ambiguous: RefCell<rustc_hash::FxHashSet<ProjectionKey>>,
 }
+
+/// Key for the projection cache: `(trait_id, self_ty, assoc_name)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProjectionKey(DefId, TypeId, Symbol);
 
 #[derive(Clone, Debug)]
 enum ProjectionCacheEntry {
@@ -29,14 +41,13 @@ enum ProjectionCacheEntry {
     Normalized(TypeId),
     /// Normalization failed (no impl found, etc.).
     Error,
-    /// Ambiguous (self_ty is an inference var).
-    Ambiguous,
 }
 
 impl ProjectionCache {
     pub fn new() -> Self {
         ProjectionCache {
-            map: RefCell::new(HashMap::default()),
+            cache: QueryCache::with_capacity(MAX_CACHE_SIZE),
+            ambiguous: RefCell::new(rustc_hash::FxHashSet::default()),
         }
     }
 
@@ -49,10 +60,17 @@ impl ProjectionCache {
         ctx: &TypeContext,
     ) -> Option<TypeId> {
         let resolved = ctx.resolve_binding(self_ty);
-        let map = self.map.borrow();
-        match map.get(&(trait_id, resolved, *assoc_name)) {
-            Some(ProjectionCacheEntry::Normalized(ty)) => Some(*ty),
-            _ => None,
+        let key = ProjectionKey(trait_id, resolved, *assoc_name);
+
+        // Check ambiguous set first.
+        if self.ambiguous.borrow().contains(&key) {
+            return None;
+        }
+
+        match self.cache.lookup(&key) {
+            Some(ProjectionCacheEntry::Normalized(ty)) => Some(ty),
+            Some(ProjectionCacheEntry::Error) => None,
+            None => None,
         }
     }
 
@@ -67,14 +85,8 @@ impl ProjectionCache {
         ctx: &TypeContext,
     ) {
         let resolved = ctx.resolve_binding(self_ty);
-        let mut map = self.map.borrow_mut();
-        if map.len() >= MAX_CACHE_SIZE {
-            map.clear();
-        }
-        map.insert(
-            (trait_id, resolved, assoc_name),
-            ProjectionCacheEntry::Normalized(ty),
-        );
+        let key = ProjectionKey(trait_id, resolved, assoc_name);
+        self.cache.insert(key, ProjectionCacheEntry::Normalized(ty));
     }
 
     /// Mark a projection as ambiguous (should not be cached permanently).
@@ -86,19 +98,14 @@ impl ProjectionCache {
         ctx: &TypeContext,
     ) {
         let resolved = ctx.resolve_binding(self_ty);
-        let mut map = self.map.borrow_mut();
-        if map.len() >= MAX_CACHE_SIZE {
-            map.clear();
-        }
-        map.insert(
-            (trait_id, resolved, assoc_name),
-            ProjectionCacheEntry::Ambiguous,
-        );
+        let key = ProjectionKey(trait_id, resolved, assoc_name);
+        self.ambiguous.borrow_mut().insert(key);
     }
 
     /// Clear the cache. Called when new impls are added.
     pub fn clear(&self) {
-        self.map.borrow_mut().clear();
+        self.cache.clear();
+        self.ambiguous.borrow_mut().clear();
     }
 }
 

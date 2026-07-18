@@ -10,6 +10,8 @@ use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet;
 use std::collections::BinaryHeap;
 
+pub mod defaulting;
+
 /// ── Inline GuardSet (ported from OmniML guard_set.ml) ───────────
 
 /// Reference-counted guard set for tracking when inference variables
@@ -161,16 +163,25 @@ pub struct InferRegionTree {
     pub pool_undo_log: Vec<PoolUndoEntry>,
 }
 
+/// Which pool list a Register entry modified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegisterKind {
+    Var,
+    RigidVar,
+}
+
 /// A single undo entry for a pool mutation.
 #[derive(Debug, Clone)]
 pub enum PoolUndoEntry {
-    /// A variable was registered (pushed).  Truncate to the saved lengths.
+    /// A variable was registered (pushed into `var_ids` or `rigid_var_ids`).
+    /// Reverse: remove the var by value from the appropriate list.
     Register {
         region_idx: usize,
-        old_var_len: usize,
-        old_rigid_len: usize,
+        var_id: usize,
+        kind: RegisterKind,
     },
-    /// A variable was unregistered (removed by value).  Re-insert it.
+    /// A variable was unregistered (removed by value from `var_ids`).
+    /// Reverse: re-insert it.
     Unregister { region_idx: usize, var_id: usize },
 }
 
@@ -288,8 +299,8 @@ impl InferRegionTree {
         let idx = self.current.0;
         self.pool_undo_log.push(PoolUndoEntry::Register {
             region_idx: idx,
-            old_var_len: self.nodes[idx].pool.var_ids.len(),
-            old_rigid_len: self.nodes[idx].pool.rigid_var_ids.len(),
+            var_id,
+            kind: RegisterKind::Var,
         });
         self.nodes[idx].pool.register_var(var_id);
     }
@@ -297,8 +308,8 @@ impl InferRegionTree {
         let idx = self.current.0;
         self.pool_undo_log.push(PoolUndoEntry::Register {
             region_idx: idx,
-            old_var_len: self.nodes[idx].pool.var_ids.len(),
-            old_rigid_len: self.nodes[idx].pool.rigid_var_ids.len(),
+            var_id,
+            kind: RegisterKind::RigidVar,
         });
         self.nodes[idx].pool.register_rigid_var(var_id);
     }
@@ -306,8 +317,8 @@ impl InferRegionTree {
         let idx = region_id.0;
         self.pool_undo_log.push(PoolUndoEntry::Register {
             region_idx: idx,
-            old_var_len: self.nodes[idx].pool.var_ids.len(),
-            old_rigid_len: self.nodes[idx].pool.rigid_var_ids.len(),
+            var_id,
+            kind: RegisterKind::Var,
         });
         self.nodes[idx].pool.register_var(var_id);
     }
@@ -378,37 +389,110 @@ impl InferRegionTree {
     }
 
     /// Roll back pool mutations recorded in the undo log.
-    /// Should be called after a transaction rollback to prevent zombie
-    /// entries from abandoned inference variables.
+    ///
+    /// Uses a single pass in reverse order, applying the inverse of each
+    /// operation:
+    /// - Register (add var X to pool Y) → remove var X from pool Y by value
+    /// - Unregister (remove var X from pool Y) → re-insert var X into pool Y
+    ///
+    /// # Why single-pass reverse-order is correct
+    ///
+    /// This is a standard undo-log pattern: the last operation is undone first.
+    /// Because each entry records the *identity* of the variable being added or
+    /// removed (not just a length), every inverse operation is exact:
+    ///
+    /// | Operation          | Forward                    | Inverse                   |
+    /// |--------------------|----------------------------|---------------------------|
+    /// | `Register(var_id)` | `push var_id`              | `retain(!= var_id)`       |
+    /// | `Unregister(var_id)`| `retain(!= var_id)`       | `push var_id`             |
+    ///
+    /// The use of value-based identity (not position) means the inverse of
+    /// Register always removes the exact variable that was added, regardless
+    /// of how many other variables were added or removed in between.  This
+    /// makes the single-pass approach correct for any interleaving pattern.
+    ///
+    /// # Why the two-pass approach was wrong
+    ///
+    /// The previous implementation used two passes with length-based truncation:
+    ///
+    ///   Pass 1: for each Register entry (reverse), `truncate(old_var_len)`
+    ///   Pass 2: for each Unregister entry (reverse), `push(var_id)`
+    ///
+    /// This is unsound because `truncate` restores by *position*, not by value.
+    /// When an Unregister removes a variable from the middle of the pool, the
+    /// length-based snapshot no longer identifies which elements belong there.
+    ///
+    /// ## Minimal reproduction of the bug
+    ///
+    /// Save the following as `bug.rs` and run with `rustc bug.rs && ./bug`:
+    ///
+    /// ```rust
+    /// // Initial pool: [99]
+    /// // 1. Register(100) → [99, 100]   records old_var_len=1
+    /// // 2. Unregister(99) → [100]      removes 99 by value
+    /// // 3. Register(200) → [100, 200]  records old_var_len=1 again
+    /// //
+    /// // Two-pass rollback trace:
+    /// //   Pass 1 (reverse truncate):
+    /// //     Register(200) → truncate(1) → [100]     ← wrong, removed 200
+    /// //     Unregister(99) → skip
+    /// //     Register(100) → truncate(1) → [100]     ← no-op, already 1
+    /// //   Pass 2 (reverse re-insert):
+    /// //     Unregister(99) → push 99 → [100, 99]    ← 99 is back but 100 survived!
+    /// //     (the other entries are Register, skipped)
+    /// //   Result: [100, 99]  ❌  Expected: [99]
+    /// ```
+    ///
+    /// The root cause: `old_var_len=1` is ambiguous — it could mean `[99]` or
+    /// `[100]`.  Once Unregister removes 99, truncating to length 1 keeps the
+    /// *wrong* element (100).  The value-based approach (single-pass reverse)
+    /// records `var_id=100` and `var_id=200`, so the inverse is unambiguous:
+    ///
+    /// ```text
+    ///   Register(200) inverse → retain(!=200) → [100]
+    ///   Unregister(99) inverse → push 99 → [100, 99]
+    ///   Register(100) inverse → retain(!=100) → [99]
+    ///   Result: [99]  ✓
+    /// ```
+    ///
+    /// # Contrast with OmniML reference
+    ///
+    /// The OmniML reference implementation (omniml/lib/constraint_solver/
+    /// generalization.ml) avoids this issue entirely by using a union-find
+    /// transactional store for rollback (omniml/lib/std/union_find.ml) and
+    /// never removing individual variables from pools by value (the pool
+    /// only has `register_type` — prepend to list).  Ponent's `unregister_var`
+    /// (for `try_promote_var` / region promotion) is a custom addition that
+    /// requires value-based rollback.
     pub fn rollback_pool(&mut self) {
-        // Two-pass rollback: first truncate all Register entries
-        // (in reverse order), then re-insert all Unregister entries
-        // (also in reverse order).  This ordering ensures that a
-        // truncation does not undo a re-insertion when the same
-        // region's pool was both grown (by a register) and then
-        // shrunk (by an unregister) inside the same transaction.
-        // Pass 1: truncate pools to saved lengths (Register entries)
         for entry in self.pool_undo_log.iter().rev() {
-            if let PoolUndoEntry::Register {
-                region_idx,
-                old_var_len,
-                old_rigid_len,
-            } = entry
-            {
-                if *region_idx < self.nodes.len() {
-                    self.nodes[*region_idx].pool.var_ids.truncate(*old_var_len);
-                    self.nodes[*region_idx]
-                        .pool
-                        .rigid_var_ids
-                        .truncate(*old_rigid_len);
+            match entry {
+                PoolUndoEntry::Register {
+                    region_idx,
+                    var_id,
+                    kind,
+                } => {
+                    if *region_idx < self.nodes.len() {
+                        match kind {
+                            RegisterKind::Var => {
+                                self.nodes[*region_idx]
+                                    .pool
+                                    .var_ids
+                                    .retain(|&v| v != *var_id);
+                            }
+                            RegisterKind::RigidVar => {
+                                self.nodes[*region_idx]
+                                    .pool
+                                    .rigid_var_ids
+                                    .retain(|&v| v != *var_id);
+                            }
+                        }
+                    }
                 }
-            }
-        }
-        // Pass 2: re-insert unregistered variables (Unregister entries)
-        for entry in self.pool_undo_log.iter().rev() {
-            if let PoolUndoEntry::Unregister { region_idx, var_id } = entry {
-                if *region_idx < self.nodes.len() {
-                    self.nodes[*region_idx].pool.var_ids.push(*var_id);
+                PoolUndoEntry::Unregister { region_idx, var_id } => {
+                    if *region_idx < self.nodes.len() {
+                        self.nodes[*region_idx].pool.var_ids.push(*var_id);
+                    }
                 }
             }
         }
@@ -3033,96 +3117,52 @@ impl InferenceContext {
             }
         }
 
-        // Defaulting: unfilled infer vars get default types,
-        // UNLESS they are PartiallyGeneralizable (guarded by suspended constraints).
+        // Defaulting: delegate to the standalone defaulting module.
+        // This function is shared between the old solver (InferenceContext::solve)
+        // and the new solver (FulfillmentContext::evaluate_all).
         //
-        // The defaulting runs in TWO passes to handle the case where an
-        // Unconstrained variable (e.g. `set x = 10`) is unified with a guided
-        // variable (e.g. Integer from the literal `10`).  Pass 1 defaults the
-        // guided kinds first, which resolves the leaf variables and transitively
-        // resolves the Unconstrained variables unified with them.  Pass 2 then
-        // checks only truly unresolved Unconstrained/Any variables.
-        //
-        // The VarOrigin recorded at variable creation time determines the behaviour:
-        //
-        //   Expression(Some(span))  → Err(CannotInfer { span })
-        //     An expression-level variable that should have been resolved.
-        //
-        //   Expression(None)        → silently default to Error
-        //     Inferred variable without source span (defensive fallback).
-        //
-        //   GenericParam            → silently default to Error
-        //     Generic parameter placeholder — expected to remain unresolved
-        //     until the function is instantiated at a call site.
-        //
-        //   Synthetic               → silently default to Error
-        //     Internal compiler variable (promotion, instantiation, etc.).
-
-        // ── Pass 1: default guided kinds (Integer, Float, Bool, Numeric) ──
-        for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
-            let resolved = ctx.resolve_binding(ty_id);
-            if let TypeData::InferVar { .. } = ctx.get(resolved) {
-                if i < self.gen_statuses.len()
-                    && self.gen_statuses[i] == GenStatus::PartiallyGeneralizable
-                {
-                    continue;
-                }
-                match self.type_vars[i].kind {
-                    TypeVariableKind::Integer => {
-                        let default_ty = ctx.int(32, true);
-                        ctx.set_binding(ty_id, default_ty);
-                    }
-                    TypeVariableKind::Float => {
-                        let default_ty = ctx.float(64);
-                        ctx.set_binding(ty_id, default_ty);
-                    }
-                    TypeVariableKind::Bool => {
-                        let default_ty = ctx.bool();
-                        ctx.set_binding(ty_id, default_ty);
-                    }
-                    TypeVariableKind::Numeric => {
-                        let default_ty = ctx.int(32, true);
-                        ctx.set_binding(ty_id, default_ty);
-                    }
-                    _ => {} // Unconstrained / Any handled in Pass 2
-                }
-            }
-        }
-
-        // ── Pass 2: check Unconstrained / Any for Expression errors ─────
-        for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
-            let resolved = ctx.resolve_binding(ty_id);
-            if let TypeData::InferVar { .. } = ctx.get(resolved) {
-                if i < self.gen_statuses.len()
-                    && self.gen_statuses[i] == GenStatus::PartiallyGeneralizable
-                {
-                    continue;
-                }
-                // Expression-level Unconstrained/Any that was never resolved
-                // is a type inference failure — report it.
-                if matches!(
-                    self.type_vars[i].kind,
-                    TypeVariableKind::Unconstrained | TypeVariableKind::Any
-                ) {
-                    if let VarOrigin::Expression(Some(span)) = self
-                        .var_origins
-                        .get(i)
-                        .copied()
-                        .unwrap_or(VarOrigin::Synthetic)
-                    {
-                        return Err(TypeError::CannotInfer { span });
-                    }
-                }
-                let default_ty = match self.type_vars[i].kind {
-                    TypeVariableKind::Unconstrained => ctx.error(),
-                    TypeVariableKind::Any => ctx.error(),
-                    _ => continue,
-                };
-                ctx.set_binding(ty_id, default_ty);
-            }
-        }
+        // Build the type_vars slice: (kind, origin) pairs for each variable.
+        let type_vars: Vec<(TypeVariableKind, VarOrigin)> = self
+            .type_vars
+            .iter()
+            .enumerate()
+            .map(|(i, tv)| {
+                let origin = self
+                    .var_origins
+                    .get(i)
+                    .copied()
+                    .unwrap_or(VarOrigin::Synthetic);
+                (tv.kind, origin)
+            })
+            .collect();
+        defaulting::default_variables(
+            ctx,
+            &self.var_type_ids,
+            &type_vars,
+            &self.gen_statuses,
+        )?;
 
         Ok(())
+    }
+
+    /// Returns the variable type IDs for the defaulting logic.
+    pub fn var_type_ids(&self) -> &[TypeId] {
+        &self.var_type_ids
+    }
+
+    /// Returns the type variables (kind, shape, etc.) for the defaulting logic.
+    pub fn type_vars(&self) -> &[TypeVar] {
+        &self.type_vars
+    }
+
+    /// Returns the generalisation statuses for the defaulting logic.
+    pub fn gen_statuses(&self) -> &[GenStatus] {
+        &self.gen_statuses
+    }
+
+    /// Returns the variable origins for the defaulting logic.
+    pub fn var_origins(&self) -> &[VarOrigin] {
+        &self.var_origins
     }
 
     pub fn finalize(&self, ctx: &mut TypeContext) -> HashMap<usize, TypeId> {
@@ -3374,6 +3414,39 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
         | TypeData::Never
         | TypeData::Unit
         | TypeData::Error
+        // `Poly` is a first-class polymorphic type `[σ]` (a boxed polytope).
+        // In the OmniML calculus (§3.1, O'Brien, Rémy & Scherer) a polytope
+        // wraps a *closed* type scheme `σ = ∀ᾱ.τ`.  The body is sealed — it
+        // must not contain free inference variables, only `GenericParam`
+        // references bound by the quantifiers.
+        //
+        // The reference implementation (omniml/lib/constraint_solver/types.ml)
+        // defines it as:
+        //   type t = ... | Poly of Type.Scheme.t
+        //   module Scheme = struct
+        //     type t = { quantifiers : Type.Var.t list; body : Type.t }
+        //   end
+        // and enforces the closedness invariant in `principal_shape.ml`:
+        //   | Poly _ ->
+        //     (* Invariant: no occurrences of [Poly]. *)
+        //     assert false
+        //
+        // Contrast with `subst()` which *does* recurse into `Poly`'s body:
+        // `subst` replaces `GenericParam` indices, which CAN appear in the
+        // body as bound variables (with binder shadowing).  `replace_infer`
+        // replaces `InferVar` IDs, which should never appear in a closed
+        // polytope body — so treating `Poly` as a leaf is correct.
+        //
+        // # Defense-in-depth
+        // The reference implementation enforces the closedness invariant
+        // explicitly via `Poly.invariant` (principal_shape.ml).  Ponent
+        // does NOT have a runtime check for this invariant.  If a bug
+        // elsewhere in the compiler creates a `Poly` whose body contains
+        // an `InferVar`, `replace_infer` will silently fail to replace it,
+        // leaving a stale inference variable in the type.  Adding an
+        // invariant assertion (e.g. in `TypeContext::poly()`) would catch
+        // such violations at the construction site rather than silently
+        // propagating them.
         | TypeData::Poly { .. } => ty,
         TypeData::GenericParam { .. } => ty,
         TypeData::Adt { kind, def_id, args } => {
@@ -4902,35 +4975,331 @@ mod tests {
                 .contains(&promoted_id),
             "after rollback, promoted var should NOT be in root region's pool"
         );
-        // The promoted variable should be back in the child region's pool
-        // (the unregister_var undo entry should have re-inserted it).
+        // Both the original variable and the promoted variable were created
+        // inside the undo-log scope.  With value-based rollback, every
+        // Register inverse removes the exact var that was added, so both
+        // variables are correctly removed from the child pool.
+        assert!(
+            !infer.region_tree.nodes[child_region.0]
+                .pool
+                .var_ids
+                .contains(&promoted_id),
+            "after rollback, promoted var should NOT be in child region's pool"
+        );
+        assert!(
+            !infer.region_tree.nodes[child_region.0]
+                .pool
+                .var_ids
+                .contains(&var_id),
+            "after rollback, original var should NOT be in child region's pool"
+        );
+        // Both pools should be empty (no variables existed before the
+        // undo-logged operations).
+        assert!(
+            infer.region_tree.nodes[root.0]
+                .pool
+                .var_ids
+                .is_empty(),
+            "after rollback, root pool should be empty"
+        );
         assert!(
             infer.region_tree.nodes[child_region.0]
                 .pool
                 .var_ids
-                .contains(&promoted_id),
-            "after rollback, variable should be back in child region's pool"
+                .is_empty(),
+            "after rollback, child pool should be empty"
         );
-        // The original variable should NOT be in the child region's pool
-        // (it was created before the simulated transaction and its
-        // Register entry records old_var_len = 0, so truncation
-        // removes it — this is expected because in a real scenario
-        // the variable would be created inside the transaction scope).
-        // What matters is that the promoted variable is correctly
-        // re-inserted into the child pool and removed from the root pool.
 
         // Now run force_root_generalization — it should not crash
+        // (both pools are empty, so nothing to generalize).
         let generalized = infer.force_root_generalization(&mut ctx);
-        // After rollback, the promoted variable is back in the child pool
-        // and is unguarded, so it should be generalized.
         assert!(
-            !generalized.is_empty(),
-            "after rollback, the unguarded promoted var should be generalized"
+            generalized.is_empty(),
+            "after rollback with empty pools, nothing should be generalized"
         );
-        // The generalized variable should be the promoted one
+    }
+
+    // ── rollback_pool value-based fix ───────────────────────────────
+    // Value-based rollback using var identity rather than position.
+    // The OmniML reference implementation (omniml/lib/constraint_solver/
+    // generalization.ml) avoids this by using a union-find transactional
+    // store and never removing individual variables from pools by value.
+    // Ponent's `unregister_var` (for `try_promote_var`) requires value-based
+    // rollback because the pool is a bag — element order is not semantically
+    // meaningful.
+
+    #[test]
+    fn test_rollback_pool_register_then_unregister_same_region() {
+        // Register → Unregister → Register on the same region.
+        // Initial pool: [A]
+        // 1. Register(B) → [A, B]
+        // 2. Unregister(A) → [B]
+        // 3. Register(C) → [B, C]
+        // Rollback must restore to [A] — the set of elements, not their order.
+        let mut ctx = TypeContext::new();
+        let mut tree = InferRegionTree::new();
+        let root = tree.root;
+
+        // Seed the root pool with var 99 (simulating a pre-existing variable).
+        tree.nodes[root.0].pool.var_ids.push(99);
+
+        let pool_before = tree.nodes[root.0].pool.var_ids.clone();
+        assert_eq!(pool_before, vec![99], "seed: pool should start with [99]");
+
+        // Step 1: Register var 100
+        tree.register_var_in_region(100, root);
+        assert_eq!(
+            tree.nodes[root.0].pool.var_ids,
+            vec![99, 100],
+            "after register 100: pool should be [99, 100]"
+        );
+
+        // Step 2: Unregister var 99 (the original seed)
+        tree.unregister_var(99, root);
+        assert_eq!(
+            tree.nodes[root.0].pool.var_ids,
+            vec![100],
+            "after unregister 99: pool should be [100]"
+        );
+
+        // Step 3: Register var 200
+        tree.register_var_in_region(200, root);
+        assert_eq!(
+            tree.nodes[root.0].pool.var_ids,
+            vec![100, 200],
+            "after register 200: pool should be [100, 200]"
+        );
+
+        // Rollback — should restore to [99]
+        tree.rollback_pool();
+        assert_eq!(
+            tree.nodes[root.0].pool.var_ids,
+            vec![99],
+            "rollback: pool should be restored to [99], got {:?}",
+            tree.nodes[root.0].pool.var_ids,
+        );
         assert!(
-            generalized.iter().any(|(_, vid)| *vid == promoted_id),
-            "generalized should include the promoted variable"
+            tree.pool_undo_log.is_empty(),
+            "rollback should clear the undo log"
+        );
+    }
+
+    #[test]
+    fn test_rollback_pool_unregister_then_register_same_region() {
+        // Reverse order of operations: Unregister first, then Register.
+        // Initial pool state: [A, B]
+        // 1. Unregister(A) → [B]
+        // 2. Register(C) → [B, C]
+        // Rollback should restore to [A, B] (set, not necessarily order).
+        //
+        // Note: the pool is a bag (Vec used as a set) — element order
+        // is not semantically meaningful.  This matches the OmniML
+        // reference implementation (omniml/lib/constraint_solver/
+        // generalization.ml) where the pool is an unordered list and
+        // variables are checked for membership rather than position.
+        let mut ctx = TypeContext::new();
+        let mut tree = InferRegionTree::new();
+        let root = tree.root;
+
+        let mut sort = |v: &mut Vec<usize>| v.sort();
+
+        tree.nodes[root.0].pool.var_ids = vec![10, 20];
+
+        let mut expected = vec![10, 20];
+        sort(&mut expected);
+        let mut actual = tree.nodes[root.0].pool.var_ids.clone();
+        sort(&mut actual);
+        assert_eq!(actual, expected, "seed: pool should start with [10, 20]");
+
+        tree.unregister_var(10, root);
+        assert_eq!(
+            tree.nodes[root.0].pool.var_ids,
+            vec![20],
+            "after unregister 10: pool should be [20]"
+        );
+
+        tree.register_var_in_region(30, root);
+        assert_eq!(
+            tree.nodes[root.0].pool.var_ids,
+            vec![20, 30],
+            "after register 30: pool should be [20, 30]"
+        );
+
+        tree.rollback_pool();
+        let mut actual = tree.nodes[root.0].pool.var_ids.clone();
+        sort(&mut actual);
+        assert_eq!(
+            actual, expected,
+            "rollback: pool should be restored to [10, 20] (set), got {:?}",
+            tree.nodes[root.0].pool.var_ids,
+        );
+    }
+
+    #[test]
+    fn test_rollback_pool_register_only_same_region() {
+        // Simple case: only Register entries, no Unregister.
+        // Initial: [A]
+        // 1. Register(B) → [A, B]
+        // 2. Register(C) → [A, B, C]
+        // Rollback should restore to [A].
+        let mut ctx = TypeContext::new();
+        let mut tree = InferRegionTree::new();
+        let root = tree.root;
+
+        tree.nodes[root.0].pool.var_ids.push(1);
+
+        tree.register_var_in_region(2, root);
+        tree.register_var_in_region(3, root);
+        assert_eq!(
+            tree.nodes[root.0].pool.var_ids,
+            vec![1, 2, 3],
+            "after two registers: pool should be [1, 2, 3]"
+        );
+
+        tree.rollback_pool();
+        assert_eq!(
+            tree.nodes[root.0].pool.var_ids,
+            vec![1],
+            "rollback: pool should be restored to [1], got {:?}",
+            tree.nodes[root.0].pool.var_ids,
+        );
+    }
+
+    #[test]
+    fn test_rollback_pool_different_regions() {
+        // Register and Unregister on DIFFERENT regions should not interfere.
+        // Root pool: [A]
+        // Child pool: [B]
+        // 1. Register(C) in root → root [A, C], child [B]
+        // 2. Unregister(B) from child → root [A, C], child []
+        // Rollback should restore both pools independently.
+        let mut ctx = TypeContext::new();
+        let mut tree = InferRegionTree::new();
+        let root = tree.root;
+
+        let _parent = tree.enter_region();
+        let child = tree.current;
+
+        tree.nodes[root.0].pool.var_ids.push(10);
+        tree.nodes[child.0].pool.var_ids.push(20);
+
+        // Register in root
+        tree.register_var_in_region(30, root);
+        assert_eq!(
+            tree.nodes[root.0].pool.var_ids,
+            vec![10, 30],
+            "root pool after register 30"
+        );
+        assert_eq!(
+            tree.nodes[child.0].pool.var_ids,
+            vec![20],
+            "child pool unchanged"
+        );
+
+        // Unregister from child
+        tree.unregister_var(20, child);
+        assert_eq!(
+            tree.nodes[root.0].pool.var_ids,
+            vec![10, 30],
+            "root pool unchanged after child unregister"
+        );
+        assert_eq!(
+            tree.nodes[child.0].pool.var_ids,
+            vec![],
+            "child pool after unregister 20"
+        );
+
+        tree.rollback_pool();
+        assert_eq!(
+            tree.nodes[root.0].pool.var_ids,
+            vec![10],
+            "root pool after rollback: should be [10], got {:?}",
+            tree.nodes[root.0].pool.var_ids,
+        );
+        assert_eq!(
+            tree.nodes[child.0].pool.var_ids,
+            vec![20],
+            "child pool after rollback: should be [20], got {:?}",
+            tree.nodes[child.0].pool.var_ids,
+        );
+    }
+
+    #[test]
+    fn test_rollback_pool_rigid_var() {
+        // RigidVar registers should also roll back correctly.
+        let mut ctx = TypeContext::new();
+        let mut tree = InferRegionTree::new();
+        let root = tree.root;
+
+        tree.nodes[root.0].pool.rigid_var_ids.push(1);
+
+        tree.register_rigid_var(2);
+        assert_eq!(
+            tree.nodes[root.0].pool.rigid_var_ids,
+            vec![1, 2],
+            "after rigid register: should be [1, 2]"
+        );
+
+        tree.rollback_pool();
+        assert_eq!(
+            tree.nodes[root.0].pool.rigid_var_ids,
+            vec![1],
+            "rigid rollback: should be restored to [1], got {:?}",
+            tree.nodes[root.0].pool.rigid_var_ids,
+        );
+    }
+
+    #[test]
+    fn test_rollback_pool_empty_undo_log() {
+        // Rollback with no entries should be a no-op.
+        let mut ctx = TypeContext::new();
+        let mut tree = InferRegionTree::new();
+        let root = tree.root;
+
+        tree.nodes[root.0].pool.var_ids.push(42);
+        let snapshot = tree.nodes[root.0].pool.var_ids.clone();
+
+        tree.rollback_pool();
+        assert_eq!(
+            tree.nodes[root.0].pool.var_ids,
+            snapshot,
+            "rollback with empty log should not change pool"
+        );
+    }
+
+    #[test]
+    fn test_rollback_pool_interleaved_register_and_unregister() {
+        // Complex interleaving: Register, Unregister, Register, Unregister
+        // on the same region.  Verifies that the value-based single-pass
+        // approach correctly handles multiple alternating operations.
+        let mut ctx = TypeContext::new();
+        let mut tree = InferRegionTree::new();
+        let root = tree.root;
+
+        // Seed: [1, 2]
+        tree.nodes[root.0].pool.var_ids = vec![1, 2];
+
+        // 1. Register(3) → [1, 2, 3]
+        tree.register_var_in_region(3, root);
+        // 2. Unregister(2) → [1, 3]
+        tree.unregister_var(2, root);
+        // 3. Register(4) → [1, 3, 4]
+        tree.register_var_in_region(4, root);
+        // 4. Unregister(1) → [3, 4]
+        tree.unregister_var(1, root);
+
+        assert_eq!(
+            tree.nodes[root.0].pool.var_ids,
+            vec![3, 4],
+            "after all operations: pool should be [3, 4]"
+        );
+
+        tree.rollback_pool();
+        assert_eq!(
+            tree.nodes[root.0].pool.var_ids,
+            vec![1, 2],
+            "rollback: pool should be restored to [1, 2], got {:?}",
+            tree.nodes[root.0].pool.var_ids,
         );
     }
 }

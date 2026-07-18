@@ -329,6 +329,35 @@ pub enum TypeData {
     /// `quantifiers` lists the universally quantified variables as (index, name) pairs.
     /// `body` is the inner type, referencing quantifiers via `GenericParam`.
     /// See OmniML §3.1 (O'Brien, Rémy & Scherer).
+    ///
+    /// # Invariant (closedness)
+    /// The body must be a *closed* type: all free variables are bound by
+    /// `quantifiers`.  Inference variables (`InferVar`) must NOT appear in
+    /// the body — only `GenericParam` references bound by the quantifiers.
+    /// This matches the OmniML reference implementation's invariant
+    /// (omniml/lib/constraint_solver/principal_shape.ml):
+    /// ```ocaml
+    /// | Poly _ ->
+    ///   (* Invariant: no occurrences of [Poly]. *)
+    ///   assert false
+    /// ```
+    /// Functions that substitute into types treat `Poly` differently
+    /// depending on what they replace:
+    /// - `subst()` replaces `GenericParam` indices and **does** recurse
+    ///   into the body (with binder shadowing), because `GenericParam`
+    ///   CAN appear in the body as bound variables.
+    /// - `replace_infer()` replaces `InferVar` IDs and does **not** recurse,
+    ///   because `InferVar` must never appear in a closed polytope body.
+    ///
+    /// # Defense-in-depth
+    /// The reference implementation enforces the closedness invariant
+    /// explicitly via `Poly.invariant` (principal_shape.ml).  Ponent does
+    /// NOT have a runtime check for this invariant.  If a bug elsewhere in
+    /// the compiler creates a `Poly` whose body contains an `InferVar`,
+    /// `replace_infer()` will silently fail to replace it, leaving a stale
+    /// inference variable in the type.  Adding an invariant assertion
+    /// (e.g. in `TypeContext::poly()`) would catch such violations at the
+    /// construction site rather than silently propagating them.
     Poly {
         quantifiers: Vec<(usize, Symbol)>,
         body: TypeId,
@@ -1821,7 +1850,7 @@ impl TypeContext {
                 if self.occurs_check(a, b) {
                     return Err(TypeError::RecursiveType {
                         ty: a,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(0, 0), // TODO: pass span from caller
                     });
                 }
                 self.set_binding(a, b);
@@ -1831,7 +1860,7 @@ impl TypeContext {
                 if self.occurs_check(b, a) {
                     return Err(TypeError::RecursiveType {
                         ty: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(0, 0), // TODO: pass span from caller
                     });
                 }
                 self.set_binding(b, a);
@@ -1852,7 +1881,7 @@ impl TypeContext {
                 if self.occurs_check(a, b) {
                     return Err(TypeError::RecursiveType {
                         ty: a,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(0, 0), // TODO: pass span from caller
                     });
                 }
                 self.set_binding(a, b);
@@ -1862,7 +1891,7 @@ impl TypeContext {
                 if self.occurs_check(b, a) {
                     return Err(TypeError::RecursiveType {
                         ty: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(0, 0), // TODO: pass span from caller
                     });
                 }
                 self.set_binding(b, a);
@@ -1970,7 +1999,7 @@ impl TypeContext {
                     return Err(TypeError::Mismatch {
                         expected: b,
                         found: a,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(0, 0), // TODO: pass span from caller
                     });
                 }
                 let ty_variance = variance.xform(Variance::Invariant);
@@ -2212,7 +2241,7 @@ impl TypeContext {
                     Err(TypeError::Mismatch {
                         expected: b,
                         found: a,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(0, 0), // TODO: pass span from caller
                     })
                 }
             }
@@ -2220,7 +2249,7 @@ impl TypeContext {
             _ => Err(TypeError::Mismatch {
                 expected: b,
                 found: a,
-                span: crate::ast::Span::new(0, 0),
+                span: crate::ast::Span::new(0, 0), // TODO: pass span from caller
             }),
         }
     }
@@ -2661,6 +2690,15 @@ impl TypeContext {
                 // Poly is a binder over all its quantifiers.  Remove shadowed
                 // keys from the substitution map and recurse, so that other
                 // free variables in the body are still substituted.
+                //
+                // NOTE: this differs from `replace_infer()` which treats `Poly`
+                // as a leaf (does not recurse).  The difference is intentional:
+                // `subst()` replaces `GenericParam` indices, which CAN appear
+                // in the body as bound variables (with binder shadowing).
+                // `replace_infer()` replaces `InferVar` IDs, which must NOT
+                // appear in a closed polytope body per the OmniML invariant
+                // (omniml/lib/constraint_solver/principal_shape.ml:
+                //  `| Poly _ -> assert false`).
                 let shadowed_indices: Vec<usize> = quantifiers
                     .iter()
                     .map(|(idx, _)| *idx)

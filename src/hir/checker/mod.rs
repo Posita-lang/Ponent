@@ -11,6 +11,7 @@ use crate::hir::traits::solver::{
     FulfillmentContext, Obligation, ObligationCause, ObligationCauseCode,
     Predicate as TraitPredicate,
 };
+use crate::hir::traits::solver::select::SelectionContext;
 use crate::hir::types::*;
 use crate::symbol::Symbol;
 use std::cell::RefCell;
@@ -449,7 +450,7 @@ impl<'a> TypeChecker<'a> {
         let top_obligations: Vec<TraitPredicate> = self.trait_obligations.drain(..).collect();
         if !top_obligations.is_empty() {
             let ctx: &mut TypeContext = &mut self.ctx;
-            let mut fulfill = FulfillmentContext::new(
+            let mut selcx = SelectionContext::new(
                 ctx,
                 self.trait_env,
                 self.symbols,
@@ -457,10 +458,12 @@ impl<'a> TypeChecker<'a> {
                 &self.proj_cache,
                 &[], // no caller bounds at top level
             );
+            let mut fulfill = FulfillmentContext::new(&mut selcx);
+            fulfill.set_infer_data_from(&self.infer);
             for bound in &top_obligations {
                 let obligation = Obligation {
                     cause: crate::hir::traits::solver::ObligationCause {
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(0, 0), // TODO: propagate span from TraitPredicate
                         code: crate::hir::traits::solver::ObligationCauseCode::Misc,
                     },
                     predicate: match bound {
@@ -488,10 +491,11 @@ impl<'a> TypeChecker<'a> {
                     .map(|e| format!("{}", e))
                     .collect::<Vec<_>>()
                     .join("; ");
+                let span = errors.first().and_then(|e| e.span()).unwrap_or(crate::ast::Span::new(0, 0));
                 self.diagnostics.push(
                     Diagnostic::error(format!("trait solver error: {}", msg))
                         .with_code_str("E030")
-                        .with_span(crate::ast::Span::new(0, 0)),
+                        .with_span(span),
                 );
             }
         }
@@ -524,7 +528,7 @@ impl<'a> TypeChecker<'a> {
                 // transient FulfillmentContext was dropped.
                 if !top_obligations.is_empty() {
                     let ctx: &mut TypeContext = &mut self.ctx;
-                    let mut fulfill = FulfillmentContext::new(
+                    let mut selcx = SelectionContext::new(
                         ctx,
                         self.trait_env,
                         self.symbols,
@@ -532,10 +536,12 @@ impl<'a> TypeChecker<'a> {
                         &self.proj_cache,
                         &[],
                     );
+                    let mut fulfill = FulfillmentContext::new(&mut selcx);
+                    fulfill.set_infer_data_from(&self.infer);
                     for bound in &top_obligations {
                         let obligation = Obligation {
                             cause: crate::hir::traits::solver::ObligationCause {
-                                span: crate::ast::Span::new(0, 0),
+                                span: crate::ast::Span::new(0, 0), // TODO: propagate span from TraitPredicate
                                 code: crate::hir::traits::solver::ObligationCauseCode::Misc,
                             },
                             predicate: match bound {
@@ -563,10 +569,11 @@ impl<'a> TypeChecker<'a> {
                             .map(|e| format!("{}", e))
                             .collect::<Vec<_>>()
                             .join("; ");
+                        let span = errors.first().and_then(|e| e.span()).unwrap_or(crate::ast::Span::new(0, 0));
                         self.diagnostics.push(
                             Diagnostic::error(format!("trait solver error: {}", msg))
                                 .with_code_str("E030")
-                                .with_span(crate::ast::Span::new(0, 0)),
+                                .with_span(span),
                         );
                     }
                 }
@@ -1183,7 +1190,7 @@ impl<'a> TypeChecker<'a> {
                 if has_obligations {
                     // We need separate borrows of ctx for the solver.
                     let ctx: &mut TypeContext = guard.checker.ctx;
-                    let mut fulfill = FulfillmentContext::new(
+                    let mut selcx = SelectionContext::new(
                         ctx,
                         guard.checker.trait_env,
                         guard.checker.symbols,
@@ -1191,6 +1198,9 @@ impl<'a> TypeChecker<'a> {
                         &guard.checker.proj_cache,
                         &solver_caller_bounds, // only where-clause bounds on generic-param types as assumptions
                     );
+                    let mut fulfill = FulfillmentContext::new(&mut selcx);
+                    // Pass inference variable data for the defaulting step.
+                    fulfill.set_infer_data_from(&guard.checker.infer);
                     // Register ALL obligations (where-clause + body-check-time)
                     for bound in &all_bounds {
                         let obligation = Obligation {
@@ -1253,6 +1263,46 @@ impl<'a> TypeChecker<'a> {
                                             }
                                         },
                                         ty: *ty,
+                                    }
+                                }
+                                TraitPredicate::Eq { a, b } => {
+                                    crate::hir::traits::solver::Predicate::Eq {
+                                        a: *a,
+                                        b: *b,
+                                    }
+                                }
+                                TraitPredicate::Sub { sub, sup } => {
+                                    crate::hir::traits::solver::Predicate::Sub {
+                                        sub: *sub,
+                                        sup: *sup,
+                                    }
+                                }
+                                TraitPredicate::Match { scrutinee, branches_id } => {
+                                    crate::hir::traits::solver::Predicate::Match {
+                                        scrutinee: *scrutinee,
+                                        branches_id: *branches_id,
+                                    }
+                                }
+                                TraitPredicate::Forall { body } => {
+                                    crate::hir::traits::solver::Predicate::Forall {
+                                        body: body.clone(),
+                                    }
+                                }
+                                TraitPredicate::Exists { body } => {
+                                    crate::hir::traits::solver::Predicate::Exists {
+                                        body: body.clone(),
+                                    }
+                                }
+                                TraitPredicate::Instance { scheme_ty, instantiation_ty } => {
+                                    crate::hir::traits::solver::Predicate::Instance {
+                                        scheme_ty: *scheme_ty,
+                                        instantiation_ty: *instantiation_ty,
+                                    }
+                                }
+                                TraitPredicate::Let { def, body } => {
+                                    crate::hir::traits::solver::Predicate::Let {
+                                        def: def.clone(),
+                                        body: body.clone(),
                                     }
                                 }
                             },
@@ -1355,7 +1405,7 @@ impl<'a> TypeChecker<'a> {
                 let final_obs: Vec<TraitPredicate> = self.trait_obligations.drain(..).collect();
                 if !final_obs.is_empty() {
                     let ctx: &mut TypeContext = &mut self.ctx;
-                    let mut fulfill = FulfillmentContext::new(
+                    let mut selcx = SelectionContext::new(
                         ctx,
                         self.trait_env,
                         self.symbols,
@@ -1363,6 +1413,9 @@ impl<'a> TypeChecker<'a> {
                         &self.proj_cache,
                         &solver_caller_bounds,
                     );
+                    let mut fulfill = FulfillmentContext::new(&mut selcx);
+                    // Pass inference variable data for the defaulting step.
+                    fulfill.set_infer_data_from(&self.infer);
                     // Collect all obligations: original all_bounds (which includes
                     // where-clause bounds and body-check-time obligations) plus
                     // any new ones from contract expressions.
@@ -1429,6 +1482,46 @@ impl<'a> TypeChecker<'a> {
                                             }
                                         },
                                         ty: *ty,
+                                    }
+                                }
+                                TraitPredicate::Eq { a, b } => {
+                                    crate::hir::traits::solver::Predicate::Eq {
+                                        a: *a,
+                                        b: *b,
+                                    }
+                                }
+                                TraitPredicate::Sub { sub, sup } => {
+                                    crate::hir::traits::solver::Predicate::Sub {
+                                        sub: *sub,
+                                        sup: *sup,
+                                    }
+                                }
+                                TraitPredicate::Match { scrutinee, branches_id } => {
+                                    crate::hir::traits::solver::Predicate::Match {
+                                        scrutinee: *scrutinee,
+                                        branches_id: *branches_id,
+                                    }
+                                }
+                                TraitPredicate::Forall { body } => {
+                                    crate::hir::traits::solver::Predicate::Forall {
+                                        body: body.clone(),
+                                    }
+                                }
+                                TraitPredicate::Exists { body } => {
+                                    crate::hir::traits::solver::Predicate::Exists {
+                                        body: body.clone(),
+                                    }
+                                }
+                                TraitPredicate::Instance { scheme_ty, instantiation_ty } => {
+                                    crate::hir::traits::solver::Predicate::Instance {
+                                        scheme_ty: *scheme_ty,
+                                        instantiation_ty: *instantiation_ty,
+                                    }
+                                }
+                                TraitPredicate::Let { def, body } => {
+                                    crate::hir::traits::solver::Predicate::Let {
+                                        def: def.clone(),
+                                        body: body.clone(),
                                     }
                                 }
                             },

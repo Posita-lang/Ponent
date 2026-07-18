@@ -91,10 +91,6 @@ impl BuiltinTrait {
     /// Try to identify a builtin trait by its name.
     /// Returns `None` if the trait is user-defined.
     pub fn identify(name: &Symbol) -> Option<BuiltinTrait> {
-        // This is intentionally a match on Symbol.as_str() — it's a fixed set of
-        // builtin trait names defined by the language specification.
-        // Adding a new builtin trait requires adding it to this match
-        // AND to the enum above.
         match &*name.as_str() {
             "Sized" => Some(BuiltinTrait::Sized),
             "Copy" => Some(BuiltinTrait::Copy),
@@ -117,6 +113,12 @@ impl BuiltinTrait {
             "Write" => Some(BuiltinTrait::Write),
             _ => None,
         }
+    }
+
+    /// Whether this builtin trait is coinductive (auto‑trait / marker).
+    /// Coinductive traits treat cycles in the proof tree as success.
+    pub fn is_coinductive(&self) -> bool {
+        matches!(self, BuiltinTrait::Sized | BuiltinTrait::Copy | BuiltinTrait::Clone)
     }
 }
 

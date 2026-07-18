@@ -20,13 +20,18 @@
 //! The `TraitEnv` interface is unchanged — no modifications to the
 //! existing `add_impl`, `lookup_impl`, or `lookup_impl_generic` methods.
 
+pub mod assembly;
 pub mod builtins;
 pub mod coherence;
+pub mod delegate;
 pub mod eval;
+pub mod eval_ctxt;
 pub mod forest;
 pub mod fulfill;
+pub mod inspect;
 pub mod obligation;
 pub mod project;
+pub mod search_graph;
 pub mod select;
 
 #[cfg(test)]

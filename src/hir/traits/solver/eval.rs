@@ -34,10 +34,13 @@
 //! are identified by their nesting depth rather than a global index.
 
 use crate::ast::OverflowPolicy;
+use crate::hir::traits::solver::delegate::SolverDelegate;
+use crate::hir::traits::solver::eval_ctxt::EvalCtxt;
 use crate::hir::traits::solver::obligation::{
     BuiltinImplSource, ImplSource, Obligation, Predicate, SolveError,
 };
-use crate::hir::traits::solver::select::{MAX_RECURSION_DEPTH, SelectionContext};
+use crate::hir::traits::solver::search_graph::{GoalKey as SgGoalKey, GoalKind as SgGoalKind, SearchGraph};
+use crate::hir::traits::solver::select::MAX_RECURSION_DEPTH;
 use crate::hir::types::{AdtKind, DefId, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
 
@@ -331,57 +334,21 @@ fn canonicalize_type(ctx: &TypeContext, ty: TypeId, bound: &mut Vec<usize>) -> C
     }
 }
 
-// ── Goal key ──
+// ── Goal key ── (now in search_graph.rs — GoalKey, GoalKind)
 
-/// The predicate kind for cycle-detection identity.
-///
-/// Distinguishes `Trait`, `AutoTrait`, and `Sized` so that a cycle
-/// detected for one predicate kind is not falsely identified as a
-/// cycle for a different kind (which would cause false coinductive
-/// success or false overflow).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum GoalKind {
-    Trait,
-    AutoTrait,
-    Sized,
-}
-
-/// The resolved identity of a goal for cycle detection.
-///
-/// Uses `CanonTy` (non-allocating structural keys) instead of raw `TypeId`s,
-/// so equality is collision-free and stable even when the type contains
-/// unresolved inference variables (which `TypeContext::alloc` does not cache).
-///
-/// Includes `kind` to distinguish `Trait`, `AutoTrait`, and `Sized` —
-/// these are semantically different even when they share the same
-/// `trait_id`, `self_ty`, and `args`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct GoalKey {
-    kind: GoalKind,
-    trait_id: Option<DefId>,
-    self_ty: CanonTy,
-    args: Vec<CanonTy>,
-}
-
-/// An active frame on the cycle-detection stack.
-struct ActiveGoal {
-    predicate: Predicate,
-}
-
-/// Evaluate a goal and all its nested obligations recursively.
-pub fn evaluate_goal(
-    selcx: &mut SelectionContext,
+// ── Evaluate a goal and all its nested obligations recursively. ──
+pub fn evaluate_goal<D: SolverDelegate>(
+    ecx: &mut EvalCtxt<D>,
     goal: &Obligation,
 ) -> Result<ImplSource, SolveError> {
-    let mut stack: Vec<ActiveGoal> = Vec::new();
-    evaluate_goal_inner(selcx, goal, &mut stack, 0)
+    evaluate_goal_inner(ecx, goal, 0)
 }
 
-/// Inner recursive evaluation with explicit depth and cycle stack.
-fn evaluate_goal_inner(
-    selcx: &mut SelectionContext,
+/// Inner recursive evaluation with explicit depth, using SearchGraph
+/// for cycle detection (now embedded in EvalCtxt).
+fn evaluate_goal_inner<D: SolverDelegate>(
+    ecx: &mut EvalCtxt<D>,
     goal: &Obligation,
-    stack: &mut Vec<ActiveGoal>,
     depth: usize,
 ) -> Result<ImplSource, SolveError> {
     if depth >= MAX_RECURSION_DEPTH {
@@ -391,121 +358,73 @@ fn evaluate_goal_inner(
         });
     }
 
-    // ── Cycle detection ──
-    // Compute the current goal's canonical key under current bindings.
-    let goal_key = compute_goal_key(goal, selcx.ctx);
-    let is_keyed = goal_key.is_some();
-
-    // For each active frame, re-canonicalize under current bindings and compare.
+    // ── Cycle detection via SearchGraph (embedded in EvalCtxt) ──
+    let goal_key = SgGoalKey::from_obligation(goal, ecx.ctx());
     if let Some(ref key) = goal_key {
-        for active in stack.iter() {
-            let active_key = compute_goal_key_for_predicate(&active.predicate, selcx.ctx);
-            if let Some(ref ak) = active_key {
-                if ak == key {
-                    match &goal.predicate {
-                        Predicate::AutoTrait { .. } => {
-                            return Ok(ImplSource::Auto { nested: vec![] });
-                        }
-                        Predicate::Sized { .. } => {
-                            return Ok(ImplSource::Builtin(BuiltinImplSource::Sized));
-                        }
-                        _ => {
-                            return Err(SolveError::Overflow {
-                                obligation: Box::new(goal.clone()),
-                                depth,
-                            });
-                        }
+        match ecx.search_graph.try_entry(key, ecx.delegate) {
+            Ok(()) => {
+                // Push the goal onto the stack for evaluation.
+                // The step_kind is determined by the goal's trait kind.
+                let step_kind = if let Some(trait_id) = key.trait_id {
+                    if ecx.delegate.trait_is_coinductive(trait_id) {
+                        crate::hir::traits::solver::search_graph::PathKind::Coinductive
+                    } else {
+                        crate::hir::traits::solver::search_graph::PathKind::Inductive
                     }
+                } else {
+                    match key.kind {
+                        SgGoalKind::Sized | SgGoalKind::CopyLike | SgGoalKind::AutoTrait => {
+                            crate::hir::traits::solver::search_graph::PathKind::Coinductive
+                        }
+                        _ => crate::hir::traits::solver::search_graph::PathKind::Inductive,
+                    }
+                };
+                ecx.search_graph.push_goal(key.clone(), step_kind, true);
+            }
+            Err(path_kind) => {
+                return ecx.search_graph.handle_cycle(key, goal, path_kind);
+            }
+        }
+    }
+
+    // ── Evaluate using the new builder-pattern probe API ──
+    let result = ecx.probe(crate::hir::traits::solver::eval_ctxt::ProbeKind::TraitGoal)
+        .enter(|ecx| {
+        // Use the GoalKind-based assembly engine instead of delegate.select().
+        // The assembly engine handles candidate assembly, winnowing, and
+        // confirmation via the GoalKind trait (see assembly/mod.rs).
+        let impl_source =
+            crate::hir::traits::solver::assembly::assemble_and_evaluate_candidates(ecx, goal)?;
+
+        if matches!(&impl_source, ImplSource::Deferred { .. }) {
+            return Ok(impl_source);
+        }
+
+        for nested in impl_source.nested_obligations() {
+            match evaluate_goal_inner(ecx, &nested, depth + 1) {
+                Ok(ImplSource::Deferred { stalled_on }) => {
+                    return Ok(ImplSource::Deferred { stalled_on });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(e);
                 }
             }
         }
+
+        Ok(impl_source)
+    });
+
+    // Exit the search graph (pop from active path).
+    if goal_key.is_some() {
+        ecx.search_graph.pop_goal();
     }
 
-    if is_keyed {
-        stack.push(ActiveGoal {
-            predicate: goal.predicate.clone(),
-        });
-    }
-
-    // ── Evaluate ──
-    selcx.ctx.begin_transaction();
-
-    let result = selcx.select(goal);
-
-    let pop_goal = |stack: &mut Vec<ActiveGoal>, pushed: bool| {
-        if pushed {
-            stack.pop();
-        }
-    };
-
-    match result {
-        Ok(impl_source) => {
-            if matches!(&impl_source, ImplSource::Deferred { .. }) {
-                selcx.ctx.rollback_transaction();
-                pop_goal(stack, is_keyed);
-                return Ok(impl_source);
-            }
-            for nested in impl_source.nested_obligations() {
-                match evaluate_goal_inner(selcx, &nested, stack, depth + 1) {
-                    Ok(ImplSource::Deferred { stalled_on }) => {
-                        selcx.ctx.rollback_transaction();
-                        pop_goal(stack, is_keyed);
-                        return Ok(ImplSource::Deferred { stalled_on });
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        selcx.ctx.rollback_transaction();
-                        pop_goal(stack, is_keyed);
-                        return Err(e);
-                    }
-                }
-            }
-            selcx.ctx.commit_transaction();
-            pop_goal(stack, is_keyed);
-            Ok(impl_source)
-        }
-        Err(e) => {
-            selcx.ctx.rollback_transaction();
-            pop_goal(stack, is_keyed);
-            Err(e)
-        }
-    }
+    result
 }
 
-/// Compute the canonical goal key for an obligation under current bindings.
-fn compute_goal_key(obligation: &Obligation, ctx: &TypeContext) -> Option<GoalKey> {
-    compute_goal_key_for_predicate(&obligation.predicate, ctx)
-}
-
-/// Compute the canonical goal key for a predicate under current bindings.
-fn compute_goal_key_for_predicate(predicate: &Predicate, ctx: &TypeContext) -> Option<GoalKey> {
-    let mut bound = Vec::new();
-    match predicate {
-        Predicate::Trait {
-            trait_id,
-            self_ty,
-            args,
-        } => Some(GoalKey {
-            kind: GoalKind::Trait,
-            trait_id: Some(*trait_id),
-            self_ty: canonicalize_type(ctx, *self_ty, &mut bound),
-            args: args
-                .iter()
-                .map(|a| canonicalize_type(ctx, *a, &mut bound))
-                .collect(),
-        }),
-        Predicate::AutoTrait { trait_id, self_ty } => Some(GoalKey {
-            kind: GoalKind::AutoTrait,
-            trait_id: Some(*trait_id),
-            self_ty: canonicalize_type(ctx, *self_ty, &mut bound),
-            args: vec![],
-        }),
-        Predicate::Sized { ty } => Some(GoalKey {
-            kind: GoalKind::Sized,
-            trait_id: None,
-            self_ty: canonicalize_type(ctx, *ty, &mut bound),
-            args: vec![],
-        }),
-        _ => None,
-    }
+/// Compute the canonical goal key for an obligation, using the
+/// search_graph's key type.
+fn compute_goal_key(obligation: &Obligation, ctx: &TypeContext) -> Option<SgGoalKey> {
+    SgGoalKey::from_obligation(obligation, ctx)
 }

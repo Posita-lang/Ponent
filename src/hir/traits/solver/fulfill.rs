@@ -1,56 +1,92 @@
-use crate::hir::symbol::SymbolTable;
-use crate::hir::traits::TraitEnv;
-use crate::hir::traits::solver::builtins::BuiltinTraitRegistry;
+use crate::ast::Span;
+use crate::hir::infer::{GenStatus, InferenceContext, TypeVariableKind, VarOrigin};
+use crate::hir::infer::defaulting;
+use crate::hir::traits::solver::delegate::SolverDelegate;
 use crate::hir::traits::solver::eval::evaluate_goal;
+use crate::hir::traits::solver::eval_ctxt::EvalCtxt;
 use crate::hir::traits::solver::forest::{MAX_NODES, ObligationForest};
 use crate::hir::traits::solver::obligation::{
     ImplSource, Obligation, ObligationCause, ObligationCauseCode, Predicate, SolveError,
 };
-use crate::hir::traits::solver::project::ProjectionCache;
-use crate::hir::traits::solver::select::SelectionContext;
-use crate::hir::types::TypeContext;
+use crate::hir::traits::solver::search_graph::SearchGraph;
+use crate::hir::types::{TypeContext, TypeId};
 
 /// Drives iterative trait resolution.
 ///
 /// Owns the `ObligationForest` and manages the selection + propagation loop.
-/// Modeled after rustc's `FulfillmentContext` but simplified:
-/// - No separate `ObligationProcessor` trait (we use direct `SelectionContext` methods)
-/// - No `ObligationForest` cache keys (Posita has no `ParamEnv` at this level)
+/// Generic over `D: SolverDelegate` so it can be used with any solver backend
+/// (production `SelectionContext`, mock delegates for testing, etc.).
+///
+/// Eq/Sub/Match constraints are now handled through `Predicate::Eq`,
+/// `Predicate::Sub`, and `Predicate::Match` registered as regular obligations
+/// (see `register_predicate`).  The old inline constraint structs
+/// (`EqConstraint`, `SubConstraint`, `MatchConstraint`) and their evaluation
+/// methods have been removed as part of the EvalCtxt migration.
 ///
 /// Usage:
 /// ```ignore
-/// let mut fulfill = FulfillmentContext::new(ctx, trait_env, &caller_bounds);
+/// let mut fulfill = FulfillmentContext::new(&mut delegate);
 /// fulfill.register_obligation(obligation);
 /// match fulfill.evaluate_all() {
 ///     Ok(()) => { /* all obligations resolved */ }
 ///     Err(errors) => { /* report errors */ }
 /// }
 /// ```
-pub struct FulfillmentContext<'a> {
+pub struct FulfillmentContext<'a, D: SolverDelegate> {
     forest: ObligationForest,
-    selcx: SelectionContext<'a>,
+    delegate: &'a mut D,
+    /// Owns the search graph for cycle detection and fixpoint iteration.
+    /// Passed as `&mut` to `EvalCtxt` during goal evaluation.
+    search_graph: SearchGraph,
+    /// Inference variable data for the defaulting step.
+    /// Set by `set_infer_data` after construction.
+    infer_var_type_ids: Vec<TypeId>,
+    infer_type_vars: Vec<(TypeVariableKind, VarOrigin)>,
+    infer_gen_statuses: Vec<GenStatus>,
 }
 
-impl<'a> FulfillmentContext<'a> {
-    pub fn new(
-        ctx: &'a mut TypeContext,
-        trait_env: &'a TraitEnv,
-        symbols: &'a SymbolTable,
-        builtin_registry: &'a BuiltinTraitRegistry,
-        proj_cache: &'a ProjectionCache,
-        caller_bounds: &'a [Predicate],
-    ) -> Self {
+impl<'a, D: SolverDelegate> FulfillmentContext<'a, D> {
+    pub fn new(delegate: &'a mut D) -> Self {
         FulfillmentContext {
             forest: ObligationForest::new(),
-            selcx: SelectionContext::new(
-                ctx,
-                trait_env,
-                symbols,
-                builtin_registry,
-                proj_cache,
-                caller_bounds,
-            ),
+            delegate,
+            search_graph: SearchGraph::new(),
+            infer_var_type_ids: Vec::new(),
+            infer_type_vars: Vec::new(),
+            infer_gen_statuses: Vec::new(),
         }
+    }
+
+    /// Set the inference variable data from the `InferenceContext`.
+    /// This enables the defaulting step in `evaluate_all_inner`.
+    pub fn set_infer_data(
+        &mut self,
+        var_type_ids: &[TypeId],
+        type_vars: &[(TypeVariableKind, VarOrigin)],
+        gen_statuses: &[GenStatus],
+    ) {
+        self.infer_var_type_ids = var_type_ids.to_vec();
+        self.infer_type_vars = type_vars.to_vec();
+        self.infer_gen_statuses = gen_statuses.to_vec();
+    }
+
+    /// Convenience wrapper: extract inference variable data from an
+    /// `InferenceContext` and forward it to `set_infer_data`.
+    pub fn set_infer_data_from(&mut self, infer: &InferenceContext) {
+        let type_vars: Vec<(TypeVariableKind, VarOrigin)> = infer
+            .type_vars()
+            .iter()
+            .enumerate()
+            .map(|(i, tv)| {
+                let origin = infer
+                    .var_origins()
+                    .get(i)
+                    .copied()
+                    .unwrap_or(VarOrigin::Synthetic);
+                (tv.kind, origin)
+            })
+            .collect();
+        self.set_infer_data(infer.var_type_ids(), &type_vars, infer.gen_statuses());
     }
 
     /// Register a new obligation to be fulfilled.
@@ -89,12 +125,60 @@ impl<'a> FulfillmentContext<'a> {
     fn evaluate_all_inner(&mut self, error_on_deferred: bool) -> Result<(), Vec<SolveError>> {
         let mut errors = Vec::new();
         let mut iteration_count: usize = 0;
+        // Track the most recently processed obligation's span for error reporting.
+        let mut last_span: Option<crate::ast::Span> = None;
+
+        self.search_graph.begin_fixpoint();
 
         loop {
             // Compact the forest periodically to prevent unbounded memory growth.
             iteration_count += 1;
             if iteration_count % 100 == 0 && self.forest.len() > MAX_NODES {
                 self.forest.compact();
+            }
+
+            // ── Defaulting ──
+            if !self.infer_var_type_ids.is_empty() {
+                if let Err(e) = defaulting::default_variables(
+                    self.delegate.ctx(),
+                    &self.infer_var_type_ids,
+                    &self.infer_type_vars,
+                    &self.infer_gen_statuses,
+                ) {
+                    let span = last_span.unwrap_or(crate::ast::Span::new(0, 0));
+                    errors.push(SolveError::Ambiguous {
+                        trait_id: crate::hir::types::DefId(0),
+                        self_ty: self.delegate.ctx().error(),
+                        span,
+                        num_candidates: 0,
+                    });
+                    break;
+                }
+            }
+
+            // ── Fixpoint check ──
+            // If no goal was entered in this iteration, we have converged.
+            if !self.search_graph.has_changed() {
+                break;
+            }
+            // Try to advance the fixpoint iteration. If the limit is reached,
+            // report overflow (analogous to Rust's fixpoint_overflow_result).
+            if !self.search_graph.try_fixpoint_step() {
+                let span = last_span.unwrap_or(crate::ast::Span::new(0, 0));
+                errors.push(SolveError::Overflow {
+                    obligation: Box::new(Obligation {
+                        cause: crate::hir::traits::solver::ObligationCause {
+                            span,
+                            code: crate::hir::traits::solver::ObligationCauseCode::Misc,
+                        },
+                        predicate: crate::hir::traits::solver::Predicate::Sized {
+                            ty: self.delegate.ctx().error(),
+                        },
+                        recursion_depth: 0,
+                    }),
+                    depth: 0,
+                });
+                break;
             }
 
             // ── Progress check (BEFORE next_pending) ──
@@ -106,8 +190,8 @@ impl<'a> FulfillmentContext<'a> {
             // so next_pending can pick them up.
             let pending_count = self.forest.pending_count();
             if pending_count == 0 {
-                if self.forest.has_ready_deferred(self.selcx.ctx) {
-                    self.forest.recycle_ready_deferred(self.selcx.ctx);
+                if self.forest.has_ready_deferred(self.delegate.ctx()) {
+                    self.forest.recycle_ready_deferred(self.delegate.ctx());
                 } else {
                     break;
                 }
@@ -119,7 +203,7 @@ impl<'a> FulfillmentContext<'a> {
             };
 
             // Try to enter evaluation (with cycle detection)
-            if !self.forest.mark_evaluating(idx, self.selcx.ctx) {
+            if !self.forest.mark_evaluating(idx, self.delegate.ctx()) {
                 // Cycle detected.  The key was NOT inserted by this node
                 // (it was already in active_path from an ancestor that nests
                 // the same predicate).  Therefore we must NOT call
@@ -146,7 +230,10 @@ impl<'a> FulfillmentContext<'a> {
 
             // Select a candidate and recursively evaluate nested goals.
             let obligation = self.forest.obligation_at(idx).clone();
-            let result = evaluate_goal(&mut self.selcx, &obligation);
+            let span = obligation.cause.span;
+            last_span = Some(span);
+            let mut ecx = EvalCtxt::new(&mut *self.delegate, &mut self.search_graph, span);
+            let result = evaluate_goal(&mut ecx, &obligation);
 
             // Leave the evaluating state
             self.forest.leave_evaluating(idx);
@@ -179,8 +266,8 @@ impl<'a> FulfillmentContext<'a> {
                 // solver has run.  Report them as errors.
                 Err(vec![SolveError::Ambiguous {
                     trait_id: crate::hir::types::DefId(0),
-                    self_ty: self.selcx.ctx.error(),
-                    span: crate::ast::Span::new(0, 0),
+                    self_ty: self.delegate.ctx().error(),
+                    span: last_span.unwrap_or(crate::ast::Span::new(0, 0)),
                     num_candidates: 0,
                 }])
             } else {

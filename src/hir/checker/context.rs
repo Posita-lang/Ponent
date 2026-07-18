@@ -157,7 +157,7 @@ impl<'a> TypeChecker<'a> {
                 self.diagnostics.push(
                     Diagnostic::error(msg)
                         .with_code_str("E030")
-                        .with_span(Span::new(0, 0)),
+                        .with_span(Span::new(0, 0)), // no span available from check_unresolved
                 );
             }
             return Err(mem::take(&mut self.diagnostics));
