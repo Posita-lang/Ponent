@@ -99,21 +99,25 @@ pub enum GoalKind {
 }
 
 impl GoalKey {
-    pub fn from_obligation(
-        obligation: &Obligation,
-        ctx: &TypeContext,
-    ) -> Option<Self> {
+    pub fn from_obligation(obligation: &Obligation, ctx: &TypeContext) -> Option<Self> {
         let (kind, trait_id, self_ty, args) = match &obligation.predicate {
-            Predicate::Trait { trait_id, self_ty, args } => {
+            Predicate::Trait {
+                trait_id,
+                self_ty,
+                args,
+            } => {
                 let resolved_self = ctx.resolve_binding(*self_ty);
                 if ctx.is_infer_var(resolved_self) {
                     return None;
                 }
-                let resolved_args: Vec<TypeId> = args
-                    .iter()
-                    .map(|a| ctx.resolve_binding(*a))
-                    .collect();
-                (GoalKind::Trait, Some(*trait_id), resolved_self, resolved_args)
+                let resolved_args: Vec<TypeId> =
+                    args.iter().map(|a| ctx.resolve_binding(*a)).collect();
+                (
+                    GoalKind::Trait,
+                    Some(*trait_id),
+                    resolved_self,
+                    resolved_args,
+                )
             }
             Predicate::AutoTrait { trait_id, self_ty } => {
                 let resolved_self = ctx.resolve_binding(*self_ty);
@@ -129,13 +133,23 @@ impl GoalKey {
                 }
                 (GoalKind::Sized, None, resolved, vec![])
             }
-            Predicate::ProjectionEq { trait_id, self_ty, assoc_name, value } => {
+            Predicate::ProjectionEq {
+                trait_id,
+                self_ty,
+                assoc_name,
+                value,
+            } => {
                 let resolved_self = ctx.resolve_binding(*self_ty);
                 if ctx.is_infer_var(resolved_self) {
                     return None;
                 }
                 let resolved_value = ctx.resolve_binding(*value);
-                (GoalKind::Projection, Some(*trait_id), resolved_self, vec![resolved_value])
+                (
+                    GoalKind::Projection,
+                    Some(*trait_id),
+                    resolved_self,
+                    vec![resolved_value],
+                )
             }
             Predicate::ProjectionNormalize { projection, target } => {
                 let resolved_self = ctx.resolve_binding(projection.self_ty);
@@ -143,7 +157,12 @@ impl GoalKey {
                     return None;
                 }
                 let resolved_target = ctx.resolve_binding(*target);
-                (GoalKind::Projection, Some(projection.trait_id), resolved_self, vec![resolved_target])
+                (
+                    GoalKind::Projection,
+                    Some(projection.trait_id),
+                    resolved_self,
+                    vec![resolved_target],
+                )
             }
             Predicate::CopyLike { kind: _, ty } => {
                 let resolved = ctx.resolve_binding(*ty);
@@ -180,14 +199,22 @@ impl GoalKey {
                 // by shape-based discharge.
                 return None;
             }
-            Predicate::Forall { .. } | Predicate::Exists { .. } | Predicate::Instance { .. } | Predicate::Let { .. } => {
+            Predicate::Forall { .. }
+            | Predicate::Exists { .. }
+            | Predicate::Instance { .. }
+            | Predicate::Let { .. } => {
                 // These are structural constraints that don't participate in
                 // cycle detection — they are resolved by transforming the
                 // constraint set, not by recursive evaluation.
                 return None;
             }
         };
-        Some(GoalKey { kind, trait_id, self_ty, args })
+        Some(GoalKey {
+            kind,
+            trait_id,
+            self_ty,
+            args,
+        })
     }
 }
 
@@ -262,7 +289,10 @@ impl HeadUsages {
     }
 
     fn is_empty(self) -> bool {
-        self.inductive == 0 && self.unknown == 0 && self.coinductive == 0 && self.forced_ambiguity == 0
+        self.inductive == 0
+            && self.unknown == 0
+            && self.coinductive == 0
+            && self.forced_ambiguity == 0
     }
 
     fn is_single(self, path_kind: PathKind) -> bool {
@@ -308,7 +338,10 @@ impl CycleHeads {
     }
 
     fn insert(&mut self, depth: usize, path_from_head: PathKind, usages: HeadUsages) {
-        let head = CycleHead { path_from_head, usages };
+        let head = CycleHead {
+            path_from_head,
+            usages,
+        };
         // Keep sorted by depth (ascending).
         // Since depths are typically pushed in order, we can optimise for
         // the common case: the new depth is >= all existing depths.
@@ -455,7 +488,9 @@ impl SearchGraph {
     fn cycle_path_kind(stack: &[StackEntry], step_kind_to_head: PathKind, head: usize) -> PathKind {
         stack[head + 1..]
             .iter()
-            .fold(step_kind_to_head, |curr, entry| curr.extend(entry.step_kind_from_parent))
+            .fold(step_kind_to_head, |curr, entry| {
+                curr.extend(entry.step_kind_from_parent)
+            })
     }
 
     /// Classify a cycle based on the goal's trait kind.
@@ -519,16 +554,16 @@ impl SearchGraph {
     /// - `Ok(())` if the goal is not on the stack (new goal).
     /// - `Err(PathKind)` if the goal is on the stack (cycle detected),
     ///   with the path kind of the cycle.
-    pub fn try_entry(&mut self, key: &GoalKey, delegate: &dyn SolverDelegate) -> Result<(), PathKind> {
+    pub fn try_entry(
+        &mut self,
+        key: &GoalKey,
+        delegate: &dyn SolverDelegate,
+    ) -> Result<(), PathKind> {
         // Check if the goal is on the stack (cycle).
         // We search for the key in a separate pass to avoid borrow conflicts.
         let head_index = self.stack.iter().position(|e| e.key == *key);
         if let Some(head_index) = head_index {
-            let path_kind = Self::cycle_path_kind(
-                &self.stack,
-                PathKind::Inductive,
-                head_index,
-            );
+            let path_kind = Self::cycle_path_kind(&self.stack, PathKind::Inductive, head_index);
             // Update the path kind with the actual step from the parent to this goal.
             let step_kind = Self::classify_cycle_kind(key, delegate);
             let path_kind = path_kind.extend(step_kind);
@@ -555,18 +590,10 @@ impl SearchGraph {
 
     /// Push a new goal onto the stack for evaluation.
     /// Must be called after `try_entry` returns `Ok(())`.
-    pub fn push_goal(
-        &mut self,
-        key: GoalKey,
-        step_kind: PathKind,
-        lower_available_depth: bool,
-    ) {
-        let available_depth = AvailableDepth::allowed_for_nested(
-            self.root_depth,
-            &self.stack,
-            lower_available_depth,
-        )
-        .unwrap_or(AvailableDepth(0));
+    pub fn push_goal(&mut self, key: GoalKey, step_kind: PathKind, lower_available_depth: bool) {
+        let available_depth =
+            AvailableDepth::allowed_for_nested(self.root_depth, &self.stack, lower_available_depth)
+                .unwrap_or(AvailableDepth(0));
 
         self.stack.push(StackEntry {
             key,
@@ -627,11 +654,8 @@ impl SearchGraph {
         let entries = self.provisional_cache.get(key)?;
         for entry in entries {
             let head_index = entry.heads.highest_cycle_head_index();
-            let path_from_head = Self::cycle_path_kind(
-                &self.stack,
-                step_kind_from_parent,
-                head_index,
-            );
+            let path_from_head =
+                Self::cycle_path_kind(&self.stack, step_kind_from_parent, head_index);
             if entry.path_from_head == path_from_head {
                 return Some(entry.result.clone());
             }
@@ -679,7 +703,11 @@ impl SearchGraph {
 
         // Check that none of the nested goals of the cache entry are
         // on the current stack (which would cause a cycle).
-        if entry.nested_goals.iter().any(|g| self.stack.iter().any(|e| e.key == *g)) {
+        if entry
+            .nested_goals
+            .iter()
+            .any(|g| self.stack.iter().any(|e| e.key == *g))
+        {
             return None;
         }
 
@@ -692,11 +720,8 @@ impl SearchGraph {
                         continue;
                     }
                     let head_index = p_entry.heads.highest_cycle_head_index();
-                    let head_to_curr = Self::cycle_path_kind(
-                        &self.stack,
-                        step_kind_from_parent,
-                        head_index,
-                    );
+                    let head_to_curr =
+                        Self::cycle_path_kind(&self.stack, step_kind_from_parent, head_index);
                     if p_entry.path_from_head == head_to_curr {
                         return None;
                     }
@@ -778,7 +803,9 @@ impl SearchGraph {
                     }
                     std::cmp::Ordering::Equal => {
                         // This parent IS the cycle head.
-                        parent.usages.get_or_insert_with(HeadUsages::default)
+                        parent
+                            .usages
+                            .get_or_insert_with(HeadUsages::default)
                             .add_usages_from_nested(head.usages);
                     }
                     std::cmp::Ordering::Greater => {
@@ -801,7 +828,8 @@ impl SearchGraph {
             // Update min_reached_available_depth.
             let parent_depth = parent.available_depth;
             // Approximation: subtract 1 for each nested goal depth.
-            parent.min_reached_available_depth = parent.min_reached_available_depth
+            parent.min_reached_available_depth = parent
+                .min_reached_available_depth
                 .min(AvailableDepth(parent_depth.0.saturating_sub(1)));
         }
     }
@@ -842,27 +870,82 @@ mod tests {
 
     struct TestDelegate;
     impl SolverDelegate for TestDelegate {
-        fn ctx(&mut self) -> &mut TypeContext { unimplemented!() }
-        fn trait_env(&self) -> &crate::hir::traits::TraitEnv { unimplemented!() }
-        fn symbols(&self) -> &crate::hir::symbol::SymbolTable { unimplemented!() }
-        fn builtin_registry(&self) -> &crate::hir::traits::solver::builtins::BuiltinTraitRegistry { unimplemented!() }
-        fn proj_cache(&self) -> &crate::hir::traits::solver::project::ProjectionCache { unimplemented!() }
-        fn caller_bounds(&self) -> &[Predicate] { unimplemented!() }
-        fn resolve_obligation(&self, _: &Obligation) -> super::super::select::ResolvedObligation { unimplemented!() }
-        fn trait_is_coinductive(&self, _: DefId) -> bool { false }
-        fn is_builtin_trait(&self, _: DefId) -> Option<crate::hir::traits::solver::builtins::BuiltinTrait> { None }
-        fn handle_projection_eq(&mut self, _: DefId, _: TypeId, _: Symbol, _: TypeId, _: &crate::hir::traits::solver::obligation::ObligationCause) -> Result<ImplSource, SolveError> { unimplemented!() }
-        fn handle_projection_normalize(&mut self, _: &crate::hir::traits::solver::obligation::ProjectionTy, _: TypeId, _: &crate::hir::traits::solver::obligation::ObligationCause) -> Result<ImplSource, SolveError> { unimplemented!() }
+        fn ctx(&mut self) -> &mut TypeContext {
+            unimplemented!()
+        }
+        fn trait_env(&self) -> &crate::hir::traits::TraitEnv {
+            unimplemented!()
+        }
+        fn symbols(&self) -> &crate::hir::symbol::SymbolTable {
+            unimplemented!()
+        }
+        fn builtin_registry(&self) -> &crate::hir::traits::solver::builtins::BuiltinTraitRegistry {
+            unimplemented!()
+        }
+        fn proj_cache(&self) -> &crate::hir::traits::solver::project::ProjectionCache {
+            unimplemented!()
+        }
+        fn caller_bounds(&self) -> &[Predicate] {
+            unimplemented!()
+        }
+        fn resolve_obligation(&self, _: &Obligation) -> super::super::select::ResolvedObligation {
+            unimplemented!()
+        }
+        fn trait_is_coinductive(&self, _: DefId) -> bool {
+            false
+        }
+        fn is_builtin_trait(
+            &self,
+            _: DefId,
+        ) -> Option<crate::hir::traits::solver::builtins::BuiltinTrait> {
+            None
+        }
+        fn handle_projection_eq(
+            &mut self,
+            _: DefId,
+            _: TypeId,
+            _: Symbol,
+            _: TypeId,
+            _: &crate::hir::traits::solver::obligation::ObligationCause,
+        ) -> Result<ImplSource, SolveError> {
+            unimplemented!()
+        }
+        fn handle_projection_normalize(
+            &mut self,
+            _: &crate::hir::traits::solver::obligation::ProjectionTy,
+            _: TypeId,
+            _: &crate::hir::traits::solver::obligation::ObligationCause,
+        ) -> Result<ImplSource, SolveError> {
+            unimplemented!()
+        }
     }
 
     #[test]
     fn test_path_kind_extend() {
-        assert_eq!(PathKind::Inductive.extend(PathKind::Inductive), PathKind::Inductive);
-        assert_eq!(PathKind::Inductive.extend(PathKind::Coinductive), PathKind::Coinductive);
-        assert_eq!(PathKind::Coinductive.extend(PathKind::Inductive), PathKind::Coinductive);
-        assert_eq!(PathKind::Inductive.extend(PathKind::Unknown), PathKind::Unknown);
-        assert_eq!(PathKind::Unknown.extend(PathKind::Coinductive), PathKind::Coinductive);
-        assert_eq!(PathKind::ForcedAmbiguity.extend(PathKind::Inductive), PathKind::ForcedAmbiguity);
+        assert_eq!(
+            PathKind::Inductive.extend(PathKind::Inductive),
+            PathKind::Inductive
+        );
+        assert_eq!(
+            PathKind::Inductive.extend(PathKind::Coinductive),
+            PathKind::Coinductive
+        );
+        assert_eq!(
+            PathKind::Coinductive.extend(PathKind::Inductive),
+            PathKind::Coinductive
+        );
+        assert_eq!(
+            PathKind::Inductive.extend(PathKind::Unknown),
+            PathKind::Unknown
+        );
+        assert_eq!(
+            PathKind::Unknown.extend(PathKind::Coinductive),
+            PathKind::Coinductive
+        );
+        assert_eq!(
+            PathKind::ForcedAmbiguity.extend(PathKind::Inductive),
+            PathKind::ForcedAmbiguity
+        );
     }
 
     #[test]
@@ -895,14 +978,22 @@ mod tests {
         let root = AvailableDepth(64);
 
         // Empty stack → root depth.
-        assert_eq!(AvailableDepth::allowed_for_nested(root, &[], true), Some(AvailableDepth(64)));
+        assert_eq!(
+            AvailableDepth::allowed_for_nested(root, &[], true),
+            Some(AvailableDepth(64))
+        );
 
         // With a stack entry.
         // Use TypeId::from_raw to create a valid TypeId (direct construction
         // is not possible because the inner NonZeroUsize field is private).
         let dummy_ty = crate::hir::types::TypeId::from_raw(1);
         let entry = StackEntry {
-            key: GoalKey { kind: GoalKind::Sized, trait_id: None, self_ty: dummy_ty, args: vec![] },
+            key: GoalKey {
+                kind: GoalKind::Sized,
+                trait_id: None,
+                self_ty: dummy_ty,
+                args: vec![],
+            },
             step_kind_from_parent: PathKind::Inductive,
             available_depth: AvailableDepth(10),
             min_reached_available_depth: AvailableDepth(10),
@@ -950,6 +1041,9 @@ mod tests {
 
         let result = sg.lookup_provisional_cache(&key, PathKind::Coinductive);
         assert!(result.is_some(), "provisional cache should return a result");
-        assert!(result.unwrap().is_ok(), "provisional cache result should be Ok");
+        assert!(
+            result.unwrap().is_ok(),
+            "provisional cache result should be Ok"
+        );
     }
 }

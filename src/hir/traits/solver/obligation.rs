@@ -61,21 +61,14 @@ pub enum Predicate {
     /// `T: Copy` / `T: Clone` — special builtins
     CopyLike { kind: CopyKind, ty: TypeId },
     // ── Eq/Sub/Match constraints (migrated from old solver) ──────────
-
     /// `Eq(a, b)` — type equality constraint (migrated from `Constraint::Eq`).
     /// Succeeds if `a` and `b` can be unified, defers if either is an
     /// unresolved inference variable.
-    Eq {
-        a: TypeId,
-        b: TypeId,
-    },
+    Eq { a: TypeId, b: TypeId },
     /// `Sub(sub, sup)` — subtype constraint (migrated from `Constraint::Sub`).
     /// Succeeds if `sub <: sup`, defers if either is an unresolved
     /// inference variable.
-    Sub {
-        sub: TypeId,
-        sup: TypeId,
-    },
+    Sub { sub: TypeId, sup: TypeId },
     /// `Match { scrutinee, branches_id }` — suspended match constraint
     /// (migrated from `Constraint::Match`).  Discharged when the scrutinee's
     /// shape is uniquely determined.
@@ -84,7 +77,6 @@ pub enum Predicate {
         branches_id: (usize, usize),
     },
     // ── Forall/Exists/Instance/Let constraints (migrated from old solver) ──
-
     /// `Forall { body }` — universally quantified constraint.
     /// Binds a fresh rigid (skolem) variable for the body.
     Forall {
@@ -325,7 +317,10 @@ impl Predicate {
             | Predicate::ProjectionEq { trait_id, .. } => Some(*trait_id),
             Predicate::ProjectionNormalize { projection, .. } => Some(projection.trait_id),
             Predicate::Eq { .. } | Predicate::Sub { .. } | Predicate::Match { .. } => None,
-            Predicate::Forall { .. } | Predicate::Exists { .. } | Predicate::Instance { .. } | Predicate::Let { .. } => None,
+            Predicate::Forall { .. }
+            | Predicate::Exists { .. }
+            | Predicate::Instance { .. }
+            | Predicate::Let { .. } => None,
             _ => None,
         }
     }
@@ -335,7 +330,11 @@ impl Predicate {
     /// `GoalKind<D>::resolve` (where `D` cannot be inferred from arguments).
     pub fn resolve(&self, ctx: &TypeContext) -> super::select::ResolvedObligation {
         match self {
-            Predicate::Trait { trait_id, self_ty, args } => {
+            Predicate::Trait {
+                trait_id,
+                self_ty,
+                args,
+            } => {
                 let resolved_self = ctx.resolve_binding(*self_ty);
                 let resolved_args: Vec<TypeId> =
                     args.iter().map(|a| ctx.resolve_binding(*a)).collect();

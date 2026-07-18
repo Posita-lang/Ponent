@@ -7,11 +7,11 @@ use crate::hir::symbol::*;
 use crate::hir::traits::TraitEnv;
 use crate::hir::traits::solver::builtins::BuiltinTraitRegistry;
 use crate::hir::traits::solver::project::ProjectionCache;
+use crate::hir::traits::solver::select::SelectionContext;
 use crate::hir::traits::solver::{
     FulfillmentContext, Obligation, ObligationCause, ObligationCauseCode,
     Predicate as TraitPredicate,
 };
-use crate::hir::traits::solver::select::SelectionContext;
 use crate::hir::types::*;
 use crate::symbol::Symbol;
 use std::cell::RefCell;
@@ -491,7 +491,10 @@ impl<'a> TypeChecker<'a> {
                     .map(|e| format!("{}", e))
                     .collect::<Vec<_>>()
                     .join("; ");
-                let span = errors.first().and_then(|e| e.span()).unwrap_or(crate::ast::Span::new(0, 0));
+                let span = errors
+                    .first()
+                    .and_then(|e| e.span())
+                    .unwrap_or(crate::ast::Span::new(0, 0));
                 self.diagnostics.push(
                     Diagnostic::error(format!("trait solver error: {}", msg))
                         .with_code_str("E030")
@@ -569,7 +572,10 @@ impl<'a> TypeChecker<'a> {
                             .map(|e| format!("{}", e))
                             .collect::<Vec<_>>()
                             .join("; ");
-                        let span = errors.first().and_then(|e| e.span()).unwrap_or(crate::ast::Span::new(0, 0));
+                        let span = errors
+                            .first()
+                            .and_then(|e| e.span())
+                            .unwrap_or(crate::ast::Span::new(0, 0));
                         self.diagnostics.push(
                             Diagnostic::error(format!("trait solver error: {}", msg))
                                 .with_code_str("E030")
@@ -812,10 +818,9 @@ impl<'a> TypeChecker<'a> {
                 let return_ty = if let Some(rt) = return_type {
                     guard.checker.resolve_type(rt)?
                 } else {
-                    guard.checker.new_infer_var(
-                        TypeVariableKind::Any,
-                        VarOrigin::Expression(Some(*span)),
-                    )
+                    guard
+                        .checker
+                        .new_infer_var(TypeVariableKind::Any, VarOrigin::Expression(Some(*span)))
                 };
                 guard.checker.current_return_type = Some(return_ty);
 
@@ -1157,9 +1162,14 @@ impl<'a> TypeChecker<'a> {
                 // infer var and report CannotInfer.
                 if return_type.is_none() {
                     if let Some(ref body_stmts) = body_hir {
-                        let has_return = body_stmts.iter().any(|s| matches!(s, HirStmt::Return { .. }));
+                        let has_return = body_stmts
+                            .iter()
+                            .any(|s| matches!(s, HirStmt::Return { .. }));
                         if !has_return {
-                            let _ = guard.checker.ctx.unify(return_ty, guard.checker.ctx.never());
+                            let _ = guard
+                                .checker
+                                .ctx
+                                .unify(return_ty, guard.checker.ctx.never());
                         }
                     }
                 }
@@ -1266,10 +1276,7 @@ impl<'a> TypeChecker<'a> {
                                     }
                                 }
                                 TraitPredicate::Eq { a, b } => {
-                                    crate::hir::traits::solver::Predicate::Eq {
-                                        a: *a,
-                                        b: *b,
-                                    }
+                                    crate::hir::traits::solver::Predicate::Eq { a: *a, b: *b }
                                 }
                                 TraitPredicate::Sub { sub, sup } => {
                                     crate::hir::traits::solver::Predicate::Sub {
@@ -1277,12 +1284,13 @@ impl<'a> TypeChecker<'a> {
                                         sup: *sup,
                                     }
                                 }
-                                TraitPredicate::Match { scrutinee, branches_id } => {
-                                    crate::hir::traits::solver::Predicate::Match {
-                                        scrutinee: *scrutinee,
-                                        branches_id: *branches_id,
-                                    }
-                                }
+                                TraitPredicate::Match {
+                                    scrutinee,
+                                    branches_id,
+                                } => crate::hir::traits::solver::Predicate::Match {
+                                    scrutinee: *scrutinee,
+                                    branches_id: *branches_id,
+                                },
                                 TraitPredicate::Forall { body } => {
                                     crate::hir::traits::solver::Predicate::Forall {
                                         body: body.clone(),
@@ -1293,12 +1301,13 @@ impl<'a> TypeChecker<'a> {
                                         body: body.clone(),
                                     }
                                 }
-                                TraitPredicate::Instance { scheme_ty, instantiation_ty } => {
-                                    crate::hir::traits::solver::Predicate::Instance {
-                                        scheme_ty: *scheme_ty,
-                                        instantiation_ty: *instantiation_ty,
-                                    }
-                                }
+                                TraitPredicate::Instance {
+                                    scheme_ty,
+                                    instantiation_ty,
+                                } => crate::hir::traits::solver::Predicate::Instance {
+                                    scheme_ty: *scheme_ty,
+                                    instantiation_ty: *instantiation_ty,
+                                },
                                 TraitPredicate::Let { def, body } => {
                                     crate::hir::traits::solver::Predicate::Let {
                                         def: def.clone(),
@@ -1507,10 +1516,7 @@ impl<'a> TypeChecker<'a> {
                                     }
                                 }
                                 TraitPredicate::Eq { a, b } => {
-                                    crate::hir::traits::solver::Predicate::Eq {
-                                        a: *a,
-                                        b: *b,
-                                    }
+                                    crate::hir::traits::solver::Predicate::Eq { a: *a, b: *b }
                                 }
                                 TraitPredicate::Sub { sub, sup } => {
                                     crate::hir::traits::solver::Predicate::Sub {
@@ -1518,12 +1524,13 @@ impl<'a> TypeChecker<'a> {
                                         sup: *sup,
                                     }
                                 }
-                                TraitPredicate::Match { scrutinee, branches_id } => {
-                                    crate::hir::traits::solver::Predicate::Match {
-                                        scrutinee: *scrutinee,
-                                        branches_id: *branches_id,
-                                    }
-                                }
+                                TraitPredicate::Match {
+                                    scrutinee,
+                                    branches_id,
+                                } => crate::hir::traits::solver::Predicate::Match {
+                                    scrutinee: *scrutinee,
+                                    branches_id: *branches_id,
+                                },
                                 TraitPredicate::Forall { body } => {
                                     crate::hir::traits::solver::Predicate::Forall {
                                         body: body.clone(),
@@ -1534,12 +1541,13 @@ impl<'a> TypeChecker<'a> {
                                         body: body.clone(),
                                     }
                                 }
-                                TraitPredicate::Instance { scheme_ty, instantiation_ty } => {
-                                    crate::hir::traits::solver::Predicate::Instance {
-                                        scheme_ty: *scheme_ty,
-                                        instantiation_ty: *instantiation_ty,
-                                    }
-                                }
+                                TraitPredicate::Instance {
+                                    scheme_ty,
+                                    instantiation_ty,
+                                } => crate::hir::traits::solver::Predicate::Instance {
+                                    scheme_ty: *scheme_ty,
+                                    instantiation_ty: *instantiation_ty,
+                                },
                                 TraitPredicate::Let { def, body } => {
                                     crate::hir::traits::solver::Predicate::Let {
                                         def: def.clone(),
@@ -1599,8 +1607,7 @@ impl<'a> TypeChecker<'a> {
                 // see the correct return type rather than the stale placeholder.
                 // Using Cell<TypeId> allows mutation through the shared &SymbolTable
                 // reference that the checker holds.
-                self.symbols
-                    .update_function_return_type(*name, return_ty);
+                self.symbols.update_function_return_type(*name, return_ty);
 
                 Ok(HirStmt::FunctionDef {
                     span: *span,

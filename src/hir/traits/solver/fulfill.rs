@@ -1,6 +1,6 @@
 use crate::ast::Span;
-use crate::hir::infer::{GenStatus, InferenceContext, TypeVariableKind, VarOrigin};
 use crate::hir::infer::defaulting;
+use crate::hir::infer::{GenStatus, InferenceContext, TypeVariableKind, VarOrigin};
 use crate::hir::traits::solver::delegate::SolverDelegate;
 use crate::hir::traits::solver::eval::evaluate_goal;
 use crate::hir::traits::solver::eval_ctxt::EvalCtxt;

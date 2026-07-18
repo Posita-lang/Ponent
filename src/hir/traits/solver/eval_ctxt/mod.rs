@@ -18,11 +18,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::ast::Span;
 use crate::hir::infer::TypeVariableKind;
+use crate::hir::traits::TraitEnv;
 use crate::hir::traits::solver::builtins::BuiltinTraitRegistry;
 use crate::hir::traits::solver::delegate::SolverDelegate;
 use crate::hir::traits::solver::obligation::{ImplSource, Obligation, Predicate, SolveError};
 use crate::hir::traits::solver::search_graph::SearchGraph;
-use crate::hir::traits::TraitEnv;
 use crate::hir::types::{DefId, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
 
@@ -248,19 +248,13 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
     ///
     /// Unifies `a` and `b`.  If either side is still an unresolved inference
     /// variable, returns `Deferred` so the caller can retry later.
-    pub fn compute_eq_goal(
-        &mut self,
-        a: TypeId,
-        b: TypeId,
-    ) -> Result<ImplSource, SolveError> {
+    pub fn compute_eq_goal(&mut self, a: TypeId, b: TypeId) -> Result<ImplSource, SolveError> {
         let ctx = self.ctx();
         let ra = ctx.resolve_binding(a);
         let rb = ctx.resolve_binding(b);
         if ctx.is_infer_var(ra) || ctx.is_infer_var(rb) {
             // At least one side is still unresolved — defer.
-            let stalled_on = vec![
-                if ctx.is_infer_var(ra) { ra } else { rb },
-            ];
+            let stalled_on = vec![if ctx.is_infer_var(ra) { ra } else { rb }];
             return Ok(ImplSource::Deferred { stalled_on });
         }
         ctx.unify(a, b).map_err(|_| SolveError::Mismatch {
@@ -275,19 +269,13 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
     ///
     /// Checks that `sub <: sup`.  If either side is still an unresolved
     /// inference variable, returns `Deferred` so the caller can retry later.
-    pub fn compute_sub_goal(
-        &mut self,
-        sub: TypeId,
-        sup: TypeId,
-    ) -> Result<ImplSource, SolveError> {
+    pub fn compute_sub_goal(&mut self, sub: TypeId, sup: TypeId) -> Result<ImplSource, SolveError> {
         let ctx = self.ctx();
         let rsub = ctx.resolve_binding(sub);
         let rsup = ctx.resolve_binding(sup);
         if ctx.is_infer_var(rsub) || ctx.is_infer_var(rsup) {
             // At least one side is still unresolved — defer.
-            let stalled_on = vec![
-                if ctx.is_infer_var(rsub) { rsub } else { rsup },
-            ];
+            let stalled_on = vec![if ctx.is_infer_var(rsub) { rsub } else { rsup }];
             return Ok(ImplSource::Deferred { stalled_on });
         }
         if !ctx.subtype(sub, sup) {
@@ -408,7 +396,9 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
                 let mut inner = resolved_scheme;
                 loop {
                     match ctx.get(inner) {
-                        TypeData::Forall { param_index, body, .. } => {
+                        TypeData::Forall {
+                            param_index, body, ..
+                        } => {
                             indices.push(*param_index);
                             inner = *body;
                         }
@@ -521,8 +511,7 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
     pub fn probe<T>(
         &mut self,
         probe_kind: crate::hir::traits::solver::eval_ctxt::ProbeKind,
-    ) -> probe::ProbeCtxt<'_, 'a, D, T>
-    {
+    ) -> probe::ProbeCtxt<'_, 'a, D, T> {
         probe::ProbeCtxt {
             ecx: self,
             probe_kind,

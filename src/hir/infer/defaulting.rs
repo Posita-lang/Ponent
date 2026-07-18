@@ -19,7 +19,7 @@
 //!    - Synthetic → silently default to Error
 
 use crate::hir::infer::{GenStatus, TypeVariableKind, VarOrigin};
-use crate::hir::types::{TypeContext, TypeData, TypeId, TypeError};
+use crate::hir::types::{TypeContext, TypeData, TypeError, TypeId};
 
 /// Default unresolved inference variables to their default types.
 ///
@@ -46,12 +46,13 @@ pub fn default_variables(
         if let TypeData::InferVar { .. } = ctx.get(resolved) {
             // Skip PartiallyGeneralizable variables — they are guarded by
             // suspended constraints and will be resolved later.
-            if i < gen_statuses.len()
-                && gen_statuses[i] == GenStatus::PartiallyGeneralizable
-            {
+            if i < gen_statuses.len() && gen_statuses[i] == GenStatus::PartiallyGeneralizable {
                 continue;
             }
-            let (kind, _origin) = type_vars.get(i).copied().unwrap_or((TypeVariableKind::Any, VarOrigin::Synthetic));
+            let (kind, _origin) = type_vars
+                .get(i)
+                .copied()
+                .unwrap_or((TypeVariableKind::Any, VarOrigin::Synthetic));
             match kind {
                 TypeVariableKind::Integer => {
                     let default_ty = ctx.int(32, true);
@@ -78,15 +79,19 @@ pub fn default_variables(
     for (i, &ty_id) in var_type_ids.iter().enumerate() {
         let resolved = ctx.resolve_binding(ty_id);
         if let TypeData::InferVar { .. } = ctx.get(resolved) {
-            if i < gen_statuses.len()
-                && gen_statuses[i] == GenStatus::PartiallyGeneralizable
-            {
+            if i < gen_statuses.len() && gen_statuses[i] == GenStatus::PartiallyGeneralizable {
                 continue;
             }
-            let (kind, origin) = type_vars.get(i).copied().unwrap_or((TypeVariableKind::Any, VarOrigin::Synthetic));
+            let (kind, origin) = type_vars
+                .get(i)
+                .copied()
+                .unwrap_or((TypeVariableKind::Any, VarOrigin::Synthetic));
             // Expression-level Unconstrained/Any that was never resolved
             // is a type inference failure — report it.
-            if matches!(kind, TypeVariableKind::Unconstrained | TypeVariableKind::Any) {
+            if matches!(
+                kind,
+                TypeVariableKind::Unconstrained | TypeVariableKind::Any
+            ) {
                 if let VarOrigin::Expression(Some(span)) = origin {
                     return Err(TypeError::CannotInfer { span });
                 }

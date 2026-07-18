@@ -1,14 +1,14 @@
 use crate::ast::visit::replace_ident_in_expr;
-use std::cell::Cell;
-use std::rc::Rc;
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticCollector, DiagnosticLevel};
 use crate::hir::builtins;
 use crate::hir::symbol::*;
 use crate::hir::traits::{ImplCandidate, TraitEnv};
 use crate::symbol::Symbol;
-use rustc_hash::FxHashMap;
 use regex_syntax;
+use rustc_hash::FxHashMap;
+use std::cell::Cell;
+use std::rc::Rc;
 
 /// Represents the result of partially resolving a multi-segment path
 /// (e.g. `Foo::bar::Baz` where only `Foo` is known at resolver time).
@@ -154,7 +154,12 @@ impl<'a> NameResolver<'a> {
                 }
                 self.current_impl_type_params = Some(param_map);
 
-                let sig = self.collect_function_signature(*name, params, return_type.as_ref(), type_params);
+                let sig = self.collect_function_signature(
+                    *name,
+                    params,
+                    return_type.as_ref(),
+                    type_params,
+                );
 
                 let binding = FunctionBinding {
                     def_id,
@@ -1016,9 +1021,10 @@ impl<'a> NameResolver<'a> {
                     Some(binding.ty)
                 } else if let Some(func) = self.symbols.lookup_function(*name) {
                     let sig = func.signature.clone();
-                    let ty = self
-                        .ctx
-                        .function(sig.params.iter().map(|p| p.ty).collect(), sig.return_type.get());
+                    let ty = self.ctx.function(
+                        sig.params.iter().map(|p| p.ty).collect(),
+                        sig.return_type.get(),
+                    );
                     Some(ty)
                 } else if let Some(_ty_binding) = self.symbols.lookup_type(*name) {
                     None

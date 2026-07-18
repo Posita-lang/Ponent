@@ -30,9 +30,7 @@
 use crate::hir::symbol::SymbolTable;
 use crate::hir::traits::TraitEnv;
 use crate::hir::traits::solver::builtins::{BuiltinTrait, BuiltinTraitRegistry};
-use crate::hir::traits::solver::obligation::{
-    ImplSource, Obligation, Predicate, SolveError,
-};
+use crate::hir::traits::solver::obligation::{ImplSource, Obligation, Predicate, SolveError};
 use crate::hir::traits::solver::project::ProjectionCache;
 use crate::hir::types::{DefId, TypeContext, TypeId};
 
@@ -79,11 +77,8 @@ pub trait SolverDelegate {
         // This requires a mutable EvalCtxt, which we create inline.
         let mut search_graph = crate::hir::traits::solver::search_graph::SearchGraph::new();
         let span = obligation.cause.span;
-        let mut ecx = crate::hir::traits::solver::eval_ctxt::EvalCtxt::new(
-            self,
-            &mut search_graph,
-            span,
-        );
+        let mut ecx =
+            crate::hir::traits::solver::eval_ctxt::EvalCtxt::new(self, &mut search_graph, span);
         crate::hir::traits::solver::assembly::assemble_and_evaluate_candidates(&mut ecx, obligation)
     }
 
@@ -166,7 +161,10 @@ pub trait SolverDelegateEvalExt: SolverDelegate + Sized {
     fn evaluate_root_goal(
         &mut self,
         goal: &crate::hir::traits::solver::obligation::Obligation,
-    ) -> Result<crate::hir::traits::solver::obligation::ImplSource, crate::hir::traits::solver::obligation::SolveError>;
+    ) -> Result<
+        crate::hir::traits::solver::obligation::ImplSource,
+        crate::hir::traits::solver::obligation::SolveError,
+    >;
 
     /// Check whether evaluating a goal may hold.
     fn root_goal_may_hold(
@@ -180,10 +178,14 @@ impl<D: SolverDelegate + Sized> SolverDelegateEvalExt for D {
     fn evaluate_root_goal(
         &mut self,
         goal: &crate::hir::traits::solver::obligation::Obligation,
-    ) -> Result<crate::hir::traits::solver::obligation::ImplSource, crate::hir::traits::solver::obligation::SolveError> {
+    ) -> Result<
+        crate::hir::traits::solver::obligation::ImplSource,
+        crate::hir::traits::solver::obligation::SolveError,
+    > {
         let mut search_graph = crate::hir::traits::solver::search_graph::SearchGraph::new();
         let span = goal.cause.span;
-        let mut ecx = crate::hir::traits::solver::eval_ctxt::EvalCtxt::new(self, &mut search_graph, span);
+        let mut ecx =
+            crate::hir::traits::solver::eval_ctxt::EvalCtxt::new(self, &mut search_graph, span);
         crate::hir::traits::solver::eval::evaluate_goal(&mut ecx, goal)
     }
 

@@ -39,7 +39,9 @@ use crate::hir::traits::solver::eval_ctxt::EvalCtxt;
 use crate::hir::traits::solver::obligation::{
     BuiltinImplSource, ImplSource, Obligation, Predicate, SolveError,
 };
-use crate::hir::traits::solver::search_graph::{GoalKey as SgGoalKey, GoalKind as SgGoalKind, SearchGraph};
+use crate::hir::traits::solver::search_graph::{
+    GoalKey as SgGoalKey, GoalKind as SgGoalKind, SearchGraph,
+};
 use crate::hir::traits::solver::select::MAX_RECURSION_DEPTH;
 use crate::hir::types::{AdtKind, DefId, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
@@ -391,32 +393,33 @@ fn evaluate_goal_inner<D: SolverDelegate>(
     }
 
     // ── Evaluate using the new builder-pattern probe API ──
-    let result = ecx.probe(crate::hir::traits::solver::eval_ctxt::ProbeKind::TraitGoal)
+    let result = ecx
+        .probe(crate::hir::traits::solver::eval_ctxt::ProbeKind::TraitGoal)
         .enter(|ecx| {
-        // Use the GoalKind-based assembly engine instead of delegate.select().
-        // The assembly engine handles candidate assembly, winnowing, and
-        // confirmation via the GoalKind trait (see assembly/mod.rs).
-        let impl_source =
-            crate::hir::traits::solver::assembly::assemble_and_evaluate_candidates(ecx, goal)?;
+            // Use the GoalKind-based assembly engine instead of delegate.select().
+            // The assembly engine handles candidate assembly, winnowing, and
+            // confirmation via the GoalKind trait (see assembly/mod.rs).
+            let impl_source =
+                crate::hir::traits::solver::assembly::assemble_and_evaluate_candidates(ecx, goal)?;
 
-        if matches!(&impl_source, ImplSource::Deferred { .. }) {
-            return Ok(impl_source);
-        }
+            if matches!(&impl_source, ImplSource::Deferred { .. }) {
+                return Ok(impl_source);
+            }
 
-        for nested in impl_source.nested_obligations() {
-            match evaluate_goal_inner(ecx, &nested, depth + 1) {
-                Ok(ImplSource::Deferred { stalled_on }) => {
-                    return Ok(ImplSource::Deferred { stalled_on });
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(e);
+            for nested in impl_source.nested_obligations() {
+                match evaluate_goal_inner(ecx, &nested, depth + 1) {
+                    Ok(ImplSource::Deferred { stalled_on }) => {
+                        return Ok(ImplSource::Deferred { stalled_on });
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(e);
+                    }
                 }
             }
-        }
 
-        Ok(impl_source)
-    });
+            Ok(impl_source)
+        });
 
     // Exit the search graph (pop from active path).
     if goal_key.is_some() {

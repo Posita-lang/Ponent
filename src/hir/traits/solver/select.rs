@@ -1,7 +1,7 @@
 use crate::hir::symbol::SymbolTable;
 use crate::hir::traits::TraitEnv;
-use crate::hir::traits::solver::delegate::SolverDelegate;
 use crate::hir::traits::solver::builtins::{BuiltinTrait, BuiltinTraitRegistry};
+use crate::hir::traits::solver::delegate::SolverDelegate;
 use crate::hir::traits::solver::obligation::{
     BuiltinImplSource, ImplSource, Obligation, ObligationCause, ObligationCauseCode, Predicate,
     ProjectionTy, SolveError,
@@ -145,11 +145,8 @@ impl<'a> SelectionContext<'a> {
         // Create an EvalCtxt wrapping self and delegate to the assembly engine.
         let mut search_graph = crate::hir::traits::solver::search_graph::SearchGraph::new();
         let span = obligation.cause.span;
-        let mut ecx = crate::hir::traits::solver::eval_ctxt::EvalCtxt::new(
-            self,
-            &mut search_graph,
-            span,
-        );
+        let mut ecx =
+            crate::hir::traits::solver::eval_ctxt::EvalCtxt::new(self, &mut search_graph, span);
         crate::hir::traits::solver::assembly::assemble_and_evaluate_candidates(&mut ecx, obligation)
     }
 

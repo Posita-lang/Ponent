@@ -118,7 +118,10 @@ impl BuiltinTrait {
     /// Whether this builtin trait is coinductive (auto‑trait / marker).
     /// Coinductive traits treat cycles in the proof tree as success.
     pub fn is_coinductive(&self) -> bool {
-        matches!(self, BuiltinTrait::Sized | BuiltinTrait::Copy | BuiltinTrait::Clone)
+        matches!(
+            self,
+            BuiltinTrait::Sized | BuiltinTrait::Copy | BuiltinTrait::Clone
+        )
     }
 }
 

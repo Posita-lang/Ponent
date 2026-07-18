@@ -3,10 +3,10 @@ use crate::diagnostics::Diagnostic;
 use crate::hir::types::*;
 use crate::symbol::Symbol;
 use indexmap::IndexMap;
-use std::cell::Cell;
-use std::rc::Rc;
 use rustc_hash::FxBuildHasher;
 use rustc_hash::FxHashMap as HashMap;
+use std::cell::Cell;
+use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub struct FieldBinding {
@@ -268,7 +268,11 @@ impl SymbolTable {
                 break;
             }
         }
-        debug_assert!(found, "update_function_return_type: function '{}' not found in any scope", name.as_str());
+        debug_assert!(
+            found,
+            "update_function_return_type: function '{}' not found in any scope",
+            name.as_str()
+        );
     }
 
     pub fn insert_type(

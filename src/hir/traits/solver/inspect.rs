@@ -173,7 +173,7 @@ impl ProofTreeBuilder {
             kind: node.kind,
             trait_id: node.trait_id,
             candidates: node.candidates.clone(),
-            child_indices: Vec::new(),     // flattened away
+            child_indices: Vec::new(), // flattened away
             result: node.result.clone(),
         })
     }

@@ -61,7 +61,8 @@ pub enum BuiltinImplSource {
 pub struct CandidateHeadUsages {
     /// Map from stack depth → head usages for each cycle head.
     /// The `usize` is the index in the `SearchGraph` stack.
-    pub(crate) usages: Option<Box<HashMap<usize, crate::hir::traits::solver::search_graph::HeadUsages>>>,
+    pub(crate) usages:
+        Option<Box<HashMap<usize, crate::hir::traits::solver::search_graph::HeadUsages>>>,
 }
 
 impl CandidateHeadUsages {
@@ -156,10 +157,15 @@ impl<D: SolverDelegate, T> ProbeCtxt<'_, '_, D, T> {
         f: impl FnOnce(&mut EvalCtxt<'_, D>) -> Result<T, SolveError>,
         propagated_nested_goals: Vec<(GoalSource, Obligation, Option<GoalStalledOn>)>,
     ) -> Result<T, SolveError> {
-        let ProbeCtxt { ecx: outer, probe_kind: _, _result } = self;
+        let ProbeCtxt {
+            ecx: outer,
+            probe_kind: _,
+            _result,
+        } = self;
 
         // Save the current nested_goals and replace with the propagated ones.
-        let saved_nested_goals = std::mem::replace(&mut outer.nested_goals, propagated_nested_goals);
+        let saved_nested_goals =
+            std::mem::replace(&mut outer.nested_goals, propagated_nested_goals);
 
         // Snapshot EvalCtxt state for rollback.
         let snap = outer.snapshot();

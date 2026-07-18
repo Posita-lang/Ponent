@@ -2200,30 +2200,42 @@ fn test_where_tuple_subject_direct_trait_rejected() {
 #[cfg(test)]
 mod test_infer_return {
     use super::*;
-    
+
     #[test]
     fn test_infer_return_from_literal() {
         let result = check_source("def main() { return 42; }");
         // Should succeed: infer return type as Int<32>
-        assert!(result.is_ok(), "infer return from literal: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "infer return from literal: {:?}",
+            result.err()
+        );
     }
-    
+
     #[test]
     fn test_infer_return_from_bool() {
         let result = check_source("def main() { return true; }");
         assert!(result.is_ok(), "infer return from bool: {:?}", result.err());
     }
-    
+
     #[test]
     fn test_infer_return_no_return_defaults_to_never() {
         let result = check_source("def main() { }");
-        assert!(result.is_ok(), "no return defaults to never: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "no return defaults to never: {:?}",
+            result.err()
+        );
     }
-    
+
     #[test]
     fn test_infer_return_empty_return_defaults_to_unit() {
         let result = check_source("def main() { return; }");
-        assert!(result.is_ok(), "empty return defaults to unit: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "empty return defaults to unit: {:?}",
+            result.err()
+        );
     }
 }
 
@@ -2240,7 +2252,11 @@ mod test_regex {
             "def foo(x: Regex<\"[0-9]+\">) -> Int<32> { return 0; }
              def main() -> Int<32> { return 0; }",
         );
-        assert!(result.is_ok(), "valid regex pattern should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "valid regex pattern should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -2250,7 +2266,11 @@ mod test_regex {
             "def foo(x: Regex<\"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\\\.[a-zA-Z]{2,}\">) -> Int<32> { return 0; }
              def main() -> Int<32> { return 0; }",
         );
-        assert!(result.is_ok(), "complex regex pattern should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "complex regex pattern should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -2262,10 +2282,7 @@ mod test_regex {
                  return 0;
              }",
         );
-        assert!(
-            result.is_err(),
-            "invalid regex pattern should be rejected"
-        );
+        assert!(result.is_err(), "invalid regex pattern should be rejected");
         let errs = result.unwrap_err();
         assert!(
             errs.iter().any(|e| e.contains("invalid regex pattern")),
@@ -2293,9 +2310,14 @@ mod test_regex {
     fn test_regex_display_format() {
         // Verify that TypeData::Regex Display produces the correct format.
         let mut ctx = TypeContext::new();
-        let regex_ty = ctx.alloc(TypeData::Regex { pattern: "[0-9]+".into() });
+        let regex_ty = ctx.alloc(TypeData::Regex {
+            pattern: "[0-9]+".into(),
+        });
         let display_str = format!("{}", ctx.get(regex_ty));
-        assert_eq!(display_str, "Regex<\"[0-9]+\">", "Regex Display should match syntax");
+        assert_eq!(
+            display_str, "Regex<\"[0-9]+\">",
+            "Regex Display should match syntax"
+        );
     }
 
     #[test]
@@ -2307,14 +2329,22 @@ mod test_regex {
             "def foo(x: Regex<\"\">) -> Int<32> { return 0; }
              def main() -> Int<32> { return 0; }",
         );
-        assert!(result.is_ok(), "empty regex pattern should be valid: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "empty regex pattern should be valid: {:?}",
+            result.err()
+        );
 
         // Meta characters: `^`, `$`, `\d`, `+`, `?`, `|`, `(`, `)`.
         let result = check_source(
             "def foo(x: Regex<\"^\\\\d+$|(foo|bar)?\">) -> Int<32> { return 0; }
              def main() -> Int<32> { return 0; }",
         );
-        assert!(result.is_ok(), "regex with meta characters should be valid: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "regex with meta characters should be valid: {:?}",
+            result.err()
+        );
 
         // Unclosed group — should be rejected.
         let result = check_source(
@@ -2362,6 +2392,10 @@ mod test_regex {
         // 直接测 parser，跳过 type-check（100KB 的 type-check 可能触发其他问题）
         let mut parser = crate::parser::Parser::new(&source);
         let program = parser.parse_program();
-        assert!(program.is_ok(), "100KB regex should not crash parser: {:?}", program.err());
+        assert!(
+            program.is_ok(),
+            "100KB regex should not crash parser: {:?}",
+            program.err()
+        );
     }
 }

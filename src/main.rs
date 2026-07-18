@@ -11,9 +11,9 @@ mod hir {
     pub mod generate;
     pub mod hir;
     pub mod infer;
-    pub mod query;
     #[cfg(test)]
     mod infer_tests;
+    pub mod query;
     pub mod resolver;
     pub mod shape_var;
     pub mod smt;

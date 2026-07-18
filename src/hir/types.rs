@@ -379,7 +379,9 @@ pub enum TypeData {
     Unit,
     Error,
     /// A compile-time validated regular expression pattern: `Regex<"pattern">`.
-    Regex { pattern: String },
+    Regex {
+        pattern: String,
+    },
 }
 
 impl fmt::Display for TypeData {
@@ -3170,8 +3172,7 @@ impl TypeContext {
                 self.contains_regex(*size) || self.contains_regex(*pointee)
             }
             TypeData::Fn { params, ret } => {
-                params.iter().any(|&p| self.contains_regex(p))
-                    || self.contains_regex(*ret)
+                params.iter().any(|&p| self.contains_regex(p)) || self.contains_regex(*ret)
             }
             TypeData::Poly { body, .. } => self.contains_regex(*body),
             TypeData::Exists { base, .. } => self.contains_regex(*base),

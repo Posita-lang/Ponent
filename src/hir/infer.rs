@@ -3135,12 +3135,7 @@ impl InferenceContext {
                 (tv.kind, origin)
             })
             .collect();
-        defaulting::default_variables(
-            ctx,
-            &self.var_type_ids,
-            &type_vars,
-            &self.gen_statuses,
-        )?;
+        defaulting::default_variables(ctx, &self.var_type_ids, &type_vars, &self.gen_statuses)?;
 
         Ok(())
     }
@@ -4997,10 +4992,7 @@ mod tests {
         // Both pools should be empty (no variables existed before the
         // undo-logged operations).
         assert!(
-            infer.region_tree.nodes[root.0]
-                .pool
-                .var_ids
-                .is_empty(),
+            infer.region_tree.nodes[root.0].pool.var_ids.is_empty(),
             "after rollback, root pool should be empty"
         );
         assert!(
@@ -5262,8 +5254,7 @@ mod tests {
 
         tree.rollback_pool();
         assert_eq!(
-            tree.nodes[root.0].pool.var_ids,
-            snapshot,
+            tree.nodes[root.0].pool.var_ids, snapshot,
             "rollback with empty log should not change pool"
         );
     }

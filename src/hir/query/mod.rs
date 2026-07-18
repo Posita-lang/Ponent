@@ -36,8 +36,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod dep_graph;
 pub mod job;
@@ -99,10 +99,21 @@ pub struct QueryDescriptor {
 
 impl QueryDescriptor {
     pub const fn new(name: &'static str, description: &'static str) -> Self {
-        QueryDescriptor { name, description, eval_always: false, depth_limit: false }
+        QueryDescriptor {
+            name,
+            description,
+            eval_always: false,
+            depth_limit: false,
+        }
     }
-    pub const fn with_eval_always(mut self, val: bool) -> Self { self.eval_always = val; self }
-    pub const fn with_depth_limit(mut self, val: bool) -> Self { self.depth_limit = val; self }
+    pub const fn with_eval_always(mut self, val: bool) -> Self {
+        self.eval_always = val;
+        self
+    }
+    pub const fn with_depth_limit(mut self, val: bool) -> Self {
+        self.depth_limit = val;
+        self
+    }
 }
 
 // ── QueryCacheType trait ──────────────────────────────────────────
@@ -131,10 +142,14 @@ where
     fn remove(&self, key: &K);
     fn clear(&self);
     fn len(&self) -> usize;
-    fn is_empty(&self) -> bool { self.len() == 0 }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn for_each(&self, f: impl FnMut(&K, &V));
     /// Return cache statistics.  Default implementation returns empty stats.
-    fn stats(&self) -> CacheStats { CacheStats::default() }
+    fn stats(&self) -> CacheStats {
+        CacheStats::default()
+    }
 }
 
 // ── DefaultCache (HashMap-backed, O(1) LRU via linked list) ───────
@@ -190,7 +205,9 @@ where
     K: Clone + Eq + Hash + std::fmt::Debug,
     V: Clone + std::fmt::Debug,
 {
-    pub fn new() -> Self { DefaultCache::with_capacity(DEFAULT_CACHE_CAPACITY) }
+    pub fn new() -> Self {
+        DefaultCache::with_capacity(DEFAULT_CACHE_CAPACITY)
+    }
     pub fn with_capacity(max_entries: usize) -> Self {
         DefaultCache {
             inner: RwLock::new(CacheInner {
@@ -210,11 +227,21 @@ where
     /// Allocate a new node slot, reusing a free slot if available.
     fn alloc_node(inner: &mut CacheInner<K, V>, key: K, value: V) -> usize {
         if let Some(idx) = inner.free.pop() {
-            inner.nodes[idx] = LruNode { key, value, prev: None, next: None };
+            inner.nodes[idx] = LruNode {
+                key,
+                value,
+                prev: None,
+                next: None,
+            };
             idx
         } else {
             let idx = inner.nodes.len();
-            inner.nodes.push(LruNode { key, value, prev: None, next: None });
+            inner.nodes.push(LruNode {
+                key,
+                value,
+                prev: None,
+                next: None,
+            });
             idx
         }
     }
@@ -230,16 +257,24 @@ where
 
     /// Move a node to the head of the LRU list.
     fn move_to_head(inner: &mut CacheInner<K, V>, idx: usize) {
-        if Some(idx) == inner.head { return; }
+        if Some(idx) == inner.head {
+            return;
+        }
 
         let (prev, next) = {
             let n = &inner.nodes[idx];
             (n.prev, n.next)
         };
 
-        if let Some(p) = prev { inner.nodes[p].next = next; }
-        if let Some(n) = next { inner.nodes[n].prev = prev; }
-        if Some(idx) == inner.tail { inner.tail = prev; }
+        if let Some(p) = prev {
+            inner.nodes[p].next = next;
+        }
+        if let Some(n) = next {
+            inner.nodes[n].prev = prev;
+        }
+        if Some(idx) == inner.tail {
+            inner.tail = prev;
+        }
 
         if let Some(old_head) = inner.head {
             inner.nodes[old_head].prev = Some(idx);
@@ -247,7 +282,9 @@ where
         inner.nodes[idx].prev = None;
         inner.nodes[idx].next = inner.head;
         inner.head = Some(idx);
-        if inner.tail.is_none() { inner.tail = Some(idx); }
+        if inner.tail.is_none() {
+            inner.tail = Some(idx);
+        }
     }
 
     /// Evict the tail (least recently used) node.
@@ -324,10 +361,18 @@ where
                 let n = &inner.nodes[idx];
                 (n.prev, n.next)
             };
-            if let Some(p) = prev { inner.nodes[p].next = next; }
-            if let Some(n) = next { inner.nodes[n].prev = prev; }
-            if Some(idx) == inner.head { inner.head = next; }
-            if Some(idx) == inner.tail { inner.tail = prev; }
+            if let Some(p) = prev {
+                inner.nodes[p].next = next;
+            }
+            if let Some(n) = next {
+                inner.nodes[n].prev = prev;
+            }
+            if Some(idx) == inner.head {
+                inner.head = next;
+            }
+            if Some(idx) == inner.tail {
+                inner.tail = prev;
+            }
             Self::free_node(&mut inner, idx);
         }
     }
@@ -341,7 +386,9 @@ where
         inner.free.clear();
     }
 
-    fn len(&self) -> usize { self.inner.read().unwrap().map.len() }
+    fn len(&self) -> usize {
+        self.inner.read().unwrap().map.len()
+    }
 
     fn for_each(&self, mut f: impl FnMut(&K, &V)) {
         let inner = self.inner.read().unwrap();
@@ -354,8 +401,13 @@ where
 }
 
 impl<K, V> Default for DefaultCache<K, V>
-where K: Clone + Eq + Hash + std::fmt::Debug, V: Clone + std::fmt::Debug {
-    fn default() -> Self { Self::new() }
+where
+    K: Clone + Eq + Hash + std::fmt::Debug,
+    V: Clone + std::fmt::Debug,
+{
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── SingleCache (for unit keys) ───────────────────────────────────
@@ -391,12 +443,26 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<(), V> for SingleCache<V> {
         }
         result
     }
-    fn insert(&self, _key: (), value: V) { *self.entry.write().unwrap() = Some(value); }
-    fn remove(&self, _key: &()) { *self.entry.write().unwrap() = None; }
-    fn clear(&self) { *self.entry.write().unwrap() = None; }
-    fn len(&self) -> usize { if self.entry.read().unwrap().is_some() { 1 } else { 0 } }
+    fn insert(&self, _key: (), value: V) {
+        *self.entry.write().unwrap() = Some(value);
+    }
+    fn remove(&self, _key: &()) {
+        *self.entry.write().unwrap() = None;
+    }
+    fn clear(&self) {
+        *self.entry.write().unwrap() = None;
+    }
+    fn len(&self) -> usize {
+        if self.entry.read().unwrap().is_some() {
+            1
+        } else {
+            0
+        }
+    }
     fn for_each(&self, mut f: impl FnMut(&(), &V)) {
-        if let Some(ref v) = *self.entry.read().unwrap() { f(&(), v); }
+        if let Some(ref v) = *self.entry.read().unwrap() {
+            f(&(), v);
+        }
     }
     fn stats(&self) -> CacheStats {
         CacheStats {
@@ -408,7 +474,11 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<(), V> for SingleCache<V> {
     }
 }
 
-impl<V: Clone + std::fmt::Debug> Default for SingleCache<V> { fn default() -> Self { Self::new() } }
+impl<V: Clone + std::fmt::Debug> Default for SingleCache<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ── DefIdCache (Vec-indexed for DefId keys) ───────────────────────
 
@@ -436,14 +506,21 @@ impl<V: Clone + std::fmt::Debug> DefIdCache<V> {
 
     fn ensure_index(&self, idx: usize) {
         let mut entries = self.entries.write().unwrap();
-        if idx >= entries.len() { entries.resize_with(idx + 1, || None); }
+        if idx >= entries.len() {
+            entries.resize_with(idx + 1, || None);
+        }
     }
 }
 
 impl<V: Clone + std::fmt::Debug> QueryCacheType<crate::hir::types::DefId, V> for DefIdCache<V> {
     fn lookup(&self, key: &crate::hir::types::DefId) -> Option<V> {
         let idx = key.0;
-        let result = self.entries.read().unwrap().get(idx).and_then(|e| e.clone());
+        let result = self
+            .entries
+            .read()
+            .unwrap()
+            .get(idx)
+            .and_then(|e| e.clone());
         if result.is_some() {
             self.stats_hits.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -461,13 +538,22 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<crate::hir::types::DefId, V> for
     fn remove(&self, key: &crate::hir::types::DefId) {
         let idx = key.0;
         let mut entries = self.entries.write().unwrap();
-        if idx < entries.len() { entries[idx] = None; }
+        if idx < entries.len() {
+            entries[idx] = None;
+        }
     }
 
-    fn clear(&self) { self.entries.write().unwrap().clear(); }
+    fn clear(&self) {
+        self.entries.write().unwrap().clear();
+    }
 
     fn len(&self) -> usize {
-        self.entries.read().unwrap().iter().filter(|e| e.is_some()).count()
+        self.entries
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|e| e.is_some())
+            .count()
     }
 
     fn for_each(&self, mut f: impl FnMut(&crate::hir::types::DefId, &V)) {
@@ -547,8 +633,14 @@ impl<Q: Query> QueryVTable<Q> {
                 query_name: self.descriptor.name,
                 message: format!(
                     "query cycle detected: `{}` with key `{:?}`\n  call stack:\n    {}",
-                    self.descriptor.name, key,
-                    stack.iter().enumerate().map(|(i, s)| format!("  {}: {}", i, s)).collect::<Vec<_>>().join("\n    "),
+                    self.descriptor.name,
+                    key,
+                    stack
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| format!("  {}: {}", i, s))
+                        .collect::<Vec<_>>()
+                        .join("\n    "),
                 ),
                 stack,
             });
@@ -562,7 +654,12 @@ impl<Q: Query> QueryVTable<Q> {
                     self.descriptor.name,
                     self.active.len() + 1,
                     MAX_QUERY_DEPTH,
-                    stack.iter().enumerate().map(|(i, s)| format!("  {}: {}", i, s)).collect::<Vec<_>>().join("\n    "),
+                    stack
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| format!("  {}: {}", i, s))
+                        .collect::<Vec<_>>()
+                        .join("\n    "),
                 ),
                 stack,
             });
@@ -592,7 +689,9 @@ pub trait IntoQueryKey<K> {
 /// Identity conversion — every type can be converted to itself.
 impl<K> IntoQueryKey<K> for K {
     #[inline(always)]
-    fn into_query_key(self) -> K { self }
+    fn into_query_key(self) -> K {
+        self
+    }
 }
 
 /// `usize` → `DefId` (since `DefId` is a newtype around `usize`).
@@ -681,11 +780,19 @@ impl QuerySystem {
         node
     }
 
-    pub fn get<Q: Query>(&self, key: impl IntoQueryKey<Q::Key>, provider: &dyn QueryProvider) -> Result<Q::Value, QueryCycleError> {
+    pub fn get<Q: Query>(
+        &self,
+        key: impl IntoQueryKey<Q::Key>,
+        provider: &dyn QueryProvider,
+    ) -> Result<Q::Value, QueryCycleError> {
         let key = key.into_query_key();
 
         // Register query name for introspection (first call only).
-        self.query_names.write().unwrap().entry(TypeId::of::<Q>()).or_insert_with(|| Q::descriptor().name);
+        self.query_names
+            .write()
+            .unwrap()
+            .entry(TypeId::of::<Q>())
+            .or_insert_with(|| Q::descriptor().name);
 
         // Get or create a stable DepNodeIndex for this (query_type, key).
         let node_index = self.get_or_create_node::<Q>(&key);
@@ -722,7 +829,11 @@ impl QuerySystem {
                     drop(vtables);
                     latch.wait_on().map_err(|_| QueryCycleError {
                         query_name: Q::descriptor().name,
-                        message: format!("query poisoned: `{}` with key `{:?}`", Q::descriptor().name, key),
+                        message: format!(
+                            "query poisoned: `{}` with key `{:?}`",
+                            Q::descriptor().name,
+                            key
+                        ),
                         stack: vec![format!("{:?}", key)],
                     })?;
                     // Now the result should be in the cache.
@@ -735,14 +846,22 @@ impl QuerySystem {
                     }
                     return Err(QueryCycleError {
                         query_name: Q::descriptor().name,
-                        message: format!("query result not found after waiting: `{}` with key `{:?}`", Q::descriptor().name, key),
+                        message: format!(
+                            "query result not found after waiting: `{}` with key `{:?}`",
+                            Q::descriptor().name,
+                            key
+                        ),
                         stack: vec![format!("{:?}", key)],
                     });
                 }
                 Some(ActiveKeyStatus::Poisoned) => {
                     return Err(QueryCycleError {
                         query_name: Q::descriptor().name,
-                        message: format!("query previously panicked: `{}` with key `{:?}`", Q::descriptor().name, key),
+                        message: format!(
+                            "query previously panicked: `{}` with key `{:?}`",
+                            Q::descriptor().name,
+                            key
+                        ),
                         stack: vec![format!("{:?}", key)],
                     });
                 }
@@ -775,9 +894,7 @@ impl QuerySystem {
         //   - dep_graph task stack (finish_task)
         // Otherwise waiting threads would deadlock and subsequent queries
         // would get false-positive cycle detection.
-        let compute_result = panic::catch_unwind(AssertUnwindSafe(|| {
-            Q::compute(&key, provider)
-        }));
+        let compute_result = panic::catch_unwind(AssertUnwindSafe(|| Q::compute(&key, provider)));
 
         // Clean up dep_graph task stack (must happen regardless of panic).
         self.dep_graph.finish_task();
@@ -886,7 +1003,11 @@ impl QuerySystem {
     /// This is useful for validation passes where you only care whether
     /// the query completes without errors, not what the result is.
     /// Analogous to Rust's `tcx.ensure_ok().$query(..)`.
-    pub fn ensure_ok<Q: Query>(&self, key: impl IntoQueryKey<Q::Key>, provider: &dyn QueryProvider) -> Result<(), QueryCycleError> {
+    pub fn ensure_ok<Q: Query>(
+        &self,
+        key: impl IntoQueryKey<Q::Key>,
+        provider: &dyn QueryProvider,
+    ) -> Result<(), QueryCycleError> {
         self.get::<Q>(key, provider).map(|_| ())
     }
 
@@ -914,7 +1035,11 @@ impl QuerySystem {
     }
 }
 
-impl Default for QuerySystem { fn default() -> Self { Self::new() } }
+impl Default for QuerySystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ── QueryProvider trait ──────────────────────────────────────────
 
@@ -928,7 +1053,10 @@ pub trait QueryProvider: Sync {
 
 /// Execute a query through a provider, returning the cached or computed value.
 /// This is the primary way for queries to call other queries.
-pub fn query_get<Q: Query>(provider: &dyn QueryProvider, key: impl IntoQueryKey<Q::Key>) -> Result<Q::Value, QueryCycleError> {
+pub fn query_get<Q: Query>(
+    provider: &dyn QueryProvider,
+    key: impl IntoQueryKey<Q::Key>,
+) -> Result<Q::Value, QueryCycleError> {
     provider.query_system().get::<Q>(key, provider)
 }
 
@@ -940,11 +1068,15 @@ pub struct DefaultQueryProvider<'a> {
 }
 
 impl<'a> DefaultQueryProvider<'a> {
-    pub fn new(system: &'a QuerySystem) -> Self { DefaultQueryProvider { system } }
+    pub fn new(system: &'a QuerySystem) -> Self {
+        DefaultQueryProvider { system }
+    }
 }
 
 impl<'a> QueryProvider for DefaultQueryProvider<'a> {
-    fn query_system(&self) -> &QuerySystem { self.system }
+    fn query_system(&self) -> &QuerySystem {
+        self.system
+    }
 }
 
 // ── Query handle ──────────────────────────────────────────────────
@@ -959,12 +1091,18 @@ impl<'a> QueryHandle<'a> {
     pub fn new(system: &'a QuerySystem, provider: &'a dyn QueryProvider) -> Self {
         QueryHandle { system, provider }
     }
-    pub fn get<Q: Query>(&self, key: impl IntoQueryKey<Q::Key>) -> Result<Q::Value, QueryCycleError> {
+    pub fn get<Q: Query>(
+        &self,
+        key: impl IntoQueryKey<Q::Key>,
+    ) -> Result<Q::Value, QueryCycleError> {
         self.system.get::<Q>(key, self.provider)
     }
     /// Execute a query in `EnsureOk` mode: compute and cache the result,
     /// but discard the value.  Returns `Err(QueryCycleError)` on failure.
-    pub fn ensure_ok<Q: Query>(&self, key: impl IntoQueryKey<Q::Key>) -> Result<(), QueryCycleError> {
+    pub fn ensure_ok<Q: Query>(
+        &self,
+        key: impl IntoQueryKey<Q::Key>,
+    ) -> Result<(), QueryCycleError> {
         self.system.ensure_ok::<Q>(key, self.provider)
     }
 }
@@ -985,7 +1123,9 @@ mod tests {
         type Key = TestKey;
         type Value = TestValue;
         type Cache = DefaultCache<TestKey, TestValue>;
-        fn descriptor() -> QueryDescriptor { QueryDescriptor::new("test", "a test query") }
+        fn descriptor() -> QueryDescriptor {
+            QueryDescriptor::new("test", "a test query")
+        }
         fn compute(key: &TestKey, _: &dyn QueryProvider) -> TestValue {
             TestValue(format!("value_{}", key.0))
         }
@@ -1015,9 +1155,18 @@ mod tests {
         cache.insert(TestKey(2), TestValue("b".into()));
         assert_eq!(cache.lookup(&TestKey(1)), Some(TestValue("a".into())));
         cache.insert(TestKey(3), TestValue("c".into()));
-        assert!(cache.lookup(&TestKey(1)).is_some(), "key 1 was accessed, should survive");
-        assert!(cache.lookup(&TestKey(2)).is_none(), "key 2 was never re-accessed, should be evicted");
-        assert!(cache.lookup(&TestKey(3)).is_some(), "key 3 was just inserted");
+        assert!(
+            cache.lookup(&TestKey(1)).is_some(),
+            "key 1 was accessed, should survive"
+        );
+        assert!(
+            cache.lookup(&TestKey(2)).is_none(),
+            "key 2 was never re-accessed, should be evicted"
+        );
+        assert!(
+            cache.lookup(&TestKey(3)).is_some(),
+            "key 3 was just inserted"
+        );
     }
 
     #[test]
@@ -1046,9 +1195,12 @@ mod tests {
         let system = QuerySystem::new();
         struct Q;
         impl Query for Q {
-            type Key = TestKey; type Value = TestValue;
+            type Key = TestKey;
+            type Value = TestValue;
             type Cache = DefaultCache<TestKey, TestValue>;
-            fn descriptor() -> QueryDescriptor { QueryDescriptor::new("q", "") }
+            fn descriptor() -> QueryDescriptor {
+                QueryDescriptor::new("q", "")
+            }
             fn compute(key: &TestKey, _: &dyn QueryProvider) -> TestValue {
                 TestValue(format!("computed_{}", key.0))
             }
@@ -1065,9 +1217,12 @@ mod tests {
         let system = QuerySystem::new();
         struct Q;
         impl Query for Q {
-            type Key = TestKey; type Value = TestValue;
+            type Key = TestKey;
+            type Value = TestValue;
             type Cache = DefaultCache<TestKey, TestValue>;
-            fn descriptor() -> QueryDescriptor { QueryDescriptor::new("q", "") }
+            fn descriptor() -> QueryDescriptor {
+                QueryDescriptor::new("q", "")
+            }
             fn compute(key: &TestKey, _: &dyn QueryProvider) -> TestValue {
                 TestValue(format!("handle_{}", key.0))
             }
@@ -1085,9 +1240,12 @@ mod tests {
         let system = QuerySystem::new();
         struct Q;
         impl Query for Q {
-            type Key = TestKey; type Value = TestValue;
+            type Key = TestKey;
+            type Value = TestValue;
             type Cache = DefaultCache<TestKey, TestValue>;
-            fn descriptor() -> QueryDescriptor { QueryDescriptor::new("q", "") }
+            fn descriptor() -> QueryDescriptor {
+                QueryDescriptor::new("q", "")
+            }
             fn compute(key: &TestKey, _: &dyn QueryProvider) -> TestValue {
                 TestValue(format!("computed_{}", key.0))
             }
@@ -1126,14 +1284,18 @@ mod tests {
 
         struct EvalAlwaysQ;
         impl Query for EvalAlwaysQ {
-            type Key = TestKey; type Value = TestValue;
+            type Key = TestKey;
+            type Value = TestValue;
             type Cache = DefaultCache<TestKey, TestValue>;
             fn descriptor() -> QueryDescriptor {
-                QueryDescriptor::new("eval_always", "always re-computed")
-                    .with_eval_always(true)
+                QueryDescriptor::new("eval_always", "always re-computed").with_eval_always(true)
             }
             fn compute(key: &TestKey, _: &dyn QueryProvider) -> TestValue {
-                TestValue(format!("eval_{}_{}", key.0, EVAL_COUNTER.fetch_add(1, Ordering::SeqCst)))
+                TestValue(format!(
+                    "eval_{}_{}",
+                    key.0,
+                    EVAL_COUNTER.fetch_add(1, Ordering::SeqCst)
+                ))
             }
         }
         let provider = TestProvider;
@@ -1155,11 +1317,11 @@ mod tests {
 
         struct DeepQ;
         impl Query for DeepQ {
-            type Key = TestKey; type Value = TestValue;
+            type Key = TestKey;
+            type Value = TestValue;
             type Cache = DefaultCache<TestKey, TestValue>;
             fn descriptor() -> QueryDescriptor {
-                QueryDescriptor::new("deep", "depth-limited query")
-                    .with_depth_limit(true)
+                QueryDescriptor::new("deep", "depth-limited query").with_depth_limit(true)
             }
             fn compute(key: &TestKey, provider: &dyn QueryProvider) -> TestValue {
                 if key.0 > 0 {
@@ -1196,9 +1358,12 @@ mod tests {
         let system = QuerySystem::new();
         struct P;
         impl Query for P {
-            type Key = TestKey; type Value = TestValue;
+            type Key = TestKey;
+            type Value = TestValue;
             type Cache = DefaultCache<TestKey, TestValue>;
-            fn descriptor() -> QueryDescriptor { QueryDescriptor::new("p", "") }
+            fn descriptor() -> QueryDescriptor {
+                QueryDescriptor::new("p", "")
+            }
             fn compute(key: &TestKey, _: &dyn QueryProvider) -> TestValue {
                 TestValue(format!("par_{}", key.0))
             }

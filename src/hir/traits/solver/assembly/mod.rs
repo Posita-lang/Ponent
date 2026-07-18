@@ -24,6 +24,10 @@
 //! references to `TraitEnv` / `BuiltinTraitRegistry` through `ecx.delegate`.
 //! The `EvalCtxt` is only used in the top-level `assemble_and_evaluate_candidates`.
 
+use crate::hir::traits::ImplCandidate;
+use crate::hir::traits::TraitEnv;
+use crate::hir::traits::solver::builtins;
+use crate::hir::traits::solver::builtins::BuiltinTraitRegistry;
 use crate::hir::traits::solver::delegate::SolverDelegate;
 use crate::hir::traits::solver::eval_ctxt::EvalCtxt;
 use crate::hir::traits::solver::eval_ctxt::{GoalSource, GoalStalledOn, ProbeKind};
@@ -32,12 +36,8 @@ use crate::hir::traits::solver::obligation::{
     SolveError,
 };
 use crate::hir::traits::solver::select::{
-    Candidate, Candidates, ResolvedObligation, MAX_RECURSION_DEPTH,
+    Candidate, Candidates, MAX_RECURSION_DEPTH, ResolvedObligation,
 };
-use crate::hir::traits::solver::builtins;
-use crate::hir::traits::solver::builtins::BuiltinTraitRegistry;
-use crate::hir::traits::ImplCandidate;
-use crate::hir::traits::TraitEnv;
 use crate::hir::types::{DefId, Subst, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -398,7 +398,10 @@ pub(super) fn assemble_and_evaluate_candidates<D: SolverDelegate>(
         Predicate::Sub { sub, sup } => {
             return ecx.compute_sub_goal(*sub, *sup);
         }
-        Predicate::Match { scrutinee, branches_id } => {
+        Predicate::Match {
+            scrutinee,
+            branches_id,
+        } => {
             return ecx.compute_match_goal(*scrutinee, *branches_id);
         }
         Predicate::Forall { body } => {
@@ -407,8 +410,16 @@ pub(super) fn assemble_and_evaluate_candidates<D: SolverDelegate>(
         Predicate::Exists { body } => {
             return ecx.compute_exists_goal(body, &obligation.cause, obligation.recursion_depth);
         }
-        Predicate::Instance { scheme_ty, instantiation_ty } => {
-            return ecx.compute_instance_goal(*scheme_ty, *instantiation_ty, &obligation.cause, obligation.recursion_depth);
+        Predicate::Instance {
+            scheme_ty,
+            instantiation_ty,
+        } => {
+            return ecx.compute_instance_goal(
+                *scheme_ty,
+                *instantiation_ty,
+                &obligation.cause,
+                obligation.recursion_depth,
+            );
         }
         Predicate::Let { def, body } => {
             return ecx.compute_let_goal(def, body, &obligation.cause, obligation.recursion_depth);
@@ -438,7 +449,13 @@ pub(super) fn assemble_and_evaluate_candidates<D: SolverDelegate>(
     assemble_caller_bound_candidates(ecx, &obligation.predicate, &resolved, &mut candidates);
 
     // Assemble from builtins
-    assemble_builtin_candidates(ecx, &obligation.predicate, &resolved, &mut candidates, &mut ambiguous);
+    assemble_builtin_candidates(
+        ecx,
+        &obligation.predicate,
+        &resolved,
+        &mut candidates,
+        &mut ambiguous,
+    );
 
     // Assemble from object type
     assemble_object_candidates(ecx, &obligation.predicate, &resolved, &mut candidates);
@@ -524,7 +541,8 @@ fn assemble_impl_candidates<D: SolverDelegate>(
         // match, its head_usages are automatically discarded (not propagated
         // to the parent goal), preventing failed candidates from polluting
         // the cycle head dependency tracking.
-        let _head_usages = ecx.probe(ProbeKind::SingleCandidate)
+        let _head_usages = ecx
+            .probe(ProbeKind::SingleCandidate)
             .enter_single_candidate(|ecx| {
                 let mut single = Vec::new();
                 predicate.consider_impl_candidate(ecx, idx, impl_cand, resolved, &mut single);
@@ -572,7 +590,8 @@ fn assemble_caller_bound_candidates<D: SolverDelegate>(
         };
         if *bound_trait_id == trait_id {
             let args_vec = args.cloned().unwrap_or_default();
-            predicate.consider_caller_bound_candidate(ecx, *self_ty, &args_vec, resolved, candidates);
+            predicate
+                .consider_caller_bound_candidate(ecx, *self_ty, &args_vec, resolved, candidates);
         }
     }
 }
@@ -626,7 +645,11 @@ fn assemble_object_candidates<D: SolverDelegate>(
     let matching_trait_ids: Vec<DefId> = {
         let ctx = ecx.ctx();
         if let TypeData::DynTrait { traits, .. } = ctx.get(resolved.self_ty) {
-            traits.iter().filter(|&&t| t == resolved.trait_id).copied().collect()
+            traits
+                .iter()
+                .filter(|&&t| t == resolved.trait_id)
+                .copied()
+                .collect()
         } else {
             return;
         }
@@ -668,7 +691,9 @@ fn winnow(
     }
 
     // Sort by specificity: concrete > generic, impl > param > builtin
-    candidates.vec.sort_by(|a, b| specificity(ctx, trait_env, a, b));
+    candidates
+        .vec
+        .sort_by(|a, b| specificity(ctx, trait_env, a, b));
 
     // Keep only the most specific ones
     let mut i = 1;

@@ -14,8 +14,8 @@
 //!   by Rust's `DepGraph` for implicit task deps.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use rustc_hash::FxHashSet as HashSet;
 
@@ -41,7 +41,10 @@ pub struct TaskDeps {
 
 impl TaskDeps {
     pub fn new(current_node: DepNodeIndex) -> Self {
-        TaskDeps { current_node, reads: HashSet::default() }
+        TaskDeps {
+            current_node,
+            reads: HashSet::default(),
+        }
     }
 
     pub fn read(&mut self, other: DepNodeIndex) {
@@ -206,7 +209,9 @@ impl DepGraph {
 }
 
 impl Default for DepGraph {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
