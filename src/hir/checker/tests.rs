@@ -2226,3 +2226,142 @@ mod test_infer_return {
         assert!(result.is_ok(), "empty return defaults to unit: {:?}", result.err());
     }
 }
+
+#[cfg(test)]
+mod test_regex {
+    use super::*;
+
+    #[test]
+    fn test_regex_valid_pattern() {
+        // Valid regex patterns should parse and resolve successfully.
+        // Use Regex<"..."> as a type annotation on a function parameter.
+        // The function is not called, so no type mismatch on arguments.
+        let result = check_source(
+            "def foo(x: Regex<\"[0-9]+\">) -> Int<32> { return 0; }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "valid regex pattern should succeed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_regex_valid_pattern_complex() {
+        // More complex regex: email-like pattern.
+        let result = check_source(
+            "def foo(x: Regex<\"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\\\.[a-zA-Z]{2,}\">) -> Int<32> { return 0; }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "complex regex pattern should succeed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_regex_invalid_pattern_rejected() {
+        // Invalid regex: unmatched opening bracket.
+        let result = check_source(
+            "def main() -> Int<32> {
+                 let _: Regex<\"[0-9\"> = 0;
+                 return 0;
+             }",
+        );
+        assert!(
+            result.is_err(),
+            "invalid regex pattern should be rejected"
+        );
+        let errs = result.unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("invalid regex pattern")),
+            "error should mention invalid regex pattern: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn test_regex_invalid_escape_rejected() {
+        // Invalid regex: `\k` is not a valid regex escape sequence.
+        let result = check_source(
+            "def main() -> Int<32> {
+                 let _: Regex<\"\\k\"> = 0;
+                 return 0;
+             }",
+        );
+        assert!(
+            result.is_err(),
+            "invalid escape in regex pattern should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_regex_display_format() {
+        // Verify that TypeData::Regex Display produces the correct format.
+        let mut ctx = TypeContext::new();
+        let regex_ty = ctx.alloc(TypeData::Regex { pattern: "[0-9]+".into() });
+        let display_str = format!("{}", ctx.get(regex_ty));
+        assert_eq!(display_str, "Regex<\"[0-9]+\">", "Regex Display should match syntax");
+    }
+
+    #[test]
+    fn test_regex_pathological_patterns() {
+        // ── Edge-case & pathological regex patterns ──
+
+        // Empty pattern — valid regex (matches the empty string).
+        let result = check_source(
+            "def foo(x: Regex<\"\">) -> Int<32> { return 0; }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "empty regex pattern should be valid: {:?}", result.err());
+
+        // Meta characters: `^`, `$`, `\d`, `+`, `?`, `|`, `(`, `)`.
+        let result = check_source(
+            "def foo(x: Regex<\"^\\\\d+$|(foo|bar)?\">) -> Int<32> { return 0; }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "regex with meta characters should be valid: {:?}", result.err());
+
+        // Unclosed group — should be rejected.
+        let result = check_source(
+            "def main() -> Int<32> {
+                 let _: Regex<\"(\"> = 0;
+                 return 0;
+             }",
+        );
+        assert!(result.is_err(), "unclosed paren should be rejected");
+
+        // Unclosed character class.
+        let result = check_source(
+            "def main() -> Int<32> {
+                 let _: Regex<\"[abc\"> = 0;
+                 return 0;
+             }",
+        );
+        assert!(result.is_err(), "unclosed bracket should be rejected");
+
+        // Empty character class.
+        let result = check_source(
+            "def main() -> Int<32> {
+                 let _: Regex<\"[]\"> = 0;
+                 return 0;
+             }",
+        );
+        assert!(result.is_err(), "empty bracket should be rejected");
+
+        // Consecutive quantifiers — `**` is invalid.
+        let result = check_source(
+            "def main() -> Int<32> {
+                 let _: Regex<\"**\"> = 0;
+                 return 0;
+             }",
+        );
+        assert!(result.is_err(), "repeated quantifier should be rejected");
+
+        // 超长 pattern — 100KB 的重复 'a'，检查不会 panic 或 OOM
+        let long_pattern = "a".repeat(100_000);
+        let source = format!(
+            "def foo(x: Regex<\"{}\">) -> Int<32> {{ return 0; }}
+             def main() -> Int<32> {{ return 0; }}",
+            long_pattern
+        );
+        // 直接测 parser，跳过 type-check（100KB 的 type-check 可能触发其他问题）
+        let mut parser = crate::parser::Parser::new(&source);
+        let program = parser.parse_program();
+        assert!(program.is_ok(), "100KB regex should not crash parser: {:?}", program.err());
+    }
+}

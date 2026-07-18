@@ -8,6 +8,7 @@ use crate::hir::symbol::*;
 use crate::hir::traits::{ImplCandidate, TraitEnv};
 use crate::symbol::Symbol;
 use rustc_hash::FxHashMap;
+use regex_syntax;
 
 /// Represents the result of partially resolving a multi-segment path
 /// (e.g. `Foo::bar::Baz` where only `Foo` is known at resolver time).
@@ -1637,6 +1638,18 @@ impl<'a> NameResolver<'a> {
             Type::Union(tys, ..) => self.ctx.error(),
             Type::Error(..) => self.ctx.error(),
             Type::Expr(expr, ..) => self.resolve_expr(expr).unwrap_or(self.ctx.error()),
+            Type::Regex(pattern, _) => {
+                // Pattern validated by the parser at parse time.  `Type::Regex` is
+                // only constructed by the parser — there is no macro expansion or
+                // deserialization path that produces `ast::Type::Regex` nodes.
+                // The `debug_assert!` below is a safety net for debug builds only.
+                debug_assert!(
+                    regex_syntax::parse(pattern).is_ok(),
+                    "Regex pattern should have been validated at parse time: {}",
+                    pattern,
+                );
+                self.ctx.regex(pattern.clone())
+            }
         }
     }
 

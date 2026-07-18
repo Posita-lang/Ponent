@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use crate::ast::OverflowPolicy;
 use crate::symbol::Symbol;
 use std::cmp::Ordering;
+use std::fmt;
 
 /// Global atomic counter for DefId allocation.
 /// Used by `SymbolTable::allocate_def_id()` to ensure globally unique DefId
@@ -94,11 +95,10 @@ pub enum TypeTag {
     /// rather than separate `Struct`/`Enum` variants.
     Adt = 28,
     SkolemVar = 29,
-    /// Reserved discriminant 30 — ensures every 5-bit value maps to a valid
-    /// variant, preventing UB in `transmute<usize, TypeTag>` if a corrupt or
-    /// adversarially-constructed `TypeId` carries tag value 30.
-    #[doc(hidden)]
-    Reserved30 = 30,
+    /// A compile-time validated regular expression: `Regex<"pattern">`.
+    /// Replaces the old `Reserved30` slot — the last valid discriminant is
+    /// now `Regex = 30`; only `Reserved31 = 31` remains as a padding variant.
+    Regex = 30,
     /// Reserved discriminant 31 — same rationale as `Reserved30`; covers the
     /// remaining bit pattern so all 32 values of the 5-bit tag field are safe.
     #[doc(hidden)]
@@ -138,6 +138,7 @@ impl From<&TypeData> for TypeTag {
             TypeData::Never => TypeTag::Never,
             TypeData::Unit => TypeTag::Unit,
             TypeData::Error => TypeTag::Error,
+            TypeData::Regex { .. } => TypeTag::Regex,
         }
     }
 }
@@ -150,9 +151,9 @@ impl TypeId {
     const TAG_MASK: usize = (1 << Self::TAG_BITS) - 1;
     /// The last valid discriminant value (not the mask — those differ when
     /// reserved variants fill the gap to the bit boundary).  Set to the
-    /// highest *real* variant; `Reserved30`/`Reserved31` exist only to make
-    /// every 5-bit pattern a valid `TypeTag` for transmute safety.
-    const TAG_LAST_VARIANT: usize = TypeTag::SkolemVar as usize;
+    /// highest *real* variant; `Reserved31` exists only to make every 5-bit
+    /// pattern a valid `TypeTag` for transmute safety.
+    const TAG_LAST_VARIANT: usize = TypeTag::Regex as usize;
     /// Bounds check: every valid tag must be ≤ `TAG_LAST_VARIANT`.
     const TAG_MAX: usize = Self::TAG_LAST_VARIANT;
 
@@ -377,6 +378,18 @@ pub enum TypeData {
     Never,
     Unit,
     Error,
+    /// A compile-time validated regular expression pattern: `Regex<"pattern">`.
+    Regex { pattern: String },
+}
+
+impl fmt::Display for TypeData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TypeData::Regex { pattern } => write!(f, "Regex<\"{}\">", pattern),
+            // All other variants use Debug output.
+            other => write!(f, "{:?}", other),
+        }
+    }
 }
 
 /// Distinguishes between struct and enum ADT kinds (rustc-style).
@@ -597,6 +610,7 @@ impl TypeContext {
             | TypeData::Never
             | TypeData::Error
             | TypeData::Rational { .. }
+            | TypeData::Regex { .. }
             | TypeData::GenericParam { .. } => false,
             // Composite types: check each child TypeId
             TypeData::Fn { params, ret } => {
@@ -824,6 +838,21 @@ impl TypeContext {
 
     pub fn bool(&self) -> TypeId {
         self.builtin_bool
+    }
+
+    /// Create a compile-time validated regex type.
+    /// All `Regex` types must go through this constructor — it is the single
+    /// chokepoint for pattern validation, covering parser, resolver, and
+    /// any future deserialization path.  The parser also validates the
+    /// pattern before emitting `Type::Regex`, so this `debug_assert!` is
+    /// a safety net for debug builds only.
+    pub fn regex(&mut self, pattern: String) -> TypeId {
+        debug_assert!(
+            regex_syntax::parse(&pattern).is_ok(),
+            "Regex pattern must be valid: {}",
+            pattern,
+        );
+        self.alloc(TypeData::Regex { pattern })
     }
 
     pub fn char(&self) -> TypeId {
@@ -1738,6 +1767,7 @@ impl TypeContext {
             | TypeData::Never
             | TypeData::Unit
             | TypeData::Error
+            | TypeData::Regex { .. }
             | TypeData::DynTrait { .. }
             | TypeData::SkolemVar { .. } => false,
         }
@@ -3062,6 +3092,7 @@ impl TypeContext {
             | TypeData::Never
             | TypeData::Unit
             | TypeData::Error
+            | TypeData::Regex { .. }
             | TypeData::SkolemVar { .. } => 1,
         }
     }
@@ -3116,6 +3147,55 @@ impl TypeContext {
 
     pub fn is_rational(&self, ty: TypeId) -> bool {
         matches!(self.get(ty), TypeData::Rational { .. })
+    }
+
+    /// Recursively check whether `ty` or any of its children contains a
+    /// `Regex` type.  Used to enforce the rule that `Regex` types cannot
+    /// appear in contracts (SYNTAX.md §Compile-Time Regular Expressions).
+    pub fn contains_regex(&self, ty: TypeId) -> bool {
+        let resolved = self.resolve_binding(ty);
+        match self.get(resolved) {
+            TypeData::Regex { .. } => true,
+            // Composite types: recurse into children.
+            TypeData::Adt { args, .. } => args.iter().any(|&a| self.contains_regex(a)),
+            TypeData::Tuple { elems } => elems.iter().any(|&e| self.contains_regex(e)),
+            TypeData::Coproduct { alternatives } => {
+                alternatives.iter().any(|&a| self.contains_regex(a))
+            }
+            TypeData::Array { elem, .. } => self.contains_regex(*elem),
+            TypeData::Slice { elem } => self.contains_regex(*elem),
+            TypeData::Ref { ty, .. } => self.contains_regex(*ty),
+            TypeData::Pointer { ty } => self.contains_regex(*ty),
+            TypeData::Ptr { size, pointee } => {
+                self.contains_regex(*size) || self.contains_regex(*pointee)
+            }
+            TypeData::Fn { params, ret } => {
+                params.iter().any(|&p| self.contains_regex(p))
+                    || self.contains_regex(*ret)
+            }
+            TypeData::Poly { body, .. } => self.contains_regex(*body),
+            TypeData::Exists { base, .. } => self.contains_regex(*base),
+            TypeData::Forall { body, .. }
+            | TypeData::Mu { body, .. }
+            | TypeData::Nu { body, .. } => self.contains_regex(*body),
+            TypeData::AssociatedType { self_ty, .. } => self.contains_regex(*self_ty),
+            // Leaf types — no children, no Regex.
+            TypeData::Int { .. }
+            | TypeData::UInt { .. }
+            | TypeData::Float { .. }
+            | TypeData::Rational { .. }
+            | TypeData::Bool
+            | TypeData::Char
+            | TypeData::Byte
+            | TypeData::USize
+            | TypeData::Never
+            | TypeData::Unit
+            | TypeData::Error
+            | TypeData::GenericParam { .. }
+            | TypeData::InferVar { .. }
+            | TypeData::DynTrait { .. }
+            | TypeData::SkolemVar { .. } => false,
+        }
     }
 
     pub fn bits_of_rational_int(&self, ty: TypeId) -> Option<u8> {

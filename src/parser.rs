@@ -2,6 +2,7 @@ use crate::ast::*;
 use crate::diagnostics::Diagnostic;
 use crate::lexer::Token;
 use crate::symbol::Symbol;
+use regex_syntax;
 
 // ── Track‑A (Engineering Canon) ──────────────────────────────────────────────
 // Keyword-as-identifier policy (see `Token::as_ident_symbol` in lexer.rs):
@@ -84,6 +85,15 @@ bitflags! {
 struct SpannedToken {
     token: Token,
     span: Span,
+}
+
+/// A snapshot of the parser's token-stream state for backtracking.
+/// Created by [`Parser::checkpoint`] and restored by [`Parser::restore`].
+/// Inspired by rustc's `Parser::checkpoint` / `Parser::rewind`.
+struct Checkpoint {
+    cursor: usize,
+    peeked: Option<Result<Token, ()>>,
+    pending: Vec<Token>,
 }
 
 pub struct Parser {
@@ -445,6 +455,75 @@ impl Parser {
         let result = f(self);
         self.restrictions = old;
         result
+    }
+
+    // ── Checkpoint-based backtracking ─────────────────────────────────
+    //
+    // Eliminates the manual save/restore of `cursor`, `peeked`, `pending`
+    // that was previously scattered across the parser.  Each manual
+    // backtracking site had to save three fields, remember to restore them
+    // on every exit path, and get the ordering right — a rich source of
+    // bugs that are hard to spot in review.
+    //
+    // The Checkpoint approach is inspired by rustc's `Parser::checkpoint`
+    // and `Parser::rewind` (compiler/rustc_parse/src/parser/mod.rs).
+
+    /// Save the current parser state for potential backtracking.
+    fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            cursor: self.cursor,
+            peeked: self.peeked.clone(),
+            pending: self.pending.clone(),
+        }
+    }
+
+    /// Restore the parser to a previously saved checkpoint.
+    /// Reverts `cursor`, `peeked`, `pending` to the values they had
+    /// when `checkpoint()` was called.
+    fn restore(&mut self, cp: &Checkpoint) {
+        self.cursor = cp.cursor;
+        self.peeked = cp.peeked.clone();
+        self.pending = cp.pending.clone();
+    }
+
+    /// Try parsing with `f`.  If `f` succeeds, keep the result and the
+    /// advanced parser state.  If `f` fails, restore the parser state
+    /// to before `f` was called and return the error.
+    ///
+    /// This is useful for speculative parsing where you want to attempt
+    /// one interpretation and fall back to another if it fails.
+    fn try_parse<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, Diagnostic>,
+    ) -> Result<T, Diagnostic> {
+        let cp = self.checkpoint();
+        match f(self) {
+            Ok(val) => Ok(val),
+            Err(e) => {
+                self.restore(&cp);
+                Err(e)
+            }
+        }
+    }
+
+    /// Try parsing with `f`.  If `f` succeeds, keep the result.  If `f`
+    /// fails, restore the parser state and call `fallback` instead.
+    ///
+    /// This is the primary pattern for ambiguous constructs: try one
+    /// interpretation, and if it doesn't work, try the other.
+    fn try_parse_or<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, Diagnostic>,
+        fallback: impl FnOnce(&mut Self) -> Result<T, Diagnostic>,
+    ) -> Result<T, Diagnostic> {
+        let cp = self.checkpoint();
+        match f(self) {
+            Ok(val) => Ok(val),
+            Err(_) => {
+                self.restore(&cp);
+                fallback(self)
+            }
+        }
     }
 
     fn keyword_to_ident(&self, tok: &Token) -> Option<Symbol> {
@@ -1524,6 +1603,46 @@ impl Parser {
             }
             _ => match self.advance() {
                 Ok(Token::Ident(name)) => {
+                    // Special case: `Regex<"pattern">` — compile-time regex type.
+                    if name.eq_str("Regex") && matches!(self.peek(), Ok(Token::Lt)) {
+                        self.advance().ok(); // consume <
+                        let pattern = match self.advance() {
+                            Ok(Token::StringLiteral(Ok(s))) => s,
+                            Ok(Token::StringLiteral(Err(e))) => {
+                                return Err(Diagnostic::error(format!("invalid string literal in regex pattern: {}", e))
+                                    .with_code_str("E004")
+                                    .with_span(self.span(),));
+                            }
+                            Ok(tok) => {
+                                return Err(Diagnostic::error(format!(
+                                    "expected string literal as regex pattern, found {:?}", tok
+                                ))
+                                .with_code_str("E004")
+                                .with_help("`Regex<\"...\">` requires a string literal pattern — e.g. `Regex<\"[0-9]+\">`")
+                                .with_suggestion("use a string literal like `\"[0-9a-fA-F]+\"` as the regex pattern")
+                                .with_span(self.span(),));
+                            }
+                            Err(()) => {
+                                return Err(Diagnostic::error("unexpected end of file in regex pattern")
+                                    .with_code_str("E002")
+                                    .with_help("expected a string literal pattern after `<` in `Regex<\"...\">`")
+                                    .with_suggestion("add a string literal pattern, e.g. `Regex<\"[0-9]+\">`")
+                                    .with_span(self.span(),));
+                            }
+                        };
+                        // Validate the regex pattern at compile time (SYNTAX.md §Compile-Time Regular Expressions).
+                        if let Err(e) = regex_syntax::parse(&pattern) {
+                            return Err(Diagnostic::error(format!("invalid regex pattern: {}", e))
+                                .with_code_str("E004")
+                                .with_help("`Regex<\"...\">` requires a valid regular expression pattern")
+                                .with_suggestion("check the regex syntax — see https://docs.rs/regex/latest/regex/#syntax")
+                                .with_span(self.span(),));
+                        }
+                        self.expect(Token::Gt)?;
+                        let end = self.span().end;
+                        return Ok(Type::Regex(pattern, Span::new(start, end)));
+                    }
+
                     let mut path = vec![name];
                     while matches!(self.peek(), Ok(Token::ColonColon)) {
                         self.advance().ok();
@@ -1541,11 +1660,6 @@ impl Parser {
                         self.advance().ok();
                         let mut args = Vec::new();
                         loop {
-                            // Save state BEFORE check_const_arg / parse_type,
-                            // since both may advance the cursor via peek().
-                            let cp_cursor = self.cursor;
-                            let cp_peeked = self.peeked.clone();
-                            let cp_pending = self.pending.clone();
                             // Rustc-style pre-check: if the token definitively starts a const
                             // expression, parse it directly without any type-first attempt.
                             let arg = if matches!(self.peek(), Ok(Token::Ident(_)))
@@ -1578,13 +1692,19 @@ impl Parser {
                                 let span = expr.span();
                                 GenericArg::Positional(Type::Expr(Box::new(expr), span))
                             } else {
-                                // Ambiguous case (typically an Ident that could be a type name
-                                // or a const variable). Try type first, backtrack if an
-                                // expression-only operator follows.
+                                // Ambiguous case (typically an Ident that could be a type
+                                // name or a const variable).  Try type first; if the type
+                                // parses but the next token is an expression-only operator,
+                                // or if the type parse fails outright, backtrack and
+                                // re-parse as an expression.
+                                let cp = self.checkpoint();
                                 match self.parse_type() {
                                     Ok(ty) => {
+                                        // Post-parse check: is the token after the type an
+                                        // expression-only operator?  If so, the type was
+                                        // probably an expression — backtrack and re-parse.
                                         // Only backtrack on Shr after Ident if the token
-                                        // AFTER Shr could start an expression. This avoids
+                                        // AFTER Shr could start an expression.  This avoids
                                         // false positives on nested generic closing `>>`
                                         // like `Bar<Baz>>` where `Baz` is an Ident followed
                                         // by two closing brackets, not a right-shift.
@@ -1600,38 +1720,38 @@ impl Parser {
                                                 | Some(Token::LParen) | Some(Token::LBracket)
                                                 | Some(Token::Minus) | Some(Token::Plus)
                                                 | Some(Token::Bang) | Some(Token::Tilde));
-                                        let next_is_expr_op = next_is_shr
+                                        if next_is_shr
                                             || matches!(self.peek(),
                                                 Ok(Token::Plus) | Ok(Token::Minus)
                                                 | Ok(Token::Star) | Ok(Token::Slash) | Ok(Token::Percent)
                                                 | Ok(Token::Shl) | Ok(Token::Ampersand)
                                                 | Ok(Token::Pipe) | Ok(Token::Caret)
                                                 | Ok(Token::LParen) | Ok(Token::LBracket)
-                                                | Ok(Token::Dot) | Ok(Token::Apostrophe));
-                                        if next_is_expr_op {
-                                            self.cursor = cp_cursor;
-                                            self.peeked = cp_peeked;
-                                            self.pending = cp_pending;
+                                                | Ok(Token::Dot) | Ok(Token::Apostrophe))
+                                        {
+                                            // The next token is an expression-only operator,
+                                            // so the preceding token must be an expression.
+                                            self.restore(&cp);
                                             let expr = self.with_restrictions(
                                                 ParseRestrictions::NO_COMPARISON,
                                                 |this| this.parse_expr(),
                                             )?;
                                             let span = expr.span();
-                                            GenericArg::Positional(Type::Expr(Box::new(expr), span))
+                                            GenericArg::Positional(
+                                                Type::Expr(Box::new(expr), span))
                                         } else {
                                             GenericArg::Positional(ty)
                                         }
                                     }
                                     Err(_) => {
-                                        self.cursor = cp_cursor;
-                                        self.peeked = cp_peeked;
-                                        self.pending = cp_pending;
+                                        self.restore(&cp);
                                         let expr = self.with_restrictions(
                                             ParseRestrictions::NO_COMPARISON,
                                             |this| this.parse_expr(),
                                         )?;
                                         let span = expr.span();
-                                        GenericArg::Positional(Type::Expr(Box::new(expr), span))
+                                        GenericArg::Positional(
+                                            Type::Expr(Box::new(expr), span))
                                     }
                                 }
                             };

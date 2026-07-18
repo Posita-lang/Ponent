@@ -640,6 +640,8 @@ pub enum Type {
     /// A constant expression where a type is expected, e.g. array sizes
     /// `[Int<32>; N + 1]` or generic const args `<Array<Int, N>>`.
     Expr(Box<Expr>, Span),
+    /// A compile-time validated regular expression: `Regex<"pattern">`.
+    Regex(String, Span),
     Error(Span),
 }
 
@@ -734,6 +736,7 @@ impl Type {
             | Type::Never(span)
             | Type::Union(_, span)
             | Type::Expr(_, span)
+            | Type::Regex(_, span)
             | Type::Error(span) => *span,
             Type::Generic(_, _, span) => *span,
         }

@@ -1965,6 +1965,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 }
             }
             Type::Error(_) => Ok(self.checker.ctx.error()),
+            Type::Regex(pattern, _) => Ok(self.checker.ctx.regex(pattern.clone())),
             Type::Expr(expr, span) => {
                 let (_, ty) = self.infer_expr(expr)?;
                 Ok(ty)

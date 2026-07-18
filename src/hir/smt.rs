@@ -378,6 +378,9 @@ impl SmtSolver {
                 }
             }
             TypeData::SkolemVar { .. } => "type-unknown".to_string(),
+            // Regex types cannot appear in contracts (SYNTAX.md §Compile-Time Regular Expressions).
+            // SMT solvers have limited string theory, so we don't encode them.
+            TypeData::Regex { .. } => "type-unknown".into(),
         }
     }
 }

@@ -3447,7 +3447,8 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
         // invariant assertion (e.g. in `TypeContext::poly()`) would catch
         // such violations at the construction site rather than silently
         // propagating them.
-        | TypeData::Poly { .. } => ty,
+        | TypeData::Poly { .. }
+        | TypeData::Regex { .. } => ty,
         TypeData::GenericParam { .. } => ty,
         TypeData::Adt { kind, def_id, args } => {
             let new_args: Vec<TypeId> = args

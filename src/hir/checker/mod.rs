@@ -1351,7 +1351,18 @@ impl<'a> TypeChecker<'a> {
                     match contract {
                         Contract::Requires(expr, cspan) | Contract::Invariant(expr, cspan) => {
                             let (_, ty) = self.infer_expr(expr)?;
-                            if !self.ctx.is_bool(ty) {
+                            // Regex types cannot appear in contracts (SYNTAX.md).
+                            if self.ctx.contains_regex(ty) {
+                                self.diagnostics.push(
+                                    Diagnostic::error(
+                                        "Regex types cannot appear in contracts; they are for runtime use only",
+                                    )
+                                    .with_code_str("E030")
+                                    .with_span(*cspan)
+                                    .with_help("use a boolean predicate instead of a Regex type")
+                                    .with_suggestion("replace the Regex type with a compatible boolean expression"),
+                                );
+                            } else if !self.ctx.is_bool(ty) {
                                 self.diagnostics.push(
                                     Diagnostic::error("contract condition must be boolean")
                                         .with_code_str("E020")
@@ -1367,7 +1378,18 @@ impl<'a> TypeChecker<'a> {
                             expr, span: cspan, ..
                         } => {
                             let (_, ty) = self.infer_expr(expr)?;
-                            if !self.ctx.is_bool(ty) {
+                            // Regex types cannot appear in contracts (SYNTAX.md).
+                            if self.ctx.contains_regex(ty) {
+                                self.diagnostics.push(
+                                    Diagnostic::error(
+                                        "Regex types cannot appear in contracts; they are for runtime use only",
+                                    )
+                                    .with_code_str("E030")
+                                    .with_span(*cspan)
+                                    .with_help("use a boolean predicate instead of a Regex type")
+                                    .with_suggestion("replace the Regex type with a compatible boolean expression"),
+                                );
+                            } else if !self.ctx.is_bool(ty) {
                                 self.diagnostics.push(
                                     Diagnostic::error("ensures clause must be boolean")
                                         .with_code_str("E020")
