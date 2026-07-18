@@ -62,7 +62,16 @@ fn main() {
     let cli = cli::Cli::parse();
     match cli.command {
         cli::Command::Lex { file } => {
-            let source = fs::read_to_string(&file).expect("failed to read file");
+            let source = match fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    let mut diag = Diagnostic::error(format!("failed to read `{}`: {}", file, e));
+                    diag.source = Some(file.clone());
+                    let mut emitter = ColoredEmitter::new();
+                    emitter.emit(&diag);
+                    process::exit(1);
+                }
+            };
             let lexer = lexer::Token::lexer(&source);
             for result in lexer {
                 match result {
@@ -76,7 +85,16 @@ fn main() {
             }
         }
         cli::Command::Parse { file, ast, json } => {
-            let source = fs::read_to_string(&file).expect("failed to read file");
+            let source = match fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    let mut diag = Diagnostic::error(format!("failed to read `{}`: {}", file, e));
+                    diag.source = Some(file.clone());
+                    let mut emitter = make_emitter(json);
+                    emitter.emit(&diag);
+                    process::exit(1);
+                }
+            };
             let mut parser = parser::Parser::new(&source);
             match parser.parse_program() {
                 Ok(program) => {
