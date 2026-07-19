@@ -368,7 +368,7 @@ impl CycleHeads {
 /// cycle detection, caching, and fixpoint iteration.
 #[derive(Debug, Clone)]
 pub(crate) struct StackEntry {
-    key: GoalKey,
+    pub(crate) key: GoalKey,
     step_kind_from_parent: PathKind,
     available_depth: AvailableDepth,
     min_reached_available_depth: AvailableDepth,

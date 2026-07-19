@@ -57,13 +57,28 @@ pub struct Guarantee {
     pub post: Predicate,
     /// The set of types / memory regions that are guaranteed to be preserved.
     pub frame: Option<TypeId>,
+    /// Original AST expression of the ensures clause, used for the
+    /// semantic-equivalence fast path.  `None` if the fast path is not
+    /// applicable (e.g. non-trivial ensures).
+    pub ast_expr: Option<Box<crate::ast::Expr>>,
 }
 
 impl Guarantee {
     /// Construct a guarantee from explicit pre/post predicates and an
     /// optional frame type.
     pub fn new(pre: Predicate, post: Predicate, frame: Option<TypeId>) -> Self {
-        Guarantee { pre, post, frame }
+        Guarantee { pre, post, frame, ast_expr: None }
+    }
+
+    /// Construct a guarantee with an optional AST expression for the
+    /// semantic-equivalence fast path.
+    pub fn new_with_expr(
+        pre: Predicate,
+        post: Predicate,
+        frame: Option<TypeId>,
+        ast_expr: Option<Box<crate::ast::Expr>>,
+    ) -> Self {
+        Guarantee { pre, post, frame, ast_expr }
     }
 
     /// The identity guarantee: S = S′ (no effect).
@@ -72,6 +87,7 @@ impl Guarantee {
             pre: Predicate::True,
             post: Predicate::True,
             frame,
+            ast_expr: None,
         }
     }
 
@@ -82,6 +98,7 @@ impl Guarantee {
             pre: Predicate::True,
             post: Predicate::False,
             frame,
+            ast_expr: None,
         }
     }
 

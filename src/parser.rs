@@ -621,6 +621,7 @@ impl Parser {
             Token::NoAllocError => Some(Symbol::intern("no_alloc_error")),
             Token::NoPanic => Some(Symbol::intern("no_panic")),
             Token::DebugInfo => Some(Symbol::intern("debug_info")),
+            Token::IeeeContracts => Some(Symbol::intern("ieee_contracts")),
             Token::Old => Some(Symbol::intern("old")),
             Token::AuditLog => Some(Symbol::intern("audit_log")),
             Token::Interrupt => Some(Symbol::intern("interrupt")),

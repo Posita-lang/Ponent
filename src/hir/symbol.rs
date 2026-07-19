@@ -416,6 +416,17 @@ impl SymbolTable {
         self.trait_defs.get(&def_id)
     }
 
+    /// Look up the name (Symbol) of a trait by its DefId.
+    /// Performs a reverse lookup through all scopes' `traits` maps.
+    pub fn trait_name_by_def_id(&self, def_id: DefId) -> Option<Symbol> {
+        for scope in self.scopes.iter().rev() {
+            if let Some((name, _)) = scope.traits.iter().find(|(_, binding)| binding.def_id == def_id) {
+                return Some(*name);
+            }
+        }
+        None
+    }
+
     /// Expose the full-path-to-DefId table for multi-segment lookups.
     pub fn full_path_to_def_id(&self) -> &HashMap<Symbol, DefId> {
         &self.full_path_to_def_id

@@ -261,12 +261,16 @@ impl std::fmt::Display for SolveError {
             } => {
                 write!(
                     f,
-                    "trait impl not found for trait={:?} on type={:?}",
-                    trait_id, self_ty
+                    "trait impl not found for trait={} on type={}",
+                    trait_id.0, self_ty.raw()
                 )
             }
-            SolveError::Ambiguous { num_candidates, .. } => {
-                write!(f, "ambiguous trait impl ({} candidates)", num_candidates)
+            SolveError::Ambiguous { num_candidates, trait_id, self_ty, .. } => {
+                if *num_candidates == 0 {
+                    write!(f, "no trait implementation found for trait={} on type={}", trait_id.0, self_ty.raw())
+                } else {
+                    write!(f, "ambiguous trait impl ({} candidates)", num_candidates)
+                }
             }
             SolveError::Overflow { depth, .. } => {
                 write!(f, "trait resolution overflow at depth {}", depth)

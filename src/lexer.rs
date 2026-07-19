@@ -407,6 +407,8 @@ pub enum Token {
     NoPanic,
     #[token("debug_info")]
     DebugInfo,
+    #[token("ieee_contracts")]
+    IeeeContracts,
     #[token("old")]
     Old,
     #[token("audit_log")]
@@ -771,6 +773,7 @@ impl Token {
             Token::NoAllocError => "`no_alloc_error`".to_string(),
             Token::NoPanic => "`no_panic`".to_string(),
             Token::DebugInfo => "`debug_info`".to_string(),
+            Token::IeeeContracts => "`ieee_contracts`".to_string(),
             Token::AuditLog => "`audit_log`".to_string(),
             Token::Interrupt => "`interrupt`".to_string(),
             Token::MustUse => "`must_use`".to_string(),
@@ -996,7 +999,7 @@ mod tests {
     #[test]
     fn more_keywords() {
         check_tokens(
-            "and or not sizeof alignof catch panic unsafe let finally where requires ensures invariant constraint move dyn by copy ref mut wrap saturate trap Self no_default extern pub edition deprecated experimental endian bit_order align pad packed async await task channel linear consume pure io trusted ghost scope_cleanup trigger validate missing_match apply_lemma exists forall on on_timeout on_cancel trait impl decreases terminates cfg isolate hint must_use must_handle link_proof exhaustive no_alloc_error no_panic debug_info old audit_log interrupt round trunc ceil floor propagates overrides",
+            "and or not sizeof alignof catch panic unsafe let finally where requires ensures invariant constraint move dyn by copy ref mut wrap saturate trap Self no_default extern pub edition deprecated experimental endian bit_order align pad packed async await task channel linear consume pure io trusted ghost scope_cleanup trigger validate missing_match apply_lemma exists forall on on_timeout on_cancel trait impl decreases terminates cfg isolate hint must_use must_handle link_proof exhaustive no_alloc_error no_panic debug_info ieee_contracts old audit_log interrupt round trunc ceil floor propagates overrides",
             vec![
                 Token::And,
                 Token::Or,
@@ -1068,6 +1071,7 @@ mod tests {
                 Token::NoAllocError,
                 Token::NoPanic,
                 Token::DebugInfo,
+                Token::IeeeContracts,
                 Token::Old,
                 Token::AuditLog,
                 Token::Interrupt,

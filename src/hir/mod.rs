@@ -1,4 +1,4 @@
-mod checker;
+pub mod checker;
 mod comptime;
 mod generate;
 mod hir;
@@ -16,7 +16,6 @@ pub mod visit;
 #[cfg(debug_assertions)]
 pub mod anya;
 
-pub use checker::*;
 pub use comptime::*;
 pub use generate::*;
 pub use hir::*;
