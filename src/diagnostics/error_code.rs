@@ -388,7 +388,7 @@ Example:
     ensures x * 2  // error
   { return x; }
 
-Fix: `ensures result > 0` or another boolean predicate."
+Fix: `ensures codomain > 0` or another boolean predicate."
             }
 
             Self::DecreasesNonInt => {

@@ -394,6 +394,9 @@ pub enum Stmt {
     },
     Return {
         value: Option<Expr>,
+        /// Path labels attached to this return: `return @label1 @label2 expr`.
+        /// Used to match specific return paths to `ensures @label` clauses.
+        labels: Vec<Symbol>,
         span: Span,
     },
     Assign {
@@ -700,6 +703,10 @@ pub enum Contract {
         expr: Expr,
         span: Span,
         target: EnsuresTarget,
+        /// Path labels referenced in this ensures clause: `ensures @label expr`.
+        /// Each label acts as a placeholder for the value returned on paths
+        /// marked with that label.
+        labels: Vec<Symbol>,
     },
     Invariant(Expr, Span),
     Decreases(Expr, Span),

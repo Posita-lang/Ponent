@@ -900,12 +900,20 @@ impl<'a> TypeChecker<'a> {
                 guard
                     .checker
                     .local_variable_types
-                    .insert(Symbol::intern("result"), return_ty);
+                    .insert(Symbol::intern("codomain"), return_ty);
 
                 // SCAP: collect ensures conditions into the guarantee chain.
                 // Each `ensures` becomes a postcondition that must hold at return.
                 for contract in contracts {
                     if let Contract::Ensures { expr, .. } = contract {
+                        let expr_labels = extract_labels_from_expr(expr);
+                        // Inject each label as a scoped variable with the
+                        // return type, so that the expression can reference
+                        // `@label` as a placeholder for the return value.
+                        for label in &expr_labels {
+                            guard.checker.local_variable_types
+                                .insert(*label, return_ty);
+                        }
                         let (_, ensures_ty) = guard
                             .checker
                             .infer_expr(expr)
@@ -1162,14 +1170,133 @@ impl<'a> TypeChecker<'a> {
                 // infer var and report CannotInfer.
                 if return_type.is_none() {
                     if let Some(ref body_stmts) = body_hir {
-                        let has_return = body_stmts
-                            .iter()
-                            .any(|s| matches!(s, HirStmt::Return { .. }));
+                        // Recursively check for return statements inside nested
+                        // blocks (if, while, for, etc.) — not just top-level.
+                        fn has_return_recursive(stmts: &[HirStmt]) -> bool {
+                            for s in stmts {
+                                match s {
+                                    HirStmt::Return { .. } => return true,
+                                    HirStmt::If { then_branch, else_branch, .. } => {
+                                        if has_return_recursive(then_branch) {
+                                            return true;
+                                        }
+                                        if let Some(else_stmts) = else_branch {
+                                            if has_return_recursive(else_stmts) {
+                                                return true;
+                                            }
+                                        }
+                                    }
+                                    HirStmt::While { body, .. }
+                                    | HirStmt::WhileLet { body, .. }
+                                    | HirStmt::For { body, .. }
+                                    | HirStmt::Loop { body, .. } => {
+                                        if has_return_recursive(body) {
+                                            return true;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            false
+                        }
+                        let has_return = has_return_recursive(body_stmts);
                         if !has_return {
                             let _ = guard
                                 .checker
                                 .ctx
                                 .unify(return_ty, guard.checker.ctx.never());
+                        }
+                    }
+                }
+
+                // ── Validate path labels ──
+                // Every label referenced in `ensures @label expr` must appear on
+                // at least one `return @label` in the function body.  Labels that
+                // appear on return but are never referenced in ensures are allowed
+                // (they are simply ignored).  Labels that appear in ensures but
+                // never on any return are a compile-time error.
+                if let Some(ref body_stmts) = body_hir {
+                    // Collect all labels from ensures clauses (extracted from `@identifier`
+                    // references in the expression, e.g. `ensures @even % 2 == 0`).
+                    let ensures_labels: Vec<Symbol> = contracts.iter()
+                        .filter_map(|c| match c {
+                            Contract::Ensures { expr, .. } => {
+                                let labels = extract_labels_from_expr(expr);
+                                if labels.is_empty() { None } else { Some(labels) }
+                            }
+                            _ => None,
+                        })
+                        .flatten()
+                        .collect();
+                    if !ensures_labels.is_empty() {
+                        // Collect all labels from return statements in the body,
+                        // recursively walking nested blocks (if, while, for, etc.).
+                        fn collect_return_labels(stmts: &[HirStmt]) -> Vec<Symbol> {
+                            let mut labels = Vec::new();
+                            for s in stmts {
+                                match s {
+                                    HirStmt::Return { labels: l, .. } => {
+                                        labels.extend(l.iter().copied());
+                                    }
+                                    HirStmt::If { then_branch, else_branch, .. } => {
+                                        labels.extend(collect_return_labels(then_branch));
+                                        if let Some(else_stmts) = else_branch {
+                                            labels.extend(collect_return_labels(else_stmts));
+                                        }
+                                    }
+                                    HirStmt::While { body, .. }
+                                    | HirStmt::WhileLet { body, .. }
+                                    | HirStmt::For { body, .. }
+                                    | HirStmt::Loop { body, .. } => {
+                                        labels.extend(collect_return_labels(body));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            labels
+                        }
+                        let return_labels = collect_return_labels(body_stmts);
+                        // Check: every ensures label must appear on at least one return.
+                        for label in &ensures_labels {
+                            if !return_labels.contains(label) {
+                                guard.checker.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "label `@{}` used in `ensures` but never attached to a `return`",
+                                        label.as_str(),
+                                    ))
+                                    .with_code_str("E030")
+                                    .with_help("each label in `ensures @label` must have a matching `return @label`")
+                                    .with_suggestion(format!(
+                                        "add `return @{} <value>` to the function body, or remove `@{}` from the ensures clause",
+                                        label.as_str(), label.as_str(),
+                                    )),
+                                );
+                            }
+                        }
+                        // Check: every return label must have a matching ensures clause.
+                        //
+                        // TODO: Once reachability analysis (constant propagation +
+                        // SMT-based branch evaluation) is available, reduce this to
+                        // a warning for provably-unreachable return paths.  Currently
+                        // we conservatively error on all unlabeled returns, even if
+                        // the branch condition is statically determined (e.g.
+                        // `if true { return @s x; } else { return @r y; }` where
+                        // the else branch is dead code).
+                        for label in &return_labels {
+                            if !ensures_labels.contains(label) {
+                                guard.checker.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "label `@{}` attached to a `return` but never referenced in an `ensures` clause",
+                                        label.as_str(),
+                                    ))
+                                    .with_code_str("E030")
+                                    .with_help("each `return @label` must have a matching `ensures @label` clause")
+                                    .with_suggestion(format!(
+                                        "add `ensures @{} <property>` to the function's contracts, or remove `@{}` from the return statement",
+                                        label.as_str(), label.as_str(),
+                                    )),
+                                );
+                            }
                         }
                     }
                 }
@@ -1899,7 +2026,7 @@ impl<'a> TypeChecker<'a> {
                     }),
                 }
             }
-            Stmt::Return { value, span } => {
+            Stmt::Return { value, labels, span } => {
                 // Check if we're inside a comptime block — if so, return is comptime
                 // control flow, not a real function return.
                 let in_comptime = self
@@ -1968,12 +2095,14 @@ impl<'a> TypeChecker<'a> {
                         )?;
                         Ok(HirStmt::Return {
                             value: Some(Box::new(hir)),
+                            labels: labels.clone(),
                             span: *span,
                         })
                     } else {
                         let (hir, _) = self.infer_expr(value)?;
                         Ok(HirStmt::Return {
                             value: Some(Box::new(hir)),
+                            labels: labels.clone(),
                             span: *span,
                         })
                     }
@@ -1991,6 +2120,7 @@ impl<'a> TypeChecker<'a> {
                     }
                     Ok(HirStmt::Return {
                         value: None,
+                        labels: labels.clone(),
                         span: *span,
                     })
                 }
@@ -3884,6 +4014,54 @@ impl<'a> TypeChecker<'a> {
             }
             _ => format!("{:?}", ty),
         }
+    }
+}
+
+// ── Label extraction helpers ────────────────────────────────────
+// Extract `@identifier` labels from AST expressions.  These are
+// `Expr::Ident` with `@`-prefixed names, used in `ensures @label expr`
+// as placeholders for the return value on specific paths.
+
+fn extract_labels_from_expr(e: &Expr) -> Vec<Symbol> {
+    let mut labels = Vec::new();
+    match e {
+        Expr::Ident(name, _) if name.as_str().starts_with('@') => {
+            labels.push(*name);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            labels.extend(extract_labels_from_expr(left));
+            labels.extend(extract_labels_from_expr(right));
+        }
+        Expr::UnaryOp { expr, .. } => {
+            labels.extend(extract_labels_from_expr(expr));
+        }
+        Expr::Call { callee, args, .. } => {
+            labels.extend(extract_labels_from_expr(callee));
+            for arg in args {
+                labels.extend(extract_labels_from_expr(arg));
+            }
+        }
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            labels.extend(extract_labels_from_expr(cond));
+            for stmt in then_branch {
+                labels.extend(extract_labels_from_stmt(stmt));
+            }
+            if let Some(stmts) = else_branch {
+                for stmt in stmts {
+                    labels.extend(extract_labels_from_stmt(stmt));
+                }
+            }
+        }
+        _ => {}
+    }
+    labels
+}
+
+fn extract_labels_from_stmt(s: &Stmt) -> Vec<Symbol> {
+    match s {
+        Stmt::Expression(e) => extract_labels_from_expr(e),
+        Stmt::Return { value: Some(v), .. } => extract_labels_from_expr(v),
+        _ => Vec::new(),
     }
 }
 

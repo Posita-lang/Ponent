@@ -1402,6 +1402,7 @@ impl Parser {
                     expr,
                     span: Span::new(start, end),
                     target,
+                    labels: Vec::new(), // extracted from expr during type checking
                 })
             }
             Token::Invariant => {
@@ -2582,7 +2583,31 @@ impl Parser {
 
     fn parse_return_stmt(&mut self) -> Result<Stmt, Diagnostic> {
         let start = self.span().start;
-        self.advance().ok();
+        self.advance().ok(); // consume 'return'
+
+        // Parse optional path labels: `return @label1 @label2 expr`
+        let mut labels = Vec::new();
+        while matches!(self.peek(), Ok(Token::At)) {
+            self.advance().ok(); // consume @
+            match self.advance() {
+                Ok(Token::Ident(name)) => labels.push(Symbol::intern(&format!("@{}", name.as_str()))),
+                Ok(tok) => {
+                    return Err(Diagnostic::error(format!(
+                        "expected label name after `@`, found {:?}", tok
+                    ))
+                    .with_code_str("E004")
+                    .with_help("a path label must be an identifier: `@label_name`")
+                    .with_suggestion("write `return @even 4` instead of `return @ 4`")
+                    .with_span(self.span(),));
+                }
+                Err(()) => {
+                    return Err(Diagnostic::error("unexpected end of file after `@` in return label")
+                        .with_code_str("E002")
+                        .with_span(self.span(),));
+                }
+            }
+        }
+
         let value = if !matches!(self.peek(), Ok(Token::Semicolon) | Ok(Token::RBrace)) {
             Some(self.parse_expr()?)
         } else {
@@ -2592,6 +2617,7 @@ impl Parser {
         let end = self.span().end;
         Ok(Stmt::Return {
             value,
+            labels,
             span: Span::new(start, end),
         })
     }
@@ -4151,9 +4177,12 @@ impl Parser {
                     let end = self.span().end;
                     Ok(Expr::CompileError(msg, Span::new(start, end)))
                 } else {
-                    Err(Diagnostic::error(format!("unknown built-in `@{name}`"))
-                        .with_help("available built-ins: `@typeInfo!(Type)`")
-                        .with_span(self.span()))
+                    // `@identifier` — path label placeholder in expressions
+                    // (e.g. `ensures @even > 0`).  The `@` prefix distinguishes
+                    // label placeholders from regular variables.  The checker
+                    // validates that the label is attached to a `return`.
+                    let end = self.span().end;
+                    Ok(Expr::Ident(Symbol::intern(&format!("@{}", name.as_str())), Span::new(start, end)))
                 }
             }
             Ok(Token::Ident(name)) => Err(Diagnostic::error(format!("expected expression, found `{}`", name))
@@ -6290,5 +6319,146 @@ mod tests {
         // `*%` should bind at the same level as `*`.
         let src = "def main() { set x = 1 +% 2 *% 3; }";
         let _program = check_parse(src);
+    }
+
+    // ── @label path labels ─────────────────────────────────────────
+
+    #[test]
+    fn test_return_label_single() {
+        let src = "def f() -> Int<32> { return @even 4; }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { body: Some(body), .. } => {
+                assert_eq!(body.len(), 1);
+                match &body[0] {
+                    Stmt::Return { labels, value, .. } => {
+                        assert_eq!(labels.len(), 1);
+                        assert_eq!(labels[0].as_str(), "@even");
+                        assert!(value.is_some());
+                    }
+                    _ => panic!("expected Return"),
+                }
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_return_label_multiple() {
+        let src = "def f() -> Int<32> { return @even @big 200; }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { body: Some(body), .. } => {
+                assert_eq!(body.len(), 1);
+                match &body[0] {
+                    Stmt::Return { labels, .. } => {
+                        assert_eq!(labels.len(), 2);
+                        assert_eq!(labels[0].as_str(), "@even");
+                        assert_eq!(labels[1].as_str(), "@big");
+                    }
+                    _ => panic!("expected Return"),
+                }
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_return_label_without_expr() {
+        // Labels without expression should parse (value is None).
+        let src = "def f() { return @done; }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { body: Some(body), .. } => {
+                assert_eq!(body.len(), 1);
+                match &body[0] {
+                    Stmt::Return { labels, value, .. } => {
+                        assert_eq!(labels.len(), 1);
+                        assert_eq!(labels[0].as_str(), "@done");
+                        assert!(value.is_none());
+                    }
+                    _ => panic!("expected Return"),
+                }
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_ensures_label() {
+        // `@label` is a placeholder in the expression: `ensures @even > 0`
+        // means "the return value on the @even path is > 0".
+        let src = "def f(x: Int<32>) -> Int<32>
+                        ensures @even > 0
+                    { return @even x; }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { contracts, .. } => {
+                assert_eq!(contracts.len(), 1);
+                match &contracts[0] {
+                    Contract::Ensures { expr, .. } => {
+                        // The expression should be `@even > 0`, which parses as
+                        // a BinaryOp with Ident("@even") on the left.
+                        match expr {
+                            Expr::BinaryOp { left, op, .. } => {
+                                assert_eq!(*op, BinOp::Gt);
+                                match left.as_ref() {
+                                    Expr::Ident(name, _) => {
+                                        assert_eq!(name.as_str(), "@even");
+                                    }
+                                    _ => panic!("expected Ident on left side of >"),
+                                }
+                            }
+                            _ => panic!("expected BinaryOp for @even > 0"),
+                        }
+                    }
+                    _ => panic!("expected Ensures"),
+                }
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_ensures_label_and_codomain() {
+        // Mix of `codomain` (all paths) and `@label` (specific path).
+        let src = "def f(x: Int<32>) -> Int<32>
+                        ensures codomain >= 0
+                        ensures @fast < 100
+                    { return @fast x; }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { contracts, .. } => {
+                assert_eq!(contracts.len(), 2);
+                // Second ensures should have the @fast label in the expression
+                match &contracts[1] {
+                    Contract::Ensures { expr, .. } => {
+                        // The expression should be `@fast < 100`.
+                        match expr {
+                            Expr::BinaryOp { left, op, .. } => {
+                                assert_eq!(*op, BinOp::Lt);
+                                match left.as_ref() {
+                                    Expr::Ident(name, _) => {
+                                        assert_eq!(name.as_str(), "@fast");
+                                    }
+                                    _ => panic!("expected Ident on left side of <"),
+                                }
+                            }
+                            _ => panic!("expected BinaryOp for @fast < 100"),
+                        }
+                    }
+                    _ => panic!("expected Ensures"),
+                }
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_return_label_parse_error() {
+        // `return @` without identifier should fail.
+        let src = "def f() -> Int<32> { return @ 4; }";
+        let diags = check_parse_err(src);
+        assert!(!diags.is_empty(), "expected parse error for `return @`");
     }
 }

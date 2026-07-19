@@ -126,6 +126,8 @@ pub enum HirStmt {
     },
     Return {
         value: Option<Box<HirExpr>>,
+        /// Path labels attached to this return: `return @label1 @label2 expr`.
+        labels: Vec<Symbol>,
         span: Span,
     },
     Assign {

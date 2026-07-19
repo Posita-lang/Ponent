@@ -806,10 +806,12 @@ fn test_if_statement_with_return() {
     let cond = Expr::Literal(Literal::Bool(true), Span::new(0, 1));
     let then_stmt = Stmt::Return {
         value: Some(Expr::Literal(Literal::Int(42), Span::new(2, 4))),
+        labels: Vec::new(),
         span: Span::new(2, 4),
     };
     let else_stmt = Stmt::Return {
         value: Some(Expr::Literal(Literal::Int(0), Span::new(5, 6))),
+        labels: Vec::new(),
         span: Span::new(5, 6),
     };
     let if_expr = Expr::If {
@@ -1470,32 +1472,86 @@ fn test_old_in_contract() {
 }
 
 #[test]
-fn test_result_in_ensures() {
-    // `result` keyword in ensures refers to the return value
+fn test_codomain_in_ensures() {
+    // `codomain` keyword in ensures refers to the return value
     let result = check_source(
         "def double(x: Int<32>) -> Int<32>
-             ensures result == x + x
+             ensures codomain == x + x
          {
              return x + x;
          }
          def main() -> Int<32> { return double(5); }",
     );
-    assert!(result.is_ok(), "result in ensures: {:?}", result.err());
+    assert!(result.is_ok(), "codomain in ensures: {:?}", result.err());
 }
 
 #[test]
-fn test_result_in_ensures_multi() {
-    // Multiple ensures clauses using `result`
+fn test_codomain_in_ensures_multi() {
+    // Multiple ensures clauses using `codomain`
     let result = check_source(
         "def add(a: Int<32>, b: Int<32>) -> Int<32>
-             ensures result >= a
-             ensures result >= b
+             ensures codomain >= a
+             ensures codomain >= b
          {
              return a + b;
          }
          def main() -> Int<32> { return add(3, 4); }",
     );
     assert!(result.is_ok(), "result multi: {:?}", result.err());
+}
+
+#[test]
+fn test_label_in_ensures_and_return() {
+    // `ensures @label expr` with matching `return @label` should pass.
+    // `@label` is a placeholder in the expression: `@even > 0` means
+    // "the return value on the @even path is > 0".
+    let result = check_source(
+        "def f(x: Int<32>) -> Int<32>
+             ensures @even > 0
+         {
+             return @even x;
+         }
+         def main() -> Int<32> { return f(5); }",
+    );
+    assert!(result.is_ok(), "label in ensures+return: {:?}", result.err());
+}
+
+#[test]
+fn test_label_missing_return_rejected() {
+    // `ensures @label expr` without any `return @label` should fail.
+    let result = check_source(
+        "def f(x: Int<32>) -> Int<32>
+             ensures @even > 0
+         {
+             return x;
+         }
+         def main() -> Int<32> { return f(5); }",
+    );
+    assert!(
+        result.is_err(),
+        "label in ensures without matching return should be rejected"
+    );
+    let errs = result.unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("label") && e.contains("ensures")),
+        "error should mention label in ensures: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn test_codomain_and_label_together() {
+    // `codomain` (all paths) and `@label` (specific path) can be combined.
+    let result = check_source(
+        "def f(x: Int<32>) -> Int<32>
+             ensures codomain >= 0
+             ensures @fast < 100
+         {
+             return @fast x;
+         }
+         def main() -> Int<32> { return f(5); }",
+    );
+    assert!(result.is_ok(), "codomain + label: {:?}", result.err());
 }
 
 #[test]
