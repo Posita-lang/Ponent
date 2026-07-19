@@ -2591,20 +2591,25 @@ impl Parser {
         while matches!(self.peek(), Ok(Token::At)) {
             self.advance().ok(); // consume @
             match self.advance() {
-                Ok(Token::Ident(name)) => labels.push(Symbol::intern(&format!("@{}", name.as_str()))),
+                Ok(Token::Ident(name)) => {
+                    labels.push(Symbol::intern(&format!("@{}", name.as_str())))
+                }
                 Ok(tok) => {
                     return Err(Diagnostic::error(format!(
-                        "expected label name after `@`, found {:?}", tok
+                        "expected label name after `@`, found {:?}",
+                        tok
                     ))
                     .with_code_str("E004")
                     .with_help("a path label must be an identifier: `@label_name`")
                     .with_suggestion("write `return @even 4` instead of `return @ 4`")
-                    .with_span(self.span(),));
+                    .with_span(self.span()));
                 }
                 Err(()) => {
-                    return Err(Diagnostic::error("unexpected end of file after `@` in return label")
-                        .with_code_str("E002")
-                        .with_span(self.span(),));
+                    return Err(Diagnostic::error(
+                        "unexpected end of file after `@` in return label",
+                    )
+                    .with_code_str("E002")
+                    .with_span(self.span()));
                 }
             }
         }
@@ -6329,7 +6334,9 @@ mod tests {
         let src = "def f() -> Int<32> { return @even 4; }";
         let program = check_parse(src);
         match &program.items[0] {
-            Stmt::FunctionDef { body: Some(body), .. } => {
+            Stmt::FunctionDef {
+                body: Some(body), ..
+            } => {
                 assert_eq!(body.len(), 1);
                 match &body[0] {
                     Stmt::Return { labels, value, .. } => {
@@ -6349,7 +6356,9 @@ mod tests {
         let src = "def f() -> Int<32> { return @even @big 200; }";
         let program = check_parse(src);
         match &program.items[0] {
-            Stmt::FunctionDef { body: Some(body), .. } => {
+            Stmt::FunctionDef {
+                body: Some(body), ..
+            } => {
                 assert_eq!(body.len(), 1);
                 match &body[0] {
                     Stmt::Return { labels, .. } => {
@@ -6370,7 +6379,9 @@ mod tests {
         let src = "def f() { return @done; }";
         let program = check_parse(src);
         match &program.items[0] {
-            Stmt::FunctionDef { body: Some(body), .. } => {
+            Stmt::FunctionDef {
+                body: Some(body), ..
+            } => {
                 assert_eq!(body.len(), 1);
                 match &body[0] {
                     Stmt::Return { labels, value, .. } => {

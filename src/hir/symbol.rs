@@ -420,7 +420,11 @@ impl SymbolTable {
     /// Performs a reverse lookup through all scopes' `traits` maps.
     pub fn trait_name_by_def_id(&self, def_id: DefId) -> Option<Symbol> {
         for scope in self.scopes.iter().rev() {
-            if let Some((name, _)) = scope.traits.iter().find(|(_, binding)| binding.def_id == def_id) {
+            if let Some((name, _)) = scope
+                .traits
+                .iter()
+                .find(|(_, binding)| binding.def_id == def_id)
+            {
                 return Some(*name);
             }
         }

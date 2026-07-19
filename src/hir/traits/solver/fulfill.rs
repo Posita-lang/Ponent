@@ -151,7 +151,10 @@ impl<'a, D: SolverDelegate> FulfillmentContext<'a, D> {
                     // fall back to the first pending obligation in the forest.
                     let (actual_trait_id, actual_self_ty) = 'fetch: {
                         if let Some(entry) = self.search_graph.current_goal() {
-                            break 'fetch (entry.key.trait_id.unwrap_or(crate::hir::types::DefId(0)), entry.key.self_ty);
+                            break 'fetch (
+                                entry.key.trait_id.unwrap_or(crate::hir::types::DefId(0)),
+                                entry.key.self_ty,
+                            );
                         }
                         if let Some(idx) = self.forest.next_pending() {
                             let ob = self.forest.obligation_at(idx);

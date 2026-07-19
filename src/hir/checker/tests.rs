@@ -1513,7 +1513,11 @@ fn test_label_in_ensures_and_return() {
          }
          def main() -> Int<32> { return f(5); }",
     );
-    assert!(result.is_ok(), "label in ensures+return: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "label in ensures+return: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -1533,7 +1537,8 @@ fn test_label_missing_return_rejected() {
     );
     let errs = result.unwrap_err();
     assert!(
-        errs.iter().any(|e| e.contains("label") && e.contains("ensures")),
+        errs.iter()
+            .any(|e| e.contains("label") && e.contains("ensures")),
         "error should mention label in ensures: {:?}",
         errs
     );

@@ -490,21 +490,32 @@ impl<'a> TypeChecker<'a> {
                 for e in &errors {
                     use crate::hir::traits::solver::obligation::SolveError;
                     let (trait_id, self_ty) = match e {
-                        SolveError::Ambiguous { trait_id, self_ty, .. }
-                        | SolveError::NotFound { trait_id, self_ty, .. } => (*trait_id, *self_ty),
+                        SolveError::Ambiguous {
+                            trait_id, self_ty, ..
+                        }
+                        | SolveError::NotFound {
+                            trait_id, self_ty, ..
+                        } => (*trait_id, *self_ty),
                         _ => continue,
                     };
-                    let trait_name = self.symbols.lookup_trait_by_def_id(trait_id)
-                        .and_then(|tb| {
-                            self.symbols.trait_name_by_def_id(trait_id)
-                        })
+                    let trait_name = self
+                        .symbols
+                        .lookup_trait_by_def_id(trait_id)
+                        .and_then(|tb| self.symbols.trait_name_by_def_id(trait_id))
                         .map(|s| s.as_str())
                         .unwrap_or_else(|| format!("{:?}", trait_id));
                     let ty = self.ctx.get(self_ty);
-                    msgs.push(format!("no trait implementation found for `{}` on type `{}`", trait_name, ty));
+                    msgs.push(format!(
+                        "no trait implementation found for `{}` on type `{}`",
+                        trait_name, ty
+                    ));
                 }
                 if msgs.is_empty() {
-                    let msg = errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join("; ");
+                    let msg = errors
+                        .iter()
+                        .map(|e| format!("{}", e))
+                        .collect::<Vec<_>>()
+                        .join("; ");
                     msgs.push(msg);
                 }
                 let msg = msgs.join("; ");
@@ -941,8 +952,7 @@ impl<'a> TypeChecker<'a> {
                         // return type, so that the expression can reference
                         // `@label` as a placeholder for the return value.
                         for label in &expr_labels {
-                            guard.checker.local_variable_types
-                                .insert(*label, return_ty);
+                            guard.checker.local_variable_types.insert(*label, return_ty);
                         }
                         let (_, ensures_ty) = guard
                             .checker
@@ -1211,7 +1221,11 @@ impl<'a> TypeChecker<'a> {
                             for s in stmts {
                                 match s {
                                     HirStmt::Return { .. } => return true,
-                                    HirStmt::If { then_branch, else_branch, .. } => {
+                                    HirStmt::If {
+                                        then_branch,
+                                        else_branch,
+                                        ..
+                                    } => {
                                         if has_return_recursive(then_branch) {
                                             return true;
                                         }
@@ -1253,11 +1267,16 @@ impl<'a> TypeChecker<'a> {
                 if let Some(ref body_stmts) = body_hir {
                     // Collect all labels from ensures clauses (extracted from `@identifier`
                     // references in the expression, e.g. `ensures @even % 2 == 0`).
-                    let ensures_labels: Vec<Symbol> = contracts.iter()
+                    let ensures_labels: Vec<Symbol> = contracts
+                        .iter()
                         .filter_map(|c| match c {
                             Contract::Ensures { expr, .. } => {
                                 let labels = extract_labels_from_expr(expr);
-                                if labels.is_empty() { None } else { Some(labels) }
+                                if labels.is_empty() {
+                                    None
+                                } else {
+                                    Some(labels)
+                                }
                             }
                             _ => None,
                         })
@@ -1273,7 +1292,11 @@ impl<'a> TypeChecker<'a> {
                                     HirStmt::Return { labels: l, .. } => {
                                         labels.extend(l.iter().copied());
                                     }
-                                    HirStmt::If { then_branch, else_branch, .. } => {
+                                    HirStmt::If {
+                                        then_branch,
+                                        else_branch,
+                                        ..
+                                    } => {
                                         labels.extend(collect_return_labels(then_branch));
                                         if let Some(else_stmts) = else_branch {
                                             labels.extend(collect_return_labels(else_stmts));
@@ -2073,7 +2096,11 @@ impl<'a> TypeChecker<'a> {
                     }),
                 }
             }
-            Stmt::Return { value, labels, span } => {
+            Stmt::Return {
+                value,
+                labels,
+                span,
+            } => {
                 // Check if we're inside a comptime block — if so, return is comptime
                 // control flow, not a real function return.
                 let in_comptime = self
@@ -4109,7 +4136,12 @@ fn extract_labels_from_expr(e: &Expr) -> Vec<Symbol> {
                 labels.extend(extract_labels_from_expr(arg));
             }
         }
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             labels.extend(extract_labels_from_expr(cond));
             for stmt in then_branch {
                 labels.extend(extract_labels_from_stmt(stmt));
@@ -4154,8 +4186,12 @@ fn format_solve_errors(
     let mut msgs: Vec<String> = Vec::new();
     for e in errors {
         let (trait_id, self_ty) = match e {
-            SolveError::Ambiguous { trait_id, self_ty, .. }
-            | SolveError::NotFound { trait_id, self_ty, .. } => (*trait_id, *self_ty),
+            SolveError::Ambiguous {
+                trait_id, self_ty, ..
+            }
+            | SolveError::NotFound {
+                trait_id, self_ty, ..
+            } => (*trait_id, *self_ty),
             _ => continue,
         };
         let trait_name = symbols
@@ -4168,10 +4204,17 @@ fn format_solve_errors(
         } else {
             format!("{:?}", resolved.tag())
         };
-        msgs.push(format!("no trait implementation found for `{}` on type `{}`", trait_name, type_tag));
+        msgs.push(format!(
+            "no trait implementation found for `{}` on type `{}`",
+            trait_name, type_tag
+        ));
     }
     if msgs.is_empty() {
-        errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join("; ")
+        errors
+            .iter()
+            .map(|e| format!("{}", e))
+            .collect::<Vec<_>>()
+            .join("; ")
     } else {
         msgs.join("; ")
     }
@@ -4195,43 +4238,50 @@ fn replace_codomain(expr: &Expr, replacement: &Expr) -> Expr {
         Expr::Ident(name, _) if name.as_str() == "codomain" || name.as_str().starts_with('@') => {
             replacement.clone()
         }
-        Expr::BinaryOp { left, op, right, span } => {
-            Expr::BinaryOp {
-                left: Box::new(replace_codomain(left, replacement)),
-                op: *op,
-                right: Box::new(replace_codomain(right, replacement)),
-                span: *span,
-            }
-        }
-        Expr::UnaryOp { op, expr: inner, span } => {
-            Expr::UnaryOp {
-                op: *op,
-                expr: Box::new(replace_codomain(inner, replacement)),
-                span: *span,
-            }
-        }
-        Expr::Call { callee, args, comptime, span } => {
-            Expr::Call {
-                callee: Box::new(replace_codomain(callee, replacement)),
-                args: args.iter().map(|a| replace_codomain(a, replacement)).collect(),
-                comptime: *comptime,
-                span: *span,
-            }
-        }
-        Expr::FieldAccess { base, field, span } => {
-            Expr::FieldAccess {
-                base: Box::new(replace_codomain(base, replacement)),
-                field: *field,
-                span: *span,
-            }
-        }
-        Expr::Index { base, index, span } => {
-            Expr::Index {
-                base: Box::new(replace_codomain(base, replacement)),
-                index: Box::new(replace_codomain(index, replacement)),
-                span: *span,
-            }
-        }
+        Expr::BinaryOp {
+            left,
+            op,
+            right,
+            span,
+        } => Expr::BinaryOp {
+            left: Box::new(replace_codomain(left, replacement)),
+            op: *op,
+            right: Box::new(replace_codomain(right, replacement)),
+            span: *span,
+        },
+        Expr::UnaryOp {
+            op,
+            expr: inner,
+            span,
+        } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(replace_codomain(inner, replacement)),
+            span: *span,
+        },
+        Expr::Call {
+            callee,
+            args,
+            comptime,
+            span,
+        } => Expr::Call {
+            callee: Box::new(replace_codomain(callee, replacement)),
+            args: args
+                .iter()
+                .map(|a| replace_codomain(a, replacement))
+                .collect(),
+            comptime: *comptime,
+            span: *span,
+        },
+        Expr::FieldAccess { base, field, span } => Expr::FieldAccess {
+            base: Box::new(replace_codomain(base, replacement)),
+            field: *field,
+            span: *span,
+        },
+        Expr::Index { base, index, span } => Expr::Index {
+            base: Box::new(replace_codomain(base, replacement)),
+            index: Box::new(replace_codomain(index, replacement)),
+            span: *span,
+        },
         _ => expr.clone(),
     }
 }

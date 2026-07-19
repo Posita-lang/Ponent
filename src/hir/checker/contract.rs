@@ -67,7 +67,12 @@ impl Guarantee {
     /// Construct a guarantee from explicit pre/post predicates and an
     /// optional frame type.
     pub fn new(pre: Predicate, post: Predicate, frame: Option<TypeId>) -> Self {
-        Guarantee { pre, post, frame, ast_expr: None }
+        Guarantee {
+            pre,
+            post,
+            frame,
+            ast_expr: None,
+        }
     }
 
     /// Construct a guarantee with an optional AST expression for the
@@ -78,7 +83,12 @@ impl Guarantee {
         frame: Option<TypeId>,
         ast_expr: Option<Box<crate::ast::Expr>>,
     ) -> Self {
-        Guarantee { pre, post, frame, ast_expr }
+        Guarantee {
+            pre,
+            post,
+            frame,
+            ast_expr,
+        }
     }
 
     /// The identity guarantee: S = S′ (no effect).
