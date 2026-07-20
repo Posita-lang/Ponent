@@ -735,23 +735,27 @@ impl<'a> TypeChecker<'a> {
                         .local_variable_types
                         .current_frame_contains(var_name.clone())
                     {
+                        let prev_span = self.span_get(var_name).unwrap_or(*span);
                         dup_diag = Some(
                             Diagnostic::error(format!("duplicate definition of `{}`", var_name,))
                                 .with_code_str("E019")
                                 .with_span(*span)
+                                .with_additional_span(prev_span)
                                 .with_secondary_label(
-                                    self.span_get(var_name).unwrap_or(*span),
+                                    prev_span,
                                     "previous definition here",
                                 ),
                         );
                     } else if self.local_variable_types.get(var_name.clone()).is_some() {
                         // Shadowing is allowed but warns.
+                        let prev_span = self.span_get(var_name).unwrap_or(*span);
                         self.diagnostics.push(
                             Diagnostic::warning(format!("shadowing definition of `{}`", var_name,))
                                 .with_code_str("W113")
                                 .with_span(*span)
+                                .with_additional_span(prev_span)
                                 .with_secondary_label(
-                                    self.span_get(var_name).unwrap_or(*span),
+                                    prev_span,
                                     "previous definition here",
                                 ),
                         );
@@ -3283,7 +3287,21 @@ impl<'a> TypeChecker<'a> {
                         format!("index must be an integer, got {}", actual_str)
                     }
                 };
-                let mut diag = Diagnostic::error(msg).with_code_str("E030").with_span(span);
+                let mut diag = match ctx {
+                    TypingContext::ReturnValue => {
+                        Diagnostic::error(msg).with_code_str("E036").with_span(span)
+                    }
+                    TypingContext::Argument { .. } => {
+                        Diagnostic::error(msg).with_code_str("E037").with_span(span)
+                    }
+                    TypingContext::Condition => {
+                        Diagnostic::error(msg).with_code_str("E038").with_span(span)
+                    }
+                    TypingContext::Index => {
+                        Diagnostic::error(msg).with_code_str("E039").with_span(span)
+                    }
+                    _ => Diagnostic::error(msg).with_code_str("E030").with_span(span),
+                };
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
                     diag = diag.with_suggestion(suggestion);
                 }
@@ -3492,7 +3510,7 @@ impl<'a> TypeChecker<'a> {
                                 "type mismatch: expected `Bool`, found `{}`",
                                 other_type_str,
                             ))
-                            .with_code_str("E030")
+                            .with_code_str("E031")
                             .with_span(span),
                         )
                     } else {
@@ -3508,7 +3526,7 @@ impl<'a> TypeChecker<'a> {
                                 "type mismatch: expected integer type, found `{}`",
                                 other_type_str,
                             ))
-                            .with_code_str("E030")
+                            .with_code_str("E031")
                             .with_span(span),
                         )
                     } else {
@@ -3522,7 +3540,7 @@ impl<'a> TypeChecker<'a> {
                                 "type mismatch: expected float type, found `{}`",
                                 other_type_str,
                             ))
-                            .with_code_str("E030")
+                            .with_code_str("E031")
                             .with_span(span),
                         )
                     } else {
@@ -3536,7 +3554,7 @@ impl<'a> TypeChecker<'a> {
                                 "type mismatch: expected numeric type, found `{}`",
                                 other_type_str,
                             ))
-                            .with_code_str("E030")
+                            .with_code_str("E031")
                             .with_span(span),
                         )
                     } else {
@@ -3553,7 +3571,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 // Add a note label for the "maybe_var" operand (the infer var).
                 if let Some(ms) = maybe_var_span {
-                    d.labels.push(Label::new(ms, "expected integer type"));
+                    d.labels.push(Label::secondary(ms, "expected integer type"));
                 }
                 // Trace the type origin: if the "other" operand's type came from
                 // a variable definition, show where it originated.

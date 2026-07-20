@@ -164,5 +164,16 @@ fn main() {
                 }
             }
         }
+        cli::Command::Explain { code } => {
+            match code {
+                Some(code) => {
+                    let explanation = diagnostics::explain_error_code(&code);
+                    println!("{}", explanation);
+                }
+                None => {
+                    print!("{}", diagnostics::list_error_codes());
+                }
+            }
+        }
     }
 }

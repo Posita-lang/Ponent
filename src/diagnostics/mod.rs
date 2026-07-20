@@ -20,9 +20,9 @@ pub use emitter::{
     DiagnosticEmitter, colored::ColoredEmitter, html::HtmlEmitter, json::JsonEmitter,
     plain::PlainEmitter,
 };
-pub use error_code::{ErrorCategory, ErrorCode, WarningCode};
+pub use error_code::{ErrorCategory, ErrCode};
 pub use glyph::GlyphRenderer;
-pub use label::{AnnotationKind, Label, SourceContext};
+pub use label::{AnnotationKind, Label, SourcePos};
 pub use level::DiagnosticLevel;
 
 use crate::ast::Span;
@@ -131,9 +131,7 @@ impl MultiSpan {
 pub struct Diagnostic {
     pub level: DiagnosticLevel,
     pub message: String,
-    pub code: Option<ErrorCode>,
-    /// Warning code (e.g. `WarningCode::Shadowing` → "W113").
-    pub warning_code: Option<WarningCode>,
+    pub code: Option<ErrCode>,
     /// Primary spans (multiple for multi-location diagnostics).
     pub spans: MultiSpan,
     pub help: Option<String>,
@@ -169,7 +167,7 @@ pub struct Subdiag {
 /// into a duplicate definition [E019] diagnostic.
 #[derive(Debug, Clone)]
 pub struct RelatedError {
-    pub code: Option<ErrorCode>,
+    pub code: Option<ErrCode>,
     pub message: String,
     pub span: Option<Span>,
     pub label: Option<String>,
@@ -217,7 +215,6 @@ impl Diagnostic {
             level,
             message: message.into(),
             code: None,
-            warning_code: None,
             spans: MultiSpan::default(),
             help: None,
             suggestions: Vec::new(),
@@ -263,21 +260,16 @@ impl Diagnostic {
         self
     }
 
-    /// Set the error code (e.g. `ErrorCode::TypeMismatch` → `E030`).
-    pub fn with_code(mut self, code: ErrorCode) -> Self {
+    /// Set the error code (e.g. `ErrCode::TypeMismatch` → `E030`).
+    pub fn with_code(mut self, code: ErrCode) -> Self {
         self.code = Some(code);
         self
     }
 
     /// Convenience: set error code by string (backward compat).
-    /// Prefer `with_code(ErrorCode::...)` for the new enum-based API.
+    /// Prefer `with_code(ErrCode::new(...))` for the new API.
     pub fn with_code_str(mut self, code: impl Into<String>) -> Self {
-        let code_str = code.into();
-        if let Some(ec) = ErrorCode::from_str(&code_str) {
-            self.code = Some(ec);
-        } else if let Some(wc) = WarningCode::from_str(&code_str) {
-            self.warning_code = Some(wc);
-        }
+        self.code = Some(ErrCode::new(code));
         self
     }
 
@@ -350,64 +342,9 @@ impl Diagnostic {
     }
 }
 
-// ── Forward-compatible aliases for old-style string codes ─────────
-
-impl ErrorCode {
-    /// Attempt to parse a string like `"E030"` into an `ErrorCode`.
-    pub fn from_str(code: &str) -> Option<Self> {
-        match code {
-            "E001" => Some(ErrorCode::ExpectedToken),
-            "E002" => Some(ErrorCode::UnexpectedEOF),
-            "E003" => Some(ErrorCode::UnexpectedToken),
-            "E004" => Some(ErrorCode::ParseError),
-            "E005" => Some(ErrorCode::ExpectedIdentifier),
-            "E006" => Some(ErrorCode::RecursionLimitExceeded),
-            "E010" => Some(ErrorCode::NoSuchField),
-            "E011" => Some(ErrorCode::TypeNotFound),
-            "E012" => Some(ErrorCode::NameNotFound),
-            "E013" => Some(ErrorCode::UndefinedType),
-            "E014" => Some(ErrorCode::GenericArgsOnNonGeneric),
-            "E015" => Some(ErrorCode::CannotResolveImport),
-            "E016" => Some(ErrorCode::NoDefaultValue),
-            "E017" => Some(ErrorCode::ArraySizeNotConstant),
-            "E018" => Some(ErrorCode::UnexpectedTopLevel),
-            "E019" => Some(ErrorCode::DuplicateDefinition),
-            "E020" => Some(ErrorCode::ContractNonBool),
-            "E021" => Some(ErrorCode::EnsuresNonBool),
-            "E022" => Some(ErrorCode::DecreasesNonInt),
-            "E030" => Some(ErrorCode::TypeMismatch),
-            "E031" => Some(ErrorCode::InvalidBinaryOp),
-            "E032" => Some(ErrorCode::InvalidUnaryOp),
-            "E033" => Some(ErrorCode::WrongNumberOfArgs),
-            "E034" => Some(ErrorCode::ExpectedBool),
-            "E035" => Some(ErrorCode::ExpectedInteger),
-            "E036" => Some(ErrorCode::ExpectedResult),
-            "E037" => Some(ErrorCode::ExpectedFuture),
-            "E038" => Some(ErrorCode::ReturnOutsideFunction),
-            "E039" => Some(ErrorCode::ReturnWithoutValue),
-            "E040" => Some(ErrorCode::LeaveOutsideLoop),
-            "E041" => Some(ErrorCode::ContinueOutsideLoop),
-            "E042" => Some(ErrorCode::CannotLeaveClosure),
-            "E043" => Some(ErrorCode::SetNoPattern),
-            "E044" => Some(ErrorCode::LetNeedsInit),
-            "E045" => Some(ErrorCode::InvalidLValue),
-            "E046" => Some(ErrorCode::ContractBoolAtReturn),
-            "E100" => Some(ErrorCode::TraitNotFound),
-            "E101" => Some(ErrorCode::ImplMissingMethod),
-            "E102" => Some(ErrorCode::ImplMissingAssocType),
-            "E103" => Some(ErrorCode::ImplSignatureMismatch),
-            "E104" => Some(ErrorCode::OrphanImpl),
-            "E105" => Some(ErrorCode::InherentImplOnNonAdt),
-            "E106" => Some(ErrorCode::TraitViolatesTermination),
-            "E600" => Some(ErrorCode::SafeCastFromRef),
-            "E601" => Some(ErrorCode::SafeCastNonPrimitive),
-            "E602" => Some(ErrorCode::UnsafeCastRefToInt),
-            "E603" => Some(ErrorCode::UnsafeCastIncompatible),
-            "E604" => Some(ErrorCode::UnknownAttribute),
-            _ => None,
-        }
-    }
-}
+// ── ErrCode is now a string-based code — use `ErrCode::new("E030")` ──
+// The old `from_str` method with enum variants was removed in favour of
+// the lookup table in `error_code.rs`.  Any string is accepted as a code.
 
 // ── Display ───────────────────────────────────────────────────────
 
@@ -459,13 +396,119 @@ impl fmt::Display for Diagnostic {
 }
 
 /// Render the `--explain` output for a given error code string.
+/// Output is formatted with syntax highlighting, text wrapping, and ANSI colors.
 pub fn explain_error_code(code_str: &str) -> String {
-    match ErrorCode::from_str(code_str) {
-        Some(code) => {
-            format!("{}: {}\n\n{}", code.code(), code.title(), code.explain())
+    use std::fmt::Write;
+
+    // Check if the code exists in the lookup table before proceeding.
+    let Some(code) = crate::diagnostics::error_code::lookup(code_str) else {
+        return format!(
+            "\x1b[1;31merror\x1b[0m\x1b[2m[E000]\x1b[0m: unknown error code `{code_str}`\n\
+             {help}",
+            help = suggest_code(code_str),
+        );
+    };
+
+    let code = ErrCode::new(code_str);
+    let mut out = String::new();
+
+    // ── Header: bold error code + title ──
+    let _ = writeln!(
+        out,
+        "\x1b[1m{code}:\x1b[0m \x1b[36m{title}\x1b[0m",
+        code = code.code(),
+        title = code.title(),
+    );
+    let _ = writeln!(out);
+
+    // ── Body: parse explanation text, highlight code blocks, wrap text ──
+    let explain = code.explain();
+    let mut in_code_block = false;
+    // Dark background for code blocks (256-color: dark gray)
+    const CODE_BG: &str = "\x1b[48;5;236m";
+    const RESET: &str = "\x1b[0m";
+
+    for line in explain.lines() {
+        if line.starts_with("  ") && !line.trim().is_empty() {
+            // Code/example line — apply syntax highlighting + background
+            if !in_code_block {
+                let _ = writeln!(out);
+                in_code_block = true;
+            }
+            let highlighted = crate::diagnostics::glyph::highlight_code(line, true);
+            let _ = writeln!(out, "  {CODE_BG}{highlighted}{RESET}");
+        } else if line.trim().is_empty() {
+            if in_code_block {
+                in_code_block = false;
+            }
+            let _ = writeln!(out);
+        } else {
+            if in_code_block {
+                in_code_block = false;
+                let _ = writeln!(out);
+            }
+            // Regular text — wrap at 78 columns
+            let wrapped = textwrap::fill(line, 78);
+            let _ = write!(out, "{}", wrapped);
+            let _ = writeln!(out);
         }
-        None => format!("Unknown error code: {}", code_str),
     }
+
+    out
+}
+
+/// Generate a "did you mean?" suggestion for an unknown error code.
+/// Uses a simple prefix/suffix matching heuristic against the CODE_TABLE.
+fn suggest_code(input: &str) -> String {
+    // Find candidates that share a common prefix or suffix with the input.
+    let candidates: Vec<&str> = crate::diagnostics::error_code::CODE_TABLE
+        .iter()
+        .map(|e| e.code)
+        .filter(|code| {
+            let common = code.chars().zip(input.chars()).take_while(|(a, b)| a == b).count();
+            common >= 3 && (code.len() != input.len())
+        })
+        .take(3)
+        .collect();
+
+    if candidates.is_empty() {
+        "\x1b[1;34mhelp\x1b[0m: valid error codes include E001–E061, E101–E103, W113 — \n       run `ponent explain <CODE>` with a valid code (e.g. `ponent explain E030`)".to_string()
+    } else {
+        format!(
+            "\x1b[1;34mhelp\x1b[0m: did you mean `{}`?\n       run `ponent explain <CODE>` with a valid error code",
+            candidates.join("` or `"),
+        )
+    }
+}
+
+/// List all available error codes with their titles, formatted for terminal output.
+pub fn list_error_codes() -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "\x1b[1mAvailable error codes:\x1b[0m\n");
+    let mut last_category = None;
+    for entry in crate::diagnostics::error_code::CODE_TABLE {
+        let cat = entry.category;
+        if Some(cat) != last_category {
+            let _ = writeln!(
+                out,
+                " \x1b[36m── {} ──\x1b[0m",
+                cat.as_str(),
+            );
+            last_category = Some(cat);
+        }
+        let _ = writeln!(
+            out,
+            "  \x1b[1m{}\x1b[0m  {}",
+            entry.code,
+            entry.title,
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\n\x1b[2mRun `ponent explain <CODE>` for details on a specific error code.\x1b[0m"
+    );
+    out
 }
 
 /// Convenience function to emit diagnostics to stderr.
@@ -494,7 +537,7 @@ mod tests {
     #[test]
     fn test_basic_error() {
         let diag = Diagnostic::error("something went wrong")
-            .with_code(ErrorCode::TypeMismatch)
+            .with_code(ErrCode::new("E030"))
             .with_span(Span::new(5, 12))
             .with_suggestion("try using `as` to cast");
         assert!(diag.is_error());
@@ -504,7 +547,7 @@ mod tests {
     #[test]
     fn test_with_labels() {
         let diag = Diagnostic::error("no field `z` on type Point")
-            .with_code(ErrorCode::NoSuchField)
+            .with_code(ErrCode::new("E010"))
             .with_span(Span::new(50, 53))
             .with_label(Span::new(0, 30), "type defined here");
         assert_eq!(diag.labels.len(), 1);
@@ -519,6 +562,21 @@ mod tests {
     }
 
     #[test]
+    fn test_explain_unknown_code() {
+        let explain = explain_error_code("E03");
+        assert!(explain.contains("unknown error code"));
+        assert!(explain.contains("E03"));
+        assert!(explain.contains("E030")); // did you mean suggestion
+        assert!(explain.contains("help"));
+
+        let explain = explain_error_code("E999");
+        assert!(explain.contains("unknown error code"));
+        assert!(explain.contains("E999"));
+        // No candidates should match "E999" — falls back to generic help
+        assert!(explain.contains("valid error codes include"));
+    }
+
+    #[test]
     fn test_call_chain() {
         let mut chain = CallChain::new();
         chain.push(chain::ChainEntry {
@@ -527,7 +585,7 @@ mod tests {
             message: "main".to_string(),
         });
         let diag = Diagnostic::error("type mismatch")
-            .with_code(ErrorCode::TypeMismatch)
+            .with_code(ErrCode::new("E030"))
             .with_call_chain(chain);
         assert!(diag.call_chain.is_some());
         assert!(diag.to_string().contains("referenced by"));
@@ -542,7 +600,7 @@ mod tests {
     #[test]
     fn test_diagnostic_collector() {
         let mut collector = DiagCtxt::new();
-        collector.push(Diagnostic::error("first error").with_code(ErrorCode::TypeMismatch));
+        collector.push(Diagnostic::error("first error").with_code(ErrCode::new("E030")));
         collector.push(Diagnostic::warning("first warning"));
         assert_eq!(collector.len(), 2);
         assert_eq!(collector.error_count(), 1);
@@ -571,14 +629,14 @@ mod tests {
 
     #[test]
     fn test_error_category() {
-        assert_eq!(ErrorCode::TypeMismatch.category(), ErrorCategory::Type);
-        assert_eq!(ErrorCode::ExpectedToken.category(), ErrorCategory::Parse);
+        assert_eq!(ErrCode::new("E030").category(), ErrorCategory::Type);
+        assert_eq!(ErrCode::new("E001").category(), ErrorCategory::Parse);
         assert_eq!(
-            ErrorCode::ContractNonBool.category(),
+            ErrCode::new("E020").category(),
             ErrorCategory::Contract
         );
         assert_eq!(
-            ErrorCode::ImplMissingMethod.category(),
+            ErrCode::new("E041").category(),
             ErrorCategory::Trait
         );
     }

@@ -91,6 +91,7 @@ struct Styles {
     red_bold: &'static str,
     cyan: &'static str,
     blue: &'static str,
+    magenta: &'static str,
     green: &'static str,
     yellow: &'static str,
 }
@@ -106,6 +107,7 @@ impl Styles {
                 red_bold: "\x1b[31;1m",
                 cyan: "\x1b[36m",
                 blue: "\x1b[34m",
+                magenta: "\x1b[35m",
                 green: "\x1b[32m",
                 yellow: "\x1b[33m",
             }
@@ -118,6 +120,7 @@ impl Styles {
                 red_bold: "",
                 cyan: "",
                 blue: "",
+                magenta: "",
                 green: "",
                 yellow: "",
             }
@@ -182,22 +185,23 @@ impl GlyphRenderer {
         self.write_header(&mut out, diag);
 
         if let Some(ref source) = diag.source {
-            if let Some(span) = diag.spans.first() {
-                // Merge existing labels with labels from related_errors,
-                // so that each related error's span is annotated with its
-                // error code, e.g. "type mismatch [E030]".
-                let mut merged_labels = diag.labels.clone();
-                for rel in &diag.related_errors {
-                    if let Some(rel_span) = rel.span {
-                        let label_text = if let Some(ref code) = rel.code {
-                            format!("{} [{}]", rel.message, code.code())
-                        } else {
-                            rel.message.clone()
-                        };
-                        merged_labels.push(Label::secondary(rel_span, label_text));
-                    }
+            // Merge labels from related_errors once, used for all primary spans.
+            let mut merged_labels = diag.labels.clone();
+            for rel in &diag.related_errors {
+                if let Some(rel_span) = rel.span {
+                    let label_text = if let Some(ref code) = rel.code {
+                        format!("{} [{}]", rel.message, code.code())
+                    } else {
+                        rel.message.clone()
+                    };
+                    merged_labels.push(Label::secondary(rel_span, label_text));
                 }
-                self.write_source_section(&mut out, source, span, &merged_labels, "<input>");
+            }
+            // Render a source section for EACH primary span, so that
+            // multi-location diagnostics (e.g. duplicate definition + original)
+            // show both locations with their own source context.
+            for &primary_span in &diag.spans.primary {
+                self.write_source_section(&mut out, source, primary_span, &merged_labels, "<input>");
             }
         }
 
@@ -286,7 +290,6 @@ impl GlyphRenderer {
             .code
             .as_ref()
             .map(|c| c.code())
-            .or_else(|| diag.warning_code.as_ref().map(|w| w.code()))
             .unwrap_or("?");
         // Combine primary error code with related error codes, e.g. "E019,E030".
         let all_codes: String = if diag.related_errors.is_empty() {
@@ -407,10 +410,61 @@ impl GlyphRenderer {
         for line_idx in first_line..=last_line {
             let line = lines[line_idx];
 
+            // Compute underlines for this line from all labels
+            // (runs BEFORE source line rendering so we can use the
+            // primary span info to add background highlighting).
+            let underlines = compute_line_underlines(&all_labels, source, line, line_idx);
+
+            // ── Compute primary span columns for background highlighting ──
+            // Build a set of columns that are covered by a primary underline
+            // (underline_char == '^').  These columns will get a subtle
+            // background color to make the error location stand out.
+            let mut primary_cols: Vec<bool> = vec![false; line.len()];
+            for (col, ulen, underline_char, _msg) in &underlines {
+                if *underline_char == '^' {
+                    let end = std::cmp::min(col + ulen, line.len());
+                    for i in *col..end {
+                        if i < primary_cols.len() {
+                            primary_cols[i] = true;
+                        }
+                    }
+                }
+            }
+
+            // Apply background color to primary span columns.
+            // Split the line into segments: normal / highlighted / normal.
+            let code_bg = "\x1b[48;5;236m";
+            let reset_fg = "\x1b[22m\x1b[39m"; // reset bold+fg only, preserve bg
+            let full_reset = "\x1b[0m";
+            let mut rendered = String::with_capacity(line.len() + 64);
+            let mut i = 0;
+            while i < line.len() {
+                if primary_cols[i] {
+                    // Start of a primary span segment
+                    rendered.push_str(code_bg);
+                    let start = i;
+                    while i < line.len() && primary_cols[i] {
+                        i += 1;
+                    }
+                    // Apply syntax highlighting within the primary span
+                    let segment = &line[start..i];
+                    rendered.push_str(&highlight_code(segment, self.s.use_color));
+                    rendered.push_str(reset_fg);
+                    rendered.push_str(full_reset); // reset background
+                } else {
+                    let start = i;
+                    while i < line.len() && !primary_cols[i] {
+                        i += 1;
+                    }
+                    let segment = &line[start..i];
+                    rendered.push_str(&highlight_code(segment, self.s.use_color));
+                }
+            }
+
             // Line number + source
             let _ = writeln!(
                 out,
-                "{dim}{v}{reset}{cyan}{line_num:>width$}{reset} {dim}{sub_v}{reset} {line}",
+                "{dim}{v}{reset}{cyan}{line_num:>width$}{reset} {dim}{sub_v}{reset} {rendered}",
                 dim = self.s.dim,
                 v = self.bc.v,
                 reset = self.s.reset,
@@ -418,11 +472,39 @@ impl GlyphRenderer {
                 line_num = line_idx + 1,
                 width = line_num_width,
                 sub_v = self.bc.sub_v,
-                line = line,
+                rendered = rendered,
             );
 
-            // Compute underlines for this line from all labels
-            let underlines = compute_line_underlines(&all_labels, source, line, line_idx);
+            // ── Detect multi-line labels ──
+            // For labels that span multiple lines, determine if this line is
+            // the first, middle, or last line of the annotation, so we can
+            // render `_` connectors and `|` inline marks accordingly.
+            // Collect labels that are multi-line and overlap this line.
+            let mut multiline_flags: Vec<(usize, usize, char, &str, &str)> = Vec::new();
+            for (col, ulen, underline_char, msg) in &underlines {
+                // Find the original label in all_labels that matches this underline.
+                for lbl in &all_labels {
+                    let label_start_line = span_line(lbl.span, source);
+                    let label_end_line = span_line(Span::new(lbl.span.end, lbl.span.end), source);
+                    if label_start_line != label_end_line {
+                        // This label spans multiple lines.
+                        // Check if this underline corresponds to this label.
+                        if *col == (lbl.span.start.saturating_sub(line_start_byte(source, line_idx)))
+                            || lbl.message.as_str() == *msg
+                        {
+                            let part = if line_idx == label_start_line {
+                                "start"
+                            } else if line_idx == label_end_line {
+                                "end"
+                            } else {
+                                "middle"
+                            };
+                            multiline_flags.push((*col, *ulen, *underline_char, msg, part));
+                            break;
+                        }
+                    }
+                }
+            }
 
             // ── Render annotation line ──
             // Combine all underlines into a single line, like rustc's `- ^ -`.
@@ -588,7 +670,7 @@ impl GlyphRenderer {
 
 // ── Helper: byte offset → line:col ──────────────────────────────
 
-fn byte_to_linecol(source: &str, byte_offset: usize) -> SourcePos {
+pub(crate) fn byte_to_linecol(source: &str, byte_offset: usize) -> SourcePos {
     let len = source.len();
     let clamped = std::cmp::min(byte_offset, len);
     let prefix = &source[..clamped];
@@ -604,7 +686,7 @@ fn byte_to_linecol(source: &str, byte_offset: usize) -> SourcePos {
 
 /// Returns the 0‑based line index of the start of a span, or `None` if
 /// the byte offset is out of bounds.
-fn span_line(span: Span, source: &str) -> usize {
+pub(crate) fn span_line(span: Span, source: &str) -> usize {
     let clamped = std::cmp::min(span.start, source.len());
     source[..clamped].matches('\n').count()
 }
@@ -613,7 +695,7 @@ fn span_line(span: Span, source: &str) -> usize {
 
 /// Returns a list of `(col, len, underline_char, message)` for all labels
 /// that cover the given line index.
-fn compute_line_underlines<'a>(
+pub(crate) fn compute_line_underlines<'a>(
     labels: &'a [Label],
     source: &str,
     line: &str,
@@ -651,7 +733,7 @@ fn compute_line_underlines<'a>(
 }
 
 /// Find the byte offset of the start of a given line (0-based).
-fn line_start_byte(source: &str, line_idx: usize) -> usize {
+pub(crate) fn line_start_byte(source: &str, line_idx: usize) -> usize {
     let mut offset = 0;
     for _ in 0..line_idx {
         if let Some(pos) = source[offset..].find('\n') {
@@ -661,6 +743,101 @@ fn line_start_byte(source: &str, line_idx: usize) -> usize {
         }
     }
     offset
+}
+
+// ── Syntax highlighting ─────────────────────────────────────────
+
+/// Posita keywords to highlight in bold.
+const KEYWORDS: &[&str] = &[
+    "def", "set", "let", "return", "if", "else", "while", "for", "loop",
+    "break", "leave", "continue", "true", "false", "import", "type", "trait",
+    "impl", "ensures", "requires", "invariant", "decreases", "match", "with",
+    "struct", "enum", "pub", "mut", "ref", "comptime", "extern", "edition",
+    "constraint", "where", "in", "is", "as", "and", "or", "not", "fn",
+];
+
+/// Posita built-in type names to highlight in cyan.
+const TYPES: &[&str] = &[
+    "Int", "UInt", "Float", "Bool", "Char", "Byte", "USize", "Str",
+    "Unit", "Never", "String",
+];
+
+/// Simple syntax highlighter that wraps select tokens in ANSI color codes.
+/// Only keywords (bold) and types (cyan) are highlighted — everything else
+/// stays in the default terminal color for a clean, readable output.
+/// When `use_color` is false, the input is returned unchanged.
+pub fn highlight_code(line: &str, use_color: bool) -> String {
+    if !use_color {
+        return line.to_string();
+    }
+
+    // Reset only foreground color and bold — preserve background color
+    // so that callers can wrap the output in a background color block.
+    let reset = "\x1b[22m\x1b[39m";
+    let bold = "\x1b[1m";
+    let cyan = "\x1b[36m";
+
+    let mut out = String::with_capacity(line.len() + 32);
+    let mut i = 0;
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+
+    while i < len {
+        // Skip string literals entirely — no highlighting inside strings.
+        if bytes[i] == b'"' {
+            let start = i;
+            i += 1;
+            while i < len && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < len { i += 1; }
+                i += 1;
+            }
+            if i < len { i += 1; }
+            out.push_str(&line[start..i]);
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            let start = i;
+            i += 1;
+            while i < len && bytes[i] != b'\'' {
+                if bytes[i] == b'\\' && i + 1 < len { i += 1; }
+                i += 1;
+            }
+            if i < len { i += 1; }
+            out.push_str(&line[start..i]);
+            continue;
+        }
+
+        // Identifiers: check for keywords and types.
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = &line[start..i];
+            if TYPES.contains(&word) {
+                let _ = std::fmt::write(
+                    &mut out,
+                    format_args!("{cyan}{}{reset}", word),
+                );
+                continue;
+            }
+            if KEYWORDS.contains(&word) {
+                let _ = std::fmt::write(
+                    &mut out,
+                    format_args!("{bold}{}{reset}", word),
+                );
+                continue;
+            }
+            out.push_str(word);
+            continue;
+        }
+
+        // Everything else: pass through as-is.
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+
+    out
 }
 
 // ── Tests ───────────────────────────────────────────────────────

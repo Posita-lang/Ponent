@@ -1,3 +1,8 @@
+use crate::ast::Span;
+use crate::diagnostics::glyph::{
+    byte_to_linecol, compute_line_underlines,
+};
+use crate::diagnostics::label::{AnnotationKind, Label};
 use crate::diagnostics::Diagnostic;
 use std::fmt::Write;
 
@@ -98,20 +103,11 @@ impl HtmlEmitter {
             html.push_str(&format!("<div class='span'>at {}</div>\n", span));
         }
 
-        // Source context
-        if let (Some(span), Some(source)) = (diag.spans.first(), diag.source.as_ref()) {
-            let ctx =
-                crate::diagnostics::label::SourceContext::new(source.as_str(), span, "<input>", 2);
-            let rendered = ctx.render(span, &diag.labels, false);
-            if !rendered.is_empty() {
-                let escaped = self.escape(
-                    &rendered
-                        .lines()
-                        .filter(|l| !l.is_empty())
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                );
-                html.push_str(&format!("<pre class='source-line'>{}</pre>\n", escaped));
+        // Source context — render directly from Diagnostic struct fields
+        if let Some(source) = diag.source.as_ref() {
+            let ctx = self.render_source_html(source, &diag.spans.primary, &diag.labels);
+            if !ctx.is_empty() {
+                html.push_str(&format!("<pre class='source-line'>{}</pre>\n", ctx));
             }
         }
 
@@ -162,6 +158,153 @@ impl HtmlEmitter {
         }
 
         html.push_str("</div>\n");
+        html
+    }
+
+    /// Render the source context as HTML, directly from the Diagnostic's
+    /// source text, spans, and labels — without going through GlyphRenderer's
+    /// terminal-formatted output.
+    fn render_source_html(&self, source: &str, primary_spans: &[Span], labels: &[Label]) -> String {
+        let Some(&span) = primary_spans.first() else {
+            return String::new();
+        };
+        let lines: Vec<&str> = source.lines().collect();
+        if lines.is_empty() {
+            return String::new();
+        }
+
+        let start_pos = byte_to_linecol(source, span.start);
+        let end_pos = byte_to_linecol(source, span.end);
+
+        let context_lines = 2;
+        let first_line = start_pos.line.saturating_sub(context_lines);
+        let last_line = std::cmp::min(
+            end_pos.line + 1 + context_lines,
+            lines.len().saturating_sub(1),
+        );
+        let line_num_width = format!("{}", last_line + 1).len();
+
+        // Collect all labels: primary span first, then existing labels
+        let mut all_labels = Vec::with_capacity(labels.len() + 1);
+        all_labels.push(Label {
+            span,
+            message: String::new(),
+            kind: AnnotationKind::Primary,
+        });
+        all_labels.extend(labels.iter().cloned());
+
+        let mut html = String::new();
+
+        for line_idx in first_line..=last_line {
+            let line = lines[line_idx];
+            let underlines =
+                compute_line_underlines(&all_labels, source, line, line_idx);
+
+            // ── Build primary columns set for background highlighting ──
+            let mut primary_cols: Vec<bool> = vec![false; line.len()];
+            for (col, ulen, underline_char, _msg) in &underlines {
+                if *underline_char == '^' {
+                    let end = std::cmp::min(col + ulen, line.len());
+                    for i in *col..end {
+                        if i < primary_cols.len() {
+                            primary_cols[i] = true;
+                        }
+                    }
+                }
+            }
+
+            // ── Render line number ──
+            let line_num_str = format!("{:>width$}", line_idx + 1, width = line_num_width);
+            html.push_str(&format!(
+                "<span class='line-num'>{line_num_str} │ </span>"
+            ));
+
+            // ── Render source line with primary span highlighting ──
+            let mut rendered = String::with_capacity(line.len() + 64);
+            let mut i = 0;
+            while i < line.len() {
+                if primary_cols[i] {
+                    rendered.push_str("<span class='highlight'>");
+                    let start = i;
+                    while i < line.len() && primary_cols[i] {
+                        i += 1;
+                    }
+                    rendered.push_str(&self.escape(&line[start..i]));
+                    rendered.push_str("</span>");
+                } else {
+                    let start = i;
+                    while i < line.len() && !primary_cols[i] {
+                        i += 1;
+                    }
+                    rendered.push_str(&self.escape(&line[start..i]));
+                }
+            }
+            html.push_str(&rendered);
+            html.push('\n');
+
+            // ── Render underline annotations ──
+            if !underlines.is_empty() {
+                let spaces = " ".repeat(line_num_width + 1);
+                html.push_str(&format!(
+                    "<span class='line-num'>{spaces} │ </span>"
+                ));
+
+                // Merge overlapping underlines (primary `^` takes precedence)
+                let mut combined: Vec<char> = vec![' '; line.len()];
+                fn priority(c: char) -> u8 {
+                    match c {
+                        '^' => 0,
+                        '~' => 1,
+                        '-' => 2,
+                        _ => 3,
+                    }
+                }
+                for (col, ulen, underline_char, _msg) in &underlines {
+                    let end = std::cmp::min(col + ulen, line.len());
+                    for i in *col..end {
+                        if priority(*underline_char) < priority(combined[i]) {
+                            combined[i] = *underline_char;
+                        }
+                    }
+                }
+
+                let combined_str: String = combined.iter().collect();
+                let trimmed = combined_str.trim().to_string();
+                if !trimmed.is_empty() {
+                    let first_col =
+                        combined.iter().position(|c| *c != ' ').unwrap_or(0);
+                    let padded = " ".repeat(first_col) + &trimmed;
+                    html.push_str(&format!(
+                        "<span class='underline'>{}</span>",
+                        self.escape(&padded)
+                    ));
+                }
+                html.push('\n');
+
+                // ── Render label message lines ──
+                for (col, _ulen, _ch, msg) in &underlines {
+                    if msg.is_empty() {
+                        continue;
+                    }
+                    let msg_spaces = " ".repeat(line_num_width + 1);
+                    html.push_str(&format!(
+                        "<span class='line-num'>{msg_spaces} │ </span>"
+                    ));
+                    let mut connector = String::new();
+                    for _ in 0..*col {
+                        connector.push(' ');
+                    }
+                    connector.push('|');
+                    html.push_str(&format!(
+                        "<span class='label'>{} {}</span>",
+                        self.escape(&connector),
+                        self.escape(msg),
+                    ));
+                    html.push('\n');
+                }
+            }
+        }
+
         html
     }
 
