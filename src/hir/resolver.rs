@@ -1,6 +1,6 @@
 use crate::ast::visit::replace_ident_in_expr;
 use crate::ast::*;
-use crate::diagnostics::{Diagnostic, DiagCtxt, DiagnosticLevel};
+use crate::diagnostics::{DiagCtxt, Diagnostic, DiagnosticLevel};
 use crate::hir::builtins;
 use crate::hir::symbol::*;
 use crate::hir::traits::{ImplCandidate, TraitEnv};
@@ -105,8 +105,7 @@ impl<'a> NameResolver<'a> {
     pub fn resolve_program(
         &mut self,
         program: &Program,
-    ) -> Result<(SymbolTable, TraitEnv, DiagCtxt, ResolutionMap), DiagCtxt>
-    {
+    ) -> Result<(SymbolTable, TraitEnv, DiagCtxt, ResolutionMap), DiagCtxt> {
         for item in &program.items {
             self.resolve_item(item);
         }

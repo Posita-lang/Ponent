@@ -1622,7 +1622,10 @@ fn test_variable_duplicate_in_same_scope() {
              return x;
          }",
     );
-    assert!(result.is_err(), "duplicate definition in same scope should be rejected");
+    assert!(
+        result.is_err(),
+        "duplicate definition in same scope should be rejected"
+    );
     let errs = result.unwrap_err();
     assert!(
         errs.iter().any(|e| e.contains("duplicate definition")),
@@ -2495,7 +2498,8 @@ mod test_regex {
         );
         let errs = result.unwrap_err();
         assert!(
-            errs.iter().any(|e| e.contains("type mismatch") && e.contains("&Str")),
+            errs.iter()
+                .any(|e| e.contains("type mismatch") && e.contains("&Str")),
             "expected type mismatch with &Str, got: {:?}",
             errs
         );

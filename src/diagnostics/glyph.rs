@@ -22,18 +22,18 @@
 //! ```
 
 use crate::ast::Span;
+use crate::diagnostics::Diagnostic;
 use crate::diagnostics::label::{AnnotationKind, Label, SourcePos};
 use crate::diagnostics::level::DiagnosticLevel;
-use crate::diagnostics::Diagnostic;
 use std::fmt::Write;
 
 // ── Box-drawing characters ──────────────────────────────────────
 
 struct BoxChars {
-    tl: &'static str,   // top-left corner
-    bl: &'static str,   // bottom-left corner
-    h: &'static str,    // horizontal line
-    v: &'static str,    // vertical line
+    tl: &'static str,     // top-left corner
+    bl: &'static str,     // bottom-left corner
+    h: &'static str,      // horizontal line
+    v: &'static str,      // vertical line
     sub_tl: &'static str, // sub-box top-left
     sub_bl: &'static str, // sub-box bottom-left
     sub_v: &'static str,  // sub-box vertical
@@ -125,7 +125,9 @@ impl Styles {
     }
 
     fn get(&self, style: Style) -> &'static str {
-        if !self.use_color { return ""; }
+        if !self.use_color {
+            return "";
+        }
         match style {
             Style::Error => "\x1b[31;1m",
             Style::Warning => "\x1b[33;1m",
@@ -218,17 +220,17 @@ impl GlyphRenderer {
                 for lbl in &diag.labels {
                     let lbl_line = span_line(lbl.span, source);
                     if lbl_line < first_line || lbl_line > last_line {
-                            let _ = writeln!(
-                                out,
-                                "{v}  {sub_h}{sub_h}{sub_h} {ch} {span}: {msg}",
-                                v = self.bc.v,
-                                sub_h = self.bc.sub_h,
-                                ch = lbl.underline_char(),
-                                span = lbl.span,
-                                msg = lbl.message,
-                            );
-                        }
+                        let _ = writeln!(
+                            out,
+                            "{v}  {sub_h}{sub_h}{sub_h} {ch} {span}: {msg}",
+                            v = self.bc.v,
+                            sub_h = self.bc.sub_h,
+                            ch = lbl.underline_char(),
+                            span = lbl.span,
+                            msg = lbl.message,
+                        );
                     }
+                }
             }
         }
 
@@ -270,13 +272,7 @@ impl GlyphRenderer {
         let _ = write!(
             out,
             "{}{}{}{} {}{}{}",
-            self.s.dim,
-            self.bc.bl,
-            self.bc.h,
-            self.s.reset,
-            self.s.red_bold,
-            msg,
-            self.s.reset,
+            self.s.dim, self.bc.bl, self.bc.h, self.s.reset, self.s.red_bold, msg, self.s.reset,
         );
         out
     }
@@ -397,7 +393,15 @@ impl GlyphRenderer {
             col = start_pos.col + 1,
         );
         // Spacing line
-        let _ = writeln!(out, "{dim}{v}{indent}{sub_v}{reset}", dim = self.s.dim, v = self.bc.v, indent = indent, sub_v = self.bc.sub_v, reset = self.s.reset);
+        let _ = writeln!(
+            out,
+            "{dim}{v}{indent}{sub_v}{reset}",
+            dim = self.s.dim,
+            v = self.bc.v,
+            indent = indent,
+            sub_v = self.bc.sub_v,
+            reset = self.s.reset
+        );
 
         // Render each line in the range
         for line_idx in first_line..=last_line {
@@ -430,7 +434,12 @@ impl GlyphRenderer {
                 let mut combined: Vec<char> = vec![' '; line.len()];
                 // Priority: Primary > Secondary > Note (lower number = higher priority)
                 fn priority(c: char) -> u8 {
-                    match c { '^' => 0, '~' => 1, '-' => 2, _ => 3 }
+                    match c {
+                        '^' => 0,
+                        '~' => 1,
+                        '-' => 2,
+                        _ => 3,
+                    }
                 }
                 for (col, ulen, underline_char, _msg) in &underlines {
                     let end = std::cmp::min(col + ulen, line.len());
@@ -479,7 +488,12 @@ impl GlyphRenderer {
                     // render them as `| help: message` instead of `| message`,
                     // with the `help:` prefix in cyan (matching write_help_line).
                     let display_msg = if *ch == ' ' {
-                        format!("{cyan}help:{reset} {msg}", cyan = self.s.cyan, reset = self.s.reset, msg = msg)
+                        format!(
+                            "{cyan}help:{reset} {msg}",
+                            cyan = self.s.cyan,
+                            reset = self.s.reset,
+                            msg = msg
+                        )
                     } else {
                         (*msg).to_string()
                     };
@@ -654,16 +668,18 @@ fn line_start_byte(source: &str, line_idx: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnostics::Diagnostic;
     use crate::ast::Span;
+    use crate::diagnostics::Diagnostic;
 
     #[test]
     fn test_basic_error_render() {
         let source = "def a(x: Bool)\n  ensures @s > 1\n  {\n    set j = \"0xFFFF\";\n    set i = j + 1;\n    return @s @r i;\n  }\ndef main(){}";
-        let diag = Diagnostic::error("trait solver error: no trait implementation found for `Ord` on type `Int`")
-            .with_code_str("E030")
-            .with_span(Span::new(0, 106))
-            .with_source(source);
+        let diag = Diagnostic::error(
+            "trait solver error: no trait implementation found for `Ord` on type `Int`",
+        )
+        .with_code_str("E030")
+        .with_span(Span::new(0, 106))
+        .with_source(source);
         let renderer = GlyphRenderer::new(false);
         let output = renderer.render_diagnostic(&diag);
         println!("{}", output);

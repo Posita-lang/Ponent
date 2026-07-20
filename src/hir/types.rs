@@ -419,8 +419,11 @@ impl fmt::Display for TypeData {
         match self {
             TypeData::Regex { pattern } => write!(f, "Regex<\"{}\">", pattern),
             TypeData::Int { bits, signed, .. } => {
-                if *signed { write!(f, "Int<{}>", bits) }
-                else { write!(f, "UInt<{}>", bits) }
+                if *signed {
+                    write!(f, "Int<{}>", bits)
+                } else {
+                    write!(f, "UInt<{}>", bits)
+                }
             }
             TypeData::UInt { bits, .. } => write!(f, "UInt<{}>", bits),
             TypeData::Float { bits } => write!(f, "Float<{}>", bits),
@@ -429,30 +432,47 @@ impl fmt::Display for TypeData {
             TypeData::Byte => write!(f, "Byte"),
             TypeData::USize => write!(f, "USize"),
             TypeData::Adt { kind, def_id, .. } => {
-                if def_id == &DefId(usize::MAX) { write!(f, "Str") }
-                else { match kind { AdtKind::Struct => write!(f, "struct"), AdtKind::Enum => write!(f, "enum") } }
+                if def_id == &DefId(usize::MAX) {
+                    write!(f, "Str")
+                } else {
+                    match kind {
+                        AdtKind::Struct => write!(f, "struct"),
+                        AdtKind::Enum => write!(f, "enum"),
+                    }
+                }
             }
             TypeData::Tuple { elems } => {
                 write!(f, "(")?;
                 for (i, e) in elems.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}", e.tag())?;
                 }
-                if elems.len() == 1 { write!(f, ",")?; }
+                if elems.len() == 1 {
+                    write!(f, ",")?;
+                }
                 write!(f, ")")
             }
             TypeData::Array { elem, size } => write!(f, "[{}; {}]", elem.tag(), size),
             TypeData::Slice { elem } => write!(f, "&[{}]", elem.tag()),
             TypeData::Ref { ty, mutable } => {
-                if *mutable { write!(f, "&mut {}", ty.tag()) }
-                else { write!(f, "&{}", ty.tag()) }
+                if *mutable {
+                    write!(f, "&mut {}", ty.tag())
+                } else {
+                    write!(f, "&{}", ty.tag())
+                }
             }
             TypeData::Pointer { ty } => write!(f, "*{}", ty.tag()),
-            TypeData::Ptr { size, pointee } => write!(f, "Ptr<size={}, pointee={}>", size.tag(), pointee.tag()),
+            TypeData::Ptr { size, pointee } => {
+                write!(f, "Ptr<size={}, pointee={}>", size.tag(), pointee.tag())
+            }
             TypeData::Fn { params, ret } => {
                 write!(f, "fn(")?;
                 for (i, p) in params.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}", p.tag())?;
                 }
                 write!(f, ") -> {}", ret.tag())
@@ -466,7 +486,11 @@ impl fmt::Display for TypeData {
             TypeData::SkolemVar { .. } => write!(f, "skolem"),
             TypeData::Never => write!(f, "!"),
             TypeData::Error => write!(f, "!!"),
-            TypeData::Rational { int_bits, frac_bits, .. } => write!(f, "Rational<{}, {}>", int_bits, frac_bits),
+            TypeData::Rational {
+                int_bits,
+                frac_bits,
+                ..
+            } => write!(f, "Rational<{}, {}>", int_bits, frac_bits),
             _ => write!(f, "{:?}", self),
         }
     }
@@ -481,8 +505,11 @@ impl TypeData {
         match self {
             TypeData::Ref { ty, mutable } => {
                 let inner = ctx.get(*ty).display_with(ctx);
-                if *mutable { format!("&mut {}", inner) }
-                else { format!("&{}", inner) }
+                if *mutable {
+                    format!("&mut {}", inner)
+                } else {
+                    format!("&{}", inner)
+                }
             }
             TypeData::Slice { elem } => {
                 let inner = ctx.get(*elem).display_with(ctx);
@@ -493,25 +520,44 @@ impl TypeData {
                 format!("[{}; {}]", inner, size)
             }
             TypeData::Tuple { elems } => {
-                let parts: Vec<String> = elems.iter().map(|e| ctx.get(*e).display_with(ctx)).collect();
+                let parts: Vec<String> = elems
+                    .iter()
+                    .map(|e| ctx.get(*e).display_with(ctx))
+                    .collect();
                 format!("({})", parts.join(", "))
             }
             TypeData::Fn { params, ret } => {
-                let params: Vec<String> = params.iter().map(|p| ctx.get(*p).display_with(ctx)).collect();
+                let params: Vec<String> = params
+                    .iter()
+                    .map(|p| ctx.get(*p).display_with(ctx))
+                    .collect();
                 let ret = ctx.get(*ret).display_with(ctx);
                 format!("fn({}) -> {}", params.join(", "), ret)
             }
             TypeData::Ptr { size, pointee } => {
-                format!("Ptr<size={}, pointee={}>", ctx.get(*size).display_with(ctx), ctx.get(*pointee).display_with(ctx))
+                format!(
+                    "Ptr<size={}, pointee={}>",
+                    ctx.get(*size).display_with(ctx),
+                    ctx.get(*pointee).display_with(ctx)
+                )
             }
             TypeData::Pointer { ty } => format!("*{}", ctx.get(*ty).display_with(ctx)),
             TypeData::Adt { kind, def_id, .. } => {
-                if def_id == &DefId(usize::MAX) { "Str".to_string() }
-                else { match kind { AdtKind::Struct => "struct".to_string(), AdtKind::Enum => "enum".to_string() } }
+                if def_id == &DefId(usize::MAX) {
+                    "Str".to_string()
+                } else {
+                    match kind {
+                        AdtKind::Struct => "struct".to_string(),
+                        AdtKind::Enum => "enum".to_string(),
+                    }
+                }
             }
             TypeData::Int { bits, signed, .. } => {
-                if *signed { format!("Int<{}>", bits) }
-                else { format!("UInt<{}>", bits) }
+                if *signed {
+                    format!("Int<{}>", bits)
+                } else {
+                    format!("UInt<{}>", bits)
+                }
             }
             TypeData::UInt { bits, .. } => format!("UInt<{}>", bits),
             TypeData::Float { bits } => format!("Float<{}>", bits),
@@ -521,7 +567,11 @@ impl TypeData {
             TypeData::USize => "USize".to_string(),
             TypeData::Never => "!".to_string(),
             TypeData::Error => "!!".to_string(),
-            TypeData::Rational { int_bits, frac_bits, .. } => format!("Rational<{}, {}>", int_bits, frac_bits),
+            TypeData::Rational {
+                int_bits,
+                frac_bits,
+                ..
+            } => format!("Rational<{}, {}>", int_bits, frac_bits),
             TypeData::InferVar { id } => format!("infer#{}", id),
             // For all other types, use the Display trait (which shows TypeTag
             // for leaf types and doesn't need TypeContext).

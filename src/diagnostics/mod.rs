@@ -106,7 +106,9 @@ pub struct MultiSpan {
 
 impl MultiSpan {
     pub fn new(span: Span) -> Self {
-        MultiSpan { primary: vec![span] }
+        MultiSpan {
+            primary: vec![span],
+        }
     }
 
     pub fn push(&mut self, span: Span) {
@@ -341,7 +343,10 @@ impl Diagnostic {
 
     /// Get the main location string for display.
     pub fn location_string(&self) -> String {
-        self.spans.first().map(|s| format!("at {}", s)).unwrap_or_default()
+        self.spans
+            .first()
+            .map(|s| format!("at {}", s))
+            .unwrap_or_default()
     }
 }
 

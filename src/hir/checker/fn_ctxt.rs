@@ -228,7 +228,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             } => {
                 let (left_hir, left_ty) = self.infer_expr(left)?;
                 let (right_hir, right_ty) = self.infer_expr(right)?;
-                let result_ty = self.checker.binary_op_type(*op, left_ty, right_ty, Some(left.span()), Some(right.span()), *span)?;
+                let result_ty = self.checker.binary_op_type(
+                    *op,
+                    left_ty,
+                    right_ty,
+                    Some(left.span()),
+                    Some(right.span()),
+                    *span,
+                )?;
                 Ok((
                     HirExpr::BinaryOp {
                         left: Box::new(left_hir),
@@ -1568,7 +1575,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         other_span: Option<Span>,
         span: Span,
     ) -> Result<(), Diagnostic> {
-        self.checker.check_kind_compat(maybe_var, maybe_var_span, other, other_span, span)
+        self.checker
+            .check_kind_compat(maybe_var, maybe_var_span, other, other_span, span)
     }
 
     /// Resolve a syntactic type to a TypeId — actual implementation.
@@ -2110,7 +2118,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         right_span: Option<Span>,
         span: Span,
     ) -> Result<TypeId, Diagnostic> {
-        self.checker.binary_op_type(op, left, right, left_span, right_span, span)
+        self.checker
+            .binary_op_type(op, left, right, left_span, right_span, span)
     }
 
     /// Check a statement (delegates to TypeChecker).

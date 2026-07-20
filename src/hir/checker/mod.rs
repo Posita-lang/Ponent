@@ -1,5 +1,5 @@
 use crate::ast::*;
-use crate::diagnostics::{Diagnostic, DiagCtxt, Label};
+use crate::diagnostics::{DiagCtxt, Diagnostic, Label};
 use crate::hir::hir::*;
 use crate::hir::infer::*;
 use crate::hir::resolver::ResolutionMap;
@@ -177,10 +177,16 @@ pub(crate) struct VarScopeGuard {
 }
 
 impl VarScopeGuard {
-    fn new(frames: Rc<RefCell<Vec<HashMap<Symbol, TypeId>>>>, span_frames: Rc<RefCell<Vec<HashMap<Symbol, Span>>>>) -> Self {
+    fn new(
+        frames: Rc<RefCell<Vec<HashMap<Symbol, TypeId>>>>,
+        span_frames: Rc<RefCell<Vec<HashMap<Symbol, Span>>>>,
+    ) -> Self {
         frames.borrow_mut().push(HashMap::new());
         span_frames.borrow_mut().push(HashMap::new());
-        VarScopeGuard { frames, span_frames }
+        VarScopeGuard {
+            frames,
+            span_frames,
+        }
     }
 }
 
@@ -495,7 +501,8 @@ impl<'a> TypeChecker<'a> {
         // Save the obligations in a persistent local so that the retry pass
         // (after the old solver resolves inference variables) can reuse them.
         // The first pass drains the vector; the retry pass uses the saved copy.
-        let mut top_obligations: Vec<(Span, TraitPredicate)> = self.trait_obligations.drain(..).collect();
+        let mut top_obligations: Vec<(Span, TraitPredicate)> =
+            self.trait_obligations.drain(..).collect();
         // Also process any residual obligations salvaged from failed function bodies.
         top_obligations.extend(self.residual_trait_obligations.drain(..));
         if !top_obligations.is_empty() {
@@ -724,32 +731,29 @@ impl<'a> TypeChecker<'a> {
                 // are aggregated as children of this diagnostic.
                 let mut dup_diag: Option<Diagnostic> = None;
                 if let Some(var_name) = name {
-                    if self.local_variable_types.current_frame_contains(var_name.clone()) {
+                    if self
+                        .local_variable_types
+                        .current_frame_contains(var_name.clone())
+                    {
                         dup_diag = Some(
-                            Diagnostic::error(format!(
-                                "duplicate definition of `{}`",
-                                var_name,
-                            ))
-                            .with_code_str("E019")
-                            .with_span(*span)
-                            .with_secondary_label(
-                                self.span_get(var_name).unwrap_or(*span),
-                                "previous definition here",
-                            ),
+                            Diagnostic::error(format!("duplicate definition of `{}`", var_name,))
+                                .with_code_str("E019")
+                                .with_span(*span)
+                                .with_secondary_label(
+                                    self.span_get(var_name).unwrap_or(*span),
+                                    "previous definition here",
+                                ),
                         );
                     } else if self.local_variable_types.get(var_name.clone()).is_some() {
                         // Shadowing is allowed but warns.
                         self.diagnostics.push(
-                            Diagnostic::warning(format!(
-                                "shadowing definition of `{}`",
-                                var_name,
-                            ))
-                            .with_code_str("W113")
-                            .with_span(*span)
-                            .with_secondary_label(
-                                self.span_get(var_name).unwrap_or(*span),
-                                "previous definition here",
-                            ),
+                            Diagnostic::warning(format!("shadowing definition of `{}`", var_name,))
+                                .with_code_str("W113")
+                                .with_span(*span)
+                                .with_secondary_label(
+                                    self.span_get(var_name).unwrap_or(*span),
+                                    "previous definition here",
+                                ),
                         );
                     }
                 }
@@ -829,14 +833,12 @@ impl<'a> TypeChecker<'a> {
                     Ok(r) => r,
                     Err(rhs_err) => {
                         if let Some(ref mut d) = dup_diag {
-                            d.related_errors.push(
-                                crate::diagnostics::RelatedError {
-                                    code: rhs_err.code.clone(),
-                                    message: rhs_err.message.clone(),
-                                    span: rhs_err.spans.first(),
-                                    label: None,
-                                },
-                            );
+                            d.related_errors.push(crate::diagnostics::RelatedError {
+                                code: rhs_err.code.clone(),
+                                message: rhs_err.message.clone(),
+                                span: rhs_err.spans.first(),
+                                label: None,
+                            });
                         } else {
                             self.diagnostics.push(rhs_err);
                         }
@@ -1080,10 +1082,7 @@ impl<'a> TypeChecker<'a> {
                             guard.checker.local_variable_types.insert(*label, return_ty);
                             guard.checker.span_insert(*label, *span);
                         }
-                        let (_, ensures_ty) = match guard
-                            .checker
-                            .infer_expr(expr)
-                        {
+                        let (_, ensures_ty) = match guard.checker.infer_expr(expr) {
                             Ok(result) => result,
                             Err(diag) => {
                                 // ── Collect the error, don't swallow it ──
@@ -1551,7 +1550,8 @@ impl<'a> TypeChecker<'a> {
                     guard.checker.trait_obligations.drain(..).collect();
                 // Save all obligations for potential retry after guard.commit().
                 let all_bounds: Vec<(Span, TraitPredicate)> = {
-                    let mut bounds: Vec<(Span, TraitPredicate)> = caller_bounds.iter().map(|b| (*span, b.clone())).collect();
+                    let mut bounds: Vec<(Span, TraitPredicate)> =
+                        caller_bounds.iter().map(|b| (*span, b.clone())).collect();
                     bounds.extend(trait_obs.clone());
                     bounds
                 };
@@ -1689,10 +1689,7 @@ impl<'a> TypeChecker<'a> {
                         let symbols = unsafe { &*symbols_ptr };
                         let ctx = unsafe { &*ctx_ptr };
                         let msg = format_solve_errors(symbols, ctx, &errors);
-                        let err_span = errors
-                            .first()
-                            .and_then(|e| e.span())
-                            .unwrap_or(*span);
+                        let err_span = errors.first().and_then(|e| e.span()).unwrap_or(*span);
                         return Err(Diagnostic::error(format!("trait solver error: {}", msg))
                             .with_code_str("E030")
                             .with_span(err_span));
@@ -1811,7 +1808,8 @@ impl<'a> TypeChecker<'a> {
                 // time.  This catches obligations from both the function body
                 // and contract expressions (requires, ensures, etc.) that were
                 // deferred due to unresolved infer vars during the first pass.
-                let final_obs: Vec<(Span, TraitPredicate)> = self.trait_obligations.drain(..).collect();
+                let final_obs: Vec<(Span, TraitPredicate)> =
+                    self.trait_obligations.drain(..).collect();
                 if !final_obs.is_empty() {
                     let ctx: &mut TypeContext = &mut self.ctx;
                     let mut selcx = SelectionContext::new(
@@ -1947,10 +1945,7 @@ impl<'a> TypeChecker<'a> {
                         let symbols = unsafe { &*symbols_ptr };
                         let ctx = unsafe { &*ctx_ptr };
                         let msg = format_solve_errors(symbols, ctx, &errors);
-                        let err_span = errors
-                            .first()
-                            .and_then(|e| e.span())
-                            .unwrap_or(*span);
+                        let err_span = errors.first().and_then(|e| e.span()).unwrap_or(*span);
                         return Err(Diagnostic::error(format!("trait solver error: {}", msg))
                             .with_code_str("E030")
                             .with_span(err_span));
@@ -2438,7 +2433,8 @@ impl<'a> TypeChecker<'a> {
                 }
                 let (target_hir, target_ty) = self.infer_expr(target)?;
                 let value_hir = if let Some(op) = op {
-                    let result_ty = self.binary_op_type(*op, target_ty, target_ty, None, None, *span)?;
+                    let result_ty =
+                        self.binary_op_type(*op, target_ty, target_ty, None, None, *span)?;
                     self.unify_with(target_ty, result_ty, *span, TypingContext::None)?;
                     self.check_expr(value, Expectation::HasType(target_ty), TypingContext::None)?
                 } else {
@@ -3366,16 +3362,22 @@ impl<'a> TypeChecker<'a> {
             return Err(Diagnostic::error("operator not supported via traits").with_span(span));
         };
 
-        self.trait_obligations.push((span, TraitPredicate::Trait {
-            trait_id,
-            self_ty: left,
-            args: vec![],
-        }));
-        self.trait_obligations.push((span, TraitPredicate::Trait {
-            trait_id,
-            self_ty: right,
-            args: vec![],
-        }));
+        self.trait_obligations.push((
+            span,
+            TraitPredicate::Trait {
+                trait_id,
+                self_ty: left,
+                args: vec![],
+            },
+        ));
+        self.trait_obligations.push((
+            span,
+            TraitPredicate::Trait {
+                trait_id,
+                self_ty: right,
+                args: vec![],
+            },
+        ));
 
         // Comparison operators return bool.
         // Unify operands so that inference variables are resolved before
@@ -3485,12 +3487,14 @@ impl<'a> TypeChecker<'a> {
             let mut diag = match kind {
                 Some(TypeVariableKind::Bool) => {
                     if !self.ctx.is_bool(resolved_other) {
-                        Some(Diagnostic::error(format!(
-                            "type mismatch: expected `Bool`, found `{}`",
-                            other_type_str,
-                        ))
-                        .with_code_str("E030")
-                        .with_span(span))
+                        Some(
+                            Diagnostic::error(format!(
+                                "type mismatch: expected `Bool`, found `{}`",
+                                other_type_str,
+                            ))
+                            .with_code_str("E030")
+                            .with_span(span),
+                        )
                     } else {
                         None
                     }
@@ -3499,36 +3503,42 @@ impl<'a> TypeChecker<'a> {
                     if !self.ctx.is_integer(resolved_other)
                         && !matches!(self.ctx.get(resolved_other), TypeData::Rational { .. })
                     {
-                        Some(Diagnostic::error(format!(
-                            "type mismatch: expected integer type, found `{}`",
-                            other_type_str,
-                        ))
-                        .with_code_str("E030")
-                        .with_span(span))
+                        Some(
+                            Diagnostic::error(format!(
+                                "type mismatch: expected integer type, found `{}`",
+                                other_type_str,
+                            ))
+                            .with_code_str("E030")
+                            .with_span(span),
+                        )
                     } else {
                         None
                     }
                 }
                 Some(TypeVariableKind::Float) => {
                     if !self.ctx.is_float(resolved_other) {
-                        Some(Diagnostic::error(format!(
-                            "type mismatch: expected float type, found `{}`",
-                            other_type_str,
-                        ))
-                        .with_code_str("E030")
-                        .with_span(span))
+                        Some(
+                            Diagnostic::error(format!(
+                                "type mismatch: expected float type, found `{}`",
+                                other_type_str,
+                            ))
+                            .with_code_str("E030")
+                            .with_span(span),
+                        )
                     } else {
                         None
                     }
                 }
                 Some(TypeVariableKind::Numeric) => {
                     if !self.ctx.is_numeric(resolved_other) {
-                        Some(Diagnostic::error(format!(
-                            "type mismatch: expected numeric type, found `{}`",
-                            other_type_str,
-                        ))
-                        .with_code_str("E030")
-                        .with_span(span))
+                        Some(
+                            Diagnostic::error(format!(
+                                "type mismatch: expected numeric type, found `{}`",
+                                other_type_str,
+                            ))
+                            .with_code_str("E030")
+                            .with_span(span),
+                        )
                     } else {
                         None
                     }
@@ -3547,9 +3557,11 @@ impl<'a> TypeChecker<'a> {
                 }
                 // Trace the type origin: if the "other" operand's type came from
                 // a variable definition, show where it originated.
-                if let Some((_origin_name, origin_span)) = self.resolve_type_origin(resolved_other) {
+                if let Some((_origin_name, origin_span)) = self.resolve_type_origin(resolved_other)
+                {
                     if origin_span != other_span.unwrap_or(origin_span) {
-                        d.labels.push(Label::secondary(origin_span, "type originates here"));
+                        d.labels
+                            .push(Label::secondary(origin_span, "type originates here"));
                     }
                     // If the type is a string reference (&Str / &[Byte]),
                     // suggest that the programmer might have meant a numeric literal.
@@ -3563,13 +3575,11 @@ impl<'a> TypeChecker<'a> {
                         if matches!(inner, TypeData::Adt { def_id, .. } if *def_id == DefId(usize::MAX))
                             || matches!(inner, TypeData::Byte)
                         {
-                            d.labels.push(
-                                Label::help(
-                                    origin_span,
-                                    "this value is a string, not a number. \
+                            d.labels.push(Label::help(
+                                origin_span,
+                                "this value is a string, not a number. \
                                      Remove the quotes to use it as a numeric literal.",
-                                ),
-                            );
+                            ));
                         }
                     }
                 }
@@ -3645,7 +3655,8 @@ impl<'a> TypeChecker<'a> {
                 // Sized via Predicate::Sized, which triggers the builtin Sized
                 // check in candidate assembly.  If the type is still an infer var,
                 // the obligation is deferred and retried after the old solver runs.
-                self.trait_obligations.push((span, TraitPredicate::Sized { ty }));
+                self.trait_obligations
+                    .push((span, TraitPredicate::Sized { ty }));
             }
             _ => {} // concrete types and generic params: assumed Sized
         }

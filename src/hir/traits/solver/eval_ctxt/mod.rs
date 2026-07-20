@@ -248,7 +248,12 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
     ///
     /// Unifies `a` and `b`.  If either side is still an unresolved inference
     /// variable, returns `Deferred` so the caller can retry later.
-    pub fn compute_eq_goal(&mut self, a: TypeId, b: TypeId, span: Span) -> Result<ImplSource, SolveError> {
+    pub fn compute_eq_goal(
+        &mut self,
+        a: TypeId,
+        b: TypeId,
+        span: Span,
+    ) -> Result<ImplSource, SolveError> {
         let ctx = self.ctx();
         let ra = ctx.resolve_binding(a);
         let rb = ctx.resolve_binding(b);
@@ -269,7 +274,12 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
     ///
     /// Checks that `sub <: sup`.  If either side is still an unresolved
     /// inference variable, returns `Deferred` so the caller can retry later.
-    pub fn compute_sub_goal(&mut self, sub: TypeId, sup: TypeId, span: Span) -> Result<ImplSource, SolveError> {
+    pub fn compute_sub_goal(
+        &mut self,
+        sub: TypeId,
+        sup: TypeId,
+        span: Span,
+    ) -> Result<ImplSource, SolveError> {
         let ctx = self.ctx();
         let rsub = ctx.resolve_binding(sub);
         let rsup = ctx.resolve_binding(sup);
