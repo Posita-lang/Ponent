@@ -46,7 +46,7 @@ impl<'a, 'tcx> ScopeGuard<'a, 'tcx> {
     /// 2. Store the snapshot in `self.saved_tree` so `Drop` can restore
     ///    the region tree if solving panics.
     /// 3. On success discard the snapshot; on error restore it.
-    pub(crate) fn commit(mut self) -> Result<(), DiagnosticCollector> {
+    pub(crate) fn commit(mut self) -> Result<(), DiagCtxt> {
         if !self.should_restore {
             return Ok(());
         }
@@ -136,7 +136,7 @@ impl<'a> TypeChecker<'a> {
     pub(crate) fn solve_current_ctx(
         &mut self,
         current: &mut InferenceContext,
-    ) -> Result<(), DiagnosticCollector> {
+    ) -> Result<(), DiagCtxt> {
         // ── Dirty region propagation ─────────────────────────────
         current.region_tree.mark_current_dirty();
 
@@ -192,7 +192,10 @@ impl<'a> TypeChecker<'a> {
     /// Push a new scope frame for local variable bindings.
     /// Returns a guard that pops the frame on drop — safe even under `?`.
     pub(crate) fn enter_var_scope(&self) -> VarScopeGuard {
-        VarScopeGuard::new(self.local_variable_types.rc_clone())
+        VarScopeGuard::new(
+            self.local_variable_types.rc_clone(),
+            self.local_variable_spans.clone(),
+        )
     }
 
     /// Find the innermost break target.

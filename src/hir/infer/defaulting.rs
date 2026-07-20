@@ -56,19 +56,27 @@ pub fn default_variables(
             match kind {
                 TypeVariableKind::Integer => {
                     let default_ty = ctx.int(32, true);
-                    ctx.set_binding(ty_id, default_ty);
+                    // Set the binding on the ROOT of the resolution chain,
+                    // not on the intermediate `ty_id`.  If `ty_id` is an
+                    // intermediate variable in a unification chain (e.g.
+                    // `IntVar → return_ty`), setting the binding on `ty_id`
+                    // would overwrite the `IntVar → return_ty` link, causing
+                    // `resolve_binding(return_ty)` to return the unbound
+                    // `return_ty` instead of the defaulted type.
+                    // (omniml/lib/constraint_solver/defaulting.ml)
+                    ctx.set_binding(resolved, default_ty);
                 }
                 TypeVariableKind::Float => {
                     let default_ty = ctx.float(64);
-                    ctx.set_binding(ty_id, default_ty);
+                    ctx.set_binding(resolved, default_ty);
                 }
                 TypeVariableKind::Bool => {
                     let default_ty = ctx.bool();
-                    ctx.set_binding(ty_id, default_ty);
+                    ctx.set_binding(resolved, default_ty);
                 }
                 TypeVariableKind::Numeric => {
                     let default_ty = ctx.int(32, true);
-                    ctx.set_binding(ty_id, default_ty);
+                    ctx.set_binding(resolved, default_ty);
                 }
                 _ => {} // Unconstrained / Any handled in Pass 2
             }
@@ -87,13 +95,20 @@ pub fn default_variables(
                 .copied()
                 .unwrap_or((TypeVariableKind::Any, VarOrigin::Synthetic));
             // Expression-level Unconstrained/Any that was never resolved
-            // is a type inference failure — report it.
+            // is a type inference failure.  We do NOT return CannotInfer here
+            // because that would break the solver loop and prevent other
+            // obligations (e.g. trait resolution) from being processed.
+            // Instead, we let the variable fall through to the defaulting
+            // logic below, which binds it to ctx.error().  The error type
+            // then propagates through the type system — any downstream use
+            // of this variable will produce a concrete type error, surfacing
+            // the original inference failure naturally.
             if matches!(
                 kind,
                 TypeVariableKind::Unconstrained | TypeVariableKind::Any
             ) {
                 if let VarOrigin::Expression(Some(span)) = origin {
-                    return Err(TypeError::CannotInfer { span });
+                    // Fall through to defaulting: bound to ctx.error() below.
                 }
             }
             let default_ty = match kind {

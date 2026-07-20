@@ -1,24 +1,48 @@
 use super::{Diagnostic, EmissionGuarantee};
 
-/// Collects multiple diagnostics and provides utilities for error aggregation.
-/// Analogue to rustc's `DiagnosticBuilder` / `Handler` pattern.
+/// Global diagnostic context, analogous to rustc's `DiagCtxt`.
+/// Collects diagnostics and provides utilities for error aggregation.
+/// Thread-safe (within the compiler's single-threaded execution model)
+/// and controls whether warnings are emitted.
 #[derive(Debug, Clone)]
-pub struct DiagnosticCollector {
+pub struct DiagCtxt {
     diagnostics: Vec<Diagnostic>,
+    /// If false, warning-level diagnostics are suppressed.
+    pub can_emit_warnings: bool,
 }
 
-impl DiagnosticCollector {
+impl DiagCtxt {
     pub fn new() -> Self {
-        DiagnosticCollector {
+        DiagCtxt {
             diagnostics: Vec::new(),
+            can_emit_warnings: true,
         }
     }
 
-    /// Push a diagnostic into the collector and return an `EmissionGuarantee`
+    /// Push a diagnostic into the context and return an `EmissionGuarantee`
     /// proving the diagnostic was recorded (inspired by rustc's `ErrorGuaranteed`).
     pub fn push(&mut self, diag: Diagnostic) -> EmissionGuarantee {
+        if diag.is_warning() && !self.can_emit_warnings {
+            return EmissionGuarantee::emitted();
+        }
         self.diagnostics.push(diag);
         EmissionGuarantee::emitted()
+    }
+
+    /// Create and push an error diagnostic in one step.
+    pub fn error(&mut self, msg: impl Into<String>) -> EmissionGuarantee {
+        self.push(Diagnostic::error(msg))
+    }
+
+    /// Create and push a warning diagnostic in one step.
+    pub fn warn(&mut self, msg: impl Into<String>) -> EmissionGuarantee {
+        self.push(Diagnostic::warning(msg))
+    }
+
+    /// Create and push an error with a formatted message.
+    pub fn error_fmt(&mut self, msg: impl Into<String>, code: &str) -> EmissionGuarantee {
+        let diag = Diagnostic::error(msg).with_code_str(code);
+        self.push(diag)
     }
 
     pub fn extend(&mut self, diags: Vec<Diagnostic>) {
@@ -91,19 +115,22 @@ impl DiagnosticCollector {
     }
 }
 
-impl Default for DiagnosticCollector {
+impl Default for DiagCtxt {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl From<Vec<Diagnostic>> for DiagnosticCollector {
+impl From<Vec<Diagnostic>> for DiagCtxt {
     fn from(diags: Vec<Diagnostic>) -> Self {
-        DiagnosticCollector { diagnostics: diags }
+        DiagCtxt {
+            diagnostics: diags,
+            can_emit_warnings: true,
+        }
     }
 }
 
-impl IntoIterator for DiagnosticCollector {
+impl IntoIterator for DiagCtxt {
     type Item = Diagnostic;
     type IntoIter = std::vec::IntoIter<Diagnostic>;
 

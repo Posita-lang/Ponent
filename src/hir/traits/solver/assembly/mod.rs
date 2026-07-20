@@ -393,16 +393,16 @@ pub(super) fn assemble_and_evaluate_candidates<D: SolverDelegate>(
             );
         }
         Predicate::Eq { a, b } => {
-            return ecx.compute_eq_goal(*a, *b);
+            return ecx.compute_eq_goal(*a, *b, obligation.cause.span);
         }
         Predicate::Sub { sub, sup } => {
-            return ecx.compute_sub_goal(*sub, *sup);
+            return ecx.compute_sub_goal(*sub, *sup, obligation.cause.span);
         }
         Predicate::Match {
             scrutinee,
             branches_id,
         } => {
-            return ecx.compute_match_goal(*scrutinee, *branches_id);
+            return ecx.compute_match_goal(*scrutinee, *branches_id, obligation.cause.span);
         }
         Predicate::Forall { body } => {
             return ecx.compute_forall_goal(body, &obligation.cause, obligation.recursion_depth);

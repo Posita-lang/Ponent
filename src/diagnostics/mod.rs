@@ -10,16 +10,18 @@ pub mod chain;
 pub mod collector;
 pub mod emitter;
 pub mod error_code;
+pub mod glyph;
 pub mod label;
 pub mod level;
 
 pub use chain::CallChain;
-pub use collector::DiagnosticCollector;
+pub use collector::DiagCtxt;
 pub use emitter::{
     DiagnosticEmitter, colored::ColoredEmitter, html::HtmlEmitter, json::JsonEmitter,
     plain::PlainEmitter,
 };
-pub use error_code::{ErrorCategory, ErrorCode};
+pub use error_code::{ErrorCategory, ErrorCode, WarningCode};
+pub use glyph::GlyphRenderer;
 pub use label::{AnnotationKind, Label, SourceContext};
 pub use level::DiagnosticLevel;
 
@@ -30,10 +32,9 @@ use std::fmt;
 
 /// A token proving that a diagnostic (error or warning) has been emitted.
 ///
-/// Functions that can fail should return `Result<T, Diagnostic>` and the
-/// caller pushes it into the collector.  `EmissionGuarantee` tracks
-/// whether the diagnostic was *actually* pushed, preventing "silent
-/// swallowing" of errors.
+/// Functions that can fail should return `DiagResult<T>` and the caller
+/// pushes it into the collector.  `EmissionGuarantee` tracks whether the
+/// diagnostic was *actually* pushed, preventing "silent swallowing" of errors.
 ///
 /// See rustc's `ErrorGuaranteed` for the original pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +46,75 @@ impl EmissionGuarantee {
     /// The emitted diagnostic was an error or warning.
     pub fn emitted() -> Self {
         EmissionGuarantee { _private: () }
+    }
+}
+
+/// A `Result` that guarantees a diagnostic (error or warning) has been
+/// emitted on the `Err` path.  Analogous to rustc's `Result<T, ErrorGuaranteed>`
+/// pattern — the `Err` variant carries an `EmissionGuarantee` proving that
+/// the diagnostic was recorded, rather than carrying the diagnostic itself.
+pub type DiagResult<T> = Result<T, EmissionGuaranteed>;
+
+/// Opaque wrapper around `EmissionGuarantee` for use in `DiagResult`.
+/// Functions that return `DiagResult<T>` produce an `EmissionGuaranteed`
+/// on the error path, proving a diagnostic was emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmissionGuaranteed(EmissionGuarantee);
+
+/// A lazily-formatted diagnostic message, analogous to rustc's `DiagMessage`.
+/// Currently a simple wrapper around `String`; future versions may support
+/// delayed formatting with arguments.
+#[derive(Debug, Clone)]
+pub struct DiagMessage {
+    inner: String,
+}
+
+impl DiagMessage {
+    pub fn new(msg: impl Into<String>) -> Self {
+        DiagMessage { inner: msg.into() }
+    }
+
+    pub fn into_string(self) -> String {
+        self.inner
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.inner
+    }
+}
+
+impl From<String> for DiagMessage {
+    fn from(s: String) -> Self {
+        DiagMessage::new(s)
+    }
+}
+
+impl From<&str> for DiagMessage {
+    fn from(s: &str) -> Self {
+        DiagMessage::new(s)
+    }
+}
+
+/// A set of spans that a diagnostic points to, supporting multiple primary
+/// locations.  Analogous to rustc's `MultiSpan`.  When there is a single
+/// primary span, `primary` contains one element; for multiple (e.g. a
+/// duplicate definition + the previous definition), both are primary.
+#[derive(Debug, Clone, Default)]
+pub struct MultiSpan {
+    pub primary: Vec<Span>,
+}
+
+impl MultiSpan {
+    pub fn new(span: Span) -> Self {
+        MultiSpan { primary: vec![span] }
+    }
+
+    pub fn push(&mut self, span: Span) {
+        self.primary.push(span);
+    }
+
+    pub fn first(&self) -> Option<Span> {
+        self.primary.first().copied()
     }
 }
 
@@ -60,7 +130,10 @@ pub struct Diagnostic {
     pub level: DiagnosticLevel,
     pub message: String,
     pub code: Option<ErrorCode>,
-    pub span: Option<Span>,
+    /// Warning code (e.g. `WarningCode::Shadowing` → "W113").
+    pub warning_code: Option<WarningCode>,
+    /// Primary spans (multiple for multi-location diagnostics).
+    pub spans: MultiSpan,
     pub help: Option<String>,
     pub suggestions: Vec<String>,
     /// Multi-span annotations for source-context rendering
@@ -72,6 +145,9 @@ pub struct Diagnostic {
     /// Child diagnostics (notes, help messages attached to this diagnostic).
     /// Inspired by rustc's `Subdiag` — emitted immediately after the parent.
     pub children: Vec<Subdiag>,
+    /// Related errors displayed alongside this diagnostic in a single merged box.
+    /// Each related error has its own error code, message, and optional span.
+    pub related_errors: Vec<RelatedError>,
 }
 
 /// A child diagnostic attached to a parent `Diagnostic`.
@@ -83,6 +159,18 @@ pub struct Subdiag {
     pub message: String,
     pub span: Option<Span>,
     pub labels: Vec<Label>,
+}
+
+/// A related error displayed alongside the primary diagnostic in a single
+/// merged box.  Each related error has its own error code, message, and
+/// optional source span — for example, a type mismatch [E030] aggregated
+/// into a duplicate definition [E019] diagnostic.
+#[derive(Debug, Clone)]
+pub struct RelatedError {
+    pub code: Option<ErrorCode>,
+    pub message: String,
+    pub span: Option<Span>,
+    pub label: Option<String>,
 }
 
 impl Subdiag {
@@ -127,13 +215,15 @@ impl Diagnostic {
             level,
             message: message.into(),
             code: None,
-            span: None,
+            warning_code: None,
+            spans: MultiSpan::default(),
             help: None,
             suggestions: Vec::new(),
             labels: Vec::new(),
             call_chain: None,
             source: None,
             children: Vec::new(),
+            related_errors: Vec::new(),
         }
     }
 
@@ -161,7 +251,13 @@ impl Diagnostic {
 
     /// Set the primary source span for this diagnostic.
     pub fn with_span(mut self, span: Span) -> Self {
-        self.span = Some(span);
+        self.spans = MultiSpan::new(span);
+        self
+    }
+
+    /// Add a secondary primary span (for multi-location diagnostics).
+    pub fn with_additional_span(mut self, span: Span) -> Self {
+        self.spans.push(span);
         self
     }
 
@@ -174,12 +270,11 @@ impl Diagnostic {
     /// Convenience: set error code by string (backward compat).
     /// Prefer `with_code(ErrorCode::...)` for the new enum-based API.
     pub fn with_code_str(mut self, code: impl Into<String>) -> Self {
-        // Try to parse the string into an ErrorCode; if it fails, store as-is via note
         let code_str = code.into();
-        // We'll just store it by trying to find a matching code
-        // For now, just set the string
         if let Some(ec) = ErrorCode::from_str(&code_str) {
             self.code = Some(ec);
+        } else if let Some(wc) = WarningCode::from_str(&code_str) {
+            self.warning_code = Some(wc);
         }
         self
     }
@@ -214,6 +309,14 @@ impl Diagnostic {
         self
     }
 
+    /// Attach a related error to be displayed alongside this diagnostic
+    /// in a single merged box (e.g. a type mismatch aggregated into a
+    /// duplicate definition diagnostic).
+    pub fn with_related(mut self, err: RelatedError) -> Self {
+        self.related_errors.push(err);
+        self
+    }
+
     /// Attach a call chain (Zig-style `referenced by`).
     pub fn with_call_chain(mut self, chain: CallChain) -> Self {
         self.call_chain = Some(chain);
@@ -238,7 +341,7 @@ impl Diagnostic {
 
     /// Get the main location string for display.
     pub fn location_string(&self) -> String {
-        self.span.map(|s| format!("at {}", s)).unwrap_or_default()
+        self.spans.first().map(|s| format!("at {}", s)).unwrap_or_default()
     }
 }
 
@@ -263,6 +366,7 @@ impl ErrorCode {
             "E016" => Some(ErrorCode::NoDefaultValue),
             "E017" => Some(ErrorCode::ArraySizeNotConstant),
             "E018" => Some(ErrorCode::UnexpectedTopLevel),
+            "E019" => Some(ErrorCode::DuplicateDefinition),
             "E020" => Some(ErrorCode::ContractNonBool),
             "E021" => Some(ErrorCode::EnsuresNonBool),
             "E022" => Some(ErrorCode::DecreasesNonInt),
@@ -371,8 +475,8 @@ pub fn emit_diagnostics(diags: &[Diagnostic], use_color: bool) {
     }
 }
 
-/// Convenience function to emit a DiagnosticCollector.
-pub fn emit_collector(collector: &DiagnosticCollector, use_color: bool) {
+/// Convenience function to emit a DiagCtxt.
+pub fn emit_collector(collector: &DiagCtxt, use_color: bool) {
     let diags: Vec<Diagnostic> = collector.iter().cloned().collect();
     emit_diagnostics(&diags, use_color);
 }
@@ -432,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_diagnostic_collector() {
-        let mut collector = DiagnosticCollector::new();
+        let mut collector = DiagCtxt::new();
         collector.push(Diagnostic::error("first error").with_code(ErrorCode::TypeMismatch));
         collector.push(Diagnostic::warning("first warning"));
         assert_eq!(collector.len(), 2);

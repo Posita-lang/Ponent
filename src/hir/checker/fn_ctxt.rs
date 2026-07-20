@@ -128,17 +128,42 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub fn infer_expr(&mut self, expr: &Expr) -> Result<(HirExpr, TypeId), Diagnostic> {
         match expr {
             Expr::Literal(lit, span) => {
-                let kind = match lit {
-                    Literal::Int(_) => TypeVariableKind::Integer,
-                    Literal::Float(_) => TypeVariableKind::Float,
-                    Literal::Bool(_) => TypeVariableKind::Bool,
-                    Literal::Char(_) | Literal::String(_) | Literal::ByteString(_) => {
-                        TypeVariableKind::Any
+                match lit {
+                    Literal::Int(_) => {
+                        let ty = self.new_infer_var(
+                            TypeVariableKind::Integer,
+                            crate::hir::infer::VarOrigin::Expression(Some(*span)),
+                        );
+                        Ok((HirExpr::Literal(lit.clone(), ty, *span), ty))
                     }
-                };
-                let ty =
-                    self.new_infer_var(kind, crate::hir::infer::VarOrigin::Expression(Some(*span)));
-                Ok((HirExpr::Literal(lit.clone(), ty, *span), ty))
+                    Literal::Float(_) => {
+                        let ty = self.new_infer_var(
+                            TypeVariableKind::Float,
+                            crate::hir::infer::VarOrigin::Expression(Some(*span)),
+                        );
+                        Ok((HirExpr::Literal(lit.clone(), ty, *span), ty))
+                    }
+                    Literal::Bool(_) => {
+                        let ty = self.checker.ctx.bool();
+                        Ok((HirExpr::Literal(lit.clone(), ty, *span), ty))
+                    }
+                    Literal::Char(_) => {
+                        let ty = self.checker.ctx.char();
+                        Ok((HirExpr::Literal(lit.clone(), ty, *span), ty))
+                    }
+                    Literal::String(_) => {
+                        // String literals have type `&Str` (SYNTAX.md).
+                        // This is a reference to the built-in `Str` type,
+                        // not `&[Byte]` (which is for byte string literals).
+                        let ty = self.checker.ctx.str_ref();
+                        Ok((HirExpr::Literal(lit.clone(), ty, *span), ty))
+                    }
+                    Literal::ByteString(_) => {
+                        // Byte string literals have type `&[Byte]` (SYNTAX.md).
+                        let ty = self.checker.ctx.slice(self.checker.ctx.byte());
+                        Ok((HirExpr::Literal(lit.clone(), ty, *span), ty))
+                    }
+                }
             }
             Expr::Ident(name, span) => {
                 // Check the local variable type cache first (set by VariableDef)
@@ -203,7 +228,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             } => {
                 let (left_hir, left_ty) = self.infer_expr(left)?;
                 let (right_hir, right_ty) = self.infer_expr(right)?;
-                let result_ty = self.checker.binary_op_type(*op, left_ty, right_ty, *span)?;
+                let result_ty = self.checker.binary_op_type(*op, left_ty, right_ty, Some(left.span()), Some(right.span()), *span)?;
                 Ok((
                     HirExpr::BinaryOp {
                         left: Box::new(left_hir),
@@ -1524,8 +1549,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // if the inferred type is an InferVar with a kind constraint
             // (e.g. Bool from a `true` literal, Integer from `42`),
             // verify that the expected type is compatible with that kind.
-            self.check_kind_compat(ty, expected_ty, hir.span())?;
-            self.check_kind_compat(expected_ty, ty, hir.span())?;
+            self.check_kind_compat(ty, None, expected_ty, None, hir.span())?;
+            self.check_kind_compat(expected_ty, None, ty, None, hir.span())?;
             self.unify_with(expected_ty, ty, hir.span(), ctx)?;
         }
         Ok(hir)
@@ -1538,10 +1563,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     fn check_kind_compat(
         &self,
         maybe_var: TypeId,
+        maybe_var_span: Option<Span>,
         other: TypeId,
+        other_span: Option<Span>,
         span: Span,
     ) -> Result<(), Diagnostic> {
-        self.checker.check_kind_compat(maybe_var, other, span)
+        self.checker.check_kind_compat(maybe_var, maybe_var_span, other, other_span, span)
     }
 
     /// Resolve a syntactic type to a TypeId — actual implementation.
@@ -2079,9 +2106,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         op: BinOp,
         left: TypeId,
         right: TypeId,
+        left_span: Option<Span>,
+        right_span: Option<Span>,
         span: Span,
     ) -> Result<TypeId, Diagnostic> {
-        self.checker.binary_op_type(op, left, right, span)
+        self.checker.binary_op_type(op, left, right, left_span, right_span, span)
     }
 
     /// Check a statement (delegates to TypeChecker).

@@ -35,7 +35,7 @@ impl super::DiagnosticEmitter for HtmlEmitter {
              .diag.help { border-left: 4px solid #94e2d5; background: #1e2a2a; }\n\
              .diag.code { color: #89b4fa; font-weight: bold; }\n\
              .diag.message { color: #cdd6f4; }\n\
-             .diag.span { color: #6c7086; }\n\
+             .diag .span { color: #6c7086; }\n\
              .diag .suggestion { color: #a6e3a1; }\n\
              .diag .help-text { color: #94e2d5; }\n\
              .chain { margin-left: 20px; color: #6c7086; font-size: 0.9em; }\n\
@@ -94,12 +94,12 @@ impl HtmlEmitter {
         ));
 
         // Span location
-        if let Some(span) = diag.span {
+        if let Some(span) = diag.spans.first() {
             html.push_str(&format!("<div class='span'>at {}</div>\n", span));
         }
 
         // Source context
-        if let (Some(span), Some(source)) = (diag.span, diag.source.as_ref()) {
+        if let (Some(span), Some(source)) = (diag.spans.first(), diag.source.as_ref()) {
             let ctx =
                 crate::diagnostics::label::SourceContext::new(source.as_str(), span, "<input>", 2);
             let rendered = ctx.render(span, &diag.labels, false);

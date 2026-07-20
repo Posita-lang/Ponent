@@ -1613,8 +1613,8 @@ fn test_generic_return() {
 }
 
 #[test]
-fn test_variable_shadowing() {
-    // Variable shadowing in same scope
+fn test_variable_duplicate_in_same_scope() {
+    // Duplicate definition in the same scope is an error.
     let result = check_source(
         "def main() -> Int<32> {
              set x = 1;
@@ -1622,7 +1622,13 @@ fn test_variable_shadowing() {
              return x;
          }",
     );
-    assert!(result.is_ok(), "shadowing: {:?}", result.err());
+    assert!(result.is_err(), "duplicate definition in same scope should be rejected");
+    let errs = result.unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("duplicate definition")),
+        "expected duplicate definition error: {:?}",
+        errs
+    );
 }
 
 #[test]
@@ -2457,6 +2463,41 @@ mod test_regex {
             program.is_ok(),
             "100KB regex should not crash parser: {:?}",
             program.err()
+        );
+    }
+
+    #[test]
+    fn test_trait_obligations_salvaged_after_failed_function_body() {
+        // Regression test: if a function body fails before the
+        // trait_obligations drain site, the obligations must be salvaged
+        // into residual_trait_obligations and processed at the top level.
+        //
+        // Source: `ensures @s > 1` pushes an `Ord(Int)` obligation.
+        // `set i = j + 1` (String + Int) fails the function body.
+        // The second function `def main(){}` triggers the salvage path.
+        let result = check_source(
+            "def a(x:Bool)
+                 ensures @s > 1
+                 ensures @r > 0
+               {
+                 set j = \"0xFFFF\";
+                 set i = j + 1;
+                 return @s @r i;
+               }
+             def main(){}",
+        );
+        // The `Ord` obligation should survive the function body failure.
+        // The actual error is now a type mismatch between integer and `&Str`
+        // (from `set i = j + 1`), not an `Ord`-not-found false positive.
+        assert!(
+            result.is_err(),
+            "expected type mismatch error, but type-checking succeeded"
+        );
+        let errs = result.unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("type mismatch") && e.contains("&Str")),
+            "expected type mismatch with &Str, got: {:?}",
+            errs
         );
     }
 }

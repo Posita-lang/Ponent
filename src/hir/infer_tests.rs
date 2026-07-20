@@ -1166,13 +1166,14 @@ fn test_defaulting_unconstrained_kind() {
 }
 
 #[test]
-fn test_defaulting_expression_var_returns_cannot_infer() {
+fn test_defaulting_expression_var_defaults_to_error() {
     let mut ctx = new_ctx();
     let mut infer = new_infer();
     let (symbols, trait_env) = default_env();
 
     // An expression-level variable with Unconstrained kind and no constraints
-    // should produce CannotInfer
+    // should now default to ctx.error() instead of returning CannotInfer.
+    // This allows the solver to continue processing other obligations.
     let var = infer.new_type_var(
         &mut ctx,
         TypeVariableKind::Unconstrained,
@@ -1180,9 +1181,15 @@ fn test_defaulting_expression_var_returns_cannot_infer() {
     );
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
     assert!(
-        matches!(result, Err(TypeError::CannotInfer { .. })),
-        "expression-level var without constraints should return CannotInfer, got {:?}",
+        result.is_ok(),
+        "expression-level var without constraints should default to Error, got {:?}",
         result
+    );
+    let resolved = ctx.resolve_binding(var);
+    assert!(
+        matches!(ctx.get(resolved), TypeData::Error),
+        "Unconstrained var should default to Error, got {:?}",
+        ctx.get(resolved)
     );
 }
 

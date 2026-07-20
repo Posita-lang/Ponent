@@ -4199,11 +4199,22 @@ impl Parser {
                         .unwrap_or_else(|| "try `42`, `true`, `x`, `if cond { a } else { b }`, or `|x| { x + 1 }`".into())
                 )
                 .with_span(self.span(),)),
-            _ => Err(Diagnostic::error("expected expression")
-                .with_code_str("E007")
-                .with_help("expected a valid expression — try a literal, variable, `if`, `match`, `|...| { }` closure, or prefix operator")
-                .with_suggestion("try `42`, `true`, `x`, `if cond { a } else { b }`, or `|x| { x + 1 }`")
-                .with_span(self.span(),)),
+            _ => {
+                let mut diag = Diagnostic::error("expected expression")
+                    .with_code_str("E007")
+                    .with_span(self.span());
+                // Detect unexpected `;` — likely a double semicolon.
+                if let Ok(Token::Semicolon) = self.peek() {
+                    diag = diag
+                        .with_help("remove this extra semicolon")
+                        .with_suggestion("remove the `;` here");
+                } else {
+                    diag = diag
+                        .with_help("expected a valid expression — try a literal, variable, `if`, `match`, `|...| { }` closure, or prefix operator")
+                        .with_suggestion("try `42`, `true`, `x`, `if cond { a } else { b }`, or `|x| { x + 1 }`");
+                }
+                Err(diag)
+            }
         }
     }
 

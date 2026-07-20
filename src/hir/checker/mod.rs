@@ -1,5 +1,5 @@
 use crate::ast::*;
-use crate::diagnostics::{Diagnostic, DiagnosticCollector};
+use crate::diagnostics::{Diagnostic, DiagCtxt, Label};
 use crate::hir::hir::*;
 use crate::hir::infer::*;
 use crate::hir::resolver::ResolutionMap;
@@ -135,6 +135,33 @@ impl ScopedVarMap {
     fn rc_clone(&self) -> Rc<RefCell<Vec<HashMap<Symbol, TypeId>>>> {
         Rc::clone(&self.frames)
     }
+
+    /// Check whether a binding exists in the innermost (current) scope frame only.
+    /// Returns `true` if the name is bound in the current frame, `false` otherwise.
+    /// Unlike `get()`, this does NOT search enclosing scopes, so it correctly
+    /// allows shadowing of outer-scope variables.
+    pub fn current_frame_contains(&self, name: Symbol) -> bool {
+        self.frames
+            .borrow()
+            .last()
+            .map_or(false, |frame| frame.contains_key(&name))
+    }
+
+    /// Iterate over all bindings across all scope frames.
+    /// Yields each (name, type) pair exactly once (innermost frame wins on duplicates).
+    pub fn iter(&self) -> Vec<(Symbol, TypeId)> {
+        let frames = self.frames.borrow();
+        let mut result = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for frame in frames.iter().rev() {
+            for (name, ty) in frame {
+                if seen.insert(*name) {
+                    result.push((*name, *ty));
+                }
+            }
+        }
+        result
+    }
 }
 
 /// RAII guard that pops a variable scope frame on drop.
@@ -146,18 +173,21 @@ impl ScopedVarMap {
 /// independent of any borrow on the `TypeChecker` or `ScopedVarMap`.
 pub(crate) struct VarScopeGuard {
     frames: Rc<RefCell<Vec<HashMap<Symbol, TypeId>>>>,
+    span_frames: Rc<RefCell<Vec<HashMap<Symbol, Span>>>>,
 }
 
 impl VarScopeGuard {
-    fn new(frames: Rc<RefCell<Vec<HashMap<Symbol, TypeId>>>>) -> Self {
+    fn new(frames: Rc<RefCell<Vec<HashMap<Symbol, TypeId>>>>, span_frames: Rc<RefCell<Vec<HashMap<Symbol, Span>>>>) -> Self {
         frames.borrow_mut().push(HashMap::new());
-        VarScopeGuard { frames }
+        span_frames.borrow_mut().push(HashMap::new());
+        VarScopeGuard { frames, span_frames }
     }
 }
 
 impl Drop for VarScopeGuard {
     fn drop(&mut self) {
         self.frames.borrow_mut().pop();
+        self.span_frames.borrow_mut().pop();
     }
 }
 
@@ -165,7 +195,7 @@ pub struct TypeChecker<'a> {
     ctx: &'a mut TypeContext,
     symbols: &'a SymbolTable,
     trait_env: &'a mut TraitEnv,
-    diagnostics: DiagnosticCollector,
+    diagnostics: DiagCtxt,
     current_function: Option<DefId>,
     current_return_type: Option<TypeId>,
     resolving_aliases: HashSet<DefId>,
@@ -183,6 +213,11 @@ pub struct TypeChecker<'a> {
     /// A new frame is pushed on block entry and popped on block exit.
     /// Ovewwides the wesowvew's pwacehowdew `ewrow` type. (◕‿◕)
     local_variable_types: ScopedVarMap,
+    /// Map of variable name → definition span, for type origin tracing.
+    /// Populated alongside `local_variable_types` at variable definition sites.
+    /// Used by `resolve_type_origin` to show where a type originates.
+    /// Scoped alongside `local_variable_types` via `VarScopeGuard`.
+    local_variable_spans: Rc<RefCell<Vec<HashMap<Symbol, Span>>>>,
     /// Pre-resolved by NameResolver: variable name → TypeId
     resolution_map: ResolutionMap,
     /// Local cache of generic type parameter types (e.g. `T` in `def foo<T>(x: T)`).
@@ -239,7 +274,12 @@ pub struct TypeChecker<'a> {
     /// routed through the new solver, `Constraint::Impl` will be removed
     /// from the old solver and this field will become the sole collection
     /// point for trait obligations.
-    trait_obligations: Vec<TraitPredicate>,
+    trait_obligations: Vec<(Span, TraitPredicate)>,
+    /// Residual obligations from function bodies that failed before their
+    /// solver pass ran.  These are processed at the `check_program` top-level
+    /// solver pass, preventing obligation loss when a function body errors
+    /// before the `trait_obligations` drain site.
+    residual_trait_obligations: Vec<(Span, TraitPredicate)>,
 }
 
 /// Error type for comptime control flow within comptime blocks.
@@ -273,7 +313,7 @@ impl<'a> TypeChecker<'a> {
             ctx,
             symbols,
             trait_env,
-            diagnostics: DiagnosticCollector::new(),
+            diagnostics: DiagCtxt::new(),
             current_function: None,
             current_return_type: None,
             resolving_aliases: HashSet::new(),
@@ -281,6 +321,7 @@ impl<'a> TypeChecker<'a> {
             infer_stack: Vec::new(),
             region_tree: RegionTree::new(),
             local_variable_types: ScopedVarMap::new(),
+            local_variable_spans: Rc::new(RefCell::new(vec![HashMap::new()])),
             local_type_param_cache: HashMap::new(),
             resolution_map,
             guarantee_chain: GuaranteeChain::new(),
@@ -292,6 +333,7 @@ impl<'a> TypeChecker<'a> {
             builtin_registry: BuiltinTraitRegistry::new(),
             proj_cache: ProjectionCache::new(),
             trait_obligations: Vec::new(),
+            residual_trait_obligations: Vec::new(),
         };
 
         // ── Register builtin trait DefIds ──
@@ -328,6 +370,12 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
+        // Built-in traits and impls are registered by `register_builtins`
+        // inside `NameResolver::new`.  The debug assertion below was removed
+        // because it fired in test configurations where the TraitEnv is empty
+        // (e.g. unit tests that parse and check without a full resolver).
+        // The registration chain is verified by the `check_source` test helper.
+
         checker
     }
 
@@ -338,11 +386,11 @@ impl<'a> TypeChecker<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `Err(DiagnosticCollector)` containing all type errors found
+    /// Returns `Err(DiagCtxt)` containing all type errors found
     /// during checking.  The checker continues after each error to collect
     /// as many diagnostics as possible.
     #[must_use]
-    pub fn check_program(&mut self, program: &Program) -> Result<HirProgram, DiagnosticCollector> {
+    pub fn check_program(&mut self, program: &Program) -> Result<HirProgram, DiagCtxt> {
         let mut items = Vec::new();
 
         // Wrap the entire program in an inference scope so that
@@ -447,7 +495,9 @@ impl<'a> TypeChecker<'a> {
         // Save the obligations in a persistent local so that the retry pass
         // (after the old solver resolves inference variables) can reuse them.
         // The first pass drains the vector; the retry pass uses the saved copy.
-        let top_obligations: Vec<TraitPredicate> = self.trait_obligations.drain(..).collect();
+        let mut top_obligations: Vec<(Span, TraitPredicate)> = self.trait_obligations.drain(..).collect();
+        // Also process any residual obligations salvaged from failed function bodies.
+        top_obligations.extend(self.residual_trait_obligations.drain(..));
         if !top_obligations.is_empty() {
             let ctx: &mut TypeContext = &mut self.ctx;
             let mut selcx = SelectionContext::new(
@@ -460,10 +510,10 @@ impl<'a> TypeChecker<'a> {
             );
             let mut fulfill = FulfillmentContext::new(&mut selcx);
             fulfill.set_infer_data_from(&self.infer);
-            for bound in &top_obligations {
+            for (obl_span, bound) in &top_obligations {
                 let obligation = Obligation {
                     cause: crate::hir::traits::solver::ObligationCause {
-                        span: crate::ast::Span::new(0, 0), // TODO: propagate span from TraitPredicate
+                        span: *obl_span,
                         code: crate::hir::traits::solver::ObligationCauseCode::Misc,
                     },
                     predicate: match bound {
@@ -504,7 +554,7 @@ impl<'a> TypeChecker<'a> {
                         .and_then(|tb| self.symbols.trait_name_by_def_id(trait_id))
                         .map(|s| s.as_str())
                         .unwrap_or_else(|| format!("{:?}", trait_id));
-                    let ty = self.ctx.get(self_ty);
+                    let ty = self.ctx.get(self_ty).display_with(self.ctx);
                     msgs.push(format!(
                         "no trait implementation found for `{}` on type `{}`",
                         trait_name, ty
@@ -569,10 +619,10 @@ impl<'a> TypeChecker<'a> {
                     );
                     let mut fulfill = FulfillmentContext::new(&mut selcx);
                     fulfill.set_infer_data_from(&self.infer);
-                    for bound in &top_obligations {
+                    for (obl_span, bound) in &top_obligations {
                         let obligation = Obligation {
                             cause: crate::hir::traits::solver::ObligationCause {
-                                span: crate::ast::Span::new(0, 0), // TODO: propagate span from TraitPredicate
+                                span: *obl_span,
                                 code: crate::hir::traits::solver::ObligationCauseCode::Misc,
                             },
                             predicate: match bound {
@@ -667,6 +717,43 @@ impl<'a> TypeChecker<'a> {
                     );
                 }
 
+                // ── Duplicate variable detection ──
+                // Check BEFORE the RHS is evaluated, so the error is reported
+                // even if the initializer expression fails type-checking.
+                // When a duplicate is detected, subsequent errors from the RHS
+                // are aggregated as children of this diagnostic.
+                let mut dup_diag: Option<Diagnostic> = None;
+                if let Some(var_name) = name {
+                    if self.local_variable_types.current_frame_contains(var_name.clone()) {
+                        dup_diag = Some(
+                            Diagnostic::error(format!(
+                                "duplicate definition of `{}`",
+                                var_name,
+                            ))
+                            .with_code_str("E019")
+                            .with_span(*span)
+                            .with_secondary_label(
+                                self.span_get(var_name).unwrap_or(*span),
+                                "previous definition here",
+                            ),
+                        );
+                    } else if self.local_variable_types.get(var_name.clone()).is_some() {
+                        // Shadowing is allowed but warns.
+                        self.diagnostics.push(
+                            Diagnostic::warning(format!(
+                                "shadowing definition of `{}`",
+                                var_name,
+                            ))
+                            .with_code_str("W113")
+                            .with_span(*span)
+                            .with_secondary_label(
+                                self.span_get(var_name).unwrap_or(*span),
+                                "previous definition here",
+                            ),
+                        );
+                    }
+                }
+
                 // Resolve the declared type, or leave as an inference variable if not provided.
                 let declared_ty = if let Some(ty) = ty {
                     self.resolve_type(ty)?
@@ -678,64 +765,87 @@ impl<'a> TypeChecker<'a> {
                 };
 
                 // Determine the actual initializer (value) and its type.
-                let (value_hir, inferred_ty) = if let Some(value) = value {
-                    // Explicit initializer present
-                    if ty.is_some() {
-                        let hir = self.check_expr(
-                            value,
-                            Expectation::HasType(declared_ty),
-                            TypingContext::None,
-                        )?;
-                        let ty = hir.ty();
-                        (Some(hir), ty)
+                // Wrap in a closure so errors from the RHS can be aggregated
+                // into the duplicate definition diagnostic.
+                let rhs_result = (|| -> Result<(Option<HirExpr>, TypeId, Option<HirPattern>, Option<Vec<HirStmt>>), Diagnostic> {
+                    let (value_hir, inferred_ty) = if let Some(value) = value {
+                        // Explicit initializer present
+                        if ty.is_some() {
+                            let hir = self.check_expr(
+                                value,
+                                Expectation::HasType(declared_ty),
+                                TypingContext::None,
+                            )?;
+                            let ty = hir.ty();
+                            (Some(hir), ty)
+                        } else {
+                            let (hir, ty) = self.infer_expr(value)?;
+                            (Some(hir), ty)
+                        }
                     } else {
-                        let (hir, ty) = self.infer_expr(value)?;
-                        (Some(hir), ty)
+                        // No explicit initializer: try type's default value
+                        let default_expr = self.lookup_type_default_expr(declared_ty, *span)?;
+                        if let Some(default_expr) = default_expr {
+                            let hir = self.check_expr(
+                                &default_expr,
+                                Expectation::HasType(declared_ty),
+                                TypingContext::None,
+                            )?;
+                            let ty = hir.ty();
+                            (Some(hir), ty)
+                        } else {
+                            // Neither default nor initializer – error
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    "type has no default value and no initializer provided",
+                                )
+                                .with_code_str("E003")
+                                .with_span(*span),
+                            );
+                            (None, declared_ty)
+                        }
+                    };
+                    // Unify declared type with inferred type (if we have both)
+                    if let Some(ref value_hir) = value_hir {
+                        self.unify_with(declared_ty, inferred_ty, *span, TypingContext::None)?;
                     }
-                } else {
-                    // No explicit initializer: try type's default value
-                    let default_expr = self.lookup_type_default_expr(declared_ty, *span)?;
-                    if let Some(default_expr) = default_expr {
-                        let hir = self.check_expr(
-                            &default_expr,
-                            Expectation::HasType(declared_ty),
-                            TypingContext::None,
-                        )?;
-                        let ty = hir.ty();
-                        (Some(hir), ty)
+                    let pattern_hir = if let Some(pattern) = pattern {
+                        Some(self.check_pattern(pattern, declared_ty)?)
                     } else {
-                        // Neither default nor initializer – error
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                "type has no default value and no initializer provided",
-                            )
-                            .with_code_str("E003")
-                            .with_span(*span),
-                        );
-                        (None, declared_ty)
+                        None
+                    };
+                    let else_hir = if let Some(else_branch) = else_branch {
+                        let mut stmts = Vec::new();
+                        for s in else_branch {
+                            stmts.push(self.check_stmt(s)?);
+                        }
+                        Some(stmts)
+                    } else {
+                        None
+                    };
+                    Ok((value_hir, inferred_ty, pattern_hir, else_hir))
+                })();
+                let (value_hir, inferred_ty, pattern_hir, else_hir) = match rhs_result {
+                    Ok(r) => r,
+                    Err(rhs_err) => {
+                        if let Some(ref mut d) = dup_diag {
+                            d.related_errors.push(
+                                crate::diagnostics::RelatedError {
+                                    code: rhs_err.code.clone(),
+                                    message: rhs_err.message.clone(),
+                                    span: rhs_err.spans.first(),
+                                    label: None,
+                                },
+                            );
+                        } else {
+                            self.diagnostics.push(rhs_err);
+                        }
+                        (None, self.ctx.error(), None, None)
                     }
                 };
-
-                // Unify declared type with inferred type (if we have both)
-                if let Some(ref value_hir) = value_hir {
-                    self.unify_with(declared_ty, inferred_ty, *span, TypingContext::None)?;
+                if let Some(ref d) = dup_diag {
+                    self.diagnostics.push(d.clone());
                 }
-
-                let pattern_hir = if let Some(pattern) = pattern {
-                    Some(self.check_pattern(pattern, declared_ty)?)
-                } else {
-                    None
-                };
-
-                let else_hir = if let Some(else_branch) = else_branch {
-                    let mut stmts = Vec::new();
-                    for s in else_branch {
-                        stmts.push(self.check_stmt(s)?);
-                    }
-                    Some(stmts)
-                } else {
-                    None
-                };
 
                 let final_ty = if declared_ty != self.ctx.error() {
                     declared_ty
@@ -745,9 +855,17 @@ impl<'a> TypeChecker<'a> {
                     self.ctx.error()
                 };
 
-                // Cache the variable's type for subsequent references
+                // Cache the variable's type for subsequent references.
+                // If this is a duplicate definition, preserve the original
+                // type and span — do NOT overwrite them with the duplicate's
+                // values, otherwise resolve_type_origin and "previous
+                // definition here" labels would point to the wrong location,
+                // and downstream error recovery would see the wrong type.
                 if let Some(var_name) = name {
-                    self.local_variable_types.insert(var_name.clone(), final_ty);
+                    if dup_diag.is_none() {
+                        self.local_variable_types.insert(var_name.clone(), final_ty);
+                        self.span_insert(var_name.clone(), *span);
+                    }
                 }
 
                 // Track mutable global variables (top-level `set mut`).
@@ -793,14 +911,19 @@ impl<'a> TypeChecker<'a> {
                 is_async,
                 ..
             } => {
-                // ── Clear per-function trait_obligations ──
+                // ── Salvage per-function trait_obligations ──
                 // Each function body starts with a fresh accumulator.
                 // If a previous function failed, its stale obligations
                 // would leak into this function's trait-solving context,
                 // causing spurious errors or silent acceptance of invalid
-                // obligations.  Clearing the vector at the start of each
-                // function prevents cross-function contamination.
-                self.trait_obligations.clear();
+                // obligations.  Instead of clearing (which would lose
+                // obligations from a failed function), salvage them into
+                // residual_trait_obligations for processing at the top
+                // level by `check_program`.
+                let residual: Vec<_> = self.trait_obligations.drain(..).collect();
+                if !residual.is_empty() {
+                    self.residual_trait_obligations.extend(residual);
+                }
 
                 // Register generic type parameters FIRST so that `T` in parameter types,
                 // return types, and where clauses can be resolved.
@@ -937,11 +1060,13 @@ impl<'a> TypeChecker<'a> {
                         .checker
                         .local_variable_types
                         .insert(p.name.clone(), p.ty);
+                    guard.checker.span_insert(p.name.clone(), p.span);
                 }
                 guard
                     .checker
                     .local_variable_types
                     .insert(Symbol::intern("codomain"), return_ty);
+                guard.checker.span_insert(Symbol::intern("codomain"), *span);
 
                 // SCAP: collect ensures conditions into the guarantee chain.
                 // Each `ensures` becomes a postcondition that must hold at return.
@@ -953,11 +1078,25 @@ impl<'a> TypeChecker<'a> {
                         // `@label` as a placeholder for the return value.
                         for label in &expr_labels {
                             guard.checker.local_variable_types.insert(*label, return_ty);
+                            guard.checker.span_insert(*label, *span);
                         }
-                        let (_, ensures_ty) = guard
+                        let (_, ensures_ty) = match guard
                             .checker
                             .infer_expr(expr)
-                            .unwrap_or_else(|_| (HirExpr::Error(*span), guard.checker.ctx.bool()));
+                        {
+                            Ok(result) => result,
+                            Err(diag) => {
+                                // ── Collect the error, don't swallow it ──
+                                // If the ensures expression fails to type-check
+                                // (e.g. a type mismatch in the contract), we
+                                // must still report the error rather than silently
+                                // defaulting to `bool`.  The checker continues
+                                // with a default value so that subsequent errors
+                                // in the same function body can also be collected.
+                                guard.checker.diagnostics.push(diag);
+                                (HirExpr::Error(*span), guard.checker.ctx.bool())
+                            }
+                        };
                         let g = Guarantee::new_with_expr(
                             Predicate::True,
                             Predicate::Type(ensures_ty),
@@ -1193,20 +1332,51 @@ impl<'a> TypeChecker<'a> {
 
                 let body_result = if let Some(body) = body {
                     let mut stmts = Vec::new();
+                    let mut body_err = None;
                     for s in body {
-                        stmts.push(guard.checker.check_stmt(s)?);
+                        match guard.checker.check_stmt(s) {
+                            Ok(hir) => stmts.push(hir),
+                            Err(e) => {
+                                body_err = Some(e);
+                                break;
+                            }
+                        }
                     }
-                    Ok(Some(stmts))
+                    match body_err {
+                        Some(e) => Err(e),
+                        None => Ok(Some(stmts)),
+                    }
                 } else {
                     Ok(None)
                 };
 
                 guard.checker.pop_ctx();
 
-                let body_hir = match body_result {
-                    Ok(body) => body,
-                    Err(e) => return Err(e),
-                };
+                // ── Defer body error propagation ──
+                // The solver pass (below) must run INSIDE the inference scope
+                // so that inference variables from the function body are still
+                // alive and the solver can resolve trait obligations correctly.
+                // If we propagated the body error immediately, the guard would
+                // be dropped, the inference scope would be aborted, and any
+                // trait obligations pushed during ensures/contract checking
+                // (e.g. `Ord` from `ensures @s > 1`) would lose their inference
+                // variables — causing false positives like "Ord not found on Int".
+                //
+                // Instead, we save the body error and run the solver pass first,
+                // then propagate the error after.  This is consistent with the
+                // OmniML region/level design (omniml/lib/constraint_solver/
+                // generalization.ml): inference variables are resolved within
+                // their defining region before the region is exited.
+                let mut body_hir: Option<Vec<HirStmt>> = None;
+                let mut saved_body_err: Option<Diagnostic> = None;
+                match body_result {
+                    Ok(body) => {
+                        body_hir = body;
+                    }
+                    Err(e) => {
+                        saved_body_err = Some(e);
+                    }
+                }
 
                 // If no explicit return type was written and the body has no
                 // return statements, default the inferred return type to Never.
@@ -1377,11 +1547,11 @@ impl<'a> TypeChecker<'a> {
                 // require_type_sized) are registered as obligations but
                 // NOT passed as caller_bounds, because they would match
                 // themselves as Param candidates and cause ambiguity.
-                let trait_obs: Vec<TraitPredicate> =
+                let trait_obs: Vec<(Span, TraitPredicate)> =
                     guard.checker.trait_obligations.drain(..).collect();
                 // Save all obligations for potential retry after guard.commit().
-                let all_bounds: Vec<TraitPredicate> = {
-                    let mut bounds = caller_bounds.clone();
+                let all_bounds: Vec<(Span, TraitPredicate)> = {
+                    let mut bounds: Vec<(Span, TraitPredicate)> = caller_bounds.iter().map(|b| (*span, b.clone())).collect();
                     bounds.extend(trait_obs.clone());
                     bounds
                 };
@@ -1401,13 +1571,13 @@ impl<'a> TypeChecker<'a> {
                     // Pass inference variable data for the defaulting step.
                     fulfill.set_infer_data_from(&guard.checker.infer);
                     // Register ALL obligations (where-clause + body-check-time)
-                    for bound in &all_bounds {
+                    for (obl_span, bound) in &all_bounds {
                         let obligation = Obligation {
                             cause: crate::hir::traits::solver::ObligationCause {
-                                span: *span,
+                                span: *obl_span,
                                 code:
                                     crate::hir::traits::solver::ObligationCauseCode::WhereClause {
-                                        span: *span,
+                                        span: *obl_span,
                                     },
                             },
                             predicate: match bound {
@@ -1519,10 +1689,25 @@ impl<'a> TypeChecker<'a> {
                         let symbols = unsafe { &*symbols_ptr };
                         let ctx = unsafe { &*ctx_ptr };
                         let msg = format_solve_errors(symbols, ctx, &errors);
+                        let err_span = errors
+                            .first()
+                            .and_then(|e| e.span())
+                            .unwrap_or(*span);
                         return Err(Diagnostic::error(format!("trait solver error: {}", msg))
                             .with_code_str("E030")
-                            .with_span(*span));
+                            .with_span(err_span));
                     }
+                }
+
+                // ── Propagate saved body error ──
+                // If the function body failed, we must abort the inference scope
+                // (via guard drop) rather than committing it, because the body's
+                // inference results are partial/incomplete.  The solver pass has
+                // already run inside the inference scope, so trait obligations
+                // from ensures/contracts were resolved correctly before the
+                // inference variables were lost.
+                if let Some(body_err) = saved_body_err {
+                    return Err(body_err);
                 }
 
                 let exit_res = guard.commit();
@@ -1626,7 +1811,7 @@ impl<'a> TypeChecker<'a> {
                 // time.  This catches obligations from both the function body
                 // and contract expressions (requires, ensures, etc.) that were
                 // deferred due to unresolved infer vars during the first pass.
-                let final_obs: Vec<TraitPredicate> = self.trait_obligations.drain(..).collect();
+                let final_obs: Vec<(Span, TraitPredicate)> = self.trait_obligations.drain(..).collect();
                 if !final_obs.is_empty() {
                     let ctx: &mut TypeContext = &mut self.ctx;
                     let mut selcx = SelectionContext::new(
@@ -1643,15 +1828,15 @@ impl<'a> TypeChecker<'a> {
                     // Collect all obligations: original all_bounds (which includes
                     // where-clause bounds and body-check-time obligations) plus
                     // any new ones from contract expressions.
-                    let all_final: Vec<&TraitPredicate> =
+                    let all_final: Vec<&(Span, TraitPredicate)> =
                         all_bounds.iter().chain(final_obs.iter()).collect();
-                    for bound in all_final {
+                    for (obl_span, bound) in all_final {
                         let obligation = Obligation {
                             cause: crate::hir::traits::solver::ObligationCause {
-                                span: *span,
+                                span: *obl_span,
                                 code:
                                     crate::hir::traits::solver::ObligationCauseCode::WhereClause {
-                                        span: *span,
+                                        span: *obl_span,
                                     },
                             },
                             predicate: match bound {
@@ -1762,9 +1947,13 @@ impl<'a> TypeChecker<'a> {
                         let symbols = unsafe { &*symbols_ptr };
                         let ctx = unsafe { &*ctx_ptr };
                         let msg = format_solve_errors(symbols, ctx, &errors);
+                        let err_span = errors
+                            .first()
+                            .and_then(|e| e.span())
+                            .unwrap_or(*span);
                         return Err(Diagnostic::error(format!("trait solver error: {}", msg))
                             .with_code_str("E030")
-                            .with_span(*span));
+                            .with_span(err_span));
                     }
                 }
 
@@ -2249,7 +2438,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 let (target_hir, target_ty) = self.infer_expr(target)?;
                 let value_hir = if let Some(op) = op {
-                    let result_ty = self.binary_op_type(*op, target_ty, target_ty, *span)?;
+                    let result_ty = self.binary_op_type(*op, target_ty, target_ty, None, None, *span)?;
                     self.unify_with(target_ty, result_ty, *span, TypingContext::None)?;
                     self.check_expr(value, Expectation::HasType(target_ty), TypingContext::None)?
                 } else {
@@ -3055,49 +3244,47 @@ impl<'a> TypeChecker<'a> {
             .unify(expected, actual)
             .map(|_| ())
             .map_err(|_err| {
+                let expected_str = self.ctx.get(expected).display_with(self.ctx);
+                let actual_str = self.ctx.get(actual).display_with(self.ctx);
                 let msg = match ctx {
                     TypingContext::ReturnValue => {
                         format!(
-                            "return value type mismatch: expected {:?}, found {:?}",
-                            self.ctx.get(expected),
-                            self.ctx.get(actual)
+                            "return value type mismatch: expected {}, found {}",
+                            expected_str, actual_str,
                         )
                     }
                     TypingContext::StructFieldInit => {
                         format!(
-                            "field initializer type mismatch: expected {:?}, found {:?}",
-                            self.ctx.get(expected),
-                            self.ctx.get(actual)
+                            "field initializer type mismatch: expected {}, found {}",
+                            expected_str, actual_str,
                         )
                     }
                     TypingContext::Condition => {
-                        format!("condition must be boolean, got {:?}", self.ctx.get(actual))
+                        format!("condition must be boolean, got {}", actual_str)
                     }
                     TypingContext::Argument { index, total } => {
                         format!(
-                            "argument {} of {} has wrong type: expected {:?}, found {:?}",
+                            "argument {} of {} has wrong type: expected {}, found {}",
                             index + 1,
                             total,
-                            self.ctx.get(expected),
-                            self.ctx.get(actual)
+                            expected_str,
+                            actual_str,
                         )
                     }
                     TypingContext::ClosureBody => {
                         format!(
-                            "closure body type mismatch: expected {:?}, found {:?}",
-                            self.ctx.get(expected),
-                            self.ctx.get(actual)
+                            "closure body type mismatch: expected {}, found {}",
+                            expected_str, actual_str,
                         )
                     }
                     TypingContext::None => {
                         format!(
-                            "type mismatch: expected {:?}, found {:?}",
-                            self.ctx.get(expected),
-                            self.ctx.get(actual)
+                            "type mismatch: expected {}, found {}",
+                            expected_str, actual_str,
                         )
                     }
                     TypingContext::Index => {
-                        format!("index must be an integer, got {:?}", self.ctx.get(actual))
+                        format!("index must be an integer, got {}", actual_str)
                     }
                 };
                 let mut diag = Diagnostic::error(msg).with_code_str("E030").with_span(span);
@@ -3113,6 +3300,8 @@ impl<'a> TypeChecker<'a> {
         op: BinOp,
         left: TypeId,
         right: TypeId,
+        left_span: Option<Span>,
+        right_span: Option<Span>,
         span: Span,
     ) -> Result<TypeId, Diagnostic> {
         // Logical And/Or are NOT trait-routed in the desugaring table.
@@ -3128,8 +3317,8 @@ impl<'a> TypeChecker<'a> {
             // Check kind compatibility early so that e.g. `true and infer_var(Integer)`
             // produces "type mismatch: expected integer type, found Bool" at the operator
             // site rather than a confusing unification failure later.
-            self.check_kind_compat(left, right, span)?;
-            self.check_kind_compat(right, left, span)?;
+            self.check_kind_compat(left, left_span, right, right_span, span)?;
+            self.check_kind_compat(right, right_span, left, left_span, span)?;
             self.unify_with(left, right, span, TypingContext::None)?;
             return Ok(self.ctx.bool());
         }
@@ -3160,8 +3349,8 @@ impl<'a> TypeChecker<'a> {
             // Check kind compatibility early, before unify, so that
             // e.g. `infer_var(Float) +% 1` produces "expected integer type, found Float"
             // at the operator site rather than a confusing error later.
-            self.check_kind_compat(left, right, span)?;
-            self.check_kind_compat(right, left, span)?;
+            self.check_kind_compat(left, left_span, right, right_span, span)?;
+            self.check_kind_compat(right, right_span, left, left_span, span)?;
             self.unify_with(left, right, span, TypingContext::None)?;
             return Ok(left);
         }
@@ -3169,24 +3358,24 @@ impl<'a> TypeChecker<'a> {
         // Trait-routed operators: check kind compatibility early so that
         // e.g. `1 + "hello"` produces a clear diagnostic at the operator
         // site rather than a confusing inference failure later.
-        self.check_kind_compat(left, right, span)?;
-        self.check_kind_compat(right, left, span)?;
+        self.check_kind_compat(left, left_span, right, right_span, span)?;
+        self.check_kind_compat(right, right_span, left, left_span, span)?;
 
         // All other operators route through traits (§Spec: Operator Desugaring).
         let Some(trait_id) = self.get_trait_id_for_binop(op, span)? else {
             return Err(Diagnostic::error("operator not supported via traits").with_span(span));
         };
 
-        self.trait_obligations.push(TraitPredicate::Trait {
+        self.trait_obligations.push((span, TraitPredicate::Trait {
             trait_id,
             self_ty: left,
             args: vec![],
-        });
-        self.trait_obligations.push(TraitPredicate::Trait {
+        }));
+        self.trait_obligations.push((span, TraitPredicate::Trait {
             trait_id,
             self_ty: right,
             args: vec![],
-        });
+        }));
 
         // Comparison operators return bool.
         // Unify operands so that inference variables are resolved before
@@ -3217,6 +3406,50 @@ impl<'a> TypeChecker<'a> {
         Ok(result_ty)
     }
 
+    /// Trace a type back to its origin variable, if any.
+    /// Scans `local_variable_types` for a variable whose resolved type matches
+    /// `ty`, then returns the variable's definition span from
+    /// `local_variable_spans`.  Returns `None` if the type doesn't match any
+    /// tracked variable (e.g. it's a literal type or a function result).
+    fn resolve_type_origin(&self, ty: TypeId) -> Option<(Symbol, Span)> {
+        let resolved = self.ctx.resolve_binding(ty);
+        // Never match the error sentinel type — it's not a real type and
+        // would cause "type originates here" labels on every cascaded error.
+        if matches!(self.ctx.get(resolved), TypeData::Error) {
+            return None;
+        }
+        for (sym, var_ty) in self.local_variable_types.iter() {
+            if self.ctx.resolve_binding(var_ty) == resolved {
+                if let Some(def_span) = self.span_get(&sym) {
+                    return Some((sym, def_span));
+                }
+            }
+        }
+        None
+    }
+
+    /// Look up a variable's definition span in the scoped `local_variable_spans`
+    /// stack, searching from innermost to outermost frame.
+    fn span_get(&self, name: &Symbol) -> Option<Span> {
+        let frames = self.local_variable_spans.borrow();
+        for frame in frames.iter().rev() {
+            if let Some(&span) = frame.get(name) {
+                return Some(span);
+            }
+        }
+        None
+    }
+
+    /// Insert a variable's definition span into the innermost frame of
+    /// the scoped `local_variable_spans` stack.
+    fn span_insert(&self, name: Symbol, span: Span) {
+        self.local_variable_spans
+            .borrow_mut()
+            .last_mut()
+            .unwrap()
+            .insert(name, span);
+    }
+
     /// Check that an inference variable's kind constraint is compatible with the
     /// resolved type of another type.  This prevents situations like
     /// `true` (InferVar with kind Bool) being unified with `Int<32>`.
@@ -3224,7 +3457,9 @@ impl<'a> TypeChecker<'a> {
     fn check_kind_compat(
         &self,
         maybe_var: TypeId,
+        maybe_var_span: Option<Span>,
         other: TypeId,
+        other_span: Option<Span>,
         span: Span,
     ) -> Result<(), Diagnostic> {
         if let TypeData::InferVar { id } = self.ctx.get(maybe_var) {
@@ -3233,53 +3468,112 @@ impl<'a> TypeChecker<'a> {
             // Only check when the other side is a concrete type (not a type variable).
             // Type variables (InferVar, GenericParam, SkolemVar) are placeholders
             // that can be unified with any compatible type.
+            // Also skip the error sentinel type — cascading errors from a
+            // previously failed expression add no useful information.
             match self.ctx.get(resolved_other) {
                 TypeData::InferVar { .. }
                 | TypeData::GenericParam { .. }
-                | TypeData::SkolemVar { .. } => return Ok(()),
+                | TypeData::SkolemVar { .. }
+                | TypeData::Error => return Ok(()),
                 _ => {}
             }
-            match kind {
+            let other_type_str = if matches!(self.ctx.get(resolved_other), TypeData::Error) {
+                "no suitable type exists".to_string()
+            } else {
+                format!("{}", self.ctx.get(resolved_other).display_with(self.ctx))
+            };
+            let mut diag = match kind {
                 Some(TypeVariableKind::Bool) => {
                     if !self.ctx.is_bool(resolved_other) {
-                        return Err(Diagnostic::error(format!(
-                            "type mismatch: expected `Bool`, found `{:?}`",
-                            self.ctx.get(resolved_other),
+                        Some(Diagnostic::error(format!(
+                            "type mismatch: expected `Bool`, found `{}`",
+                            other_type_str,
                         ))
-                        .with_span(span));
+                        .with_code_str("E030")
+                        .with_span(span))
+                    } else {
+                        None
                     }
                 }
                 Some(TypeVariableKind::Integer) => {
                     if !self.ctx.is_integer(resolved_other)
                         && !matches!(self.ctx.get(resolved_other), TypeData::Rational { .. })
                     {
-                        return Err(Diagnostic::error(format!(
-                            "type mismatch: expected integer type, found `{:?}`",
-                            self.ctx.get(resolved_other),
+                        Some(Diagnostic::error(format!(
+                            "type mismatch: expected integer type, found `{}`",
+                            other_type_str,
                         ))
-                        .with_span(span));
+                        .with_code_str("E030")
+                        .with_span(span))
+                    } else {
+                        None
                     }
                 }
                 Some(TypeVariableKind::Float) => {
                     if !self.ctx.is_float(resolved_other) {
-                        return Err(Diagnostic::error(format!(
-                            "type mismatch: expected float type, found `{:?}`",
-                            self.ctx.get(resolved_other),
+                        Some(Diagnostic::error(format!(
+                            "type mismatch: expected float type, found `{}`",
+                            other_type_str,
                         ))
-                        .with_span(span));
+                        .with_code_str("E030")
+                        .with_span(span))
+                    } else {
+                        None
                     }
                 }
                 Some(TypeVariableKind::Numeric) => {
                     if !self.ctx.is_numeric(resolved_other) {
-                        return Err(Diagnostic::error(format!(
-                            "type mismatch: expected numeric type, found `{:?}`",
-                            self.ctx.get(resolved_other),
+                        Some(Diagnostic::error(format!(
+                            "type mismatch: expected numeric type, found `{}`",
+                            other_type_str,
                         ))
-                        .with_span(span));
+                        .with_code_str("E030")
+                        .with_span(span))
+                    } else {
+                        None
                     }
                 }
                 // Any / Unconstrained are compatible with everything
-                Some(TypeVariableKind::Any) | Some(TypeVariableKind::Unconstrained) | None => {}
+                Some(TypeVariableKind::Any) | Some(TypeVariableKind::Unconstrained) | None => None,
+            };
+            if let Some(ref mut d) = diag {
+                // Add a secondary label for the "other" operand (the concrete type).
+                if let Some(os) = other_span {
+                    d.labels.push(Label::secondary(os, other_type_str));
+                }
+                // Add a note label for the "maybe_var" operand (the infer var).
+                if let Some(ms) = maybe_var_span {
+                    d.labels.push(Label::new(ms, "expected integer type"));
+                }
+                // Trace the type origin: if the "other" operand's type came from
+                // a variable definition, show where it originated.
+                if let Some((_origin_name, origin_span)) = self.resolve_type_origin(resolved_other) {
+                    if origin_span != other_span.unwrap_or(origin_span) {
+                        d.labels.push(Label::secondary(origin_span, "type originates here"));
+                    }
+                    // If the type is a string reference (&Str / &[Byte]),
+                    // suggest that the programmer might have meant a numeric literal.
+                    // Place this note at the origin span (the definition site),
+                    // right after the "type originates here" label.
+                    if matches!(self.ctx.get(resolved_other), TypeData::Ref { .. }) {
+                        let inner = match self.ctx.get(resolved_other) {
+                            TypeData::Ref { ty, .. } => self.ctx.get(*ty),
+                            _ => &TypeData::Error,
+                        };
+                        if matches!(inner, TypeData::Adt { def_id, .. } if *def_id == DefId(usize::MAX))
+                            || matches!(inner, TypeData::Byte)
+                        {
+                            d.labels.push(
+                                Label::help(
+                                    origin_span,
+                                    "this value is a string, not a number. \
+                                     Remove the quotes to use it as a numeric literal.",
+                                ),
+                            );
+                        }
+                    }
+                }
+                return Err(std::mem::replace(d, Diagnostic::error("placeholder")));
             }
         }
         Ok(())
@@ -3351,7 +3645,7 @@ impl<'a> TypeChecker<'a> {
                 // Sized via Predicate::Sized, which triggers the builtin Sized
                 // check in candidate assembly.  If the type is still an infer var,
                 // the obligation is deferred and retried after the old solver runs.
-                self.trait_obligations.push(TraitPredicate::Sized { ty });
+                self.trait_obligations.push((span, TraitPredicate::Sized { ty }));
             }
             _ => {} // concrete types and generic params: assumed Sized
         }
@@ -4008,7 +4302,8 @@ impl<'a> TypeChecker<'a> {
                 }
                 HirStmt::Return { value: None, .. }
                 | HirStmt::Leave { .. }
-                | HirStmt::Continue { .. } => return self.ctx.never(),
+                | HirStmt::Continue { .. }
+                | HirStmt::Loop { .. } => return self.ctx.never(),
                 _ => {}
             }
         }

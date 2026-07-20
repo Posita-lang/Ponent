@@ -1,6 +1,6 @@
 use crate::ast::visit::replace_ident_in_expr;
 use crate::ast::*;
-use crate::diagnostics::{Diagnostic, DiagnosticCollector, DiagnosticLevel};
+use crate::diagnostics::{Diagnostic, DiagCtxt, DiagnosticLevel};
 use crate::hir::builtins;
 use crate::hir::symbol::*;
 use crate::hir::traits::{ImplCandidate, TraitEnv};
@@ -49,7 +49,7 @@ pub struct NameResolver<'a> {
     ctx: &'a mut TypeContext,
     symbols: SymbolTable,
     trait_env: TraitEnv,
-    diagnostics: DiagnosticCollector,
+    diagnostics: DiagCtxt,
     current_scope: usize,
     current_function: Option<DefId>,
     current_type: Option<DefId>,
@@ -88,7 +88,7 @@ impl<'a> NameResolver<'a> {
             ctx,
             symbols,
             trait_env,
-            diagnostics: DiagnosticCollector::new(),
+            diagnostics: DiagCtxt::new(),
             current_scope: 0,
             current_function: None,
             current_type: None,
@@ -105,7 +105,7 @@ impl<'a> NameResolver<'a> {
     pub fn resolve_program(
         &mut self,
         program: &Program,
-    ) -> Result<(SymbolTable, TraitEnv, DiagnosticCollector, ResolutionMap), DiagnosticCollector>
+    ) -> Result<(SymbolTable, TraitEnv, DiagCtxt, ResolutionMap), DiagCtxt>
     {
         for item in &program.items {
             self.resolve_item(item);
@@ -745,7 +745,11 @@ impl<'a> NameResolver<'a> {
             _ => {
                 if let Some(stmt_span) = self.get_stmt_span(item) {
                     self.diagnostics.push(
-                        Diagnostic::error("unexpected statement at top level").with_span(stmt_span),
+                        Diagnostic::error(
+                            "`set` and `let` statements are not allowed at the top level; only declarations (`def`, `type`, `trait`, `import`, `impl`, `constraint`, `comptime`, `extern`, `edition`) are permitted here",
+                        )
+                        .with_code_str("E018")
+                        .with_span(stmt_span),
                     );
                 }
             }
@@ -1816,7 +1820,7 @@ impl<'a> NameResolver<'a> {
         self.symbols
     }
 
-    pub fn diagnostics(&self) -> &DiagnosticCollector {
+    pub fn diagnostics(&self) -> &DiagCtxt {
         &self.diagnostics
     }
 

@@ -91,7 +91,7 @@ impl JsonEmitter {
         }
 
         // span
-        if let Some(span) = diag.span {
+        if let Some(span) = diag.spans.first() {
             s.push_str(&format!(
                 "{}  \"span\": {{\"start\": {}, \"end\": {}}},\n",
                 Self::indent(i),

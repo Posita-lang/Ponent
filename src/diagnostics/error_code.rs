@@ -65,6 +65,7 @@ pub enum ErrorCode {
     NoDefaultValue,
     ArraySizeNotConstant,
     UnexpectedTopLevel,
+    DuplicateDefinition,
 
     // ── Contract errors (E020–E029) ───────────────────────────
     ContractNonBool,
@@ -128,6 +129,7 @@ impl ErrorCode {
             NoDefaultValue => "E016",
             ArraySizeNotConstant => "E017",
             UnexpectedTopLevel => "E018",
+            DuplicateDefinition => "E019",
 
             ContractNonBool => "E020",
             EnsuresNonBool => "E021",
@@ -187,6 +189,7 @@ impl ErrorCode {
             NoDefaultValue => "no default value",
             ArraySizeNotConstant => "array size not constant",
             UnexpectedTopLevel => "unexpected top-level item",
+            DuplicateDefinition => "duplicate definition",
 
             ContractNonBool => "contract condition must be boolean",
             EnsuresNonBool => "ensures clause must be boolean",
@@ -245,7 +248,8 @@ impl ErrorCode {
             | CannotResolveImport
             | NoDefaultValue
             | ArraySizeNotConstant
-            | UnexpectedTopLevel => ErrorCategory::Resolution,
+            | UnexpectedTopLevel
+            | DuplicateDefinition => ErrorCategory::Resolution,
 
             ContractNonBool | EnsuresNonBool | DecreasesNonInt | ContractBoolAtReturn => {
                 ErrorCategory::Contract
@@ -498,6 +502,19 @@ defined in the current crate, or the trait must be from the current crate.
 This restriction prevents conflicting implementations across crates."
             }
 
+            Self::DuplicateDefinition => {
+                "A variable, function, or type has been defined more than once in the same scope.
+
+This is not allowed because the second definition would shadow the first without
+any way to refer to the original binding.
+
+Example of invalid code:
+  set x = 1;
+  set x = 2;  // error: duplicate definition of `x`
+
+Fix: use a different name for the second definition, or remove the first one."
+            }
+
             _ => "No detailed explanation is available for this error code yet.",
         }
     }
@@ -526,5 +543,55 @@ impl fmt::Display for ErrorCode {
 impl fmt::Display for ErrorCategory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+/// Warning code identifiers, parallel to `ErrorCode` for diagnostics that
+/// do not prevent compilation but indicate potential issues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WarningCode {
+    Shadowing,
+}
+
+impl WarningCode {
+    pub fn code(&self) -> &'static str {
+        match self {
+            WarningCode::Shadowing => "W113",
+        }
+    }
+
+    pub fn title(&self) -> &'static str {
+        match self {
+            WarningCode::Shadowing => "variable shadowing",
+        }
+    }
+
+    pub fn explain(&self) -> &'static str {
+        match self {
+            WarningCode::Shadowing => {
+                "A variable in the current scope has the same name as a variable in an
+outer scope, which shadows (hides) the outer one.
+
+This is allowed in Posita, but may indicate a bug if the outer variable was
+still needed.  Consider renaming one of the variables to avoid confusion.
+
+Example:
+  def f() {
+    set x = 1;
+    if true {
+      set x = 2;  // warning: shadows the outer `x`
+    }
+  }
+
+Fix: use a different name for the inner variable, or remove the outer one."
+            }
+        }
+    }
+
+    pub fn from_str(code: &str) -> Option<Self> {
+        match code {
+            "W113" => Some(WarningCode::Shadowing),
+            _ => None,
+        }
     }
 }

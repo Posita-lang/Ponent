@@ -384,12 +384,148 @@ pub enum TypeData {
     },
 }
 
+impl fmt::Display for TypeTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TypeTag::Int => write!(f, "Int"),
+            TypeTag::UInt => write!(f, "UInt"),
+            TypeTag::Float => write!(f, "Float"),
+            TypeTag::Bool => write!(f, "Bool"),
+            TypeTag::Char => write!(f, "Char"),
+            TypeTag::Byte => write!(f, "Byte"),
+            TypeTag::USize => write!(f, "USize"),
+            TypeTag::Adt => write!(f, "struct/enum"),
+            TypeTag::Tuple => write!(f, "tuple"),
+            TypeTag::Array => write!(f, "array"),
+            TypeTag::Slice => write!(f, "slice"),
+            TypeTag::Ref => write!(f, "ref"),
+            TypeTag::Pointer => write!(f, "ptr"),
+            TypeTag::Fn => write!(f, "fn"),
+            TypeTag::InferVar => write!(f, "?"),
+            TypeTag::GenericParam => write!(f, "generic"),
+            TypeTag::SkolemVar => write!(f, "skolem"),
+            TypeTag::Never => write!(f, "!"),
+            TypeTag::Error => write!(f, "!!"),
+            _ => write!(f, "{:?}", self),
+        }
+    }
+}
+
 impl fmt::Display for TypeData {
+    /// Human-readable type name.  For types that contain nested `TypeId`
+    /// values (e.g. `Ref`, `Slice`, `Adt`), use `display_with(ctx)` instead
+    /// — this fallback shows the `TypeTag` of the element type.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TypeData::Regex { pattern } => write!(f, "Regex<\"{}\">", pattern),
-            // All other variants use Debug output.
-            other => write!(f, "{:?}", other),
+            TypeData::Int { bits, signed, .. } => {
+                if *signed { write!(f, "Int<{}>", bits) }
+                else { write!(f, "UInt<{}>", bits) }
+            }
+            TypeData::UInt { bits, .. } => write!(f, "UInt<{}>", bits),
+            TypeData::Float { bits } => write!(f, "Float<{}>", bits),
+            TypeData::Bool => write!(f, "Bool"),
+            TypeData::Char => write!(f, "Char"),
+            TypeData::Byte => write!(f, "Byte"),
+            TypeData::USize => write!(f, "USize"),
+            TypeData::Adt { kind, def_id, .. } => {
+                if def_id == &DefId(usize::MAX) { write!(f, "Str") }
+                else { match kind { AdtKind::Struct => write!(f, "struct"), AdtKind::Enum => write!(f, "enum") } }
+            }
+            TypeData::Tuple { elems } => {
+                write!(f, "(")?;
+                for (i, e) in elems.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", e.tag())?;
+                }
+                if elems.len() == 1 { write!(f, ",")?; }
+                write!(f, ")")
+            }
+            TypeData::Array { elem, size } => write!(f, "[{}; {}]", elem.tag(), size),
+            TypeData::Slice { elem } => write!(f, "&[{}]", elem.tag()),
+            TypeData::Ref { ty, mutable } => {
+                if *mutable { write!(f, "&mut {}", ty.tag()) }
+                else { write!(f, "&{}", ty.tag()) }
+            }
+            TypeData::Pointer { ty } => write!(f, "*{}", ty.tag()),
+            TypeData::Ptr { size, pointee } => write!(f, "Ptr<size={}, pointee={}>", size.tag(), pointee.tag()),
+            TypeData::Fn { params, ret } => {
+                write!(f, "fn(")?;
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", p.tag())?;
+                }
+                write!(f, ") -> {}", ret.tag())
+            }
+            TypeData::DynTrait { .. } => write!(f, "dyn Trait"),
+            TypeData::Exists { name, .. } => write!(f, "exists {}", name),
+            TypeData::Forall { .. } => write!(f, "forall ..."),
+            TypeData::Poly { .. } => write!(f, "poly"),
+            TypeData::InferVar { id } => write!(f, "infer#{}", id),
+            TypeData::GenericParam { index, .. } => write!(f, "T{}", index),
+            TypeData::SkolemVar { .. } => write!(f, "skolem"),
+            TypeData::Never => write!(f, "!"),
+            TypeData::Error => write!(f, "!!"),
+            TypeData::Rational { int_bits, frac_bits, .. } => write!(f, "Rational<{}, {}>", int_bits, frac_bits),
+            _ => write!(f, "{:?}", self),
+        }
+    }
+}
+
+impl TypeData {
+    /// Render the type to a human-readable string, resolving nested `TypeId`
+    /// values through `ctx` so that e.g. `&Str` is printed as `&Str` rather
+    /// than `&struct/enum`.  This is the preferred formatting method when a
+    /// `TypeContext` is available.
+    pub fn display_with(&self, ctx: &TypeContext) -> String {
+        match self {
+            TypeData::Ref { ty, mutable } => {
+                let inner = ctx.get(*ty).display_with(ctx);
+                if *mutable { format!("&mut {}", inner) }
+                else { format!("&{}", inner) }
+            }
+            TypeData::Slice { elem } => {
+                let inner = ctx.get(*elem).display_with(ctx);
+                format!("&[{}]", inner)
+            }
+            TypeData::Array { elem, size } => {
+                let inner = ctx.get(*elem).display_with(ctx);
+                format!("[{}; {}]", inner, size)
+            }
+            TypeData::Tuple { elems } => {
+                let parts: Vec<String> = elems.iter().map(|e| ctx.get(*e).display_with(ctx)).collect();
+                format!("({})", parts.join(", "))
+            }
+            TypeData::Fn { params, ret } => {
+                let params: Vec<String> = params.iter().map(|p| ctx.get(*p).display_with(ctx)).collect();
+                let ret = ctx.get(*ret).display_with(ctx);
+                format!("fn({}) -> {}", params.join(", "), ret)
+            }
+            TypeData::Ptr { size, pointee } => {
+                format!("Ptr<size={}, pointee={}>", ctx.get(*size).display_with(ctx), ctx.get(*pointee).display_with(ctx))
+            }
+            TypeData::Pointer { ty } => format!("*{}", ctx.get(*ty).display_with(ctx)),
+            TypeData::Adt { kind, def_id, .. } => {
+                if def_id == &DefId(usize::MAX) { "Str".to_string() }
+                else { match kind { AdtKind::Struct => "struct".to_string(), AdtKind::Enum => "enum".to_string() } }
+            }
+            TypeData::Int { bits, signed, .. } => {
+                if *signed { format!("Int<{}>", bits) }
+                else { format!("UInt<{}>", bits) }
+            }
+            TypeData::UInt { bits, .. } => format!("UInt<{}>", bits),
+            TypeData::Float { bits } => format!("Float<{}>", bits),
+            TypeData::Bool => "Bool".to_string(),
+            TypeData::Char => "Char".to_string(),
+            TypeData::Byte => "Byte".to_string(),
+            TypeData::USize => "USize".to_string(),
+            TypeData::Never => "!".to_string(),
+            TypeData::Error => "!!".to_string(),
+            TypeData::Rational { int_bits, frac_bits, .. } => format!("Rational<{}, {}>", int_bits, frac_bits),
+            TypeData::InferVar { id } => format!("infer#{}", id),
+            // For all other types, use the Display trait (which shows TypeTag
+            // for leaf types and doesn't need TypeContext).
+            other => format!("{}", other),
         }
     }
 }

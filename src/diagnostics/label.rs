@@ -10,6 +10,8 @@ pub enum AnnotationKind {
     Secondary,
     /// Dashed underline `---` — a note-level location.
     Note,
+    /// Help annotation — no underline, rendered as `| help: message`.
+    Help,
 }
 
 /// A labeled annotation pointing to a span of source code.
@@ -45,6 +47,14 @@ impl Label {
         }
     }
 
+    pub fn help(span: Span, message: impl Into<String>) -> Self {
+        Label {
+            span,
+            message: message.into(),
+            kind: AnnotationKind::Help,
+        }
+    }
+
     pub fn with_kind(mut self, kind: AnnotationKind) -> Self {
         self.kind = kind;
         self
@@ -56,6 +66,7 @@ impl Label {
             AnnotationKind::Primary => '^',
             AnnotationKind::Secondary => '~',
             AnnotationKind::Note => '-',
+            AnnotationKind::Help => ' ', // no underline, rendered as `| help: message`
         }
     }
 }

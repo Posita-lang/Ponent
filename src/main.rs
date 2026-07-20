@@ -119,12 +119,13 @@ fn main() {
                                 let mut diags = _diags.into_inner();
                                 attach_source_to_diags(&mut diags, &source);
 
-                                // Register built-in traits and impls before type checking
-                                hir::builtins::register_builtins(
-                                    &mut symbols,
-                                    &mut trait_env,
-                                    &mut ctx,
-                                );
+                                // Built-in traits and impls are registered by
+                                // `NameResolver::new` → `builtins::register_builtins`.
+                                // The `trait_env` is passed through `resolve_program`
+                                // and into `TypeChecker::new` below.  If the resolver
+                                // is ever refactored to NOT call `register_builtins`,
+                                // the trait solver will fail immediately at the first
+                                // trait obligation (no impls found).
 
                                 let mut checker = TypeChecker::new(
                                     &mut ctx,
