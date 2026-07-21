@@ -75,7 +75,7 @@ pub enum Style {
     Bold,
     Dim,
     BrightRed,
-    Cyan,
+    BrightBlue,
     Blue,
     Green,
     Yellow,
@@ -89,7 +89,7 @@ struct Styles {
     bold: &'static str,
     dim: &'static str,
     red_bold: &'static str,
-    cyan: &'static str,
+    bright_blue: &'static str,
     blue: &'static str,
     magenta: &'static str,
     green: &'static str,
@@ -105,8 +105,8 @@ impl Styles {
                 bold: "\x1b[1m",
                 dim: "\x1b[2m",
                 red_bold: "\x1b[1;91m",
-                cyan: "\x1b[96m",
-                blue: "\x1b[94m",
+                bright_blue: "\x1b[94m",
+                blue: "\x1b[34m",
                 magenta: "\x1b[95m",
                 green: "\x1b[92m",
                 yellow: "\x1b[93m",
@@ -118,7 +118,7 @@ impl Styles {
                 bold: "",
                 dim: "",
                 red_bold: "",
-                cyan: "",
+                bright_blue: "",
                 blue: "",
                 magenta: "",
                 green: "",
@@ -139,7 +139,7 @@ impl Styles {
             Style::Bold => self.bold,
             Style::Dim => self.dim,
             Style::BrightRed => self.red_bold,
-            Style::Cyan => self.cyan,
+            Style::BrightBlue => self.bright_blue,
             Style::Blue => self.blue,
             Style::Green => self.green,
             Style::Yellow => self.yellow,
@@ -278,7 +278,7 @@ impl GlyphRenderer {
                             out,
                             "{v}  {cyan}= {bold}note{reset}: {msg} at {line}:{col}",
                             v = self.bc.v,
-                            cyan = self.s.cyan,
+                            cyan = self.s.bright_blue,
                             bold = self.s.bold,
                             reset = self.s.reset,
                             msg = lbl.message,
@@ -388,7 +388,7 @@ impl GlyphRenderer {
                 v = self.bc.v,
                 indent = indent,
                 num = i + 2,
-                msg = rel.message,
+                msg = crate::diagnostics::glyph::highlight_code_with_backticks(&rel.message, self.s.use_color),
             );
         }
     }
@@ -459,7 +459,7 @@ impl GlyphRenderer {
             sub_tl = self.bc.sub_tl,
             sub_h = self.bc.sub_h,
             reset = self.s.reset,
-            cyan = self.s.cyan,
+            cyan = self.s.bright_blue,
             location_display = location_display,
         );
         // Spacing line
@@ -545,7 +545,7 @@ impl GlyphRenderer {
                 dim = self.s.dim,
                 v = self.bc.v,
                 reset = self.s.reset,
-                cyan = self.s.cyan,
+                cyan = self.s.bright_blue,
                 line_num = line_idx + 1,
                 width = line_num_width,
                 sub_v = self.bc.sub_v,
@@ -668,12 +668,26 @@ impl GlyphRenderer {
                     let display_msg = if *ch == ' ' {
                         format!(
                             "{cyan}help:{reset} {cyan}{msg}{reset}",
-                            cyan = self.s.cyan,
+                            cyan = self.s.bright_blue,
                             reset = self.s.reset,
                             msg = msg
                         )
                     } else {
-                        format!("{connector_color}{msg}{connector_reset}")
+                        let highlighted = crate::diagnostics::glyph::highlight_code_with_backticks(msg, self.s.use_color);
+                        // Restore the connector color after each reset from
+                        // highlight_code, otherwise the `[E030]` suffix and
+                        // other text after highlighted type names would fall
+                        // back to the default terminal color.
+                        let highlighted = highlighted.replace(
+                            "\x1b[22m\x1b[39m",
+                            &format!("\x1b[22m\x1b[39m{connector_color}"),
+                        );
+                        format!(
+                            "{connector_color}{highlighted}{connector_reset}",
+                            connector_color = connector_color,
+                            highlighted = highlighted,
+                            connector_reset = connector_reset,
+                        )
                     };
                     connector.push('|');
                     let _ = writeln!(
@@ -761,8 +775,8 @@ impl GlyphRenderer {
                         rendered.push_str(&part.content);
                     }
                     crate::diagnostics::StringPartStyle::Highlighted => {
-                        // Highlighted parts in cyan (matching type name color).
-                        rendered.push_str(&format!("\x1b[36m{}\x1b[0m", part.content));
+                        // Highlighted parts in bright blue (matching type name color).
+                        rendered.push_str(&format!("{}{}{}", self.s.bright_blue, part.content, self.s.reset));
                     }
                 }
             }
@@ -787,7 +801,7 @@ impl GlyphRenderer {
             out,
             "{v}  {cyan}= {bold}note{reset}: {green}{msg}{reset}",
             v = self.bc.v,
-            cyan = self.s.cyan,
+            cyan = self.s.bright_blue,
             bold = self.s.bold,
             reset = self.s.reset,
             green = self.s.green,
@@ -800,7 +814,7 @@ impl GlyphRenderer {
             out,
             "{v}  {cyan}= {bold}help{reset}: {cyan}{msg}{reset}",
             v = self.bc.v,
-            cyan = self.s.cyan,
+            cyan = self.s.bright_blue,
             bold = self.s.bold,
             reset = self.s.reset,
             msg = msg,
@@ -896,17 +910,64 @@ const KEYWORDS: &[&str] = &[
     "constraint", "where", "in", "is", "as", "and", "or", "not", "fn",
 ];
 
-/// Posita built-in type names to highlight in cyan.
+/// Posita built-in type names to highlight in bright blue.
 const TYPES: &[&str] = &[
     "Int", "UInt", "Float", "Bool", "Char", "Byte", "USize", "Str",
     "Unit", "Never", "String",
 ];
 
+/// Advance `pos` past a matching bracket pair at `bytes[pos]`, if any.
+/// Handles `<...>`, `(...)`, `[...]` with proper nesting.
+/// Returns the position past the closing bracket, or `pos` if no bracket
+/// or if the nesting depth exceeds `MAX_BRACKET_DEPTH` (guards against
+/// unmatched brackets scanning to the end of the input).
+fn skip_brackets(bytes: &[u8], pos: usize) -> usize {
+    const MAX_BRACKET_DEPTH: usize = 10;
+    const MAX_SKIP_LEN: usize = 120; // max chars to scan; guards against
+                                      // a single unclosed bracket scanning
+                                      // to the end of the input.
+    if pos >= bytes.len() {
+        return pos;
+    }
+    let (open, close) = match bytes[pos] {
+        b'<' => (b'<', b'>'),
+        b'(' => (b'(', b')'),
+        b'[' => (b'[', b']'),
+        _ => return pos,
+    };
+    let mut p = pos + 1;
+    let mut depth: usize = 1;
+    while p < bytes.len() && depth > 0 && (p - pos) <= MAX_SKIP_LEN {
+        if bytes[p] == open {
+            depth += 1;
+            if depth > MAX_BRACKET_DEPTH {
+                return pos;
+            }
+        } else if bytes[p] == close {
+            depth -= 1;
+        }
+        p += 1;
+    }
+    if depth > 0 { pos } else { p }
+}
+
 /// Simple syntax highlighter that wraps select tokens in ANSI color codes.
-/// Only keywords (bold) and types (cyan) are highlighted — everything else
+/// Only keywords (bold) and types (bright blue) are highlighted — everything else
 /// stays in the default terminal color for a clean, readable output.
 /// When `use_color` is false, the input is returned unchanged.
+/// Highlight code in a line, optionally adding backticks around type names.
+/// When `add_backtick_quotes` is true, type names like `Int<32>` are wrapped
+/// in backticks (`` `Int<32>` ``) so that downstream consumers (e.g.
+/// `write_header`) can render them with consistent styling.
 pub fn highlight_code(line: &str, use_color: bool) -> String {
+    highlight_code_impl(line, use_color, false)
+}
+
+pub(crate) fn highlight_code_with_backticks(line: &str, use_color: bool) -> String {
+    highlight_code_impl(line, use_color, true)
+}
+
+fn highlight_code_impl(line: &str, use_color: bool, add_backtick_quotes: bool) -> String {
     if !use_color {
         return line.to_string();
     }
@@ -915,12 +976,16 @@ pub fn highlight_code(line: &str, use_color: bool) -> String {
     // so that callers can wrap the output in a background color block.
     let reset = "\x1b[22m\x1b[39m";
     let bold = "\x1b[1m";
-    let cyan = "\x1b[36m";
+    let hl = "\x1b[94m";
 
     let mut out = String::with_capacity(line.len() + 32);
     let mut i = 0;
     let bytes = line.as_bytes();
     let len = bytes.len();
+    // When `add_backtick_quotes` is true, type names are wrapped in
+    // backticks (`` `Int<32>` ``) so that downstream consumers like
+    // `write_header` can render them with consistent styling.
+    let backtick = if add_backtick_quotes { "`" } else { "" };
 
     while i < len {
         // Skip string literals entirely — no highlighting inside strings.
@@ -955,10 +1020,14 @@ pub fn highlight_code(line: &str, use_color: bool) -> String {
             }
             let word = &line[start..i];
             if TYPES.contains(&word) {
+                // Consume optional `<...>`, `(...)`, `[...]` after the type name
+                // so the full type like `Int<32>` or `&Str` is highlighted together.
+                let type_end = skip_brackets(bytes, i);
                 let _ = std::fmt::write(
                     &mut out,
-                    format_args!("{cyan}{}{reset}", word),
+                    format_args!("{hl}{}{}{}{reset}", backtick, &line[start..type_end], backtick),
                 );
+                i = type_end;
                 continue;
             }
             if KEYWORDS.contains(&word) {
@@ -969,6 +1038,60 @@ pub fn highlight_code(line: &str, use_color: bool) -> String {
                 continue;
             }
             out.push_str(word);
+            continue;
+        }
+
+        // `&` followed by a type name: highlight the `&` too.
+        if (bytes[i] == b'&' || bytes[i] == b'*')
+            && i + 1 < len && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
+        {
+            let op = bytes[i] as char;
+            i += 1;
+            let start = i;
+            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = &line[start..i];
+            if TYPES.contains(&word) {
+                let type_end = skip_brackets(bytes, i);
+                let _ = std::fmt::write(
+                    &mut out,
+                    format_args!("{hl}{}{}{}{}{reset}", backtick, op, &line[start..type_end], backtick),
+                );
+                i = type_end;
+                continue;
+            }
+            out.push(op);
+            out.push_str(word);
+            continue;
+        }
+
+        // Backtick-quoted type names: `Int<32>`, `Bool`, etc.
+        // Highlight the entire backtick-quoted segment in bright blue
+        // when the content matches a known type name.
+        if bytes[i] == b'`' {
+            let start = i;
+            i += 1;
+            // Collect the content between backticks.
+            let content_start = i;
+            while i < len && bytes[i] != b'`' {
+                i += 1;
+            }
+            let content = &line[content_start..i];
+            // Check if the content (without the trailing `>`) is a type
+            // name, e.g. `Int<32>` → check `Int`, `&Str` → check `Str`.
+            let type_name = content.split(&['<', '(', '['][..]).next().unwrap_or(content);
+            // Strip leading `&` or `*` for reference/pointer types.
+            let type_name = type_name.trim_start_matches(|c| c == '&' || c == '*');
+            if TYPES.contains(&type_name) {
+                let _ = std::fmt::write(
+                    &mut out,
+                    format_args!("{hl}{}{reset}", &line[start..=i]),
+                );
+            } else {
+                out.push_str(&line[start..=i]);
+            }
+            if i < len { i += 1; }
             continue;
         }
 

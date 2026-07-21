@@ -27,17 +27,6 @@ macro_rules! tr {
         let mut result = template.to_string();
         // Collect placeholders, sort by length (longest first) to avoid
         // overlapping key name issues (e.g. `{name}` vs `{name_with_underscore}`).
-        $(
-            $(
-                let placeholder = format!("{{{}}}", stringify!($key));
-                let val = format!("{}", $val);
-                // Replace longer placeholders first — done at runtime via
-                // a simple loop since the macro can't sort at compile time.
-                // We'll use a Vec to collect and sort.
-                $crate::tr!(@push (placeholder, val));
-            )+
-        )?
-        // Sort by placeholder length descending, then replace.
         {
             let mut pairs: Vec<(String, String)> = Vec::new();
             $(
@@ -52,8 +41,6 @@ macro_rules! tr {
         }
         result
     }};
-    // Internal helper — not meant to be called directly.
-    (@push ($p:expr, $v:expr)) => {};
 }
 
 pub mod chain;
@@ -301,7 +288,7 @@ pub enum StringPartStyle {
 
 /// A sequence of styled text segments, used for rich diagnostic messages.
 /// When rendered, highlighted segments are shown in a distinct color
-/// (e.g. cyan for type names) while normal segments use the default color.
+/// (e.g. bright blue for type names) while normal segments use the default color.
 #[derive(Debug, Clone)]
 pub struct StyledString(pub Vec<StringPart>);
 
