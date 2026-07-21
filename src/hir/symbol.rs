@@ -247,6 +247,13 @@ impl SymbolTable {
         Ok(())
     }
 
+    /// Check if a function with the given name exists in the root scope.
+    /// Used to verify entry-point functions like `main`.
+    pub fn has_function(&self, name: &str) -> bool {
+        let sym = Symbol::from(name);
+        self.scopes[0].functions.contains_key(&sym)
+    }
+
     /// Update the return type of a previously registered function binding.
     /// Used by the type checker to patch the resolver's placeholder type
     /// (e.g. `unit()`) with the actual inferred return type after inference

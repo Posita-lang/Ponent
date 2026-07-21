@@ -1,4 +1,27 @@
 use std::fmt;
+use std::sync::OnceLock;
+
+/// The port number of the local explain server, if running.
+static EXPLAIN_PORT: OnceLock<u16> = OnceLock::new();
+
+/// Set the port for the local explain server.  Called by the CLI before
+/// displaying error code URLs.
+pub fn set_explain_port(port: u16) {
+    let _ = EXPLAIN_PORT.set(port);
+}
+
+/// The URL for the `--explain` feature.  Returns a `localhost` URL when
+/// the local explain server is running, otherwise the canonical doc URL.
+fn explain_url(code: &str) -> String {
+    if let Some(&port) = EXPLAIN_PORT.get() {
+        format!("http://127.0.0.1:{port}/{code}")
+    } else {
+        // We will register this domain and set up a proper documentation
+        // website in the future.  For now, the local explain server is the
+        // primary way to view error explanations in a browser.
+        format!("https://doc.posita-lang.org/error_codes/{code}.html")
+    }
+}
 
 /// Categorization of compiler error codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -34,7 +57,28 @@ impl ErrorCategory {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ErrCode(String);
 
+/// Error returned when an unknown error code string is used.
+#[derive(Debug, Clone)]
+pub struct UnknownCode(pub String);
+
+impl fmt::Display for UnknownCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown error code: `{}`", self.0)
+    }
+}
+
+impl std::error::Error for UnknownCode {}
+
 impl ErrCode {
+    /// Create a new `ErrCode` without validation.
+    ///
+    /// In debug builds, a `debug_assert!` panics if the code is not in the
+    /// lookup table.  In release builds the code is accepted as-is and will
+    /// silently fall back to "unknown error" for `title()` / `category()` /
+    /// `explain()`.
+    ///
+    /// Prefer [`Self::try_new`] when the input comes from an external source
+    /// (user input, CLI arguments, etc.).
     pub fn new(code: impl Into<String>) -> Self {
         let code = code.into();
         debug_assert!(
@@ -42,6 +86,18 @@ impl ErrCode {
             "unknown error code: {code:?} — must be added to CODE_TABLE in error_code.rs",
         );
         ErrCode(code)
+    }
+
+    /// Validate that `code` exists in the lookup table, returning
+    /// [`UnknownCode`] if it does not.  This check runs in **all** build
+    /// profiles (unlike the `debug_assert!` in [`Self::new`]).
+    pub fn try_new(code: impl Into<String>) -> Result<Self, UnknownCode> {
+        let code = code.into();
+        if lookup(&code).is_some() {
+            Ok(ErrCode(code))
+        } else {
+            Err(UnknownCode(code))
+        }
     }
 
     /// The code string, e.g. "E030" or "W113".
@@ -72,7 +128,7 @@ impl ErrCode {
 
     /// The diagnostic URL for the `--explain` feature.
     pub fn url(&self) -> String {
-        format!("https://doc.posita-lang.org/error_codes/{}.html", self.0)
+        explain_url(&self.0)
     }
 
     /// The diagnostic URL, formatted as an ANSI hyperlink if the terminal supports it.
@@ -144,6 +200,8 @@ pub(crate) const CODE_TABLE: &[CodeEntry] = &[
 
     CodeEntry { code: "E060", title: "internal compiler error", category: ErrorCategory::Internal, explain: "An internal compiler error occurred. This is a bug in the compiler.\n\nPlease report this error at https://github.com/posita-lang/ponent/issues." },
     CodeEntry { code: "E061", title: "unreachable code", category: ErrorCategory::Internal, explain: "The compiler reached an unreachable code path. This is a bug." },
+
+    CodeEntry { code: "E062", title: "main function not found", category: ErrorCategory::Resolution, explain: "The crate does not define a `main` function, which is required for executable output.\n\nEvery executable crate must have a `main` function that serves as the entry\npoint for the program.  The `main` function takes no arguments and returns\nan integer type (e.g. `Int<32>`).\n\nFix: add a `def main() { ... }` function to the crate." },
 
     CodeEntry { code: "E101", title: "trait impl missing method", category: ErrorCategory::Trait, explain: "A trait implementation is missing a required method.\n\nEvery trait method must be implemented in the impl block. This error\noccurs when a method declared in the trait is not defined in the impl.\n\nFix: add a `def` for the missing method in this impl block." },
     CodeEntry { code: "E102", title: "orphan impl or bare type variable", category: ErrorCategory::Trait, explain: "A trait impl could not be registered: either it violates the orphan rule\n(a type/trait from another crate), or a bare type variable appeared\nwithout sufficient context to determine its kind.\n\nFix: ensure the impl follows the orphan rule, or provide a type\nannotation for the bare type variable." },

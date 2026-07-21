@@ -6,11 +6,64 @@
 //! - **Austral**: multi-format output (plain / JSON / HTML), error type classification
 //! - **Vale**: per-pass error humanizers, structured error types
 
+// ── i18n: translation macro ────────────────────────────────────
+//
+// Looks up the format string in the current language's message table,
+// then substitutes `{param}` placeholders with the given values.
+// Placeholders are sorted by length (longest first) to avoid
+// overlapping key name issues (e.g. `{name}` vs `{name_with_underscore}`).
+//
+// Usage:
+//   tr!("type mismatch: expected `{expected}`, found `{found}",
+//       expected = "Int<32>", found = "Bool")
+#[macro_export]
+macro_rules! tr {
+    ($msg:literal $(, $($key:ident = $val:expr),+ $(,)?)?) => {{
+        let template = $crate::diagnostics::i18n::lookup($msg);
+        // If the lookup returned the fallback placeholder, use the original
+        // format string instead — it's more informative than "(untitled)".
+        // This happens when a message key hasn't been added to the i18n table.
+        let template = if template == "(untitled)" { $msg } else { template };
+        let mut result = template.to_string();
+        // Collect placeholders, sort by length (longest first) to avoid
+        // overlapping key name issues (e.g. `{name}` vs `{name_with_underscore}`).
+        $(
+            $(
+                let placeholder = format!("{{{}}}", stringify!($key));
+                let val = format!("{}", $val);
+                // Replace longer placeholders first — done at runtime via
+                // a simple loop since the macro can't sort at compile time.
+                // We'll use a Vec to collect and sort.
+                $crate::tr!(@push (placeholder, val));
+            )+
+        )?
+        // Sort by placeholder length descending, then replace.
+        {
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            $(
+                $(
+                    pairs.push((format!("{{{}}}", stringify!($key)), format!("{}", $val)));
+                )+
+            )?
+            pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+            for (placeholder, val) in pairs {
+                result = result.replace(&placeholder, &val);
+            }
+        }
+        result
+    }};
+    // Internal helper — not meant to be called directly.
+    (@push ($p:expr, $v:expr)) => {};
+}
+
 pub mod chain;
 pub mod collector;
 pub mod emitter;
 pub mod error_code;
+pub mod explain_server;
 pub mod glyph;
+pub mod i18n;
+pub mod kind;
 pub mod label;
 pub mod level;
 
@@ -22,30 +75,73 @@ pub use emitter::{
 };
 pub use error_code::{ErrorCategory, ErrCode};
 pub use glyph::GlyphRenderer;
-pub use label::{AnnotationKind, Label, SourcePos};
+pub use kind::{DiagnosticKind, Humanizer};
+pub use label::{AnnotationKind, Label, Snippet, SourcePos};
 pub use level::DiagnosticLevel;
 
 use crate::ast::Span;
 use std::fmt;
 
+// ── Diagnostic options (inspired by GHC's DiagOpts) ────────────────
+
+/// Centralized configuration for the diagnostic system.
+///
+/// Controls filtering, formatting, and display behaviour across all emitter
+/// backends (terminal, HTML, JSON, etc.).
+#[derive(Debug, Clone)]
+pub struct DiagOpts {
+    /// Maximum number of errors to report before stopping (`None` = unlimited).
+    pub max_errors: Option<usize>,
+    /// Treat all warnings as errors.
+    pub warn_is_error: bool,
+    /// Number of source-context lines to show above and below the primary span.
+    pub context_lines: usize,
+    /// Whether to emit ANSI colour codes (only relevant for terminal emitters).
+    pub use_color: bool,
+    /// Reverse the order in which errors are reported (most recent first).
+    pub reverse_errors: bool,
+}
+
+impl Default for DiagOpts {
+    fn default() -> Self {
+        DiagOpts {
+            max_errors: None,
+            warn_is_error: false,
+            context_lines: 2,
+            use_color: true,
+            reverse_errors: false,
+        }
+    }
+}
+
 // ── Emission guarantee (inspired by rustc's ErrorGuaranteed) ─────
 
-/// A token proving that a diagnostic (error or warning) has been emitted.
-///
-/// Functions that can fail should return `DiagResult<T>` and the caller
-/// pushes it into the collector.  `EmissionGuarantee` tracks whether the
-/// diagnostic was *actually* pushed, preventing "silent swallowing" of errors.
-///
-/// See rustc's `ErrorGuaranteed` for the original pattern.
+/// A token proving that a diagnostic (error or warning) has been emitted
+/// (or intentionally suppressed).  `EmissionGuarantee::emitted()` means the
+/// diagnostic was *actually* recorded; `EmissionGuarantee::suppressed()`
+/// means it was filtered out (e.g. a warning when `can_emit_warnings` is
+/// false).  Callers can call [`was_emitted`](Self::was_emitted) to
+/// distinguish the two cases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmissionGuarantee {
     _private: (),
+    emitted: bool,
 }
 
 impl EmissionGuarantee {
-    /// The emitted diagnostic was an error or warning.
+    /// The emitted diagnostic was recorded.
     pub fn emitted() -> Self {
-        EmissionGuarantee { _private: () }
+        EmissionGuarantee { _private: (), emitted: true }
+    }
+
+    /// The diagnostic was suppressed (e.g. warning when warnings are off).
+    pub fn suppressed() -> Self {
+        EmissionGuarantee { _private: (), emitted: false }
+    }
+
+    /// Returns `true` if the diagnostic was actually recorded.
+    pub fn was_emitted(&self) -> bool {
+        self.emitted
     }
 }
 
@@ -60,6 +156,12 @@ pub type DiagResult<T> = Result<T, EmissionGuaranteed>;
 /// on the error path, proving a diagnostic was emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmissionGuaranteed(EmissionGuarantee);
+
+impl From<EmissionGuarantee> for EmissionGuaranteed {
+    fn from(g: EmissionGuarantee) -> Self {
+        EmissionGuaranteed(g)
+    }
+}
 
 /// A lazily-formatted diagnostic message, analogous to rustc's `DiagMessage`.
 /// Currently a simple wrapper around `String`; future versions may support
@@ -120,6 +222,114 @@ impl MultiSpan {
     }
 }
 
+/// How confident we are that a suggestion is correct.
+/// Inspired by rustc's `Applicability`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applicability {
+    /// The suggestion can be applied automatically without review.
+    MachineApplicable,
+    /// The suggestion might be correct, but needs human review.
+    MaybeIncorrect,
+    /// The suggestion has placeholders that need to be filled in.
+    HasPlaceholders,
+    /// The applicability is unspecified.
+    Unspecified,
+}
+
+impl Default for Applicability {
+    fn default() -> Self {
+        Applicability::MachineApplicable
+    }
+}
+
+/// How a suggestion should be displayed.
+/// Inspired by rustc's `SuggestionStyle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuggestionStyle {
+    /// Show the suggestion inline with the diagnostic.
+    ShowAlways,
+    /// Show the suggestion code, but hide the message.
+    ShowCode,
+    /// Show the message, but hide the inline code.
+    HideCodeInline,
+    /// Hide the suggestion entirely from the user.
+    HideCodeAlways,
+    /// Completely hidden (only visible to tools, e.g. IDE).
+    CompletelyHidden,
+}
+
+impl Default for SuggestionStyle {
+    fn default() -> Self {
+        SuggestionStyle::ShowAlways
+    }
+}
+
+/// A structured suggestion with confidence and style metadata.
+#[derive(Debug, Clone)]
+pub struct Suggestion {
+    pub message: String,
+    pub applicability: Applicability,
+    pub style: SuggestionStyle,
+}
+
+impl std::fmt::Display for Suggestion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tag = match self.applicability {
+            Applicability::MachineApplicable => "",
+            Applicability::MaybeIncorrect => " (maybe incorrect)",
+            Applicability::HasPlaceholders => " (has placeholders)",
+            Applicability::Unspecified => "",
+        };
+        write!(f, "{}{}", self.message, tag)
+    }
+}
+
+/// A segment of styled text, used in notes and help messages.
+/// Inspired by rustc's `StringPart`.
+#[derive(Debug, Clone)]
+pub struct StringPart {
+    pub content: String,
+    pub style: StringPartStyle,
+}
+
+/// Whether a `StringPart` should be highlighted or rendered normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringPartStyle {
+    Normal,
+    Highlighted,
+}
+
+/// A sequence of styled text segments, used for rich diagnostic messages.
+/// When rendered, highlighted segments are shown in a distinct color
+/// (e.g. cyan for type names) while normal segments use the default color.
+#[derive(Debug, Clone)]
+pub struct StyledString(pub Vec<StringPart>);
+
+impl StyledString {
+    pub fn new(parts: Vec<StringPart>) -> Self {
+        StyledString(parts)
+    }
+
+    pub fn plain(text: impl Into<String>) -> Self {
+        StyledString(vec![StringPart {
+            content: text.into(),
+            style: StringPartStyle::Normal,
+        }])
+    }
+
+    pub fn highlighted(text: impl Into<String>) -> Self {
+        StyledString(vec![StringPart {
+            content: text.into(),
+            style: StringPartStyle::Highlighted,
+        }])
+    }
+
+    /// Render the styled string as plain text (without ANSI codes).
+    pub fn to_plain(&self) -> String {
+        self.0.iter().map(|p| p.content.as_str()).collect()
+    }
+}
+
 /// A complete compiler diagnostic (error, warning, help, note, or info).
 ///
 /// Architecture inspired by multiple compilers:
@@ -129,25 +339,53 @@ impl MultiSpan {
 /// - **Vale**: Structured error variants per compiler pass
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
-    pub level: DiagnosticLevel,
-    pub message: String,
-    pub code: Option<ErrCode>,
+    level: DiagnosticLevel,
+    message: String,
+    code: Option<ErrCode>,
+    /// Structured error kind (Vale-style ADT).  When present, the humanizer
+    /// can derive `message`, `labels`, and other fields automatically.
+    kind: Option<DiagnosticKind>,
     /// Primary spans (multiple for multi-location diagnostics).
-    pub spans: MultiSpan,
-    pub help: Option<String>,
-    pub suggestions: Vec<String>,
+    spans: MultiSpan,
+    help: Option<String>,
+    /// Structured suggestions with applicability and style metadata.
+    suggestions: Vec<Suggestion>,
     /// Multi-span annotations for source-context rendering
-    pub labels: Vec<Label>,
+    labels: Vec<Label>,
     /// Zig-style call chain tracing how the error was reached
-    pub call_chain: Option<CallChain>,
+    call_chain: Option<CallChain>,
     /// Retained source text for `^`-underline rendering
-    pub source: Option<String>,
+    source: Option<String>,
+    /// Source file name displayed in the `┌─ <input>:1:1` location header.
+    file_name: String,
     /// Child diagnostics (notes, help messages attached to this diagnostic).
-    /// Inspired by rustc's `Subdiag` — emitted immediately after the parent.
-    pub children: Vec<Subdiag>,
+    children: Vec<Subdiag>,
     /// Related errors displayed alongside this diagnostic in a single merged box.
-    /// Each related error has its own error code, message, and optional span.
-    pub related_errors: Vec<RelatedError>,
+    related_errors: Vec<RelatedError>,
+}
+
+impl Diagnostic {
+    // ── Read-only accessors ─────────────────────────────────────────
+    pub fn level(&self) -> DiagnosticLevel { self.level }
+    pub fn message(&self) -> &str { &self.message }
+    pub fn code(&self) -> Option<&ErrCode> { self.code.as_ref() }
+    pub fn kind(&self) -> Option<&DiagnosticKind> { self.kind.as_ref() }
+    pub fn spans(&self) -> &MultiSpan { &self.spans }
+    pub fn help(&self) -> Option<&str> { self.help.as_deref() }
+    pub fn suggestions(&self) -> &[Suggestion] { &self.suggestions }
+    pub fn labels(&self) -> &[Label] { &self.labels }
+    pub fn call_chain(&self) -> Option<&CallChain> { self.call_chain.as_ref() }
+    pub fn source(&self) -> Option<&str> { self.source.as_deref() }
+    pub fn file_name(&self) -> &str { &self.file_name }
+    pub fn children(&self) -> &[Subdiag] { &self.children }
+    pub fn children_mut(&mut self) -> &mut Vec<Subdiag> { &mut self.children }
+    pub fn related_errors(&self) -> &[RelatedError] { &self.related_errors }
+
+    // ── Mutable accessors ───────────────────────────────────────────
+    pub fn labels_mut(&mut self) -> &mut Vec<Label> { &mut self.labels }
+    pub fn related_errors_mut(&mut self) -> &mut Vec<RelatedError> { &mut self.related_errors }
+    pub fn set_source(&mut self, source: Option<String>) { self.source = source; }
+    pub fn set_file_name(&mut self, file_name: String) { self.file_name = file_name; }
 }
 
 /// A child diagnostic attached to a parent `Diagnostic`.
@@ -157,6 +395,10 @@ pub struct Diagnostic {
 pub struct Subdiag {
     pub level: DiagnosticLevel,
     pub message: String,
+    /// Optional styled version of the message, with highlighted parts.
+    /// When present, the glyph renderer uses this instead of the plain
+    /// `message` to render rich text with color highlights.
+    pub styled_message: Option<StyledString>,
     pub span: Option<Span>,
     pub labels: Vec<Label>,
 }
@@ -179,6 +421,7 @@ impl Subdiag {
         Subdiag {
             level,
             message: message.into(),
+            styled_message: None,
             span: None,
             labels: Vec::new(),
         }
@@ -215,12 +458,14 @@ impl Diagnostic {
             level,
             message: message.into(),
             code: None,
+            kind: None,
             spans: MultiSpan::default(),
             help: None,
             suggestions: Vec::new(),
             labels: Vec::new(),
             call_chain: None,
             source: None,
+            file_name: "<input>".into(),
             children: Vec::new(),
             related_errors: Vec::new(),
         }
@@ -232,6 +477,24 @@ impl Diagnostic {
 
     pub fn warning(message: impl Into<String>) -> Self {
         Self::new(DiagnosticLevel::Warning, message)
+    }
+
+    /// Create an error diagnostic from a structured [`DiagnosticKind`].
+    /// The humanizer runs immediately to populate `message`, `labels`,
+    /// `help`, and `suggestions` from the kind's data.
+    pub fn error_kind(kind: DiagnosticKind) -> Self {
+        let mut diag = Self::new(DiagnosticLevel::Error, "");
+        diag.kind = Some(kind);
+        diag.humanize();
+        diag
+    }
+
+    /// Create a warning diagnostic from a structured [`DiagnosticKind`].
+    pub fn warning_kind(kind: DiagnosticKind) -> Self {
+        let mut diag = Self::new(DiagnosticLevel::Warning, "");
+        diag.kind = Some(kind);
+        diag.humanize();
+        diag
     }
 
     pub fn help_diag(message: impl Into<String>) -> Self {
@@ -279,14 +542,33 @@ impl Diagnostic {
         self
     }
 
-    /// Add a single suggestion.
+    /// Add a single suggestion with default applicability and style.
     pub fn with_suggestion(mut self, suggestion: impl Into<String>) -> Self {
-        self.suggestions.push(suggestion.into());
+        self.suggestions.push(Suggestion {
+            message: suggestion.into(),
+            applicability: Applicability::MachineApplicable,
+            style: SuggestionStyle::ShowAlways,
+        });
+        self
+    }
+
+    /// Add a suggestion with explicit applicability and style.
+    pub fn with_suggestion_style(
+        mut self,
+        suggestion: impl Into<String>,
+        applicability: Applicability,
+        style: SuggestionStyle,
+    ) -> Self {
+        self.suggestions.push(Suggestion {
+            message: suggestion.into(),
+            applicability,
+            style,
+        });
         self
     }
 
     /// Replace suggestions list.
-    pub fn with_suggestions(mut self, suggestions: Vec<String>) -> Self {
+    pub fn with_suggestions(mut self, suggestions: Vec<Suggestion>) -> Self {
         self.suggestions = suggestions;
         self
     }
@@ -323,6 +605,77 @@ impl Diagnostic {
         self
     }
 
+    /// Set the source file name for the `┌─ <file>:1:1` location header.
+    pub fn with_file_name(mut self, file_name: impl Into<String>) -> Self {
+        self.file_name = file_name.into();
+        self
+    }
+
+    /// Set the structured diagnostic kind (Vale-style ADT).
+    ///
+    /// When present, the humanizer can derive `message`, `labels`, and other
+    /// fields from the kind's structured data, producing more precise error
+    /// messages than a flat string.
+    pub fn with_kind(mut self, kind: DiagnosticKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+
+    /// Add a highlighted note child (styled text with type/name highlights).
+    pub fn with_highlighted_note(mut self, styled: StyledString) -> Self {
+        let msg = styled.to_plain();
+        self.children.push(Subdiag {
+            level: DiagnosticLevel::Note,
+            message: msg,
+            styled_message: Some(styled),
+            span: None,
+            labels: Vec::new(),
+        });
+        self
+    }
+
+    /// Add a highlighted help child (styled text with type/name highlights).
+    pub fn with_highlighted_help(mut self, styled: StyledString) -> Self {
+        let msg = styled.to_plain();
+        self.children.push(Subdiag {
+            level: DiagnosticLevel::Help,
+            message: msg,
+            styled_message: Some(styled),
+            span: None,
+            labels: Vec::new(),
+        });
+        self
+    }
+
+    /// Run the humanizer on `self.kind` (if present) to populate `message`,
+    /// `labels`, `help`, and `suggestions` from the structured data.
+    ///
+    /// This is a no-op if `kind` is `None` (the message/labels were already
+    /// set manually).
+    pub fn humanize(&mut self) {
+        let Some(ref kind) = self.kind else { return };
+        self.message = kind.message();
+        let labels = kind.labels();
+        // Populate `spans` from the primary labels so the source-context
+        // renderer knows which lines to display.
+        for lbl in &labels {
+            if matches!(lbl.kind, AnnotationKind::Primary) {
+                self.spans.push(lbl.span);
+            }
+        }
+        self.labels = labels;
+        if self.help.is_none() {
+            self.help = kind.help();
+        }
+        if self.suggestions.is_empty() {
+            self.suggestions = kind.suggestions().into_iter().map(|s| Suggestion {
+                message: s,
+                applicability: Applicability::MachineApplicable,
+                style: SuggestionStyle::ShowAlways,
+            }).collect();
+        }
+    }
+
     // ── Query methods ──────────────────────────────────────────────
 
     pub fn is_error(&self) -> bool {
@@ -340,6 +693,95 @@ impl Diagnostic {
             .map(|s| format!("at {}", s))
             .unwrap_or_default()
     }
+
+    /// Merge context from another diagnostic into `self`.
+    ///
+    /// If `other` has a span, source, labels, or a call chain and `self`
+    /// does not yet have them, they are copied over.  This is useful for
+    /// progressively enriching a diagnostic as it passes through compiler
+    /// passes (the "context augmentation" pattern inspired by Austral).
+    pub fn augment(&mut self, other: &Diagnostic) {
+        if self.spans.first().is_none() {
+            if let Some(span) = other.spans.first() {
+                self.spans = MultiSpan::new(span);
+            }
+        }
+        if self.source.is_none() {
+            self.source.clone_from(&other.source);
+        }
+        if self.call_chain.is_none() {
+            self.call_chain.clone_from(&other.call_chain);
+        }
+        // Merge labels that aren't already present
+        for lbl in &other.labels {
+            if !self.labels.iter().any(|l| l.span == lbl.span && l.message == lbl.message) {
+                self.labels.push(lbl.clone());
+            }
+        }
+    }
+}
+
+/// Wrap a function that may produce a diagnostic, augmenting any errors
+/// it emits with the given span and source context.
+///
+/// This is the Ponent equivalent of Austral's `adorn_error_with_span`:
+/// instead of catching exceptions, the closure receives a `&mut DiagCtxt`
+/// and any diagnostics it pushes are augmented with `span` and `source`.
+///
+/// # Convention
+///
+/// This function **augments the last diagnostic** pushed to `ctxt` when the
+/// closure returns `Err`.  It relies on the invariant that the diagnostic
+/// produced by the failing closure is the most recent one in the context.
+/// If the closure pushes multiple diagnostics, only the last one is
+/// augmented — earlier ones are left untouched.
+///
+/// This is an intentional design choice: the "root cause" diagnostic is
+/// typically the last one pushed, and augmenting it with the outer call
+/// site's span/source is the most useful behaviour.  Callers that push
+/// multiple diagnostics before failing should order them so that the
+/// one needing augmentation is last.
+///
+/// # Safety
+///
+/// `EmissionGuaranteed` can only be obtained by calling `DiagCtxt::push()`,
+/// which records a diagnostic before returning the token.  Therefore, if
+/// `f` returns `Err(EmissionGuaranteed)`, at least one diagnostic must have
+/// been pushed, and `last_mut()` is guaranteed to return `Some`.
+///
+/// # Example
+/// ```ignore
+/// adorn_with_span(ctxt, span, source, |ctxt| {
+///     check_something(ctxt)?;
+///     Ok(())
+/// });
+/// ```
+pub fn adorn_with_span<T>(
+    ctxt: &mut DiagCtxt,
+    span: Span,
+    source: Option<&str>,
+    f: impl FnOnce(&mut DiagCtxt) -> Result<T, EmissionGuaranteed>,
+) -> Result<T, EmissionGuaranteed> {
+    let diag_count_before = ctxt.len();
+    let result = f(ctxt);
+    // If the closure failed, augment the last diagnostic with context.
+    if result.is_err() {
+        // Assert that at least one diagnostic was pushed by the closure.
+        debug_assert!(
+            ctxt.len() > diag_count_before,
+            "adorn_with_span: closure returned Err but no diagnostic was pushed — \
+             the closure must push a diagnostic via `ctxt.push(...)` before returning Err",
+        );
+        if let Some(diag) = ctxt.last_mut() {
+            if diag.spans.first().is_none() {
+                diag.spans = MultiSpan::new(span);
+            }
+            if diag.source.is_none() {
+                diag.source = source.map(|s| s.to_string());
+            }
+        }
+    }
+    result
 }
 
 // ── ErrCode is now a string-based code — use `ErrCode::new("E030")` ──
@@ -400,16 +842,17 @@ impl fmt::Display for Diagnostic {
 pub fn explain_error_code(code_str: &str) -> String {
     use std::fmt::Write;
 
-    // Check if the code exists in the lookup table before proceeding.
-    let Some(code) = crate::diagnostics::error_code::lookup(code_str) else {
-        return format!(
-            "\x1b[1;31merror\x1b[0m\x1b[2m[E000]\x1b[0m: unknown error code `{code_str}`\n\
-             {help}",
-            help = suggest_code(code_str),
-        );
+    // Use `try_new` to validate the code exists in the lookup table.
+    let code = match ErrCode::try_new(code_str) {
+        Ok(code) => code,
+        Err(_) => {
+            return format!(
+                "\x1b[1;31merror\x1b[0m\x1b[2m[E000]\x1b[0m: unknown error code `{code_str}`\n\
+                 {help}",
+                help = suggest_code(code_str),
+            );
+        }
     };
-
-    let code = ErrCode::new(code_str);
     let mut out = String::new();
 
     // ── Header: bold error code + title ──

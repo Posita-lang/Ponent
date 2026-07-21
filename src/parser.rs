@@ -5386,7 +5386,7 @@ mod tests {
         let diags = check_parse_err("fn main(){}");
         let has = diags
             .iter()
-            .any(|d| d.suggestions.iter().any(|s| s.contains("def")));
+            .any(|d| d.suggestions().iter().any(|s| s.message.contains("def")));
         assert!(
             has,
             "expected 'did you mean `def`?' for `fn`, got: {:?}",
@@ -5401,7 +5401,7 @@ mod tests {
         let diags = check_parse_err("def main() { match x { $ => {} }; }");
         let has = diags
             .iter()
-            .any(|d| d.suggestions.iter().any(|s| s.contains("try")));
+            .any(|d| d.suggestions().iter().any(|s| s.message.contains("try")));
         assert!(
             has,
             "expected a suggestion for bad pattern token, got: {:?}",

@@ -101,3 +101,57 @@ pub fn byte_offset_to_string(source: &str, byte_offset: usize) -> String {
     let pos = byte_to_linecol(source, byte_offset);
     format!("{}:{}", pos.line + 1, pos.col + 1)
 }
+
+// ── Snippet: a contiguous slice of source code with annotations ──
+
+/// A contiguous slice of source code with its annotations, ready for
+/// rendering.  Inspired by the `Snippet` type in `annotate-snippets-rs`.
+///
+/// Each `Snippet` represents one continuous region of source text (e.g. a
+/// function body, a type definition) together with the labels / underlines
+/// that should be drawn over it.
+#[derive(Debug, Clone)]
+pub struct Snippet {
+    /// Display name / file path of the source (e.g. `"src/main.pn"`).
+    pub origin: String,
+    /// 1‑based line number of the first line in `source`.
+    pub line_start: usize,
+    /// The raw source text (may span multiple lines).
+    pub source: String,
+    /// Annotations (labels) attached to this snippet.
+    pub annotations: Vec<Label>,
+    /// Whether to fold long runs of unannotated lines into `…`.
+    pub fold: bool,
+}
+
+impl Snippet {
+    pub fn new(origin: impl Into<String>, source: impl Into<String>) -> Self {
+        Snippet {
+            origin: origin.into(),
+            line_start: 1,
+            source: source.into(),
+            annotations: Vec::new(),
+            fold: false,
+        }
+    }
+
+    pub fn with_line_start(mut self, line_start: usize) -> Self {
+        self.line_start = line_start;
+        self
+    }
+
+    pub fn with_annotation(mut self, label: Label) -> Self {
+        self.annotations.push(label);
+        self
+    }
+
+    pub fn with_annotations(mut self, labels: impl IntoIterator<Item = Label>) -> Self {
+        self.annotations.extend(labels);
+        self
+    }
+
+    pub fn with_fold(mut self, fold: bool) -> Self {
+        self.fold = fold;
+        self
+    }
+}

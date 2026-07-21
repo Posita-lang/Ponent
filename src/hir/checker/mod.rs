@@ -1,5 +1,7 @@
 use crate::ast::*;
-use crate::diagnostics::{DiagCtxt, Diagnostic, Label};
+use crate::diagnostics::{
+    Applicability, DiagCtxt, Diagnostic, DiagnosticKind, Label, Suggestion, SuggestionStyle,
+};
 use crate::hir::hir::*;
 use crate::hir::infer::*;
 use crate::hir::resolver::ResolutionMap;
@@ -453,18 +455,28 @@ impl<'a> TypeChecker<'a> {
 
         // Evaluate deferred comptime blocks from Pass 2.  Now all comptime function
         // bodies are registered, so forward references will resolve correctly.
-        for (hir, ty, span) in self.deferred_comptime_blocks.drain(..) {
+        for (hir, _ty, span) in self.deferred_comptime_blocks.drain(..) {
             let mut eval = crate::hir::comptime::ComptimeEvalContext::new(self.ctx, self.symbols);
             for (name, (params, body)) in &self.comptime_fn_registry {
                 eval.register_fn(name.clone(), params.clone(), body.clone());
             }
-            if let Err(e) = eval.eval_block(&hir) {
-                self.diagnostics.push(
-                    Diagnostic::error(format!("comptime error: {}", e))
-                        .with_code_str("E080")
-                        .with_span(span),
-                );
-            }
+            let _ = crate::diagnostics::adorn_with_span(
+                &mut self.diagnostics,
+                span,
+                None,
+                |ctxt| {
+                    match eval.eval_block(&hir) {
+                        Ok(_) => Ok(()),
+                        Err(e) => {
+                            // Push once; adorn_with_span will add span/source.
+                            Err(ctxt.push(
+                                Diagnostic::error(crate::tr!("comptime error: {e}", e = e))
+                                    .with_code_str("E080"),
+                            ).into())
+                        }
+                    }
+                },
+            );
         }
 
         // Pass 3: type-check remaining items (non-comptime functions,
@@ -581,7 +593,7 @@ impl<'a> TypeChecker<'a> {
                     .and_then(|e| e.span())
                     .unwrap_or(crate::ast::Span::new(0, 0));
                 self.diagnostics.push(
-                    Diagnostic::error(format!("trait solver error: {}", msg))
+                    Diagnostic::error(crate::tr!("trait solver error: {msg}", msg = msg))
                         .with_code_str("E030")
                         .with_span(span),
                 );
@@ -737,20 +749,18 @@ impl<'a> TypeChecker<'a> {
                     {
                         let prev_span = self.span_get(var_name).unwrap_or(*span);
                         dup_diag = Some(
-                            Diagnostic::error(format!("duplicate definition of `{}`", var_name,))
-                                .with_code_str("E019")
-                                .with_span(*span)
-                                .with_additional_span(prev_span)
-                                .with_secondary_label(
-                                    prev_span,
-                                    "previous definition here",
-                                ),
+                            Diagnostic::error_kind(DiagnosticKind::DuplicateDefinition {
+                                name: var_name.to_string(),
+                                this_span: *span,
+                                original_span: prev_span,
+                            })
+                            .with_code_str("E019"),
                         );
                     } else if self.local_variable_types.get(var_name.clone()).is_some() {
                         // Shadowing is allowed but warns.
                         let prev_span = self.span_get(var_name).unwrap_or(*span);
                         self.diagnostics.push(
-                            Diagnostic::warning(format!("shadowing definition of `{}`", var_name,))
+                            Diagnostic::warning(crate::tr!("shadowing definition of `{name}`", name = var_name.as_str()))
                                 .with_code_str("W113")
                                 .with_span(*span)
                                 .with_additional_span(prev_span)
@@ -837,10 +847,10 @@ impl<'a> TypeChecker<'a> {
                     Ok(r) => r,
                     Err(rhs_err) => {
                         if let Some(ref mut d) = dup_diag {
-                            d.related_errors.push(crate::diagnostics::RelatedError {
-                                code: rhs_err.code.clone(),
-                                message: rhs_err.message.clone(),
-                                span: rhs_err.spans.first(),
+                            d.related_errors_mut().push(crate::diagnostics::RelatedError {
+                                code: rhs_err.code().cloned(),
+                                message: rhs_err.message().to_string(),
+                                span: rhs_err.spans().first(),
                                 label: None,
                             });
                         } else {
@@ -1714,7 +1724,7 @@ impl<'a> TypeChecker<'a> {
                 let exit_res = guard.commit();
 
                 if let Err(diags) = exit_res {
-                    let details: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
+                    let details: Vec<String> = diags.iter().map(|d| d.message().to_string()).collect();
                     return Err(Diagnostic::error(format!(
                         "inference failure: {}",
                         details.join("; ")
@@ -2753,15 +2763,14 @@ impl<'a> TypeChecker<'a> {
                     for (tm_name, _tm_sig) in &trait_binding.methods {
                         if !impl_method_names.contains(tm_name) {
                             self.diagnostics.push(
-                                Diagnostic::error(format!(
-                                    "impl missing method `{}` required by trait `{}`",
-                                    tm_name,
-                                    Self::type_to_string(tp.as_ref()),
-                                ))
+                                Diagnostic::error_kind(DiagnosticKind::ImplMissingMethod {
+                                    trait_name: Self::type_to_string(tp.as_ref()),
+                                    method_name: tm_name.to_string(),
+                                    impl_span: span,
+                                    trait_span: trait_binding.span,
+                                })
                                 .with_code_str("E101")
-                                .with_help("every trait method must be implemented — add a `def` for it in this impl block")
-                                .with_span(span)
-                                .with_label(trait_binding.span, "required by trait declaration here"));
+                                .with_help("every trait method must be implemented — add a `def` for it in this impl block"));
                         }
                     }
 
@@ -3198,19 +3207,65 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Suggest a cast for common type mismatches (e.g. Int ↔ Float).
-    fn suggest_cast(&self, expected: TypeId, actual: TypeId) -> Option<String> {
+    fn suggest_cast(&self, expected: TypeId, actual: TypeId) -> Option<Suggestion> {
         let (e, a) = (self.ctx.get(expected), self.ctx.get(actual));
-        match (e, a) {
+        let msg = match (e, a) {
             (TypeData::Int { .. }, TypeData::Float { .. })
             | (TypeData::Float { .. }, TypeData::Int { .. }) => {
-                Some("try using `as` to cast between integer and float types".into())
+                Some("try using `as` to cast between integer and float types")
             }
             (TypeData::Bool, TypeData::Int { .. }) => {
-                Some("try `x != 0` to convert Int to Bool".into())
+                Some("try `x != 0` to convert Int to Bool")
             }
             (TypeData::Int { .. }, TypeData::Bool) => {
-                Some("try `if x { 1 } else { 0 }` to convert Bool to Int".into())
+                Some("try `if x { 1 } else { 0 }` to convert Bool to Int")
             }
+            _ => None,
+        };
+        msg.map(|m| Suggestion {
+            message: m.into(),
+            applicability: Applicability::MaybeIncorrect,
+            style: SuggestionStyle::ShowAlways,
+        })
+    }
+
+    /// Generate a human-readable reason for a type mismatch between two
+    /// types, explaining *why* they are incompatible.  Returns `None` when
+    /// no specific reason can be determined (the types are simply different).
+    pub(crate) fn type_mismatch_reason(&self, expected: TypeId, actual: TypeId) -> Option<String> {
+        let (e, a) = (self.ctx.get(expected), self.ctx.get(actual));
+        match (e, a) {
+            (TypeData::Int { bits: eb, signed: es, .. }, TypeData::Int { bits: ab, signed: as_, .. }) => {
+                if eb != ab {
+                    Some(format!("Int<{eb}> is not the same width as Int<{ab}>"))
+                } else if es != as_ {
+                    Some(format!("signed Int<{eb}> is not the same as unsigned Int<{eb}>"))
+                } else {
+                    None
+                }
+            }
+            (TypeData::Int { .. }, TypeData::UInt { bits: ab, .. }) => {
+                Some(format!("signed integer is not the same as unsigned UInt<{ab}>"))
+            }
+            (TypeData::UInt { bits: eb, .. }, TypeData::Int { .. }) => {
+                Some(format!("unsigned UInt<{eb}> is not the same as signed integer"))
+            }
+            (TypeData::UInt { bits: eb, .. }, TypeData::UInt { bits: ab, .. }) => {
+                if eb != ab {
+                    Some(format!("UInt<{eb}> is not the same width as UInt<{ab}>"))
+                } else {
+                    None
+                }
+            }
+            (TypeData::Float { bits: eb }, TypeData::Float { bits: ab }) => {
+                if eb != ab {
+                    Some(format!("Float<{eb}> is not the same width as Float<{ab}>"))
+                } else {
+                    None
+                }
+            }
+            (TypeData::Ref { .. }, _) => Some("a reference type is not a value type; try dereferencing with `*`".into()),
+            (_, TypeData::Ref { .. }) => Some("expected a reference type, but got a value type; try taking a reference with `&`".into()),
             _ => None,
         }
     }
@@ -3220,14 +3275,17 @@ impl<'a> TypeChecker<'a> {
             .unify(expected, actual)
             .map(|_| ())
             .map_err(|_err| {
-                let msg = format!(
-                    "type mismatch: expected {:?}, found {:?}",
-                    self.ctx.get(expected),
-                    self.ctx.get(actual)
-                );
-                let mut diag = Diagnostic::error(msg).with_code_str("E030").with_span(span);
+                let reason = self.type_mismatch_reason(expected, actual);
+                let mut diag = Diagnostic::error_kind(DiagnosticKind::TypeMismatch {
+                    expected: format!("{:?}", self.ctx.get(expected)),
+                    found: format!("{:?}", self.ctx.get(actual)),
+                    span,
+                    found_span: None,
+                    reason,
+                })
+                .with_code_str("E030");
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
-                    diag = diag.with_suggestion(suggestion);
+                    diag = diag.with_suggestion(suggestion.message);
                 }
                 diag
             })
@@ -3303,7 +3361,7 @@ impl<'a> TypeChecker<'a> {
                     _ => Diagnostic::error(msg).with_code_str("E030").with_span(span),
                 };
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
-                    diag = diag.with_suggestion(suggestion);
+                    diag = diag.with_suggestion(suggestion.message);
                 }
                 diag
             })
@@ -3567,18 +3625,18 @@ impl<'a> TypeChecker<'a> {
             if let Some(ref mut d) = diag {
                 // Add a secondary label for the "other" operand (the concrete type).
                 if let Some(os) = other_span {
-                    d.labels.push(Label::secondary(os, other_type_str));
+                    d.labels_mut().push(Label::secondary(os, other_type_str));
                 }
                 // Add a note label for the "maybe_var" operand (the infer var).
                 if let Some(ms) = maybe_var_span {
-                    d.labels.push(Label::secondary(ms, "expected integer type"));
+                    d.labels_mut().push(Label::secondary(ms, "expected integer type"));
                 }
                 // Trace the type origin: if the "other" operand's type came from
                 // a variable definition, show where it originated.
                 if let Some((_origin_name, origin_span)) = self.resolve_type_origin(resolved_other)
                 {
                     if origin_span != other_span.unwrap_or(origin_span) {
-                        d.labels
+                        d.labels_mut()
                             .push(Label::secondary(origin_span, "type originates here"));
                     }
                     // If the type is a string reference (&Str / &[Byte]),
@@ -3593,7 +3651,7 @@ impl<'a> TypeChecker<'a> {
                         if matches!(inner, TypeData::Adt { def_id, .. } if *def_id == DefId(usize::MAX))
                             || matches!(inner, TypeData::Byte)
                         {
-                            d.labels.push(Label::help(
+                            d.labels_mut().push(Label::help(
                                 origin_span,
                                 "this value is a string, not a number. \
                                      Remove the quotes to use it as a numeric literal.",
@@ -4176,9 +4234,13 @@ impl<'a> TypeChecker<'a> {
         }
 
         // Build an informative error message
-        let mut diag = Diagnostic::error(format!("no field `{}` found on type", name))
-            .with_code_str("E010")
-            .with_span(span);
+        let type_name = format!("{:?}", self.ctx.get(ty));
+        let mut diag = Diagnostic::error_kind(DiagnosticKind::NoSuchField {
+            field_name: name.to_string(),
+            type_name,
+            span,
+        })
+        .with_code_str("E010");
 
         // If we found the type definition, show where it was defined
         if let TypeData::Adt { def_id, .. } = self.ctx.get(ty) {

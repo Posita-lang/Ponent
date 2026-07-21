@@ -41,6 +41,8 @@ pub(crate) struct ResolutionMap {
     pub value_resolutions: FxHashMap<Symbol, PartialRes>,
     /// Partial resolution of type paths (multi-segment), keyed by the first segment.
     pub type_resolutions: FxHashMap<Symbol, PartialRes>,
+    /// Whether a top-level `main` function was found during resolution.
+    pub has_main: bool,
 }
 use crate::hir::types::*;
 use rustc_hash::FxHashMap as HashMap;
@@ -55,6 +57,8 @@ pub struct NameResolver<'a> {
     current_type: Option<DefId>,
     import_map: Vec<ImportEntry>,
     local_crate_id: CrateId,
+    /// Whether a top-level function named `main` was resolved.
+    has_main: bool,
     /// Temporary mapping of type parameter names to GenericParam TypeIds
     /// used when resolving types inside an `impl<T>` block.
     current_impl_type_params: Option<HashMap<Symbol, TypeId>>,
@@ -94,6 +98,7 @@ impl<'a> NameResolver<'a> {
             current_type: None,
             import_map: Vec::new(),
             local_crate_id,
+            has_main: false,
             current_impl_type_params: None,
             current_impl_for_type: None,
             resolution_map: ResolutionMap::default(),
@@ -105,25 +110,19 @@ impl<'a> NameResolver<'a> {
     pub fn resolve_program(
         &mut self,
         program: &Program,
-    ) -> Result<(SymbolTable, TraitEnv, DiagCtxt, ResolutionMap), DiagCtxt> {
+    ) -> (SymbolTable, TraitEnv, DiagCtxt, ResolutionMap) {
         for item in &program.items {
             self.resolve_item(item);
         }
 
-        if self.diagnostics.has_errors() {
-            Err(std::mem::take(&mut self.diagnostics))
-        } else {
-            let symbols =
-                std::mem::replace(&mut self.symbols, SymbolTable::new(self.local_crate_id));
-            let trait_env = std::mem::replace(&mut self.trait_env, TraitEnv::new());
-            let resolution_map = std::mem::take(&mut self.resolution_map);
-            Ok((
-                symbols,
-                trait_env,
-                std::mem::take(&mut self.diagnostics),
-                resolution_map,
-            ))
-        }
+        let symbols =
+            std::mem::replace(&mut self.symbols, SymbolTable::new(self.local_crate_id));
+        let trait_env = std::mem::replace(&mut self.trait_env, TraitEnv::new());
+        let mut resolution_map = std::mem::take(&mut self.resolution_map);
+        resolution_map.has_main = self.has_main;
+        let diags = std::mem::take(&mut self.diagnostics);
+
+        (symbols, trait_env, diags, resolution_map)
     }
 
     fn resolve_item(&mut self, item: &Stmt) {
@@ -173,6 +172,9 @@ impl<'a> NameResolver<'a> {
                 };
                 if let Err(diag) = self.symbols.insert_function(name.clone(), binding, *span) {
                     self.diagnostics.push(diag);
+                }
+                if name.as_str() == "main" {
+                    self.has_main = true;
                 }
 
                 self.enter_scope();
@@ -2024,17 +2026,18 @@ mod tests {
         let mut parser = Parser::new(source);
         let program = parser
             .parse_program()
-            .map_err(|diags| diags.into_iter().map(|d| d.message).collect::<Vec<_>>())?;
+            .map_err(|diags| diags.into_iter().map(|d| d.message().to_string()).collect::<Vec<_>>())?;
         let local_crate_id = CrateId(DefId(0));
         let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
-        let (symbols, trait_env, _diags, resolution_map) =
-            resolver.resolve_program(&program).map_err(|diags| {
-                diags
-                    .into_inner()
-                    .into_iter()
-                    .map(|d| d.message)
-                    .collect::<Vec<_>>()
-            })?;
+        let (symbols, trait_env, diags, resolution_map) =
+            resolver.resolve_program(&program);
+        if diags.has_errors() {
+            return Err(diags
+                .into_inner()
+                .into_iter()
+                .map(|d| d.message().to_string())
+                .collect::<Vec<_>>());
+        }
         Ok((symbols, trait_env, resolution_map, ctx))
     }
 

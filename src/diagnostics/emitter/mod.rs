@@ -4,6 +4,7 @@ pub mod colored;
 pub mod html;
 pub mod json;
 pub mod plain;
+pub mod stylesheet;
 
 /// Trait for rendering diagnostics to different output formats.
 /// Each emitter handles a specific format (plain text, colored, JSON, HTML).

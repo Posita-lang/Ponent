@@ -16,19 +16,20 @@ fn check_source(source: &str) -> Result<HirProgram, Vec<String>> {
     let mut parser = Parser::new(source);
     let program = parser
         .parse_program()
-        .map_err(|diags| diags.into_iter().map(|d| d.message).collect::<Vec<_>>())?;
+        .map_err(|diags| diags.into_iter().map(|d| d.message().to_string()).collect::<Vec<_>>())?;
 
     let mut ctx = TypeContext::new();
     let local_crate_id = CrateId(DefId(0));
     let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
-    let (mut symbols, mut trait_env, _res_diags, resolution_map) =
-        resolver.resolve_program(&program).map_err(|diags| {
-            diags
-                .into_inner()
-                .into_iter()
-                .map(|d| d.message)
-                .collect::<Vec<_>>()
-        })?;
+    let (mut symbols, mut trait_env, res_diags, resolution_map) =
+        resolver.resolve_program(&program);
+    if res_diags.has_errors() {
+        return Err(res_diags
+            .into_inner()
+            .into_iter()
+            .map(|d| d.message().to_string())
+            .collect::<Vec<_>>());
+    }
 
     // NOTE: register_builtins is called inside NameResolver::new (resolver.rs:83),
     // so the builtin types and traits are already registered at this point.
@@ -42,7 +43,7 @@ fn check_source(source: &str) -> Result<HirProgram, Vec<String>> {
         diags
             .into_inner()
             .into_iter()
-            .map(|d| d.message)
+            .map(|d| d.message().to_string())
             .collect::<Vec<_>>()
     })
 }

@@ -42,10 +42,13 @@ use std::process;
 
 /// Attach source text to all diagnostics in a slice so the emitter can
 /// render `^`-underline annotations (Rust-style source context).
-fn attach_source_to_diags(diags: &mut [Diagnostic], source: &str) {
+fn attach_source_to_diags(diags: &mut [Diagnostic], source: &str, file_name: &str) {
     for diag in diags.iter_mut() {
-        if diag.source.is_none() {
-            diag.source = Some(source.to_string());
+        if diag.source().is_none() {
+            diag.set_source(Some(source.to_string()));
+        }
+        if diag.file_name() == "<input>" {
+            diag.set_file_name(file_name.to_string());
         }
     }
 }
@@ -66,7 +69,7 @@ fn main() {
                 Ok(s) => s,
                 Err(e) => {
                     let mut diag = Diagnostic::error(format!("failed to read `{}`: {}", file, e));
-                    diag.source = Some(file.clone());
+                    diag.set_source(Some(file.clone()));
                     let mut emitter = ColoredEmitter::new();
                     emitter.emit(&diag);
                     process::exit(1);
@@ -89,7 +92,7 @@ fn main() {
                 Ok(s) => s,
                 Err(e) => {
                     let mut diag = Diagnostic::error(format!("failed to read `{}`: {}", file, e));
-                    diag.source = Some(file.clone());
+                    diag.set_source(Some(file.clone()));
                     let mut emitter = make_emitter(json);
                     emitter.emit(&diag);
                     process::exit(1);
@@ -114,41 +117,53 @@ fn main() {
                         };
 
                         let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
-                        match resolver.resolve_program(&program) {
-                            Ok((mut symbols, mut trait_env, _diags, resolution_map)) => {
-                                let mut diags = _diags.into_inner();
-                                attach_source_to_diags(&mut diags, &source);
+                        let (symbols, mut trait_env, resolver_diags, resolution_map) =
+                            resolver.resolve_program(&program);
+                        let mut all_diags = resolver_diags.into_inner();
+                        attach_source_to_diags(&mut all_diags, &source, &file);
 
-                                // Built-in traits and impls are registered by
-                                // `NameResolver::new` → `builtins::register_builtins`.
-                                // The `trait_env` is passed through `resolve_program`
-                                // and into `TypeChecker::new` below.  If the resolver
-                                // is ever refactored to NOT call `register_builtins`,
-                                // the trait solver will fail immediately at the first
-                                // trait obligation (no impls found).
-
-                                let mut checker = TypeChecker::new(
-                                    &mut ctx,
-                                    &symbols,
-                                    &mut trait_env,
-                                    resolution_map,
-                                );
-                                match checker.check_program(&program) {
-                                    Ok(_hir_program) => {
-                                        println!("Type checking succeeded.");
-                                    }
-                                    Err(errors) => {
-                                        let mut diags = errors.into_inner();
-                                        attach_source_to_diags(&mut diags, &source);
-                                        let mut emitter = make_emitter(json);
-                                        emitter.emit_all(&diags);
-                                        process::exit(1);
-                                    }
+                        let has_main = resolution_map.has_main;
+                        let mut checker = TypeChecker::new(
+                            &mut ctx,
+                            &symbols,
+                            &mut trait_env,
+                            resolution_map,
+                        );
+                        let checker_result = checker.check_program(&program);
+                        match checker_result {
+                            Ok(_hir_program) => {
+                                // Checker succeeded — report any resolver diagnostics.
+                                if !all_diags.is_empty() {
+                                    let mut emitter = make_emitter(json);
+                                    emitter.emit_all(&all_diags);
+                                }
+                                // Verify that a `main` function exists.
+                                if !has_main {
+                                    let mut diags = vec![
+                                        Diagnostic::error(
+                                            "`main` function not found in crate",
+                                        )
+                                        .with_code_str("E062")
+                                        .with_help(
+                                            "add a `def main() { ... }` function as the entry point",
+                                        ),
+                                    ];
+                                    attach_source_to_diags(&mut diags, &source, &file);
+                                    let mut emitter = make_emitter(json);
+                                    emitter.emit_all(&diags);
+                                    process::exit(1);
+                                }
+                                if all_diags.is_empty() {
+                                    println!("Type checking succeeded.");
+                                } else {
+                                    process::exit(1);
                                 }
                             }
                             Err(errors) => {
                                 let mut diags = errors.into_inner();
-                                attach_source_to_diags(&mut diags, &source);
+                                attach_source_to_diags(&mut diags, &source, &file);
+                                // Merge resolver diagnostics into checker diagnostics.
+                                diags.extend(all_diags);
                                 let mut emitter = make_emitter(json);
                                 emitter.emit_all(&diags);
                                 process::exit(1);
@@ -157,7 +172,7 @@ fn main() {
                     }
                 }
                 Err(mut diagnostics) => {
-                    attach_source_to_diags(&mut diagnostics, &source);
+                    attach_source_to_diags(&mut diagnostics, &source, &file);
                     let mut emitter = make_emitter(json);
                     emitter.emit_all(&diagnostics);
                     process::exit(1);
@@ -167,8 +182,29 @@ fn main() {
         cli::Command::Explain { code } => {
             match code {
                 Some(code) => {
+                    // Start the local explain server on a random port.
+                    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                        .expect("failed to bind explain server");
+                    let port = listener.local_addr().unwrap().port();
+                    diagnostics::error_code::set_explain_port(port);
+
                     let explanation = diagnostics::explain_error_code(&code);
                     println!("{}", explanation);
+
+                    let explain_code = code.clone();
+                    let url = format!("http://127.0.0.1:{port}/{explain_code}");
+                    // Open the browser in a background thread so the server
+                    // can accept connections.
+                    let url_bg = url.clone();
+                    std::thread::spawn(move || {
+                        let _ = open_browser(&url_bg);
+                    });
+
+                    // Serve the explain page using the already-bound listener.
+                    diagnostics::explain_server::serve_explain(listener, &explain_code)
+                        .unwrap_or_else(|e| {
+                            eprintln!("warning: explain server error: {e}");
+                        });
                 }
                 None => {
                     print!("{}", diagnostics::list_error_codes());
@@ -176,4 +212,28 @@ fn main() {
             }
         }
     }
+}
+
+/// Open a URL in the user's default browser.
+#[cfg(target_os = "linux")]
+fn open_browser(url: &str) -> std::io::Result<()> {
+    std::process::Command::new("xdg-open").arg(url).spawn()?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_browser(url: &str) -> std::io::Result<()> {
+    std::process::Command::new("open").arg(url).spawn()?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn open_browser(url: &str) -> std::io::Result<()> {
+    std::process::Command::new("cmd").args(["/c", "start", url]).spawn()?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn open_browser(_url: &str) -> std::io::Result<()> {
+    Ok(()) // silently no-op on unsupported platforms
 }

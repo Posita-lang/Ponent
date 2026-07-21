@@ -136,7 +136,7 @@ impl JsonEmitter {
                 s.push_str(&format!(
                     "{}    {}",
                     Self::indent(i + 1),
-                    Self::escape_json(sug)
+                    Self::escape_json(&sug.message)
                 ));
                 if idx < diag.suggestions.len() - 1 {
                     s.push(',');

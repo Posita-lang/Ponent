@@ -25,21 +25,33 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     /// Suggest a cast for common type mismatches (e.g. Int ↔ Float).
-    pub fn suggest_cast(&self, expected: TypeId, actual: TypeId) -> Option<String> {
+    pub fn suggest_cast(&self, expected: TypeId, actual: TypeId) -> Option<Suggestion> {
         let (e, a) = (self.checker.ctx.get(expected), self.checker.ctx.get(actual));
-        match (e, a) {
+        let msg = match (e, a) {
             (TypeData::Int { .. }, TypeData::Float { .. })
             | (TypeData::Float { .. }, TypeData::Int { .. }) => {
-                Some("try using `as` to cast between integer and float types".into())
+                Some("try using `as` to cast between integer and float types")
             }
             (TypeData::Bool, TypeData::Int { .. }) => {
-                Some("try `x != 0` to convert Int to Bool".into())
+                Some("try `x != 0` to convert Int to Bool")
             }
             (TypeData::Int { .. }, TypeData::Bool) => {
-                Some("try `if x { 1 } else { 0 }` to convert Bool to Int".into())
+                Some("try `if x { 1 } else { 0 }` to convert Bool to Int")
             }
             _ => None,
-        }
+        };
+        msg.map(|m| Suggestion {
+            message: m.into(),
+            applicability: Applicability::MaybeIncorrect,
+            style: SuggestionStyle::ShowAlways,
+        })
+    }
+
+    /// Generate a human-readable reason for a type mismatch between two
+    /// types, explaining *why* they are incompatible.
+    /// Delegates to [`TypeChecker::type_mismatch_reason`].
+    fn type_mismatch_reason(&self, expected: TypeId, actual: TypeId) -> Option<String> {
+        self.checker.type_mismatch_reason(expected, actual)
     }
 
     pub fn unify(
@@ -53,14 +65,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             .unify(expected, actual)
             .map(|_| ())
             .map_err(|_err| {
-                let msg = format!(
-                    "type mismatch: expected {:?}, found {:?}",
-                    self.checker.ctx.get(expected),
-                    self.checker.ctx.get(actual)
-                );
-                let mut diag = Diagnostic::error(msg).with_code_str("E030").with_span(span);
+                let reason = self.type_mismatch_reason(expected, actual);
+                let mut diag = Diagnostic::error_kind(DiagnosticKind::TypeMismatch {
+                    expected: format!("{:?}", self.checker.ctx.get(expected)),
+                    found: format!("{:?}", self.checker.ctx.get(actual)),
+                    span,
+                    found_span: None,
+                    reason,
+                })
+                .with_code_str("E030");
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
-                    diag = diag.with_suggestion(suggestion);
+                    diag = diag.with_suggestion(suggestion.message);
                 }
                 diag
             })
@@ -78,6 +93,20 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             .unify(expected, actual)
             .map(|_| ())
             .map_err(|_err| {
+                // Check for the None context first — use structured kind.
+                if matches!(ctx, TypingContext::None) {
+                    let reason = self.type_mismatch_reason(expected, actual);
+                    return Diagnostic::error_kind(
+                        DiagnosticKind::TypeMismatch {
+                            expected: format!("{:?}", self.checker.ctx.get(expected)),
+                            found: format!("{:?}", self.checker.ctx.get(actual)),
+                            span,
+                            found_span: None,
+                            reason,
+                        },
+                    )
+                    .with_code_str("E030");
+                }
                 let msg = match ctx {
                     TypingContext::ReturnValue => format!(
                         "return value type mismatch: expected {:?}, found {:?}",
@@ -105,11 +134,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         self.checker.ctx.get(expected),
                         self.checker.ctx.get(actual)
                     ),
-                    TypingContext::None => format!(
-                        "type mismatch: expected {:?}, found {:?}",
-                        self.checker.ctx.get(expected),
-                        self.checker.ctx.get(actual)
-                    ),
+                    TypingContext::None => unreachable!(), // handled above
                     TypingContext::Index => format!(
                         "index must be an integer, got {:?}",
                         self.checker.ctx.get(actual)
@@ -117,7 +142,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 };
                 let mut diag = Diagnostic::error(msg).with_code_str("E030").with_span(span);
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
-                    diag = diag.with_suggestion(suggestion);
+                    diag = diag.with_suggestion(suggestion.message);
                 }
                 diag
             })
@@ -693,12 +718,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             .ok_or_else(|| {
                                 let field_names: Vec<String> =
                                     binding.fields.iter().map(|f| f.name.as_str()).collect();
-                                let mut diag = Diagnostic::error(format!(
-                                    "field '{}' not found in struct",
-                                    name
-                                ))
+                                let type_name = format!("{:?}", def_id);
+                                let mut diag = Diagnostic::error_kind(DiagnosticKind::NoSuchField {
+                                    field_name: name.to_string(),
+                                    type_name,
+                                    span: *span,
+                                })
                                 .with_code_str("E010")
-                                .with_span(*span)
                                 .with_suggestion(format!(
                                     "available fields: {}",
                                     field_names.join(", ")
@@ -2279,9 +2305,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             .iter()
                             .find(|f| f.name == *name)
                             .ok_or_else(|| {
-                                Diagnostic::error(format!("field '{}' not found in struct", name))
-                                    .with_code_str("E010")
-                                    .with_span(*span)
+                                let type_name = format!("{:?}", def_id);
+                                Diagnostic::error_kind(DiagnosticKind::NoSuchField {
+                                    field_name: name.to_string(),
+                                    type_name,
+                                    span: *span,
+                                })
+                                .with_code_str("E010")
                             })?;
                     let field_ty = self.checker.ctx.subst(field_def.ty, &subst);
                     hir_fields.push((name.clone(), Box::new(self.check_pattern(pat, field_ty)?)));

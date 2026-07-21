@@ -29,34 +29,44 @@ impl super::DiagnosticEmitter for HtmlEmitter {
     }
 
     fn emit_all(&mut self, diags: &[Diagnostic]) {
+        let css = crate::diagnostics::emitter::stylesheet::Stylesheet::dark().to_html_css();
         let mut html = String::from(
             "<!DOCTYPE html>\n<html>\n<head>\n<meta charset='utf-8'>\n\
              <title>Ponent Compiler Diagnostics</title>\n\
-             <style>\n\
-             body { font-family: 'DejaVu Sans Mono', monospace; background: #1e1e2e; color: #cdd6f4; padding: 20px; }\n\
+             <style>\n",
+        );
+        html.push_str(&css);
+        html.push_str(
+             "\n\
+             body { font-family: 'DejaVu Sans Mono', monospace; background: var(--bg); color: var(--fg); padding: 20px; }\n\
+             #theme-toggle { position: fixed; top: 12px; right: 12px; z-index: 100; }\n\
+             #theme-toggle button { background: var(--toggle-bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 14px; cursor: pointer; font-family: inherit; font-size: 0.85em; }\n\
+             #theme-toggle button:hover { opacity: 0.8; }\n\
              .diag { margin: 12px 0; padding: 12px; border-radius: 6px; }\n\
-             .diag.error { border-left: 4px solid #f38ba8; background: #2a1e1e; }\n\
-             .diag.warning { border-left: 4px solid #f9e2af; background: #2a2a1e; }\n\
-             .diag.help { border-left: 4px solid #94e2d5; background: #1e2a2a; }\n\
-             .diag.code { color: #89b4fa; font-weight: bold; }\n\
-             .diag.message { color: #cdd6f4; }\n\
-             .diag .span { color: #6c7086; }\n\
-             .diag .suggestion { color: #a6e3a1; }\n\
-             .diag .help-text { color: #94e2d5; }\n\
-             .chain { margin-left: 20px; color: #6c7086; font-size: 0.9em; }\n\
+             .diag.error { border-left: 4px solid var(--error-border); background: var(--error-bg); }\n\
+             .diag.warning { border-left: 4px solid var(--warning-border); background: var(--warning-bg); }\n\
+             .diag.help { border-left: 4px solid var(--help-border); background: var(--help-bg); }\n\
+             .diag.code { color: var(--accent); font-weight: bold; }\n\
+             .diag.message { color: var(--fg); }\n\
+             .diag .span { color: var(--muted); }\n\
+             .diag .suggestion { color: var(--suggestion); }\n\
+             .diag .help-text { color: var(--help-text); }\n\
+             .chain { margin-left: 20px; color: var(--muted); font-size: 0.9em; }\n\
              .chain .entry { margin: 2px 0; }\n\
-             .chain .entry .label { color: #89b4fa; }\n\
-             .summary { margin-top: 16px; padding: 8px; border-top: 1px solid #45475a; color: #6c7086; }\n\
+             .chain .entry .label { color: var(--accent); }\n\
+             .summary { margin-top: 16px; padding: 8px; border-top: 1px solid var(--border); color: var(--muted); }\n\
              details { margin: 4px 0; }\n\
-             summary { cursor: pointer; color: #89b4fa; }\n\
-             .source-line { white-space: pre; font-family: monospace; color: #a6adc8; }\n\
-             .source-line .line-num { color: #6c7086; user-select: none; }\n\
-             .source-line .highlight { background: #f38ba833; border-radius: 2px; }\n\
-             .source-line .underline { color: #f38ba8; }\n\
-             .explain { background: #181825; padding: 12px; border-radius: 6px; margin-top: 8px; }\n\
-             .explain h4 { color: #89b4fa; margin: 0 0 8px 0; }\n\
-             .explain pre { white-space: pre-wrap; color: #bac2de; }\n\
-             </style>\n</head>\n<body>\n<h1>Ponent Compiler Diagnostics</h1>\n",
+             summary { cursor: pointer; color: var(--accent); }\n\
+             .source-line { white-space: pre; font-family: monospace; color: var(--source-fg); }\n\
+             .source-line .line-num { color: var(--muted); user-select: none; }\n\
+             .source-line .highlight { background: var(--highlight-bg); border-radius: 2px; }\n\
+             .source-line .underline { color: var(--underline); }\n\
+             .explain { background: var(--diag-bg); padding: 12px; border-radius: 6px; margin-top: 8px; }\n\
+             .explain h4 { color: var(--accent); margin: 0 0 8px 0; }\n\
+             .explain pre { white-space: pre-wrap; color: var(--explain-fg); }\n\
+             </style>\n</head>\n<body>\n\
+             <div id='theme-toggle'><button onclick=\"document.body.classList.toggle('light')\">Toggle theme</button></div>\n\
+             <h1>Ponent Compiler Diagnostics</h1>\n",
         );
 
         for diag in diags {
@@ -115,7 +125,7 @@ impl HtmlEmitter {
         for suggestion in &diag.suggestions {
             html.push_str(&format!(
                 "<div class='suggestion'>suggestion: {}</div>\n",
-                self.escape(suggestion),
+                self.escape(&suggestion.message),
             ));
         }
 

@@ -104,12 +104,12 @@ impl Styles {
                 reset: "\x1b[0m",
                 bold: "\x1b[1m",
                 dim: "\x1b[2m",
-                red_bold: "\x1b[31;1m",
-                cyan: "\x1b[36m",
-                blue: "\x1b[34m",
-                magenta: "\x1b[35m",
-                green: "\x1b[32m",
-                yellow: "\x1b[33m",
+                red_bold: "\x1b[1;91m",
+                cyan: "\x1b[96m",
+                blue: "\x1b[94m",
+                magenta: "\x1b[95m",
+                green: "\x1b[92m",
+                yellow: "\x1b[93m",
             }
         } else {
             Styles {
@@ -132,10 +132,10 @@ impl Styles {
             return "";
         }
         match style {
-            Style::Error => "\x1b[31;1m",
-            Style::Warning => "\x1b[33;1m",
-            Style::Note => "\x1b[34m",
-            Style::Help => "\x1b[36m",
+            Style::Error => "\x1b[1;91m",
+            Style::Warning => "\x1b[1;33m",
+            Style::Note => "\x1b[1;92m",
+            Style::Help => "\x1b[1;96m",
             Style::Bold => self.bold,
             Style::Dim => self.dim,
             Style::BrightRed => self.red_bold,
@@ -160,10 +160,21 @@ pub struct GlyphRenderer {
 }
 
 impl GlyphRenderer {
+    /// Create a new renderer with the given options.
+    /// When `opts` is provided, its `context_lines` and `use_color` are used;
+    /// otherwise defaults to `use_color` with 1 context line.
     pub fn new(use_color: bool) -> Self {
+        Self::with_opts(use_color, None)
+    }
+
+    /// Create a new renderer that reads `context_lines` and `use_color`
+    /// from the given [`DiagOpts`](crate::diagnostics::DiagOpts), falling
+    /// back to `use_color` when `opts` is `None`.
+    pub fn with_opts(use_color: bool, opts: Option<&crate::diagnostics::DiagOpts>) -> Self {
+        let context_lines = opts.map(|o| o.context_lines).unwrap_or(1);
         GlyphRenderer {
             use_color,
-            context_lines: 2,
+            context_lines,
             bc: if use_color { &UNICODE } else { &ASCII },
             s: Styles::new(use_color),
         }
@@ -197,11 +208,47 @@ impl GlyphRenderer {
                     merged_labels.push(Label::secondary(rel_span, label_text));
                 }
             }
-            // Render a source section for EACH primary span, so that
-            // multi-location diagnostics (e.g. duplicate definition + original)
-            // show both locations with their own source context.
-            for &primary_span in &diag.spans.primary {
-                self.write_source_section(&mut out, source, primary_span, &merged_labels, "<input>");
+            // Render source sections for each cluster of overlapping primary spans.
+            // Sort spans by position, then merge overlapping context windows into
+            // a single source section so the output reads top-to-bottom without
+            // redundant line ranges (e.g. lines 1-3 and 3-6 → 1-6).
+            let mut sorted_spans = diag.spans.primary.clone();
+            sorted_spans.sort_by_key(|s| s.start);
+
+            // Build (line_range, span) pairs for merging.
+            let lines: Vec<&str> = source.lines().collect();
+            let mut ranges: Vec<((usize, usize), Span)> = sorted_spans
+                .iter()
+                .map(|&sp| {
+                    let start_pos = byte_to_linecol(source, sp.start);
+                    let end_pos = byte_to_linecol(source, sp.end);
+                    let first = start_pos.line.saturating_sub(self.context_lines);
+                    let last = std::cmp::min(
+                        end_pos.line + 1 + self.context_lines,
+                        lines.len().saturating_sub(1),
+                    );
+                    ((first, last), sp)
+                })
+                .collect();
+
+            // Merge overlapping ranges.
+            let mut merged: Vec<((usize, usize), Span)> = Vec::new();
+            for (range, sp) in &ranges {
+                if let Some(last) = merged.last_mut() {
+                    // If ranges overlap or are adjacent, merge them.
+                    if range.0 <= last.0.1.saturating_add(1) {
+                        last.0 .1 = last.0 .1.max(range.1);
+                        // Extend the span to cover the merged range using
+                        // the extremes of all spans in the merged group.
+                        last.1 = Span::new(last.1.start.min(sp.start), last.1.end.max(sp.end));
+                        continue;
+                    }
+                }
+                merged.push((*range, *sp));
+            }
+
+            for &(_, primary_span) in &merged {
+                self.write_source_section(&mut out, source, primary_span, &merged_labels, &diag.file_name, diag.level);
             }
         }
 
@@ -224,14 +271,19 @@ impl GlyphRenderer {
                 for lbl in &diag.labels {
                     let lbl_line = span_line(lbl.span, source);
                     if lbl_line < first_line || lbl_line > last_line {
+                        // Render labels outside the source-context range as
+                        // notes, matching the style of `write_note_line`.
+                        let pos = byte_to_linecol(source, lbl.span.start);
                         let _ = writeln!(
                             out,
-                            "{v}  {sub_h}{sub_h}{sub_h} {ch} {span}: {msg}",
+                            "{v}  {cyan}= {bold}note{reset}: {msg} at {line}:{col}",
                             v = self.bc.v,
-                            sub_h = self.bc.sub_h,
-                            ch = lbl.underline_char(),
-                            span = lbl.span,
+                            cyan = self.s.cyan,
+                            bold = self.s.bold,
+                            reset = self.s.reset,
                             msg = lbl.message,
+                            line = pos.line + 1,
+                            col = pos.col + 1,
                         );
                     }
                 }
@@ -245,7 +297,7 @@ impl GlyphRenderer {
 
         // Suggestions (as = note: ...)
         for suggestion in &diag.suggestions {
-            self.write_note_line(&mut out, &suggestion);
+            self.write_note_line(&mut out, &suggestion.message);
         }
 
         // Help
@@ -318,9 +370,9 @@ impl GlyphRenderer {
             level = level_label,
             all_codes = all_codes,
             msg_prefix = if diag.related_errors.is_empty() {
-                diag.message.clone()
+                crate::diagnostics::glyph::highlight_code(&diag.message, self.s.use_color)
             } else {
-                format!("1. {}", diag.message)
+                format!("1. {}", crate::diagnostics::glyph::highlight_code(&diag.message, self.s.use_color))
             },
         );
         // Calculate the indentation for related error items so they align
@@ -350,6 +402,7 @@ impl GlyphRenderer {
         primary_span: Span,
         labels: &[Label],
         filename: &str,
+        level: crate::diagnostics::level::DiagnosticLevel,
     ) {
         // Collect all annotated spans: primary + labels
         let mut all_labels: Vec<Label> = Vec::with_capacity(labels.len() + 1);
@@ -380,10 +433,26 @@ impl GlyphRenderer {
         // Indent for lines that don't have a line number (location header, spacing, explanation)
         let indent = " ".repeat(line_num_width + 1);
 
-        // Location header: ┌─ input:1:1
+        // Location header: ┌─ input:1:1  (with OSC 8 hyperlink when filename is a real path)
+        let location_str = format!("{filename}:{line}:{col}",
+            filename = filename,
+            line = start_pos.line + 1,
+            col = start_pos.col + 1,
+        );
+        let location_display = if filename != "<input>" && !filename.is_empty() {
+            // OSC 8 hyperlink — Ctrl+click opens the file in the editor.
+            // Convert to absolute path so the `file://` URL works correctly.
+            let abs_path = std::path::Path::new(filename)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(filename));
+            let file_url = format!("file://{}", abs_path.display());
+            format!("\x1b]8;;{file_url}\x1b\\{location_str}\x1b]8;;\x1b\\")
+        } else {
+            location_str
+        };
         let _ = writeln!(
             out,
-            "{dim}{v}{indent}{sub_tl}{sub_h}{reset} {cyan}{filename}:{line}:{col}{reset}",
+            "{dim}{v}{indent}{sub_tl}{sub_h}{reset} {cyan}{location_display}{reset}",
             dim = self.s.dim,
             v = self.bc.v,
             indent = indent,
@@ -391,9 +460,7 @@ impl GlyphRenderer {
             sub_h = self.bc.sub_h,
             reset = self.s.reset,
             cyan = self.s.cyan,
-            filename = filename,
-            line = start_pos.line + 1,
-            col = start_pos.col + 1,
+            location_display = location_display,
         );
         // Spacing line
         let _ = writeln!(
@@ -407,6 +474,22 @@ impl GlyphRenderer {
         );
 
         // Render each line in the range
+        // Pre-compute multi-line labels so we can render connectors
+        // on middle/end lines where no underline is visible.
+        let mut multi_line_labels: Vec<(usize, usize, char, String)> = Vec::new();
+        for lbl in &all_labels {
+            let label_start = span_line(lbl.span, source);
+            let label_end = span_line(Span::new(lbl.span.end, lbl.span.end), source);
+            if label_start != label_end {
+                // Find the column for this label from the first line's underlines.
+                let first_line = &lines[label_start];
+                let first_underlines = compute_line_underlines(&all_labels, source, first_line, label_start);
+                if let Some((col, ulen, ch, _)) = first_underlines.iter().find(|(_, _, _, msg)| lbl.message.as_str() == *msg) {
+                    multi_line_labels.push((*col, *ulen, *ch, lbl.message.clone()));
+                }
+            }
+        }
+
         for line_idx in first_line..=last_line {
             let line = lines[line_idx];
 
@@ -433,15 +516,11 @@ impl GlyphRenderer {
 
             // Apply background color to primary span columns.
             // Split the line into segments: normal / highlighted / normal.
-            let code_bg = "\x1b[48;5;236m";
-            let reset_fg = "\x1b[22m\x1b[39m"; // reset bold+fg only, preserve bg
-            let full_reset = "\x1b[0m";
             let mut rendered = String::with_capacity(line.len() + 64);
             let mut i = 0;
             while i < line.len() {
                 if primary_cols[i] {
                     // Start of a primary span segment
-                    rendered.push_str(code_bg);
                     let start = i;
                     while i < line.len() && primary_cols[i] {
                         i += 1;
@@ -449,8 +528,6 @@ impl GlyphRenderer {
                     // Apply syntax highlighting within the primary span
                     let segment = &line[start..i];
                     rendered.push_str(&highlight_code(segment, self.s.use_color));
-                    rendered.push_str(reset_fg);
-                    rendered.push_str(full_reset); // reset background
                 } else {
                     let start = i;
                     while i < line.len() && !primary_cols[i] {
@@ -505,9 +582,17 @@ impl GlyphRenderer {
                     }
                 }
             }
-
-            // ── Render annotation line ──
             // Combine all underlines into a single line, like rustc's `- ^ -`.
+            // Determine the annotation color from the diagnostic level.
+            let annotation_style = match level {
+                crate::diagnostics::level::DiagnosticLevel::Error => Style::Error,
+                crate::diagnostics::level::DiagnosticLevel::Warning => Style::Warning,
+                crate::diagnostics::level::DiagnosticLevel::Help => Style::Help,
+                crate::diagnostics::level::DiagnosticLevel::Note | crate::diagnostics::level::DiagnosticLevel::Info => Style::Note,
+            };
+            let annotation_color = self.s.get(annotation_style);
+            let connector_color = annotation_color;
+            let connector_reset = "\x1b[0m";
             // Sorted by column so overlapping labels are handled correctly.
             if !underlines.is_empty() {
                 let spaces = " ".repeat(line_num_width + 1);
@@ -534,6 +619,14 @@ impl GlyphRenderer {
                 // Trim trailing spaces from the combined annotation
                 let combined_str: String = combined.iter().collect();
                 let trimmed = combined_str.trim().to_string();
+                // Determine the annotation color from the diagnostic level.
+                let annotation_style = match level {
+                    crate::diagnostics::level::DiagnosticLevel::Error => Style::Error,
+                    crate::diagnostics::level::DiagnosticLevel::Warning => Style::Warning,
+                    crate::diagnostics::level::DiagnosticLevel::Help => Style::Help,
+                    crate::diagnostics::level::DiagnosticLevel::Note | crate::diagnostics::level::DiagnosticLevel::Info => Style::Note,
+                };
+                let annotation_color = self.s.get(annotation_style);
                 // Only render if there are actual annotations
                 if !trimmed.is_empty() {
                     // Compute the column offset for the first non-space character
@@ -541,7 +634,7 @@ impl GlyphRenderer {
                     let padded = " ".repeat(first_col) + &trimmed;
                     let _ = writeln!(
                         out,
-                        "{dim}{v}{spaces}{sub_v}{reset} {padded}",
+                        "{dim}{v}{spaces}{sub_v}{reset} {annotation_color}{padded}{reset}",
                         dim = self.s.dim,
                         v = self.bc.v,
                         spaces = spaces,
@@ -566,60 +659,88 @@ impl GlyphRenderer {
                     for _ in 0..*col {
                         connector.push(' ');
                     }
+                    // Color the connector `|` to match the annotation line.
+                    let connector_color = self.s.get(annotation_style);
+                    let connector_reset = "\x1b[0m";
                     // AnnotationKind::Help labels have no underline char (space);
                     // render them as `| help: message` instead of `| message`,
                     // with the `help:` prefix in cyan (matching write_help_line).
                     let display_msg = if *ch == ' ' {
                         format!(
-                            "{cyan}help:{reset} {msg}",
+                            "{cyan}help:{reset} {cyan}{msg}{reset}",
                             cyan = self.s.cyan,
                             reset = self.s.reset,
                             msg = msg
                         )
                     } else {
-                        (*msg).to_string()
+                        format!("{connector_color}{msg}{connector_reset}")
                     };
                     connector.push('|');
                     let _ = writeln!(
                         out,
-                        "{v}{msg_spaces}{sub_v} {connector}",
+                        "{dim}{v}{reset}{msg_spaces}{dim}{sub_v}{reset} {connector_color}{connector}{connector_reset}",
+                        dim = self.s.dim,
                         v = self.bc.v,
                         msg_spaces = msg_spaces,
+                        reset = self.s.reset,
                         sub_v = self.bc.sub_v,
+                        connector_color = connector_color,
                         connector = connector,
+                        connector_reset = connector_reset,
                     );
                     let _ = writeln!(
                         out,
-                        "{v}{msg_spaces}{sub_v} {connector} {display_msg}",
+                        "{dim}{v}{reset}{msg_spaces}{dim}{sub_v}{reset} {connector_color}{connector} {connector_reset}{display_msg}",
+                        dim = self.s.dim,
                         v = self.bc.v,
                         msg_spaces = msg_spaces,
+                        reset = self.s.reset,
                         sub_v = self.bc.sub_v,
+                        connector_color = connector_color,
                         connector = connector,
+                        connector_reset = connector_reset,
                         display_msg = display_msg,
+                    );
+                }
+            }
+            // ── Render multi-line label connectors ──
+            // For labels that span multiple lines, show the connector `|`
+            // on every line the label covers, not just the one with the underline.
+            let spaces = " ".repeat(line_num_width + 1);
+            for (col, _ulen, _ch, _msg, part) in &multiline_flags {
+                if *part == "middle" || *part == "end" {
+                    let mut connector = String::new();
+                    for _ in 0..*col {
+                        connector.push(' ');
+                    }
+                    connector.push('|');
+                    let _ = writeln!(
+                        out,
+                        "{dim}{v}{reset}{spaces}{dim}{sub_v}{reset} {connector_color}{connector}{connector_reset}",
+                        dim = self.s.dim,
+                        v = self.bc.v,
+                        spaces = spaces,
+                        reset = self.s.reset,
+                        sub_v = self.bc.sub_v,
+                        connector_color = connector_color,
+                        connector = connector,
+                        connector_reset = connector_reset,
                     );
                 }
             }
         }
 
-        // Explanation box
-        // We'll put the primary span's message (if any) as the explanation
-        // Otherwise, use the diagnostic level label
-        let explanation = all_labels
-            .iter()
-            .find(|l| matches!(l.kind, AnnotationKind::Primary) && !l.message.is_empty())
-            .map(|l| l.message.as_str())
-            .unwrap_or("");
-
+        // Explanation box — now redundant since labels are rendered inline.
+        // Kept as an empty visual terminal to close the source section.
         let _ = writeln!(
             out,
-            "{dim}{v}{indent}{sub_bl}{sub_h}{reset} {explanation}",
+            "{dim}{v}{indent}{sub_bl}{sub_h}{reset}",
             dim = self.s.dim,
             v = self.bc.v,
             indent = indent,
             sub_bl = self.bc.sub_bl,
             sub_h = self.bc.sub_h,
             reset = self.s.reset,
-            explanation = explanation,
         );
     }
 
@@ -631,6 +752,24 @@ impl GlyphRenderer {
             DiagnosticLevel::Help => "help",
             _ => child.level.label(),
         };
+        // Render the message — if styled, use highlighted parts.
+        let msg = if let Some(ref styled) = child.styled_message {
+            let mut rendered = String::new();
+            for part in &styled.0 {
+                match part.style {
+                    crate::diagnostics::StringPartStyle::Normal => {
+                        rendered.push_str(&part.content);
+                    }
+                    crate::diagnostics::StringPartStyle::Highlighted => {
+                        // Highlighted parts in cyan (matching type name color).
+                        rendered.push_str(&format!("\x1b[36m{}\x1b[0m", part.content));
+                    }
+                }
+            }
+            rendered
+        } else {
+            child.message.clone()
+        };
         let _ = writeln!(
             out,
             "{v}  {prefix_color}= {bold}{prefix}{reset}: {msg}",
@@ -639,18 +778,19 @@ impl GlyphRenderer {
             bold = self.s.bold,
             prefix = prefix,
             reset = self.s.reset,
-            msg = child.message,
+            msg = msg,
         );
     }
 
     fn write_note_line(&self, out: &mut String, msg: &str) {
         let _ = writeln!(
             out,
-            "{v}  {cyan}= {bold}note{reset}: {msg}",
+            "{v}  {cyan}= {bold}note{reset}: {green}{msg}{reset}",
             v = self.bc.v,
             cyan = self.s.cyan,
             bold = self.s.bold,
             reset = self.s.reset,
+            green = self.s.green,
             msg = msg,
         );
     }
@@ -658,7 +798,7 @@ impl GlyphRenderer {
     fn write_help_line(&self, out: &mut String, msg: &str) {
         let _ = writeln!(
             out,
-            "{v}  {cyan}= {bold}help{reset}: {msg}",
+            "{v}  {cyan}= {bold}help{reset}: {cyan}{msg}{reset}",
             v = self.bc.v,
             cyan = self.s.cyan,
             bold = self.s.bold,
