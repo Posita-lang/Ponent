@@ -32,9 +32,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             | (TypeData::Float { .. }, TypeData::Int { .. }) => {
                 Some("try using `as` to cast between integer and float types")
             }
-            (TypeData::Bool, TypeData::Int { .. }) => {
-                Some("try `x != 0` to convert Int to Bool")
-            }
+            (TypeData::Bool, TypeData::Int { .. }) => Some("try `x != 0` to convert Int to Bool"),
             (TypeData::Int { .. }, TypeData::Bool) => {
                 Some("try `if x { 1 } else { 0 }` to convert Bool to Int")
             }
@@ -96,15 +94,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // Check for the None context first — use structured kind.
                 if matches!(ctx, TypingContext::None) {
                     let reason = self.type_mismatch_reason(expected, actual);
-                    return Diagnostic::error_kind(
-                        DiagnosticKind::TypeMismatch {
-                            expected: format!("{:?}", self.checker.ctx.get(expected)),
-                            found: format!("{:?}", self.checker.ctx.get(actual)),
-                            span,
-                            found_span: None,
-                            reason,
-                        },
-                    )
+                    return Diagnostic::error_kind(DiagnosticKind::TypeMismatch {
+                        expected: format!("{:?}", self.checker.ctx.get(expected)),
+                        found: format!("{:?}", self.checker.ctx.get(actual)),
+                        span,
+                        found_span: None,
+                        reason,
+                    })
                     .with_code_str("E030");
                 }
                 let msg = match ctx {
@@ -719,16 +715,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 let field_names: Vec<String> =
                                     binding.fields.iter().map(|f| f.name.as_str()).collect();
                                 let type_name = format!("{:?}", def_id);
-                                let mut diag = Diagnostic::error_kind(DiagnosticKind::NoSuchField {
-                                    field_name: name.to_string(),
-                                    type_name,
-                                    span: *span,
-                                })
-                                .with_code_str("E010")
-                                .with_suggestion(format!(
-                                    "available fields: {}",
-                                    field_names.join(", ")
-                                ));
+                                let mut diag =
+                                    Diagnostic::error_kind(DiagnosticKind::NoSuchField {
+                                        field_name: name.to_string(),
+                                        type_name,
+                                        span: *span,
+                                    })
+                                    .with_code_str("E010")
+                                    .with_suggestion(format!(
+                                        "available fields: {}",
+                                        field_names.join(", ")
+                                    ));
                                 if let Some(suggestion) =
                                     did_you_mean_suggestion(&name.as_str(), &field_names)
                                 {

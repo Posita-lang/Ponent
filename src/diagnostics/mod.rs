@@ -60,7 +60,7 @@ pub use emitter::{
     DiagnosticEmitter, colored::ColoredEmitter, html::HtmlEmitter, json::JsonEmitter,
     plain::PlainEmitter,
 };
-pub use error_code::{ErrorCategory, ErrCode};
+pub use error_code::{ErrCode, ErrorCategory};
 pub use glyph::GlyphRenderer;
 pub use kind::{DiagnosticKind, Humanizer};
 pub use label::{AnnotationKind, Label, Snippet, SourcePos};
@@ -118,12 +118,18 @@ pub struct EmissionGuarantee {
 impl EmissionGuarantee {
     /// The emitted diagnostic was recorded.
     pub fn emitted() -> Self {
-        EmissionGuarantee { _private: (), emitted: true }
+        EmissionGuarantee {
+            _private: (),
+            emitted: true,
+        }
     }
 
     /// The diagnostic was suppressed (e.g. warning when warnings are off).
     pub fn suppressed() -> Self {
-        EmissionGuarantee { _private: (), emitted: false }
+        EmissionGuarantee {
+            _private: (),
+            emitted: false,
+        }
     }
 
     /// Returns `true` if the diagnostic was actually recorded.
@@ -353,26 +359,62 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     // ── Read-only accessors ─────────────────────────────────────────
-    pub fn level(&self) -> DiagnosticLevel { self.level }
-    pub fn message(&self) -> &str { &self.message }
-    pub fn code(&self) -> Option<&ErrCode> { self.code.as_ref() }
-    pub fn kind(&self) -> Option<&DiagnosticKind> { self.kind.as_ref() }
-    pub fn spans(&self) -> &MultiSpan { &self.spans }
-    pub fn help(&self) -> Option<&str> { self.help.as_deref() }
-    pub fn suggestions(&self) -> &[Suggestion] { &self.suggestions }
-    pub fn labels(&self) -> &[Label] { &self.labels }
-    pub fn call_chain(&self) -> Option<&CallChain> { self.call_chain.as_ref() }
-    pub fn source(&self) -> Option<&str> { self.source.as_deref() }
-    pub fn file_name(&self) -> &str { &self.file_name }
-    pub fn children(&self) -> &[Subdiag] { &self.children }
-    pub fn children_mut(&mut self) -> &mut Vec<Subdiag> { &mut self.children }
-    pub fn related_errors(&self) -> &[RelatedError] { &self.related_errors }
+    pub fn level(&self) -> DiagnosticLevel {
+        self.level
+    }
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+    pub fn code(&self) -> Option<&ErrCode> {
+        self.code.as_ref()
+    }
+    pub fn kind(&self) -> Option<&DiagnosticKind> {
+        self.kind.as_ref()
+    }
+    pub fn spans(&self) -> &MultiSpan {
+        &self.spans
+    }
+    pub fn help(&self) -> Option<&str> {
+        self.help.as_deref()
+    }
+    pub fn suggestions(&self) -> &[Suggestion] {
+        &self.suggestions
+    }
+    pub fn labels(&self) -> &[Label] {
+        &self.labels
+    }
+    pub fn call_chain(&self) -> Option<&CallChain> {
+        self.call_chain.as_ref()
+    }
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+    pub fn file_name(&self) -> &str {
+        &self.file_name
+    }
+    pub fn children(&self) -> &[Subdiag] {
+        &self.children
+    }
+    pub fn children_mut(&mut self) -> &mut Vec<Subdiag> {
+        &mut self.children
+    }
+    pub fn related_errors(&self) -> &[RelatedError] {
+        &self.related_errors
+    }
 
     // ── Mutable accessors ───────────────────────────────────────────
-    pub fn labels_mut(&mut self) -> &mut Vec<Label> { &mut self.labels }
-    pub fn related_errors_mut(&mut self) -> &mut Vec<RelatedError> { &mut self.related_errors }
-    pub fn set_source(&mut self, source: Option<String>) { self.source = source; }
-    pub fn set_file_name(&mut self, file_name: String) { self.file_name = file_name; }
+    pub fn labels_mut(&mut self) -> &mut Vec<Label> {
+        &mut self.labels
+    }
+    pub fn related_errors_mut(&mut self) -> &mut Vec<RelatedError> {
+        &mut self.related_errors
+    }
+    pub fn set_source(&mut self, source: Option<String>) {
+        self.source = source;
+    }
+    pub fn set_file_name(&mut self, file_name: String) {
+        self.file_name = file_name;
+    }
 }
 
 /// A child diagnostic attached to a parent `Diagnostic`.
@@ -655,11 +697,15 @@ impl Diagnostic {
             self.help = kind.help();
         }
         if self.suggestions.is_empty() {
-            self.suggestions = kind.suggestions().into_iter().map(|s| Suggestion {
-                message: s,
-                applicability: Applicability::MachineApplicable,
-                style: SuggestionStyle::ShowAlways,
-            }).collect();
+            self.suggestions = kind
+                .suggestions()
+                .into_iter()
+                .map(|s| Suggestion {
+                    message: s,
+                    applicability: Applicability::MachineApplicable,
+                    style: SuggestionStyle::ShowAlways,
+                })
+                .collect();
         }
     }
 
@@ -701,7 +747,11 @@ impl Diagnostic {
         }
         // Merge labels that aren't already present
         for lbl in &other.labels {
-            if !self.labels.iter().any(|l| l.span == lbl.span && l.message == lbl.message) {
+            if !self
+                .labels
+                .iter()
+                .any(|l| l.span == lbl.span && l.message == lbl.message)
+            {
                 self.labels.push(lbl.clone());
             }
         }
@@ -895,7 +945,11 @@ fn suggest_code(input: &str) -> String {
         .iter()
         .map(|e| e.code)
         .filter(|code| {
-            let common = code.chars().zip(input.chars()).take_while(|(a, b)| a == b).count();
+            let common = code
+                .chars()
+                .zip(input.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
             common >= 3 && (code.len() != input.len())
         })
         .take(3)
@@ -920,19 +974,10 @@ pub fn list_error_codes() -> String {
     for entry in crate::diagnostics::error_code::CODE_TABLE {
         let cat = entry.category;
         if Some(cat) != last_category {
-            let _ = writeln!(
-                out,
-                " \x1b[36m── {} ──\x1b[0m",
-                cat.as_str(),
-            );
+            let _ = writeln!(out, " \x1b[36m── {} ──\x1b[0m", cat.as_str(),);
             last_category = Some(cat);
         }
-        let _ = writeln!(
-            out,
-            "  \x1b[1m{}\x1b[0m  {}",
-            entry.code,
-            entry.title,
-        );
+        let _ = writeln!(out, "  \x1b[1m{}\x1b[0m  {}", entry.code, entry.title,);
     }
     let _ = writeln!(
         out,
@@ -1061,13 +1106,7 @@ mod tests {
     fn test_error_category() {
         assert_eq!(ErrCode::new("E030").category(), ErrorCategory::Type);
         assert_eq!(ErrCode::new("E001").category(), ErrorCategory::Parse);
-        assert_eq!(
-            ErrCode::new("E020").category(),
-            ErrorCategory::Contract
-        );
-        assert_eq!(
-            ErrCode::new("E041").category(),
-            ErrorCategory::Trait
-        );
+        assert_eq!(ErrCode::new("E020").category(), ErrorCategory::Contract);
+        assert_eq!(ErrCode::new("E041").category(), ErrorCategory::Trait);
     }
 }

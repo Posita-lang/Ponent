@@ -87,8 +87,7 @@ impl DiagCtxt {
 
     /// Return true if any diagnostic (reported or unreported) is an error.
     pub fn has_errors(&self) -> bool {
-        self.reported.iter().any(|d| d.is_error())
-            || self.unreported.iter().any(|d| d.is_error())
+        self.reported.iter().any(|d| d.is_error()) || self.unreported.iter().any(|d| d.is_error())
     }
 
     /// Clear all diagnostics.

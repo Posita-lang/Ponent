@@ -115,8 +115,7 @@ impl<'a> NameResolver<'a> {
             self.resolve_item(item);
         }
 
-        let symbols =
-            std::mem::replace(&mut self.symbols, SymbolTable::new(self.local_crate_id));
+        let symbols = std::mem::replace(&mut self.symbols, SymbolTable::new(self.local_crate_id));
         let trait_env = std::mem::replace(&mut self.trait_env, TraitEnv::new());
         let mut resolution_map = std::mem::take(&mut self.resolution_map);
         resolution_map.has_main = self.has_main;
@@ -2024,13 +2023,15 @@ mod tests {
     ) -> Result<(SymbolTable, TraitEnv, ResolutionMap, TypeContext), Vec<String>> {
         let mut ctx = TypeContext::new();
         let mut parser = Parser::new(source);
-        let program = parser
-            .parse_program()
-            .map_err(|diags| diags.into_iter().map(|d| d.message().to_string()).collect::<Vec<_>>())?;
+        let program = parser.parse_program().map_err(|diags| {
+            diags
+                .into_iter()
+                .map(|d| d.message().to_string())
+                .collect::<Vec<_>>()
+        })?;
         let local_crate_id = CrateId(DefId(0));
         let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
-        let (symbols, trait_env, diags, resolution_map) =
-            resolver.resolve_program(&program);
+        let (symbols, trait_env, diags, resolution_map) = resolver.resolve_program(&program);
         if diags.has_errors() {
             return Err(diags
                 .into_inner()

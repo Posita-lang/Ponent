@@ -14,9 +14,12 @@ fn check_source(source: &str) -> Result<HirProgram, Vec<String>> {
     // there is no cross-test DefId collision.
 
     let mut parser = Parser::new(source);
-    let program = parser
-        .parse_program()
-        .map_err(|diags| diags.into_iter().map(|d| d.message().to_string()).collect::<Vec<_>>())?;
+    let program = parser.parse_program().map_err(|diags| {
+        diags
+            .into_iter()
+            .map(|d| d.message().to_string())
+            .collect::<Vec<_>>()
+    })?;
 
     let mut ctx = TypeContext::new();
     let local_crate_id = CrateId(DefId(0));

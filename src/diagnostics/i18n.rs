@@ -92,47 +92,136 @@ const EN: MsgTable = &[
     // ── General ──
     ("comptime error: {e}", "comptime error: {e}"),
     ("trait solver error: {msg}", "trait solver error: {msg}"),
-    ("type mismatch: expected `{expected}`, found `{found}`", "type mismatch: expected `{expected}`, found `{found}`"),
-    ("duplicate definition of `{name}`", "duplicate definition of `{name}`"),
-    ("no field `{field}` found on type `{type}`", "no field `{field}` found on type `{type}`"),
-    ("`main` function not found in crate", "`main` function not found in crate"),
-    ("add a `def main() {{ ... }}` function as the entry point", "add a `def main() {{ ... }}` function as the entry point"),
-    ("`set` does not support pattern destructuring; use `let` instead", "`set` does not support pattern destructuring; use `let` instead"),
-    ("`let` requires an explicit initializer; it cannot rely on a type's default value", "`let` requires an explicit initializer; it cannot rely on a type's default value"),
-    ("type has no default value and no initializer provided", "type has no default value and no initializer provided"),
-    ("shadowing definition of `{name}`", "shadowing definition of `{name}`"),
-    ("impl missing method `{method}` required by trait `{trait}`", "impl missing method `{method}` required by trait `{trait}`"),
-    ("every trait method must be implemented — add a `def` for it in this impl block", "every trait method must be implemented — add a `def` for it in this impl block"),
-    ("unknown error code: `{code}`", "unknown error code: `{code}`"),
-    ("valid error codes include E001–E061, E101–E103, W113 — \n       run `ponent explain <CODE>` with a valid code (e.g. `ponent explain E030`)", "valid error codes include E001–E061, E101–E103, W113 — \n       run `ponent explain <CODE>` with a valid code (e.g. `ponent explain E030`)"),
-    ("did you mean `{candidates}`?",
-     "did you mean `{candidates}`?"),
-    ("run `ponent explain <CODE>` with a valid error code",
-     "run `ponent explain <CODE>` with a valid error code"),
+    (
+        "type mismatch: expected `{expected}`, found `{found}`",
+        "type mismatch: expected `{expected}`, found `{found}`",
+    ),
+    (
+        "duplicate definition of `{name}`",
+        "duplicate definition of `{name}`",
+    ),
+    (
+        "no field `{field}` found on type `{type}`",
+        "no field `{field}` found on type `{type}`",
+    ),
+    (
+        "`main` function not found in crate",
+        "`main` function not found in crate",
+    ),
+    (
+        "add a `def main() {{ ... }}` function as the entry point",
+        "add a `def main() {{ ... }}` function as the entry point",
+    ),
+    (
+        "`set` does not support pattern destructuring; use `let` instead",
+        "`set` does not support pattern destructuring; use `let` instead",
+    ),
+    (
+        "`let` requires an explicit initializer; it cannot rely on a type's default value",
+        "`let` requires an explicit initializer; it cannot rely on a type's default value",
+    ),
+    (
+        "type has no default value and no initializer provided",
+        "type has no default value and no initializer provided",
+    ),
+    (
+        "shadowing definition of `{name}`",
+        "shadowing definition of `{name}`",
+    ),
+    (
+        "impl missing method `{method}` required by trait `{trait}`",
+        "impl missing method `{method}` required by trait `{trait}`",
+    ),
+    (
+        "every trait method must be implemented — add a `def` for it in this impl block",
+        "every trait method must be implemented — add a `def` for it in this impl block",
+    ),
+    (
+        "unknown error code: `{code}`",
+        "unknown error code: `{code}`",
+    ),
+    (
+        "valid error codes include E001–E061, E101–E103, W113 — \n       run `ponent explain <CODE>` with a valid code (e.g. `ponent explain E030`)",
+        "valid error codes include E001–E061, E101–E103, W113 — \n       run `ponent explain <CODE>` with a valid code (e.g. `ponent explain E030`)",
+    ),
+    (
+        "did you mean `{candidates}`?",
+        "did you mean `{candidates}`?",
+    ),
+    (
+        "run `ponent explain <CODE>` with a valid error code",
+        "run `ponent explain <CODE>` with a valid error code",
+    ),
     ("Available error codes:", "Available error codes:"),
 ];
 
 /// Russian messages.
 const RU: MsgTable = &[
     ("comptime error: {e}", "ошибка comptime: {e}"),
-    ("trait solver error: {msg}", "ошибка решателя трейтов: {msg}"),
-    ("type mismatch: expected `{expected}`, found `{found}`", "несоответствие типов: ожидался `{expected}`, найден `{found}`"),
-    ("duplicate definition of `{name}`", "повторное определение `{name}`"),
-    ("no field `{field}` found on type `{type}`", "поле `{field}` не найдено в типе `{type}`"),
-    ("`main` function not found in crate", "функция `main` не найдена в крейте"),
-    ("add a `def main() {{ ... }}` function as the entry point", "добавьте функцию `def main() {{ ... }}` как точку входа"),
-    ("`set` does not support pattern destructuring; use `let` instead", "`set` не поддерживает деструктуризацию; используйте `let`"),
-    ("`let` requires an explicit initializer; it cannot rely on a type's default value", "`let` требует явного инициализатора"),
-    ("type has no default value and no initializer provided", "тип не имеет значения по умолчанию"),
-    ("shadowing definition of `{name}`", "затенение определения `{name}`"),
-    ("impl missing method `{method}` required by trait `{trait}`", "в реализации трейта `{trait}` отсутствует метод `{method}`"),
-    ("every trait method must be implemented — add a `def` for it in this impl block", "все методы трейта должны быть реализованы"),
-    ("unknown error code: `{code}`", "неизвестный код ошибки: `{code}`"),
-    ("valid error codes include E001–E061, E101–E103, W113 — \n       run `ponent explain <CODE>` with a valid code (e.g. `ponent explain E030`)", "допустимые коды ошибок: E001–E061, E101–E103, W113\n       запустите `ponent explain <CODE>`"),
-    ("did you mean `{candidates}`?",
-     "возможно, вы имели в виду `{candidates}`?"),
-    ("run `ponent explain <CODE>` with a valid error code",
-     "запустите `ponent explain <CODE>` с правильным кодом"),
+    (
+        "trait solver error: {msg}",
+        "ошибка решателя трейтов: {msg}",
+    ),
+    (
+        "type mismatch: expected `{expected}`, found `{found}`",
+        "несоответствие типов: ожидался `{expected}`, найден `{found}`",
+    ),
+    (
+        "duplicate definition of `{name}`",
+        "повторное определение `{name}`",
+    ),
+    (
+        "no field `{field}` found on type `{type}`",
+        "поле `{field}` не найдено в типе `{type}`",
+    ),
+    (
+        "`main` function not found in crate",
+        "функция `main` не найдена в крейте",
+    ),
+    (
+        "add a `def main() {{ ... }}` function as the entry point",
+        "добавьте функцию `def main() {{ ... }}` как точку входа",
+    ),
+    (
+        "`set` does not support pattern destructuring; use `let` instead",
+        "`set` не поддерживает деструктуризацию; используйте `let`",
+    ),
+    (
+        "`let` requires an explicit initializer; it cannot rely on a type's default value",
+        "`let` требует явного инициализатора",
+    ),
+    (
+        "type has no default value and no initializer provided",
+        "тип не имеет значения по умолчанию",
+    ),
+    (
+        "shadowing definition of `{name}`",
+        "затенение определения `{name}`",
+    ),
+    (
+        "impl missing method `{method}` required by trait `{trait}`",
+        "в реализации трейта `{trait}` отсутствует метод `{method}`",
+    ),
+    (
+        "every trait method must be implemented — add a `def` for it in this impl block",
+        "все методы трейта должны быть реализованы",
+    ),
+    (
+        "unknown error code: `{code}`",
+        "неизвестный код ошибки: `{code}`",
+    ),
+    (
+        "valid error codes include E001–E061, E101–E103, W113 — \n       run `ponent explain <CODE>` with a valid code (e.g. `ponent explain E030`)",
+        "допустимые коды ошибок: E001–E061, E101–E103, W113\n       запустите `ponent explain <CODE>`",
+    ),
+    (
+        "did you mean `{candidates}`?",
+        "возможно, вы имели в виду `{candidates}`?",
+    ),
+    (
+        "run `ponent explain <CODE>` with a valid error code",
+        "запустите `ponent explain <CODE>` с правильным кодом",
+    ),
     ("Available error codes:", "Доступные коды ошибок:"),
 ];
 
@@ -140,22 +229,56 @@ const RU: MsgTable = &[
 const ZH: MsgTable = &[
     ("comptime error: {e}", "编译期错误：{e}"),
     ("trait solver error: {msg}", "trait 求解器错误：{msg}"),
-    ("type mismatch: expected `{expected}`, found `{found}`", "类型不匹配：期望 `{expected}`，得到 `{found}`"),
+    (
+        "type mismatch: expected `{expected}`, found `{found}`",
+        "类型不匹配：期望 `{expected}`，得到 `{found}`",
+    ),
     ("duplicate definition of `{name}`", "重复定义 `{name}`"),
-    ("no field `{field}` found on type `{type}`", "类型 `{type}` 中没有字段 `{field}`"),
-    ("`main` function not found in crate", "crate 中没有找到 `main` 函数"),
-    ("add a `def main() {{ ... }}` function as the entry point", "添加一个 `def main() {{ ... }}` 函数作为入口点"),
-    ("`set` does not support pattern destructuring; use `let` instead", "`set` 不支持解构，请使用 `let`"),
-    ("`let` requires an explicit initializer; it cannot rely on a type's default value", "`let` 需要显式初始化"),
-    ("type has no default value and no initializer provided", "类型没有默认值且未提供初始化器"),
+    (
+        "no field `{field}` found on type `{type}`",
+        "类型 `{type}` 中没有字段 `{field}`",
+    ),
+    (
+        "`main` function not found in crate",
+        "crate 中没有找到 `main` 函数",
+    ),
+    (
+        "add a `def main() {{ ... }}` function as the entry point",
+        "添加一个 `def main() {{ ... }}` 函数作为入口点",
+    ),
+    (
+        "`set` does not support pattern destructuring; use `let` instead",
+        "`set` 不支持解构，请使用 `let`",
+    ),
+    (
+        "`let` requires an explicit initializer; it cannot rely on a type's default value",
+        "`let` 需要显式初始化",
+    ),
+    (
+        "type has no default value and no initializer provided",
+        "类型没有默认值且未提供初始化器",
+    ),
     ("shadowing definition of `{name}`", "`{name}` 的阴影定义"),
-    ("impl missing method `{method}` required by trait `{trait}`", "trait `{trait}` 的实现缺少方法 `{method}`"),
-    ("every trait method must be implemented — add a `def` for it in this impl block", "所有 trait 方法都必须实现"),
+    (
+        "impl missing method `{method}` required by trait `{trait}`",
+        "trait `{trait}` 的实现缺少方法 `{method}`",
+    ),
+    (
+        "every trait method must be implemented — add a `def` for it in this impl block",
+        "所有 trait 方法都必须实现",
+    ),
     ("unknown error code: `{code}`", "未知错误码：`{code}`"),
-    ("valid error codes include E001–E061, E101–E103, W113 — \n       run `ponent explain <CODE>` with a valid code (e.g. `ponent explain E030`)", "有效的错误码包括 E001–E061, E101–E103, W113\n       运行 `ponent explain <CODE>` 查看详情"),
-    ("did you mean `{candidates}`?",
-     "您是不是想找 `{candidates}`？"),
-    ("run `ponent explain <CODE>` with a valid error code",
-     "请使用正确的错误码运行 `ponent explain <CODE>`"),
+    (
+        "valid error codes include E001–E061, E101–E103, W113 — \n       run `ponent explain <CODE>` with a valid code (e.g. `ponent explain E030`)",
+        "有效的错误码包括 E001–E061, E101–E103, W113\n       运行 `ponent explain <CODE>` 查看详情",
+    ),
+    (
+        "did you mean `{candidates}`?",
+        "您是不是想找 `{candidates}`？",
+    ),
+    (
+        "run `ponent explain <CODE>` with a valid error code",
+        "请使用正确的错误码运行 `ponent explain <CODE>`",
+    ),
     ("Available error codes:", "可用的错误码："),
 ];

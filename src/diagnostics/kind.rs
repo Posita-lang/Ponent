@@ -89,16 +89,25 @@ pub trait Humanizer {
     fn labels(&self) -> Vec<Label>;
 
     /// Optional help text.
-    fn help(&self) -> Option<String> { None }
+    fn help(&self) -> Option<String> {
+        None
+    }
 
     /// Optional suggestions.
-    fn suggestions(&self) -> Vec<String> { vec![] }
+    fn suggestions(&self) -> Vec<String> {
+        vec![]
+    }
 }
 
 impl Humanizer for DiagnosticKind {
     fn message(&self) -> String {
         match self {
-            DiagnosticKind::TypeMismatch { expected, found, reason, .. } => {
+            DiagnosticKind::TypeMismatch {
+                expected,
+                found,
+                reason,
+                ..
+            } => {
                 let mut msg = format!("type mismatch: expected `{expected}`, found `{found}`");
                 if let Some(r) = reason {
                     use std::fmt::Write;
@@ -106,10 +115,20 @@ impl Humanizer for DiagnosticKind {
                 }
                 msg
             }
-            DiagnosticKind::NoSuchField { field_name, type_name, .. } => {
+            DiagnosticKind::NoSuchField {
+                field_name,
+                type_name,
+                ..
+            } => {
                 format!("no field `{field_name}` on type `{type_name}`")
             }
-            DiagnosticKind::ArgumentTypeMismatch { callee, param_name, expected, found, .. } => {
+            DiagnosticKind::ArgumentTypeMismatch {
+                callee,
+                param_name,
+                expected,
+                found,
+                ..
+            } => {
                 format!(
                     "argument type mismatch in call to `{callee}`: \
                      parameter `{param_name}` expected `{expected}`, found `{found}`"
@@ -122,24 +141,27 @@ impl Humanizer for DiagnosticKind {
                 format!("duplicate definition of `{name}`")
             }
             DiagnosticKind::ContractNonBool { clause, found, .. } => {
-                format!(
-                    "`{clause}` clause must be boolean, found `{found}`"
-                )
+                format!("`{clause}` clause must be boolean, found `{found}`")
             }
-            DiagnosticKind::ImplMissingMethod { trait_name, method_name, .. } => {
-                format!(
-                    "impl of `{trait_name}` is missing method `{method_name}`"
-                )
+            DiagnosticKind::ImplMissingMethod {
+                trait_name,
+                method_name,
+                ..
+            } => {
+                format!("impl of `{trait_name}` is missing method `{method_name}`")
             }
         }
     }
 
     fn labels(&self) -> Vec<Label> {
         match self {
-            DiagnosticKind::TypeMismatch { span, found_span, .. } => {
-                let mut labels = vec![
-                    Label::new(*span, format!("expected {}", self.expected_str())),
-                ];
+            DiagnosticKind::TypeMismatch {
+                span, found_span, ..
+            } => {
+                let mut labels = vec![Label::new(
+                    *span,
+                    format!("expected {}", self.expected_str()),
+                )];
                 if let Some(fs) = found_span {
                     labels.push(Label::secondary(*fs, self.found_str()));
                 }
@@ -148,10 +170,17 @@ impl Humanizer for DiagnosticKind {
             DiagnosticKind::NoSuchField { span, .. } => {
                 vec![Label::new(*span, "field not found")]
             }
-            DiagnosticKind::ArgumentTypeMismatch { span, param_span, expected, found, .. } => {
-                let mut labels = vec![
-                    Label::new(*span, format!("expected `{expected}`, found `{found}`")),
-                ];
+            DiagnosticKind::ArgumentTypeMismatch {
+                span,
+                param_span,
+                expected,
+                found,
+                ..
+            } => {
+                let mut labels = vec![Label::new(
+                    *span,
+                    format!("expected `{expected}`, found `{found}`"),
+                )];
                 if let Some(ps) = param_span {
                     labels.push(Label::secondary(*ps, format!("`{expected}` declared here")));
                 }
@@ -160,7 +189,11 @@ impl Humanizer for DiagnosticKind {
             DiagnosticKind::NameNotFound { span, .. } => {
                 vec![Label::new(*span, "not found in this scope")]
             }
-            DiagnosticKind::DuplicateDefinition { this_span, original_span, .. } => {
+            DiagnosticKind::DuplicateDefinition {
+                this_span,
+                original_span,
+                ..
+            } => {
                 vec![
                     Label::new(*this_span, "duplicate definition"),
                     Label::secondary(*original_span, "first defined here"),
@@ -169,7 +202,11 @@ impl Humanizer for DiagnosticKind {
             DiagnosticKind::ContractNonBool { span, .. } => {
                 vec![Label::new(*span, "expected bool")]
             }
-            DiagnosticKind::ImplMissingMethod { impl_span, trait_span, .. } => {
+            DiagnosticKind::ImplMissingMethod {
+                impl_span,
+                trait_span,
+                ..
+            } => {
                 vec![
                     Label::new(*impl_span, "method missing here"),
                     Label::secondary(*trait_span, "required by trait declaration here"),

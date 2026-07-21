@@ -237,7 +237,7 @@ impl GlyphRenderer {
                 if let Some(last) = merged.last_mut() {
                     // If ranges overlap or are adjacent, merge them.
                     if range.0 <= last.0.1.saturating_add(1) {
-                        last.0 .1 = last.0 .1.max(range.1);
+                        last.0.1 = last.0.1.max(range.1);
                         // Extend the span to cover the merged range using
                         // the extremes of all spans in the merged group.
                         last.1 = Span::new(last.1.start.min(sp.start), last.1.end.max(sp.end));
@@ -248,7 +248,14 @@ impl GlyphRenderer {
             }
 
             for &(_, primary_span) in &merged {
-                self.write_source_section(&mut out, source, primary_span, &merged_labels, &diag.file_name, diag.level);
+                self.write_source_section(
+                    &mut out,
+                    source,
+                    primary_span,
+                    &merged_labels,
+                    &diag.file_name,
+                    diag.level,
+                );
             }
         }
 
@@ -338,11 +345,7 @@ impl GlyphRenderer {
     fn write_header(&self, out: &mut String, diag: &Diagnostic) {
         let level_label = diag.level.label();
         let level_color = diag.level.ansi_color();
-        let code_str = diag
-            .code
-            .as_ref()
-            .map(|c| c.code())
-            .unwrap_or("?");
+        let code_str = diag.code.as_ref().map(|c| c.code()).unwrap_or("?");
         // Combine primary error code with related error codes, e.g. "E019,E030".
         let all_codes: String = if diag.related_errors.is_empty() {
             code_str.to_string()
@@ -372,7 +375,10 @@ impl GlyphRenderer {
             msg_prefix = if diag.related_errors.is_empty() {
                 crate::diagnostics::glyph::highlight_code(&diag.message, self.s.use_color)
             } else {
-                format!("1. {}", crate::diagnostics::glyph::highlight_code(&diag.message, self.s.use_color))
+                format!(
+                    "1. {}",
+                    crate::diagnostics::glyph::highlight_code(&diag.message, self.s.use_color)
+                )
             },
         );
         // Calculate the indentation for related error items so they align
@@ -388,7 +394,10 @@ impl GlyphRenderer {
                 v = self.bc.v,
                 indent = indent,
                 num = i + 2,
-                msg = crate::diagnostics::glyph::highlight_code_with_backticks(&rel.message, self.s.use_color),
+                msg = crate::diagnostics::glyph::highlight_code_with_backticks(
+                    &rel.message,
+                    self.s.use_color
+                ),
             );
         }
     }
@@ -434,7 +443,8 @@ impl GlyphRenderer {
         let indent = " ".repeat(line_num_width + 1);
 
         // Location header: ┌─ input:1:1  (with OSC 8 hyperlink when filename is a real path)
-        let location_str = format!("{filename}:{line}:{col}",
+        let location_str = format!(
+            "{filename}:{line}:{col}",
             filename = filename,
             line = start_pos.line + 1,
             col = start_pos.col + 1,
@@ -483,8 +493,12 @@ impl GlyphRenderer {
             if label_start != label_end {
                 // Find the column for this label from the first line's underlines.
                 let first_line = &lines[label_start];
-                let first_underlines = compute_line_underlines(&all_labels, source, first_line, label_start);
-                if let Some((col, ulen, ch, _)) = first_underlines.iter().find(|(_, _, _, msg)| lbl.message.as_str() == *msg) {
+                let first_underlines =
+                    compute_line_underlines(&all_labels, source, first_line, label_start);
+                if let Some((col, ulen, ch, _)) = first_underlines
+                    .iter()
+                    .find(|(_, _, _, msg)| lbl.message.as_str() == *msg)
+                {
                     multi_line_labels.push((*col, *ulen, *ch, lbl.message.clone()));
                 }
             }
@@ -566,7 +580,11 @@ impl GlyphRenderer {
                     if label_start_line != label_end_line {
                         // This label spans multiple lines.
                         // Check if this underline corresponds to this label.
-                        if *col == (lbl.span.start.saturating_sub(line_start_byte(source, line_idx)))
+                        if *col
+                            == (lbl
+                                .span
+                                .start
+                                .saturating_sub(line_start_byte(source, line_idx)))
                             || lbl.message.as_str() == *msg
                         {
                             let part = if line_idx == label_start_line {
@@ -588,7 +606,8 @@ impl GlyphRenderer {
                 crate::diagnostics::level::DiagnosticLevel::Error => Style::Error,
                 crate::diagnostics::level::DiagnosticLevel::Warning => Style::Warning,
                 crate::diagnostics::level::DiagnosticLevel::Help => Style::Help,
-                crate::diagnostics::level::DiagnosticLevel::Note | crate::diagnostics::level::DiagnosticLevel::Info => Style::Note,
+                crate::diagnostics::level::DiagnosticLevel::Note
+                | crate::diagnostics::level::DiagnosticLevel::Info => Style::Note,
             };
             let annotation_color = self.s.get(annotation_style);
             let connector_color = annotation_color;
@@ -624,7 +643,8 @@ impl GlyphRenderer {
                     crate::diagnostics::level::DiagnosticLevel::Error => Style::Error,
                     crate::diagnostics::level::DiagnosticLevel::Warning => Style::Warning,
                     crate::diagnostics::level::DiagnosticLevel::Help => Style::Help,
-                    crate::diagnostics::level::DiagnosticLevel::Note | crate::diagnostics::level::DiagnosticLevel::Info => Style::Note,
+                    crate::diagnostics::level::DiagnosticLevel::Note
+                    | crate::diagnostics::level::DiagnosticLevel::Info => Style::Note,
                 };
                 let annotation_color = self.s.get(annotation_style);
                 // Only render if there are actual annotations
@@ -673,7 +693,10 @@ impl GlyphRenderer {
                             msg = msg
                         )
                     } else {
-                        let highlighted = crate::diagnostics::glyph::highlight_code_with_backticks(msg, self.s.use_color);
+                        let highlighted = crate::diagnostics::glyph::highlight_code_with_backticks(
+                            msg,
+                            self.s.use_color,
+                        );
                         // Restore the connector color after each reset from
                         // highlight_code, otherwise the `[E030]` suffix and
                         // other text after highlighted type names would fall
@@ -776,7 +799,10 @@ impl GlyphRenderer {
                     }
                     crate::diagnostics::StringPartStyle::Highlighted => {
                         // Highlighted parts in bright blue (matching type name color).
-                        rendered.push_str(&format!("{}{}{}", self.s.bright_blue, part.content, self.s.reset));
+                        rendered.push_str(&format!(
+                            "{}{}{}",
+                            self.s.bright_blue, part.content, self.s.reset
+                        ));
                     }
                 }
             }
@@ -903,17 +929,52 @@ pub(crate) fn line_start_byte(source: &str, line_idx: usize) -> usize {
 
 /// Posita keywords to highlight in bold.
 const KEYWORDS: &[&str] = &[
-    "def", "set", "let", "return", "if", "else", "while", "for", "loop",
-    "break", "leave", "continue", "true", "false", "import", "type", "trait",
-    "impl", "ensures", "requires", "invariant", "decreases", "match", "with",
-    "struct", "enum", "pub", "mut", "ref", "comptime", "extern", "edition",
-    "constraint", "where", "in", "is", "as", "and", "or", "not", "fn",
+    "def",
+    "set",
+    "let",
+    "return",
+    "if",
+    "else",
+    "while",
+    "for",
+    "loop",
+    "break",
+    "leave",
+    "continue",
+    "true",
+    "false",
+    "import",
+    "type",
+    "trait",
+    "impl",
+    "ensures",
+    "requires",
+    "invariant",
+    "decreases",
+    "match",
+    "with",
+    "struct",
+    "enum",
+    "pub",
+    "mut",
+    "ref",
+    "comptime",
+    "extern",
+    "edition",
+    "constraint",
+    "where",
+    "in",
+    "is",
+    "as",
+    "and",
+    "or",
+    "not",
+    "fn",
 ];
 
 /// Posita built-in type names to highlight in bright blue.
 const TYPES: &[&str] = &[
-    "Int", "UInt", "Float", "Bool", "Char", "Byte", "USize", "Str",
-    "Unit", "Never", "String",
+    "Int", "UInt", "Float", "Bool", "Char", "Byte", "USize", "Str", "Unit", "Never", "String",
 ];
 
 /// Advance `pos` past a matching bracket pair at `bytes[pos]`, if any.
@@ -924,8 +985,8 @@ const TYPES: &[&str] = &[
 fn skip_brackets(bytes: &[u8], pos: usize) -> usize {
     const MAX_BRACKET_DEPTH: usize = 10;
     const MAX_SKIP_LEN: usize = 120; // max chars to scan; guards against
-                                      // a single unclosed bracket scanning
-                                      // to the end of the input.
+    // a single unclosed bracket scanning
+    // to the end of the input.
     if pos >= bytes.len() {
         return pos;
     }
@@ -993,10 +1054,14 @@ fn highlight_code_impl(line: &str, use_color: bool, add_backtick_quotes: bool) -
             let start = i;
             i += 1;
             while i < len && bytes[i] != b'"' {
-                if bytes[i] == b'\\' && i + 1 < len { i += 1; }
+                if bytes[i] == b'\\' && i + 1 < len {
+                    i += 1;
+                }
                 i += 1;
             }
-            if i < len { i += 1; }
+            if i < len {
+                i += 1;
+            }
             out.push_str(&line[start..i]);
             continue;
         }
@@ -1004,10 +1069,14 @@ fn highlight_code_impl(line: &str, use_color: bool, add_backtick_quotes: bool) -
             let start = i;
             i += 1;
             while i < len && bytes[i] != b'\'' {
-                if bytes[i] == b'\\' && i + 1 < len { i += 1; }
+                if bytes[i] == b'\\' && i + 1 < len {
+                    i += 1;
+                }
                 i += 1;
             }
-            if i < len { i += 1; }
+            if i < len {
+                i += 1;
+            }
             out.push_str(&line[start..i]);
             continue;
         }
@@ -1025,16 +1094,18 @@ fn highlight_code_impl(line: &str, use_color: bool, add_backtick_quotes: bool) -
                 let type_end = skip_brackets(bytes, i);
                 let _ = std::fmt::write(
                     &mut out,
-                    format_args!("{hl}{}{}{}{reset}", backtick, &line[start..type_end], backtick),
+                    format_args!(
+                        "{hl}{}{}{}{reset}",
+                        backtick,
+                        &line[start..type_end],
+                        backtick
+                    ),
                 );
                 i = type_end;
                 continue;
             }
             if KEYWORDS.contains(&word) {
-                let _ = std::fmt::write(
-                    &mut out,
-                    format_args!("{bold}{}{reset}", word),
-                );
+                let _ = std::fmt::write(&mut out, format_args!("{bold}{}{reset}", word));
                 continue;
             }
             out.push_str(word);
@@ -1043,7 +1114,8 @@ fn highlight_code_impl(line: &str, use_color: bool, add_backtick_quotes: bool) -
 
         // `&` followed by a type name: highlight the `&` too.
         if (bytes[i] == b'&' || bytes[i] == b'*')
-            && i + 1 < len && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
+            && i + 1 < len
+            && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
         {
             let op = bytes[i] as char;
             i += 1;
@@ -1056,7 +1128,13 @@ fn highlight_code_impl(line: &str, use_color: bool, add_backtick_quotes: bool) -
                 let type_end = skip_brackets(bytes, i);
                 let _ = std::fmt::write(
                     &mut out,
-                    format_args!("{hl}{}{}{}{}{reset}", backtick, op, &line[start..type_end], backtick),
+                    format_args!(
+                        "{hl}{}{}{}{}{reset}",
+                        backtick,
+                        op,
+                        &line[start..type_end],
+                        backtick
+                    ),
                 );
                 i = type_end;
                 continue;
@@ -1080,18 +1158,20 @@ fn highlight_code_impl(line: &str, use_color: bool, add_backtick_quotes: bool) -
             let content = &line[content_start..i];
             // Check if the content (without the trailing `>`) is a type
             // name, e.g. `Int<32>` → check `Int`, `&Str` → check `Str`.
-            let type_name = content.split(&['<', '(', '['][..]).next().unwrap_or(content);
+            let type_name = content
+                .split(&['<', '(', '['][..])
+                .next()
+                .unwrap_or(content);
             // Strip leading `&` or `*` for reference/pointer types.
             let type_name = type_name.trim_start_matches(|c| c == '&' || c == '*');
             if TYPES.contains(&type_name) {
-                let _ = std::fmt::write(
-                    &mut out,
-                    format_args!("{hl}{}{reset}", &line[start..=i]),
-                );
+                let _ = std::fmt::write(&mut out, format_args!("{hl}{}{reset}", &line[start..=i]));
             } else {
                 out.push_str(&line[start..=i]);
             }
-            if i < len { i += 1; }
+            if i < len {
+                i += 1;
+            }
             continue;
         }
 

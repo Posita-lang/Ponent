@@ -1,9 +1,7 @@
 use crate::ast::Span;
-use crate::diagnostics::glyph::{
-    byte_to_linecol, compute_line_underlines,
-};
-use crate::diagnostics::label::{AnnotationKind, Label};
 use crate::diagnostics::Diagnostic;
+use crate::diagnostics::glyph::{byte_to_linecol, compute_line_underlines};
+use crate::diagnostics::label::{AnnotationKind, Label};
 use std::fmt::Write;
 
 /// HTML emitter — generates diagnostic output as HTML.
@@ -207,8 +205,7 @@ impl HtmlEmitter {
 
         for line_idx in first_line..=last_line {
             let line = lines[line_idx];
-            let underlines =
-                compute_line_underlines(&all_labels, source, line, line_idx);
+            let underlines = compute_line_underlines(&all_labels, source, line, line_idx);
 
             // ── Build primary columns set for background highlighting ──
             let mut primary_cols: Vec<bool> = vec![false; line.len()];
@@ -225,9 +222,7 @@ impl HtmlEmitter {
 
             // ── Render line number ──
             let line_num_str = format!("{:>width$}", line_idx + 1, width = line_num_width);
-            html.push_str(&format!(
-                "<span class='line-num'>{line_num_str} │ </span>"
-            ));
+            html.push_str(&format!("<span class='line-num'>{line_num_str} │ </span>"));
 
             // ── Render source line with primary span highlighting ──
             let mut rendered = String::with_capacity(line.len() + 64);
@@ -255,9 +250,7 @@ impl HtmlEmitter {
             // ── Render underline annotations ──
             if !underlines.is_empty() {
                 let spaces = " ".repeat(line_num_width + 1);
-                html.push_str(&format!(
-                    "<span class='line-num'>{spaces} │ </span>"
-                ));
+                html.push_str(&format!("<span class='line-num'>{spaces} │ </span>"));
 
                 // Merge overlapping underlines (primary `^` takes precedence)
                 let mut combined: Vec<char> = vec![' '; line.len()];
@@ -281,8 +274,7 @@ impl HtmlEmitter {
                 let combined_str: String = combined.iter().collect();
                 let trimmed = combined_str.trim().to_string();
                 if !trimmed.is_empty() {
-                    let first_col =
-                        combined.iter().position(|c| *c != ' ').unwrap_or(0);
+                    let first_col = combined.iter().position(|c| *c != ' ').unwrap_or(0);
                     let padded = " ".repeat(first_col) + &trimmed;
                     html.push_str(&format!(
                         "<span class='underline'>{}</span>",
@@ -297,9 +289,7 @@ impl HtmlEmitter {
                         continue;
                     }
                     let msg_spaces = " ".repeat(line_num_width + 1);
-                    html.push_str(&format!(
-                        "<span class='line-num'>{msg_spaces} │ </span>"
-                    ));
+                    html.push_str(&format!("<span class='line-num'>{msg_spaces} │ </span>"));
                     let mut connector = String::new();
                     for _ in 0..*col {
                         connector.push(' ');

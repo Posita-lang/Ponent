@@ -123,12 +123,8 @@ fn main() {
                         attach_source_to_diags(&mut all_diags, &source, &file);
 
                         let has_main = resolution_map.has_main;
-                        let mut checker = TypeChecker::new(
-                            &mut ctx,
-                            &symbols,
-                            &mut trait_env,
-                            resolution_map,
-                        );
+                        let mut checker =
+                            TypeChecker::new(&mut ctx, &symbols, &mut trait_env, resolution_map);
                         let checker_result = checker.check_program(&program);
                         match checker_result {
                             Ok(_hir_program) => {
@@ -229,7 +225,9 @@ fn open_browser(url: &str) -> std::io::Result<()> {
 
 #[cfg(target_os = "windows")]
 fn open_browser(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("cmd").args(["/c", "start", url]).spawn()?;
+    std::process::Command::new("cmd")
+        .args(["/c", "start", url])
+        .spawn()?;
     Ok(())
 }
 

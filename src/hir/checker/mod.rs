@@ -460,23 +460,21 @@ impl<'a> TypeChecker<'a> {
             for (name, (params, body)) in &self.comptime_fn_registry {
                 eval.register_fn(name.clone(), params.clone(), body.clone());
             }
-            let _ = crate::diagnostics::adorn_with_span(
-                &mut self.diagnostics,
-                span,
-                None,
-                |ctxt| {
+            let _ =
+                crate::diagnostics::adorn_with_span(&mut self.diagnostics, span, None, |ctxt| {
                     match eval.eval_block(&hir) {
                         Ok(_) => Ok(()),
                         Err(e) => {
                             // Push once; adorn_with_span will add span/source.
-                            Err(ctxt.push(
-                                Diagnostic::error(crate::tr!("comptime error: {e}", e = e))
-                                    .with_code_str("E080"),
-                            ).into())
+                            Err(ctxt
+                                .push(
+                                    Diagnostic::error(crate::tr!("comptime error: {e}", e = e))
+                                        .with_code_str("E080"),
+                                )
+                                .into())
                         }
                     }
-                },
-            );
+                });
         }
 
         // Pass 3: type-check remaining items (non-comptime functions,
@@ -760,14 +758,14 @@ impl<'a> TypeChecker<'a> {
                         // Shadowing is allowed but warns.
                         let prev_span = self.span_get(var_name).unwrap_or(*span);
                         self.diagnostics.push(
-                            Diagnostic::warning(crate::tr!("shadowing definition of `{name}`", name = var_name.as_str()))
-                                .with_code_str("W113")
-                                .with_span(*span)
-                                .with_additional_span(prev_span)
-                                .with_secondary_label(
-                                    prev_span,
-                                    "previous definition here",
-                                ),
+                            Diagnostic::warning(crate::tr!(
+                                "shadowing definition of `{name}`",
+                                name = var_name.as_str()
+                            ))
+                            .with_code_str("W113")
+                            .with_span(*span)
+                            .with_additional_span(prev_span)
+                            .with_secondary_label(prev_span, "previous definition here"),
                         );
                     }
                 }
@@ -847,12 +845,13 @@ impl<'a> TypeChecker<'a> {
                     Ok(r) => r,
                     Err(rhs_err) => {
                         if let Some(ref mut d) = dup_diag {
-                            d.related_errors_mut().push(crate::diagnostics::RelatedError {
-                                code: rhs_err.code().cloned(),
-                                message: rhs_err.message().to_string(),
-                                span: rhs_err.spans().first(),
-                                label: None,
-                            });
+                            d.related_errors_mut()
+                                .push(crate::diagnostics::RelatedError {
+                                    code: rhs_err.code().cloned(),
+                                    message: rhs_err.message().to_string(),
+                                    span: rhs_err.spans().first(),
+                                    label: None,
+                                });
                         } else {
                             self.diagnostics.push(rhs_err);
                         }
@@ -1724,7 +1723,8 @@ impl<'a> TypeChecker<'a> {
                 let exit_res = guard.commit();
 
                 if let Err(diags) = exit_res {
-                    let details: Vec<String> = diags.iter().map(|d| d.message().to_string()).collect();
+                    let details: Vec<String> =
+                        diags.iter().map(|d| d.message().to_string()).collect();
                     return Err(Diagnostic::error(format!(
                         "inference failure: {}",
                         details.join("; ")
@@ -3214,9 +3214,7 @@ impl<'a> TypeChecker<'a> {
             | (TypeData::Float { .. }, TypeData::Int { .. }) => {
                 Some("try using `as` to cast between integer and float types")
             }
-            (TypeData::Bool, TypeData::Int { .. }) => {
-                Some("try `x != 0` to convert Int to Bool")
-            }
+            (TypeData::Bool, TypeData::Int { .. }) => Some("try `x != 0` to convert Int to Bool"),
             (TypeData::Int { .. }, TypeData::Bool) => {
                 Some("try `if x { 1 } else { 0 }` to convert Bool to Int")
             }
@@ -3235,21 +3233,34 @@ impl<'a> TypeChecker<'a> {
     pub(crate) fn type_mismatch_reason(&self, expected: TypeId, actual: TypeId) -> Option<String> {
         let (e, a) = (self.ctx.get(expected), self.ctx.get(actual));
         match (e, a) {
-            (TypeData::Int { bits: eb, signed: es, .. }, TypeData::Int { bits: ab, signed: as_, .. }) => {
+            (
+                TypeData::Int {
+                    bits: eb,
+                    signed: es,
+                    ..
+                },
+                TypeData::Int {
+                    bits: ab,
+                    signed: as_,
+                    ..
+                },
+            ) => {
                 if eb != ab {
                     Some(format!("Int<{eb}> is not the same width as Int<{ab}>"))
                 } else if es != as_ {
-                    Some(format!("signed Int<{eb}> is not the same as unsigned Int<{eb}>"))
+                    Some(format!(
+                        "signed Int<{eb}> is not the same as unsigned Int<{eb}>"
+                    ))
                 } else {
                     None
                 }
             }
-            (TypeData::Int { .. }, TypeData::UInt { bits: ab, .. }) => {
-                Some(format!("signed integer is not the same as unsigned UInt<{ab}>"))
-            }
-            (TypeData::UInt { bits: eb, .. }, TypeData::Int { .. }) => {
-                Some(format!("unsigned UInt<{eb}> is not the same as signed integer"))
-            }
+            (TypeData::Int { .. }, TypeData::UInt { bits: ab, .. }) => Some(format!(
+                "signed integer is not the same as unsigned UInt<{ab}>"
+            )),
+            (TypeData::UInt { bits: eb, .. }, TypeData::Int { .. }) => Some(format!(
+                "unsigned UInt<{eb}> is not the same as signed integer"
+            )),
             (TypeData::UInt { bits: eb, .. }, TypeData::UInt { bits: ab, .. }) => {
                 if eb != ab {
                     Some(format!("UInt<{eb}> is not the same width as UInt<{ab}>"))
@@ -3264,8 +3275,13 @@ impl<'a> TypeChecker<'a> {
                     None
                 }
             }
-            (TypeData::Ref { .. }, _) => Some("a reference type is not a value type; try dereferencing with `*`".into()),
-            (_, TypeData::Ref { .. }) => Some("expected a reference type, but got a value type; try taking a reference with `&`".into()),
+            (TypeData::Ref { .. }, _) => {
+                Some("a reference type is not a value type; try dereferencing with `*`".into())
+            }
+            (_, TypeData::Ref { .. }) => Some(
+                "expected a reference type, but got a value type; try taking a reference with `&`"
+                    .into(),
+            ),
             _ => None,
         }
     }
@@ -3629,7 +3645,8 @@ impl<'a> TypeChecker<'a> {
                 }
                 // Add a note label for the "maybe_var" operand (the infer var).
                 if let Some(ms) = maybe_var_span {
-                    d.labels_mut().push(Label::secondary(ms, "expected integer type"));
+                    d.labels_mut()
+                        .push(Label::secondary(ms, "expected integer type"));
                 }
                 // Trace the type origin: if the "other" operand's type came from
                 // a variable definition, show where it originated.
