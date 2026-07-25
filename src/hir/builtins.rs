@@ -13,6 +13,7 @@ fn insert_trait(symbols: &mut SymbolTable, name: &str, def_id: &mut DefId) {
         associated_types: vec![],
         super_traits: vec![],
         span: Span::new(0, 0),
+        attributes: vec![],
         crate_id: symbols.local_crate_id,
     };
     symbols
@@ -34,6 +35,7 @@ fn insert_trait_with_assoc_types(
         associated_types,
         super_traits: vec![],
         span: Span::new(0, 0),
+        attributes: vec![],
         crate_id: symbols.local_crate_id,
     };
     symbols
@@ -270,6 +272,7 @@ pub fn register_builtins(
             kind: TypeKind::Enum,
             span: Span::new(0, 0),
             alias_ast: None,
+            attributes: vec![],
             fields: vec![],
             variants: vec![ok_variant, err_variant],
             invariant: None,
@@ -317,6 +320,7 @@ pub fn register_builtins(
             kind: TypeKind::Enum,
             span: Span::new(0, 0),
             alias_ast: None,
+            attributes: vec![],
             fields: vec![],
             variants: vec![none_variant, some_variant],
             invariant: None,
@@ -374,6 +378,7 @@ pub fn register_builtins(
             kind: TypeKind::Enum,
             span: Span::new(0, 0),
             alias_ast: None,
+            attributes: vec![],
             fields: vec![],
             variants: vec![output_variant],
             invariant: None,
@@ -459,6 +464,7 @@ pub fn register_builtins(
             kind: TypeKind::Enum,
             span: Span::new(0, 0),
             alias_ast: None,
+            attributes: vec![],
             fields: vec![],
             variants: vec![],
             invariant: None,

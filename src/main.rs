@@ -6,6 +6,7 @@ mod cli;
 mod diagnostics;
 mod hir {
     pub mod builtins;
+    pub mod cfg;
     pub mod checker;
     pub mod comptime;
     pub mod generate;
@@ -18,11 +19,13 @@ mod hir {
     pub mod shape_var;
     pub mod smt;
     pub mod symbol;
+    pub mod target;
     pub mod traits;
     pub mod types;
 }
 mod lexer;
 mod parser;
+mod sat;
 mod symbol;
 mod vfs;
 
@@ -32,7 +35,7 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 use clap::Parser;
-use diagnostics::{ColoredEmitter, Diagnostic, DiagnosticEmitter, JsonEmitter};
+use diagnostics::{ColoredEmitter, DiagCtxt, Diagnostic, DiagnosticEmitter, JsonEmitter};
 use hir::checker::TypeChecker;
 use hir::resolver::NameResolver;
 use hir::types::{CrateId, DefId, TypeContext};
@@ -61,6 +64,52 @@ fn make_emitter(json: bool) -> Box<dyn DiagnosticEmitter> {
     }
 }
 
+/// Resolve a target from CLI argument: load a JSON file, look up a builtin,
+/// or fall back to the host target.
+fn resolve_target(target_opt: &Option<String>) -> Result<hir::target::Target, String> {
+    match target_opt {
+        Some(name) => {
+            let path = std::path::Path::new(name);
+            if path.exists() {
+                // Try loading as a JSON target spec.
+                match hir::target::Target::from_json(path) {
+                    Ok(target) => Ok(target),
+                    Err(e) => {
+                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                        Err(if ext != "json" {
+                            format!(
+                                "`{}` is not a valid target spec (expected `.json` file)\n\
+                                     note: file extension is `.{}`\n\
+                                     help: rename the file to `{}` or convert it to JSON.",
+                                name,
+                                ext,
+                                path.with_extension("json").display()
+                            )
+                        } else {
+                            format!("invalid target spec `{}`: {}", name, e)
+                        })
+                    }
+                }
+            } else {
+                // Try as a built-in target name.
+                hir::target::Target::builtin(name).ok_or_else(|| {
+                    let targets = [
+                        "  x86_64-linux-gnu",
+                        "  aarch64-linux-gnu",
+                        "  riscv64",
+                        "  wasm32",
+                        "  arm-eabi",
+                        "  custom-template",
+                    ];
+                    format!("unknown target `{}`\navailable built-in targets:\n{}\n  or provide a path to a .json target spec file.",
+                        name, targets.join("\n"))
+                })
+            }
+        }
+        None => Ok(hir::target::Target::host()),
+    }
+}
+
 fn main() {
     let cli = cli::Cli::parse();
     match cli.command {
@@ -69,9 +118,12 @@ fn main() {
                 Ok(s) => s,
                 Err(e) => {
                     let mut diag = Diagnostic::error(format!("failed to read `{}`: {}", file, e));
-                    diag.set_source(Some(file.clone()));
+                    // Don't set source — the file couldn't be read, so there's
+                    // no source code to display.  The emitter will render the
+                    // error without source context and close the box with └─.
                     let mut emitter = ColoredEmitter::new();
                     emitter.emit(&diag);
+                    emitter.emit_summary(1, 0);
                     process::exit(1);
                 }
             };
@@ -92,9 +144,12 @@ fn main() {
                 Ok(s) => s,
                 Err(e) => {
                     let mut diag = Diagnostic::error(format!("failed to read `{}`: {}", file, e));
-                    diag.set_source(Some(file.clone()));
+                    // Don't set source — the file couldn't be read, so there's
+                    // no source code to display.  The emitter will render the
+                    // error without source context and close the box with └─.
                     let mut emitter = make_emitter(json);
                     emitter.emit(&diag);
+                    emitter.emit_summary(1, 0);
                     process::exit(1);
                 }
             };
@@ -104,13 +159,23 @@ fn main() {
                     if ast {
                         println!("{:#?}", program);
                     } else {
-                        let mut ctx = TypeContext::new();
+                        let target = match resolve_target(&cli.target) {
+                            Ok(t) => t,
+                            Err(msg) => {
+                                let mut diag = Diagnostic::error(msg);
+                                let mut emitter = make_emitter(json);
+                                emitter.emit(&diag);
+                                emitter.emit_summary(1, 0);
+                                process::exit(1);
+                            }
+                        };
+                        let mut ctx = TypeContext::new_with_target(target);
                         let local_crate_id = CrateId(DefId(0));
 
                         // Expand `generate` blocks before name resolution,
                         // so the resolver sees only concrete declarations.
-                        let expander = hir::generate::GenerateExpander::new(&mut ctx);
-                        let expanded_items = expander.expand_program(program.items);
+                        let mut expander = hir::generate::GenerateExpander::new_phase1(&mut ctx);
+                        let (expanded_items, _) = expander.expand_program(program.items);
                         let program = ast::Program {
                             items: expanded_items,
                             span: program.span,
@@ -122,10 +187,60 @@ fn main() {
                         let mut all_diags = resolver_diags.into_inner();
                         attach_source_to_diags(&mut all_diags, &source, &file);
 
+                        // Phase 2: expand `generate` blocks with name resolution
+                        // complete — `@typeInfo!` can now return real type data.
+                        let mut expander =
+                            hir::generate::GenerateExpander::new_phase2(&mut ctx, &symbols);
+                        let (expanded_items, new_items) = expander.expand_program(program.items);
+                        let program = ast::Program {
+                            items: expanded_items,
+                            span: program.span,
+                        };
+
+                        // Phase 2 expansion may have introduced new AST nodes
+                        // (e.g. from conditional branches).  Re-run the resolver
+                        // so that any new type/function references are resolved
+                        // before type checking.
+                        let (symbols, mut trait_env, resolver_diags, resolution_map) =
+                            if !new_items.is_empty() {
+                                // Incremental resolution: only process the newly expanded
+                                // items, reusing the existing symbol table from Phase 1.
+                                let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
+                                resolver.resolve_incremental(
+                                    &new_items,
+                                    symbols,
+                                    trait_env,
+                                    resolution_map,
+                                )
+                            } else {
+                                // No new items — keep the Phase 1 results unchanged.
+                                (symbols, trait_env, DiagCtxt::new(), resolution_map)
+                            };
+                        let mut phase2_diags = resolver_diags.into_inner();
+                        attach_source_to_diags(&mut phase2_diags, &source, &file);
+                        all_diags.extend(phase2_diags);
+
                         let has_main = resolution_map.has_main;
-                        let mut checker =
-                            TypeChecker::new(&mut ctx, &symbols, &mut trait_env, resolution_map);
+                        let mut checker = TypeChecker::new_with_source(
+                            &mut ctx,
+                            &symbols,
+                            &mut trait_env,
+                            resolution_map,
+                            cli.strict,
+                            cli.enable_experimental,
+                            cli.feature,
+                            cli.debug,
+                            Some(&source),
+                        );
                         let checker_result = checker.check_program(&program);
+                        // Extract checker diagnostics (warnings, notes) even on success.
+                        let checker_diags = checker.take_diagnostics();
+                        let mut checker_diag_vec: Vec<Diagnostic> = checker_diags.into_inner();
+                        attach_source_to_diags(&mut checker_diag_vec, &source, &file);
+                        if !checker_diag_vec.is_empty() {
+                            let mut emitter = make_emitter(json);
+                            emitter.emit_all(&checker_diag_vec);
+                        }
                         match checker_result {
                             Ok(_hir_program) => {
                                 // Checker succeeded — report any resolver diagnostics.

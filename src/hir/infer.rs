@@ -2036,21 +2036,35 @@ impl InferenceContext {
         }
 
         // Compute transitive guards via binding-root sharing.
+        // Optimization: pre-compute all roots to avoid O(n²) resolve_binding calls.
         let mut trans_guarded: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for &i in &dirty {
             if i < self.guard_sets.len() && !self.guard_sets[i].is_empty() {
                 trans_guarded.insert(i);
             }
         }
+        // Pre-compute binding roots for all dirty indices.
+        let mut roots: HashMap<usize, TypeId> = HashMap::default();
+        for &idx in &dirty {
+            if idx < self.var_type_ids.len() {
+                roots.insert(idx, ctx.resolve_binding(self.var_type_ids[idx]));
+            }
+        }
+        // Collect roots of already-guarded items.
+        let mut guarded_roots: FxHashSet<TypeId> = FxHashSet::default();
+        for &j in &dirty {
+            if j < self.var_type_ids.len() && trans_guarded.contains(&j) {
+                if let Some(&root) = roots.get(&j) {
+                    guarded_roots.insert(root);
+                }
+            }
+        }
+        // Any non-guarded item whose root matches a guarded root becomes guarded.
         for &i in &dirty {
             if !trans_guarded.contains(&i) && i < self.var_type_ids.len() {
-                let i_root = ctx.resolve_binding(self.var_type_ids[i]);
-                for &j in &dirty {
-                    if j < self.var_type_ids.len() && trans_guarded.contains(&j) {
-                        if ctx.resolve_binding(self.var_type_ids[j]) == i_root {
-                            trans_guarded.insert(i);
-                            break;
-                        }
+                if let Some(&root) = roots.get(&i) {
+                    if guarded_roots.contains(&root) {
+                        trans_guarded.insert(i);
                     }
                 }
             }
@@ -3443,7 +3457,8 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
         // such violations at the construction site rather than silently
         // propagating them.
         | TypeData::Poly { .. }
-        | TypeData::Regex { .. } => ty,
+        | TypeData::Regex { .. }
+        | TypeData::Type => ty,
         TypeData::GenericParam { .. } => ty,
         TypeData::Adt { kind, def_id, args } => {
             let new_args: Vec<TypeId> = args
@@ -5198,7 +5213,7 @@ mod tests {
         );
         assert_eq!(
             tree.nodes[child.0].pool.var_ids,
-            vec![],
+            Vec::<usize>::new(),
             "child pool after unregister 20"
         );
 

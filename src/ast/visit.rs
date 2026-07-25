@@ -196,6 +196,7 @@ pub fn walk_expr<'ast, V: Visitor<'ast>>(visitor: &mut V, expr: &'ast Expr) -> V
         Expr::Error(_) => V::Result::output(),
         Expr::CompileError(_, _) => V::Result::output(),
         Expr::TypeInfo(ty, _) => visitor.visit_ty(ty),
+        Expr::LayoutOf(ty, _) => visitor.visit_ty(ty),
     }
 }
 
@@ -463,7 +464,18 @@ pub fn walk_expr_mut<V: MutVisitor>(visitor: &mut V, expr: &mut Expr) {
         | Expr::Task { .. }
         | Expr::Error(_)
         | Expr::CompileError(_, _)
-        | Expr::TypeInfo(_, _) => {}
+        // LayoutOf and TypeInfo contain Box<Type> / Box<Expr>, but their
+        // type arguments are resolved and frozen at parse-time — no MutVisitor
+        // pass (including type substitution) should modify them.  If a future
+        // pass needs to visit these types, add visit_ty_mut calls here.
+        // ⚠️  CRITICAL: If generic substitution over LayoutOf's inner AST type
+        //    is ever needed, the skip here will SILENTLY produce wrong layouts.
+        //    When adding such a pass, also add a debug_assert! in
+        //    ComptimeEvalContext::resolve_ast_type verifying the resolved
+        //    TypeId is not an InferVar (indicating substitution was missed).
+        // TODO: revisit if generic substitution over LayoutOf is needed.
+        | Expr::TypeInfo(_, _)
+        | Expr::LayoutOf(_, _) => {}
         Expr::TypeAnnotated { expr: e, ty: _, .. } => visitor.visit_expr_mut(e),
         Expr::BinaryOp { left, right, .. } => {
             visitor.visit_expr_mut(left);

@@ -1,0 +1,21 @@
+{
+    "data_layout": "e-m:e-p:32:32:32-i16:16:16-i32:32:32-f32:32:32-n8:16:32",
+    "pointer_width": 32,
+    "arch": "custom",
+    "os": "freestanding",
+    "abi": "custom",
+    "endian": "little",
+    "int_sizes": { "8": 1, "16": 2, "32": 4 },
+    "float_sizes": { "32": 4 },
+    "default_overflow": "trap",
+    "max_align": 8,
+    "allow_unaligned": true,
+    "packed_default": false,
+    "atomic_bits": [8, 16, 32],
+    "stack_align": 8,
+    "fn_align": 4,
+    "global_align": 8,
+    "forbid_panic": true,
+    "deterministic_memory": true,
+    "description": "Custom hardware template — modify for your specific platform"
+}

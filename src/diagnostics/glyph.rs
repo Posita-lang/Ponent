@@ -69,6 +69,7 @@ const ASCII: BoxChars = BoxChars {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Style {
     Error,
+    Fatal,
     Warning,
     Note,
     Help,
@@ -133,6 +134,7 @@ impl Styles {
         }
         match style {
             Style::Error => "\x1b[1;91m",
+            Style::Fatal => "\x1b[1;41;97m", // bold, red background, white text
             Style::Warning => "\x1b[1;33m",
             Style::Note => "\x1b[1;92m",
             Style::Help => "\x1b[1;96m",
@@ -603,6 +605,7 @@ impl GlyphRenderer {
             // Combine all underlines into a single line, like rustc's `- ^ -`.
             // Determine the annotation color from the diagnostic level.
             let annotation_style = match level {
+                crate::diagnostics::level::DiagnosticLevel::Fatal => Style::Fatal,
                 crate::diagnostics::level::DiagnosticLevel::Error => Style::Error,
                 crate::diagnostics::level::DiagnosticLevel::Warning => Style::Warning,
                 crate::diagnostics::level::DiagnosticLevel::Help => Style::Help,
@@ -640,6 +643,7 @@ impl GlyphRenderer {
                 let trimmed = combined_str.trim().to_string();
                 // Determine the annotation color from the diagnostic level.
                 let annotation_style = match level {
+                    crate::diagnostics::level::DiagnosticLevel::Fatal => Style::Fatal,
                     crate::diagnostics::level::DiagnosticLevel::Error => Style::Error,
                     crate::diagnostics::level::DiagnosticLevel::Warning => Style::Warning,
                     crate::diagnostics::level::DiagnosticLevel::Help => Style::Help,

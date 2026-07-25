@@ -62,7 +62,7 @@ pub use emitter::{
 };
 pub use error_code::{ErrCode, ErrorCategory};
 pub use glyph::GlyphRenderer;
-pub use kind::{DiagnosticKind, Humanizer};
+pub use kind::{ComptimeReason, DiagnosticKind, Humanizer, TypeCtx};
 pub use label::{AnnotationKind, Label, Snippet, SourcePos};
 pub use level::DiagnosticLevel;
 
@@ -504,6 +504,10 @@ impl Diagnostic {
         Self::new(DiagnosticLevel::Error, message)
     }
 
+    pub fn fatal(message: impl Into<String>) -> Self {
+        Self::new(DiagnosticLevel::Fatal, message)
+    }
+
     pub fn warning(message: impl Into<String>) -> Self {
         Self::new(DiagnosticLevel::Warning, message)
     }
@@ -513,6 +517,14 @@ impl Diagnostic {
     /// `help`, and `suggestions` from the kind's data.
     pub fn error_kind(kind: DiagnosticKind) -> Self {
         let mut diag = Self::new(DiagnosticLevel::Error, "");
+        diag.kind = Some(kind);
+        diag.humanize();
+        diag
+    }
+
+    /// Create a fatal diagnostic from a structured [`DiagnosticKind`].
+    pub fn fatal_kind(kind: DiagnosticKind) -> Self {
+        let mut diag = Self::new(DiagnosticLevel::Fatal, "");
         diag.kind = Some(kind);
         diag.humanize();
         diag

@@ -1,6 +1,6 @@
 use super::*;
-use crate::ast::{BinOp, Literal, Span};
-use crate::hir::hir::{HirExpr, HirStmt};
+use crate::ast::{BinOp, Literal, Span, VariableKind};
+use crate::hir::hir::{HirExpr, HirMatchArm, HirParam, HirPattern, HirStmt};
 use crate::hir::types::{TypeContext, TypeId};
 use crate::symbol::Symbol;
 
@@ -62,10 +62,12 @@ fn make_if(cond: HirExpr, then: HirExpr, els: Option<HirExpr>) -> HirExpr {
 }
 
 fn eval(ctx: &mut TypeContext, expr: &HirExpr) -> Result<ComptimeValue, ComptimeError> {
+    use crate::diagnostics::DiagCtxt;
     use crate::hir::symbol::SymbolTable;
     use crate::hir::types::{CrateId, DefId};
     let symbols = SymbolTable::new(CrateId(DefId(0)));
-    let mut ec = ComptimeEvalContext::new(ctx, &symbols);
+    let mut diag = DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(ctx, &symbols, &mut diag);
     ec.eval_expr(expr)
 }
 
@@ -195,7 +197,8 @@ fn test_eval_step_limit() {
     let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
         crate::hir::types::DefId(0),
     ));
-    let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
     ec.set_step_limit(0);
     let r = ec.eval_expr(&make_int(42));
     assert!(matches!(r, Err(ComptimeError::StepLimitExceeded)));
@@ -209,7 +212,8 @@ fn test_eval_variable_def() {
     let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
         crate::hir::types::DefId(0),
     ));
-    let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
     let block = HirStmt::VariableDef {
         name: Some("x".into()),
@@ -236,8 +240,10 @@ fn test_eval_variable_assign() {
     let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
         crate::hir::types::DefId(0),
     ));
-    let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
     ec.variables.insert("x".into(), ComptimeValue::Int(10));
+    ec.memory_used = ComptimeValue::Int(10).memory_size();
 
     let assign = HirStmt::Assign {
         target: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
@@ -259,7 +265,8 @@ fn test_eval_assign_unknown_variable() {
     let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
         crate::hir::types::DefId(0),
     ));
-    let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
     let assign = HirStmt::Assign {
         target: Box::new(HirExpr::Ident(
@@ -283,7 +290,8 @@ fn test_eval_ident_resolves_local_var() {
     let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
         crate::hir::types::DefId(0),
     ));
-    let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
     ec.variables.insert("x".into(), ComptimeValue::Int(99));
 
     let expr = HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0));
@@ -297,7 +305,8 @@ fn test_eval_ident_unknown() {
     let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
         crate::hir::types::DefId(0),
     ));
-    let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
     let expr = HirExpr::Ident("unknown".into(), TypeId::NONE, Span::new(0, 0));
     let r = ec.eval_expr(&expr);
@@ -313,7 +322,8 @@ fn test_eval_comptime_fn_call() {
     let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
         crate::hir::types::DefId(0),
     ));
-    let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
     // Register a comptime function: def double(x: Int<32>) -> Int<32> { 2 * x }
     let body = vec![HirStmt::Expression(Box::new(make_binop_ty(
@@ -345,7 +355,8 @@ fn test_eval_comptime_fn_call_unknown() {
     let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
         crate::hir::types::DefId(0),
     ));
-    let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
     let call = HirExpr::Call {
         callee: Box::new(HirExpr::Ident(
@@ -371,9 +382,11 @@ fn test_eval_while_loop() {
     let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
         crate::hir::types::DefId(0),
     ));
-    let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
     ec.variables.insert("i".into(), ComptimeValue::Int(0));
+    ec.memory_used = ComptimeValue::Int(0).memory_size();
     // Simulate a while loop: while i < 5 { i = i + 1 }
     let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
     let cond = make_binop_ty(i_expr(), BinOp::Lt, make_int_val(5, int32), int32);
@@ -405,13 +418,157 @@ fn test_eval_while_loop() {
 }
 
 #[test]
+fn test_eval_while_scope_isolation() {
+    let mut ctx = TypeContext::new();
+    let int32 = ctx.int(32, true);
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    // Outer variable `i` — exists before and should persist after the loop.
+    ec.variables.insert("i".into(), ComptimeValue::Int(0));
+    ec.memory_used = ComptimeValue::Int(0).memory_size();
+
+    // while i < 1 { set x = 42; i = i + 1 }
+    let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
+    let cond = make_binop_ty(i_expr(), BinOp::Lt, make_int_val(1, int32), int32);
+    let body = vec![
+        HirStmt::VariableDef {
+            kind: crate::ast::VariableKind::Set,
+            mutable: false,
+            name: Some(crate::symbol::Symbol::intern("x")),
+            pattern: None,
+            ty: int32,
+            value: Some(Box::new(make_int_val(42, int32))),
+            else_branch: None,
+            span: Span::new(0, 0),
+            type_captures: vec![],
+        },
+        HirStmt::Assign {
+            target: Box::new(i_expr()),
+            value: Box::new(make_binop_ty(
+                i_expr(),
+                BinOp::Add,
+                make_int_val(1, int32),
+                int32,
+            )),
+            op: None,
+            span: Span::new(0, 0),
+        },
+    ];
+
+    let while_stmt = HirStmt::While {
+        cond: Box::new(cond),
+        body,
+        invariant: None,
+        decreases: None,
+        span: Span::new(0, 0),
+    };
+    let _ = ec.eval_block(&[while_stmt]);
+
+    // After the loop, outer variable `i` should still be accessible and updated.
+    let i_val = ec.variables.get(&Symbol::intern("i"));
+    assert!(
+        i_val.is_some(),
+        "outer variable i should still exist after while loop"
+    );
+    assert!(
+        matches!(i_val, Some(ComptimeValue::Int(1))),
+        "outer variable i should be 1 after loop, got {:?}",
+        i_val
+    );
+
+    // After the loop, inner variable `x` must NOT leak.
+    assert!(
+        ec.variables.get(&Symbol::intern("x")).is_none(),
+        "variable x defined inside while body should not leak to outer scope"
+    );
+}
+
+#[test]
+fn test_eval_while_shadowing_same_name() {
+    // Verify that a `set` inside a while body shadowing an outer variable
+    // by the same name does NOT persist after the loop, while normal
+    // modifications to outer variables (via `Assign`) ARE preserved.
+    let mut ctx = TypeContext::new();
+    let int32 = ctx.int(32, true);
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    // Outer variable `x` (will be shadowed inside the loop) and `i` (counter).
+    ec.variables.insert("x".into(), ComptimeValue::Int(5));
+    ec.variables.insert("i".into(), ComptimeValue::Int(0));
+    ec.memory_used = ComptimeValue::Int(5).memory_size() + ComptimeValue::Int(0).memory_size();
+
+    // while i < 1 { set x = 42; i = i + 1 }
+    let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
+    let cond = make_binop_ty(i_expr(), BinOp::Lt, make_int_val(1, int32), int32);
+    let body = vec![
+        // `set x = 42` — shadows outer x inside the loop body
+        HirStmt::VariableDef {
+            kind: crate::ast::VariableKind::Set,
+            mutable: false,
+            name: Some(crate::symbol::Symbol::intern("x")),
+            pattern: None,
+            ty: int32,
+            value: Some(Box::new(make_int_val(42, int32))),
+            else_branch: None,
+            span: Span::new(0, 0),
+            type_captures: vec![],
+        },
+        // `i = i + 1` — modifies outer variable
+        HirStmt::Assign {
+            target: Box::new(i_expr()),
+            value: Box::new(make_binop_ty(
+                i_expr(),
+                BinOp::Add,
+                make_int_val(1, int32),
+                int32,
+            )),
+            op: None,
+            span: Span::new(0, 0),
+        },
+    ];
+    let while_stmt = HirStmt::While {
+        cond: Box::new(cond),
+        body,
+        invariant: None,
+        decreases: None,
+        span: Span::new(0, 0),
+    };
+    let _ = ec.eval_block(&[while_stmt]);
+
+    // After the loop, outer `x` must be restored to 5 (shadow was cleaned up).
+    let x_val = ec.variables.get(&Symbol::intern("x"));
+    assert!(
+        matches!(x_val, Some(ComptimeValue::Int(5))),
+        "outer x should be restored to 5 after while loop, got {:?}",
+        x_val,
+    );
+
+    // After the loop, `i` must be 1 (modification preserved).
+    let i_val = ec.variables.get(&Symbol::intern("i"));
+    assert!(
+        matches!(i_val, Some(ComptimeValue::Int(1))),
+        "outer i should be 1 after while loop, got {:?}",
+        i_val,
+    );
+}
+
+#[test]
 fn test_eval_while_step_limit() {
     let mut ctx = TypeContext::new();
     let int32 = ctx.int(32, true);
     let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
         crate::hir::types::DefId(0),
     ));
-    let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
     ec.set_step_limit(5);
 
     ec.variables.insert("i".into(), ComptimeValue::Int(0));
@@ -449,11 +606,12 @@ fn test_eval_type_info() {
     let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
         crate::hir::types::DefId(0),
     ));
-    let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
     let expr = HirExpr::TypeInfo(int32, Span::new(0, 0));
     let r = ec.eval_expr(&expr);
-    assert!(r.is_ok() && matches!(r.unwrap(), ComptimeValue::Type(t) if t == int32));
+    assert!(r.is_ok() && matches!(r.unwrap(), ComptimeValue::TypeInfo(_)));
 }
 
 // ── Phase 9: Variable scope isolation test ─────────────────────────
@@ -464,7 +622,8 @@ fn test_eval_fn_call_scope_isolation() {
     let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
         crate::hir::types::DefId(0),
     ));
-    let mut ec = ComptimeEvalContext::new(&ctx, &symbols);
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
     ec.variables.insert("x".into(), ComptimeValue::Int(1));
 
     // Register a function that assigns to its own param, not the outer scope
@@ -493,4 +652,1377 @@ fn test_eval_fn_call_scope_isolation() {
         ec.variables.get(&Symbol::intern("x")),
         Some(ComptimeValue::Int(1))
     ));
+}
+
+// ── Phase 10: Float arithmetic tests ──────────────────────────────
+
+#[test]
+fn test_eval_float_add() {
+    let mut ctx = TypeContext::new();
+    let expr = HirExpr::BinaryOp {
+        left: Box::new(HirExpr::Literal(
+            Literal::Float(1.5),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        op: BinOp::Add,
+        right: Box::new(HirExpr::Literal(
+            Literal::Float(2.5),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = eval(&mut ctx, &expr);
+    assert!(matches!(r, Ok(ComptimeValue::Float(v)) if (v - 4.0).abs() < 1e-10));
+}
+
+#[test]
+fn test_eval_float_mul() {
+    let mut ctx = TypeContext::new();
+    let expr = HirExpr::BinaryOp {
+        left: Box::new(HirExpr::Literal(
+            Literal::Float(3.0),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        op: BinOp::Mul,
+        right: Box::new(HirExpr::Literal(
+            Literal::Float(1.5),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = eval(&mut ctx, &expr);
+    assert!(matches!(r, Ok(ComptimeValue::Float(v)) if (v - 4.5).abs() < 1e-10));
+}
+
+// ── Phase 11: String operations tests ─────────────────────────────
+
+#[test]
+fn test_eval_string_concat() {
+    let mut ctx = TypeContext::new();
+    let expr = HirExpr::BinaryOp {
+        left: Box::new(HirExpr::Literal(
+            Literal::String("hello ".into()),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        op: BinOp::Add,
+        right: Box::new(HirExpr::Literal(
+            Literal::String("world".into()),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = eval(&mut ctx, &expr);
+    assert!(matches!(&r, Ok(ComptimeValue::String(s)) if s.as_ref() == "hello world"));
+}
+
+#[test]
+fn test_eval_string_eq() {
+    let mut ctx = TypeContext::new();
+    let expr = HirExpr::BinaryOp {
+        left: Box::new(HirExpr::Literal(
+            Literal::String("abc".into()),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        op: BinOp::Eq,
+        right: Box::new(HirExpr::Literal(
+            Literal::String("abc".into()),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = eval(&mut ctx, &expr);
+    assert!(matches!(r, Ok(ComptimeValue::Bool(true))));
+}
+
+// ── Phase 12: Comparison operators tests ──────────────────────────
+
+#[test]
+fn test_eval_int_comparisons() {
+    let mut ctx = TypeContext::new();
+    let int32 = ctx.int(32, true);
+    let a = make_int_val(5, int32);
+    let b = make_int_val(10, int32);
+
+    let tests = vec![
+        (BinOp::Eq, false),
+        (BinOp::Neq, true),
+        (BinOp::Lt, true),
+        (BinOp::Gt, false),
+        (BinOp::Le, true),
+        (BinOp::Ge, false),
+    ];
+    for (op, expected) in tests {
+        let expr = make_binop_ty(a.clone(), op, b.clone(), int32);
+        let r = eval(&mut ctx, &expr);
+        assert!(
+            matches!(&r, Ok(ComptimeValue::Bool(v)) if *v == expected),
+            "5 {:?} 10 should be {}, got {:?}",
+            op,
+            expected,
+            r
+        );
+    }
+}
+
+#[test]
+fn test_eval_float_comparisons() {
+    let mut ctx = TypeContext::new();
+    let a = HirExpr::Literal(Literal::Float(3.14), TypeId::NONE, Span::new(0, 0));
+    let b = HirExpr::Literal(Literal::Float(2.71), TypeId::NONE, Span::new(0, 0));
+
+    let tests = vec![
+        (BinOp::Eq, false),
+        (BinOp::Neq, true),
+        (BinOp::Lt, false),
+        (BinOp::Gt, true),
+    ];
+    for (op, expected) in tests {
+        let expr = HirExpr::BinaryOp {
+            left: Box::new(a.clone()),
+            op,
+            right: Box::new(b.clone()),
+            ty: TypeId::NONE,
+            span: Span::new(0, 0),
+        };
+        let r = eval(&mut ctx, &expr);
+        assert!(
+            matches!(&r, Ok(ComptimeValue::Bool(v)) if *v == expected),
+            "3.14 {:?} 2.71 should be {}, got {:?}",
+            op,
+            expected,
+            r
+        );
+    }
+}
+
+// ── Phase 13: Pointer tests ───────────────────────────────────────
+
+#[test]
+fn test_eval_ref_and_deref() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+    ec.variables.insert("x".into(), ComptimeValue::Int(42));
+
+    // &x
+    let ref_expr = HirExpr::UnaryOp {
+        op: crate::ast::UnaryOp::Ref,
+        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&ref_expr);
+    assert!(matches!(&r, Ok(ComptimeValue::Pointer { name, .. }) if name.as_str() == "x"));
+
+    // *ptr
+    let deref_expr = HirExpr::UnaryOp {
+        op: crate::ast::UnaryOp::Deref,
+        expr: Box::new(ref_expr),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&deref_expr);
+    assert!(matches!(r, Ok(ComptimeValue::Int(42))));
+}
+
+// ── Phase 14: Aggregate (struct/tuple/array) tests ────────────────
+
+#[test]
+fn test_eval_struct_lit() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let expr = HirExpr::StructLit {
+        path: vec![],
+        fields: vec![
+            ("x".into(), Box::new(make_int(10))),
+            ("y".into(), Box::new(make_int(20))),
+        ],
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&expr);
+    assert!(r.is_ok());
+    if let Ok(ComptimeValue::Aggregate { fields }) = r {
+        assert_eq!(fields.len(), 2);
+        assert!(fields[0].0.eq_str("x"));
+        assert!(matches!(fields[0].1, ComptimeValue::Int(10)));
+        assert!(fields[1].0.eq_str("y"));
+        assert!(matches!(fields[1].1, ComptimeValue::Int(20)));
+    }
+}
+
+#[test]
+fn test_eval_tuple() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let expr = HirExpr::Tuple(
+        vec![make_int(1), make_int(2), make_int(3)],
+        TypeId::NONE,
+        Span::new(0, 0),
+    );
+    let r = ec.eval_expr(&expr);
+    assert!(r.is_ok());
+    if let Ok(ComptimeValue::Aggregate { fields }) = r {
+        assert_eq!(fields.len(), 3);
+        assert!(fields[0].0.eq_str("_0"));
+        assert!(matches!(fields[0].1, ComptimeValue::Int(1)));
+    }
+}
+
+#[test]
+fn test_eval_array() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let expr = HirExpr::Array(
+        vec![make_int(10), make_int(20), make_int(30)],
+        TypeId::NONE,
+        Span::new(0, 0),
+    );
+    let r = ec.eval_expr(&expr);
+    assert!(r.is_ok());
+    if let Ok(ComptimeValue::Aggregate { fields }) = r {
+        assert_eq!(fields.len(), 3);
+        assert!(fields[0].0.eq_str("[0]"));
+        assert!(matches!(fields[0].1, ComptimeValue::Int(10)));
+    }
+}
+
+#[test]
+fn test_eval_aggregate_field_access() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let struct_expr = HirExpr::StructLit {
+        path: vec![],
+        fields: vec![
+            (
+                "name".into(),
+                Box::new(HirExpr::Literal(
+                    Literal::String("test".into()),
+                    TypeId::NONE,
+                    Span::new(0, 0),
+                )),
+            ),
+            ("value".into(), Box::new(make_int(42))),
+        ],
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    // Access field: struct_expr.name
+    let field_access = HirExpr::FieldAccess {
+        base: Box::new(struct_expr),
+        field: "name".into(),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&field_access);
+    assert!(matches!(&r, Ok(ComptimeValue::String(s)) if s.as_ref() == "test"));
+}
+
+#[test]
+fn test_eval_aggregate_index() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let arr_expr = HirExpr::Array(
+        vec![make_int(100), make_int(200), make_int(300)],
+        TypeId::NONE,
+        Span::new(0, 0),
+    );
+    // Index: arr[1]
+    let index = HirExpr::Index {
+        base: Box::new(arr_expr),
+        index: Box::new(HirExpr::Literal(
+            Literal::Int(1),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&index);
+    assert!(matches!(r, Ok(ComptimeValue::Int(200))));
+}
+
+// ── Phase 15: Type cast tests ─────────────────────────────────────
+
+#[test]
+fn test_eval_cast_int_to_int() {
+    let mut ctx = TypeContext::new();
+    let int32 = ctx.int(32, true);
+    let expr = HirExpr::Cast {
+        expr: Box::new(make_int_val(42, int32)),
+        ty: ctx.int(64, true),
+        safe: true,
+        rounding: None,
+        span: Span::new(0, 0),
+    };
+    let r = eval(&mut ctx, &expr);
+    assert!(matches!(r, Ok(ComptimeValue::Int(42))));
+}
+
+#[test]
+fn test_eval_cast_int_to_float() {
+    let mut ctx = TypeContext::new();
+    let int32 = ctx.int(32, true);
+    let expr = HirExpr::Cast {
+        expr: Box::new(make_int_val(42, int32)),
+        ty: ctx.float(64),
+        safe: true,
+        rounding: None,
+        span: Span::new(0, 0),
+    };
+    let r = eval(&mut ctx, &expr);
+    assert!(matches!(r, Ok(ComptimeValue::Float(v)) if (v - 42.0).abs() < 1e-10));
+}
+
+// ── Phase 16: TypeAnnotated test ──────────────────────────────────
+
+#[test]
+fn test_eval_type_annotated() {
+    let mut ctx = TypeContext::new();
+    let expr = HirExpr::TypeAnnotated {
+        expr: Box::new(make_int(42)),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = eval(&mut ctx, &expr);
+    assert!(matches!(r, Ok(ComptimeValue::Int(42))));
+}
+
+// ── Phase 17: EnumLit test ────────────────────────────────────────
+
+#[test]
+fn test_eval_enum_lit() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let expr = HirExpr::EnumLit {
+        path: vec!["Option".into()],
+        variant: "Some".into(),
+        payload: Some(Box::new(make_int(42))),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&expr);
+    assert!(r.is_ok());
+    if let Ok(ComptimeValue::Aggregate { fields }) = r {
+        assert!(fields[0].0.eq_str("Some"));
+        assert!(fields.len() >= 3);
+        assert!(matches!(fields[2].1, ComptimeValue::Int(42)));
+    }
+}
+
+// ── Phase 18: IfLet test ──────────────────────────────────────────
+
+#[test]
+fn test_eval_if_let_matches() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let scrutinee = make_int(42);
+    let pattern = HirPattern::Wildcard(Span::new(0, 0));
+    let then_branch = vec![HirStmt::Expression(Box::new(make_int(1)))];
+    let else_branch = vec![HirStmt::Expression(Box::new(make_int(0)))];
+
+    let expr = HirExpr::IfLet {
+        pattern,
+        scrutinee: Box::new(scrutinee),
+        then_branch,
+        else_branch: Some(else_branch),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&expr);
+    assert!(matches!(r, Ok(ComptimeValue::Int(1))));
+}
+
+// ── Phase 19: Match test ──────────────────────────────────────────
+
+#[test]
+fn test_eval_match_wildcard() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let scrutinee = make_int(42);
+    let arms = vec![HirMatchArm {
+        pattern: HirPattern::Wildcard(Span::new(0, 0)),
+        guard: None,
+        body: Box::new(make_int(99)),
+        span: Span::new(0, 0),
+    }];
+    let expr = HirExpr::Match {
+        scrutinee: Box::new(scrutinee),
+        arms,
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&expr);
+    assert!(matches!(r, Ok(ComptimeValue::Int(99))));
+}
+
+// ── Phase 20: LayoutOf test ───────────────────────────────────────
+
+#[test]
+fn test_eval_layout_of() {
+    let mut ctx = TypeContext::new();
+    let int32 = ctx.int(32, true);
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    // Use the correct AST type structure: Type::Generic(Int, [32])
+    let expr = HirExpr::LayoutOf(
+        Box::new(crate::ast::Type::Generic(
+            Box::new(crate::ast::Type::Path(vec!["Int".into()], Span::new(0, 0))),
+            vec![crate::ast::GenericArg::Positional(
+                crate::ast::Type::Literal(
+                    Box::new(crate::ast::Expr::Literal(
+                        crate::ast::Literal::Int(32),
+                        Span::new(0, 0),
+                    )),
+                    Span::new(0, 0),
+                ),
+            )],
+            Span::new(0, 0),
+        )),
+        Span::new(0, 0),
+    );
+    let r = ec.eval_expr(&expr);
+    assert!(r.is_ok(), "layout_of!(Int<32>) should succeed: {:?}", r);
+    if let Ok(ComptimeValue::LayoutDescriptor(desc)) = r {
+        assert_eq!(desc.size, 4, "Int<32> should be 4 bytes");
+        assert_eq!(desc.align, 4, "Int<32> should have alignment 4");
+    }
+}
+
+// ── Phase 29: Nested match test ────────────────────────────────
+
+#[test]
+fn test_eval_nested_match() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    // Build: match (match 42 { _ => 1 }) { _ => 2 }
+    let inner_match = HirExpr::Match {
+        scrutinee: Box::new(make_int(42)),
+        arms: vec![HirMatchArm {
+            pattern: HirPattern::Wildcard(Span::new(0, 0)),
+            guard: None,
+            body: Box::new(make_int(1)),
+            span: Span::new(0, 0),
+        }],
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let outer_match = HirExpr::Match {
+        scrutinee: Box::new(inner_match),
+        arms: vec![HirMatchArm {
+            pattern: HirPattern::Wildcard(Span::new(0, 0)),
+            guard: None,
+            body: Box::new(make_int(2)),
+            span: Span::new(0, 0),
+        }],
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&outer_match);
+    assert!(matches!(r, Ok(ComptimeValue::Int(2))));
+}
+
+// ── Phase 21: CompileError test ───────────────────────────────────
+
+#[test]
+fn test_eval_compile_error() {
+    let mut ctx = TypeContext::new();
+    let r = eval(
+        &mut ctx,
+        &HirExpr::CompileError("test error".into(), Span::new(0, 0)),
+    );
+    assert!(matches!(r, Err(ComptimeError::AssertionFailed(msg)) if msg == "test error"));
+}
+
+// ── Phase 22: Memory limit test ───────────────────────────────────
+
+#[test]
+fn test_eval_memory_limit() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+    ec.set_memory_limit(1); // Very low limit
+
+    let block = HirStmt::VariableDef {
+        name: Some("big".into()),
+        value: Some(Box::new(HirExpr::Literal(
+            Literal::String("this is a long string that should exceed the memory limit".into()),
+            TypeId::NONE,
+            Span::new(0, 0),
+        ))),
+        pattern: None,
+        else_branch: None,
+        kind: crate::ast::VariableKind::Set,
+        ty: TypeId::NONE,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_block(&[block]);
+    assert!(matches!(r, Err(ComptimeError::MemoryLimitExceeded(_))));
+}
+
+// ── Phase 23: UnsafeBlock test ────────────────────────────────────
+
+#[test]
+fn test_eval_unsafe_block() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let expr = HirExpr::UnsafeBlock {
+        body: vec![HirStmt::Expression(Box::new(make_int(42)))],
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&expr);
+    assert!(matches!(r, Ok(ComptimeValue::Int(42))));
+}
+
+// ── Phase 24: Try expression test ─────────────────────────────────
+
+#[test]
+fn test_eval_try_expr() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let expr = HirExpr::Try {
+        expr: Box::new(make_int(42)),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&expr);
+    assert!(matches!(r, Ok(ComptimeValue::Int(42))));
+}
+
+// ── Phase 25: PolyBox/PolyUnbox test ──────────────────────────────
+
+#[test]
+fn test_eval_poly_box_unbox() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    // poly(42)
+    let box_expr = HirExpr::PolyBox {
+        expr: Box::new(make_int(42)),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&box_expr);
+    assert!(matches!(r, Ok(ComptimeValue::Int(42))));
+}
+
+// ── Phase 26: Zero-param closure test ─────────────────────────────
+
+#[test]
+fn test_eval_zero_param_closure() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let expr = HirExpr::Closure {
+        params: vec![],
+        return_type: TypeId::NONE,
+        captures: vec![],
+        body: vec![HirStmt::Expression(Box::new(make_int(42)))],
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&expr);
+    assert!(matches!(r, Ok(ComptimeValue::Int(42))));
+}
+
+#[test]
+fn test_eval_closure_with_params_deferred() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let param = crate::hir::hir::HirParam {
+        name: "x".into(),
+        ty: TypeId::NONE,
+        default: None,
+        span: Span::new(0, 0),
+    };
+    let expr = HirExpr::Closure {
+        params: vec![param],
+        return_type: TypeId::NONE,
+        captures: vec![],
+        body: vec![HirStmt::Expression(Box::new(make_int(42)))],
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&expr);
+    assert!(matches!(r, Err(ComptimeError::Deferred)));
+}
+
+// ── Phase 27: Pointer index test ──────────────────────────────────
+
+#[test]
+fn test_eval_pointer_index() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    // Create an array variable
+    let arr = ComptimeValue::Aggregate {
+        fields: vec![
+            (Symbol::intern("[0]"), ComptimeValue::Int(100)),
+            (Symbol::intern("[1]"), ComptimeValue::Int(200)),
+            (Symbol::intern("[2]"), ComptimeValue::Int(300)),
+        ],
+    };
+    ec.variables.insert("arr".into(), arr.clone());
+
+    // Create a pointer to arr
+    let ptr = ComptimeValue::Pointer {
+        name: "arr".into(),
+        mutable: false,
+    };
+    ec.variables.insert("ptr".into(), ptr);
+
+    // ptr[1]
+    let index = HirExpr::Index {
+        base: Box::new(HirExpr::Ident("ptr".into(), TypeId::NONE, Span::new(0, 0))),
+        index: Box::new(HirExpr::Literal(
+            Literal::Int(1),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&index);
+    assert!(matches!(r, Ok(ComptimeValue::Int(200))));
+}
+
+// ── Phase 28: Assert built-in test ────────────────────────────────
+
+#[test]
+fn test_eval_assert_success() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let call = HirExpr::Call {
+        callee: Box::new(HirExpr::Ident(
+            "assert".into(),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        args: vec![HirExpr::Literal(
+            Literal::Bool(true),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )],
+        comptime: true,
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&call);
+    assert!(matches!(r, Ok(ComptimeValue::Unit)));
+}
+
+#[test]
+fn test_eval_assert_failure() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let call = HirExpr::Call {
+        callee: Box::new(HirExpr::Ident(
+            "assert".into(),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        args: vec![HirExpr::Literal(
+            Literal::Bool(false),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )],
+        comptime: true,
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&call);
+    assert!(matches!(r, Err(ComptimeError::AssertionFailed(_))));
+}
+
+// ── Phase 30: Bool and Unit equality tests ─────────────────────
+
+#[test]
+fn test_eval_bool_eq() {
+    let mut ctx = TypeContext::new();
+    let t = HirExpr::Literal(Literal::Bool(true), TypeId::NONE, Span::new(0, 0));
+    let f = HirExpr::Literal(Literal::Bool(false), TypeId::NONE, Span::new(0, 0));
+    let eq = make_binop(t.clone(), BinOp::Eq, f.clone());
+    let neq = make_binop(t.clone(), BinOp::Neq, f.clone());
+    let eq2 = make_binop(t.clone(), BinOp::Eq, t.clone());
+    assert!(matches!(
+        eval(&mut ctx, &eq),
+        Ok(ComptimeValue::Bool(false))
+    ));
+    assert!(matches!(
+        eval(&mut ctx, &neq),
+        Ok(ComptimeValue::Bool(true))
+    ));
+    assert!(matches!(
+        eval(&mut ctx, &eq2),
+        Ok(ComptimeValue::Bool(true))
+    ));
+}
+
+#[test]
+fn test_eval_unit_eq() {
+    let mut ctx = TypeContext::new();
+    let u = HirExpr::Block(vec![], TypeId::NONE, Span::new(0, 0));
+    let eq = make_binop(u.clone(), BinOp::Eq, u.clone());
+    let neq = make_binop(u.clone(), BinOp::Neq, u);
+    assert!(matches!(eval(&mut ctx, &eq), Ok(ComptimeValue::Bool(true))));
+    assert!(matches!(
+        eval(&mut ctx, &neq),
+        Ok(ComptimeValue::Bool(false))
+    ));
+}
+
+// ── Phase 31: Unary negation tests ─────────────────────────────
+
+#[test]
+fn test_eval_neg_int() {
+    let mut ctx = TypeContext::new();
+    let expr = HirExpr::UnaryOp {
+        op: crate::ast::UnaryOp::Neg,
+        expr: Box::new(make_int(42)),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    assert!(matches!(eval(&mut ctx, &expr), Ok(ComptimeValue::Int(-42))));
+}
+
+#[test]
+fn test_eval_not_bool() {
+    let mut ctx = TypeContext::new();
+    let expr = HirExpr::UnaryOp {
+        op: crate::ast::UnaryOp::Not,
+        expr: Box::new(HirExpr::Literal(
+            Literal::Bool(true),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    assert!(matches!(
+        eval(&mut ctx, &expr),
+        Ok(ComptimeValue::Bool(false))
+    ));
+}
+
+// ── Phase 32: Variable shadowing tests ─────────────────────────
+
+#[test]
+fn test_eval_variable_shadowing() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+    ec.variables.insert("x".into(), ComptimeValue::Int(10));
+
+    // Inner block shadows x
+    let inner = HirExpr::Block(
+        vec![HirStmt::VariableDef {
+            name: Some("x".into()),
+            pattern: None,
+            value: Some(Box::new(make_int(20))),
+            else_branch: None,
+            kind: crate::ast::VariableKind::Set,
+            ty: TypeId::NONE,
+            type_captures: vec![],
+            mutable: false,
+            span: Span::new(0, 0),
+        }],
+        TypeId::NONE,
+        Span::new(0, 0),
+    );
+    let _ = ec.eval_expr(&inner);
+    // Outer x should still be 10 (block scoping prevents leaks)
+    assert!(matches!(
+        ec.variables.get(&Symbol::intern("x")),
+        Some(ComptimeValue::Int(10))
+    ));
+}
+
+// ── Phase 33: Assign with op tests ─────────────────────────────
+
+// ── Phase 34: Arithmetic edge cases ────────────────────────────
+#[test]
+fn test_eval_int_min_neg() {
+    let mut ctx = TypeContext::new();
+    let expr = HirExpr::UnaryOp {
+        op: crate::ast::UnaryOp::Neg,
+        expr: Box::new(HirExpr::Literal(
+            Literal::Int(i128::MIN),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = eval(&mut ctx, &expr);
+    assert!(r.is_ok(), "negating i128::MIN should not overflow: {:?}", r);
+}
+
+#[test]
+fn test_eval_string_neq() {
+    let mut ctx = TypeContext::new();
+    let a = HirExpr::Literal(Literal::String("abc".into()), TypeId::NONE, Span::new(0, 0));
+    let b = HirExpr::Literal(Literal::String("def".into()), TypeId::NONE, Span::new(0, 0));
+    let expr = make_binop(a, BinOp::Neq, b);
+    assert!(matches!(
+        eval(&mut ctx, &expr),
+        Ok(ComptimeValue::Bool(true))
+    ));
+}
+
+#[test]
+fn test_eval_float_neq() {
+    let mut ctx = TypeContext::new();
+    let a = HirExpr::Literal(Literal::Float(3.14), TypeId::NONE, Span::new(0, 0));
+    let b = HirExpr::Literal(Literal::Float(2.71), TypeId::NONE, Span::new(0, 0));
+    let expr = make_binop(a, BinOp::Neq, b);
+    assert!(matches!(
+        eval(&mut ctx, &expr),
+        Ok(ComptimeValue::Bool(true))
+    ));
+}
+
+// ── Phase 35: Match pattern tests ──────────────────────────────
+
+#[test]
+fn test_eval_match_tuple_pattern() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let scrutinee = HirExpr::Tuple(
+        vec![make_int(1), make_int(2)],
+        TypeId::NONE,
+        Span::new(0, 0),
+    );
+    let arms = vec![HirMatchArm {
+        pattern: HirPattern::Tuple(
+            vec![
+                HirPattern::Wildcard(Span::new(0, 0)),
+                HirPattern::Wildcard(Span::new(0, 0)),
+            ],
+            Span::new(0, 0),
+        ),
+        guard: None,
+        body: Box::new(make_int(42)),
+        span: Span::new(0, 0),
+    }];
+    let expr = HirExpr::Match {
+        scrutinee: Box::new(scrutinee),
+        arms,
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    assert!(matches!(ec.eval_expr(&expr), Ok(ComptimeValue::Int(42))));
+}
+
+#[test]
+fn test_eval_match_enum_pattern() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let scrutinee = HirExpr::EnumLit {
+        path: vec!["Option".into()],
+        variant: "Some".into(),
+        payload: Some(Box::new(make_int(42))),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let arms = vec![HirMatchArm {
+        pattern: HirPattern::Enum {
+            path: vec!["Option".into()],
+            variant: "Some".into(),
+            inner: Some(Box::new(HirPattern::Wildcard(Span::new(0, 0)))),
+            span: Span::new(0, 0),
+        },
+        guard: None,
+        body: Box::new(make_int(99)),
+        span: Span::new(0, 0),
+    }];
+    let expr = HirExpr::Match {
+        scrutinee: Box::new(scrutinee),
+        arms,
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    assert!(matches!(ec.eval_expr(&expr), Ok(ComptimeValue::Int(99))));
+}
+
+// ── Phase 36: Catch expression test ────────────────────────────
+
+#[test]
+fn test_eval_catch_expr() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let expr = HirExpr::Catch {
+        expr: Box::new(make_int(42)),
+        branches: vec![],
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    assert!(matches!(ec.eval_expr(&expr), Ok(ComptimeValue::Int(42))));
+}
+
+// ── Phase 37: LeaveWith and Await are errors ───────────────────
+
+#[test]
+fn test_eval_leave_with_error() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let expr = HirExpr::LeaveWith {
+        expr: Box::new(make_int(0)),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&expr);
+    assert!(matches!(r, Err(ComptimeError::NotComptimeAllowed(_))));
+}
+
+#[test]
+fn test_eval_await_error() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let expr = HirExpr::Await {
+        expr: Box::new(make_int(0)),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&expr);
+    assert!(matches!(r, Err(ComptimeError::NotComptimeAllowed(_))));
+}
+
+// ── Phase 38: AttrAccess test ──────────────────────────────────
+
+#[test]
+fn test_eval_attr_access_default() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let expr = HirExpr::AttrAccess {
+        base: Box::new(make_int(42)),
+        attr: "default".into(),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&expr);
+    assert!(matches!(r, Ok(ComptimeValue::Int(42))));
+}
+
+// ── Phase 39: While with netsted loop ──────────────────────────
+
+#[test]
+fn test_eval_while_neested() {
+    let mut ctx = TypeContext::new();
+    let int32 = ctx.int(32, true);
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+    ec.variables.insert("i".into(), ComptimeValue::Int(0));
+    ec.variables.insert("j".into(), ComptimeValue::Int(0));
+    ec.memory_used = ComptimeValue::Int(0).memory_size() + ComptimeValue::Int(0).memory_size();
+
+    let i = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
+    let j = || HirExpr::Ident("j".into(), int32, Span::new(0, 0));
+    let outer_cond = make_binop_ty(i(), BinOp::Lt, make_int_val(3, int32), int32);
+    let inner_cond = make_binop_ty(j(), BinOp::Lt, make_int_val(2, int32), int32);
+    let inner_body = vec![HirStmt::Assign {
+        target: Box::new(j()),
+        value: Box::new(make_binop_ty(
+            j(),
+            BinOp::Add,
+            make_int_val(1, int32),
+            int32,
+        )),
+        op: None,
+        span: Span::new(0, 0),
+    }];
+    let inner_while = HirStmt::While {
+        cond: Box::new(inner_cond),
+        body: inner_body,
+        invariant: None,
+        decreases: None,
+        span: Span::new(0, 0),
+    };
+    let outer_body = vec![
+        inner_while,
+        HirStmt::Assign {
+            target: Box::new(i()),
+            value: Box::new(make_binop_ty(
+                i(),
+                BinOp::Add,
+                make_int_val(1, int32),
+                int32,
+            )),
+            op: None,
+            span: Span::new(0, 0),
+        },
+    ];
+    let outer_while = HirStmt::While {
+        cond: Box::new(outer_cond),
+        body: outer_body,
+        invariant: None,
+        decreases: None,
+        span: Span::new(0, 0),
+    };
+    let _ = ec.eval_block(&[outer_while]);
+    assert!(matches!(
+        ec.variables.get(&Symbol::intern("i")),
+        Some(ComptimeValue::Int(3))
+    ));
+}
+
+// ── Self-recursion test ────────────────────────────────────────
+
+#[test]
+fn test_eval_self_recursion() {
+    // comptime def fact(n) -> Int<64> {
+    //     if n <= 1 { 1 } else { n * fact!(n - 1) }
+    // }
+    // fact!(5) should return 120
+    let mut ctx = TypeContext::new();
+    let int64 = ctx.int(64, true);
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    let n_param = HirExpr::Ident("n".into(), int64, Span::new(0, 0));
+    let cond = make_binop_ty(n_param.clone(), BinOp::Le, make_int_val(1, int64), int64);
+    let recursive_call = HirExpr::Call {
+        callee: Box::new(HirExpr::Ident("fact".into(), int64, Span::new(0, 0))),
+        args: vec![make_binop_ty(
+            n_param.clone(),
+            BinOp::Sub,
+            make_int_val(1, int64),
+            int64,
+        )],
+        comptime: true,
+        ty: int64,
+        span: Span::new(0, 0),
+    };
+    let if_expr = HirExpr::If {
+        cond: Box::new(cond),
+        then_branch: vec![HirStmt::Expression(Box::new(make_int_val(1, int64)))],
+        else_branch: Some(vec![HirStmt::Expression(Box::new(make_binop_ty(
+            n_param.clone(),
+            BinOp::Mul,
+            recursive_call,
+            int64,
+        )))]),
+        is_expression: true,
+        ty: int64,
+        span: Span::new(0, 0),
+    };
+    let fn_body = vec![HirStmt::Expression(Box::new(if_expr))];
+    ec.register_fn("fact".into(), vec!["n".into()], fn_body);
+
+    // fact!(5) = 5 * 4 * 3 * 2 * 1 = 120
+    let call = HirExpr::Call {
+        callee: Box::new(HirExpr::Ident("fact".into(), int64, Span::new(0, 0))),
+        args: vec![make_int_val(5, int64)],
+        comptime: true,
+        ty: int64,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&call);
+    assert!(
+        matches!(r, Ok(ComptimeValue::Int(120))),
+        "fact!(5) = 120, got {:?}",
+        r
+    );
+}
+
+// ── Mutual recursion test ──────────────────────────────────────
+
+#[test]
+fn test_eval_mutual_recursion() {
+    // comptime def is_even(n) -> Bool {
+    //     if n == 0 { true } else { is_odd!(n - 1) }
+    // }
+    // comptime def is_odd(n) -> Bool {
+    //     if n == 0 { false } else { is_even!(n - 1) }
+    // }
+    // is_even!(4) should return true
+    let mut ctx = TypeContext::new();
+    let int64 = ctx.int(64, true);
+    let bool_ty = ctx.bool();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    // is_even body: if n == 0 { true } else { is_odd!(n - 1) }
+    let n_even = HirExpr::Ident("n".into(), int64, Span::new(0, 0));
+    let cond_even = make_binop_ty(n_even.clone(), BinOp::Eq, make_int_val(0, int64), bool_ty);
+    let is_odd_call = HirExpr::Call {
+        callee: Box::new(HirExpr::Ident("is_odd".into(), bool_ty, Span::new(0, 0))),
+        args: vec![make_binop_ty(
+            n_even.clone(),
+            BinOp::Sub,
+            make_int_val(1, int64),
+            int64,
+        )],
+        comptime: true,
+        ty: bool_ty,
+        span: Span::new(0, 0),
+    };
+    let even_body = vec![HirStmt::Expression(Box::new(HirExpr::If {
+        cond: Box::new(cond_even),
+        then_branch: vec![HirStmt::Expression(Box::new(HirExpr::Literal(
+            crate::ast::Literal::Bool(true),
+            bool_ty,
+            Span::new(0, 0),
+        )))],
+        else_branch: Some(vec![HirStmt::Expression(Box::new(is_odd_call))]),
+        is_expression: true,
+        ty: bool_ty,
+        span: Span::new(0, 0),
+    }))];
+
+    // is_odd body: if n == 0 { false } else { is_even!(n - 1) }
+    let n_odd = HirExpr::Ident("n".into(), int64, Span::new(0, 0));
+    let cond_odd = make_binop_ty(n_odd.clone(), BinOp::Eq, make_int_val(0, int64), bool_ty);
+    let is_even_call = HirExpr::Call {
+        callee: Box::new(HirExpr::Ident("is_even".into(), bool_ty, Span::new(0, 0))),
+        args: vec![make_binop_ty(
+            n_odd.clone(),
+            BinOp::Sub,
+            make_int_val(1, int64),
+            int64,
+        )],
+        comptime: true,
+        ty: bool_ty,
+        span: Span::new(0, 0),
+    };
+    let odd_body = vec![HirStmt::Expression(Box::new(HirExpr::If {
+        cond: Box::new(cond_odd),
+        then_branch: vec![HirStmt::Expression(Box::new(HirExpr::Literal(
+            crate::ast::Literal::Bool(false),
+            bool_ty,
+            Span::new(0, 0),
+        )))],
+        else_branch: Some(vec![HirStmt::Expression(Box::new(is_even_call))]),
+        is_expression: true,
+        ty: bool_ty,
+        span: Span::new(0, 0),
+    }))];
+
+    ec.register_fn("is_even".into(), vec!["n".into()], even_body);
+    ec.register_fn("is_odd".into(), vec!["n".into()], odd_body);
+
+    // is_even!(4) = is_odd!(3) = is_even!(2) = is_odd!(1) = is_even!(0) = true
+    let call = HirExpr::Call {
+        callee: Box::new(HirExpr::Ident("is_even".into(), bool_ty, Span::new(0, 0))),
+        args: vec![make_int_val(4, int64)],
+        comptime: true,
+        ty: bool_ty,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&call);
+    assert!(
+        matches!(r, Ok(ComptimeValue::Bool(true))),
+        "is_even!(4) = true, got {:?}",
+        r
+    );
+
+    // is_odd!(3) = is_even!(2) = is_odd!(1) = is_even!(0) = true
+    let call = HirExpr::Call {
+        callee: Box::new(HirExpr::Ident("is_odd".into(), bool_ty, Span::new(0, 0))),
+        args: vec![make_int_val(3, int64)],
+        comptime: true,
+        ty: bool_ty,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&call);
+    assert!(
+        matches!(r, Ok(ComptimeValue::Bool(true))),
+        "is_odd!(3) = true, got {:?}",
+        r
+    );
+}
+
+#[test]
+/// Verify that deeply recursive comptime function calls trigger
+/// StepLimitExceeded (not a stack overflow or infinite hang).
+fn test_comptime_recursive_step_limit() {
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let int32 = ctx.int(32, true);
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+    // Set a small step limit — far below what the unbounded recursion needs.
+    ec.set_step_limit(100);
+    let _ = int32;
+
+    // def recurse(n: Int<32>) -> Int<32> { recurse!(n + 1) }
+    let self_call = HirExpr::Call {
+        callee: Box::new(HirExpr::Ident("recurse".into(), int32, Span::new(0, 0))),
+        args: vec![HirExpr::BinaryOp {
+            left: Box::new(HirExpr::Ident("n".into(), int32, Span::new(0, 0))),
+            op: BinOp::Add,
+            right: Box::new(make_int_val(1, int32)),
+            ty: int32,
+            span: Span::new(0, 0),
+        }],
+        comptime: true,
+        ty: int32,
+        span: Span::new(0, 0),
+    };
+    let fn_body = vec![HirStmt::Expression(Box::new(self_call))];
+    ec.register_fn("recurse".into(), vec!["n".into()], fn_body);
+
+    let call = HirExpr::Call {
+        callee: Box::new(HirExpr::Ident("recurse".into(), int32, Span::new(0, 0))),
+        args: vec![make_int_val(0, int32)],
+        comptime: true,
+        ty: int32,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&call);
+    assert!(
+        matches!(r, Err(ComptimeError::StepLimitExceeded)),
+        "recursive comptime call should hit StepLimitExceeded, got {:?}",
+        r
+    );
 }

@@ -448,6 +448,24 @@ pub(crate) const CODE_TABLE: &[CodeEntry] = &[
         category: ErrorCategory::Generic,
         explain: "A variable in the current scope has the same name as a variable in an\nouter scope, which shadows (hides) the outer one.\n\nThis is allowed in Posita, but may indicate a bug if the outer variable was\nstill needed.  Consider renaming one of the variables to avoid confusion.\n\nExample:\n  def f() {\n    set x = 1;\n    if true {\n      set x = 2;  // warning: shadows the outer `x`\n    }\n  }\n\nFix: use a different name for the inner variable, or remove the outer one.",
     },
+    CodeEntry {
+        code: "E091",
+        title: "strict mode violation",
+        category: ErrorCategory::Generic,
+        explain: "In strict mode, @trusted functions must have @link_proof or\n@comptime_test evidence linking them to a formal proof.\n\nWithout such evidence, the compiler cannot verify that the function\nmeets its safety guarantees.  Add @link_proof or use @comptime_test\nto provide the required proof linkage.",
+    },
+    CodeEntry {
+        code: "E081",
+        title: "comptime sandbox violation",
+        category: ErrorCategory::Generic,
+        explain: "A comptime block attempted to call a @trusted or @io function, which\nis prohibited because comptime code is sandboxed.\n\nComptime blocks can only call comptime functions (declared with\n`comptime def`) or safe built-in operations.  To call a @trusted\nfunction at compile time, use `comptime @trusted { ... }` instead.",
+    },
+    CodeEntry {
+        code: "E092",
+        title: "cfg condition unreachable in strict mode",
+        category: ErrorCategory::Generic,
+        explain: "In strict mode, the SAT-based cfg reachability checker determined that\na `@cfg(condition)` is unsatisfiable under any target configuration.\n\nThis likely indicates contradictory conditions (e.g.\n`all(target_os == \"linux\", target_os == \"windows\")`).\n\nFix the @cfg condition to be satisfiable under at least one target.",
+    },
 ];
 
 /// Look up a code string in the table.

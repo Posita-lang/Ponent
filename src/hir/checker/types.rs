@@ -1,3 +1,4 @@
+use crate::diagnostics::TypeCtx;
 use crate::hir::types::TypeId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,4 +26,17 @@ pub enum TypingContext {
     ReturnValue,
     /// Checking an array/slice index expression (must be integer)
     Index,
+}
+
+/// Convert a `TypingContext` to a `TypeCtx` for use in `TypeMismatch` diagnostics.
+pub fn typing_context_to_type_ctx(ctx: &TypingContext) -> TypeCtx {
+    match ctx {
+        TypingContext::None => TypeCtx::Unspecified,
+        TypingContext::Argument { .. } => TypeCtx::FunctionArg,
+        TypingContext::ClosureBody => TypeCtx::Inference,
+        TypingContext::Condition => TypeCtx::Unspecified,
+        TypingContext::StructFieldInit => TypeCtx::Field,
+        TypingContext::ReturnValue => TypeCtx::ReturnType,
+        TypingContext::Index => TypeCtx::Unspecified,
+    }
 }

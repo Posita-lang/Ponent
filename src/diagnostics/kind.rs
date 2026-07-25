@@ -1,6 +1,50 @@
 use crate::ast::Span;
 use crate::diagnostics::label::{AnnotationKind, Label};
 
+/// Describes the context in which a type was expected.
+/// Inspired by Elm's `Expected` type which carries `Context` — knowing
+/// *why* a type was expected allows the renderer to produce more precise
+/// error messages like "parameter 1 of `foo` expects `Int<32>`" instead
+/// of just "expected `Int<32>`".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeCtx {
+    /// No specific context (general/unspecified).
+    Unspecified,
+    /// From a variable or parameter type annotation.
+    Annotation,
+    /// From a function return type annotation.
+    ReturnType,
+    /// From a binary operator's operand type.
+    BinOp,
+    /// From a function call argument position.
+    FunctionArg,
+    /// From a record field type.
+    Field,
+    /// From a type alias or generic constraint.
+    TypeAlias,
+    /// From a contract condition (requires / ensures).
+    Contract,
+    /// From a variable definition's inferred type.
+    Inference,
+}
+
+impl std::fmt::Display for TypeCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TypeCtx::Unspecified => Ok(()),
+            TypeCtx::Annotation => write!(f, "from type annotation"),
+            TypeCtx::ReturnType => write!(f, "from return type"),
+            TypeCtx::BinOp => write!(f, "from operator"),
+            TypeCtx::FunctionArg => write!(f, "from function argument"),
+            TypeCtx::Field => write!(f, "from field type"),
+            TypeCtx::TypeAlias => write!(f, "from type alias"),
+            TypeCtx::Contract => write!(f, "from contract"),
+            TypeCtx::Inference => write!(f, "from type inference"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 /// A structured diagnostic kind, carrying the exact data relevant to the
 /// error or warning being reported.
 ///
@@ -20,7 +64,6 @@ use crate::diagnostics::label::{AnnotationKind, Label};
 /// })
 /// .with_code(ErrCode::new("E030"));
 /// ```
-#[derive(Debug, Clone)]
 pub enum DiagnosticKind {
     /// A value of one type was used where another type was expected.
     TypeMismatch {
@@ -33,6 +76,9 @@ pub enum DiagnosticKind {
         /// Optional explanation of WHY the types don't match
         /// (e.g. "Int<16> is not a subtype of Int<23>").
         reason: Option<String>,
+        /// The context in which the expected type was determined
+        /// (e.g. from a type annotation, a function return type, etc.).
+        context: Option<TypeCtx>,
     },
     /// A field access referred to a field that doesn't exist on the type.
     NoSuchField {
@@ -74,6 +120,59 @@ pub enum DiagnosticKind {
         impl_span: Span,
         trait_span: Span,
     },
+    /// A compile-time evaluation error (comptime).
+    Comptime {
+        kind: ComptimeErrorKind,
+        span: Span,
+        traceback: Vec<(ComptimeReason, Span)>,
+    },
+}
+
+/// Why a block is being evaluated at compile time — used for error
+/// context backtracking (like Zig's `BlockComptimeReason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComptimeReason {
+    /// User wrote `comptime { ... }` block.
+    ComptimeBlock,
+    /// Inside a `comptime def` function body.
+    ComptimeFnDef,
+    /// Calling a comptime function with `!`.
+    ComptimeFnCall,
+    /// Evaluating `@comptime_test` function.
+    ComptimeTest,
+    /// Evaluating `assert!()`.
+    Assertion,
+    /// Evaluating `@typeInfo!()`.
+    TypeInfo,
+    /// Evaluating `layout_of!()`.
+    LayoutOf,
+}
+
+/// Specific kinds of comptime evaluation errors.
+#[derive(Debug, Clone)]
+pub enum ComptimeErrorKind {
+    /// Step limit exceeded (possible infinite loop).
+    StepLimitExceeded,
+    /// Division or remainder by zero.
+    DivisionByZero,
+    /// Integer overflow (trap policy).
+    Overflow,
+    /// Type mismatch in a comptime operation.
+    TypeError(String),
+    /// Assertion failed at compile time.
+    AssertionFailed(String),
+    /// Unknown identifier in comptime context.
+    UnknownIdentifier(String),
+    /// A runtime-only construct encountered in comptime context.
+    NotComptimeAllowed(String),
+    /// The expression cannot be evaluated at compile time.
+    Deferred,
+    /// A comptime sandbox violation.
+    SandboxViolation(String),
+    /// Memory limit exceeded during comptime evaluation.
+    MemoryLimitExceeded(String),
+    /// An internal comptime error.
+    Internal(String),
 }
 
 /// Converts a [`DiagnosticKind`] into a human-readable message and a set of
@@ -106,9 +205,16 @@ impl Humanizer for DiagnosticKind {
                 expected,
                 found,
                 reason,
+                context,
                 ..
             } => {
                 let mut msg = format!("type mismatch: expected `{expected}`, found `{found}`");
+                if let Some(ctx) = context {
+                    if !matches!(ctx, TypeCtx::Unspecified) {
+                        use std::fmt::Write;
+                        let _ = write!(msg, " ({ctx})");
+                    }
+                }
                 if let Some(r) = reason {
                     use std::fmt::Write;
                     let _ = write!(msg, " — {r}");
@@ -150,20 +256,81 @@ impl Humanizer for DiagnosticKind {
             } => {
                 format!("impl of `{trait_name}` is missing method `{method_name}`")
             }
+            DiagnosticKind::Comptime {
+                kind, traceback, ..
+            } => {
+                let msg = match kind {
+                    ComptimeErrorKind::StepLimitExceeded => {
+                        "comptime step limit exceeded (possible infinite loop)".into()
+                    }
+                    ComptimeErrorKind::DivisionByZero => {
+                        "division by zero in comptime expression".into()
+                    }
+                    ComptimeErrorKind::Overflow => "integer overflow in comptime expression".into(),
+                    ComptimeErrorKind::TypeError(s) => format!("comptime type error: {s}"),
+                    ComptimeErrorKind::AssertionFailed(s) => {
+                        format!("comptime assertion failed: {s}")
+                    }
+                    ComptimeErrorKind::UnknownIdentifier(s) => {
+                        format!("unknown identifier in comptime: {s}")
+                    }
+                    ComptimeErrorKind::NotComptimeAllowed(s) => {
+                        format!("not allowed in comptime: {s}")
+                    }
+                    ComptimeErrorKind::Deferred => {
+                        "expression cannot be evaluated at compile time".into()
+                    }
+                    ComptimeErrorKind::SandboxViolation(s) => {
+                        format!("comptime sandbox violation: {s}")
+                    }
+                    ComptimeErrorKind::MemoryLimitExceeded(s) => {
+                        format!("comptime memory limit exceeded: {s}")
+                    }
+                    ComptimeErrorKind::Internal(s) => format!("internal comptime error: {s}"),
+                };
+                if traceback.is_empty() {
+                    msg
+                } else {
+                    let tb_lines: Vec<String> = traceback
+                        .iter()
+                        .map(|(reason, span)| {
+                            let reason_str = match reason {
+                                ComptimeReason::ComptimeBlock => "comptime { ... } block",
+                                ComptimeReason::ComptimeFnDef => "comptime def function body",
+                                ComptimeReason::ComptimeFnCall => "comptime function call",
+                                ComptimeReason::ComptimeTest => "@comptime_test function",
+                                ComptimeReason::Assertion => "assert!()",
+                                ComptimeReason::TypeInfo => "@typeInfo!()",
+                                ComptimeReason::LayoutOf => "layout_of!()",
+                            };
+                            if span.start != 0 || span.end != 0 {
+                                format!("  · {reason_str} at offset {}", span.start)
+                            } else {
+                                format!("  · {reason_str}")
+                            }
+                        })
+                        .collect();
+                    format!(
+                        "{msg}\n\ncomptime call stack (most recent first):\n{}",
+                        tb_lines.join("\n")
+                    )
+                }
+            }
         }
     }
 
     fn labels(&self) -> Vec<Label> {
         match self {
             DiagnosticKind::TypeMismatch {
-                span, found_span, ..
+                span,
+                found_span,
+                expected,
+                found,
+                ..
             } => {
-                let mut labels = vec![Label::new(
-                    *span,
-                    format!("expected {}", self.expected_str()),
-                )];
+                let mut labels = vec![Label::new(*span, format!("expected {expected}"))];
                 if let Some(fs) = found_span {
-                    labels.push(Label::secondary(*fs, self.found_str()));
+                    labels.push(Label::secondary(*fs, format!("{found}")));
                 }
                 labels
             }
@@ -211,6 +378,9 @@ impl Humanizer for DiagnosticKind {
                     Label::new(*impl_span, "method missing here"),
                     Label::secondary(*trait_span, "required by trait declaration here"),
                 ]
+            }
+            DiagnosticKind::Comptime { span, .. } => {
+                vec![Label::new(*span, "comptime evaluation error")]
             }
         }
     }

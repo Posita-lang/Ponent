@@ -697,11 +697,95 @@ impl Parser {
         match self.peek() {
             Ok(Token::Comptime) => {
                 self.advance().ok();
+                // Check for `@trusted` annotation.
+                let trusted = if matches!(self.peek(), Ok(Token::At)) {
+                    let attr = self.parse_attribute()?;
+                    if !attr.name.eq_str("trusted") {
+                        return Err(Diagnostic::error(
+                            "only `@trusted` is allowed after `comptime`",
+                        )
+                        .with_code_str("E004")
+                        .with_span(attr.span)
+                        .with_help("use `comptime @trusted { ... }` for a trusted comptime block")
+                        .with_suggestion("remove the unknown attribute, or use `@trusted`"));
+                    }
+                    true
+                } else {
+                    false
+                };
                 match self.peek() {
                     Ok(Token::Def) => {
                         self.advance().ok();
                         self.with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
                             this.parse_function_def(attributes, doc, true, false)
+                        })
+                    }
+                    Ok(Token::LBracket) => {
+                        // comptime [captures] { ... }
+                        let start = self.span().start;
+                        self.advance().ok(); // consume '['
+                        let mut captures = Vec::new();
+                        loop {
+                            let name_span = self.span();
+                            match self.peek() {
+                                Ok(Token::RBracket) => {
+                                    self.advance().ok();
+                                    break;
+                                }
+                                Ok(Token::Ident(name)) => {
+                                    captures.push((name.clone(), name_span));
+                                    self.advance().ok();
+                                    match self.peek() {
+                                        Ok(Token::Comma) => {
+                                            self.advance().ok();
+                                        }
+                                        Ok(Token::RBracket) => continue,
+                                        other => {
+                                            return Err(Diagnostic::error(format!(
+                                                "expected ',' or ']' after capture name, found {:?}",
+                                                other
+                                            ))
+                                            .with_code_str("E005")
+                                            .with_span(self.span()));
+                                        }
+                                    }
+                                }
+                                other => {
+                                    return Err(Diagnostic::error(format!(
+                                        "expected capture name or ']', found {:?}",
+                                        other
+                                    ))
+                                    .with_code_str("E005")
+                                    .with_span(self.span()));
+                                }
+                            }
+                        }
+                        // Also allow `comptime [x] @trusted { ... }` (trusted after captures).
+                        let trusted = if matches!(self.peek(), Ok(Token::At)) {
+                            let attr = self.parse_attribute()?;
+                            if !attr.name.eq_str("trusted") {
+                                return Err(Diagnostic::error(
+                                    "only `@trusted` is allowed after `comptime [captures]`",
+                                )
+                                .with_code_str("E004")
+                                .with_span(attr.span)
+                                .with_help("use `comptime [captures] @trusted { ... }` for a trusted comptime block with captures")
+                                .with_suggestion("remove the unknown attribute, or use `@trusted`"));
+                            }
+                            true
+                        } else {
+                            trusted
+                        };
+                        self.expect(Token::LBrace)?;
+                        let body = self.parse_block()?;
+                        self.expect(Token::RBrace)?;
+                        let end = self.span().end;
+                        Ok(Stmt::ComptimeBlock {
+                            captures,
+                            trusted,
+                            attributes,
+                            body,
+                            span: Span::new(start, end),
                         })
                     }
                     Ok(Token::LBrace) => {
@@ -711,6 +795,9 @@ impl Parser {
                         self.expect(Token::RBrace)?;
                         let end = self.span().end;
                         Ok(Stmt::ComptimeBlock {
+                            captures: Vec::new(),
+                            trusted,
+                            attributes,
                             body,
                             span: Span::new(start, end),
                         })
@@ -756,11 +843,48 @@ impl Parser {
             Ok(Token::Constraint) => self.parse_constraint(),
             Ok(Token::Set) | Ok(Token::Let) => {
                 // Top-level variable declarations (global `set`/`let`).
-                self.parse_variable_def()
+                self.parse_variable_def(attributes)
             }
             Ok(Token::Layout) => {
                 self.advance().ok();
                 self.parse_layout_def(attributes)
+            }
+            Ok(Token::Generate) => {
+                let _start = self.span().start;
+                self.advance().ok();
+                // expect `for` keyword
+                match self.advance() {
+                    Ok(Token::For) => {}
+                    Ok(tok) => {
+                        return Err(Diagnostic::error(format!(
+                            "expected `for` after `generate`, found {:?}",
+                            tok
+                        ))
+                        .with_code_str("E004")
+                        .with_help(
+                            "`generate` must be followed by `for` and a type name or module path",
+                        )
+                        .with_span(self.span()));
+                    }
+                    Err(()) => {
+                        return Err(Diagnostic::error(
+                            "expected `for` after `generate`, found end of file",
+                        )
+                        .with_code_str("E004")
+                        .with_span(self.span()));
+                    }
+                }
+                let for_type = Box::new(self.parse_type()?);
+                self.expect(Token::LBrace)?;
+                let body = self.parse_block()?;
+                self.expect(Token::RBrace)?;
+                let _end = self.span().end;
+                Ok(Stmt::Generate {
+                    attributes,
+                    for_type,
+                    body,
+                    span: Span::new(_start, _end),
+                })
             }
             _ => {
                 let tok = self.advance().ok();
@@ -859,7 +983,20 @@ impl Parser {
     ) -> Result<Stmt, Diagnostic> {
         let start = self.span().start;
         let name = match self.advance() {
-            Ok(Token::Ident(name)) => name,
+            Ok(Token::Ident(name)) => {
+                // `layout_of` is a reserved comptime intrinsic — reject attempts
+                // to define a function with this name to avoid confusion.
+                if name.eq_str("layout_of") {
+                    return Err(Diagnostic::error(
+                        "`layout_of` is a reserved identifier and cannot be used as a function name",
+                    )
+                    .with_code_str("E004")
+                    .with_span(self.span())
+                    .with_help("`layout_of` is a built-in comptime intrinsic (see SYNTAX.md §Comptime Intrinsics)")
+                    .with_suggestion("rename the function to something else, or use `layout_of!(Type)` syntax to invoke the builtin"));
+                }
+                name
+            }
             Ok(tok) => {
                 return Err(Diagnostic::error(format!("expected function name, found {:?}", tok))
                     .with_code_str("E004")
@@ -1927,8 +2064,30 @@ impl Parser {
     }
 
     fn parse_stmt_inner(&mut self) -> Result<Stmt, Diagnostic> {
+        // Collect leading @attributes — only valid before comptime inside
+        // function bodies (e.g. @deprecated("use bar") comptime { ... }).
+        // Use checkpoint/restore to avoid consuming `@` in expression-level
+        // constructs like `@compile_error("msg")`.
+        let mut attributes = Vec::new();
+        if matches!(self.peek(), Ok(Token::At)) {
+            let cp = self.checkpoint();
+            loop {
+                match self.peek() {
+                    Ok(Token::At) => {
+                        attributes.push(self.parse_attribute()?);
+                    }
+                    _ => break,
+                }
+            }
+            if !matches!(self.peek(), Ok(Token::Comptime)) {
+                // Not followed by comptime — restore cursor so the `@`
+                // can be parsed as part of an expression (e.g. @compile_error).
+                self.restore(&cp);
+                attributes = Vec::new();
+            }
+        }
         match self.peek() {
-            Ok(Token::Set) | Ok(Token::Let) => self.parse_variable_def(),
+            Ok(Token::Set) | Ok(Token::Let) => self.parse_variable_def(Vec::new()),
             Ok(Token::If) => self.parse_if_stmt(),
             Ok(Token::While) => self.parse_while_stmt(),
             Ok(Token::For) => self.parse_for_stmt(),
@@ -1947,11 +2106,90 @@ impl Parser {
             Ok(Token::Comptime) => {
                 let _start = self.span().start;
                 self.advance().ok();
+                // Check for `@trusted` annotation.
+                let trusted = if matches!(self.peek(), Ok(Token::At)) {
+                    let attr = self.parse_attribute()?;
+                    if !attr.name.eq_str("trusted") {
+                        return Err(Diagnostic::error(
+                            "only `@trusted` is allowed after `comptime`",
+                        )
+                        .with_code_str("E004")
+                        .with_span(attr.span)
+                        .with_help(
+                            "use `comptime @trusted { ... }` for a trusted comptime block",
+                        ));
+                    }
+                    true
+                } else {
+                    false
+                };
+                // Support `comptime [captures] { ... }` inside function bodies.
+                let captures = if matches!(self.peek(), Ok(Token::LBracket)) {
+                    let mut captures = Vec::new();
+                    self.advance().ok(); // consume '['
+                    loop {
+                        let name_span = self.span();
+                        match self.peek() {
+                            Ok(Token::RBracket) => {
+                                self.advance().ok();
+                                break;
+                            }
+                            Ok(Token::Ident(name)) => {
+                                captures.push((name.clone(), name_span));
+                                self.advance().ok();
+                                match self.peek() {
+                                    Ok(Token::Comma) => {
+                                        self.advance().ok();
+                                    }
+                                    Ok(Token::RBracket) => continue,
+                                    other => {
+                                        return Err(Diagnostic::error(format!(
+                                            "expected ',' or ']' after capture name, found {:?}",
+                                            other
+                                        ))
+                                        .with_code_str("E005")
+                                        .with_span(self.span()));
+                                    }
+                                }
+                            }
+                            other => {
+                                return Err(Diagnostic::error(format!(
+                                    "expected capture name or ']', found {:?}",
+                                    other
+                                ))
+                                .with_code_str("E005")
+                                .with_span(self.span()));
+                            }
+                        }
+                    }
+                    captures
+                } else {
+                    Vec::new()
+                };
+                // Also allow `comptime [x] @trusted { ... }` (trusted after captures).
+                let trusted = if matches!(self.peek(), Ok(Token::At)) {
+                    let attr = self.parse_attribute()?;
+                    if !attr.name.eq_str("trusted") {
+                        return Err(Diagnostic::error(
+                            "only `@trusted` is allowed after `comptime [captures]`",
+                        )
+                        .with_code_str("E004")
+                        .with_span(attr.span)
+                        .with_help("use `comptime [captures] @trusted { ... }` for a trusted comptime block with captures")
+                        .with_suggestion("remove the unknown attribute, or use `@trusted`"));
+                    }
+                    true
+                } else {
+                    trusted
+                };
                 self.expect(Token::LBrace)?;
                 let body = self.parse_block()?;
                 self.expect(Token::RBrace)?;
                 let _end = self.span().end;
                 Ok(Stmt::ComptimeBlock {
+                    captures,
+                    trusted,
+                    attributes,
                     body,
                     span: Span::new(_start, _end),
                 })
@@ -1980,6 +2218,7 @@ impl Parser {
                 self.expect(Token::RBrace)?;
                 let _end = self.span().end;
                 Ok(Stmt::Generate {
+                    attributes: Vec::new(),
                     for_type,
                     body,
                     span: Span::new(_start, _end),
@@ -2060,7 +2299,7 @@ impl Parser {
     fn parse_ghost_variable(&mut self) -> Result<Stmt, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
-        let mut stmt = self.parse_variable_def()?;
+        let mut stmt = self.parse_variable_def(Vec::new())?;
         if let Stmt::VariableDef { .. } = &mut stmt {
             let end = self.span().end;
             return Ok(Stmt::GhostVariableDef {
@@ -2087,6 +2326,7 @@ impl Parser {
         self.expect(Token::RBrace)?;
         let end = self.span().end;
         Ok(Stmt::Isolate {
+            attributes: Vec::new(),
             body,
             span: Span::new(start, end),
         })
@@ -2158,7 +2398,7 @@ impl Parser {
         })
     }
 
-    fn parse_variable_def(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_variable_def(&mut self, attributes: Vec<Attribute>) -> Result<Stmt, Diagnostic> {
         let start = self.span().start;
         let kind = match self.advance().map_err(|_| {
             Diagnostic::error("unexpected token")
@@ -2277,7 +2517,7 @@ impl Parser {
             value,
             else_branch,
             span: Span::new(start, end),
-            attributes: Vec::new(),
+            attributes,
             doc: None,
             type_captures,
         })
@@ -3319,6 +3559,11 @@ impl Parser {
     }
 
     fn parse_impl_method(&mut self) -> Result<ImplMethod, Diagnostic> {
+        // Parse leading attributes: @trusted, @io, etc.
+        let mut attributes = Vec::new();
+        while matches!(self.peek(), Ok(Token::At)) {
+            attributes.push(self.parse_attribute()?);
+        }
         if matches!(self.peek(), Ok(Token::Def)) {
             self.advance().ok();
         }
@@ -3393,6 +3638,7 @@ impl Parser {
         let end = self.span().end;
         Ok(ImplMethod {
             name,
+            attributes,
             params,
             return_type,
             body,
@@ -4316,6 +4562,39 @@ impl Parser {
         let restrict = self
             .restrictions
             .contains(ParseRestrictions::NO_STRUCT_LITERAL);
+
+        // Check for built-in layout_of!(Type) — a comptime-only expression.
+        //
+        // NOTE: `layout_of` is a reserved identifier in Posita.  If a user
+        // defines a function named `layout_of`, it will be shadowed by this
+        // builtin and require the `!` suffix to call.  This is documented
+        // in SYNTAX.md under "Comptime Intrinsics".
+        if path.len() == 1 && path[0].eq_str("layout_of") {
+            // Check for the required `!` suffix — provide a clear error if missing.
+            if !matches!(self.peek(), Ok(Token::Bang)) {
+                let found = match self.peek() {
+                    Ok(tok) => format!("{:?}", tok),
+                    Err(()) => "end of file".to_string(),
+                };
+                return Err(Diagnostic::error(
+                    "`layout_of` requires `!` suffix — use `layout_of!(Type)`",
+                )
+                .with_code_str("E001")
+                .with_span(Span::new(start, self.span().end))
+                .with_help(format!(
+                    "`layout_of` is a comptime intrinsic; add `!` before `(` (found `{}`)",
+                    found,
+                ))
+                .with_suggestion("layout_of!(Type)"));
+            }
+            self.advance().ok(); // consume `!`
+            self.expect(Token::LParen)?;
+            let ty = self.parse_type()?;
+            self.expect(Token::RParen)?;
+            let end = self.span().end;
+            return Ok(Expr::LayoutOf(Box::new(ty), Span::new(start, end)));
+        }
+
         match self.peek() {
             Ok(Token::LBrace) if !restrict => self.parse_struct_lit(path, start),
             Ok(Token::LParen) => {

@@ -1,0 +1,21 @@
+{
+    "data_layout": "e-m:e-p:32:32:32-i64:64:64-f64:64:64-n8:16:32",
+    "pointer_width": 32,
+    "arch": "arm",
+    "os": "freestanding",
+    "abi": "eabi",
+    "endian": "little",
+    "int_sizes": { "8": 1, "16": 2, "32": 4, "64": 8 },
+    "float_sizes": { "32": 4, "64": 8 },
+    "default_overflow": "trap",
+    "max_align": 8,
+    "allow_unaligned": true,
+    "packed_default": false,
+    "atomic_bits": [8, 16, 32],
+    "stack_align": 8,
+    "fn_align": 4,
+    "global_align": 8,
+    "forbid_panic": false,
+    "deterministic_memory": false,
+    "description": "ARM 32-bit (EABI, freestanding, soft-float)"
+}

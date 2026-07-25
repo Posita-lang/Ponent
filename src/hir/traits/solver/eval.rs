@@ -336,6 +336,7 @@ fn canonicalize_type(ctx: &TypeContext, ty: TypeId, bound: &mut Vec<usize>) -> C
         // Regex types are opaque leaf types — they contain no nested TypeIds
         // and cannot participate in trait solving.
         TypeData::Regex { .. } => CanonTy::Unknown,
+        TypeData::Type => CanonTy::Unknown,
     }
 }
 

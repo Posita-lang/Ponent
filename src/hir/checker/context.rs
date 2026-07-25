@@ -181,7 +181,22 @@ impl<'a> TypeChecker<'a> {
 
     /// Push a new context frame (e.g., entering a function body, loop, closure).
     pub(crate) fn push_ctx(&mut self, kind: CtxKind, span: Span, label: Option<String>) {
-        self.region_tree.push_frame(CtxFrame { kind, span, label });
+        self.region_tree.push_frame(CtxFrame {
+            kind,
+            span,
+            label,
+            comptime_reason: None,
+        });
+    }
+
+    /// Push a context frame with a comptime reason (for error backtracking).
+    pub(crate) fn push_comptime_ctx(&mut self, reason: ComptimeReason, span: Span) {
+        self.region_tree.push_frame(CtxFrame {
+            kind: CtxKind::Comptime,
+            span,
+            label: None,
+            comptime_reason: Some(reason),
+        });
     }
 
     /// Pop the innermost context frame.

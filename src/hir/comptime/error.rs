@@ -1,9 +1,14 @@
 use crate::ast::Span;
 
 /// Errors that can occur during comptime evaluation.
+///
+/// These are produced by `ComptimeEvalContext` and converted to
+/// `Diagnostic::error` by the TypeChecker (with span/source context
+/// and comptime traceback attached).
 #[derive(Debug, Clone)]
 pub enum ComptimeError {
     /// Step limit reached; possible infinite loop.
+    /// Default limit is 10_000 steps, configurable via `set_step_limit()`.
     StepLimitExceeded,
     /// Division or remainder by zero.
     DivisionByZero,
@@ -21,6 +26,10 @@ pub enum ComptimeError {
     Deferred,
     /// An internal comptime error.
     Internal(String),
+    /// A comptime sandbox violation (e.g. calling @trusted/@io function).
+    SandboxViolation(String),
+    /// Memory limit exceeded during comptime evaluation.
+    MemoryLimitExceeded(String),
 }
 
 impl std::fmt::Display for ComptimeError {
@@ -39,6 +48,12 @@ impl std::fmt::Display for ComptimeError {
             ComptimeError::NotComptimeAllowed(msg) => write!(f, "{}", msg),
             ComptimeError::Deferred => write!(f, "expression cannot be evaluated at compile time"),
             ComptimeError::Internal(msg) => write!(f, "internal comptime error: {}", msg),
+            ComptimeError::SandboxViolation(msg) => {
+                write!(f, "comptime sandbox violation: {}", msg)
+            }
+            ComptimeError::MemoryLimitExceeded(msg) => {
+                write!(f, "comptime memory limit exceeded: {}", msg)
+            }
         }
     }
 }

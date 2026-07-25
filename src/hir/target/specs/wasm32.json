@@ -1,0 +1,21 @@
+{
+    "data_layout": "e-m:e-p:32:32:32-i64:64:64-f64:64:64-n8:16:32",
+    "pointer_width": 32,
+    "arch": "wasm32",
+    "os": "wasi",
+    "abi": "musl",
+    "endian": "little",
+    "int_sizes": { "8": 1, "16": 2, "32": 4, "64": 8 },
+    "float_sizes": { "32": 4, "64": 8 },
+    "default_overflow": "trap",
+    "max_align": 16,
+    "allow_unaligned": false,
+    "packed_default": false,
+    "atomic_bits": null,
+    "stack_align": 4,
+    "fn_align": 1,
+    "global_align": 4,
+    "forbid_panic": false,
+    "deterministic_memory": false,
+    "description": "WebAssembly 32-bit (WASI, single-threaded)"
+}

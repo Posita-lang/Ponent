@@ -1,13 +1,14 @@
 pub mod checker;
+pub mod cfg;
 mod comptime;
 mod generate;
 mod hir;
 mod infer;
 mod resolver;
 mod shape_var;
+pub mod target;
 mod smt;
 mod symbol;
-pub mod symbol_table;
 mod traits;
 mod types;
 pub mod visit;

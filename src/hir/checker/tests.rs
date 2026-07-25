@@ -41,7 +41,7 @@ fn check_source(source: &str) -> Result<HirProgram, Vec<String>> {
     // in add_impl to detect false positives.
     // builtins::register_builtins(&mut symbols, &mut trait_env, &mut ctx);
 
-    let mut checker = TypeChecker::new(&mut ctx, &symbols, &mut trait_env, resolution_map);
+    let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, resolution_map);
     checker.check_program(&program).map_err(|diags| {
         diags
             .into_inner()
@@ -49,6 +49,26 @@ fn check_source(source: &str) -> Result<HirProgram, Vec<String>> {
             .map(|d| d.message().to_string())
             .collect::<Vec<_>>()
     })
+}
+
+/// Create a TypeChecker with default settings (non-strict, experimental disabled,
+/// no features, non-debug).  Tests that need non-defaults call `TypeChecker::new` directly.
+fn make_checker<'a>(
+    ctx: &'a mut TypeContext,
+    symbols: &'a SymbolTable,
+    trait_env: &'a mut TraitEnv,
+    resolution_map: ResolutionMap,
+) -> TypeChecker<'a> {
+    TypeChecker::new(
+        ctx,
+        symbols,
+        trait_env,
+        resolution_map,
+        false,
+        false,
+        vec![],
+        false,
+    )
 }
 
 #[test]
@@ -756,6 +776,7 @@ fn test_region_tree_basic_ops() {
         kind: CtxKind::Function,
         span: Span::new(0, 0),
         label: None,
+        comptime_reason: None,
     });
     assert_eq!(rt.current_frames().len(), 1);
 
@@ -770,8 +791,7 @@ fn test_if_expression_type_inference() {
     let mut ctx = TypeContext::new();
     let symbols = SymbolTable::new(CrateId(DefId(0)));
     let mut trait_env = TraitEnv::new();
-    let mut checker =
-        TypeChecker::new(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
+    let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
 
     // if true { 42 } else { 0 }
     let cond = Expr::Literal(Literal::Bool(true), Span::new(0, 1));
@@ -803,8 +823,7 @@ fn test_if_statement_with_return() {
     let mut ctx = TypeContext::new();
     let symbols = SymbolTable::new(CrateId(DefId(0)));
     let mut trait_env = TraitEnv::new();
-    let mut checker =
-        TypeChecker::new(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
+    let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
 
     // if true { return 42 } else { return 0 }  — both diverge → never
     let cond = Expr::Literal(Literal::Bool(true), Span::new(0, 1));
@@ -836,8 +855,7 @@ fn test_if_expression_branch_type_match() {
     let mut ctx = TypeContext::new();
     let symbols = SymbolTable::new(CrateId(DefId(0)));
     let mut trait_env = TraitEnv::new();
-    let mut checker =
-        TypeChecker::new(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
+    let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
 
     // if true { 42 } else { false } — should still succeed via unification
     let cond = Expr::Literal(Literal::Bool(true), Span::new(0, 1));
@@ -866,8 +884,7 @@ fn test_if_expression_tuple() {
     let mut ctx = TypeContext::new();
     let symbols = SymbolTable::new(CrateId(DefId(0)));
     let mut trait_env = TraitEnv::new();
-    let mut checker =
-        TypeChecker::new(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
+    let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
 
     // if true { 1 } else { 2 } inside tuple context
     let if_expr = Expr::If {
@@ -894,8 +911,7 @@ fn test_scap_ensures_bool_check() {
     let mut ctx = TypeContext::new();
     let symbols = SymbolTable::new(CrateId(DefId(0)));
     let mut trait_env = TraitEnv::new();
-    let mut checker =
-        TypeChecker::new(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
+    let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
 
     // Push a guarantee with a boolean postcondition (simulating 'ensures result > 0')
     let post = checker.ctx.bool();
@@ -922,8 +938,7 @@ fn test_scap_ensures_chaining() {
     let mut ctx = TypeContext::new();
     let symbols = SymbolTable::new(CrateId(DefId(0)));
     let mut trait_env = TraitEnv::new();
-    let mut checker =
-        TypeChecker::new(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
+    let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
 
     // Push g₀ (caller's guarantee)
     let g0 = Guarantee::new(Predicate::True, Predicate::Type(checker.ctx.bool()), None);
@@ -952,7 +967,7 @@ fn test_scap_ensures_no_guarantee_ok() {
     let mut ctx = TypeContext::new();
     let symbols = SymbolTable::new(CrateId(DefId(0)));
     let mut trait_env = TraitEnv::new();
-    let checker = TypeChecker::new(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
+    let checker = make_checker(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
 
     // No ensures clause = vacuously true (chain is empty)
     assert!(checker.guarantee_chain.current().is_none());
@@ -964,8 +979,7 @@ fn test_scap_multiple_ensures_clauses() {
     let mut ctx = TypeContext::new();
     let symbols = SymbolTable::new(CrateId(DefId(0)));
     let mut trait_env = TraitEnv::new();
-    let mut checker =
-        TypeChecker::new(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
+    let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
 
     // Push two guarantees (simulating two ensures clauses)
     let g1 = Guarantee::new(Predicate::True, Predicate::Type(checker.ctx.bool()), None);
@@ -992,8 +1006,7 @@ fn test_scap_guarantee_discharge_on_return() {
     let mut ctx = TypeContext::new();
     let symbols = SymbolTable::new(CrateId(DefId(0)));
     let mut trait_env = TraitEnv::new();
-    let mut checker =
-        TypeChecker::new(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
+    let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
 
     // Simulate entering a function: push a guarantee
     let g = Guarantee::new(Predicate::True, Predicate::Type(checker.ctx.bool()), None);
@@ -1156,7 +1169,6 @@ fn test_trait_impl_generic_with_bound() {
 
 #[test]
 fn test_trait_two_methods_impl_both() {
-    // FIXME: same `Self` resolution limitation as test_trait_impl_all_methods_provided
     let result = check_source(
         "trait Pair { def first(x: Int<32>) -> Int<32>; def second(x: Int<32>) -> Int<32>; }
              type MyInt = Int<32> with default = 0;
@@ -1166,9 +1178,7 @@ fn test_trait_two_methods_impl_both() {
              }
              def main() -> Int<32> { return 0; }",
     );
-    if result.is_err() {
-        return;
-    }
+    assert!(result.is_ok(), "impl with two methods: {:?}", result.err());
 }
 
 #[test]
@@ -2506,6 +2516,157 @@ mod test_regex {
                 .any(|e| e.contains("type mismatch") && e.contains("&Str")),
             "expected type mismatch with &Str, got: {:?}",
             errs
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_rejects_unproven_trusted() {
+        // In strict mode, @trusted without @link_proof should be rejected.
+        let source = "@trusted
+         def unsafe_fn() -> Int<32> { return 42; }
+         def main() -> Int<32> { return 0; }";
+        let mut parser = Parser::new(source);
+        let program = parser.parse_program().expect("parse should succeed");
+        let mut ctx = TypeContext::new();
+        let local_crate_id = CrateId(DefId(0));
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
+        let (symbols, mut trait_env, _res_diags, resolution_map) =
+            resolver.resolve_program(&program);
+        let mut checker = TypeChecker::new(
+            &mut ctx,
+            &symbols,
+            &mut trait_env,
+            resolution_map,
+            true,   // strict_mode
+            false,  // enable_experimental
+            vec![], // features
+            false,  // debug
+        );
+        let result = checker.check_program(&program);
+        assert!(
+            result.is_err(),
+            "strict mode should reject @trusted without @link_proof"
+        );
+    }
+
+    #[test]
+    fn test_experimental_accepted_with_flag() {
+        // @experimental should be accepted when --enable-experimental is set.
+        let source = "@experimental
+         def main() -> Int<32> { return 0; }";
+        let mut parser = Parser::new(source);
+        let program = parser.parse_program().expect("parse should succeed");
+        let mut ctx = TypeContext::new();
+        let local_crate_id = CrateId(DefId(0));
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
+        let (symbols, mut trait_env, _res_diags, resolution_map) =
+            resolver.resolve_program(&program);
+        let mut checker = TypeChecker::new(
+            &mut ctx,
+            &symbols,
+            &mut trait_env,
+            resolution_map,
+            false,  // strict_mode
+            true,   // enable_experimental
+            vec![], // features
+            false,  // debug
+        );
+        let result = checker.check_program(&program);
+        assert!(
+            result.is_ok(),
+            "@experimental should be accepted with --enable-experimental, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_rejects_contradictory_cfg() {
+        // all(target_os == "linux", target_os == "windows") is contradictory.
+        let source = "@cfg(all(target_os == \"linux\", target_os == \"windows\"))
+         def f() -> Int<32> { return 0; }
+         def main() -> Int<32> { return 0; }";
+        let mut parser = Parser::new(source);
+        let program = parser.parse_program().expect("parse should succeed");
+        let mut ctx = TypeContext::new();
+        let local_crate_id = CrateId(DefId(0));
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
+        let (symbols, mut trait_env, _res_diags, resolution_map) =
+            resolver.resolve_program(&program);
+        let mut checker = TypeChecker::new(
+            &mut ctx,
+            &symbols,
+            &mut trait_env,
+            resolution_map,
+            true,
+            false,
+            vec![],
+            false,
+        );
+        let result = checker.check_program(&program);
+        assert!(
+            result.is_err(),
+            "strict mode should reject contradictory cfg condition"
+        );
+    }
+
+    #[test]
+    fn test_cfg_debug_with_flag() {
+        let source = "@cfg(debug)
+         def f() -> Int<32> { return 0; }
+         def main() -> Int<32> { return 0; }";
+        let mut parser = Parser::new(source);
+        let program = parser.parse_program().expect("parse should succeed");
+        let mut ctx = TypeContext::new();
+        let local_crate_id = CrateId(DefId(0));
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
+        let (symbols, mut trait_env, _res_diags, resolution_map) =
+            resolver.resolve_program(&program);
+        let mut checker = TypeChecker::new(
+            &mut ctx,
+            &symbols,
+            &mut trait_env,
+            resolution_map,
+            false,
+            false,
+            vec![],
+            true,
+        );
+        let result = checker.check_program(&program);
+        assert!(
+            result.is_ok(),
+            "@cfg(debug) should pass with --debug, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_comptime_sandbox_rejects_trusted_call() {
+        let source = "@trusted
+         def unsafe_fn() -> Int<32> { return 42; }
+         def main() -> Int<32> {
+             comptime { return unsafe_fn(); }
+         }";
+        let mut parser = Parser::new(source);
+        let program = parser.parse_program().expect("parse should succeed");
+        let mut ctx = TypeContext::new();
+        let local_crate_id = CrateId(DefId(0));
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
+        let (symbols, mut trait_env, _res_diags, resolution_map) =
+            resolver.resolve_program(&program);
+        let mut checker = TypeChecker::new(
+            &mut ctx,
+            &symbols,
+            &mut trait_env,
+            resolution_map,
+            false,
+            false,
+            vec![],
+            false,
+        );
+        let result = checker.check_program(&program);
+        assert!(
+            result.is_err(),
+            "comptime block should reject call to @trusted function"
         );
     }
 }

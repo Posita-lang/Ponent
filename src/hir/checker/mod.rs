@@ -1,7 +1,9 @@
 use crate::ast::*;
 use crate::diagnostics::{
-    Applicability, DiagCtxt, Diagnostic, DiagnosticKind, Label, Suggestion, SuggestionStyle,
+    Applicability, ComptimeReason, DiagCtxt, Diagnostic, DiagnosticKind, Label, Suggestion,
+    SuggestionStyle, TypeCtx,
 };
+use crate::hir::comptime::value::ComptimeValue;
 use crate::hir::hir::*;
 use crate::hir::infer::*;
 use crate::hir::resolver::ResolutionMap;
@@ -55,6 +57,8 @@ pub enum CtxKind {
     LabeledBlock,
     /// A comptime evawuation bwock — `wetuwn` inside is comptime contwow fwow, not an ewwow. (◕‿◕)
     Comptime,
+    /// An `isolate` bwock — no access to extewnaw mutabwe state. (｀・ω・´)
+    Isolate,
 }
 
 /// A fwame howding the context kind and its span (*/ω＼*)
@@ -64,6 +68,8 @@ pub struct CtxFrame {
     span: Span,
     /// Optionaw wabew name (onwy used by WabewedBwock)
     label: Option<String>,
+    /// Why this block is comptime (if applicable).
+    comptime_reason: Option<ComptimeReason>,
 }
 /// A scoped map of variable name → TypeId.
 ///
@@ -204,6 +210,8 @@ pub struct TypeChecker<'a> {
     symbols: &'a SymbolTable,
     trait_env: &'a mut TraitEnv,
     diagnostics: DiagCtxt,
+    /// Source text for converting byte offsets to line:column in tracebacks.
+    source: Option<&'a str>,
     current_function: Option<DefId>,
     current_return_type: Option<TypeId>,
     resolving_aliases: HashSet<DefId>,
@@ -256,6 +264,9 @@ pub struct TypeChecker<'a> {
     /// Names of mutable global variables (top-level `set mut`).
     /// These can only be read/written inside `@trusted` functions.
     mutable_globals: HashSet<Symbol>,
+    /// Functions that access mutable globals (by DefId).
+    /// Populated during body checking; used to enforce isolate block restrictions.
+    functions_accessing_mutables: HashSet<DefId>,
     /// Whether the current function is annotated `@trusted`.
     current_function_trusted: bool,
     /// Registry of comptime functions: name → (param_names, body).
@@ -268,7 +279,28 @@ pub struct TypeChecker<'a> {
     comptime_fn_pass: bool,
     /// Deferred comptime blocks collected during Pass 2.  Evaluated after
     /// all comptime function bodies are registered.
-    deferred_comptime_blocks: Vec<(Vec<HirStmt>, TypeId, Span)>,
+    /// Each entry is (captures, body_hir, ty, span).
+    deferred_comptime_blocks: Vec<(Vec<(Symbol, Span)>, Vec<HirStmt>, TypeId, Span)>,
+    /// Compile-time constant values for immutable `set` variable declarations
+    /// with literal initializers.  Used by `comptime [x] { ... }` capture lists.
+    ///
+    /// This is a scope-aware value stack: each variable maps to a stack of
+    /// values pushed in nested scopes.  On scope exit, the top value is popped,
+    /// restoring the outer scope's value.  The companion `scope_var_stack`
+    /// tracks which variables were defined in each scope frame so they can be
+    /// correctly popped.
+    ///
+    /// # Invariants
+    /// - `scope_var_stack.len()` equals the current nesting depth managed by
+    ///   `enter_var_scope()` / `VarScopeGuard`.
+    /// - For every `Symbol` in each inner `Vec<Symbol>` of `scope_var_stack`,
+    ///   `literal_values[Symbol]` has at least `scope_var_stack.len() - frame_index`
+    ///   entries (enough to pop back to the outer scope).
+    literal_values: HashMap<Symbol, Vec<ComptimeValue>>,
+    /// Scope stack for literal values: each entry is the list of variable names
+    /// that were defined (and thus pushed onto `literal_values`) in that scope.
+    /// Popped in lockstep with `enter_var_scope()` / `VarScopeGuard`.
+    scope_var_stack: Vec<Vec<Symbol>>,
     /// Registry of builtin trait DefIds for fast lookup during trait resolution.
     builtin_registry: BuiltinTraitRegistry,
     /// Cache for associated type projection normalization.
@@ -288,6 +320,17 @@ pub struct TypeChecker<'a> {
     /// solver pass, preventing obligation loss when a function body errors
     /// before the `trait_obligations` drain site.
     residual_trait_obligations: Vec<(Span, TraitPredicate)>,
+    /// Whether the compiler is running in strict mode.
+    /// In strict mode, all `@trusted` functions must have `@link_proof` or
+    /// `@comptime_test` evidence; otherwise, compilation fails.
+    strict_mode: bool,
+    /// Whether experimental features are enabled.
+    /// When false, items marked @experimental cause a compile error.
+    enable_experimental: bool,
+    /// Conditional compilation features from `--feature xxx`.
+    pub(crate) features: Vec<String>,
+    /// Whether debug mode is enabled (`@cfg(debug)` = true).
+    pub(crate) debug: bool,
 }
 
 /// Error type for comptime control flow within comptime blocks.
@@ -316,12 +359,41 @@ impl<'a> TypeChecker<'a> {
         symbols: &'a SymbolTable,
         trait_env: &'a mut TraitEnv,
         resolution_map: ResolutionMap,
+        strict_mode: bool,
+        enable_experimental: bool,
+        features: Vec<String>,
+        debug: bool,
+    ) -> Self {
+        Self::new_with_source(
+            ctx,
+            symbols,
+            trait_env,
+            resolution_map,
+            strict_mode,
+            enable_experimental,
+            features,
+            debug,
+            None,
+        )
+    }
+
+    pub fn new_with_source(
+        ctx: &'a mut TypeContext,
+        symbols: &'a SymbolTable,
+        trait_env: &'a mut TraitEnv,
+        resolution_map: ResolutionMap,
+        strict_mode: bool,
+        enable_experimental: bool,
+        features: Vec<String>,
+        debug: bool,
+        source: Option<&'a str>,
     ) -> Self {
         let mut checker = TypeChecker {
             ctx,
             symbols,
             trait_env,
             diagnostics: DiagCtxt::new(),
+            source,
             current_function: None,
             current_return_type: None,
             resolving_aliases: HashSet::new(),
@@ -334,14 +406,21 @@ impl<'a> TypeChecker<'a> {
             resolution_map,
             guarantee_chain: GuaranteeChain::new(),
             mutable_globals: HashSet::new(),
+            functions_accessing_mutables: HashSet::new(),
             current_function_trusted: false,
             comptime_fn_registry: HashMap::new(),
             comptime_fn_pass: false,
             deferred_comptime_blocks: Vec::new(),
+            literal_values: HashMap::new(),
+            scope_var_stack: Vec::new(),
             builtin_registry: BuiltinTraitRegistry::new(),
             proj_cache: ProjectionCache::new(),
             trait_obligations: Vec::new(),
             residual_trait_obligations: Vec::new(),
+            strict_mode,
+            enable_experimental,
+            features,
+            debug,
         };
 
         // ── Register builtin trait DefIds ──
@@ -401,6 +480,11 @@ impl<'a> TypeChecker<'a> {
     pub fn check_program(&mut self, program: &Program) -> Result<HirProgram, DiagCtxt> {
         let mut items = Vec::new();
 
+        // Wrap the entire program in a literal value scope so that
+        // top-level variable definitions (`set x = 42`) have a scope
+        // frame to track into.  Popped at the end of this function.
+        self.push_literal_scope();
+
         // Wrap the entire program in an inference scope so that
         // top‑level statements (variable defs, expression stmts, etc.)
         // also have their Eq/Impl/Match constraints solved and finalized.
@@ -412,11 +496,15 @@ impl<'a> TypeChecker<'a> {
         // WITHOUT checking bodies, so that forward references between comptime
         // functions work correctly (e.g. `comptime def f() { g() }` followed by
         // `comptime def g() { 42 }`).
+        // Also skip items whose @cfg condition is not met.
         let comptime_fn_indices: Vec<usize> = program
             .items
             .iter()
             .enumerate()
             .filter_map(|(i, stmt)| {
+                if self.should_skip_due_to_cfg(stmt) {
+                    return None;
+                }
                 if let Stmt::FunctionDef {
                     name,
                     params,
@@ -455,33 +543,111 @@ impl<'a> TypeChecker<'a> {
 
         // Evaluate deferred comptime blocks from Pass 2.  Now all comptime function
         // bodies are registered, so forward references will resolve correctly.
-        for (hir, _ty, span) in self.deferred_comptime_blocks.drain(..) {
-            let mut eval = crate::hir::comptime::ComptimeEvalContext::new(self.ctx, self.symbols);
+        for (captures, hir, _ty, span) in self.deferred_comptime_blocks.drain(..) {
+            // Collect literal values for capture names before any mutable borrow of self.
+            let captured_literals: Vec<(Symbol, Option<ComptimeValue>)> = captures
+                .iter()
+                .map(|(sym, _span)| {
+                    (
+                        *sym,
+                        self.literal_values.get(sym).and_then(|v| v.last()).cloned(),
+                    )
+                })
+                .collect();
+            let traceback = {
+                let frames: Vec<&CtxFrame> = self
+                    .region_tree
+                    .iter_frames_rev()
+                    .filter(|f| matches!(f.kind, CtxKind::Comptime))
+                    .collect();
+                format_comptime_traceback_inner(&frames, self.source)
+            };
+            let mut eval = crate::hir::comptime::ComptimeEvalContext::new_with_source(
+                self.ctx,
+                self.symbols,
+                &mut self.diagnostics,
+                traceback.clone(),
+                self.source,
+            );
+            // Inject captured variable values (from pre-collected literals).
+            for (capture, val) in &captured_literals {
+                if let Some(val) = val {
+                    eval.variables.insert(*capture, val.clone());
+                }
+            }
             for (name, (params, body)) in &self.comptime_fn_registry {
                 eval.register_fn(name.clone(), params.clone(), body.clone());
             }
-            let _ =
-                crate::diagnostics::adorn_with_span(&mut self.diagnostics, span, None, |ctxt| {
-                    match eval.eval_block(&hir) {
+            let eval_result = eval.eval_block(&hir);
+            drop(eval);
+            let _ = crate::diagnostics::adorn_with_span(
+                &mut self.diagnostics,
+                span,
+                None,
+                |ctxt| {
+                    match eval_result {
                         Ok(_) => Ok(()),
                         Err(e) => {
+                            let msg = if traceback.is_empty() {
+                                crate::tr!("comptime error: {e}", e = e)
+                            } else {
+                                let tb_str: Vec<String> = traceback
+                                    .iter()
+                                    .map(|(reason, span)| {
+                                        let r = match reason {
+                                            ComptimeReason::ComptimeBlock => {
+                                                "comptime { ... } block"
+                                            }
+                                            ComptimeReason::ComptimeFnDef => {
+                                                "comptime def function body"
+                                            }
+                                            ComptimeReason::ComptimeFnCall => {
+                                                "comptime function call"
+                                            }
+                                            ComptimeReason::ComptimeTest => {
+                                                "@comptime_test function"
+                                            }
+                                            ComptimeReason::Assertion => "assert!()",
+                                            ComptimeReason::TypeInfo => "@typeInfo!()",
+                                            ComptimeReason::LayoutOf => "layout_of!()",
+                                        };
+                                        if span.start != 0 || span.end != 0 {
+                                            format!("  · {r} at offset {}", span.start)
+                                        } else {
+                                            format!("  · {r}")
+                                        }
+                                    })
+                                    .collect();
+                                format!(
+                                    "comptime error: {}\ncomptime call stack (most recent first):\n{}",
+                                    e,
+                                    tb_str.join("\n"),
+                                )
+                            };
                             // Push once; adorn_with_span will add span/source.
                             Err(ctxt
-                                .push(
-                                    Diagnostic::error(crate::tr!("comptime error: {e}", e = e))
-                                        .with_code_str("E080"),
-                                )
+                                .push(Diagnostic::error(msg).with_code_str("E080"))
                                 .into())
                         }
                     }
-                });
+                },
+            );
         }
 
         // Pass 3: type-check remaining items (non-comptime functions,
         // comptime blocks, type defs, etc.) in order.
+        // Skip items whose @cfg condition is not met.
         for (i, stmt) in program.items.iter().enumerate() {
             if comptime_fn_indices.contains(&i) {
                 continue; // already processed in pass 2
+            }
+            // In strict mode, check that @cfg conditions are provably reachable.
+            if self.strict_mode {
+                self.check_cfg_reachability(stmt);
+            }
+            if self.should_skip_due_to_cfg(stmt) {
+                items.push(HirStmt::Stripped { span: stmt.span() }); // item excluded by @cfg
+                continue;
             }
             match self.check_stmt(stmt) {
                 Ok(hir) => items.push(hir),
@@ -571,7 +737,10 @@ impl<'a> TypeChecker<'a> {
                         .and_then(|tb| self.symbols.trait_name_by_def_id(trait_id))
                         .map(|s| s.as_str())
                         .unwrap_or_else(|| format!("{:?}", trait_id));
-                    let ty = self.ctx.get(self_ty).display_with(self.ctx);
+                    let ty = self
+                        .ctx
+                        .get(self_ty)
+                        .display_with(self.ctx, Some(self.symbols));
                     msgs.push(format!(
                         "no trait implementation found for `{}` on type `{}`",
                         trait_name, ty
@@ -690,6 +859,7 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
+        self.pop_literal_scope();
         if self.diagnostics.has_errors() {
             Err(mem::take(&mut self.diagnostics))
         } else {
@@ -741,10 +911,7 @@ impl<'a> TypeChecker<'a> {
                 // are aggregated as children of this diagnostic.
                 let mut dup_diag: Option<Diagnostic> = None;
                 if let Some(var_name) = name {
-                    if self
-                        .local_variable_types
-                        .current_frame_contains(var_name.clone())
-                    {
+                    if self.local_variable_types.current_frame_contains(*var_name) {
                         let prev_span = self.span_get(var_name).unwrap_or(*span);
                         dup_diag = Some(
                             Diagnostic::error_kind(DiagnosticKind::DuplicateDefinition {
@@ -754,7 +921,7 @@ impl<'a> TypeChecker<'a> {
                             })
                             .with_code_str("E019"),
                         );
-                    } else if self.local_variable_types.get(var_name.clone()).is_some() {
+                    } else if self.local_variable_types.get(*var_name).is_some() {
                         // Shadowing is allowed but warns.
                         let prev_span = self.span_get(var_name).unwrap_or(*span);
                         self.diagnostics.push(
@@ -878,8 +1045,78 @@ impl<'a> TypeChecker<'a> {
                 // and downstream error recovery would see the wrong type.
                 if let Some(var_name) = name {
                     if dup_diag.is_none() {
-                        self.local_variable_types.insert(var_name.clone(), final_ty);
-                        self.span_insert(var_name.clone(), *span);
+                        self.local_variable_types.insert(*var_name, final_ty);
+                        self.span_insert(*var_name, *span);
+                        // Track comptime-known literal values for explicit captures.
+                        if !*mutable {
+                            if let Some(ref value_hir) = value_hir {
+                                if let HirExpr::Literal(lit, _, _) = value_hir {
+                                    let cv = match lit {
+                                        Literal::Int(v) => Some(ComptimeValue::Int(*v)),
+                                        Literal::Float(v) => Some(ComptimeValue::Float(*v)),
+                                        Literal::Bool(v) => Some(ComptimeValue::Bool(*v)),
+                                        Literal::String(s) => Some(ComptimeValue::String(
+                                            std::sync::Arc::from(s.as_str()),
+                                        )),
+                                        _ => None,
+                                    };
+                                    if let Some(val) = cv {
+                                        self.insert_literal_value(*var_name, val);
+                                    }
+                                } else {
+                                    // Non-literal initializer — try evaluating it
+                                    // as a comptime expression (e.g. `40 + 2`,
+                                    // `fibonacci!(5)`).  If it evaluates
+                                    // successfully, the result is stored as a
+                                    // comptime-known value for explicit captures.
+                                    let result =
+                                        {
+                                            // Direct capture: `set y = x` where `x` is
+                                            // already tracked as a comptime-known literal.
+                                            if let HirExpr::Ident(name, _, _) = value_hir {
+                                                if let Some(val) = self.get_literal_value(name) {
+                                                    Some(Ok(val.clone()))
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            }
+                                            .unwrap_or_else(|| {
+                                                let mut ec =
+                                                    crate::hir::comptime::ComptimeEvalContext::new(
+                                                        self.ctx,
+                                                        self.symbols,
+                                                        &mut self.diagnostics,
+                                                    );
+                                                // Register comptime functions so that
+                                                // pure comptime function calls in the
+                                                // initializer resolve correctly.
+                                                for (fn_name, (fn_params, fn_body)) in
+                                                    &self.comptime_fn_registry
+                                                {
+                                                    ec.register_fn(
+                                                        fn_name.clone(),
+                                                        fn_params.clone(),
+                                                        fn_body.clone(),
+                                                    );
+                                                }
+                                                ec.eval_expr(value_hir)
+                                            })
+                                        };
+                                    match result {
+                                        Ok(val) => {
+                                            self.insert_literal_value(*var_name, val);
+                                        }
+                                        Err(_) => {
+                                            // Expression is not comptime-evaluable —
+                                            // skip.  The capture list will report
+                                            // a proper error later.
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -887,7 +1124,7 @@ impl<'a> TypeChecker<'a> {
                 // These require `@trusted` context to be read/written.
                 if *mutable && self.current_function.is_none() {
                     if let Some(var_name) = name {
-                        self.mutable_globals.insert(var_name.clone());
+                        self.mutable_globals.insert(*var_name);
                     }
                 }
 
@@ -989,6 +1226,28 @@ impl<'a> TypeChecker<'a> {
                 guard.checker.current_function_trusted =
                     attributes.iter().any(|a| a.name.eq_str("trusted"));
 
+                // ── Proof obligation check (strict mode) ────────────────
+                // In strict mode, all @trusted functions must have @link_proof
+                // or @comptime_test evidence.  This ensures that trust
+                // boundaries are backed by formal proofs or test coverage.
+                if guard.checker.current_function_trusted && guard.checker.strict_mode {
+                    let has_link_proof = attributes.iter().any(|a| a.name.eq_str("link_proof"));
+                    let has_comptime_test =
+                        attributes.iter().any(|a| a.name.eq_str("comptime_test"));
+                    if !has_link_proof && !has_comptime_test {
+                        guard.checker.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "@trusted function `{}` must have @link_proof or @comptime_test evidence in strict mode",
+                                name,
+                            ))
+                            .with_code_str("E091")
+                            .with_span(*span)
+                            .with_help("add `@link_proof(path, hash)` referencing an external proof, or `@comptime_test` to validate at compile time")
+                            .with_suggestion("add `@link_proof(\"path/to/proof.coq\", \"sha256:...\")` or `@comptime_test` above this function"),
+                        );
+                    }
+                }
+
                 // Enter inference scope BEFORE creating return_ty so that the
                 // return‑type inference variable lives in the fresh context
                 // (not the old one pushed onto the infer stack).
@@ -1064,6 +1323,11 @@ impl<'a> TypeChecker<'a> {
                 }
 
                 guard.checker.push_ctx(CtxKind::Function, *span, None);
+                if *is_comptime {
+                    guard
+                        .checker
+                        .push_comptime_ctx(ComptimeReason::ComptimeFnDef, *span);
+                }
 
                 // Enter a variable scope for the function body
                 let _scope = guard.checker.enter_var_scope();
@@ -1363,6 +1627,9 @@ impl<'a> TypeChecker<'a> {
                 };
 
                 guard.checker.pop_ctx();
+                if *is_comptime {
+                    guard.checker.pop_ctx();
+                }
 
                 // ── Defer body error propagation ──
                 // The solver pass (below) must run INSIDE the inference scope
@@ -1997,6 +2264,92 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
 
+                // ── @comptime_test: execute at compile time ──────────────
+                // If the function has the `@comptime_test` attribute, evaluate
+                // its body at compile time.  Test failures (assertion failures)
+                // cause a compile error.  The function is stripped from the
+                // final binary (not emitted to HIR).
+                let is_comptime_test = attributes.iter().any(|a| a.name.eq_str("comptime_test"));
+                if is_comptime_test {
+                    // @comptime_test functions must have no parameters — eval_block
+                    // cannot bind parameters, so any params would fail with
+                    // UnknownIdentifier when referenced in the body.
+                    if !params.is_empty() {
+                        self.diagnostics.push(
+                            Diagnostic::error("@comptime_test function must have no parameters")
+                                .with_code_str("E090")
+                                .with_span(*span)
+                                .with_help("@comptime_test functions are executed at compile time with no arguments")
+                                .with_suggestion("remove the parameters, or use a regular comptime def function instead"),
+                        );
+                        return Ok(HirStmt::Error);
+                    }
+                    if let Some(ref body) = body_hir {
+                        // If type-checking already produced Error nodes anywhere
+                        // in the body (including nested inside if branches, loop
+                        // bodies, closures, etc.), skip comptime evaluation to
+                        // avoid confusing secondary errors.
+                        let has_error = contains_error(body);
+                        if !has_error {
+                            let outer_tb = {
+                                let frames: Vec<&CtxFrame> = self
+                                    .region_tree
+                                    .iter_frames_rev()
+                                    .filter(|f| matches!(f.kind, CtxKind::Comptime))
+                                    .collect();
+                                format_comptime_traceback_inner(&frames, self.source)
+                            };
+                            let mut eval =
+                                crate::hir::comptime::ComptimeEvalContext::new_with_source(
+                                    self.ctx,
+                                    self.symbols,
+                                    &mut self.diagnostics,
+                                    outer_tb,
+                                    self.source,
+                                );
+                            for (fn_name, (fn_params, fn_body)) in &self.comptime_fn_registry {
+                                eval.register_fn(
+                                    fn_name.clone(),
+                                    fn_params.clone(),
+                                    fn_body.clone(),
+                                );
+                            }
+                            match eval.eval_block(body) {
+                                Ok(_) => {
+                                    // Test passed — strip from HIR.
+                                    return Ok(HirStmt::Stripped { span: *span });
+                                }
+                                Err(e) => {
+                                    self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "@comptime_test `{}` failed: {}",
+                                        name, e,
+                                    ))
+                                    .with_code_str("E090")
+                                    .with_span(*span)
+                                    .with_help("@comptime_test functions are executed at compile time; fix the assertion failure"),
+                                );
+                                    return Ok(HirStmt::Error);
+                                }
+                            }
+                        } // end if !has_error
+                        // If the body contains Error nodes (type errors), the test
+                        // cannot be evaluated — strip it to avoid leaking an errored
+                        // @comptime_test function into the final HIR.
+                        return Ok(HirStmt::Stripped { span: *span });
+                    }
+                    if body_hir.is_none() {
+                        // body_hir is None (extern function) — emit error below.
+                        self.diagnostics.push(
+                        Diagnostic::error("@comptime_test requires a function body")
+                            .with_code_str("E090")
+                            .with_span(*span)
+                            .with_help("@comptime_test functions must have a body to execute at compile time; extern declarations cannot be tested")
+                            .with_suggestion("remove `@comptime_test` from this function, or provide a body"),
+                    );
+                    }
+                }
+
                 // Patch the resolver's placeholder return type (unit()) with the
                 // actual inferred/concrete type so that cross‑function call sites
                 // see the correct return type rather than the stale placeholder.
@@ -2024,6 +2377,7 @@ impl<'a> TypeChecker<'a> {
                         .filter(|a| a.name.eq_str("hint"))
                         .flat_map(|a| a.args.clone())
                         .collect(),
+                    generated_by_comptime: false,
                 })
             }
             Stmt::Expression(expr) => {
@@ -2403,7 +2757,7 @@ impl<'a> TypeChecker<'a> {
                     if let Some(ret_ty) = self.current_return_type {
                         if self.ctx.is_infer_var(ret_ty) {
                             // Infer var — unify with unit
-                            let _ = self.unify(ret_ty, self.ctx.unit(), *span);
+                            let _ = self.unify(ret_ty, self.ctx.unit(), *span, TypeCtx::ReturnType);
                         } else if !self.ctx.is_unit(ret_ty) && !self.ctx.is_never(ret_ty) {
                             self.diagnostics.push(
                                 Diagnostic::error("return without value in non-unit function")
@@ -2444,6 +2798,38 @@ impl<'a> TypeChecker<'a> {
                             .with_help("wrap the function in `@trusted` and add `requires`/`ensures` contracts")
                         );
                     }
+                    // Track which functions access mutable globals (for isolate checking)
+                    if self.mutable_globals.contains(name) {
+                        if let Some(def_id) = self.current_function {
+                            self.functions_accessing_mutables.insert(def_id);
+                        }
+                    }
+                    // Mutable globals are also forbidden inside comptime blocks
+                    if self.mutable_globals.contains(name) && self.is_in_comptime() {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "cannot assign to mutable global `{}` inside comptime context",
+                                name,
+                            ))
+                            .with_code_str("E082")
+                            .with_span(*span)
+                            .with_help(
+                                "comptime code is sandboxed and cannot access mutable global state",
+                            ),
+                        );
+                    }
+                    // Mutable globals are also forbidden inside isolate blocks
+                    if self.mutable_globals.contains(name) && self.is_in_isolate() {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "cannot assign to mutable global `{}` inside isolate block",
+                                name,
+                            ))
+                            .with_code_str("E093")
+                            .with_span(*span)
+                            .with_help("isolate blocks must not access external mutable state"),
+                        );
+                    }
                 }
                 let (target_hir, target_ty) = self.infer_expr(target)?;
                 let value_hir = if let Some(op) = op {
@@ -2461,10 +2847,16 @@ impl<'a> TypeChecker<'a> {
                     span: *span,
                 })
             }
-            Stmt::ComptimeBlock { body, span } => {
+            Stmt::ComptimeBlock {
+                captures,
+                body,
+                trusted,
+                span,
+                ..
+            } => {
                 // Push a comptime context frame so that `return` inside comptime
                 // blocks is treated as comptime control flow, not an error.
-                self.push_ctx(CtxKind::Comptime, *span, None);
+                self.push_comptime_ctx(ComptimeReason::ComptimeBlock, *span);
                 let body_hir = match self.check_block(body) {
                     Ok(hir) => {
                         self.pop_ctx();
@@ -2482,13 +2874,99 @@ impl<'a> TypeChecker<'a> {
                             // evaluation so that forward references to comptime functions
                             // defined later in the source are available at evaluation time.
                             // After Pass 2 completes, all deferred blocks are evaluated.
-                            self.deferred_comptime_blocks.push((hir.clone(), ty, *span));
+                            self.deferred_comptime_blocks.push((
+                                captures.clone(),
+                                hir.clone(),
+                                ty,
+                                *span,
+                            ));
                         } else {
                             // Evaluate the comptime block at compile time.
-                            let mut eval = crate::hir::comptime::ComptimeEvalContext::new(
-                                self.ctx,
-                                self.symbols,
-                            );
+                            // Pre-collect literal values for captures before any mutable borrow of self.
+                            let captured_literals: Vec<(Symbol, Option<ComptimeValue>)> = captures
+                                .iter()
+                                .map(|(sym, _span)| {
+                                    (
+                                        *sym,
+                                        self.literal_values
+                                            .get(sym)
+                                            .and_then(|v| v.last())
+                                            .cloned(),
+                                    )
+                                })
+                                .collect();
+                            // ── Check capture errors BEFORE eval creation ──
+                            // so they appear before any comptime evaluation errors.
+                            // Iterate over original captures (which carry spans) so
+                            // each error can point to the specific capture name.
+                            for (capture, capture_span) in captures.iter() {
+                                let val = self
+                                    .literal_values
+                                    .get(capture)
+                                    .and_then(|v| v.last())
+                                    .cloned();
+                                if val.is_some() {
+                                    continue;
+                                }
+                                if let Some(binding) = self
+                                    .symbols
+                                    .lookup_variable(*capture, crate::ast::Span::new(0, 0))
+                                {
+                                    if binding.mutable {
+                                        self.diagnostics.push(
+                                            Diagnostic::error(format!(
+                                                "cannot capture mutable variable `{}` in comptime block",
+                                                capture,
+                                            ))
+                                            .with_code_str("E082")
+                                            .with_span(*capture_span),
+                                        );
+                                    } else {
+                                        self.diagnostics.push(
+                                            Diagnostic::error(format!(
+                                                "captured variable `{}` must be a compile-time \
+                                                 constant (initializer must be a literal or \
+                                                 another comptime-known value)",
+                                                capture,
+                                            ))
+                                            .with_code_str("E082")
+                                            .with_span(*capture_span),
+                                        );
+                                    }
+                                } else {
+                                    self.diagnostics.push(
+                                        Diagnostic::error(format!(
+                                            "unknown variable `{}` in comptime capture list",
+                                            capture,
+                                        ))
+                                        .with_code_str("E082")
+                                        .with_span(*capture_span),
+                                    );
+                                }
+                            }
+                            let outer_tb = {
+                                let frames: Vec<&CtxFrame> = self
+                                    .region_tree
+                                    .iter_frames_rev()
+                                    .filter(|f| matches!(f.kind, CtxKind::Comptime))
+                                    .collect();
+                                format_comptime_traceback_inner(&frames, self.source)
+                            };
+                            let mut eval =
+                                crate::hir::comptime::ComptimeEvalContext::new_with_source(
+                                    self.ctx,
+                                    self.symbols,
+                                    &mut self.diagnostics,
+                                    outer_tb,
+                                    self.source,
+                                );
+                            eval.set_trusted(*trusted);
+                            // Inject captured literal values into eval context.
+                            for (capture, val) in &captured_literals {
+                                if let Some(val) = val {
+                                    eval.variables.insert(*capture, val.clone());
+                                }
+                            }
                             // Register pre-collected comptime functions.
                             for (name, (params, body)) in &self.comptime_fn_registry {
                                 eval.register_fn(name.clone(), params.clone(), body.clone());
@@ -2502,6 +2980,8 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
                         Ok(HirStmt::ComptimeBlock {
+                            captures: captures.clone(),
+                            trusted: *trusted,
                             body: hir,
                             ty,
                             span: *span,
@@ -2548,12 +3028,33 @@ impl<'a> TypeChecker<'a> {
                     span: *span,
                 })
             }
-            Stmt::Isolate { body, span } => {
-                let body_hir = self.check_block(body)?;
-                Ok(HirStmt::Isolate {
-                    body: body_hir,
-                    span: *span,
-                })
+            Stmt::Isolate { body, span, .. } => {
+                // Push an Isolate context frame so that the body can be
+                // verified to not access external mutable state.
+                // ── TODO: complete tracking ───────────────────────────
+                // The current check only flags calls to @trusted/@io/mutating
+                // functions inside the isolate block.  A complete tracking pass
+                // should also verify that:
+                //   - No writes occur through &mut references from outside
+                //   - No `isolate`-captured variables are mutated
+                //   - Calls to `unsafe` / extern functions are rejected
+                // Full implementation deferred to a follow-up pass.
+                // ───────────────────────────────────────────────────────
+                self.push_ctx(CtxKind::Isolate, *span, None);
+                let body_hir = match self.check_block(body) {
+                    Ok(hir) => {
+                        self.pop_ctx();
+                        Ok(HirStmt::Isolate {
+                            body: hir,
+                            span: *span,
+                        })
+                    }
+                    Err(diag) => {
+                        self.pop_ctx();
+                        Err(diag)
+                    }
+                };
+                body_hir
             }
             Stmt::LayoutDef {
                 name,
@@ -2568,19 +3069,19 @@ impl<'a> TypeChecker<'a> {
                     span: *span,
                 })
             }
-            Stmt::TypeDef { .. } => {
+            Stmt::TypeDef { span, .. } => {
                 // Type definitions are already handled by the resolver;
                 // no additional checking needed here.
-                Ok(HirStmt::Error)
+                Ok(HirStmt::Stripped { span: *span })
             }
             Stmt::Edition(version, span) => {
                 // Edition is validated and stored by the resolver.
                 // The checker simply passes it through.
                 Ok(HirStmt::Edition(version.clone(), *span))
             }
-            Stmt::TraitDef { .. } => {
+            Stmt::TraitDef { span, .. } => {
                 // Trait definitions are handled by the resolver; skip silently.
-                Ok(HirStmt::Error)
+                Ok(HirStmt::Stripped { span: *span })
             }
             Stmt::Import {
                 path,
@@ -2739,6 +3240,27 @@ impl<'a> TypeChecker<'a> {
                             return Ok(HirStmt::Error);
                         }
                     };
+                    // ── @experimental check ───────────────────────────
+                    for attr in &trait_binding.attributes {
+                        if attr.name.eq_str("experimental") && !self.enable_experimental {
+                            let trait_name = match tp.as_ref() {
+                                Type::Path(p, _) => p
+                                    .last()
+                                    .map(|s| s.as_str().to_string())
+                                    .unwrap_or_else(|| "?".to_string()),
+                                _ => "?".to_string(),
+                            };
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "use of experimental trait `{}`",
+                                    trait_name,
+                                ))
+                                .with_code_str("E094")
+                                .with_span(span)
+                                .with_help("experimental features are not enabled; use `--enable-experimental` to use this trait"),
+                            );
+                        }
+                    }
 
                     // Register generic type parameters so `T` in `impl<T> Foo for T` resolves
                     // Collect names before insertion so we can clean up after the impl block
@@ -2826,6 +3348,7 @@ impl<'a> TypeChecker<'a> {
                             param_tys,
                             ret_ty,
                             span: m.span,
+                            attributes: m.attributes.clone(),
                             has_auto_deref: auto_deref,
                         });
                     }
@@ -3017,6 +3540,7 @@ impl<'a> TypeChecker<'a> {
                             param_tys,
                             ret_ty,
                             span: m.span,
+                            attributes: m.attributes.clone(),
                             has_auto_deref: auto_deref,
                         });
                     }
@@ -3286,7 +3810,13 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn unify(&mut self, expected: TypeId, actual: TypeId, span: Span) -> Result<(), Diagnostic> {
+    fn unify(
+        &mut self,
+        expected: TypeId,
+        actual: TypeId,
+        span: Span,
+        context: TypeCtx,
+    ) -> Result<(), Diagnostic> {
         self.ctx
             .unify(expected, actual)
             .map(|_| ())
@@ -3298,6 +3828,7 @@ impl<'a> TypeChecker<'a> {
                     span,
                     found_span: None,
                     reason,
+                    context: Some(context),
                 })
                 .with_code_str("E030");
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
@@ -3318,8 +3849,14 @@ impl<'a> TypeChecker<'a> {
             .unify(expected, actual)
             .map(|_| ())
             .map_err(|_err| {
-                let expected_str = self.ctx.get(expected).display_with(self.ctx);
-                let actual_str = self.ctx.get(actual).display_with(self.ctx);
+                let expected_str = self
+                    .ctx
+                    .get(expected)
+                    .display_with(self.ctx, Some(self.symbols));
+                let actual_str = self
+                    .ctx
+                    .get(actual)
+                    .display_with(self.ctx, Some(self.symbols));
                 let msg = match ctx {
                     TypingContext::ReturnValue => {
                         format!(
@@ -3574,7 +4111,12 @@ impl<'a> TypeChecker<'a> {
             let other_type_str = if matches!(self.ctx.get(resolved_other), TypeData::Error) {
                 "no suitable type exists".to_string()
             } else {
-                format!("{}", self.ctx.get(resolved_other).display_with(self.ctx))
+                format!(
+                    "{}",
+                    self.ctx
+                        .get(resolved_other)
+                        .display_with(self.ctx, Some(self.symbols))
+                )
             };
             let mut diag = match kind {
                 Some(TypeVariableKind::Bool) => {
@@ -4513,6 +5055,175 @@ impl<'a> TypeChecker<'a> {
             _ => format!("{:?}", ty),
         }
     }
+
+    /// Check if we are currently inside a `comptime { ... }` block.
+    ///
+    /// Used to enforce comptime sandbox restrictions: calling `@trusted` or
+    /// `@io` functions from comptime context is a compile-time error.
+    pub(crate) fn is_in_comptime(&self) -> bool {
+        self.region_tree
+            .iter_frames_rev()
+            .any(|f| matches!(f.kind, CtxKind::Comptime))
+    }
+
+    /// Check if we are currently inside an `isolate { ... }` block.
+    pub(crate) fn is_in_isolate(&self) -> bool {
+        self.region_tree
+            .iter_frames_rev()
+            .any(|f| matches!(f.kind, CtxKind::Isolate))
+    }
+
+    // ── Literal value scope helpers ─────────────────────────────
+    //
+    // literal_values tracks comptime-known constant values as a
+    // scope-aware value stack.  These helpers manage the stack:
+
+    /// Push a new scope frame for literal value tracking.
+    /// Must be called alongside `enter_var_scope()` (a new frame is
+    /// pushed before checking a block's statements).
+    pub(crate) fn push_literal_scope(&mut self) {
+        self.scope_var_stack.push(Vec::new());
+    }
+
+    /// Pop the innermost literal scope frame and remove all values
+    /// that were defined in that scope, restoring outer-scope values.
+    ///
+    /// Must be called when the corresponding `VarScopeGuard` drops
+    /// (i.e. on scope exit), paired with the matching `push_literal_scope`.
+    ///
+    /// # Panics
+    /// Panics if `scope_var_stack` is empty (scope imbalance bug).
+    pub(crate) fn pop_literal_scope(&mut self) {
+        let frame = self
+            .scope_var_stack
+            .pop()
+            .expect("pop_literal_scope without matching push_literal_scope");
+        for name in &frame {
+            if let Some(stack) = self.literal_values.get_mut(name) {
+                stack.pop();
+                if stack.is_empty() {
+                    self.literal_values.remove(name);
+                }
+            }
+        }
+    }
+
+    /// Record a comptime-known value for `name` in the current scope.
+    /// Pushes onto the per-variable value stack and records `name` in
+    /// the current scope frame so `pop_literal_scope` can undo it.
+    ///
+    /// # Panics
+    /// Panics if no literal scope frame has been pushed (must be
+    /// called inside a block after `push_literal_scope`).
+    pub(crate) fn insert_literal_value(&mut self, name: Symbol, value: ComptimeValue) {
+        self.literal_values.entry(name).or_default().push(value);
+        self.scope_var_stack
+            .last_mut()
+            .expect("insert_literal_value outside any literal scope")
+            .push(name);
+    }
+
+    /// Get the current (innermost) comptime-known value for `name`,
+    /// or `None` if the variable has no comptime-known value in the
+    /// current or any enclosing scope.
+    pub(crate) fn get_literal_value(&self, name: &Symbol) -> Option<&ComptimeValue> {
+        self.literal_values.get(name)?.last()
+    }
+
+    /// Check whether a statement should be skipped due to `@cfg` evaluation.
+    ///
+    /// Returns `true` if the item has a `@cfg(condition)` attribute whose
+    /// condition is not met on the current target, meaning the item should
+    /// be excluded from compilation.
+    fn should_skip_due_to_cfg(&mut self, stmt: &Stmt) -> bool {
+        let attributes = match stmt {
+            Stmt::FunctionDef { attributes, .. }
+            | Stmt::TypeDef { attributes, .. }
+            | Stmt::TraitDef { attributes, .. }
+            | Stmt::ImplBlock { attributes, .. }
+            | Stmt::ExternFunction { attributes, .. }
+            | Stmt::LayoutDef { attributes, .. }
+            | Stmt::Generate { attributes, .. }
+            | Stmt::VariableDef { attributes, .. }
+            | Stmt::ComptimeBlock { attributes, .. }
+            | Stmt::Isolate { attributes, .. } => attributes,
+            _ => return false,
+        };
+        for attr in attributes {
+            if !crate::hir::cfg::eval_cfg(
+                attr,
+                &self.ctx.target,
+                &self.features,
+                self.debug,
+                &mut self.diagnostics,
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// In strict mode, check that all `@cfg` conditions on this statement
+    /// are provably reachable under some target configuration.
+    /// If a condition is contradictory (e.g. `all(target_os = "linux", target_os = "windows")`),
+    /// emit a diagnostic error.
+    fn check_cfg_reachability(&mut self, stmt: &Stmt) {
+        let (attributes, span) = match stmt {
+            Stmt::FunctionDef {
+                attributes, span, ..
+            }
+            | Stmt::TypeDef {
+                attributes, span, ..
+            }
+            | Stmt::TraitDef {
+                attributes, span, ..
+            }
+            | Stmt::ImplBlock {
+                attributes, span, ..
+            }
+            | Stmt::ExternFunction {
+                attributes, span, ..
+            }
+            | Stmt::LayoutDef {
+                attributes, span, ..
+            }
+            | Stmt::Generate {
+                attributes, span, ..
+            }
+            | Stmt::VariableDef {
+                attributes, span, ..
+            }
+            | Stmt::ComptimeBlock {
+                attributes, span, ..
+            }
+            | Stmt::Isolate {
+                attributes, span, ..
+            } => (attributes, *span),
+            _ => return,
+        };
+        for attr in attributes {
+            if !crate::hir::cfg::is_provably_reachable(
+                attr,
+                self.strict_mode,
+                &mut self.diagnostics,
+            ) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "@cfg condition is unreachable: no target configuration can satisfy it"
+                    )
+                    .with_code_str("E092")
+                    .with_span(span)
+                    .with_help("the @cfg condition contradicts itself (e.g. target_os = \"linux\" and target_os = \"windows\" simultaneously)")
+                );
+            }
+        }
+    }
+
+    /// Take the collected diagnostics out of the checker (including warnings).
+    /// Returns the `DiagCtxt` with all accumulated diagnostics.
+    pub fn take_diagnostics(&mut self) -> DiagCtxt {
+        std::mem::replace(&mut self.diagnostics, DiagCtxt::new())
+    }
 }
 
 // ── Label extraction helpers ────────────────────────────────────
@@ -4623,6 +5334,177 @@ fn format_solve_errors(
     }
 }
 
+use crate::hir::hir::{HirExpr, HirStmt};
+
+// Internal node type for the iterative Error-walker stack so we can
+// push both HirStmt and HirExpr references onto one Vec.
+enum Node<'a> {
+    Stmt(&'a HirStmt),
+    Expr(&'a HirExpr),
+}
+
+/// Iteratively check whether a tree of `HirStmt` / `HirExpr` contains any
+/// `Error` node, using an explicit stack to avoid stack overflow on deeply
+/// nested code (e.g. 1000+ nested `if` expressions).
+///
+/// This traversal is scoped to a single function body (passed as `stmts`),
+/// not the entire program, so O(n) complexity is acceptable — the
+/// subsequent comptime evaluation is also O(n) for the same body.
+/// Returns `true` the moment an `Error` is found (short-circuit).
+fn contains_error(stmts: &[HirStmt]) -> bool {
+    let mut stack: Vec<Node<'_>> = stmts.iter().map(Node::Stmt).collect();
+
+    while let Some(node) = stack.pop() {
+        match node {
+            Node::Stmt(HirStmt::Error) => return true,
+            Node::Stmt(HirStmt::Expression(e)) => stack.push(Node::Expr(e)),
+            Node::Stmt(
+                HirStmt::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                }
+                | HirStmt::IfLet {
+                    then_branch,
+                    else_branch,
+                    ..
+                },
+            ) => {
+                stack.extend(then_branch.iter().map(Node::Stmt));
+                if let Some(b) = else_branch {
+                    stack.extend(b.iter().map(Node::Stmt));
+                }
+            }
+            Node::Stmt(
+                HirStmt::While { body, .. }
+                | HirStmt::WhileLet { body, .. }
+                | HirStmt::For { body, .. }
+                | HirStmt::Loop { body, .. }
+                | HirStmt::ComptimeBlock { body, .. }
+                | HirStmt::ScopeCleanup { body, .. }
+                | HirStmt::Unsafe { body, .. }
+                | HirStmt::Isolate { body, .. }
+                | HirStmt::Generate { body, .. },
+            ) => {
+                stack.extend(body.iter().map(Node::Stmt));
+            }
+            Node::Stmt(HirStmt::GhostVariableDef { inner, .. }) => stack.push(Node::Stmt(inner)),
+            // All other HirStmt variants have no nested Error-carrying nodes.
+            Node::Stmt(_) => {}
+
+            // ── HirExpr ──
+            Node::Expr(HirExpr::Error(_)) => return true,
+            Node::Expr(e) => push_expr_children(&mut stack, e),
+        }
+    }
+    false
+}
+
+/// Push the children of an expression onto the stack.
+fn push_expr_children<'a>(stack: &mut Vec<Node<'a>>, expr: &'a HirExpr) {
+    match expr {
+        HirExpr::Error(_) => unreachable!("handled by caller"),
+        // Leaf variants.
+        HirExpr::Literal(..)
+        | HirExpr::Ident(..)
+        | HirExpr::TypeInfo(..)
+        | HirExpr::LayoutOf(..)
+        | HirExpr::CompileError(..) => {}
+        // Single child.
+        HirExpr::TypeAnnotated { expr: e, .. }
+        | HirExpr::UnaryOp { expr: e, .. }
+        | HirExpr::FieldAccess { base: e, .. }
+        | HirExpr::AttrAccess { base: e, .. }
+        | HirExpr::Cast { expr: e, .. }
+        | HirExpr::Move(e, _, _)
+        | HirExpr::Try { expr: e, .. }
+        | HirExpr::LeaveWith { expr: e, .. }
+        | HirExpr::Await { expr: e, .. }
+        | HirExpr::Old { expr: e, .. }
+        | HirExpr::PolyBox { expr: e, .. }
+        | HirExpr::PolyUnbox { expr: e, .. } => stack.push(Node::Expr(e)),
+        // Two children.
+        HirExpr::BinaryOp { left, right, .. }
+        | HirExpr::Quantified {
+            range: left,
+            body: right,
+            ..
+        } => {
+            stack.push(Node::Expr(right));
+            stack.push(Node::Expr(left));
+        }
+        HirExpr::Index { base, index, .. } => {
+            stack.push(Node::Expr(index));
+            stack.push(Node::Expr(base));
+        }
+        HirExpr::Range { start, end, .. } => {
+            if let Some(e) = end {
+                stack.push(Node::Expr(e));
+            }
+            if let Some(e) = start {
+                stack.push(Node::Expr(e));
+            }
+        }
+        // Collections of children.
+        HirExpr::Call { callee, args, .. } => {
+            stack.push(Node::Expr(callee));
+            stack.extend(args.iter().map(Node::Expr));
+        }
+        HirExpr::StructLit { fields, .. } => {
+            stack.extend(fields.iter().map(|(_, e)| Node::Expr(e)));
+        }
+        HirExpr::EnumLit { payload, .. } => {
+            if let Some(e) = payload {
+                stack.push(Node::Expr(e));
+            }
+        }
+        HirExpr::Tuple(items, _, _) | HirExpr::Array(items, _, _) => {
+            stack.extend(items.iter().map(Node::Expr));
+        }
+        // Blocks / stmt-containers.
+        HirExpr::Closure { body, .. }
+        | HirExpr::UnsafeBlock { body, .. }
+        | HirExpr::Block(body, _, _)
+        | HirExpr::Task { block: body, .. } => {
+            stack.extend(body.iter().map(Node::Stmt));
+        }
+        HirExpr::Catch {
+            expr: e, branches, ..
+        } => {
+            stack.push(Node::Expr(e));
+            for b in branches {
+                stack.extend(b.body.iter().map(Node::Stmt));
+            }
+        }
+        HirExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        }
+        | HirExpr::IfLet {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stack.extend(then_branch.iter().map(Node::Stmt));
+            if let Some(b) = else_branch {
+                stack.extend(b.iter().map(Node::Stmt));
+            }
+        }
+        HirExpr::Match {
+            scrutinee, arms, ..
+        } => {
+            stack.push(Node::Expr(scrutinee));
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    stack.push(Node::Expr(g));
+                }
+                stack.push(Node::Expr(&arm.body));
+            }
+        }
+    }
+}
+
 /// Try the fast path: check if `return_value` satisfies `ensures_expr`.
 ///
 /// Strategy: replace `codomain` (and any `@label`) in the ensures
@@ -4638,7 +5520,7 @@ fn try_fast_path(ensures_expr: &Expr, return_value: &Expr) -> bool {
 #[allow(dead_code)]
 fn replace_codomain(expr: &Expr, replacement: &Expr) -> Expr {
     match expr {
-        Expr::Ident(name, _) if name.as_str() == "codomain" || name.as_str().starts_with('@') => {
+        Expr::Ident(name, _) if name.eq_str("codomain") || name.as_str().starts_with('@') => {
             replacement.clone()
         }
         Expr::BinaryOp {
@@ -4687,6 +5569,18 @@ fn replace_codomain(expr: &Expr, replacement: &Expr) -> Expr {
         },
         _ => expr.clone(),
     }
+}
+
+/// Collect a comptime traceback from a slice of comptime frames.
+/// Returns structured (ComptimeReason, Span) pairs for flexible rendering.
+fn format_comptime_traceback_inner(
+    frames: &[&CtxFrame],
+    _source: Option<&str>,
+) -> Vec<(ComptimeReason, Span)> {
+    frames
+        .iter()
+        .filter_map(|frame| frame.comptime_reason.map(|reason| (reason, frame.span)))
+        .collect()
 }
 
 #[cfg(test)]

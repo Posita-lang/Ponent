@@ -17,6 +17,13 @@ use std::fmt;
 /// `Symbol` values are comparable, hashable, and copyable — they are
 /// the recommended way to represent identifiers, keywords, and paths
 /// throughout the compiler.
+///
+/// ── Sibling ───────────────────────────────────────────────────
+/// The historical fork in `src/hir/symbol_table.rs` was the same
+/// Symbol/Interner types.  That file has been deleted and all
+/// references consolidated into this module.  The implementation
+/// here includes `resolve_ref` which the fork lacked.
+/// ──────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Symbol(u32);
 
@@ -35,9 +42,11 @@ impl Symbol {
         INTERNER.with(|i| i.borrow().resolve(self))
     }
 
-    /// Convenience: compare against a string slice without resolving.
+    /// Compare against a string slice without allocating.
+    /// Internally resolves to `&str` inside the interner lock, avoiding
+    /// the `String` allocation that `as_str()` would produce.
     pub fn eq_str(self, s: &str) -> bool {
-        self.as_str() == s
+        INTERNER.with(|i| i.borrow().resolve_ref(self) == s)
     }
 }
 
@@ -102,6 +111,17 @@ impl Interner {
             .get(sym.0 as usize)
             .cloned()
             .unwrap_or_else(|| format!("<symbol {}>", sym.0))
+    }
+
+    /// Resolve a symbol to a `&str` reference into the arena (no allocation).
+    fn resolve_ref(&self, sym: Symbol) -> &str {
+        if sym.0 == u32::MAX {
+            return "<invalid>";
+        }
+        self.arena
+            .get(sym.0 as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("<unknown>")
     }
 }
 

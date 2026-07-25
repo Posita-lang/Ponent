@@ -1,18 +1,25 @@
 use std::fmt;
 
 /// The severity or kind of a diagnostic message.
+///
+/// Variant order is significant: derived `Ord` uses declaration order,
+/// so least-severe variants come first, most-severe last.
+/// This ensures `level >= DiagnosticLevel::Error` correctly matches
+/// both `Error` and `Fatal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DiagnosticLevel {
-    Error,
-    Warning,
-    Help,
-    Note,
     Info,
+    Note,
+    Help,
+    Warning,
+    Error,
+    Fatal,
 }
 
 impl DiagnosticLevel {
     pub fn as_str(&self) -> &'static str {
         match self {
+            DiagnosticLevel::Fatal => "fatal",
             DiagnosticLevel::Error => "error",
             DiagnosticLevel::Warning => "warning",
             DiagnosticLevel::Help => "help",
@@ -23,6 +30,7 @@ impl DiagnosticLevel {
 
     pub fn prefix(&self) -> &'static str {
         match self {
+            DiagnosticLevel::Fatal => "F",
             DiagnosticLevel::Error => "E",
             DiagnosticLevel::Warning => "W",
             DiagnosticLevel::Help => "H",
@@ -33,6 +41,7 @@ impl DiagnosticLevel {
 
     pub fn ansi_color(&self) -> &'static str {
         match self {
+            DiagnosticLevel::Fatal => "\x1b[41;37m", // red bg, white text
             DiagnosticLevel::Error => "\x1b[31m",
             DiagnosticLevel::Warning => "\x1b[33m",
             DiagnosticLevel::Help => "\x1b[36m",
@@ -43,6 +52,7 @@ impl DiagnosticLevel {
 
     pub fn ansi_bold_color(&self) -> &'static str {
         match self {
+            DiagnosticLevel::Fatal => "\x1b[31;1m",
             DiagnosticLevel::Error => "\x1b[31;1m",
             DiagnosticLevel::Warning => "\x1b[33;1m",
             _ => self.ansi_color(),
@@ -55,6 +65,7 @@ impl DiagnosticLevel {
 
     pub fn label(&self) -> &'static str {
         match self {
+            DiagnosticLevel::Fatal => "fatal",
             DiagnosticLevel::Error => "error",
             DiagnosticLevel::Warning => "warning",
             DiagnosticLevel::Help => "help",

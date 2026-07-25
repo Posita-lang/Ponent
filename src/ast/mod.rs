@@ -235,6 +235,11 @@ pub enum Expr {
     /// `TypeInfo` value describing the type's structure at comptime.
     /// Inspired by Zig's `@typeInfo`.
     TypeInfo(Box<Type>, Span),
+    /// Compile-time layout reflection: `layout_of!(Type)` — returns a
+    /// `LayoutDescriptor` describing the type's size, alignment, and
+    /// field offsets at comptime.  `layout_of!` is comptime-only and
+    /// thus requires `!`.
+    LayoutOf(Box<Type>, Span),
     /// Compile-time error: `@compile_error!("msg")` unconditionally halts
     /// compilation with the given message when evaluated (comptime-only).
     /// Parsed as an expression so it can be guarded by `if` / `match`.
@@ -406,6 +411,16 @@ pub enum Stmt {
         span: Span,
     },
     ComptimeBlock {
+        /// Variables captured from the enclosing runtime scope.
+        /// `comptime [x, y] { ... }` makes `x` and `y` available as
+        /// compile‑time constants inside the block.
+        /// Each entry carries the variable name and its source span in
+        /// the capture list so that errors can point to the specific name.
+        captures: Vec<(Symbol, Span)>,
+        /// Whether this block is annotated `@trusted`, granting access to
+        /// `@trusted` functions and `unsafe` operations during comptime.
+        trusted: bool,
+        attributes: Vec<Attribute>,
         body: Vec<Stmt>,
         span: Span,
     },
@@ -414,6 +429,7 @@ pub enum Stmt {
     /// to produce module-level declarations (impl, def, type, const).
     /// See SYNTAX.md §1029.
     Generate {
+        attributes: Vec<Attribute>,
         for_type: Box<Type>,
         body: Vec<Stmt>,
         span: Span,
@@ -438,6 +454,7 @@ pub enum Stmt {
         span: Span,
     },
     Isolate {
+        attributes: Vec<Attribute>,
         body: Vec<Stmt>,
         span: Span,
     },
@@ -576,6 +593,7 @@ pub struct AssociatedType {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImplMethod {
     pub name: Symbol,
+    pub attributes: Vec<Attribute>,
     pub params: Vec<Param>,
     pub return_type: Type,
     pub body: Option<Vec<Stmt>>,
@@ -822,6 +840,7 @@ impl Expr {
             Expr::Old(_, span) => *span,
             Expr::Task { span, .. } => *span,
             Expr::TypeInfo(_, span) => *span,
+            Expr::LayoutOf(_, span) => *span,
             Expr::CompileError(_, span) => *span,
             Expr::Error(span) => *span,
         }

@@ -124,6 +124,50 @@ impl<'a> NameResolver<'a> {
         (symbols, trait_env, diags, resolution_map)
     }
 
+    /// Incremental resolution: processes only `new_items` and merges the
+    /// results into the pre-existing `symbols`, `trait_env`, and `resolution_map`
+    /// from a previous `resolve_program` call.
+    ///
+    /// Use this after Phase 2 `generate` expansion, where only newly generated
+    /// items need name resolution — the existing declarations are already resolved.
+    ///
+    /// ⚠️  Generated items are processed in order: if a type alias references
+    /// another generated type, the referenced type MUST appear first in `new_items`.
+    /// Function bodies are deferred (signature-only resolution), so mutual
+    /// function references are safe regardless of order.
+    ///
+    /// The global DefId allocator (`allocate_def_id`) continues from where the
+    /// previous resolution left off, so there is no DefId collision risk.
+    pub fn resolve_incremental(
+        &mut self,
+        new_items: &[Stmt],
+        existing_symbols: SymbolTable,
+        existing_trait_env: TraitEnv,
+        existing_resolution_map: ResolutionMap,
+    ) -> (SymbolTable, TraitEnv, DiagCtxt, ResolutionMap) {
+        // Restore existing resolution state.
+        self.has_main = existing_resolution_map.has_main;
+        self.symbols = existing_symbols;
+        self.trait_env = existing_trait_env;
+        self.resolution_map = existing_resolution_map;
+        self.diagnostics = DiagCtxt::new();
+        self.current_scope = 0;
+
+        // Only resolve the newly generated items.
+        for item in new_items {
+            self.resolve_item(item);
+        }
+
+        // Take results (same pattern as resolve_program).
+        let symbols = std::mem::replace(&mut self.symbols, SymbolTable::new(self.local_crate_id));
+        let trait_env = std::mem::replace(&mut self.trait_env, TraitEnv::new());
+        let mut resolution_map = std::mem::take(&mut self.resolution_map);
+        resolution_map.has_main = self.has_main;
+        let diags = std::mem::take(&mut self.diagnostics);
+
+        (symbols, trait_env, diags, resolution_map)
+    }
+
     fn resolve_item(&mut self, item: &Stmt) {
         match item {
             Stmt::FunctionDef {
@@ -172,7 +216,7 @@ impl<'a> NameResolver<'a> {
                 if let Err(diag) = self.symbols.insert_function(name.clone(), binding, *span) {
                     self.diagnostics.push(diag);
                 }
-                if name.as_str() == "main" {
+                if name.eq_str("main") {
                     self.has_main = true;
                 }
 
@@ -433,6 +477,7 @@ impl<'a> NameResolver<'a> {
                     kind,
                     span: *span,
                     alias_ast,
+                    attributes: attributes.clone(),
                     fields,
                     variants,
                     invariant,
@@ -478,6 +523,7 @@ impl<'a> NameResolver<'a> {
                 name,
                 methods,
                 associated_types,
+                attributes,
                 ..
             } => {
                 let def_id = self.allocate_def_id();
@@ -502,6 +548,7 @@ impl<'a> NameResolver<'a> {
                         .collect(),
                     super_traits: vec![],
                     span: *span,
+                    attributes: attributes.clone(),
                     crate_id: self.symbols.local_crate_id,
                 };
                 if let Err(diag) = self.symbols.insert_trait(name.clone(), binding, *span) {
@@ -576,6 +623,7 @@ impl<'a> NameResolver<'a> {
                         param_tys,
                         ret_ty,
                         span: method.span,
+                        attributes: method.attributes.clone(),
                         has_auto_deref,
                     });
                 }
@@ -815,6 +863,7 @@ impl<'a> NameResolver<'a> {
                         kind: TypeKind::Alias,
                         span: *span,
                         alias_ast: None,
+                        attributes: vec![],
                         fields: vec![],
                         variants: vec![],
                         invariant: None,
@@ -1351,6 +1400,13 @@ impl<'a> NameResolver<'a> {
                 // @typeInfo!(Type) — resolve the type argument, return Unit.
                 self.resolve_type_expr(ty);
                 Some(self.ctx.unit())
+            }
+            Expr::LayoutOf(ty, _) => {
+                // layout_of!(Type) — resolve the type argument, return error type
+                // as a placeholder (the actual LayoutDescriptor is computed at
+                // comptime, but the type system cannot determine it here).
+                self.resolve_type_expr(ty);
+                Some(self.ctx.error())
             }
             Expr::CompileError(msg, span) => {
                 // @compile_error!("msg") — emit an error and continue (deferred to checker).

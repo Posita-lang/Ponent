@@ -99,10 +99,8 @@ pub enum TypeTag {
     /// Replaces the old `Reserved30` slot — the last valid discriminant is
     /// now `Regex = 30`; only `Reserved31 = 31` remains as a padding variant.
     Regex = 30,
-    /// Reserved discriminant 31 — same rationale as `Reserved30`; covers the
-    /// remaining bit pattern so all 32 values of the 5-bit tag field are safe.
-    #[doc(hidden)]
-    Reserved31 = 31,
+    /// `Type` — the type of types, used as a first-class value in comptime.
+    TypeKind = 31,
 }
 
 impl From<&TypeData> for TypeTag {
@@ -139,6 +137,7 @@ impl From<&TypeData> for TypeTag {
             TypeData::Unit => TypeTag::Unit,
             TypeData::Error => TypeTag::Error,
             TypeData::Regex { .. } => TypeTag::Regex,
+            TypeData::Type => TypeTag::TypeKind,
         }
     }
 }
@@ -382,6 +381,11 @@ pub enum TypeData {
     Regex {
         pattern: String,
     },
+    /// `type` — the type of types, used as a first-class value in comptime
+    /// contexts.  When a comptime function returns `type`, it returns a
+    /// `TypeId` value that can be used in type declarations.
+    /// Corresponds to `Token::Type` in the parser and `ComptimeValue::Type`.
+    Type,
 }
 
 impl fmt::Display for TypeTag {
@@ -432,7 +436,7 @@ impl fmt::Display for TypeData {
             TypeData::Byte => write!(f, "Byte"),
             TypeData::USize => write!(f, "USize"),
             TypeData::Adt { kind, def_id, .. } => {
-                if def_id == &DefId(usize::MAX) {
+                if def_id == &DefId::SENTINEL_STR {
                     write!(f, "Str")
                 } else {
                     match kind {
@@ -501,10 +505,17 @@ impl TypeData {
     /// values through `ctx` so that e.g. `&Str` is printed as `&Str` rather
     /// than `&struct/enum`.  This is the preferred formatting method when a
     /// `TypeContext` is available.
-    pub fn display_with(&self, ctx: &TypeContext) -> String {
+    ///
+    /// When `symbols` is `Some`, ADT types (structs, enums) are rendered with
+    /// their actual name (e.g. `MyStruct`) instead of a generic `struct`/`enum`.
+    pub fn display_with(
+        &self,
+        ctx: &TypeContext,
+        symbols: Option<&crate::hir::symbol::SymbolTable>,
+    ) -> String {
         match self {
             TypeData::Ref { ty, mutable } => {
-                let inner = ctx.get(*ty).display_with(ctx);
+                let inner = ctx.get(*ty).display_with(ctx, symbols);
                 if *mutable {
                     format!("&mut {}", inner)
                 } else {
@@ -512,39 +523,48 @@ impl TypeData {
                 }
             }
             TypeData::Slice { elem } => {
-                let inner = ctx.get(*elem).display_with(ctx);
+                let inner = ctx.get(*elem).display_with(ctx, symbols);
                 format!("&[{}]", inner)
             }
             TypeData::Array { elem, size } => {
-                let inner = ctx.get(*elem).display_with(ctx);
+                let inner = ctx.get(*elem).display_with(ctx, symbols);
                 format!("[{}; {}]", inner, size)
             }
             TypeData::Tuple { elems } => {
                 let parts: Vec<String> = elems
                     .iter()
-                    .map(|e| ctx.get(*e).display_with(ctx))
+                    .map(|e| ctx.get(*e).display_with(ctx, symbols))
                     .collect();
                 format!("({})", parts.join(", "))
             }
             TypeData::Fn { params, ret } => {
                 let params: Vec<String> = params
                     .iter()
-                    .map(|p| ctx.get(*p).display_with(ctx))
+                    .map(|p| ctx.get(*p).display_with(ctx, symbols))
                     .collect();
-                let ret = ctx.get(*ret).display_with(ctx);
+                let ret = ctx.get(*ret).display_with(ctx, symbols);
                 format!("fn({}) -> {}", params.join(", "), ret)
             }
             TypeData::Ptr { size, pointee } => {
                 format!(
                     "Ptr<size={}, pointee={}>",
-                    ctx.get(*size).display_with(ctx),
-                    ctx.get(*pointee).display_with(ctx)
+                    ctx.get(*size).display_with(ctx, symbols),
+                    ctx.get(*pointee).display_with(ctx, symbols)
                 )
             }
-            TypeData::Pointer { ty } => format!("*{}", ctx.get(*ty).display_with(ctx)),
+            TypeData::Pointer { ty } => format!("*{}", ctx.get(*ty).display_with(ctx, symbols)),
             TypeData::Adt { kind, def_id, .. } => {
-                if def_id == &DefId(usize::MAX) {
+                if def_id == &DefId::SENTINEL_STR {
                     "Str".to_string()
+                } else if let Some(symbols) = symbols {
+                    if let Some(name) = symbols.type_name_by_def_id(*def_id) {
+                        name.as_str().to_string()
+                    } else {
+                        match kind {
+                            AdtKind::Struct => "struct".to_string(),
+                            AdtKind::Enum => "enum".to_string(),
+                        }
+                    }
                 } else {
                     match kind {
                         AdtKind::Struct => "struct".to_string(),
@@ -589,6 +609,10 @@ pub enum AdtKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DefId(pub usize);
+impl DefId {
+    pub const SENTINEL_STR: DefId = DefId(usize::MAX);
+    pub const SENTINEL_LAYOUT_DESC: DefId = DefId(usize::MAX - 1);
+}
 
 #[derive(Debug, Clone)]
 pub struct TypeMeta {
@@ -639,9 +663,241 @@ struct VarianceEdge {
     sign: isize,
 }
 
+/// A type factory that can create new types with shared (immutable) access.
+/// The type arena is wrapped in `RefCell` so that types can be created
+/// without `&mut` access to the `TypeContext`.
+#[derive(Debug)]
+pub struct TypeFactory {
+    types: RefCell<Vec<Arc<TypeData>>>,
+    type_map: RefCell<HashMap<TypeData, TypeId>>,
+    /// Index up to which types have been synced by TypeContext.
+    /// `drain_new_types()` returns all types from this index onward
+    /// and advances it.  This avoids the O(n) while loop in
+    /// `TypeContext::alloc` that previously scanned the entire arena.
+    sync_index: Cell<usize>,
+}
+
+impl TypeFactory {
+    pub fn new() -> Self {
+        TypeFactory {
+            types: RefCell::new(Vec::new()),
+            type_map: RefCell::new(HashMap::default()),
+            sync_index: Cell::new(0),
+        }
+    }
+
+    pub fn alloc(&self, data: TypeData) -> (TypeId, Arc<TypeData>) {
+        // ═══════════════════════════════════════════════════════════════
+        // Borrow order constraint: immutable borrow for volatile check
+        // MUST be dropped before the mutable borrow for push below.
+        // Rust's RefCell does not allow upgrading a shared borrow to an
+        // exclusive one — the two must be sequential, not concurrent.
+        // ═══════════════════════════════════════════════════════════════
+        let types_borrow = self.types.borrow();
+        let can_cache = !is_type_volatile_inner(&data, Some(&types_borrow));
+        drop(types_borrow); // ← release before mutable borrow
+        if can_cache {
+            let type_map = self.type_map.borrow();
+            if let Some(&id) = type_map.get(&data) {
+                // Cache hit — return the existing Arc from the types vec.
+                let types = self.types.borrow();
+                return (id, types[id.index()].clone());
+            }
+        }
+        let tag = TypeTag::from(&data) as usize;
+        let mut types = self.types.borrow_mut();
+        let index = types.len();
+        let id = TypeId::from_raw(((index + 1) << TypeId::TAG_BITS) | tag);
+        let arc = Arc::new(data.clone()); // clone for Arc (HashMap needs original by value)
+        types.push(arc.clone());
+        drop(types);
+        if can_cache {
+            self.type_map.borrow_mut().insert(data, id);
+        }
+        (id, arc)
+    }
+
+    pub fn len(&self) -> usize {
+        self.types.borrow().len()
+    }
+
+    /// Drain newly created types since the last call to this method.
+    /// Returns `Arc` clones for all types from the current sync index
+    /// to the end of the arena, then advances the sync index.
+    /// Used by `TypeContext` to keep its `self.types` cache in sync
+    /// without scanning the entire arena on every allocation.
+    pub fn drain_new_types(&self) -> Vec<Arc<TypeData>> {
+        let types = self.types.borrow();
+        let start = self.sync_index.get();
+        let end = types.len();
+        if start >= end {
+            return Vec::new();
+        }
+        let mut result = Vec::with_capacity(end - start);
+        for i in start..end {
+            result.push(types[i].clone());
+        }
+        self.sync_index.set(end);
+        result
+    }
+
+    pub fn borrow_types(&self) -> std::cell::Ref<'_, Vec<Arc<TypeData>>> {
+        self.types.borrow()
+    }
+
+    pub fn int(&self, bits: u8, signed: bool) -> TypeId {
+        self.alloc(TypeData::Int {
+            bits,
+            signed,
+            overflow_policy: OverflowPolicy::Trap,
+        })
+        .0
+    }
+
+    pub fn uint(&self, bits: u8) -> TypeId {
+        self.alloc(TypeData::UInt {
+            bits,
+            overflow_policy: OverflowPolicy::Trap,
+        })
+        .0
+    }
+
+    pub fn float(&self, bits: u8) -> TypeId {
+        self.alloc(TypeData::Float { bits }).0
+    }
+
+    pub fn tuple(&self, elems: Vec<TypeId>) -> TypeId {
+        self.alloc(TypeData::Tuple { elems }).0
+    }
+
+    pub fn array(&self, elem: TypeId, size: u64) -> TypeId {
+        self.alloc(TypeData::Array { elem, size }).0
+    }
+
+    pub fn slice(&self, elem: TypeId) -> TypeId {
+        self.alloc(TypeData::Slice { elem }).0
+    }
+
+    pub fn reference(&self, ty: TypeId, mutable: bool) -> TypeId {
+        self.alloc(TypeData::Ref { ty, mutable }).0
+    }
+
+    pub fn pointer(&self, ty: TypeId) -> TypeId {
+        self.alloc(TypeData::Pointer { ty }).0
+    }
+
+    pub fn ptr(&self, size: TypeId, pointee: TypeId) -> TypeId {
+        self.alloc(TypeData::Ptr { size, pointee }).0
+    }
+
+    pub fn function(&self, params: Vec<TypeId>, ret: TypeId) -> TypeId {
+        self.alloc(TypeData::Fn { params, ret }).0
+    }
+
+    pub fn regex(&self, pattern: String) -> TypeId {
+        debug_assert!(
+            regex_syntax::parse(&pattern).is_ok(),
+            "Regex pattern must be valid"
+        );
+        self.alloc(TypeData::Regex { pattern }).0
+    }
+}
+
+fn is_type_volatile_inner(data: &TypeData, types: Option<&Vec<Arc<TypeData>>>) -> bool {
+    match data {
+        TypeData::InferVar { .. } | TypeData::SkolemVar { .. } => true,
+        TypeData::GenericParam { .. }
+        | TypeData::Int { .. }
+        | TypeData::UInt { .. }
+        | TypeData::Float { .. }
+        | TypeData::Bool
+        | TypeData::Char
+        | TypeData::Byte
+        | TypeData::USize
+        | TypeData::Never
+        | TypeData::Unit
+        | TypeData::Error
+        | TypeData::Type
+        | TypeData::Rational { .. }
+        | TypeData::Regex { .. } => false,
+        TypeData::Adt { args, .. } => args.iter().any(|a| is_type_volatile_inner_by_id(*a, types)),
+        TypeData::Tuple { elems } => elems
+            .iter()
+            .any(|e| is_type_volatile_inner_by_id(*e, types)),
+        TypeData::Array { elem, .. } => is_type_volatile_inner_by_id(*elem, types),
+        TypeData::Slice { elem } => is_type_volatile_inner_by_id(*elem, types),
+        TypeData::Ref { ty, .. } => is_type_volatile_inner_by_id(*ty, types),
+        TypeData::Pointer { ty } => is_type_volatile_inner_by_id(*ty, types),
+        TypeData::Ptr { size, pointee } => {
+            is_type_volatile_inner_by_id(*size, types)
+                || is_type_volatile_inner_by_id(*pointee, types)
+        }
+        TypeData::Fn { params, ret } => {
+            params
+                .iter()
+                .any(|p| is_type_volatile_inner_by_id(*p, types))
+                || is_type_volatile_inner_by_id(*ret, types)
+        }
+        TypeData::DynTrait { .. } => false,
+        TypeData::Exists { base, .. } => is_type_volatile_inner_by_id(*base, types),
+        TypeData::Forall { body, .. } => is_type_volatile_inner_by_id(*body, types),
+        TypeData::Poly { body, .. } => is_type_volatile_inner_by_id(*body, types),
+        TypeData::Coproduct { alternatives } => alternatives
+            .iter()
+            .any(|a| is_type_volatile_inner_by_id(*a, types)),
+        TypeData::Mu { body, .. } => is_type_volatile_inner_by_id(*body, types),
+        TypeData::Nu { body, .. } => is_type_volatile_inner_by_id(*body, types),
+        TypeData::AssociatedType { .. } => false,
+    }
+}
+
+fn is_type_volatile_inner_by_id(ty: TypeId, types: Option<&Vec<Arc<TypeData>>>) -> bool {
+    // If we have access to the type arena, look up the TypeData and check.
+    if let Some(types) = types {
+        let idx = ty.index();
+        if idx < types.len() {
+            match &*types[idx] {
+                TypeData::InferVar { .. } | TypeData::SkolemVar { .. } => return true,
+                // Composite types: recurse.
+                TypeData::Adt { args, .. } => {
+                    return args
+                        .iter()
+                        .any(|a| is_type_volatile_inner_by_id(*a, Some(types)));
+                }
+                TypeData::Tuple { elems } => {
+                    return elems
+                        .iter()
+                        .any(|e| is_type_volatile_inner_by_id(*e, Some(types)));
+                }
+                TypeData::Array { elem, .. } => {
+                    return is_type_volatile_inner_by_id(*elem, Some(types));
+                }
+                TypeData::Slice { elem } => {
+                    return is_type_volatile_inner_by_id(*elem, Some(types));
+                }
+                TypeData::Ref { ty, .. } => {
+                    return is_type_volatile_inner_by_id(*ty, Some(types));
+                }
+                TypeData::Pointer { ty } => {
+                    return is_type_volatile_inner_by_id(*ty, Some(types));
+                }
+                TypeData::Fn { params, ret } => {
+                    return params
+                        .iter()
+                        .any(|p| is_type_volatile_inner_by_id(*p, Some(types)))
+                        || is_type_volatile_inner_by_id(*ret, Some(types));
+                }
+                _ => {} // Leaf types — handled by the caller.
+            }
+        }
+    }
+    // Without the arena, conservatively assume not volatile.
+    // The top-level alloc path already checks the data directly.
+    false
+}
+
 pub struct TypeContext {
     types: Vec<Arc<TypeData>>,
-    type_map: HashMap<TypeData, TypeId>,
     pub(crate) bindings: RefCell<HashMap<TypeId, TypeId>>,
     meta: HashMap<TypeId, TypeMeta>,
     def_id_to_type_id: HashMap<DefId, TypeId>,
@@ -656,6 +912,9 @@ pub struct TypeContext {
     pub builtin_str: TypeId,
     /// Built-in reference to string slice `&Str` — a `Ref { ty: Str, mutable: false }`.
     pub builtin_str_ref: TypeId,
+    /// Return type of `layout_of!(Type)` — a dedicated struct-like type
+    /// for comptime layout descriptors, replacing the old `ctx.error()` fallback.
+    pub builtin_layout_descriptor: TypeId,
     /// Cache for variance check results: (param_index, TypeId, expected_sign, cumulative_sign) → bool.
     variance_cache: RefCell<HashMap<(usize, TypeId, isize, isize), bool>>,
     /// Pre-computed variance-annotated outgoing edges for each TypeId.
@@ -683,13 +942,21 @@ pub struct TypeContext {
     next_param_index: Cell<usize>,
     /// Language edition for this compilation unit.
     edition: Edition,
+    /// Target platform information (arch, ABI, sizes, alignments).
+    pub target: crate::hir::target::Target,
+    /// A type factory for comptime code that needs to create new types.
+    pub factory: TypeFactory,
 }
 
 impl TypeContext {
     pub fn new() -> Self {
+        Self::new_with_target(crate::hir::target::Target::host())
+    }
+
+    pub fn new_with_target(target: crate::hir::target::Target) -> Self {
+        let factory = TypeFactory::new();
         let mut ctx = TypeContext {
             types: Vec::new(),
-            type_map: HashMap::default(),
             bindings: RefCell::new(HashMap::default()),
             meta: HashMap::default(),
             def_id_to_type_id: HashMap::default(),
@@ -702,6 +969,7 @@ impl TypeContext {
             builtin_usize: TypeId::NONE,
             builtin_str: TypeId::NONE,
             builtin_str_ref: TypeId::NONE,
+            builtin_layout_descriptor: TypeId::NONE,
             variance_cache: RefCell::new(HashMap::default()),
             variance_edges: RefCell::new(HashMap::default()),
             transaction_stack: RefCell::new(Vec::new()),
@@ -710,6 +978,8 @@ impl TypeContext {
             next_universe: Cell::new(0),
             next_param_index: Cell::new(0),
             edition: Edition::latest(),
+            target,
+            factory,
         };
         ctx.builtin_unit = ctx.alloc(TypeData::Unit);
         ctx.builtin_never = ctx.alloc(TypeData::Never);
@@ -721,11 +991,17 @@ impl TypeContext {
         // Str type: represented as a zero-sized struct with a sentinel DefId.
         ctx.builtin_str = ctx.alloc(TypeData::Adt {
             kind: AdtKind::Struct,
-            def_id: DefId(usize::MAX),
+            def_id: DefId::SENTINEL_STR,
             args: vec![],
         });
         // &Str = Ref { ty: Str, mutable: false }
         ctx.builtin_str_ref = ctx.reference(ctx.builtin_str, false);
+        // LayoutDescriptor type for layout_of! results.
+        ctx.builtin_layout_descriptor = ctx.alloc(TypeData::Adt {
+            kind: AdtKind::Struct,
+            def_id: DefId::SENTINEL_LAYOUT_DESC,
+            args: vec![],
+        });
         ctx
     }
 
@@ -751,26 +1027,31 @@ impl TypeContext {
     }
 
     pub fn alloc(&mut self, data: TypeData) -> TypeId {
-        // Types that transitively contain any volatile type (InferVar, SkolemVar)
-        // must NOT be cached: InferVar ids can be reused across inference scopes
-        // (stale bindings would leak), and SkolemVar ids are single-use per
-        // enter_universe call (caching them just bloats the type_map).
-        let can_cache = !self.type_is_volatile(&data);
-        if can_cache {
-            if let Some(&id) = self.type_map.get(&data) {
-                return id;
-            }
-        }
-        let tag = TypeTag::from(&data) as usize;
-        let index = self.types.len();
-        // Offset index by +1 so the encoded raw value is never zero,
-        // enabling NonZeroUsize niche optimization for Option<TypeId>.
-        let id = TypeId::from_raw(((index + 1) << TypeId::TAG_BITS) | tag);
-        self.types.push(Arc::new(data.clone()));
-        if can_cache {
-            self.type_map.insert(data, id);
-        }
+        let (id, arc) = self.factory.alloc(data);
+        // Keep self.types in sync with the factory's arena so that
+        // get()/get_raw() can find types created via alloc().
+        // Also sync any types that were created directly via
+        // ctx.factory() (bypassing ctx.alloc()) — e.g. from layout
+        // resolution helpers (resolve_single_ast_type in layout.rs).
+        // `drain_new_types()` already includes `arc`, so don't push it again.
+        self.types.extend(self.factory.drain_new_types());
         id
+    }
+
+    /// Get a reference to the type factory, which can create new types
+    /// with shared (immutable) access via its internal `RefCell`.
+    pub fn factory(&self) -> &TypeFactory {
+        &self.factory
+    }
+
+    /// Sync any types created via `ctx.factory().alloc()` into `self.types`
+    /// so they become visible to `ctx.get()` / `ctx.get_raw()`.
+    ///
+    /// Must be called after any direct `ctx.factory().alloc()` usage that
+    /// bypasses `ctx.alloc()`.  Without this, the type exists in the
+    /// factory's arena but `ctx.get(id)` will panic with index out of bounds.
+    pub fn sync_factory(&mut self) {
+        self.types.extend(self.factory.drain_new_types());
     }
 
     /// Check whether a `TypeData` transitively contains any volatile type
@@ -781,7 +1062,7 @@ impl TypeContext {
     ///   caching a composite that embeds an InferVar would let stale
     ///   bindings leak into the new scope.
     /// - **SkolemVar**: each `enter_universe()` call creates a fresh id;
-    ///   caching composities that embed them would bloat the `type_map`
+    ///   caching composities that embed them would bloat the cache.
     ///   with single-use entries that never hit the cache.
     fn type_is_volatile(&self, data: &TypeData) -> bool {
         match data {
@@ -799,7 +1080,8 @@ impl TypeContext {
             | TypeData::Error
             | TypeData::Rational { .. }
             | TypeData::Regex { .. }
-            | TypeData::GenericParam { .. } => false,
+            | TypeData::GenericParam { .. }
+            | TypeData::Type => false,
             // Composite types: check each child TypeId
             TypeData::Fn { params, ret } => {
                 params.iter().any(|&p| self.type_is_volatile_by_id(p))
@@ -852,8 +1134,17 @@ impl TypeContext {
         self.type_is_volatile(&self.types[resolved.index()])
     }
 
+    /// Returns the resolved `TypeData` for a `TypeId`, following bindings.
     pub fn get(&self, id: TypeId) -> &TypeData {
         let resolved = self.resolve_binding(id);
+        debug_assert!(
+            resolved.index() < self.types.len(),
+            "TypeContext::get() index {} out of bounds (types.len={}) — \
+             type may have been created via ctx.factory().alloc() without \
+             calling sync_factory() first",
+            resolved.index(),
+            self.types.len(),
+        );
         &self.types[resolved.index()]
     }
 
@@ -862,6 +1153,14 @@ impl TypeContext {
     /// so it can inspect the original type before any substitution.
     /// Useful for binder-scope checks where the raw type identity matters.
     pub fn get_raw(&self, id: TypeId) -> &TypeData {
+        debug_assert!(
+            id.index() < self.types.len(),
+            "TypeContext::get_raw() index {} out of bounds (types.len={}) — \
+             type may have been created via ctx.factory().alloc() without \
+             calling sync_factory() first",
+            id.index(),
+            self.types.len(),
+        );
         &self.types[id.index()]
     }
 
@@ -976,6 +1275,11 @@ impl TypeContext {
     }
 
     pub fn int(&mut self, bits: u8, signed: bool) -> TypeId {
+        debug_assert!(
+            bits >= 1 && bits <= 64,
+            "Int<{}> out of range (SYNTAX.md: bits 1..64)",
+            bits,
+        );
         self.alloc(TypeData::Int {
             bits,
             signed,
@@ -984,6 +1288,11 @@ impl TypeContext {
     }
 
     pub fn uint(&mut self, bits: u8) -> TypeId {
+        debug_assert!(
+            bits >= 1 && bits <= 64,
+            "UInt<{}> out of range (SYNTAX.md: bits 1..64)",
+            bits,
+        );
         self.alloc(TypeData::UInt {
             bits,
             overflow_policy: OverflowPolicy::Trap,
@@ -1957,7 +2266,8 @@ impl TypeContext {
             | TypeData::Error
             | TypeData::Regex { .. }
             | TypeData::DynTrait { .. }
-            | TypeData::SkolemVar { .. } => false,
+            | TypeData::SkolemVar { .. }
+            | TypeData::Type => false,
         }
     }
 
@@ -2837,8 +3147,13 @@ impl TypeContext {
         }
     }
 
-    pub(crate) fn find_type(&self, data: &TypeData) -> Option<TypeId> {
-        self.type_map.get(data).copied()
+    pub(crate) fn find_type(&self, _data: &TypeData) -> Option<TypeId> {
+        // Previously delegated to ctx.type_map, then to factory.type_map.
+        // Both paths are now superseded — TypeFactory handles dedup internally
+        // in factory.alloc().  Callers should rely on that path instead.
+        // This stub is retained for the transition; remove once all callers
+        // are updated to not use this method.
+        None
     }
 
     pub fn subst(&mut self, ty: TypeId, subst: &Subst) -> TypeId {
@@ -3281,7 +3596,8 @@ impl TypeContext {
             | TypeData::Unit
             | TypeData::Error
             | TypeData::Regex { .. }
-            | TypeData::SkolemVar { .. } => 1,
+            | TypeData::SkolemVar { .. }
+            | TypeData::Type => 1,
         }
     }
 
@@ -3381,7 +3697,8 @@ impl TypeContext {
             | TypeData::GenericParam { .. }
             | TypeData::InferVar { .. }
             | TypeData::DynTrait { .. }
-            | TypeData::SkolemVar { .. } => false,
+            | TypeData::SkolemVar { .. }
+            | TypeData::Type => false,
         }
     }
 

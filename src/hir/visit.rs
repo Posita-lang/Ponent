@@ -177,6 +177,12 @@ pub fn walk_hir_expr<V: HirVisitor>(visitor: &mut V, expr: &HirExpr) -> V::Resul
             visitor.visit_type_id(*ty)?;
             V::Result::output()
         }
+        HirExpr::LayoutOf(_, _) => {
+            // LayoutOf stores a Box<crate::ast::Type>, not a TypeId —
+            // the AST type is resolved during comptime evaluation.
+            // No type_id to visit here.
+            V::Result::output()
+        }
         HirExpr::CompileError(_, _) => V::Result::output(),
         HirExpr::Task { block, ty, .. } => {
             visitor.visit_type_id(*ty)?;
@@ -259,7 +265,7 @@ pub fn walk_hir_stmt<V: HirVisitor>(visitor: &mut V, stmt: &HirStmt) -> V::Resul
         }
         HirStmt::GhostVariableDef { inner, .. } => visitor.visit_hir_stmt(inner),
         HirStmt::Leave { .. } | HirStmt::Continue { .. } | HirStmt::Trigger { .. }
-        | HirStmt::Edition(..) | HirStmt::Error => V::Result::output(),
+        | HirStmt::Edition(..) | HirStmt::Stripped { .. } | HirStmt::Error => V::Result::output(),
         HirStmt::TypeDef { .. } | HirStmt::TraitDef { .. } | HirStmt::Import { .. }
         | HirStmt::ExternFunction { .. } | HirStmt::Constraint { .. }
         | HirStmt::ImplBlock { .. } => V::Result::output(),

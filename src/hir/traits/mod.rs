@@ -51,6 +51,7 @@ pub struct MethodInfo {
     pub param_tys: Vec<TypeId>,
     pub ret_ty: TypeId,
     pub span: Span,
+    pub attributes: Vec<crate::ast::Attribute>,
     /// Whether this method's `Deref` impl is marked `@auto_deref`.
     /// Without this flag, even if a type implements `Deref`, the compiler
     /// will NOT automatically dereference through it — the user must write `*x`.
@@ -620,6 +621,7 @@ mod tests {
             kind: crate::hir::symbol::TypeKind::Struct,
             span: crate::ast::Span::new(0, 0),
             alias_ast: None,
+            attributes: vec![],
             fields: vec![],
             variants: vec![],
             invariant: None,
@@ -666,6 +668,7 @@ mod tests {
             param_tys: vec![],
             ret_ty: ctx.int(32, true),
             span: crate::ast::Span::new(0, 0),
+            attributes: vec![],
             has_auto_deref: false,
         };
         env.add_inherent_methods(def_id, vec![method]);

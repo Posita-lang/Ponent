@@ -70,6 +70,7 @@ pub struct TypeBinding {
     pub kind: TypeKind,
     pub span: Span,
     pub alias_ast: Option<Type>,
+    pub attributes: Vec<Attribute>,
     pub fields: Vec<FieldBinding>,
     pub variants: Vec<EnumVariant>,
     pub invariant: Option<Expr>,
@@ -113,6 +114,7 @@ pub struct TraitBinding {
     /// stores `Clone`'s DefId here.
     pub super_traits: Vec<DefId>,
     pub span: Span,
+    pub attributes: Vec<Attribute>,
     pub crate_id: CrateId,
 }
 
@@ -179,6 +181,13 @@ pub struct SymbolTable {
     /// Maps fully-qualified type path (e.g. "std::collections::HashMap") to DefId.
     /// Used to resolve multi-segment paths when no module hierarchy exists yet.
     full_path_to_def_id: HashMap<Symbol, DefId>,
+    /// Reverse mapping: DefId → Symbol for O(1) name lookup.
+    /// Populated in `insert_type` alongside `type_defs`.
+    def_id_to_name: HashMap<DefId, Symbol>,
+    /// Reverse mapping: full-path → DefId → full-path Symbol.
+    /// Populated by `register_full_path` alongside `full_path_to_def_id`.
+    /// Avoids O(n) scans of `full_path_to_def_id` for name lookups.
+    def_id_to_full_path: HashMap<DefId, Symbol>,
 }
 
 impl SymbolTable {
@@ -192,6 +201,8 @@ impl SymbolTable {
             next_def_id: 0,
             local_crate_id,
             full_path_to_def_id: HashMap::default(),
+            def_id_to_name: HashMap::default(),
+            def_id_to_full_path: HashMap::default(),
         }
     }
 
@@ -297,6 +308,7 @@ impl SymbolTable {
         }
         let def_id = binding.def_id;
         self.type_defs.insert(def_id, binding.clone());
+        self.def_id_to_name.insert(def_id, name);
         scope.types.insert(name, binding);
         // Note: intentionally NOT inserting the simple name into
         // full_path_to_def_id here.  The full-path map is reserved for
@@ -311,6 +323,7 @@ impl SymbolTable {
     /// encounters type definitions inside modules or when processing imports.
     pub fn register_full_path(&mut self, full_path: Symbol, def_id: DefId) {
         self.full_path_to_def_id.entry(full_path).or_insert(def_id);
+        self.def_id_to_full_path.entry(def_id).or_insert(full_path);
     }
 
     pub fn insert_trait(
@@ -402,6 +415,26 @@ impl SymbolTable {
 
     pub fn lookup_type_by_def_id(&self, def_id: DefId) -> Option<&TypeBinding> {
         self.type_defs.get(&def_id)
+    }
+
+    /// Look up the name of a type by its `DefId`.
+    /// Uses the O(1) reverse map populated by `insert_type`,
+    /// falling back to `def_id_to_full_path` for path-registered types.
+    pub fn type_name_by_def_id(&self, def_id: DefId) -> Option<Symbol> {
+        // Fast path: reverse map populated by insert_type.
+        if let Some(&name) = self.def_id_to_name.get(&def_id) {
+            return Some(name);
+        }
+        // Fallback: O(1) reverse map populated by register_full_path.
+        if let Some(&full_path) = self.def_id_to_full_path.get(&def_id) {
+            // Extract the last segment as the simple name.
+            let name_str = full_path.as_str();
+            if let Some(last) = name_str.rsplit("::").next() {
+                return Some(Symbol::intern(last));
+            }
+            return Some(full_path);
+        }
+        None
     }
 
     pub fn lookup_trait(&self, name: Symbol) -> Option<&TraitBinding> {

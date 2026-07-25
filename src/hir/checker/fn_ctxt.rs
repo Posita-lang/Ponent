@@ -65,11 +65,20 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             .map_err(|_err| {
                 let reason = self.type_mismatch_reason(expected, actual);
                 let mut diag = Diagnostic::error_kind(DiagnosticKind::TypeMismatch {
-                    expected: format!("{:?}", self.checker.ctx.get(expected)),
-                    found: format!("{:?}", self.checker.ctx.get(actual)),
+                    expected: self
+                        .checker
+                        .ctx
+                        .get(expected)
+                        .display_with(self.checker.ctx, Some(self.checker.symbols)),
+                    found: self
+                        .checker
+                        .ctx
+                        .get(actual)
+                        .display_with(self.checker.ctx, Some(self.checker.symbols)),
                     span,
                     found_span: None,
                     reason,
+                    context: None,
                 })
                 .with_code_str("E030");
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
@@ -94,12 +103,22 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // Check for the None context first — use structured kind.
                 if matches!(ctx, TypingContext::None) {
                     let reason = self.type_mismatch_reason(expected, actual);
+                    let type_ctx = typing_context_to_type_ctx(&ctx);
                     return Diagnostic::error_kind(DiagnosticKind::TypeMismatch {
-                        expected: format!("{:?}", self.checker.ctx.get(expected)),
-                        found: format!("{:?}", self.checker.ctx.get(actual)),
+                        expected: self
+                            .checker
+                            .ctx
+                            .get(expected)
+                            .display_with(self.checker.ctx, Some(self.checker.symbols)),
+                        found: self
+                            .checker
+                            .ctx
+                            .get(actual)
+                            .display_with(self.checker.ctx, Some(self.checker.symbols)),
                         span,
                         found_span: None,
                         reason,
+                        context: Some(type_ctx),
                     })
                     .with_code_str("E030");
                 }
@@ -203,10 +222,31 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             .with_help("wrap the function in `@trusted` and add `requires`/`ensures` contracts")
                         );
                     }
+                    // Track which functions access mutable globals (for isolate checking)
+                    if self.checker.mutable_globals.contains(name) {
+                        if let Some(def_id) = self.checker.current_function {
+                            self.checker.functions_accessing_mutables.insert(def_id);
+                        }
+                    }
+                    // Reading a mutable global inside an isolate block is also forbidden
+                    if self.checker.mutable_globals.contains(name) && self.checker.is_in_isolate() {
+                        self.checker.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "cannot read mutable global `{}` inside isolate block",
+                                name,
+                            ))
+                            .with_code_str("E093")
+                            .with_span(*span)
+                            .with_help("isolate blocks must not access external mutable state"),
+                        );
+                    }
                     Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
                 } else if let Some(binding) = self.checker.symbols.lookup_variable(*name, *span) {
                     Ok((HirExpr::Ident(*name, binding.ty, *span), binding.ty))
                 } else if let Some(func) = self.checker.symbols.lookup_function(*name) {
+                    // ── @deprecated / @experimental check ───────────────
+                    self.check_deprecated_experimental(name, &func.attributes, *span);
+
                     let sig = &func.signature;
                     // Construct the function type: Fn(params..., ret)
                     let mut fn_ty = self.checker.ctx.function(
@@ -300,9 +340,218 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 comptime,
                 span,
             } => {
+                // ── Extract callee name once for all checks ─────────────
+                let callee_name: Option<Symbol> = match callee.as_ref() {
+                    Expr::Ident(name, _) => Some(*name),
+                    Expr::FieldAccess { field, .. } => Some(*field),
+                    _ => None,
+                };
+                let name_str = callee_name
+                    .as_ref()
+                    .map(|s| s.as_str().to_string())
+                    .unwrap_or_else(|| "this function".to_string());
+
+                // Look up function attributes once for repeated checks.
+                // ⚠️ TODO(security): For `x.foo()` (FieldAccess) forms, `lookup_function`
+                //   looks up "foo" as a free function, which will likely return None
+                //   for methods (registered under trait/impl).  In those cases we fall
+                //   back to `(false, false)` — meaning @trusted and @io attribute checks
+                //   are silently skipped for method calls.  Proper fix requires looking
+                //   up method attributes through the receiver type's impl blocks.
+                let (has_trusted, has_io) = callee_name
+                    .and_then(|name| self.checker.symbols.lookup_function(name))
+                    .map(|f| {
+                        let has_trusted = f.attributes.iter().any(|a| a.name.eq_str("trusted"));
+                        let has_io = f.attributes.iter().any(|a| a.name.eq_str("io"));
+                        (has_trusted, has_io)
+                    })
+                    .unwrap_or((false, false));
+
+                // In strict mode, warn if we couldn't resolve the callee's attributes
+                // (e.g. method call on a FieldAccess target), as sandbox checks rely
+                // on knowing whether a function is @trusted or @io.
+                if self.checker.strict_mode
+                    && callee_name.is_some()
+                    && self
+                        .checker
+                        .symbols
+                        .lookup_function(callee_name.unwrap())
+                        .is_none()
+                    && matches!(callee.as_ref(), Expr::FieldAccess { .. })
+                {
+                    // Could also look up through the receiver type's inherent methods
+                    // here; for now just warn that the check is incomplete.
+                    self.checker.diagnostics.push(
+                        Diagnostic::warning(format!(
+                            "cannot verify @trusted/@io attributes for method `{}` — \
+                             sandbox checks may be incomplete in strict mode",
+                            name_str,
+                        ))
+                        .with_code_str("W092")
+                        .with_span(*span)
+                        .with_help("method attributes are resolved through trait/impl lookup, which is not yet supported here"),
+                    );
+                }
+
+                // ── Comptime sandbox check ─────────────────────────────
+                // Inside a comptime block, only comptime function calls
+                // (marked with `!`) are allowed.  Calls without `!` are
+                // rejected unless they are built-in comptime intrinsics.
+                if self.checker.is_in_comptime() && !*comptime {
+                    if let Err(e) = self.check_call_attribute_violation(
+                        callee_name
+                            .as_ref()
+                            .unwrap_or(&Symbol::intern("this_function")),
+                        false,
+                        has_trusted,
+                        has_io,
+                        *span,
+                    ) {
+                        return Ok(e);
+                    }
+
+                    self.checker.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "cannot call `{}` from comptime context: only comptime functions (called with `!`) are allowed in comptime blocks",
+                            name_str,
+                        ))
+                        .with_code_str("E081")
+                        .with_span(*span)
+                        .with_suggestion(format!(
+                            "use `{}!()` to call a comptime function, or move this call outside the comptime block",
+                            name_str,
+                        )),
+                    );
+                    return Ok((HirExpr::Error(*span), self.checker.ctx.error()));
+                }
+
+                // ── Isolate block check ─────────────────────────────────
+                // Inside an isolate block, calling @trusted or @io functions
+                // is forbidden because they may access external mutable state.
+                // Also reject calls to functions known to access mutable globals.
+                if self.checker.is_in_isolate() {
+                    if let Err(e) = self.check_call_attribute_violation(
+                        callee_name
+                            .as_ref()
+                            .unwrap_or(&Symbol::intern("this_function")),
+                        false,
+                        has_trusted,
+                        has_io,
+                        *span,
+                    ) {
+                        return Ok(e);
+                    }
+                    // Check if the callee directly accesses mutable globals.
+                    //
+                    // TODO(safety-critical): this only catches *direct* access — if the callee
+                    // calls another function that accesses mutable globals, the check
+                    // will not catch it.  Full transitive analysis would require
+                    // interprocedural reachability (e.g. a call graph + fixpoint),
+                    // which we may add in a future pass.  For now, functions that
+                    // transitively access mutable globals should be annotated with
+                    // `@trusted` or `@io` to ensure the isolate check catches them.
+                    // In strict mode, consider warning for all function calls inside
+                    // isolate blocks when transitive safety cannot be verified.
+                    if let Some(name) = callee_name {
+                        if let Some(binding) = self.checker.symbols.lookup_function(name) {
+                            if self
+                                .checker
+                                .functions_accessing_mutables
+                                .contains(&binding.def_id)
+                            {
+                                self.checker.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "cannot call function `{}` inside isolate block: it accesses mutable global state",
+                                        name_str,
+                                    ))
+                                    .with_code_str("E093")
+                                    .with_span(*span)
+                                    .with_help("isolate blocks guarantee no external mutable state access; this function reads or writes mutable globals")
+                                );
+                                return Ok((HirExpr::Error(*span), self.checker.ctx.error()));
+                            }
+                        }
+                    }
+                }
+
+                // ── Non-comptime function with `!` check ────────────────
+                // Calling `f!()` on a function that is NOT a comptime function
+                // should be caught at type-checking time, not evaluation time.
+                if *comptime {
+                    if let Some(name) = callee_name {
+                        if let Some(binding) = self.checker.symbols.lookup_function(name) {
+                            if !binding.is_comptime {
+                                self.checker.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "cannot call `{}!()`: `{}` is not a comptime function; remove the `!` to call it at runtime",
+                                        name, name,
+                                    ))
+                                    .with_code_str("E081")
+                                    .with_span(*span)
+                                    .with_help("only `comptime def` functions can be called with `!`")
+                                );
+                                return Ok((HirExpr::Error(*span), self.checker.ctx.error()));
+                            }
+                        }
+                    }
+                }
+
                 // Check if this is a method call (x.foo()) rather than a free function call
                 if let Expr::FieldAccess { base, field, .. } = callee.as_ref() {
                     let (base_hir, base_ty) = self.infer_expr(base)?;
+                    // ── Method @trusted/@io attribute check ───────────
+                    // For method calls, look up the method's attributes through
+                    // inherent impl blocks, which `lookup_function` cannot find.
+                    if self.checker.is_in_comptime() || self.checker.is_in_isolate() {
+                        for method in self
+                            .checker
+                            .trait_env
+                            .lookup_inherent_methods(base_ty, self.checker.ctx)
+                        {
+                            if method.name == *field {
+                                let has_trusted =
+                                    method.attributes.iter().any(|a| a.name.eq_str("trusted"));
+                                let has_io = method.attributes.iter().any(|a| a.name.eq_str("io"));
+                                if let Err(e) = self.check_call_attribute_violation(
+                                    field,
+                                    true,
+                                    has_trusted,
+                                    has_io,
+                                    *span,
+                                ) {
+                                    return Ok(e);
+                                }
+                                break;
+                            }
+                        }
+                        // Also check trait impl methods (`impl Trait for Type`),
+                        // which `lookup_inherent_methods` does not cover.
+                        let trait_methods: Vec<(Symbol, bool, bool)> = self
+                            .checker
+                            .trait_env
+                            .lookup_impls_for_type(base_ty)
+                            .iter()
+                            .flat_map(|impl_candidate| &impl_candidate.methods)
+                            .filter(|m| m.name == *field)
+                            .map(|m| {
+                                let has_trusted =
+                                    m.attributes.iter().any(|a| a.name.eq_str("trusted"));
+                                let has_io = m.attributes.iter().any(|a| a.name.eq_str("io"));
+                                (m.name, has_trusted, has_io)
+                            })
+                            .collect::<Vec<_>>();
+                        for (_, has_trusted, has_io) in &trait_methods {
+                            if let Err(e) = self.check_call_attribute_violation(
+                                field,
+                                true,
+                                *has_trusted,
+                                *has_io,
+                                *span,
+                            ) {
+                                return Ok(e);
+                            }
+                        }
+                    }
                     if let Some((param_tys, ret_ty)) = self.checker.lookup_method(base_ty, *field) {
                         // Adjust: method calls pass `self` as the first arg implicitly,
                         // so the param list from the declaration includes self.
@@ -1510,6 +1759,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let ty_id = self.resolve_type(ty)?;
                 Ok((HirExpr::TypeInfo(ty_id, *span), self.checker.ctx.unit()))
             }
+            Expr::LayoutOf(ty, span) => {
+                // layout_of!(Type) — pass the AST type through to HIR so that
+                // type expressions can be resolved during comptime evaluation.
+                // The expression type is a dedicated LayoutDescriptor (not
+                // ctx.error()), so field access on the result type-checks.
+                Ok((
+                    HirExpr::LayoutOf(ty.clone(), *span),
+                    self.checker.ctx.builtin_layout_descriptor,
+                ))
+            }
             Expr::CompileError(msg, span) => {
                 let diag = Diagnostic::error(msg.clone())
                     .with_code_str("E099")
@@ -1586,6 +1845,78 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         Ok(hir)
     }
 
+    /// Check whether calling a function/method with the given @trusted/@io
+    /// attributes violates the current comptime or isolate sandbox.
+    /// Returns `Ok(())` if the call is allowed, or the appropriate
+    /// `(HirExpr::Error, error_type)` pair if the call should be rejected.
+    fn check_call_attribute_violation(
+        &mut self,
+        name: &Symbol,
+        is_method: bool,
+        has_trusted: bool,
+        has_io: bool,
+        span: Span,
+    ) -> Result<(), (HirExpr, TypeId)> {
+        let kind = if is_method { "method" } else { "function" };
+        if self.checker.is_in_comptime() {
+            if has_trusted {
+                self.checker.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "cannot call @trusted {} `{}` from comptime context: \
+                         comptime code is sandboxed and cannot call @trusted functions",
+                        kind, name,
+                    ))
+                    .with_code_str("E081")
+                    .with_span(span)
+                    .with_help("@trusted functions may perform I/O or unsafe operations, which are prohibited in comptime"),
+                );
+                return Err((HirExpr::Error(span), self.checker.ctx.error()));
+            }
+            if has_io {
+                self.checker.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "cannot call @io {} `{}` from comptime context: \
+                         comptime code is sandboxed and cannot perform I/O",
+                        kind, name,
+                    ))
+                    .with_code_str("E081")
+                    .with_span(span)
+                    .with_help("I/O operations are prohibited in comptime"),
+                );
+                return Err((HirExpr::Error(span), self.checker.ctx.error()));
+            }
+        }
+        if self.checker.is_in_isolate() {
+            if has_trusted {
+                self.checker.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "cannot call @trusted {} `{}` inside isolate block: \
+                         isolate blocks must not access external mutable state",
+                        kind, name,
+                    ))
+                    .with_code_str("E093")
+                    .with_span(span)
+                    .with_help("isolate blocks guarantee no external mutable state access; @trusted functions may violate this"),
+                );
+                return Err((HirExpr::Error(span), self.checker.ctx.error()));
+            }
+            if has_io {
+                self.checker.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "cannot call @io {} `{}` inside isolate block: \
+                         isolate blocks must not perform I/O",
+                        kind, name,
+                    ))
+                    .with_code_str("E093")
+                    .with_span(span)
+                    .with_help("isolate blocks guarantee no external mutable state access; @io functions may perform I/O"),
+                );
+                return Err((HirExpr::Error(span), self.checker.ctx.error()));
+            }
+        }
+        Ok(())
+    }
+
     /// Check that an InferVar's kind constraint is compatible with the
     /// resolved type of another type.  This prevents situations like
     /// `true` (InferVar with kind Bool) being unified with `Int<32>`.
@@ -1636,6 +1967,22 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             })?
                             .clone();
                     };
+                    // ── @experimental check ───────────────────────────
+                    for attr in &binding.attributes {
+                        if attr.name.eq_str("experimental") && !self.checker.enable_experimental {
+                            self.checker.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "use of experimental type `{}`",
+                                    path.last()
+                                        .map(|s| s.as_str().to_string())
+                                        .unwrap_or_else(|| "?".to_string()),
+                                ))
+                                .with_code_str("E094")
+                                .with_span(*span)
+                                .with_help("experimental features are not enabled; use `--enable-experimental` to use this type"),
+                            );
+                        }
+                    }
                     match binding.kind {
                         TypeKind::Alias => {
                             if self.checker.resolving_aliases.contains(&def_id) {
@@ -1843,8 +2190,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     // Non-literal size: try to evaluate it as a comptime expression.
                     match self.infer_expr(size) {
                         Ok((size_hir, _size_ty)) => {
-                            let mut eval =
-                                ComptimeEvalContext::new(self.checker.ctx, self.checker.symbols);
+                            let mut eval = ComptimeEvalContext::new(
+                                self.checker.ctx,
+                                self.checker.symbols,
+                                &mut self.checker.diagnostics,
+                            );
                             for (name, (params, body)) in &self.checker.comptime_fn_registry {
                                 eval.register_fn(name.clone(), params.clone(), body.clone());
                             }
@@ -2154,13 +2504,21 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// Check a block — actual implementation, not delegation.
     #[must_use]
     pub fn check_block(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, Diagnostic> {
+        self.checker.push_literal_scope();
         let _scope = self.checker.enter_var_scope();
-        let mut result = Vec::new();
-        for stmt in stmts {
-            result.push(self.checker.check_stmt(stmt)?);
-        }
-        // scope drops here — pops the frame (even on `?` early return)
-        Ok(result)
+        // Wrap in a closure so that `?` return inside the loop does not
+        // skip cleanup — the outer function always runs pop_literal_scope.
+        let result = (|| {
+            let mut result = Vec::new();
+            for stmt in stmts {
+                result.push(self.checker.check_stmt(stmt)?);
+            }
+            Ok(result)
+        })();
+        // scope drops here — pops the var scope frame (even on `?` early return)
+        drop(_scope);
+        self.checker.pop_literal_scope();
+        result
     }
 
     /// Check a pattern against an expected type.
@@ -2420,6 +2778,54 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     .diagnostics
                     .push(Diagnostic::error("unsupported pattern type").with_span(Span::new(0, 0)));
                 Ok(HirPattern::Error(Span::new(0, 0)))
+            }
+        }
+    }
+
+    /// Check if a function name has `@deprecated` or `@experimental` attributes
+    /// and emit appropriate warnings/errors.
+    fn check_deprecated_experimental(
+        &mut self,
+        name: &Symbol,
+        attributes: &[Attribute],
+        span: Span,
+    ) {
+        // @deprecated and @experimental are mutually exclusive — a function
+        // can't be both "already established but not recommended" and "newly
+        // introduced".  @experimental (error) takes priority over @deprecated
+        // (warning) when both are present.
+        let mut has_experimental_error = false;
+        for attr in attributes {
+            if attr.name.eq_str("experimental") && !self.checker.enable_experimental {
+                has_experimental_error = true;
+                let msg = format!("use of experimental function `{}`", name);
+                self.checker.diagnostics.push(
+                    Diagnostic::error(msg)
+                        .with_code_str("E094")
+                        .with_span(span)
+                        .with_help(
+                            "experimental features are not enabled; use `--enable-experimental` to use this function",
+                        ),
+                );
+            }
+        }
+        if !has_experimental_error {
+            for attr in attributes {
+                if attr.name.eq_str("deprecated") {
+                    let msg = if let Some(Expr::Literal(Literal::String(reason), _)) =
+                        attr.args.first()
+                    {
+                        format!("use of deprecated function `{}`: {}", name, reason)
+                    } else {
+                        format!("use of deprecated function `{}`", name)
+                    };
+                    self.checker.diagnostics.push(
+                        Diagnostic::warning(msg)
+                            .with_code_str("W090")
+                            .with_span(span)
+                            .with_help("consider migrating to a replacement function"),
+                    );
+                }
             }
         }
     }
