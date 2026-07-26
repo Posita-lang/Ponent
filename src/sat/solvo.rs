@@ -27,7 +27,7 @@
 /// solver.add_clause(&[a, b]);
 /// solver.add_clause(&[-a, b]);
 /// solver.add_clause(&[a, -b]);
-/// assert_eq!(solver.solve(), Some(vec![true, true])); // a=true, b=true
+/// assert_eq!(solver.solve(), SolveResult::Sat(vec![true, true])); // a=true, b=true
 /// ```
 
 /// Maximum formula size (clauses × variables) before pure literal elimination
@@ -37,6 +37,13 @@
 /// threshold the solver falls back to branching-only, which is still correct
 /// but may explore more of the search tree.
 const PURE_LITERAL_THRESHOLD: usize = 2048;
+
+/// Default maximum number of decisions (branching choices) before the solver
+/// gives up and returns [`SolveResult::Unknown`].  Guards against exponential
+/// search on maliciously crafted `@cfg` conditions.  100 000 lets the solver
+/// handle formulas up to ~40–50 variables comfortably while capping runaway
+/// search on pathological inputs.
+const DEFAULT_MAX_DECISIONS: usize = 100_000;
 
 /// A SAT variable with an optional name for debugging.
 #[derive(Debug, Clone)]
@@ -48,6 +55,53 @@ pub struct Var {
 /// Each literal is an `i32`: positive = variable, negative = ¬variable.
 /// Variable indices are 1-based (0 is reserved).
 pub type Clause = Vec<i32>;
+
+/// The result of a SAT solver invocation.
+///
+/// Three states mirror the standard SAT/SMT outcome:
+/// - [`Sat`](SolveResult::Sat) — the formula is satisfiable, with a model (assignment).
+/// - [`Unsat`](SolveResult::Unsat) — the formula is unsatisfiable (no model exists).
+/// - [`Unknown`](SolveResult::Unknown) — the solver could not decide within the
+///   configured decision limit (`set_max_decisions`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SolveResult {
+    /// The formula is satisfiable.  Contains a model: for each variable
+    /// (1-based index), its assigned boolean value.
+    Sat(Vec<bool>),
+    /// The formula is unsatisfiable — no satisfying assignment exists.
+    Unsat,
+    /// The solver gave up after exceeding the decision limit without reaching
+    /// a definite conclusion.  The formula may be satisfiable or unsatisfiable.
+    Unknown,
+}
+
+impl SolveResult {
+    /// Unwrap the model from a [`Sat`](SolveResult::Sat) result.
+    ///
+    /// # Panics
+    /// Panics if the result is not `Sat`.
+    pub fn unwrap_sat(self) -> Vec<bool> {
+        match self {
+            SolveResult::Sat(model) => model,
+            _ => panic!("called `unwrap_sat()` on a non-Sat result: {self:?}"),
+        }
+    }
+
+    /// Returns `true` if the result is [`Sat`](SolveResult::Sat).
+    pub fn is_sat(&self) -> bool {
+        matches!(self, SolveResult::Sat(_))
+    }
+
+    /// Returns `true` if the result is [`Unsat`](SolveResult::Unsat).
+    pub fn is_unsat(&self) -> bool {
+        matches!(self, SolveResult::Unsat)
+    }
+
+    /// Returns `true` if the result is [`Unknown`](SolveResult::Unknown).
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, SolveResult::Unknown)
+    }
+}
 
 /// A SAT solver using the DPLL algorithm.
 #[derive(Debug)]
@@ -69,6 +123,20 @@ pub struct Solver {
     /// Reusable buffers for pure literal detection (avoids per-call allocation).
     pure_pos: Vec<bool>,
     pure_neg: Vec<bool>,
+    /// Maximum number of decisions (branching choices) before giving up.
+    max_decisions: usize,
+    /// Number of decisions made so far in the current `solve()` call.
+    decisions_made: usize,
+}
+
+/// Internal outcome of the DPLL loop — distinguishes "truly unsatisfiable"
+/// from "hit the decision limit" so that `solve()` can map them to
+/// [`SolveResult::Unsat`] and [`SolveResult::Unknown`] respectively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DpllOutcome {
+    Sat,
+    Unsat,
+    LimitExceeded,
 }
 
 impl Solver {
@@ -83,7 +151,16 @@ impl Solver {
             trail_limits: vec![0],
             pure_pos: Vec::new(),
             pure_neg: Vec::new(),
+            max_decisions: DEFAULT_MAX_DECISIONS,
+            decisions_made: 0,
         }
+    }
+
+    /// Set a custom decision limit.  The solver will give up and return `None`
+    /// after this many branching choices.  Use 0 to allow unbounded search
+    /// (not recommended for untrusted input).
+    pub fn set_max_decisions(&mut self, limit: usize) {
+        self.max_decisions = limit;
     }
 
     /// Declare a new boolean variable. Returns its index (1-based).
@@ -145,24 +222,32 @@ impl Solver {
         self.add_at_most_one(lits); // at most one
     }
 
-    /// Solve the current formula.  Returns `Some(assignment)` if satisfiable,
-    /// `None` if unsatisfiable.  The assignment is a vector of `bool` values
-    /// for each variable (index 0 is unused).
-    pub fn solve(&mut self) -> Option<Vec<bool>> {
-        if self.dpll() {
-            let result: Vec<bool> = self.assignment[1..]
-                .iter()
-                .map(|&a| a.unwrap_or(false))
-                .collect();
-            Some(result)
-        } else {
-            None
+    /// Solve the current formula.
+    ///
+    /// Returns:
+    /// - [`SolveResult::Sat`]`(assignment)` — the formula is satisfiable; the
+    ///   assignment maps each variable (1-based index) to its boolean value.
+    /// - [`SolveResult::Unsat`] — the formula is unsatisfiable.
+    /// - [`SolveResult::Unknown`] — the solver exceeded the decision limit
+    ///   (`set_max_decisions`) without reaching a definite conclusion.
+    pub fn solve(&mut self) -> SolveResult {
+        self.decisions_made = 0;
+        match self.dpll() {
+            DpllOutcome::Sat => {
+                let result: Vec<bool> = self.assignment[1..]
+                    .iter()
+                    .map(|&a| a.unwrap_or(false))
+                    .collect();
+                SolveResult::Sat(result)
+            }
+            DpllOutcome::Unsat => SolveResult::Unsat,
+            DpllOutcome::LimitExceeded => SolveResult::Unknown,
         }
     }
 
     /// DPLL main loop — iterative implementation using an explicit stack.
     /// Avoids recursion depth issues on large formulas.
-    fn dpll(&mut self) -> bool {
+    fn dpll(&mut self) -> DpllOutcome {
         let formula_size = self.clauses.len().saturating_mul(self.vars.len());
         let use_pure_literal = formula_size <= PURE_LITERAL_THRESHOLD;
 
@@ -207,19 +292,25 @@ impl Solver {
                 // If we exhausted all decision levels without finding an
                 // unexplored branch, the formula is unsatisfiable.
                 if stack.is_empty() {
-                    return false;
+                    return DpllOutcome::Unsat;
                 }
                 continue;
             }
 
             // ── Decision phase ──
             if self.all_satisfied() {
-                return true;
+                return DpllOutcome::Sat;
             }
 
             let var = self.choose_var();
             if var == 0 {
-                return true; // No unassigned variables — all satisfied.
+                return DpllOutcome::Sat; // No unassigned variables — all satisfied.
+            }
+
+            // Enforce the decision limit to cap exponential search.
+            self.decisions_made += 1;
+            if self.decisions_made >= self.max_decisions && self.max_decisions > 0 {
+                return DpllOutcome::LimitExceeded;
             }
 
             // Push decision point and try true.
@@ -446,7 +537,7 @@ mod tests {
         let mut solver = Solver::new();
         let a = solver.new_var();
         solver.add_unit(a as i32);
-        assert!(solver.solve().is_some());
+        assert!(solver.solve().is_sat());
     }
 
     #[test]
@@ -455,7 +546,7 @@ mod tests {
         let a = solver.new_var();
         solver.add_unit(a as i32);
         solver.add_unit(-(a as i32));
-        assert!(solver.solve().is_none());
+        assert!(solver.solve().is_unsat());
     }
 
     #[test]
@@ -466,8 +557,8 @@ mod tests {
         solver.add_unit(a as i32);
         solver.add_unit(b as i32);
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         assert!(model[0]);
         assert!(model[1]);
     }
@@ -480,8 +571,8 @@ mod tests {
         solver.add_clause(&[a as i32, b as i32]);
         solver.add_unit(-(a as i32));
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         assert!(!model[0]);
         assert!(model[1]);
     }
@@ -494,8 +585,8 @@ mod tests {
         let c = solver.new_named_var("c");
         solver.add_exactly_one(&[a as i32, b as i32, c as i32]);
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         let true_count = model.iter().filter(|&&v| v).count();
         assert_eq!(true_count, 1);
     }
@@ -508,8 +599,8 @@ mod tests {
         solver.add_implies(a as i32, b as i32);
         solver.add_unit(a as i32);
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         assert!(model[0]);
         assert!(model[1]);
     }
@@ -522,7 +613,7 @@ mod tests {
         solver.add_clause(&[a as i32, b as i32]);
         solver.add_unit(-(a as i32));
         solver.add_unit(-(b as i32));
-        assert!(solver.solve().is_none());
+        assert!(solver.solve().is_unsat());
     }
 
     #[test]
@@ -535,7 +626,7 @@ mod tests {
         solver.add_clause(&[linux as i32, windows as i32, macos as i32]);
         solver.add_unit(linux as i32);
         solver.add_unit(macos as i32);
-        assert!(solver.solve().is_none());
+        assert!(solver.solve().is_unsat());
     }
 
     // ── Additional tests ──────────────────────────────────────────
@@ -550,8 +641,8 @@ mod tests {
         // a
         solver.add_unit(a as i32);
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         assert!(model[0]); // a true
         assert!(model[1]); // b true (by equivalence)
     }
@@ -565,8 +656,8 @@ mod tests {
         // ¬a
         solver.add_unit(-(a as i32));
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         assert!(!model[0]); // a false
         assert!(!model[1]); // b false (by equivalence)
     }
@@ -583,8 +674,8 @@ mod tests {
         // a
         solver.add_unit(a as i32);
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         assert!(model[0]); // a true
         assert!(model[1]); // b true
         assert!(model[2]); // c true
@@ -602,8 +693,8 @@ mod tests {
         solver.add_clause(&[-(a as i32), b as i32]);
         solver.add_clause(&[a as i32, -(b as i32)]);
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         assert!(model[0]); // a true
         assert!(model[1]); // b true
     }
@@ -619,7 +710,7 @@ mod tests {
         solver.add_clause(&[-(a as i32), b as i32]);
         solver.add_clause(&[a as i32, -(b as i32)]);
         solver.add_clause(&[-(a as i32), -(b as i32)]);
-        assert!(solver.solve().is_none());
+        assert!(solver.solve().is_unsat());
     }
 
     #[test]
@@ -631,8 +722,8 @@ mod tests {
         solver.add_clause(&[a as i32, b as i32]);
         solver.add_unit(-(a as i32));
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         assert!(!model[0]); // a false
         assert!(model[1]); // b true (unit propagation)
     }
@@ -647,8 +738,8 @@ mod tests {
         solver.add_unit(a as i32);
         solver.add_clause(&[-(a as i32), b as i32]);
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         assert!(model[0]); // a true
         assert!(model[1]); // b true
     }
@@ -657,7 +748,7 @@ mod tests {
     fn test_empty_formula() {
         // Empty formula is always satisfiable
         let mut solver = Solver::new();
-        assert!(solver.solve().is_some());
+        assert!(solver.solve().is_sat());
     }
 
     #[test]
@@ -666,7 +757,7 @@ mod tests {
         let a = solver.new_var();
         solver.add_clause(&[a as i32]);
         solver.add_clause(&[-(a as i32)]);
-        assert!(solver.solve().is_none());
+        assert!(solver.solve().is_unsat());
     }
 
     #[test]
@@ -680,8 +771,8 @@ mod tests {
         // Force a true
         solver.add_unit(a as i32);
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         assert!(model[0]); // a true
         assert!(!model[1]); // b false
         assert!(!model[2]); // c false
@@ -696,7 +787,7 @@ mod tests {
         solver.add_at_most_one(&[a as i32, b as i32]);
         solver.add_unit(a as i32);
         solver.add_unit(b as i32);
-        assert!(solver.solve().is_none());
+        assert!(solver.solve().is_unsat());
     }
 
     #[test]
@@ -711,7 +802,7 @@ mod tests {
         solver.add_clause(&[-(b as i32), -(c as i32)]);
         solver.add_unit(a as i32);
         let result = solver.solve();
-        assert!(result.is_some());
+        assert!(result.is_sat());
         // a=true, b=false, c=true is one solution
         // or a=true, b=true, c=false is another
     }
@@ -727,8 +818,8 @@ mod tests {
         }
         solver.add_unit(vars[0]);
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         for (i, v) in vars.iter().enumerate() {
             assert!(model[*v as usize - 1], "var {} should be true", i);
         }
@@ -744,8 +835,8 @@ mod tests {
         solver.add_at_most_one(&[a as i32, b as i32, c as i32]);
         solver.add_unit(a as i32);
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         assert!(model[0]); // a true
         assert!(!model[1]); // b false
         assert!(!model[2]); // c false
@@ -762,8 +853,8 @@ mod tests {
         solver.add_clause(&[-(a as i32), c as i32]);
         solver.add_clause(&[-(b as i32), -(c as i32)]);
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         // Verify clause (a ∨ b)
         assert!(model[0] || model[1]);
         // Verify clause (¬a ∨ c)
@@ -786,8 +877,8 @@ mod tests {
         solver.add_implies(c as i32, d as i32);
         solver.add_unit(a as i32);
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         assert!(model[0]); // a true (unit)
         assert!(model[1]); // b true (propagated from a)
         assert!(model[2]); // c true (propagated from b)
@@ -803,7 +894,7 @@ mod tests {
         solver.add_implies(a as i32, b as i32);
         solver.add_implies(a as i32, -(b as i32));
         solver.add_unit(a as i32);
-        assert!(solver.solve().is_none());
+        assert!(solver.solve().is_unsat());
     }
 
     #[test]
@@ -823,8 +914,8 @@ mod tests {
         solver.add_clause(&[-(a as i32), -(b as i32), -(c as i32)]);
         solver.add_unit(-(a as i32));
         let result = solver.solve();
-        assert!(result.is_some());
-        let model = result.unwrap();
+        assert!(result.is_sat());
+        let model = result.unwrap_sat();
         assert!(!model[0]); // a false (unit)
         assert!(model[1]); // b true (propagated)
         assert!(model[2]); // c true (propagated)
@@ -853,7 +944,7 @@ mod tests {
         solver.add_clause(&[-(a as i32), -(b as i32)]);
         solver.add_clause(&[-(a as i32), -(c as i32)]);
         solver.add_clause(&[-(b as i32), -(c as i32)]);
-        assert!(solver.solve().is_none());
+        assert!(solver.solve().is_unsat());
     }
 
     #[test]
@@ -863,7 +954,7 @@ mod tests {
         let a = solver.new_var();
         solver.add_unit(a as i32);
         solver.add_unit(-(a as i32));
-        assert!(solver.solve().is_none());
+        assert!(solver.solve().is_unsat());
     }
 
     #[test]
@@ -880,7 +971,7 @@ mod tests {
         solver.add_unit(b as i32);
         // But they can't both be colored with the same color (edge constraint).
         solver.add_clause(&[-(a as i32), -(b as i32)]);
-        assert!(solver.solve().is_none());
+        assert!(solver.solve().is_unsat());
     }
 
     #[test]
@@ -903,7 +994,7 @@ mod tests {
         // At most one pigeon per hole.
         solver.add_at_most_one(&[p0h0 as i32, p1h0 as i32, p2h0 as i32]);
         solver.add_at_most_one(&[p0h1 as i32, p1h1 as i32, p2h1 as i32]);
-        assert!(solver.solve().is_none());
+        assert!(solver.solve().is_unsat());
     }
 
     #[test]
@@ -918,7 +1009,7 @@ mod tests {
         solver.add_implies(b as i32, c as i32);
         solver.add_implies(c as i32, -(a as i32));
         solver.add_unit(a as i32);
-        assert!(solver.solve().is_none());
+        assert!(solver.solve().is_unsat());
     }
 
     #[test]
@@ -936,7 +1027,7 @@ mod tests {
         solver.add_clause(&[a as i32, b as i32]);
         solver.add_clause(&[-(a as i32), b as i32]);
         solver.add_clause(&[a as i32, -(b as i32)]);
-        assert!(solver.solve().is_none());
+        assert!(solver.solve().is_unsat());
     }
 
     /// A minimal recursive DPLL for comparison testing only.
@@ -1167,16 +1258,16 @@ mod tests {
 
             // Both must agree on SAT/UNSAT
             assert_eq!(
-                iter_result.is_some(),
+                iter_result.is_sat(),
                 rec_result.is_some(),
                 "Formula '{}': iterative={}, recursive={}",
                 name,
-                iter_result.is_some(),
+                iter_result.is_sat(),
                 rec_result.is_some(),
             );
 
             // If both SAT, verify the iterative model satisfies all clauses
-            if let Some(model) = &iter_result {
+            if let SolveResult::Sat(model) = &iter_result {
                 for clause in &clauses {
                     let satisfied = clause.iter().any(|&lit| {
                         let var = lit.unsigned_abs() as usize;
@@ -1257,11 +1348,11 @@ mod tests {
 
             // Verify consistency
             assert_eq!(
-                iter_result.is_some(),
+                iter_result.is_sat(),
                 rec_result.is_some(),
                 "Mismatch at {} vars: iter={}, rec={}",
                 num_vars,
-                iter_result.is_some(),
+                iter_result.is_sat(),
                 rec_result.is_some(),
             );
 
@@ -1294,7 +1385,7 @@ mod tests {
         let iter_result = solver.solve();
         let rec_result = solve_recursive(&clauses, num_vars);
 
-        if iter_result.is_some() != rec_result.is_some() {
+        if iter_result.is_sat() != rec_result.is_some() {
             let mut dimacs = format!("p cnf {} {}\n", num_vars, clauses.len());
             for c in &clauses {
                 for lit in c {
@@ -1306,7 +1397,7 @@ mod tests {
             eprintln!("DIMACS written to /tmp/divergence.cnf");
             panic!(
                 "ITER={}, REC={}",
-                iter_result.is_some(),
+                iter_result.is_sat(),
                 rec_result.is_some()
             );
         }
@@ -1416,7 +1507,7 @@ mod tests {
             };
 
             assert_eq!(
-                solvo_result.is_some(),
+                solvo_result.is_sat(),
                 z3_result.is_some(),
                 "Mismatch at {} vars, {} clauses ({})",
                 num_vars,
@@ -1432,7 +1523,7 @@ mod tests {
                 solvo_time,
                 z3_time,
                 ratio,
-                if solvo_result.is_some() {
+                if solvo_result.is_sat() {
                     "SAT"
                 } else {
                     "UNSAT"
@@ -1498,14 +1589,14 @@ mod tests {
 
             // Pigeonhole with n+1 pigeons into n holes is UNSAT
             assert_eq!(
-                solvo_result.is_some(),
+                solvo_result.is_sat(),
                 z3_result.is_some(),
                 "Pigeonhole mismatch: {} pigeons, {} holes",
                 pigeons,
                 holes,
             );
             assert!(
-                solvo_result.is_none(),
+                solvo_result.is_unsat(),
                 "Pigeonhole {}→{} should be UNSAT",
                 pigeons,
                 holes,
@@ -1694,14 +1785,14 @@ mod tests {
 
             if let Some(expected) = expected {
                 assert_eq!(
-                    solvo_result.is_some(),
+                    solvo_result.is_sat(),
                     *expected,
                     "Solvo gave wrong result for {}",
                     name,
                 );
             }
             assert_eq!(
-                solvo_result.is_some(),
+                solvo_result.is_sat(),
                 z3_result.is_some(),
                 "Solvo vs Z3 mismatch for {}",
                 name,
@@ -1712,7 +1803,7 @@ mod tests {
                 name,
                 solvo_time,
                 z3_time,
-                if solvo_result.is_some() {
+                if solvo_result.is_sat() {
                     "SAT ✓"
                 } else {
                     "UNSAT ✓"
@@ -1761,7 +1852,7 @@ mod tests {
             let z3_time = start.elapsed().as_micros();
 
             assert_eq!(
-                solvo_result.is_some(),
+                solvo_result.is_sat(),
                 z3_result.is_some(),
                 "Mismatch at {} vars, {} clauses ({})",
                 num_vars,
@@ -1776,7 +1867,7 @@ mod tests {
                 label,
                 solvo_time,
                 z3_time,
-                if solvo_result.is_some() {
+                if solvo_result.is_sat() {
                     "SAT ✓"
                 } else {
                     "UNSAT ✓"
@@ -1793,7 +1884,7 @@ mod tests {
         let a = solver.new_var();
         solver.add_clause(&[a as i32]);
         solver.add_clause(&[]); // empty clause = false
-        assert!(solver.solve().is_none(), "empty clause should be UNSAT");
+        assert!(solver.solve().is_unsat(), "empty clause should be UNSAT");
     }
 
     #[test]
@@ -1804,7 +1895,7 @@ mod tests {
         let b = solver.new_var();
         solver.add_clause(&[a as i32, -(a as i32)]); // a ∨ ¬a (tautology)
         solver.add_clause(&[b as i32]);
-        assert!(solver.solve().is_some(), "tautology clause should be SAT");
+        assert!(solver.solve().is_sat(), "tautology clause should be SAT");
     }
 
     #[test]
@@ -1817,10 +1908,10 @@ mod tests {
         solver.add_clause(&[1]); // var 1 must be true
         let result = solver.solve();
         assert!(
-            result.is_some(),
+            result.is_sat(),
             "single clause among 1000 vars should be SAT"
         );
-        if let Some(model) = result {
+        if let SolveResult::Sat(model) = result {
             assert!(model[0], "var 1 should be true in model");
         }
     }
@@ -1835,7 +1926,7 @@ mod tests {
         solver.add_clause(&[a as i32, b as i32]);
         solver.add_clause(&[a as i32, c as i32]);
         let result = solver.solve();
-        assert!(result.is_some(), "pure literal a should be assignable");
+        assert!(result.is_sat(), "pure literal a should be assignable");
     }
 
     #[test]
@@ -1874,7 +1965,7 @@ mod tests {
             solver.add_clause(&clause);
         }
         assert!(
-            solver.solve().is_none(),
+            solver.solve().is_unsat(),
             "all assignments blocked should be UNSAT"
         );
     }
@@ -1894,8 +1985,8 @@ mod tests {
         solver.add_implies(d as i32, e as i32);
         solver.add_unit(-(e as i32));
         let result = solver.solve();
-        assert!(result.is_some(), "binary clause chain should be SAT");
-        if let Some(model) = result {
+        assert!(result.is_sat(), "binary clause chain should be SAT");
+        if let SolveResult::Sat(model) = result {
             assert!(!model[0], "a should be false (¬a)");
             assert!(!model[3], "d should be false (¬d)");
         }
@@ -1908,6 +1999,6 @@ mod tests {
         let a = solver.new_var();
         solver.add_unit(a as i32);
         solver.add_unit(-(a as i32));
-        assert!(solver.solve().is_none(), "a and ¬a should be UNSAT");
+        assert!(solver.solve().is_unsat(), "a and ¬a should be UNSAT");
     }
 }

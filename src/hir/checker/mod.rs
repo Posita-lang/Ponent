@@ -572,7 +572,9 @@ impl<'a> TypeChecker<'a> {
             // Inject captured variable values (from pre-collected literals).
             for (capture, val) in &captured_literals {
                 if let Some(val) = val {
-                    eval.variables.insert(*capture, val.clone());
+                    let slot = eval.allocate_slot();
+                    eval.cur_slot.insert(*capture, slot);
+                    eval.variables.insert(slot, val.clone());
                 }
             }
             for (name, (params, body)) in &self.comptime_fn_registry {
@@ -2964,7 +2966,9 @@ impl<'a> TypeChecker<'a> {
                             // Inject captured literal values into eval context.
                             for (capture, val) in &captured_literals {
                                 if let Some(val) = val {
-                                    eval.variables.insert(*capture, val.clone());
+                                    let slot = eval.allocate_slot();
+                                    eval.cur_slot.insert(*capture, slot);
+                                    eval.variables.insert(slot, val.clone());
                                 }
                             }
                             // Register pre-collected comptime functions.
@@ -5389,6 +5393,13 @@ fn contains_error(stmts: &[HirStmt]) -> bool {
                 stack.extend(body.iter().map(Node::Stmt));
             }
             Node::Stmt(HirStmt::GhostVariableDef { inner, .. }) => stack.push(Node::Stmt(inner)),
+            // VariableDef and Assign carry a value expression that may contain Error.
+            Node::Stmt(HirStmt::VariableDef { value, .. }) => {
+                if let Some(e) = value {
+                    stack.push(Node::Expr(e));
+                }
+            }
+            Node::Stmt(HirStmt::Assign { value, .. }) => stack.push(Node::Expr(value)),
             // All other HirStmt variants have no nested Error-carrying nodes.
             Node::Stmt(_) => {}
 

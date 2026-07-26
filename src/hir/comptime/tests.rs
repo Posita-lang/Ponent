@@ -12,6 +12,22 @@ fn make_int(n: i128) -> HirExpr {
     make_int_val(n, TypeId::NONE)
 }
 
+/// Insert a comptime variable into the evaluator with a unique slot.
+/// Used in tests that need to set up variable state before evaluation.
+fn insert_var(ec: &mut ComptimeEvalContext, name: &str, val: ComptimeValue) {
+    let slot = ec.allocate_slot();
+    ec.cur_slot.insert(Symbol::intern(name), slot);
+    ec.variables.insert(slot, val);
+}
+
+/// Look up a comptime variable by name via the slot mapping.
+/// Returns `None` if the variable doesn't exist in the current scope.
+fn get_var<'a>(ec: &'a ComptimeEvalContext, name: &str) -> Option<&'a ComptimeValue> {
+    ec.cur_slot
+        .get(&Symbol::intern(name))
+        .and_then(|slot| ec.variables.get(slot))
+}
+
 fn make_bool(b: bool) -> HirExpr {
     HirExpr::Literal(Literal::Bool(b), TypeId::NONE, Span::new(0, 0))
 }
@@ -229,7 +245,7 @@ fn test_eval_variable_def() {
     let r = ec.eval_block(&[block]);
     assert!(matches!(r, Ok(ComptimeValue::Int(42))));
     assert!(matches!(
-        ec.variables.get(&Symbol::intern("x")),
+        get_var(&ec, "x"),
         Some(ComptimeValue::Int(42))
     ));
 }
@@ -242,7 +258,7 @@ fn test_eval_variable_assign() {
     ));
     let mut diag = crate::diagnostics::DiagCtxt::new();
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
-    ec.variables.insert("x".into(), ComptimeValue::Int(10));
+    insert_var(&mut ec, "x", ComptimeValue::Int(10));
     ec.memory_used = ComptimeValue::Int(10).memory_size();
 
     let assign = HirStmt::Assign {
@@ -254,7 +270,7 @@ fn test_eval_variable_assign() {
     let r = ec.eval_block(&[assign]);
     assert!(matches!(r, Ok(ComptimeValue::Int(20))));
     assert!(matches!(
-        ec.variables.get(&Symbol::intern("x")),
+        get_var(&ec, "x"),
         Some(ComptimeValue::Int(20))
     ));
 }
@@ -292,7 +308,7 @@ fn test_eval_ident_resolves_local_var() {
     ));
     let mut diag = crate::diagnostics::DiagCtxt::new();
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
-    ec.variables.insert("x".into(), ComptimeValue::Int(99));
+    insert_var(&mut ec, "x", ComptimeValue::Int(99));
 
     let expr = HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0));
     let r = ec.eval_expr(&expr);
@@ -385,7 +401,7 @@ fn test_eval_while_loop() {
     let mut diag = crate::diagnostics::DiagCtxt::new();
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
-    ec.variables.insert("i".into(), ComptimeValue::Int(0));
+    insert_var(&mut ec, "i", ComptimeValue::Int(0));
     ec.memory_used = ComptimeValue::Int(0).memory_size();
     // Simulate a while loop: while i < 5 { i = i + 1 }
     let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
@@ -412,7 +428,7 @@ fn test_eval_while_loop() {
     let _ = ec.eval_block(&[while_stmt]);
     // After the loop, i should be 5
     assert!(matches!(
-        ec.variables.get(&Symbol::intern("i")),
+        get_var(&ec, "i"),
         Some(ComptimeValue::Int(5))
     ));
 }
@@ -428,7 +444,7 @@ fn test_eval_while_scope_isolation() {
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
     // Outer variable `i` — exists before and should persist after the loop.
-    ec.variables.insert("i".into(), ComptimeValue::Int(0));
+    insert_var(&mut ec, "i", ComptimeValue::Int(0));
     ec.memory_used = ComptimeValue::Int(0).memory_size();
 
     // while i < 1 { set x = 42; i = i + 1 }
@@ -469,7 +485,7 @@ fn test_eval_while_scope_isolation() {
     let _ = ec.eval_block(&[while_stmt]);
 
     // After the loop, outer variable `i` should still be accessible and updated.
-    let i_val = ec.variables.get(&Symbol::intern("i"));
+    let i_val = get_var(&ec, "i");
     assert!(
         i_val.is_some(),
         "outer variable i should still exist after while loop"
@@ -482,7 +498,7 @@ fn test_eval_while_scope_isolation() {
 
     // After the loop, inner variable `x` must NOT leak.
     assert!(
-        ec.variables.get(&Symbol::intern("x")).is_none(),
+        get_var(&ec, "x").is_none(),
         "variable x defined inside while body should not leak to outer scope"
     );
 }
@@ -501,8 +517,8 @@ fn test_eval_while_shadowing_same_name() {
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
     // Outer variable `x` (will be shadowed inside the loop) and `i` (counter).
-    ec.variables.insert("x".into(), ComptimeValue::Int(5));
-    ec.variables.insert("i".into(), ComptimeValue::Int(0));
+    insert_var(&mut ec, "x", ComptimeValue::Int(5));
+    insert_var(&mut ec, "i", ComptimeValue::Int(0));
     ec.memory_used = ComptimeValue::Int(5).memory_size() + ComptimeValue::Int(0).memory_size();
 
     // while i < 1 { set x = 42; i = i + 1 }
@@ -544,7 +560,7 @@ fn test_eval_while_shadowing_same_name() {
     let _ = ec.eval_block(&[while_stmt]);
 
     // After the loop, outer `x` must be restored to 5 (shadow was cleaned up).
-    let x_val = ec.variables.get(&Symbol::intern("x"));
+    let x_val = get_var(&ec, "x");
     assert!(
         matches!(x_val, Some(ComptimeValue::Int(5))),
         "outer x should be restored to 5 after while loop, got {:?}",
@@ -552,7 +568,7 @@ fn test_eval_while_shadowing_same_name() {
     );
 
     // After the loop, `i` must be 1 (modification preserved).
-    let i_val = ec.variables.get(&Symbol::intern("i"));
+    let i_val = get_var(&ec, "i");
     assert!(
         matches!(i_val, Some(ComptimeValue::Int(1))),
         "outer i should be 1 after while loop, got {:?}",
@@ -571,7 +587,7 @@ fn test_eval_while_step_limit() {
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
     ec.set_step_limit(5);
 
-    ec.variables.insert("i".into(), ComptimeValue::Int(0));
+    insert_var(&mut ec, "i", ComptimeValue::Int(0));
     let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
     let cond = make_binop_ty(i_expr(), BinOp::Lt, make_int_val(100, int32), int32);
     let body = vec![HirStmt::Assign {
@@ -624,7 +640,7 @@ fn test_eval_fn_call_scope_isolation() {
     ));
     let mut diag = crate::diagnostics::DiagCtxt::new();
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
-    ec.variables.insert("x".into(), ComptimeValue::Int(1));
+    insert_var(&mut ec, "x", ComptimeValue::Int(1));
 
     // Register a function that assigns to its own param, not the outer scope
     let body = vec![HirStmt::Assign {
@@ -649,7 +665,7 @@ fn test_eval_fn_call_scope_isolation() {
     let _ = ec.eval_expr(&call);
     // Outer x should still be 1, not 99
     assert!(matches!(
-        ec.variables.get(&Symbol::intern("x")),
+        get_var(&ec, "x"),
         Some(ComptimeValue::Int(1))
     ));
 }
@@ -817,7 +833,7 @@ fn test_eval_ref_and_deref() {
     ));
     let mut diag = crate::diagnostics::DiagCtxt::new();
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
-    ec.variables.insert("x".into(), ComptimeValue::Int(42));
+    insert_var(&mut ec, "x", ComptimeValue::Int(42));
 
     // &x
     let ref_expr = HirExpr::UnaryOp {
@@ -827,7 +843,7 @@ fn test_eval_ref_and_deref() {
         span: Span::new(0, 0),
     };
     let r = ec.eval_expr(&ref_expr);
-    assert!(matches!(&r, Ok(ComptimeValue::Pointer { name, .. }) if name.as_str() == "x"));
+    assert!(matches!(&r, Ok(ComptimeValue::Pointer { .. })));
 
     // *ptr
     let deref_expr = HirExpr::UnaryOp {
@@ -838,6 +854,466 @@ fn test_eval_ref_and_deref() {
     };
     let r = ec.eval_expr(&deref_expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(42))));
+}
+
+// ── Phase 13b: Pointer shadowing regression tests ────────────────
+// These verify that pointers captured via `&x` / `&mut x` in an outer
+// scope correctly resolve to the original slot even when an inner scope
+// shadows `x` with a new `set x = ...`.  (Bug: Pointer used to store the
+// *name* of the variable, so dereference would find the shadowed value.)
+
+#[test]
+fn test_eval_pointer_shadowing_block() {
+    // set x = 1; set p = &x; { set x = 2; *p }  →  *p should be 1
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    // set x = 1
+    let def_x = HirStmt::VariableDef {
+        name: Some("x".into()),
+        value: Some(Box::new(make_int(1))),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: TypeId::NONE,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    // set p = &x
+    let ref_x = HirExpr::UnaryOp {
+        op: crate::ast::UnaryOp::Ref,
+        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let def_p = HirStmt::VariableDef {
+        name: Some("p".into()),
+        value: Some(Box::new(ref_x)),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: TypeId::NONE,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    // Inner block: { set x = 2; *p }
+    let inner_var = HirStmt::VariableDef {
+        name: Some("x".into()),
+        value: Some(Box::new(make_int(2))),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: TypeId::NONE,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    let deref_p = HirExpr::UnaryOp {
+        op: crate::ast::UnaryOp::Deref,
+        expr: Box::new(HirExpr::Ident(
+            "p".into(),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let inner_block = HirExpr::Block(
+        vec![inner_var, HirStmt::Expression(Box::new(deref_p))],
+        TypeId::NONE,
+        Span::new(0, 0),
+    );
+    let block_stmt = HirStmt::Expression(Box::new(inner_block));
+
+    let result = ec.eval_block(&[def_x, def_p, block_stmt]);
+    assert!(
+        matches!(&result, Ok(ComptimeValue::Int(1))),
+        "expected *p == 1 despite shadowing, got {:?}",
+        result,
+    );
+}
+
+#[test]
+fn test_eval_pointer_shadowing_write_through() {
+    // set x = 1; set p = &mut x; { set x = 2; *p = 10 }
+    // After block: x should be 10 (write through pointer), not 2
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    // set x = 1
+    let def_x = HirStmt::VariableDef {
+        name: Some("x".into()),
+        value: Some(Box::new(make_int(1))),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: TypeId::NONE,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    // set p = &mut x
+    let ref_mut_x = HirExpr::UnaryOp {
+        op: crate::ast::UnaryOp::RefMut,
+        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let def_p = HirStmt::VariableDef {
+        name: Some("p".into()),
+        value: Some(Box::new(ref_mut_x)),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: TypeId::NONE,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    // Inner block: { set x = 2; *p = 10 }
+    let inner_var = HirStmt::VariableDef {
+        name: Some("x".into()),
+        value: Some(Box::new(make_int(2))),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: TypeId::NONE,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    // *p = 10
+    let deref_ptr = HirExpr::UnaryOp {
+        op: crate::ast::UnaryOp::Deref,
+        expr: Box::new(HirExpr::Ident(
+            "p".into(),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let assign_through_ptr = HirStmt::Assign {
+        target: Box::new(deref_ptr),
+        value: Box::new(make_int(10)),
+        op: None,
+        span: Span::new(0, 0),
+    };
+    let inner_block = HirExpr::Block(
+        vec![inner_var, assign_through_ptr, HirStmt::Expression(Box::new(make_int(0)))],
+        TypeId::NONE,
+        Span::new(0, 0),
+    );
+    let block_stmt = HirStmt::Expression(Box::new(inner_block));
+
+    let _ = ec.eval_block(&[def_x, def_p, block_stmt]);
+    // After the block, outer x should be 10 (written through the pointer)
+    assert!(
+        matches!(get_var(&ec, "x"), Some(ComptimeValue::Int(10))),
+        "expected outer x == 10 after write through pointer, got {:?}",
+        get_var(&ec, "x"),
+    );
+}
+
+#[test]
+fn test_eval_pointer_shadowing_nested_blocks() {
+    // set x = 1; set p = &x;
+    // { set x = 2; { set x = 3; *p } }  →  *p should be 1
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    // set x = 1
+    let def_x1 = HirStmt::VariableDef {
+        name: Some("x".into()),
+        value: Some(Box::new(make_int(1))),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: TypeId::NONE,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    // set p = &x
+    let ref_x = HirExpr::UnaryOp {
+        op: crate::ast::UnaryOp::Ref,
+        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let def_p = HirStmt::VariableDef {
+        name: Some("p".into()),
+        value: Some(Box::new(ref_x)),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: TypeId::NONE,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    // Innermost: { set x = 3; *p }
+    let inner_def = HirStmt::VariableDef {
+        name: Some("x".into()),
+        value: Some(Box::new(make_int(3))),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: TypeId::NONE,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    let deref_p = HirExpr::UnaryOp {
+        op: crate::ast::UnaryOp::Deref,
+        expr: Box::new(HirExpr::Ident(
+            "p".into(),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let innermost = HirExpr::Block(
+        vec![inner_def, HirStmt::Expression(Box::new(deref_p))],
+        TypeId::NONE,
+        Span::new(0, 0),
+    );
+    // Middle: { set x = 2; <innermost> }
+    let mid_def = HirStmt::VariableDef {
+        name: Some("x".into()),
+        value: Some(Box::new(make_int(2))),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: TypeId::NONE,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    let middle = HirExpr::Block(
+        vec![mid_def, HirStmt::Expression(Box::new(innermost))],
+        TypeId::NONE,
+        Span::new(0, 0),
+    );
+    let outer_stmt = HirStmt::Expression(Box::new(middle));
+
+    let result = ec.eval_block(&[def_x1, def_p, outer_stmt]);
+    assert!(
+        matches!(&result, Ok(ComptimeValue::Int(1))),
+        "expected *p == 1 through two levels of shadowing, got {:?}",
+        result,
+    );
+}
+
+#[test]
+fn test_eval_pointer_shadowing_while() {
+    // while i < 3 { set x = 99; i = i + 1 }
+    // with outer x and a pointer p = &x taken before the loop.
+    // *p should see outer x (unaffected by inner `set x = 99`).
+    let mut ctx = TypeContext::new();
+    let int32 = ctx.int(32, true);
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    // set x = 5 (outer)
+    let def_x = HirStmt::VariableDef {
+        name: Some("x".into()),
+        value: Some(Box::new(make_int_val(5, int32))),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: int32,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    // set i = 0
+    let def_i = HirStmt::VariableDef {
+        name: Some("i".into()),
+        value: Some(Box::new(make_int_val(0, int32))),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: int32,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    // set p = &x
+    let ref_x = HirExpr::UnaryOp {
+        op: crate::ast::UnaryOp::Ref,
+        expr: Box::new(HirExpr::Ident("x".into(), int32, Span::new(0, 0))),
+        ty: int32,
+        span: Span::new(0, 0),
+    };
+    let def_p = HirStmt::VariableDef {
+        name: Some("p".into()),
+        value: Some(Box::new(ref_x)),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: int32,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+
+    // while body: { set x = 99; i = i + 1 }
+    let i = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
+    let shadow_x = HirStmt::VariableDef {
+        name: Some("x".into()),
+        value: Some(Box::new(make_int_val(99, int32))),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: int32,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    let inc_i = HirStmt::Assign {
+        target: Box::new(i()),
+        value: Box::new(make_binop_ty(
+            i(),
+            BinOp::Add,
+            make_int_val(1, int32),
+            int32,
+        )),
+        op: None,
+        span: Span::new(0, 0),
+    };
+    let body = vec![shadow_x, inc_i];
+    let cond = make_binop_ty(i(), BinOp::Lt, make_int_val(3, int32), int32);
+    let while_stmt = HirStmt::While {
+        cond: Box::new(cond),
+        body,
+        invariant: None,
+        decreases: None,
+        span: Span::new(0, 0),
+    };
+
+    let _ = ec.eval_block(&[def_x, def_i, def_p, while_stmt]);
+    // After the loop, outer x should still be 5 (shadow was cleaned up)
+    assert!(
+        matches!(get_var(&ec, "x"), Some(ComptimeValue::Int(5))),
+        "expected outer x == 5 after while loop with shadowing, got {:?}",
+        get_var(&ec, "x"),
+    );
+    // *p should also be 5 (pointer to outer slot)
+    let deref_p = HirExpr::UnaryOp {
+        op: crate::ast::UnaryOp::Deref,
+        expr: Box::new(HirExpr::Ident(
+            "p".into(),
+            int32,
+            Span::new(0, 0),
+        )),
+        ty: int32,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&deref_p);
+    assert!(
+        matches!(r, Ok(ComptimeValue::Int(5))),
+        "expected *p == 5 after while loop, got {:?}",
+        r,
+    );
+}
+
+#[test]
+fn test_eval_pointer_shadowing_deref_after_block() {
+    // set x = 1; set p = &x; { set x = 2; }  *p  →  should be 1
+    let mut ctx = TypeContext::new();
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    // set x = 1
+    let def_x = HirStmt::VariableDef {
+        name: Some("x".into()),
+        value: Some(Box::new(make_int(1))),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: TypeId::NONE,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    // set p = &x
+    let ref_x = HirExpr::UnaryOp {
+        op: crate::ast::UnaryOp::Ref,
+        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let def_p = HirStmt::VariableDef {
+        name: Some("p".into()),
+        value: Some(Box::new(ref_x)),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: TypeId::NONE,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    // { set x = 2; }
+    let inner_var = HirStmt::VariableDef {
+        name: Some("x".into()),
+        value: Some(Box::new(make_int(2))),
+        pattern: None,
+        else_branch: None,
+        kind: VariableKind::Set,
+        ty: TypeId::NONE,
+        type_captures: vec![],
+        mutable: false,
+        span: Span::new(0, 0),
+    };
+    let block = HirExpr::Block(
+        vec![inner_var],
+        TypeId::NONE,
+        Span::new(0, 0),
+    );
+    let block_stmt = HirStmt::Expression(Box::new(block));
+
+    // Evaluate: declarations + block
+    let _ = ec.eval_block(&[def_x, def_p, block_stmt]);
+    // After block, *p should still be 1 (outer x restored, pointer slot valid)
+    let deref_p = HirExpr::UnaryOp {
+        op: crate::ast::UnaryOp::Deref,
+        expr: Box::new(HirExpr::Ident(
+            "p".into(),
+            TypeId::NONE,
+            Span::new(0, 0),
+        )),
+        ty: TypeId::NONE,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_expr(&deref_p);
+    assert!(
+        matches!(r, Ok(ComptimeValue::Int(1))),
+        "expected *p == 1 after block (shadow cleaned up), got {:?}",
+        r,
+    );
 }
 
 // ── Phase 14: Aggregate (struct/tuple/array) tests ────────────────
@@ -1359,14 +1835,15 @@ fn test_eval_pointer_index() {
             (Symbol::intern("[2]"), ComptimeValue::Int(300)),
         ],
     };
-    ec.variables.insert("arr".into(), arr.clone());
-
-    // Create a pointer to arr
+    // Create a pointer to arr — capture its slot ID.
+    let arr_slot = ec.allocate_slot();
+    ec.cur_slot.insert(Symbol::intern("arr"), arr_slot);
+    ec.variables.insert(arr_slot, arr.clone());
     let ptr = ComptimeValue::Pointer {
-        name: "arr".into(),
+        slot: arr_slot,
         mutable: false,
     };
-    ec.variables.insert("ptr".into(), ptr);
+    insert_var(&mut ec, "ptr", ptr);
 
     // ptr[1]
     let index = HirExpr::Index {
@@ -1521,7 +1998,7 @@ fn test_eval_variable_shadowing() {
     ));
     let mut diag = crate::diagnostics::DiagCtxt::new();
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
-    ec.variables.insert("x".into(), ComptimeValue::Int(10));
+    insert_var(&mut ec, "x", ComptimeValue::Int(10));
 
     // Inner block shadows x
     let inner = HirExpr::Block(
@@ -1542,7 +2019,7 @@ fn test_eval_variable_shadowing() {
     let _ = ec.eval_expr(&inner);
     // Outer x should still be 10 (block scoping prevents leaks)
     assert!(matches!(
-        ec.variables.get(&Symbol::intern("x")),
+        get_var(&ec, "x"),
         Some(ComptimeValue::Int(10))
     ));
 }
@@ -1754,8 +2231,8 @@ fn test_eval_while_neested() {
     ));
     let mut diag = crate::diagnostics::DiagCtxt::new();
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
-    ec.variables.insert("i".into(), ComptimeValue::Int(0));
-    ec.variables.insert("j".into(), ComptimeValue::Int(0));
+    insert_var(&mut ec, "i", ComptimeValue::Int(0));
+    insert_var(&mut ec, "j", ComptimeValue::Int(0));
     ec.memory_used = ComptimeValue::Int(0).memory_size() + ComptimeValue::Int(0).memory_size();
 
     let i = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
@@ -1803,7 +2280,7 @@ fn test_eval_while_neested() {
     };
     let _ = ec.eval_block(&[outer_while]);
     assert!(matches!(
-        ec.variables.get(&Symbol::intern("i")),
+        get_var(&ec, "i"),
         Some(ComptimeValue::Int(3))
     ));
 }

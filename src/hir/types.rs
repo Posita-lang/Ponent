@@ -699,6 +699,7 @@ impl TypeFactory {
         if can_cache {
             let type_map = self.type_map.borrow();
             if let Some(&id) = type_map.get(&data) {
+                drop(type_map); // ← release before borrowing types below
                 // Cache hit — return the existing Arc from the types vec.
                 let types = self.types.borrow();
                 return (id, types[id.index()].clone());
@@ -889,6 +890,13 @@ fn is_type_volatile_inner_by_id(ty: TypeId, types: Option<&Vec<Arc<TypeData>>>) 
                 }
                 _ => {} // Leaf types — handled by the caller.
             }
+        } else {
+            // The TypeId points to an index beyond the current arena.
+            // This can happen when `data` is externally constructed and
+            // its TypeId children haven't been allocated yet.  We cannot
+            // determine volatility without the referenced data, so be
+            // conservative: treat it as volatile (uncacheable).
+            return true;
         }
     }
     // Without the arena, conservatively assume not volatile.

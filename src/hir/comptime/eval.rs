@@ -6,10 +6,12 @@ use crate::hir::types::{TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
 
 use super::error::ComptimeError;
-use super::value::ComptimeValue;
+use super::value::{ComptimeValue, SlotId};
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::Arc;
 
 /// A registered comptime function: (parameter_names, body_statements).
@@ -105,40 +107,73 @@ fn check_range(result: i128, ty: TypeId, ctx: &TypeContext) -> Result<i128, Comp
     }
 }
 
-/// Pre-computed tuple field names for indices 0-63 to avoid `format!` allocations.
-const TUPLE_FIELD_NAMES: [&str; 64] = [
-    "_0", "_1", "_2", "_3", "_4", "_5", "_6", "_7", "_8", "_9", "_10", "_11", "_12", "_13", "_14",
-    "_15", "_16", "_17", "_18", "_19", "_20", "_21", "_22", "_23", "_24", "_25", "_26", "_27",
-    "_28", "_29", "_30", "_31", "_32", "_33", "_34", "_35", "_36", "_37", "_38", "_39", "_40",
-    "_41", "_42", "_43", "_44", "_45", "_46", "_47", "_48", "_49", "_50", "_51", "_52", "_53",
-    "_54", "_55", "_56", "_57", "_58", "_59", "_60", "_61", "_62", "_63",
-];
-/// Pre-computed array field names for indices 0-63 to avoid `format!` allocations.
-const ARRAY_FIELD_NAMES: [&str; 64] = [
-    "[0]", "[1]", "[2]", "[3]", "[4]", "[5]", "[6]", "[7]", "[8]", "[9]", "[10]", "[11]", "[12]",
-    "[13]", "[14]", "[15]", "[16]", "[17]", "[18]", "[19]", "[20]", "[21]", "[22]", "[23]", "[24]",
-    "[25]", "[26]", "[27]", "[28]", "[29]", "[30]", "[31]", "[32]", "[33]", "[34]", "[35]", "[36]",
-    "[37]", "[38]", "[39]", "[40]", "[41]", "[42]", "[43]", "[44]", "[45]", "[46]", "[47]", "[48]",
-    "[49]", "[50]", "[51]", "[52]", "[53]", "[54]", "[55]", "[56]", "[57]", "[58]", "[59]", "[60]",
-    "[61]", "[62]", "[63]",
-];
 /// Static payload field name to avoid allocation on every enum construction.
-const PAYLOAD_FIELD: &str = "payload";
+pub(crate) const PAYLOAD_FIELD: &str = "payload";
 
+/// Lazy-growing cache for tuple field names (e.g. `_0`, `_1`, …, `_N`).
+/// Avoids the `format!` allocation for indices ≥ 64 by memoizing each name
+/// on first access.  Thread-safe via `OnceLock<Mutex<Vec<Symbol>>>`; the
+/// lock is held only on cache misses, so repeated lookups of the same index
+/// are lock-free reads after the first miss.
 fn tuple_field_name(i: usize) -> Symbol {
+    // Fast path: pre-computed for indices 0–63 (common case for small tuples).
+    const PREFIX: [&str; 64] = [
+        "_0", "_1", "_2", "_3", "_4", "_5", "_6", "_7", "_8", "_9", "_10", "_11", "_12", "_13",
+        "_14", "_15", "_16", "_17", "_18", "_19", "_20", "_21", "_22", "_23", "_24", "_25", "_26",
+        "_27", "_28", "_29", "_30", "_31", "_32", "_33", "_34", "_35", "_36", "_37", "_38", "_39",
+        "_40", "_41", "_42", "_43", "_44", "_45", "_46", "_47", "_48", "_49", "_50", "_51", "_52",
+        "_53", "_54", "_55", "_56", "_57", "_58", "_59", "_60", "_61", "_62", "_63",
+    ];
     if i < 64 {
-        Symbol::intern(TUPLE_FIELD_NAMES[i])
-    } else {
-        Symbol::intern(&format!("_{}", i))
+        return Symbol::intern(PREFIX[i]);
     }
+    // Slow path: lazily-grown cache for large indices.
+    static CACHE: OnceLock<Mutex<Vec<Symbol>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = cache.lock().unwrap();
+    if i < guard.len() {
+        return guard[i];
+    }
+    let name = Symbol::intern(&format!("_{}", i));
+    guard.push(name);
+    name
 }
 
+/// Lazy-growing cache for array field names (e.g. `[0]`, `[1]`, …, `[N]`).
+/// Same design as `tuple_field_name`.
 fn array_field_name(i: usize) -> Symbol {
+    // Fast path: pre-computed for indices 0–63.
+    const PREFIX: [&str; 64] = [
+        "[0]", "[1]", "[2]", "[3]", "[4]", "[5]", "[6]", "[7]", "[8]", "[9]", "[10]", "[11]",
+        "[12]", "[13]", "[14]", "[15]", "[16]", "[17]", "[18]", "[19]", "[20]", "[21]", "[22]",
+        "[23]", "[24]", "[25]", "[26]", "[27]", "[28]", "[29]", "[30]", "[31]", "[32]", "[33]",
+        "[34]", "[35]", "[36]", "[37]", "[38]", "[39]", "[40]", "[41]", "[42]", "[43]", "[44]",
+        "[45]", "[46]", "[47]", "[48]", "[49]", "[50]", "[51]", "[52]", "[53]", "[54]", "[55]",
+        "[56]", "[57]", "[58]", "[59]", "[60]", "[61]", "[62]", "[63]",
+    ];
     if i < 64 {
-        Symbol::intern(ARRAY_FIELD_NAMES[i])
-    } else {
-        Symbol::intern(&format!("[{}]", i))
+        return Symbol::intern(PREFIX[i]);
     }
+    // Slow path: lazily-grown cache for large indices.
+    static CACHE: OnceLock<Mutex<Vec<Symbol>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = cache.lock().unwrap();
+    if i < guard.len() {
+        return guard[i];
+    }
+    let name = Symbol::intern(&format!("[{}]", i));
+    guard.push(name);
+    name
+}
+
+/// Check if a block's statements are all pure expressions (no side effects).
+/// Used to refine `is_pure_expr` for `Block` and `If` branches.
+fn is_pure_block(stmts: &[HirStmt]) -> bool {
+    stmts.iter().all(|stmt| match stmt {
+        HirStmt::Expression(expr) => is_pure_expr(expr),
+        // VariableDef, Assign, While, and other statement kinds have side effects.
+        _ => false,
+    })
 }
 
 /// Check if a HirExpr is a pure computation with no side effects.
@@ -159,14 +194,22 @@ fn is_pure_expr(expr: &HirExpr) -> bool {
                 && is_pure_expr(left)
                 && is_pure_expr(right)
         }
-        HirExpr::UnaryOp { op, .. } => {
+        HirExpr::UnaryOp { op, expr, .. } => {
+            // Ref/RefMut, Deref, etc. have side effects (capturing/accessing state).
             matches!(op, crate::ast::UnaryOp::Not | crate::ast::UnaryOp::Neg)
+                && is_pure_expr(expr)
         }
-        // Block and If may contain statements with side effects
-        // (assignments, function calls).  Conservatively mark them
-        // as impure so the "unused expression result" warning
-        // doesn't fire for potentially side-effecting code.
-        HirExpr::Block(..) | HirExpr::If { .. } => false,
+        HirExpr::Block(stmts, ..) => is_pure_block(stmts),
+        HirExpr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            is_pure_expr(cond)
+                && is_pure_block(then_branch)
+                && else_branch.as_ref().map_or(true, |b| is_pure_block(b))
+        }
         HirExpr::Tuple(..) => true,
         HirExpr::Array(..) => true,
         HirExpr::StructLit { .. } => true,
@@ -198,8 +241,16 @@ pub struct ComptimeEvalContext<'a> {
     hir_program: Option<&'a HirProgram>,
     /// The symbol table, used for name resolution.
     symbols: &'a SymbolTable,
-    /// Local variable bindings within the current comptime block.
-    pub variables: HashMap<Symbol, ComptimeValue>,
+    /// Variable storage: each comptime variable gets a unique `SlotId`.
+    /// The slot ID stays the same for the lifetime of the binding, so pointers
+    /// (which hold `SlotId`) are immune to variable shadowing.
+    pub variables: HashMap<SlotId, ComptimeValue>,
+    /// Maps variable name → current slot ID for name-based lookups (e.g. `Ident`).
+    /// When a `VariableDef` shadows an outer variable, this is updated to point
+    /// to the new slot; the old slot remains in `variables` until the scope exits.
+    pub cur_slot: HashMap<Symbol, SlotId>,
+    /// Monotonic counter for allocating unique `SlotId` values.
+    next_slot: u32,
     /// Registry of comptime functions: name → (param_names, body).
     /// Populated by the checker as it encounters comptime function definitions.
     fn_registry: HashMap<Symbol, ComptimeFn>,
@@ -214,14 +265,14 @@ pub struct ComptimeEvalContext<'a> {
     /// Whether the current comptime block is `@trusted`, granting access to
     /// `@trusted` functions and `unsafe` operations during comptime evaluation.
     allow_trusted: bool,
-    /// When set, records the name → original value of any variable that is
+    /// When set, records the name → original `SlotId` of any variable that is
     /// shadowed via `VariableDef` (not `Assign`) inside a scoped block
-    /// (e.g. while body).  After the block exits, these variables are
-    /// restored to their pre-block values to distinguish shadowing from
-    /// modification.  Using a HashMap (rather than cloning the entire
-    /// variables map) means only the values of actually-shadowed variables
+    /// (e.g. while body).  After the block exits, `cur_slot` is restored to
+    /// point to the original slot ID for each shadowed name, so that subsequent
+    /// name-based lookups (e.g. `i = i + 1`) find the outer binding again.
+    /// Using a HashMap means only the slot IDs of actually-shadowed variables
     /// are stored — O(k) instead of O(n) per iteration.
-    scope_shadows: Vec<HashMap<Symbol, ComptimeValue>>,
+    scope_shadows: Vec<HashMap<Symbol, SlotId>>,
 }
 
 impl<'a> ComptimeEvalContext<'a> {
@@ -246,6 +297,8 @@ impl<'a> ComptimeEvalContext<'a> {
             memory_used: 0,
             memory_limit: 10 * 1024 * 1024,
             variables: HashMap::new(),
+            cur_slot: HashMap::new(),
+            next_slot: 0,
             fn_registry: HashMap::new(),
             call_stack: Vec::new(),
             outer_traceback,
@@ -275,6 +328,27 @@ impl<'a> ComptimeEvalContext<'a> {
     /// Set a custom memory limit in bytes (for testing).
     pub fn set_memory_limit(&mut self, limit: usize) {
         self.memory_limit = limit;
+    }
+
+    /// Allocate a new unique `SlotId` for a variable.
+    pub fn allocate_slot(&mut self) -> SlotId {
+        let id = self.next_slot;
+        self.next_slot = self.next_slot.saturating_add(1);
+        SlotId(id)
+    }
+
+    /// Remove all variables whose slots were created at or after
+    /// `next_slot_at_entry`, adjusting `memory_used` accordingly.
+    /// Since `SlotId` is monotonic, this is O(m) where m = number of
+    /// new slots — the set of "new" slots since that point is exactly
+    /// `[next_slot_at_entry, self.next_slot)`.
+    fn remove_new_slots_since(&mut self, next_slot_at_entry: u32) {
+        for slot_id in next_slot_at_entry..self.next_slot {
+            let slot = SlotId(slot_id);
+            if let Some(val) = self.variables.remove(&slot) {
+                self.memory_used = self.memory_used.saturating_sub(val.memory_size());
+            }
+        }
     }
 
     /// Emit a comptime diagnostic via the diagnostic context.
@@ -483,35 +557,39 @@ impl<'a> ComptimeEvalContext<'a> {
     }
 
     /// Track memory usage when adding or replacing a variable.
+    /// If `slot` is `Some`, subtracts the old value's memory from that slot
+    /// (for updates/assignments).  If `None`, skips subtraction (new variable).
     /// Returns `Err(SandboxViolation)` if the memory limit would be exceeded.
     fn track_variable_memory(
         &mut self,
-        name: &Symbol,
+        slot: Option<&SlotId>,
         new_val: &ComptimeValue,
     ) -> Result<(), ComptimeError> {
-        // Subtract old value's memory if it exists.
-        if let Some(old) = self.variables.get(name) {
-            let old_size = old.memory_size();
-            // In debug builds, catch accounting errors where memory_used
-            // is less than the old value's size.  Only assert when
-            // memory_used > 0, since direct HashMap inserts (e.g. in tests)
-            // bypass tracking and leave memory_used at 0.
-            debug_assert!(
-                self.memory_used == 0 || self.memory_used >= old_size,
-                "memory accounting error: memory_used ({}) < old value size ({}) for variable `{}`",
-                self.memory_used,
-                old_size,
-                name,
-            );
-            // In release builds the assertion is stripped, so we use
-            // checked_sub to detect the same accounting bug and surface it
-            // as a hard error rather than silently lying about memory usage.
-            self.memory_used = self.memory_used
-                .checked_sub(old_size)
-                .ok_or_else(|| ComptimeError::Internal(format!(
-                    "memory accounting error: memory_used ({}) < old value size ({}) for variable `{}`",
-                    self.memory_used, old_size, name,
-                )))?;
+        // Subtract old value's memory if a slot is provided and it exists.
+        if let Some(slot) = slot {
+            if let Some(old) = self.variables.get(slot) {
+                let old_size = old.memory_size();
+                // In debug builds, catch accounting errors where memory_used
+                // is less than the old value's size.  Only assert when
+                // memory_used > 0, since direct HashMap inserts (e.g. in tests)
+                // bypass tracking and leave memory_used at 0.
+                debug_assert!(
+                    self.memory_used == 0 || self.memory_used >= old_size,
+                    "memory accounting error: memory_used ({}) < old value size ({}) for slot {:?}",
+                    self.memory_used,
+                    old_size,
+                    slot,
+                );
+                // In release builds the assertion is stripped, so we use
+                // checked_sub to detect the same accounting bug and surface it
+                // as a hard error rather than silently lying about memory usage.
+                self.memory_used = self.memory_used
+                    .checked_sub(old_size)
+                    .ok_or_else(|| ComptimeError::Internal(format!(
+                        "memory accounting error: memory_used ({}) < old value size ({}) for slot {:?}",
+                        self.memory_used, old_size, slot,
+                    )))?;
+            }
         }
         let new_size = new_val.memory_size();
         let new_total = self.memory_used.saturating_add(new_size);
@@ -536,6 +614,13 @@ impl<'a> ComptimeEvalContext<'a> {
         let mut result = ComptimeValue::Unit;
         let len = stmts.len();
         for (i, stmt) in stmts.iter().enumerate() {
+            // Count each statement toward the step limit, so a block with 10 000
+            // straight-line statements (no loops, no function calls) does not
+            // bypass the sandbox.
+            self.steps = self.steps.saturating_add(1);
+            if self.steps >= self.step_limit {
+                return Err(ComptimeError::StepLimitExceeded);
+            }
             match stmt {
                 HirStmt::Expression(expr) => {
                     // Warn about unused pure expressions in comptime blocks.
@@ -562,18 +647,22 @@ impl<'a> ComptimeEvalContext<'a> {
                         }
                     };
                     if let Some(n) = name {
+                        // Allocate a new slot for this variable definition.
+                        // Even if the name shadows an existing variable, the new
+                        // slot ensures that pointers to the old slot remain valid.
+                        let slot = self.allocate_slot();
                         // Track shadowing: if we're inside a scoped block (while body)
-                        // and this `set` overwrites an outer variable, record it so
-                        // the outer value can be restored after the block exits.
-                        // Also save the original value to avoid cloning the entire
-                        // variables map later — only O(k) for actually-shadowed vars.
+                        // and this `set` shadows an outer variable, record the old
+                        // slot ID so `cur_slot` can be restored after the block exits.
                         if let Some(shadows) = self.scope_shadows.last_mut() {
-                            if let Some(orig) = self.variables.get(n) {
-                                shadows.entry(*n).or_insert_with(|| orig.clone());
+                            if let Some(&old_slot) = self.cur_slot.get(n) {
+                                shadows.entry(*n).or_insert(old_slot);
                             }
                         }
-                        self.track_variable_memory(n, &val)?;
-                        self.variables.insert(n.clone(), val.clone());
+                        // Memory tracking: new slot, no old value to subtract.
+                        self.track_variable_memory(None, &val)?;
+                        self.cur_slot.insert(*n, slot);
+                        self.variables.insert(slot, val.clone());
                         result = val;
                     } else {
                         return Err(ComptimeError::not_allowed(
@@ -589,12 +678,16 @@ impl<'a> ComptimeEvalContext<'a> {
                 } => {
                     let val = self.eval_expr(value)?;
                     if let HirExpr::Ident(name, _, _) = target.as_ref() {
-                        if self.variables.contains_key(name) {
-                            self.track_variable_memory(name, &val)?;
-                            self.variables.insert(name.clone(), val.clone());
-                            result = val;
-                        } else {
-                            return Err(ComptimeError::UnknownIdentifier(name.as_str()));
+                        // Assignment to a named variable: look up its current slot.
+                        match self.cur_slot.get(name) {
+                            Some(&slot) => {
+                                self.track_variable_memory(Some(&slot), &val)?;
+                                self.variables.insert(slot, val.clone());
+                                result = val;
+                            }
+                            None => {
+                                return Err(ComptimeError::UnknownIdentifier(name.as_str()));
+                            }
                         }
                     } else if let HirExpr::UnaryOp {
                         op: crate::ast::UnaryOp::Deref,
@@ -605,15 +698,15 @@ impl<'a> ComptimeEvalContext<'a> {
                         // *ptr = val — assign through a comptime pointer.
                         let ptr_val = self.eval_expr(ptr_expr)?;
                         match ptr_val {
-                            ComptimeValue::Pointer { name, mutable, .. } => {
+                            ComptimeValue::Pointer { slot, mutable, .. } => {
                                 if !mutable {
                                     return Err(ComptimeError::not_allowed(
                                         "cannot assign through an immutable pointer; \
                                          use `&mut` to create a mutable reference",
                                     ));
                                 }
-                                self.track_variable_memory(&name, &val)?;
-                                self.variables.insert(name, val.clone());
+                                self.track_variable_memory(Some(&slot), &val)?;
+                                self.variables.insert(slot, val.clone());
                                 result = val;
                             }
                             _ => {
@@ -643,29 +736,21 @@ impl<'a> ComptimeEvalContext<'a> {
                                 // the body (set x = 1) must not leak to subsequent
                                 // iterations or to code after the loop.  Modifications
                                 // to outer variables (e.g. i = i + 1) are preserved.
-                                let saved_keys: std::collections::HashSet<Symbol> =
-                                    self.variables.keys().copied().collect();
-                                let saved_mem = self.memory_used;
-                                self.scope_shadows.push(std::collections::HashMap::new());
+                                let next_slot_at_entry = self.next_slot;
+                                self.scope_shadows.push(HashMap::new());
                                 self.eval_block(body)?;
-                                // Restore variables that were shadowed by `set` (VariableDef)
-                                // inside the body — they should not persist beyond the loop.
-                                // Original values were saved at shadow-time (O(k) for k
-                                // shadowed vars, not O(n) for all variables).
+                                // Restore `cur_slot` for variables that were shadowed
+                                // by `set` (VariableDef) inside the body — name-based
+                                // lookups should find the outer slot again.
                                 if let Some(shadows) = self.scope_shadows.last() {
-                                    for (name, orig) in shadows {
-                                        self.variables.insert(*name, orig.clone());
+                                    for (name, &old_slot) in shadows {
+                                        self.cur_slot.insert(*name, old_slot);
                                     }
                                 }
                                 self.scope_shadows.pop();
-                                self.variables.retain(|k, _| saved_keys.contains(k));
-                                // Recompute memory from retained variables to correctly
-                                // account for size changes in modified outer variables
-                                // (e.g. i = i + 1 changes i's value and thus its memory).
-                                // A full sum is O(k) per iteration, which is acceptable
-                                // relative to the O(k) retain operation above.
-                                self.memory_used =
-                                    self.variables.values().map(|v| v.memory_size()).sum();
+                                // Remove any new slots created inside the body
+                                // (O(m) where m = new slots, vs O(n) for retain).
+                                self.remove_new_slots_since(next_slot_at_entry);
                             }
                             ComptimeValue::Bool(false) => break,
                             ComptimeValue::Float(_) => {
@@ -728,14 +813,11 @@ impl<'a> ComptimeEvalContext<'a> {
                 // inside the block must not leak to the outer scope, but
                 // modifications to existing variables (e.g. through pointers)
                 // must be preserved.
-                let saved_keys: std::collections::HashSet<Symbol> =
-                    self.variables.keys().copied().collect();
-                let saved_mem = self.memory_used;
+                let next_slot_at_entry = self.next_slot;
+                let saved_cur_slot = self.cur_slot.clone();
                 let result = self.eval_block(stmts);
-                self.variables.retain(|k, _| saved_keys.contains(k));
-                // Recompute memory from retained variables to correctly account
-                // for size changes in modified existing variables (e.g. *ptr = val).
-                self.memory_used = self.variables.values().map(|v| v.memory_size()).sum();
+                self.remove_new_slots_since(next_slot_at_entry);
+                self.cur_slot = saved_cur_slot;
                 result
             }
             HirExpr::BinaryOp {
@@ -875,23 +957,26 @@ impl<'a> ComptimeEvalContext<'a> {
                     crate::ast::UnaryOp::Ref | crate::ast::UnaryOp::RefMut => {
                         // &expr / &mut expr — create a comptime pointer.
                         // Evaluate the expression to ensure it exists, then
-                        // store it and return a pointer.
+                        // store it and return a pointer with the slot ID.
                         let val = self.eval_expr(expr)?;
-                        let name = match expr.as_ref() {
-                            HirExpr::Ident(n, _, _) => *n,
+                        let slot = match expr.as_ref() {
+                            HirExpr::Ident(n, _, _) => {
+                                // Look up the current slot for this variable.
+                                *self.cur_slot.get(n).ok_or_else(|| {
+                                    ComptimeError::type_error(format!(
+                                        "cannot take reference of unknown variable `{}`",
+                                        n.as_str(),
+                                    ))
+                                })?
+                            }
                             _ => {
                                 return Err(ComptimeError::type_error(
                                     "comptime references can only be taken of simple variables",
                                 ));
                             }
                         };
-                        // Store the value in variables so deref can find it.
-                        // This intentionally re-inserts the value under the same name,
-                        // which is fine because the value is identical — the purpose
-                        // is to make it available for subsequent `*ptr` dereference.
-                        self.variables.insert(name, val.clone());
                         Ok(ComptimeValue::Pointer {
-                            name,
+                            slot,
                             mutable: *op == crate::ast::UnaryOp::RefMut,
                         })
                     }
@@ -899,18 +984,19 @@ impl<'a> ComptimeEvalContext<'a> {
                         // *ptr — dereference a comptime pointer.
                         let ptr_val = self.eval_expr(expr)?;
                         match ptr_val {
-                            ComptimeValue::Pointer { name, mutable, .. } => {
-                                // Look up the current variable value, so that
-                                // mutations made after taking the reference are
-                                // visible through the dereference.
-                                match self.variables.get(&name) {
+                            ComptimeValue::Pointer { slot, mutable, .. } => {
+                                // Look up the current value by slot ID, so that
+                                // shadowing (same name, inner scope) does NOT
+                                // affect pointer dereference.
+                                match self.variables.get(&slot) {
                                     Some(val) => Ok(val.clone()),
                                     None => Err(ComptimeError::type_error(format!(
-                                        "dereferenced pointer to `{}` points to a variable \
-                                         that went out of scope (use-after-scope); \
-                                         comptime pointers are tied to the variable's \
-                                         lifetime in the current scope",
-                                        name,
+                                        "dereferenced pointer to slot {:?} \
+                                         points to a variable that went out of \
+                                         scope (use-after-scope); comptime pointers \
+                                         are tied to the variable's lifetime in \
+                                         the current scope",
+                                        slot,
                                     ))),
                                 }
                             }
@@ -968,9 +1054,11 @@ impl<'a> ComptimeEvalContext<'a> {
                 }
             }
             HirExpr::Ident(name, _ty, _span) => {
-                // 1. Check local variables first.
-                if let Some(val) = self.variables.get(name) {
-                    return Ok(val.clone());
+                // 1. Check local variables first via the name→slot mapping.
+                if let Some(&slot) = self.cur_slot.get(name) {
+                    if let Some(val) = self.variables.get(&slot) {
+                        return Ok(val.clone());
+                    }
                 }
                 // 2. Check if the name is a zero-argument comptime function
                 //    (e.g. `comptime def N() -> Int<32> { 5 }` referenced as `N`).
@@ -1090,11 +1178,33 @@ impl<'a> ComptimeEvalContext<'a> {
                                 arg_vals.len(),
                             )));
                         }
-                        // Save the current variable scope and bind parameters.
+                        // Save the current variable scope (caller's variables and
+                        // cur_slot) so the function body runs in isolation.
                         let saved = std::mem::take(&mut self.variables);
-                        for (param, val) in params.iter().zip(arg_vals.into_iter()) {
-                            self.variables.insert(param.clone(), val);
-                        }
+                        let saved_cur_slot = std::mem::take(&mut self.cur_slot);
+                        let saved_memory = self.memory_used;
+                        // Bind parameters into the now-empty scope.
+                        // If any parameter's memory check fails, restore the outer
+                        // state before propagating the error so the evaluator is
+                        // never left with empty maps after a partial bind.
+                        let bind_result: Result<(), ComptimeError> = (|| {
+                            for (param, val) in params.iter().zip(arg_vals.into_iter()) {
+                                let slot = self.allocate_slot();
+                                self.cur_slot.insert(*param, slot);
+                                self.track_variable_memory(None, &val)?;
+                                self.variables.insert(slot, val);
+                            }
+                            Ok(())
+                        })();
+                        let saved = match bind_result {
+                            Ok(()) => saved,
+                            Err(e) => {
+                                self.variables = saved;
+                                self.cur_slot = saved_cur_slot;
+                                self.memory_used = saved_memory;
+                                return Err(e);
+                            }
+                        };
                         // Push call stack entry for traceback.
                         self.call_stack
                             .push((fn_name, ComptimeReason::ComptimeFnCall, *span));
@@ -1102,8 +1212,10 @@ impl<'a> ComptimeEvalContext<'a> {
                         let result = self.eval_block(&body);
                         // Pop call stack entry.
                         self.call_stack.pop();
-                        // Restore the previous variable scope.
+                        // Restore the previous variable scope and memory accounting.
                         self.variables = saved;
+                        self.cur_slot = saved_cur_slot;
+                        self.memory_used = saved_memory;
                         result
                     } else if self.symbols.lookup_function(fn_name).is_some() {
                         // Known function but not a comptime function.
@@ -1226,14 +1338,14 @@ impl<'a> ComptimeEvalContext<'a> {
                     }
                 };
                 match base_val {
-                    ComptimeValue::Pointer { name, .. } => {
-                        // ptr[i] — access element through a pointer.
-                        let arr = self.variables.get(&name).ok_or_else(|| {
+                    ComptimeValue::Pointer { slot, .. } => {
+                        // ptr[i] — access element through a pointer by slot ID.
+                        let arr = self.variables.get(&slot).ok_or_else(|| {
                             ComptimeError::type_error(format!(
-                                "pointer to `{}` points to a variable that went out of \
+                                "pointer to slot {:?} points to a variable that went out of \
                                  scope (use-after-scope) — comptime pointers are tied to \
                                  the variable's lifetime in the current scope",
-                                name,
+                                slot,
                             ))
                         })?;
                         if let ComptimeValue::Aggregate { fields } = arr {

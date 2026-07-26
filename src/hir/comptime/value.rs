@@ -4,6 +4,16 @@ use crate::hir::types::TypeId;
 use crate::symbol::Symbol;
 use std::sync::Arc;
 
+/// A unique identifier for a comptime variable slot.
+///
+/// Each `VariableDef` in the comptime evaluator creates a new `SlotId`,
+/// even when the variable name shadows an outer one.  `ComptimeValue::Pointer`
+/// stores the slot ID rather than the variable name, so dereferencing a pointer
+/// always resolves to the *original* variable even if a same-named variable
+/// shadows it in an inner scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SlotId(pub u32);
+
 /// The result of evaluating a comptime expression.
 #[derive(Debug, Clone)]
 pub enum ComptimeValue {
@@ -24,10 +34,10 @@ pub enum ComptimeValue {
     /// A layout descriptor (returned by `layout_of!`).
     LayoutDescriptor(Box<LayoutDescriptor>),
     /// A comptime pointer value (created by `&x` / `&mut x`).
+    /// Holds a `SlotId` (not a name), so dereference is immune to
+    /// variable shadowing: `*p` always finds the slot that `&x` captured.
     /// `mutable` indicates whether the reference is `&mut` (can be written through).
-    /// Dereference and index operations always read the current value from the
-    /// evaluator's variable table, not from a snapshot stored in the pointer.
-    Pointer { name: Symbol, mutable: bool },
+    Pointer { slot: SlotId, mutable: bool },
     /// A comptime aggregate value: struct, tuple, or array.
     /// Fields are named for structs, positional for tuples/arrays.
     Aggregate {
@@ -52,19 +62,11 @@ impl ComptimeValue {
             ComptimeValue::Bool(_) => 1,
             ComptimeValue::Int(_) => 16,  // i128
             ComptimeValue::Float(_) => 8, // f64
-            // Arc<str>: metadata (16 B) + string content length.
-            // Including the content prevents large strings from
-            // trivially bypassing the memory limit.  Over-counting
-            // across shared Arcs is acceptable for a limit that
-            // only needs to be approximate.
-            ComptimeValue::String(s) => {
-                // Arc<str>: metadata (16 B) + string content length.
-                // Including the content prevents large strings from
-                // trivially bypassing the memory limit.  Over-counting
-                // across shared Arcs is acceptable for a limit that
-                // only needs to be approximate.
-                16 + s.len()
-            }
+            // Arc<str>: ArcInner header (strong 8 B + weak 8 B + length 8 B = 24 B)
+            // + string content length.  Including the content prevents large
+            // strings from trivially bypassing the memory limit.  Over-counting
+            // across shared Arcs is acceptable for an approximate limit.
+            ComptimeValue::String(s) => 24 + s.len(),
             ComptimeValue::Type(_) => 8, // TypeId
             ComptimeValue::TypeInfo(info) => {
                 let mut size = 64; // TypeInfo struct overhead
@@ -86,7 +88,7 @@ impl ComptimeValue {
                 }
                 size
             }
-            ComptimeValue::Pointer { .. } => 16, // name (Symbol) + mutable (bool)
+            ComptimeValue::Pointer { .. } => 8, // slot (SlotId/u32) + mutable (bool)
             ComptimeValue::Aggregate { fields } => {
                 let mut size = 32; // Vec overhead
                 // Field names are Symbol (u32, Copy), zero-cost to clone.

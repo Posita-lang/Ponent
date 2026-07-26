@@ -386,7 +386,7 @@ pub fn is_provably_reachable(attr: &Attribute, strict_mode: bool, diag: &mut Dia
         }
     }
 
-    solver.solve().is_some()
+    solver.solve().is_sat()
 }
 
 /// Build a list of CNF clauses from a cfg expression.
@@ -901,7 +901,7 @@ mod tests {
             solver.add_at_most_one(group);
         }
         assert!(
-            solver.solve().is_none(),
+            solver.solve().is_unsat(),
             "all(target_arch = \"x86_64\", target_arch = \"aarch64\") \
              should be UNSATISFIABLE: x86_64 and aarch64 are mutually exclusive"
         );
