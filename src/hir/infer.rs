@@ -965,9 +965,15 @@ pub struct InferenceContext {
     /// Current snapshot nesting depth.  0 = no snapshot open.
     snapshot_depth: usize,
     /// Stack of snapshot states: for each open snapshot, records the
-    /// `resolved_ids` length, `resolved_set`, and `dirty_set` so they
-    /// can be restored on rollback (not covered by the undo log).
-    resolved_snapshot_stack: Vec<(usize, FxHashSet<usize>, std::collections::HashSet<usize>)>,
+    /// `resolved_ids` length, `resolved_set`, `dirty_set`, and
+    /// `pool_undo_log` length so they can be restored on rollback
+    /// (not covered by the main undo log).
+    resolved_snapshot_stack: Vec<(
+        usize,
+        FxHashSet<usize>,
+        std::collections::HashSet<usize>,
+        usize,
+    )>,
 }
 
 // ── Test accessors ────────────────────────────────────────────────
@@ -995,6 +1001,9 @@ impl InferenceContext {
         let mut heap = std::collections::BinaryHeap::new();
         self.wake_var_incremental(var_id, &mut heap, ctx);
         heap.len()
+    }
+    pub(crate) fn resolutions(&self) -> &[Option<TypeId>] {
+        &self.resolutions
     }
 }
 
@@ -1149,7 +1158,7 @@ impl InferenceContext {
     ///
     /// This must be used instead of bare `ctx.unify()` inside the solver loop
     /// whenever one of the sides is an InferVar owned by this context.
-    fn unify_and_track(
+    pub(crate) fn unify_and_track(
         &mut self,
         a: TypeId,
         b: TypeId,
@@ -1321,6 +1330,10 @@ impl InferenceContext {
 
         // Bind the old variable to the new one (promotion)
         if var_id < self.resolutions.len() {
+            self.push_undo(InferUndoLog::SetResolution(
+                var_id,
+                self.resolutions[var_id],
+            ));
             self.resolutions[var_id] = Some(new_ty_id);
         }
         Some(new_ty_id)
@@ -2171,6 +2184,7 @@ impl InferenceContext {
             self.resolved_ids.len(),
             self.resolved_set.clone(),
             self.dirty_set.clone(),
+            self.region_tree.pool_undo_log.len(),
         ));
         self.undo_log.len()
     }
@@ -2181,11 +2195,46 @@ impl InferenceContext {
             let undo = self.undo_log.pop().unwrap();
             self.reverse(undo);
         }
-        // Restore resolved_ids/resolved_set/dirty_set from snapshot stack.
-        if let Some((ids_len, set, dirty)) = self.resolved_snapshot_stack.pop() {
+        // Restore resolved_ids/resolved_set/dirty_set from snapshot stack,
+        // and roll back pool mutations that were made inside this snapshot.
+        if let Some((ids_len, set, dirty, pool_len)) = self.resolved_snapshot_stack.pop() {
             self.resolved_ids.truncate(ids_len);
             self.resolved_set = set;
             self.dirty_set = dirty;
+            // Roll back only pool entries added since this snapshot was opened,
+            // then truncate to preserve entries from outer snapshots.
+            while self.region_tree.pool_undo_log.len() > pool_len {
+                let entry = self.region_tree.pool_undo_log.pop().unwrap();
+                match entry {
+                    PoolUndoEntry::Register {
+                        region_idx,
+                        var_id,
+                        kind,
+                    } => {
+                        if region_idx < self.region_tree.nodes.len() {
+                            match kind {
+                                RegisterKind::Var => {
+                                    self.region_tree.nodes[region_idx]
+                                        .pool
+                                        .var_ids
+                                        .retain(|&v| v != var_id);
+                                }
+                                RegisterKind::RigidVar => {
+                                    self.region_tree.nodes[region_idx]
+                                        .pool
+                                        .rigid_var_ids
+                                        .retain(|&v| v != var_id);
+                                }
+                            }
+                        }
+                    }
+                    PoolUndoEntry::Unregister { region_idx, var_id } => {
+                        if region_idx < self.region_tree.nodes.len() {
+                            self.region_tree.nodes[region_idx].pool.var_ids.push(var_id);
+                        }
+                    }
+                }
+            }
         }
         self.snapshot_depth -= 1;
     }

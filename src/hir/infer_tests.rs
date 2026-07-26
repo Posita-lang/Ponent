@@ -1598,3 +1598,221 @@ fn test_forall_skolem_subtype_concrete_rejected() {
         result,
     );
 }
+
+// ── Undo / Rollback Tests ──
+
+#[test]
+fn test_try_promote_var_resolution_rollback() {
+    let mut ctx = new_ctx();
+    let mut infer = new_infer();
+    let root = infer.region_tree.root;
+
+    // Create a variable in a child region.
+    let _p = infer.enter_level();
+    let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let id = infer_var_id(&ctx, var);
+
+    // resolutions[id] should be None initially.
+    assert!(
+        infer.resolutions().get(id).copied().flatten().is_none(),
+        "resolution should be None before promotion",
+    );
+
+    // Open a snapshot, promote, verify resolution was set.
+    let snap = infer.start_snapshot();
+    let promoted = infer.try_promote_var(&mut ctx, id, root);
+    assert!(promoted.is_some(), "promotion should succeed");
+    assert!(
+        infer.resolutions()[id].is_some(),
+        "resolution should be set after promotion",
+    );
+
+    // Rollback — resolution should revert to None.
+    infer.rollback_to(snap);
+    assert!(
+        infer.resolutions().get(id).copied().flatten().is_none(),
+        "resolution should be restored to None after rollback",
+    );
+}
+
+#[test]
+fn test_pool_undo_via_rollback_to() {
+    let mut ctx = new_ctx();
+    let mut infer = new_infer();
+    let root = infer.region_tree.root;
+
+    let root_pool_before = infer.region_tree.nodes[root.0].pool.var_ids.len();
+
+    // Create variables inside a snapshot — they register into the root pool.
+    let snap = infer.start_snapshot();
+    let v1 = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let v2 = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let id1 = infer_var_id(&ctx, v1);
+    let id2 = infer_var_id(&ctx, v2);
+    assert!(
+        infer.region_tree.nodes[root.0].pool.var_ids.contains(&id1),
+        "v1 should be in root pool during snapshot",
+    );
+    assert!(
+        infer.region_tree.nodes[root.0].pool.var_ids.contains(&id2),
+        "v2 should be in root pool during snapshot",
+    );
+
+    // Rollback — pool should revert to pre-snapshot state.
+    infer.rollback_to(snap);
+    assert_eq!(
+        infer.region_tree.nodes[root.0].pool.var_ids.len(),
+        root_pool_before,
+        "pool should have no entries from the rolled-back snapshot",
+    );
+    assert!(
+        !infer.region_tree.nodes[root.0].pool.var_ids.contains(&id1),
+        "v1 should not be in root pool after rollback",
+    );
+    assert!(
+        !infer.region_tree.nodes[root.0].pool.var_ids.contains(&id2),
+        "v2 should not be in root pool after rollback",
+    );
+}
+
+#[test]
+fn test_unify_resolution_undo() {
+    let mut ctx = new_ctx();
+    let mut infer = new_infer();
+
+    // Create two inference variables.
+    let a = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let b = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let id_a = infer_var_id(&ctx, a);
+    let id_b = infer_var_id(&ctx, b);
+
+    // resolutions should be None for both.
+    assert!(
+        infer.resolutions()[id_a].is_none(),
+        "resolution for a should be None initially",
+    );
+    assert!(
+        infer.resolutions()[id_b].is_none(),
+        "resolution for b should be None initially",
+    );
+
+    // Open a snapshot, unify a with Bool.
+    let snap = infer.start_snapshot();
+    let result = infer.unify(a, ctx.bool(), &mut ctx);
+    assert!(result.is_ok(), "unify a with Bool should succeed");
+
+    let resolved_id_a = infer.resolutions()[id_a];
+    assert!(
+        resolved_id_a.is_some(),
+        "resolution for a should be set after unify",
+    );
+
+    // Rollback — resolution for a should revert to None.
+    infer.rollback_to(snap);
+    assert!(
+        infer.resolutions()[id_a].is_none(),
+        "resolution for a should be None after rollback",
+    );
+    assert!(
+        infer.resolutions()[id_b].is_none(),
+        "resolution for b should remain None after rollback",
+    );
+
+    // Verify binding is also rolled back at the TypeContext level.
+    assert_eq!(
+        ctx.resolve_binding(a),
+        a,
+        "unify binding should be rolled back in TypeContext",
+    );
+}
+
+#[test]
+fn test_unify_and_track_resolution_undo() {
+    let mut ctx = new_ctx();
+    let mut infer = new_infer();
+
+    // Create an inference variable.
+    let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let id = infer_var_id(&ctx, var);
+    let int32 = ctx.int(32, true);
+
+    // resolutions should be None initially.
+    assert!(
+        infer.resolutions()[id].is_none(),
+        "resolution should be None initially",
+    );
+
+    // Open a snapshot, unify_and_track var with Int<32>.
+    let snap = infer.start_snapshot();
+    let result = infer.unify_and_track(var, int32, &mut ctx);
+    assert!(result.is_ok(), "unify_and_track should succeed");
+
+    let resolved = ctx.resolve_binding(result.unwrap());
+    // The resolution points to the InferVar itself (since it stays an InferVar
+    // but is now bound to Int<32> via the TypeContext).
+    if let TypeData::InferVar { id: rid } = ctx.get(resolved) {
+        if *rid < infer.resolutions().len() {
+            assert!(
+                infer.resolutions()[*rid].is_some(),
+                "resolution should be set after unify_and_track",
+            );
+        }
+    }
+
+    // Rollback — resolution should revert to None.
+    infer.rollback_to(snap);
+    assert!(
+        infer.resolutions()[id].is_none(),
+        "resolution should be None after rollback",
+    );
+    // Note: we do NOT check ctx.resolve_binding(var) here — the
+    // TypeContext binding is managed by ctx.unify()'s own transaction
+    // system (TypeContext::transaction_depth / rollback_transaction),
+    // not by InferenceContext's undo_log.  The two rollback systems
+    // are independent: InferenceContext::rollback_to reverses the
+    // InferUndoLog entries (including SetResolution), while
+    // TypeContext::rollback_transaction handles binding undo.
+}
+
+#[test]
+fn test_pool_undo_nested_snapshots() {
+    let mut ctx = new_ctx();
+    let mut infer = new_infer();
+    let root = infer.region_tree.root;
+
+    let root_pool_before = infer.region_tree.nodes[root.0].pool.var_ids.len();
+
+    // Outer snapshot: create v1.
+    let outer = infer.start_snapshot();
+    let v1 = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let id1 = infer_var_id(&ctx, v1);
+
+    // Inner snapshot: create v2.
+    let inner = infer.start_snapshot();
+    let v2 = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let id2 = infer_var_id(&ctx, v2);
+
+    assert!(
+        infer.region_tree.nodes[root.0].pool.var_ids.contains(&id2),
+        "v2 should be in root pool during inner snapshot",
+    );
+
+    // Rollback inner — v2 should be removed, v1 should remain.
+    infer.rollback_to(inner);
+    assert!(
+        !infer.region_tree.nodes[root.0].pool.var_ids.contains(&id2),
+        "v2 should not be in root pool after inner rollback",
+    );
+    assert!(
+        infer.region_tree.nodes[root.0].pool.var_ids.contains(&id1),
+        "v1 should still be in root pool after inner rollback",
+    );
+
+    // Rollback outer — v1 should also be removed.
+    infer.rollback_to(outer);
+    assert_eq!(
+        infer.region_tree.nodes[root.0].pool.var_ids.len(),
+        root_pool_before,
+        "pool should be back to pre-snapshot state after outer rollback",
+    );
+}
