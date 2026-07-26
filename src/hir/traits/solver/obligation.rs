@@ -214,6 +214,31 @@ pub enum MaybeCause {
     CoinductiveCycle,
 }
 
+/// Whether evaluating a goal changed the inference state.
+///
+/// Used by the fixpoint iteration loop to detect convergence:
+/// when a cycle head is re-evaluated and the result hasn't changed,
+/// we've reached a fixpoint and can stop.
+#[derive(PartialEq, Eq, Debug, Hash, Clone, Copy)]
+pub enum HasChanged {
+    Yes,
+    No,
+}
+
+/// Why a goal needs to be re-evaluated after a fixpoint iteration.
+///
+/// A subset of rustc's `RerunReason` — we don't inline the full
+/// canonicalization/opaque-type infrastructure yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RerunReason {
+    /// New inference variables were introduced that may resolve ambiguity.
+    NewInferenceVars,
+    /// A nested goal was previously ambiguous and may now be resolved.
+    NestedGoalResolved,
+    /// A cycle head's provisional result has changed.
+    CycleHeadChanged,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BuiltinImplSource {
     Sized,

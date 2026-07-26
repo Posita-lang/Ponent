@@ -40,7 +40,7 @@ use crate::hir::traits::solver::obligation::{
     BuiltinImplSource, ImplSource, Obligation, Predicate, SolveError,
 };
 use crate::hir::traits::solver::search_graph::{
-    GoalKey as SgGoalKey, GoalKind as SgGoalKind, SearchGraph,
+    FIXPOINT_STEP_LIMIT, GoalKey as SgGoalKey, GoalKind as SgGoalKind, SearchGraph,
 };
 use crate::hir::traits::solver::select::MAX_RECURSION_DEPTH;
 use crate::hir::types::{AdtKind, DefId, TypeContext, TypeData, TypeId};
@@ -347,7 +347,29 @@ pub fn evaluate_goal<D: SolverDelegate>(
     ecx: &mut EvalCtxt<D>,
     goal: &Obligation,
 ) -> Result<ImplSource, SolveError> {
-    evaluate_goal_inner(ecx, goal, 0)
+    // Fixpoint iteration: re-evaluate if the goal was ambiguous and the
+    // search graph detected changes (e.g. new inference variables were
+    // introduced that may resolve ambiguity in a nested goal).
+    ecx.search_graph.begin_fixpoint();
+    for iteration in 0..FIXPOINT_STEP_LIMIT {
+        let result = evaluate_goal_inner(ecx, goal, 0);
+
+        match &result {
+            Ok(ImplSource::Deferred { .. }) if ecx.search_graph.has_changed() => {
+                // The goal was ambiguous but changes occurred — retry.
+                // Reset the changed flag for the next iteration.
+                ecx.search_graph.begin_fixpoint();
+                continue;
+            }
+            _ => return result,
+        }
+    }
+
+    // Fixpoint limit reached — treat as overflow.
+    Err(SolveError::Overflow {
+        obligation: Box::new(goal.clone()),
+        depth: FIXPOINT_STEP_LIMIT,
+    })
 }
 
 /// Inner recursive evaluation with explicit depth, using SearchGraph

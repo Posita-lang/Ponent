@@ -26,7 +26,9 @@
 use crate::hir::query::{DefaultCache as QueryCache, QueryCacheType};
 use crate::hir::traits::solver::delegate::SolverDelegate;
 use crate::hir::traits::solver::eval_ctxt::probe::CandidateHeadUsages;
-use crate::hir::traits::solver::obligation::{ImplSource, Obligation, Predicate, SolveError};
+use crate::hir::traits::solver::obligation::{
+    HasChanged, ImplSource, Obligation, Predicate, SolveError,
+};
 use crate::hir::types::{DefId, TypeContext, TypeId};
 use crate::symbol::Symbol;
 use rustc_hash::FxHashMap as HashMap;
@@ -438,7 +440,7 @@ pub struct SearchGraph {
     root_depth: AvailableDepth,
     /// Whether any goal was entered since the last `begin_fixpoint` call.
     /// Used by the fixpoint iteration loop to detect convergence.
-    changed: bool,
+    changed: HasChanged,
     /// Snapshot of the top-of-stack's `heads` state taken at
     /// `enter_single_candidate()`.  Used by `finish_single_candidate()`
     /// to compute the delta — which cycle heads were added by this
@@ -454,7 +456,7 @@ impl SearchGraph {
             provisional_cache: HashMap::default(),
             global_cache: QueryCache::new(),
             root_depth: AvailableDepth(64),
-            changed: false,
+            changed: HasChanged::No,
             candidate_head_snapshot: None,
         }
     }
@@ -466,7 +468,7 @@ impl SearchGraph {
             provisional_cache: HashMap::default(),
             global_cache: QueryCache::new(),
             root_depth: AvailableDepth(root_depth),
-            changed: false,
+            changed: HasChanged::No,
             candidate_head_snapshot: None,
         }
     }
@@ -569,7 +571,7 @@ impl SearchGraph {
             let path_kind = path_kind.extend(step_kind);
             return Err(path_kind);
         }
-        self.changed = true;
+        self.changed = HasChanged::Yes;
         Ok(())
     }
 
@@ -756,7 +758,7 @@ impl SearchGraph {
 
     /// Begin a new fixpoint iteration cycle.
     pub fn begin_fixpoint(&mut self) {
-        self.changed = false;
+        self.changed = HasChanged::No;
     }
 
     /// Try to advance the fixpoint iteration.  Returns `true` if the
@@ -771,7 +773,7 @@ impl SearchGraph {
 
     /// Returns `true` if any goal was entered since the last `begin_fixpoint`.
     pub fn has_changed(&self) -> bool {
-        self.changed
+        self.changed == HasChanged::Yes
     }
 
     // ── Update parent goal ────────────────────────────────────────
@@ -841,7 +843,7 @@ impl SearchGraph {
         self.stack.clear();
         self.provisional_cache.clear();
         self.global_cache.clear();
-        self.changed = false;
+        self.changed = HasChanged::No;
     }
 
     /// Drain the stack (pop all entries) — used when aborting evaluation.

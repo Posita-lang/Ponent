@@ -41,7 +41,7 @@ pub mod test;
 pub use eval::evaluate_goal;
 pub use fulfill::FulfillmentContext;
 pub use obligation::{
-    BuiltinImplSource, CopyKind, ImplSource, Obligation, ObligationCause, ObligationCauseCode,
-    Predicate, ProjectionTy, SolveError,
+    BuiltinImplSource, CopyKind, HasChanged, ImplSource, Obligation, ObligationCause,
+    ObligationCauseCode, Predicate, ProjectionTy, RerunReason, SolveError,
 };
 pub use select::SelectionContext;
