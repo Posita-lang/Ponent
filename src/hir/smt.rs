@@ -168,7 +168,8 @@ impl SmtSolver {
         smt.push_str("(declare-fun type-pointer (Type) Type)\n");
         smt.push_str("(declare-fun type-float32 () Type)\n");
         smt.push_str("(declare-fun type-float64 () Type)\n");
-        smt.push_str("(declare-fun type-dyn-trait (Int) Type)\n\n");
+        smt.push_str("(declare-fun type-dyn-trait (Int) Type)\n");
+        smt.push_str("(declare-fun type-type () Type)\n\n");
 
         // ── 4. Shape-of and arity-of functions ────────────────────
         smt.push_str("(declare-fun shape-of (Type) Int)\n");
@@ -201,7 +202,10 @@ impl SmtSolver {
         smt.push_str("(assert (forall ((a Type) (n Int)) (and (= (shape-of (type-array a n)) SHAPE_CONSTRUCTOR) (= (arity-of (type-array a n)) 1))))\n");
         smt.push_str("(assert (forall ((a Type) (b Type)) (and (= (shape-of (type-coproduct a b)) SHAPE_CONSTRUCTOR) (= (arity-of (type-coproduct a b)) 2))))\n");
         smt.push_str("(assert (forall ((a Type)) (and (= (shape-of (type-pointer a)) SHAPE_CONSTRUCTOR) (= (arity-of (type-pointer a)) 1))))\n");
-        smt.push_str("(assert (forall ((tag Int)) (= (shape-of (type-dyn-trait tag)) SHAPE_CONSTRUCTOR)))\n\n");
+        smt.push_str(
+            "(assert (forall ((tag Int)) (= (shape-of (type-dyn-trait tag)) SHAPE_CONSTRUCTOR)))\n",
+        );
+        smt.push_str("(assert (= (shape-of type-type) SHAPE_UNKNOWN))\n\n");
 
         // ── 6. Inference variable ──────────────────────────────
         smt.push_str(&format!("(declare-const iv_{} Type)\n", var_id));

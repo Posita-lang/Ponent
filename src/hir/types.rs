@@ -857,39 +857,58 @@ fn is_type_volatile_inner_by_id(ty: TypeId, types: Option<&Vec<Arc<TypeData>>>) 
     if let Some(types) = types {
         let idx = ty.index();
         if idx < types.len() {
-            match &*types[idx] {
-                TypeData::InferVar { .. } | TypeData::SkolemVar { .. } => return true,
-                // Composite types: recurse.
-                TypeData::Adt { args, .. } => {
-                    return args
-                        .iter()
-                        .any(|a| is_type_volatile_inner_by_id(*a, Some(types)));
-                }
-                TypeData::Tuple { elems } => {
-                    return elems
-                        .iter()
-                        .any(|e| is_type_volatile_inner_by_id(*e, Some(types)));
-                }
-                TypeData::Array { elem, .. } => {
-                    return is_type_volatile_inner_by_id(*elem, Some(types));
-                }
-                TypeData::Slice { elem } => {
-                    return is_type_volatile_inner_by_id(*elem, Some(types));
-                }
-                TypeData::Ref { ty, .. } => {
-                    return is_type_volatile_inner_by_id(*ty, Some(types));
-                }
-                TypeData::Pointer { ty } => {
-                    return is_type_volatile_inner_by_id(*ty, Some(types));
+            // Mirror the match in is_type_volatile_inner — handle every variant
+            // explicitly so that the fallthrough below is only for the `None` case.
+            return match &*types[idx] {
+                // Volatile: cannot cache.
+                TypeData::InferVar { .. } | TypeData::SkolemVar { .. } => true,
+                // Leaf / primitive types: never volatile.
+                TypeData::GenericParam { .. }
+                | TypeData::Int { .. }
+                | TypeData::UInt { .. }
+                | TypeData::Float { .. }
+                | TypeData::Bool
+                | TypeData::Char
+                | TypeData::Byte
+                | TypeData::USize
+                | TypeData::Never
+                | TypeData::Unit
+                | TypeData::Error
+                | TypeData::Type
+                | TypeData::Rational { .. }
+                | TypeData::Regex { .. } => false,
+                TypeData::DynTrait { .. } => false,
+                TypeData::AssociatedType { .. } => false,
+                // Composite types: recurse into children.
+                TypeData::Adt { args, .. } => args
+                    .iter()
+                    .any(|a| is_type_volatile_inner_by_id(*a, Some(types))),
+                TypeData::Tuple { elems } => elems
+                    .iter()
+                    .any(|e| is_type_volatile_inner_by_id(*e, Some(types))),
+                TypeData::Array { elem, .. } => is_type_volatile_inner_by_id(*elem, Some(types)),
+                TypeData::Slice { elem } => is_type_volatile_inner_by_id(*elem, Some(types)),
+                TypeData::Ref { ty, .. } => is_type_volatile_inner_by_id(*ty, Some(types)),
+                TypeData::Pointer { ty } => is_type_volatile_inner_by_id(*ty, Some(types)),
+                TypeData::Ptr { size, pointee } => {
+                    is_type_volatile_inner_by_id(*size, Some(types))
+                        || is_type_volatile_inner_by_id(*pointee, Some(types))
                 }
                 TypeData::Fn { params, ret } => {
-                    return params
+                    params
                         .iter()
                         .any(|p| is_type_volatile_inner_by_id(*p, Some(types)))
-                        || is_type_volatile_inner_by_id(*ret, Some(types));
+                        || is_type_volatile_inner_by_id(*ret, Some(types))
                 }
-                _ => {} // Leaf types — handled by the caller.
-            }
+                TypeData::Exists { base, .. } => is_type_volatile_inner_by_id(*base, Some(types)),
+                TypeData::Forall { body, .. } => is_type_volatile_inner_by_id(*body, Some(types)),
+                TypeData::Poly { body, .. } => is_type_volatile_inner_by_id(*body, Some(types)),
+                TypeData::Coproduct { alternatives } => alternatives
+                    .iter()
+                    .any(|a| is_type_volatile_inner_by_id(*a, Some(types))),
+                TypeData::Mu { body, .. } => is_type_volatile_inner_by_id(*body, Some(types)),
+                TypeData::Nu { body, .. } => is_type_volatile_inner_by_id(*body, Some(types)),
+            };
         } else {
             // The TypeId points to an index beyond the current arena.
             // This can happen when `data` is externally constructed and
@@ -899,9 +918,8 @@ fn is_type_volatile_inner_by_id(ty: TypeId, types: Option<&Vec<Arc<TypeData>>>) 
             return true;
         }
     }
-    // Without the arena, conservatively assume not volatile.
-    // The top-level alloc path already checks the data directly.
-    false
+    // Without the arena, conservatively assume volatile (uncacheable).
+    true
 }
 
 pub struct TypeContext {

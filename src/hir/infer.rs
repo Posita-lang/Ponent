@@ -529,15 +529,9 @@ pub(crate) enum InferUndoLog {
     RemoveTransitiveGuard(usize, usize),
     InsertGenericParamBinding(usize, Option<TypeId>),
     PushShapeVar,
-    PoolRegister {
-        region_idx: usize,
-        old_var_len: usize,
-        old_rigid_len: usize,
-    },
-    PoolUnregister {
-        region_idx: usize,
-        var_id: usize,
-    },
+    /// Undo entry for a `resolutions` mutation: stores (var_id, old_value)
+    /// so that `reverse()` can restore the previous resolution on rollback.
+    SetResolution(usize, Option<TypeId>),
 }
 
 impl InferenceContext {
@@ -624,25 +618,9 @@ impl InferenceContext {
                 self.shape_vars
                     .truncate_vars(self.shape_vars.vars_len().saturating_sub(1));
             }
-            InferUndoLog::PoolRegister {
-                region_idx,
-                old_var_len,
-                old_rigid_len,
-            } => {
-                if region_idx < self.region_tree.nodes.len() {
-                    self.region_tree.nodes[region_idx]
-                        .pool
-                        .var_ids
-                        .truncate(old_var_len);
-                    self.region_tree.nodes[region_idx]
-                        .pool
-                        .rigid_var_ids
-                        .truncate(old_rigid_len);
-                }
-            }
-            InferUndoLog::PoolUnregister { region_idx, var_id } => {
-                if region_idx < self.region_tree.nodes.len() {
-                    self.region_tree.nodes[region_idx].pool.var_ids.push(var_id);
+            InferUndoLog::SetResolution(id, old) => {
+                if id < self.resolutions.len() {
+                    self.resolutions[id] = old;
                 }
             }
         }
@@ -1184,6 +1162,7 @@ impl InferenceContext {
         if let TypeData::InferVar { id } = ctx.get(resolved) {
             if *id < self.resolutions.len() {
                 if self.resolutions[*id].is_none() {
+                    self.push_undo(InferUndoLog::SetResolution(*id, self.resolutions[*id]));
                     self.resolutions[*id] = Some(resolved);
                 }
             }
@@ -1206,10 +1185,12 @@ impl InferenceContext {
         }
         match (ctx.get(ra), ctx.get(rb)) {
             (TypeData::InferVar { id }, _) if *id < self.resolutions.len() => {
+                self.push_undo(InferUndoLog::SetResolution(*id, self.resolutions[*id]));
                 self.resolutions[*id] = Some(rb);
                 Ok(rb)
             }
             (_, TypeData::InferVar { id }) if *id < self.resolutions.len() => {
+                self.push_undo(InferUndoLog::SetResolution(*id, self.resolutions[*id]));
                 self.resolutions[*id] = Some(ra);
                 Ok(ra)
             }
