@@ -1,7 +1,7 @@
 use crate::ast::{Attribute, BinOp, Expr, Literal, UnaryOp};
 use crate::diagnostics::{DiagCtxt, Diagnostic};
 use crate::hir::target::Target;
-use crate::sat::Solver;
+use crate::sat::{SolveResult, Solver};
 use crate::symbol::Symbol;
 use std::collections::HashMap;
 
@@ -386,7 +386,35 @@ pub fn is_provably_reachable(attr: &Attribute, strict_mode: bool, diag: &mut Dia
         }
     }
 
-    solver.solve().is_sat()
+    match solver.solve() {
+        SolveResult::Sat(_) => true,
+        SolveResult::Unsat => false,
+        SolveResult::Unknown => {
+            let msg = format!(
+                "@cfg condition is too complex for precise satisfiability checking — \
+                 the SAT solver could not decide within the decision limit; \
+                 consider simplifying the condition with fewer or simpler terms"
+            );
+            if strict_mode {
+                diag.push(Diagnostic::error(msg).with_code_str("E092"));
+                // Error halts compilation — return value is moot, but
+                // returning false avoids downstream panic on broken state.
+                false
+            } else {
+                diag.push(
+                    Diagnostic::warning(format!(
+                        "{} — conservatively treating this code as reachable; \
+                         to suppress this warning, simplify the condition",
+                        msg,
+                    ))
+                    .with_code_str("W092"),
+                );
+                // Conservatively treat as reachable so complex but valid
+                // cfg conditions don't silently eliminate code.
+                true
+            }
+        }
+    }
 }
 
 /// Build a list of CNF clauses from a cfg expression.

@@ -244,10 +244,7 @@ fn test_eval_variable_def() {
     };
     let r = ec.eval_block(&[block]);
     assert!(matches!(r, Ok(ComptimeValue::Int(42))));
-    assert!(matches!(
-        get_var(&ec, "x"),
-        Some(ComptimeValue::Int(42))
-    ));
+    assert!(matches!(get_var(&ec, "x"), Some(ComptimeValue::Int(42))));
 }
 
 #[test]
@@ -269,10 +266,7 @@ fn test_eval_variable_assign() {
     };
     let r = ec.eval_block(&[assign]);
     assert!(matches!(r, Ok(ComptimeValue::Int(20))));
-    assert!(matches!(
-        get_var(&ec, "x"),
-        Some(ComptimeValue::Int(20))
-    ));
+    assert!(matches!(get_var(&ec, "x"), Some(ComptimeValue::Int(20))));
 }
 
 #[test]
@@ -427,10 +421,7 @@ fn test_eval_while_loop() {
     };
     let _ = ec.eval_block(&[while_stmt]);
     // After the loop, i should be 5
-    assert!(matches!(
-        get_var(&ec, "i"),
-        Some(ComptimeValue::Int(5))
-    ));
+    assert!(matches!(get_var(&ec, "i"), Some(ComptimeValue::Int(5))));
 }
 
 #[test]
@@ -577,6 +568,76 @@ fn test_eval_while_shadowing_same_name() {
 }
 
 #[test]
+fn test_assign_while_internal_var_after_loop() {
+    // Regression: assigning to a variable defined inside a while body
+    // after the loop ends must return UnknownIdentifier.  The old
+    // `cur_slot` leak made such variables appear writable in the outer
+    // scope even though they should be gone.
+    let mut ctx = TypeContext::new();
+    let int32 = ctx.int(32, true);
+    let symbols = crate::hir::symbol::SymbolTable::new(crate::hir::types::CrateId(
+        crate::hir::types::DefId(0),
+    ));
+    let mut diag = crate::diagnostics::DiagCtxt::new();
+    let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
+
+    // Counter variable `i` that makes the loop run exactly once.
+    insert_var(&mut ec, "i", ComptimeValue::Int(0));
+    ec.memory_used = ComptimeValue::Int(0).memory_size();
+
+    // while i < 1 { set x = 42; i = i + 1 }
+    let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
+    let cond = make_binop_ty(i_expr(), BinOp::Lt, make_int_val(1, int32), int32);
+    let body = vec![
+        HirStmt::VariableDef {
+            kind: crate::ast::VariableKind::Set,
+            mutable: false,
+            name: Some(crate::symbol::Symbol::intern("x")),
+            pattern: None,
+            ty: int32,
+            value: Some(Box::new(make_int_val(42, int32))),
+            else_branch: None,
+            span: Span::new(0, 0),
+            type_captures: vec![],
+        },
+        HirStmt::Assign {
+            target: Box::new(i_expr()),
+            value: Box::new(make_binop_ty(
+                i_expr(),
+                BinOp::Add,
+                make_int_val(1, int32),
+                int32,
+            )),
+            op: None,
+            span: Span::new(0, 0),
+        },
+    ];
+    let while_stmt = HirStmt::While {
+        cond: Box::new(cond),
+        body,
+        invariant: None,
+        decreases: None,
+        span: Span::new(0, 0),
+    };
+
+    let _ = ec.eval_block(&[while_stmt]);
+
+    // After the loop, `x` should NOT be assignable — it was scoped inside.
+    let assign = HirStmt::Assign {
+        target: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
+        value: Box::new(make_int(99)),
+        op: None,
+        span: Span::new(0, 0),
+    };
+    let r = ec.eval_block(&[assign]);
+    assert!(
+        matches!(r, Err(ComptimeError::UnknownIdentifier(_))),
+        "assigning to a while-internal variable after the loop should be UnknownIdentifier, got {:?}",
+        r,
+    );
+}
+
+#[test]
 fn test_eval_while_step_limit() {
     let mut ctx = TypeContext::new();
     let int32 = ctx.int(32, true);
@@ -664,10 +725,7 @@ fn test_eval_fn_call_scope_isolation() {
     };
     let _ = ec.eval_expr(&call);
     // Outer x should still be 1, not 99
-    assert!(matches!(
-        get_var(&ec, "x"),
-        Some(ComptimeValue::Int(1))
-    ));
+    assert!(matches!(get_var(&ec, "x"), Some(ComptimeValue::Int(1))));
 }
 
 // ── Phase 10: Float arithmetic tests ──────────────────────────────
@@ -916,11 +974,7 @@ fn test_eval_pointer_shadowing_block() {
     };
     let deref_p = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Deref,
-        expr: Box::new(HirExpr::Ident(
-            "p".into(),
-            TypeId::NONE,
-            Span::new(0, 0),
-        )),
+        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(0, 0))),
         ty: TypeId::NONE,
         span: Span::new(0, 0),
     };
@@ -995,11 +1049,7 @@ fn test_eval_pointer_shadowing_write_through() {
     // *p = 10
     let deref_ptr = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Deref,
-        expr: Box::new(HirExpr::Ident(
-            "p".into(),
-            TypeId::NONE,
-            Span::new(0, 0),
-        )),
+        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(0, 0))),
         ty: TypeId::NONE,
         span: Span::new(0, 0),
     };
@@ -1010,7 +1060,11 @@ fn test_eval_pointer_shadowing_write_through() {
         span: Span::new(0, 0),
     };
     let inner_block = HirExpr::Block(
-        vec![inner_var, assign_through_ptr, HirStmt::Expression(Box::new(make_int(0)))],
+        vec![
+            inner_var,
+            assign_through_ptr,
+            HirStmt::Expression(Box::new(make_int(0))),
+        ],
         TypeId::NONE,
         Span::new(0, 0),
     );
@@ -1080,11 +1134,7 @@ fn test_eval_pointer_shadowing_nested_blocks() {
     };
     let deref_p = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Deref,
-        expr: Box::new(HirExpr::Ident(
-            "p".into(),
-            TypeId::NONE,
-            Span::new(0, 0),
-        )),
+        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(0, 0))),
         ty: TypeId::NONE,
         span: Span::new(0, 0),
     };
@@ -1220,11 +1270,7 @@ fn test_eval_pointer_shadowing_while() {
     // *p should also be 5 (pointer to outer slot)
     let deref_p = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Deref,
-        expr: Box::new(HirExpr::Ident(
-            "p".into(),
-            int32,
-            Span::new(0, 0),
-        )),
+        expr: Box::new(HirExpr::Ident("p".into(), int32, Span::new(0, 0))),
         ty: int32,
         span: Span::new(0, 0),
     };
@@ -1288,11 +1334,7 @@ fn test_eval_pointer_shadowing_deref_after_block() {
         mutable: false,
         span: Span::new(0, 0),
     };
-    let block = HirExpr::Block(
-        vec![inner_var],
-        TypeId::NONE,
-        Span::new(0, 0),
-    );
+    let block = HirExpr::Block(vec![inner_var], TypeId::NONE, Span::new(0, 0));
     let block_stmt = HirStmt::Expression(Box::new(block));
 
     // Evaluate: declarations + block
@@ -1300,11 +1342,7 @@ fn test_eval_pointer_shadowing_deref_after_block() {
     // After block, *p should still be 1 (outer x restored, pointer slot valid)
     let deref_p = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Deref,
-        expr: Box::new(HirExpr::Ident(
-            "p".into(),
-            TypeId::NONE,
-            Span::new(0, 0),
-        )),
+        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(0, 0))),
         ty: TypeId::NONE,
         span: Span::new(0, 0),
     };
@@ -2018,10 +2056,7 @@ fn test_eval_variable_shadowing() {
     );
     let _ = ec.eval_expr(&inner);
     // Outer x should still be 10 (block scoping prevents leaks)
-    assert!(matches!(
-        get_var(&ec, "x"),
-        Some(ComptimeValue::Int(10))
-    ));
+    assert!(matches!(get_var(&ec, "x"), Some(ComptimeValue::Int(10))));
 }
 
 // ── Phase 33: Assign with op tests ─────────────────────────────
@@ -2279,10 +2314,7 @@ fn test_eval_while_neested() {
         span: Span::new(0, 0),
     };
     let _ = ec.eval_block(&[outer_while]);
-    assert!(matches!(
-        get_var(&ec, "i"),
-        Some(ComptimeValue::Int(3))
-    ));
+    assert!(matches!(get_var(&ec, "i"), Some(ComptimeValue::Int(3))));
 }
 
 // ── Self-recursion test ────────────────────────────────────────

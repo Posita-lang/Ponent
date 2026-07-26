@@ -10,9 +10,9 @@ use super::value::{ComptimeValue, SlotId};
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::Arc;
 
 /// A registered comptime function: (parameter_names, body_statements).
 /// The body is wrapped in `Arc` to avoid deep-cloning the AST on every call.
@@ -196,8 +196,7 @@ fn is_pure_expr(expr: &HirExpr) -> bool {
         }
         HirExpr::UnaryOp { op, expr, .. } => {
             // Ref/RefMut, Deref, etc. have side effects (capturing/accessing state).
-            matches!(op, crate::ast::UnaryOp::Not | crate::ast::UnaryOp::Neg)
-                && is_pure_expr(expr)
+            matches!(op, crate::ast::UnaryOp::Not | crate::ast::UnaryOp::Neg) && is_pure_expr(expr)
         }
         HirExpr::Block(stmts, ..) => is_pure_block(stmts),
         HirExpr::If {
@@ -751,6 +750,13 @@ impl<'a> ComptimeEvalContext<'a> {
                                 // Remove any new slots created inside the body
                                 // (O(m) where m = new slots, vs O(n) for retain).
                                 self.remove_new_slots_since(next_slot_at_entry);
+                                // Also purge `cur_slot` entries pointing to the
+                                // now-removed slots, so write-after-scope for
+                                // body-internal variables (e.g. assigning to `x`
+                                // after the loop ends) correctly fails with
+                                // UnknownIdentifier instead of silently succeeding.
+                                self.cur_slot
+                                    .retain(|_, &mut slot| slot.0 < next_slot_at_entry);
                             }
                             ComptimeValue::Bool(false) => break,
                             ComptimeValue::Float(_) => {
