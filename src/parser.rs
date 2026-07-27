@@ -3275,6 +3275,24 @@ impl Parser {
                     definition,
                     contracts: Vec::new(),
                 });
+            } else if s.eq_str("impl") {
+                // `type T = impl Trait` — opaque type (TAIT)
+                self.advance().ok();
+                let trait_ty = self.parse_type()?;
+                let modifiers = self.parse_type_modifiers()?;
+                if matches!(self.peek(), Ok(Token::Semicolon)) {
+                    self.advance().ok();
+                }
+                let end = self.span().end;
+                return Ok(Stmt::TypeDef {
+                    span: Span::new(start, end),
+                    attributes,
+                    doc,
+                    name,
+                    params,
+                    definition: TypeDefinition::Opaque(trait_ty, modifiers),
+                    contracts: Vec::new(),
+                });
             } else if s.eq_str("enum") {
                 self.advance().ok();
                 self.expect(Token::LBrace)?;

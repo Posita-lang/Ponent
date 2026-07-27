@@ -5,8 +5,13 @@
 //! while correctly allowing non-overlapping impls.
 
 use crate::ast::Span;
+use crate::hir::infer::TypeVariableKind;
 use crate::hir::traits::ImplCandidate;
 use crate::hir::traits::solver::coherence::check_overlap;
+use crate::hir::traits::solver::obligation::{
+    Obligation, ObligationCause, ObligationCauseCode, Predicate,
+};
+use crate::hir::traits::solver::search_graph::canonicalize_goal_key;
 use crate::hir::types::{DefId, TypeContext};
 use crate::symbol::Symbol;
 
@@ -502,5 +507,99 @@ fn test_forall_vs_concrete_no_overlap() {
     assert!(
         conflict.is_none(),
         "Forall vs concrete: normalization correctly distinguishes binder types from concrete types"
+    );
+}
+
+// ── Canonical cache correctness tests ──
+
+#[test]
+fn test_canonicalize_goal_key_caches_concrete_goals() {
+    let mut ctx = TypeContext::new();
+
+    // Create a goal without InferVars — should be cacheable.
+    let int_ty = ctx.int(32, true);
+    let sized = Predicate::Sized { ty: int_ty };
+    let obligation = Obligation {
+        cause: ObligationCause {
+            span: Span::new(0, 0),
+            code: ObligationCauseCode::Misc,
+        },
+        predicate: sized,
+        recursion_depth: 0,
+    };
+
+    let key = canonicalize_goal_key(&obligation, &ctx, 0);
+    assert!(
+        key.is_some(),
+        "goal without InferVar should be cacheable (key is Some)"
+    );
+}
+
+#[test]
+fn test_same_goal_same_canonical_key() {
+    let mut ctx = TypeContext::new();
+
+    let int_ty = ctx.int(64, true);
+    let sized1 = Predicate::Sized { ty: int_ty };
+    let ob1 = Obligation {
+        cause: ObligationCause {
+            span: Span::new(0, 0),
+            code: ObligationCauseCode::Misc,
+        },
+        predicate: sized1,
+        recursion_depth: 0,
+    };
+
+    let int_ty2 = ctx.int(64, true);
+    let sized2 = Predicate::Sized { ty: int_ty2 };
+    let ob2 = Obligation {
+        cause: ObligationCause {
+            span: Span::new(0, 0),
+            code: ObligationCauseCode::Misc,
+        },
+        predicate: sized2,
+        recursion_depth: 0,
+    };
+
+    let key1 = canonicalize_goal_key(&ob1, &ctx, 0);
+    let key2 = canonicalize_goal_key(&ob2, &ctx, 0);
+    assert_eq!(
+        key1, key2,
+        "structurally identical goals should produce identical canonical keys"
+    );
+}
+
+#[test]
+fn test_different_goal_different_canonical_key() {
+    let mut ctx = TypeContext::new();
+
+    let int32 = ctx.int(32, true);
+    let int64 = ctx.int(64, true);
+
+    let sized32 = Predicate::Sized { ty: int32 };
+    let ob32 = Obligation {
+        cause: ObligationCause {
+            span: Span::new(0, 0),
+            code: ObligationCauseCode::Misc,
+        },
+        predicate: sized32,
+        recursion_depth: 0,
+    };
+
+    let sized64 = Predicate::Sized { ty: int64 };
+    let ob64 = Obligation {
+        cause: ObligationCause {
+            span: Span::new(0, 0),
+            code: ObligationCauseCode::Misc,
+        },
+        predicate: sized64,
+        recursion_depth: 0,
+    };
+
+    let key32 = canonicalize_goal_key(&ob32, &ctx, 0);
+    let key64 = canonicalize_goal_key(&ob64, &ctx, 0);
+    assert_ne!(
+        key32, key64,
+        "structurally different goals should produce different canonical keys"
     );
 }

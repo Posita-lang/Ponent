@@ -54,6 +54,13 @@ pub enum Predicate {
         projection: ProjectionTy,
         target: TypeId,
     },
+    /// `NormalizesTo(ProjectionTy, TypeId)` — dedicated goal kind for
+    /// associated type projection normalization with fixpoint iteration.
+    /// See `rustc_next_trait_solver::solve::normalizes_to`.
+    NormalizesTo {
+        projection: ProjectionTy,
+        target: TypeId,
+    },
     /// `T: AutoTrait` (future: Send/Sync-like marker traits)
     AutoTrait { trait_id: DefId, self_ty: TypeId },
     /// `T: Sized` — special builtin
@@ -339,6 +346,7 @@ impl Predicate {
             Predicate::CopyLike { ty, .. } => *ty,
             Predicate::ProjectionEq { self_ty, .. } => *self_ty,
             Predicate::ProjectionNormalize { projection, .. } => projection.self_ty,
+            Predicate::NormalizesTo { projection, .. } => projection.self_ty,
             Predicate::Eq { a, .. } => *a,
             Predicate::Sub { sub, .. } => *sub,
             Predicate::Match { scrutinee, .. } => *scrutinee,

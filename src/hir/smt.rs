@@ -386,6 +386,7 @@ impl SmtSolver {
             // SMT solvers have limited string theory, so we don't encode them.
             TypeData::Regex { .. } => "type-unknown".into(),
             TypeData::Type => "type-type".into(),
+            TypeData::Opaque { .. } => "type-unknown".into(),
         }
     }
 }

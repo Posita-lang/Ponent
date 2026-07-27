@@ -148,39 +148,54 @@ pub fn resolve_projection(
     None
 }
 
+/// Result of a projection normalization attempt.
+#[derive(Debug, Clone)]
+pub enum ProjectionResult {
+    /// Successfully normalized to this type.
+    Normalized(TypeId),
+    /// Normalization deferred — the self_ty is an unresolved inference variable.
+    /// The `stalled_on` is the blocking TypeId.
+    Deferred(TypeId),
+    /// Normalization failed (no impl found, etc.).
+    Error,
+}
+
 /// Normalize a projection type to its concrete value.
 ///
 /// This is the core normalization function. It resolves the projection
 /// and then recursively normalizes the result. If the projection's
 /// self_ty is an inference variable, normalization is deferred
-/// (returns `None`).
+/// (returns `Deferred(stalled_on)`).
 pub fn normalize_projection(
     proj: &ProjectionTy,
     trait_env: &TraitEnv,
     ctx: &mut TypeContext,
     cache: &ProjectionCache,
     symbols: &SymbolTable,
-) -> Option<TypeId> {
+) -> ProjectionResult {
     // Check cache first
     if let Some(cached) = cache.get(proj.trait_id, proj.self_ty, &proj.assoc_name, ctx) {
-        return Some(cached);
+        return ProjectionResult::Normalized(cached);
     }
 
     // If self_ty is an inference variable, we cannot resolve yet
     if ctx.is_infer_var(proj.self_ty) {
         cache.mark_ambiguous(proj.trait_id, proj.self_ty, proj.assoc_name, ctx);
-        return None;
+        return ProjectionResult::Deferred(proj.self_ty);
     }
 
     // Resolve the projection
-    let resolved = resolve_projection(
+    let resolved = match resolve_projection(
         trait_env,
         proj.trait_id,
         proj.self_ty,
         &proj.assoc_name,
         ctx,
         symbols,
-    )?;
+    ) {
+        Some(ty) => ty,
+        None => return ProjectionResult::Error,
+    };
 
     // Recursively normalize the result (in case it's itself a projection)
     let result = match ctx.get(resolved) {
@@ -195,12 +210,17 @@ pub fn normalize_projection(
                 args: proj.args.clone(),
                 assoc_name: *name,
             };
-            normalize_projection(&inner_proj, trait_env, ctx, cache, symbols).unwrap_or(resolved)
+            normalize_projection(&inner_proj, trait_env, ctx, cache, symbols)
         }
-        _ => resolved,
+        _ => ProjectionResult::Normalized(resolved),
     };
 
-    // Cache the result
-    cache.insert(proj.trait_id, proj.self_ty, proj.assoc_name, result, ctx);
-    Some(result)
+    // Cache and return the result
+    match &result {
+        ProjectionResult::Normalized(ty) => {
+            cache.insert(proj.trait_id, proj.self_ty, proj.assoc_name, *ty, ctx);
+        }
+        _ => {}
+    }
+    result
 }

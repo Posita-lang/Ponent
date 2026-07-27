@@ -1955,6 +1955,12 @@ impl<'a> TypeChecker<'a> {
                                         body: body.clone(),
                                     }
                                 }
+                                TraitPredicate::NormalizesTo { projection, target } => {
+                                    crate::hir::traits::solver::Predicate::NormalizesTo {
+                                        projection: projection.clone(),
+                                        target: *target,
+                                    }
+                                }
                             },
                             recursion_depth: 0,
                         };
@@ -2211,6 +2217,12 @@ impl<'a> TypeChecker<'a> {
                                     crate::hir::traits::solver::Predicate::Let {
                                         def: def.clone(),
                                         body: body.clone(),
+                                    }
+                                }
+                                TraitPredicate::NormalizesTo { projection, target } => {
+                                    crate::hir::traits::solver::Predicate::NormalizesTo {
+                                        projection: projection.clone(),
+                                        target: *target,
                                     }
                                 }
                             },

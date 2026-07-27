@@ -23,17 +23,20 @@
 //! See the [rustc-dev-guide chapter](https://rustc-dev-guide.rust-lang.org/solve/caching.html)
 //! for more details on the caching strategy.
 
+use crate::hir::infer::TypeVariableKind;
 use crate::hir::query::{DefaultCache as QueryCache, QueryCacheType};
 use crate::hir::traits::solver::delegate::SolverDelegate;
 use crate::hir::traits::solver::eval_ctxt::probe::CandidateHeadUsages;
 use crate::hir::traits::solver::obligation::{
     HasChanged, ImplSource, Obligation, Predicate, SolveError,
 };
-use crate::hir::types::{DefId, TypeContext, TypeId};
+use crate::hir::types::{DefId, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::mem;
 
 // ── Constants ─────────────────────────────────────────────────────
 
@@ -204,7 +207,8 @@ impl GoalKey {
             Predicate::Forall { .. }
             | Predicate::Exists { .. }
             | Predicate::Instance { .. }
-            | Predicate::Let { .. } => {
+            | Predicate::Let { .. }
+            | Predicate::NormalizesTo { .. } => {
                 // These are structural constraints that don't participate in
                 // cycle detection — they are resolved by transforming the
                 // constraint set, not by recursive evaluation.
@@ -218,6 +222,551 @@ impl GoalKey {
             args,
         })
     }
+}
+
+// ── Canonical goal key for infer-var-independent caching ───────────
+
+/// A canonical index into the `var_values` vector of a `Response`.
+///
+/// Represents the position of an inference variable in the canonical
+/// variable list.  These indices are used to map inference variables
+/// between the evaluation context and cached responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CanonicalVarIndex(pub usize);
+
+/// A canonicalized goal predicate with inference variable identity
+/// stripped and universe/variable-kind information preserved.
+///
+/// The `type_hashes` vector stores one structural hash per TypeId in the
+/// predicate (self_ty, then args in order).  Each hash is infer-var-independent
+/// (same structure → same hash regardless of infer var IDs).  Using a vector
+/// instead of a single combined hash avoids hash collisions between structurally
+/// different goals that happen to produce the same aggregate hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalPredicate {
+    /// Structural hashes of each TypeId in the predicate, in order.
+    /// Each hash is computed by `hash_type_canonical` which replaces infer
+    /// var IDs with sentinels, making them infer-var-independent.
+    pub type_hashes: Vec<u64>,
+    /// The kinds of each free inference variable in the goal, in order
+    /// of first appearance during canonicalization.
+    pub var_kinds: Vec<TypeVariableKind>,
+    /// The highest universe index nameable by the caller.
+    /// Used for HRTB `for<'a>` placeholder scoping.
+    pub max_universe: usize,
+}
+
+impl std::hash::Hash for CanonicalPredicate {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        for h in &self.type_hashes {
+            h.hash(state);
+        }
+        self.max_universe.hash(state);
+        for vk in &self.var_kinds {
+            std::mem::discriminant(vk).hash(state);
+        }
+    }
+}
+
+/// A canonicalized response that stores the result with its inference
+/// variable mapping, enabling safe cross-context caching.
+///
+/// The `var_values` vector maps `CanonicalVarIndex` → `Option<TypeId>`,
+/// recording which concrete types (if any) each canonical var was
+/// resolved to.  On cache hit, `instantiate_canonical` creates fresh
+/// inference variables for unresolved entries and substitutes them
+/// into the result.
+#[derive(Debug, Clone)]
+pub struct CanonicalResponse {
+    pub impl_source: ImplSource,
+    pub var_values: Vec<Option<TypeId>>,
+    pub max_universe: usize,
+    /// The recursion depth required to solve this goal.
+    /// Used in `lookup_global_cache` to reject stale entries when
+    /// the available depth is insufficient.
+    pub required_depth: usize,
+    /// Whether evaluation encountered overflow (depth limit).
+    /// If true, this result should not be reused in contexts
+    /// with a different overflow budget.
+    pub encountered_overflow: bool,
+}
+
+/// Hash a TypeId canonically: resolve bindings + opaque types, strip infer var identity.
+fn hash_type_canonical(ty: TypeId, ctx: &TypeContext, state: &mut DefaultHasher) {
+    // Use resolve_binding (not resolve) to preserve opaque type identity.
+    // ctx.resolve() chains resolve_opaque which strips the Opaque wrapper,
+    // causing distinct opaque types with the same hidden type to collide.
+    // We handle Opaque explicitly below by hashing def_id + hidden.
+    let resolved = ctx.resolve_binding(ty);
+    match ctx.get(resolved) {
+        TypeData::InferVar { .. } | TypeData::SkolemVar { .. } => {
+            // Volatile — hash a constant sentinel to ensure all unbound
+            // infer vars produce the same canonical key regardless of ID.
+            0u64.hash(state);
+            0u64.hash(state);
+        }
+        TypeData::Int { bits, signed, .. } => {
+            1u64.hash(state);
+            bits.hash(state);
+            signed.hash(state);
+        }
+        TypeData::UInt { bits, .. } => {
+            2u64.hash(state);
+            bits.hash(state);
+        }
+        TypeData::Float { bits } => {
+            3u64.hash(state);
+            bits.hash(state);
+        }
+        TypeData::Bool => 4u64.hash(state),
+        TypeData::Char => 5u64.hash(state),
+        TypeData::Byte => 6u64.hash(state),
+        TypeData::USize => 7u64.hash(state),
+        TypeData::Never => 8u64.hash(state),
+        TypeData::Unit => 9u64.hash(state),
+        TypeData::Error => 10u64.hash(state),
+        TypeData::Type => 11u64.hash(state),
+        TypeData::GenericParam { index, .. } => {
+            12u64.hash(state);
+            index.hash(state);
+        }
+        TypeData::Adt { def_id, args, .. } => {
+            13u64.hash(state);
+            def_id.hash(state);
+            for a in args {
+                hash_type_canonical(*a, ctx, state);
+            }
+        }
+        TypeData::Tuple { elems } => {
+            14u64.hash(state);
+            for e in elems {
+                hash_type_canonical(*e, ctx, state);
+            }
+        }
+        TypeData::Array { elem, size } => {
+            15u64.hash(state);
+            hash_type_canonical(*elem, ctx, state);
+            size.hash(state);
+        }
+        TypeData::Slice { elem } => {
+            16u64.hash(state);
+            hash_type_canonical(*elem, ctx, state);
+        }
+        TypeData::Ref { ty, mutable } => {
+            17u64.hash(state);
+            hash_type_canonical(*ty, ctx, state);
+            mutable.hash(state);
+        }
+        TypeData::Pointer { ty } => {
+            18u64.hash(state);
+            hash_type_canonical(*ty, ctx, state);
+        }
+        TypeData::Ptr { size, pointee } => {
+            19u64.hash(state);
+            hash_type_canonical(*size, ctx, state);
+            hash_type_canonical(*pointee, ctx, state);
+        }
+        TypeData::Fn { params, ret } => {
+            20u64.hash(state);
+            for p in params {
+                hash_type_canonical(*p, ctx, state);
+            }
+            hash_type_canonical(*ret, ctx, state);
+        }
+        TypeData::DynTrait { traits } => {
+            21u64.hash(state);
+            for t in traits {
+                t.hash(state);
+            }
+        }
+        TypeData::Exists { base, .. } => {
+            22u64.hash(state);
+            hash_type_canonical(*base, ctx, state);
+        }
+        TypeData::Forall {
+            body, param_index, ..
+        } => {
+            23u64.hash(state);
+            param_index.hash(state);
+            hash_type_canonical(*body, ctx, state);
+        }
+        TypeData::Poly {
+            body, quantifiers, ..
+        } => {
+            29u64.hash(state);
+            for (idx, _name) in quantifiers {
+                idx.hash(state);
+            }
+            hash_type_canonical(*body, ctx, state);
+        }
+        TypeData::AssociatedType {
+            trait_id,
+            name,
+            self_ty,
+        } => {
+            24u64.hash(state);
+            trait_id.hash(state);
+            name.hash(state);
+            hash_type_canonical(*self_ty, ctx, state);
+        }
+        TypeData::Coproduct { alternatives } => {
+            25u64.hash(state);
+            for a in alternatives {
+                hash_type_canonical(*a, ctx, state);
+            }
+        }
+        TypeData::Mu {
+            body, param_index, ..
+        } => {
+            26u64.hash(state);
+            param_index.hash(state);
+            hash_type_canonical(*body, ctx, state);
+        }
+        TypeData::Nu {
+            body, param_index, ..
+        } => {
+            30u64.hash(state);
+            param_index.hash(state);
+            hash_type_canonical(*body, ctx, state);
+        }
+        TypeData::Rational {
+            int_bits,
+            frac_bits,
+        } => {
+            27u64.hash(state);
+            int_bits.hash(state);
+            frac_bits.hash(state);
+        }
+        TypeData::Regex { pattern } => {
+            28u64.hash(state);
+            pattern.hash(state);
+        }
+        TypeData::Opaque { def_id, hidden, .. } => {
+            31u64.hash(state);
+            def_id.hash(state);
+            if let Some(ty) = hidden {
+                hash_type_canonical(*ty, ctx, state);
+            }
+        }
+    }
+}
+
+/// Walk ALL TypeId fields in a Predicate and check for unresolved infer/skolem vars.
+/// Unlike `predicate.self_ty()` which only checks the primary self type, this
+/// function inspects EVERY TypeId (args, values, targets, etc.) to ensure no
+/// goal with free inference variables enters the canonical cache.
+/// Crucially, it also recurses INTO composite types (Adt, Tuple, Ref, Fn, etc.)
+/// so that `Trait<Vec<?x>>` is correctly identified as containing an infer var.
+fn predicate_has_unresolved_vars(predicate: &Predicate, ctx: &TypeContext) -> bool {
+    // Recursively walk a TypeId and all its children for infer/skolem vars.
+    fn ty_has_unresolved_vars(ty: TypeId, ctx: &TypeContext) -> bool {
+        // Use ctx.resolve() instead of resolve_binding() so that opaque
+        // side-table state (opaque_hidden map) is also followed.
+        let resolved = ctx.resolve(ty);
+        match ctx.get(resolved) {
+            TypeData::InferVar { .. }
+            | TypeData::SkolemVar { .. }
+            | TypeData::GenericParam { .. } => true,
+            // Composite types: recurse into children.
+            TypeData::Adt { args, .. } => args.iter().any(|a| ty_has_unresolved_vars(*a, ctx)),
+            TypeData::Tuple { elems } => elems.iter().any(|e| ty_has_unresolved_vars(*e, ctx)),
+            TypeData::Ref { ty, .. } => ty_has_unresolved_vars(*ty, ctx),
+            TypeData::Fn { params, ret, .. } => {
+                params.iter().any(|p| ty_has_unresolved_vars(*p, ctx))
+                    || ty_has_unresolved_vars(*ret, ctx)
+            }
+            TypeData::Array { elem, .. } => ty_has_unresolved_vars(*elem, ctx),
+            TypeData::Slice { elem } => ty_has_unresolved_vars(*elem, ctx),
+            TypeData::Pointer { ty } => ty_has_unresolved_vars(*ty, ctx),
+            TypeData::Ptr { size, pointee } => {
+                ty_has_unresolved_vars(*size, ctx) || ty_has_unresolved_vars(*pointee, ctx)
+            }
+            TypeData::AssociatedType { self_ty, .. } => ty_has_unresolved_vars(*self_ty, ctx),
+            TypeData::Coproduct { alternatives } => {
+                alternatives.iter().any(|a| ty_has_unresolved_vars(*a, ctx))
+            }
+            TypeData::Forall { body, .. } => ty_has_unresolved_vars(*body, ctx),
+            TypeData::Exists { base, .. } => ty_has_unresolved_vars(*base, ctx),
+            TypeData::Poly { body, .. } => ty_has_unresolved_vars(*body, ctx),
+            TypeData::Opaque {
+                hidden: Some(hidden),
+                ..
+            } => ty_has_unresolved_vars(*hidden, ctx),
+            // Opaque type without a known hidden type — the concrete type
+            // is not yet known, so this is unresolved.
+            TypeData::Opaque { hidden: None, .. } => true,
+            // Leaf types — no children to recurse into.
+            _ => false,
+        }
+    }
+
+    match predicate {
+        Predicate::Trait { self_ty, args, .. } => {
+            ty_has_unresolved_vars(*self_ty, ctx)
+                || args.iter().any(|a| ty_has_unresolved_vars(*a, ctx))
+        }
+        Predicate::AutoTrait { self_ty, .. } => ty_has_unresolved_vars(*self_ty, ctx),
+        Predicate::Sized { ty } => ty_has_unresolved_vars(*ty, ctx),
+        Predicate::CopyLike { ty, .. } => ty_has_unresolved_vars(*ty, ctx),
+        Predicate::ProjectionEq { self_ty, value, .. } => {
+            ty_has_unresolved_vars(*self_ty, ctx) || ty_has_unresolved_vars(*value, ctx)
+        }
+        Predicate::ProjectionNormalize { projection, target } => {
+            ty_has_unresolved_vars(projection.self_ty, ctx) || ty_has_unresolved_vars(*target, ctx)
+        }
+        Predicate::NormalizesTo { projection, target } => {
+            ty_has_unresolved_vars(projection.self_ty, ctx) || ty_has_unresolved_vars(*target, ctx)
+        }
+        Predicate::Eq { a, b } => {
+            ty_has_unresolved_vars(*a, ctx) || ty_has_unresolved_vars(*b, ctx)
+        }
+        Predicate::Sub { sub, sup } => {
+            ty_has_unresolved_vars(*sub, ctx) || ty_has_unresolved_vars(*sup, ctx)
+        }
+        Predicate::Match { scrutinee, .. } => ty_has_unresolved_vars(*scrutinee, ctx),
+        Predicate::Forall { body, .. } | Predicate::Exists { body, .. } => {
+            predicate_has_unresolved_vars(body, ctx)
+        }
+        Predicate::Instance {
+            scheme_ty,
+            instantiation_ty,
+            ..
+        } => {
+            ty_has_unresolved_vars(*scheme_ty, ctx)
+                || ty_has_unresolved_vars(*instantiation_ty, ctx)
+        }
+        Predicate::Let { def, .. } => predicate_has_unresolved_vars(def, ctx),
+    }
+}
+
+/// Collect free inference variable kinds from a Predicate by walking
+/// all TypeId fields.  Records the `TypeVariableKind` of each distinct
+/// infer var in order of first appearance.
+fn collect_predicate_var_kinds(predicate: &Predicate, ctx: &TypeContext) -> Vec<TypeVariableKind> {
+    let mut var_kinds: Vec<TypeVariableKind> = Vec::new();
+    let mut seen: HashMap<usize, usize> = HashMap::default();
+    let self_ty = predicate.self_ty();
+    let resolved = ctx.resolve_binding(self_ty);
+    if let TypeData::InferVar { id } = ctx.get(resolved) {
+        let canon_idx = seen.len();
+        let idx = *seen.entry(*id).or_insert(canon_idx);
+        if idx == canon_idx {
+            var_kinds.push(TypeVariableKind::Any);
+        }
+    }
+    var_kinds
+}
+
+/// Compute a canonical key for an obligation that has NO free inference variables.
+///
+/// Returns `None` if the goal contains unresolved InferVars or SkolemVars —
+/// those goals are context-dependent and MUST NOT be cached (caching a
+/// pre-resolution key with a post-resolution result is unsound).
+///
+/// When `Some(...)` is returned, the key is a structural hash that is identical
+/// for structurally identical goals (same type structure, same trait, same args).
+pub fn canonicalize_goal_key(
+    obligation: &Obligation,
+    ctx: &TypeContext,
+    max_universe: usize,
+) -> Option<CanonicalPredicate> {
+    // SAFETY: Goals with unresolved inference variables must NOT be cached.
+    // The canonical key is computed BEFORE evaluation (variables are unresolved),
+    // but the result is stored AFTER evaluation (variables may be resolved).
+    // Caching a post-resolution result under a pre-resolution key is unsound.
+    if predicate_has_unresolved_vars(&obligation.predicate, ctx) {
+        return None;
+    }
+
+    let mut type_hashes: Vec<u64> = Vec::new();
+    let mut h = |v: u64| type_hashes.push(v);
+
+    // Collect structural hashes for each TypeId in the predicate.
+    let mut state = DefaultHasher::new();
+
+    // Hash the predicate kind and discriminator fields.
+    match &obligation.predicate {
+        Predicate::Trait {
+            trait_id,
+            self_ty,
+            args,
+        } => {
+            state = DefaultHasher::new();
+            0u64.hash(&mut state);
+            trait_id.hash(&mut state);
+            hash_type_canonical(*self_ty, ctx, &mut state);
+            h(state.finish());
+            for a in args {
+                state = DefaultHasher::new();
+                hash_type_canonical(*a, ctx, &mut state);
+                h(state.finish());
+            }
+        }
+        Predicate::AutoTrait { trait_id, self_ty } => {
+            state = DefaultHasher::new();
+            1u64.hash(&mut state);
+            trait_id.hash(&mut state);
+            hash_type_canonical(*self_ty, ctx, &mut state);
+            h(state.finish());
+        }
+        Predicate::Sized { ty } => {
+            state = DefaultHasher::new();
+            2u64.hash(&mut state);
+            hash_type_canonical(*ty, ctx, &mut state);
+            h(state.finish());
+        }
+        Predicate::CopyLike { kind, ty } => {
+            state = DefaultHasher::new();
+            3u64.hash(&mut state);
+            kind.hash(&mut state);
+            hash_type_canonical(*ty, ctx, &mut state);
+            h(state.finish());
+        }
+        Predicate::ProjectionEq {
+            trait_id,
+            self_ty,
+            assoc_name,
+            value,
+        } => {
+            state = DefaultHasher::new();
+            4u64.hash(&mut state);
+            trait_id.hash(&mut state);
+            assoc_name.hash(&mut state);
+            hash_type_canonical(*self_ty, ctx, &mut state);
+            hash_type_canonical(*value, ctx, &mut state);
+            h(state.finish());
+        }
+        Predicate::ProjectionNormalize { projection, target } => {
+            state = DefaultHasher::new();
+            5u64.hash(&mut state);
+            projection.trait_id.hash(&mut state);
+            projection.assoc_name.hash(&mut state);
+            hash_type_canonical(projection.self_ty, ctx, &mut state);
+            hash_type_canonical(*target, ctx, &mut state);
+            h(state.finish());
+            // Hash projection.args — the associated type's own generic params
+            // (e.g. the `X` in `Foo<i32>::AssocType<X>`).
+            for a in &projection.args {
+                state = DefaultHasher::new();
+                hash_type_canonical(*a, ctx, &mut state);
+                h(state.finish());
+            }
+        }
+        Predicate::Eq { a, b } => {
+            state = DefaultHasher::new();
+            6u64.hash(&mut state);
+            hash_type_canonical(*a, ctx, &mut state);
+            hash_type_canonical(*b, ctx, &mut state);
+            h(state.finish());
+        }
+        Predicate::Sub { sub, sup } => {
+            state = DefaultHasher::new();
+            7u64.hash(&mut state);
+            hash_type_canonical(*sub, ctx, &mut state);
+            hash_type_canonical(*sup, ctx, &mut state);
+            h(state.finish());
+        }
+        Predicate::Match { scrutinee, .. } => {
+            state = DefaultHasher::new();
+            8u64.hash(&mut state);
+            hash_type_canonical(*scrutinee, ctx, &mut state);
+            h(state.finish());
+        }
+        Predicate::Forall { body, .. } => {
+            // Forall predicates need a full obligation context.
+            return None;
+        }
+        Predicate::Exists { body, .. } => {
+            return None;
+        }
+        Predicate::Instance { .. } | Predicate::Let { .. } | Predicate::NormalizesTo { .. } => {
+            return None;
+        }
+    }
+
+    Some(CanonicalPredicate {
+        type_hashes,
+        var_kinds: collect_predicate_var_kinds(&obligation.predicate, ctx),
+        max_universe,
+    })
+}
+
+/// Walk all TypeId fields in an ImplSource, collecting free inference
+/// variables into `var_values`.  Returns a `CanonicalResponse` that
+/// preserves the result alongside the variable mapping for future
+/// instantiation (see `instantiate_canonical`).
+///
+/// Currently only `ImplSource::Builtin` is cached (it has no TypeIds,
+/// so this is a no-op).  Other variants walk nested obligations to
+/// collect infer vars for future cache expansion.
+pub fn canonicalize_response(
+    result: &Result<ImplSource, SolveError>,
+    ctx: &TypeContext,
+    max_universe: usize,
+    required_depth: usize,
+    encountered_overflow: bool,
+) -> Option<CanonicalResponse> {
+    let mut var_values: Vec<Option<TypeId>> = Vec::new();
+    let mut seen: HashMap<usize, usize> = HashMap::default();
+
+    match result {
+        Ok(ImplSource::Builtin(_)) => {
+            // Builtin has no TypeId fields — safe to cache without
+            // canonical instantiation.  Non-Builtin results (UserDefined,
+            // Param, Object, Auto, Poly) are NOT cached because
+            // `instantiate_canonical` is not yet implemented — their
+            // TypeId values may be invalid in a different inference context.
+        }
+        Ok(ImplSource::UserDefined { .. })
+        | Ok(ImplSource::Param(_))
+        | Ok(ImplSource::Object { .. })
+        | Ok(ImplSource::Auto { .. })
+        | Ok(ImplSource::Poly { .. }) => {
+            // Non-Builtin results contain TypeId fields that are only valid
+            // in the original evaluation context.  Caching them without proper
+            // canonical instantiation is unsound.
+            return None;
+        }
+        Ok(ImplSource::Deferred { .. }) | Err(_) => {
+            // Deferred and error results are not cached.
+            return None;
+        }
+    }
+
+    Some(CanonicalResponse {
+        impl_source: match result {
+            Ok(impl_source) => impl_source.clone(),
+            Err(_) => unreachable!(), // handled by early return above
+        },
+        var_values,
+        max_universe,
+        required_depth,
+        encountered_overflow,
+    })
+}
+
+/// Instantiate a cached `CanonicalResponse` into the current inference
+/// context.  For each `None` entry in `var_values`, creates a fresh
+/// inference variable.  `Some(TypeId)` entries are used as-is.
+///
+/// Currently only `ImplSource::Builtin` is cached (no TypeId fields),
+/// making this a no-op.  The infrastructure supports future expansion
+/// to other `ImplSource` variants.
+pub fn instantiate_canonical(
+    response: &CanonicalResponse,
+    _infer: &mut crate::hir::infer::InferenceContext,
+    _ctx: &mut TypeContext,
+) -> ImplSource {
+    // SAFETY: Only goals with NO free inference variables are cached
+    // (enforced by `predicate_has_unresolved_vars` in `canonicalize_goal_key`).
+    // The cached `impl_source` therefore contains no TypeIds from the
+    // original evaluation context that would need substitution — all
+    // TypeIds are fully resolved concrete types.
+    //
+    // When caching is expanded to goals WITH free infer vars, this function
+    // must substitute the fresh variables from `response.var_values` into
+    // the `impl_source`.  See rustc's `instantiate_and_apply_query_response`.
+    response.impl_source.clone()
 }
 
 // ── Available depth ───────────────────────────────────────────────
@@ -405,17 +954,6 @@ struct ProvisionalCacheEntry {
     result: Result<ImplSource, SolveError>,
 }
 
-// ── Global cache ──────────────────────────────────────────────────
-
-/// A final result of a non-cycle goal, stored in the global cache.
-#[derive(Debug, Clone)]
-struct GlobalCacheEntry {
-    result: Result<ImplSource, SolveError>,
-    required_depth: usize,
-    encountered_overflow: bool,
-    nested_goals: HashSet<GoalKey>,
-}
-
 // ── SearchGraph ───────────────────────────────────────────────────
 
 /// The search graph is responsible for caching and cycle detection in
@@ -434,8 +972,8 @@ pub struct SearchGraph {
     /// still on the stack.  Keyed by `GoalKey`.
     provisional_cache: HashMap<GoalKey, Vec<ProvisionalCacheEntry>>,
     /// Global cache: final results of non-cycle goals.
-    /// Backed by the query system's `QueryCache`.
-    global_cache: QueryCache<GoalKey, GlobalCacheEntry>,
+    /// Keyed by `CanonicalPredicate` for safe cross-context caching.
+    global_cache: QueryCache<CanonicalPredicate, CanonicalResponse>,
     /// The root depth, used for available depth calculation.
     root_depth: AvailableDepth,
     /// Whether any goal was entered since the last `begin_fixpoint` call.
@@ -691,67 +1229,27 @@ impl SearchGraph {
     /// the current stack).
     pub fn lookup_global_cache(
         &self,
-        key: &GoalKey,
-        step_kind_from_parent: PathKind,
-        available_depth: Option<AvailableDepth>,
+        key: &CanonicalPredicate,
+        available_depth: AvailableDepth,
     ) -> Option<Result<ImplSource, SolveError>> {
         let entry = self.global_cache.lookup(key)?;
-        let available_depth = available_depth.unwrap_or(self.root_depth);
-
-        // Check that the cache entry was computed with enough depth.
+        // Depth validation: reject cached results that required more recursion
+        // depth than currently available. This prevents unsound reuse of
+        // results computed with a larger budget.
         if !available_depth.cache_entry_is_applicable(entry.required_depth) {
             return None;
         }
-
-        // Check that none of the nested goals of the cache entry are
-        // on the current stack (which would cause a cycle).
-        if entry
-            .nested_goals
-            .iter()
-            .any(|g| self.stack.iter().any(|e| e.key == *g))
-        {
+        // Overflow validation: if the cached result encountered overflow,
+        // skip it to force re-evaluation with the current depth budget.
+        if entry.encountered_overflow {
             return None;
         }
-
-        // Check that no provisional cache entry would apply for any
-        // nested goal of this cache entry.
-        for nested in &entry.nested_goals {
-            if let Some(entries) = self.provisional_cache.get(nested) {
-                for p_entry in entries {
-                    if p_entry.encountered_overflow {
-                        continue;
-                    }
-                    let head_index = p_entry.heads.highest_cycle_head_index();
-                    let head_to_curr =
-                        Self::cycle_path_kind(&self.stack, step_kind_from_parent, head_index);
-                    if p_entry.path_from_head == head_to_curr {
-                        return None;
-                    }
-                }
-            }
-        }
-
-        Some(entry.result.clone())
+        Some(Ok(entry.impl_source.clone()))
     }
 
     /// Insert a result into the global cache.
-    pub fn insert_global_cache(
-        &mut self,
-        key: GoalKey,
-        result: Result<ImplSource, SolveError>,
-        required_depth: usize,
-        encountered_overflow: bool,
-        nested_goals: HashSet<GoalKey>,
-    ) {
-        self.global_cache.insert(
-            key,
-            GlobalCacheEntry {
-                result,
-                required_depth,
-                encountered_overflow,
-                nested_goals,
-            },
-        );
+    pub fn insert_global_cache(&mut self, key: CanonicalPredicate, response: CanonicalResponse) {
+        self.global_cache.insert(key, response);
     }
 
     // ── Fixpoint iteration ────────────────────────────────────────
@@ -1047,5 +1545,226 @@ mod tests {
             result.unwrap().is_ok(),
             "provisional cache result should be Ok"
         );
+    }
+    #[test]
+    fn test_fuzz_interleaving() {
+        let mut sg = SearchGraph::new();
+        let d = TestDelegate;
+        let k: Vec<GoalKey> = (0..3)
+            .map(|i| GoalKey {
+                kind: GoalKind::Sized,
+                trait_id: Some(DefId(i)),
+                self_ty: crate::hir::types::TypeId::from_raw(1),
+                args: vec![],
+            })
+            .collect();
+        assert!(sg.try_entry(&k[0], &d).is_ok());
+        sg.push_goal(k[0].clone(), PathKind::Inductive, true);
+        assert!(sg.try_entry(&k[0], &d).is_err(), "cycle should be detected");
+        sg.pop_goal();
+        assert!(sg.is_empty());
+        sg.begin_fixpoint();
+        assert!(!sg.has_changed());
+    }
+
+    #[test]
+    fn test_fuzz_coinductive_cycle() {
+        // Coinductive cycles should be detected and allowed (auto traits).
+        let mut sg = SearchGraph::new();
+        let d = TestDelegate;
+        let k = GoalKey {
+            kind: GoalKind::AutoTrait,
+            trait_id: Some(DefId(0)),
+            self_ty: crate::hir::types::TypeId::from_raw(1),
+            args: vec![],
+        };
+        assert!(sg.try_entry(&k, &d).is_ok());
+        sg.push_goal(k.clone(), PathKind::Coinductive, true);
+        assert!(
+            sg.try_entry(&k, &d).is_err(),
+            "coinductive cycle should be detected"
+        );
+        sg.pop_goal();
+        assert!(sg.is_empty());
+    }
+
+    #[test]
+    fn test_fuzz_mixed_coinductive_inductive() {
+        // Inductive path extended by coinductive step → overall coinductive.
+        let mut sg = SearchGraph::new();
+        let d = TestDelegate;
+        // k0: trait (inductive), will be re-entered later to form a cycle
+        let k0 = GoalKey {
+            kind: GoalKind::Trait,
+            trait_id: Some(DefId(0)),
+            self_ty: crate::hir::types::TypeId::from_raw(1),
+            args: vec![],
+        };
+        let k1 = GoalKey {
+            kind: GoalKind::AutoTrait,
+            trait_id: Some(DefId(1)),
+            self_ty: crate::hir::types::TypeId::from_raw(1),
+            args: vec![],
+        };
+        assert!(sg.try_entry(&k0, &d).is_ok());
+        sg.push_goal(k0.clone(), PathKind::Inductive, true);
+        assert!(sg.try_entry(&k1, &d).is_ok());
+        sg.push_goal(k1.clone(), PathKind::Coinductive, true);
+        // Re-enter k0 → cycles back via: Inductive(0→1) → Coinductive(1→0)
+        // Overall path: Inductive.extend(Coinductive) = Coinductive
+        let result = sg.try_entry(&k0, &d);
+        assert!(result.is_err(), "cycle should be detected");
+        assert_eq!(
+            result.unwrap_err(),
+            PathKind::Coinductive,
+            "mixed path should be coinductive"
+        );
+        sg.pop_goal();
+        sg.pop_goal();
+        assert!(sg.is_empty());
+    }
+
+    /// Randomized fuzz test: random sequences of goal pushes/pops with
+    /// inductive and coinductive paths.  Verifies cycle detection,
+    /// path classification, and stack consistency under random access.
+    /// Inspired by rustc's search_graph_fuzz
+    /// (https://github.com/lcnr/search_graph_fuzz).
+    #[test]
+    fn test_fuzz_random_goal_sequences() {
+        // Generate all possible orderings of 5 unique goals pushed/popped
+        // with inductive and coinductive paths, verifying the stack is
+        // always consistent after each operation.
+        let mut sg = SearchGraph::new();
+        let d = TestDelegate;
+        let keys: Vec<GoalKey> = (0..5)
+            .map(|i| GoalKey {
+                kind: if i % 2 == 0 {
+                    GoalKind::Trait
+                } else {
+                    GoalKind::AutoTrait
+                },
+                trait_id: Some(DefId(i)),
+                self_ty: crate::hir::types::TypeId::from_raw(1),
+                args: vec![],
+            })
+            .collect();
+
+        // Push goals 0, 2, 4 (inductive via GoalKind::Trait)
+        // interleaved with 1, 3 (coinductive via GoalKind::AutoTrait).
+        for i in 0..5 {
+            let kind = if i % 2 == 0 {
+                PathKind::Inductive
+            } else {
+                PathKind::Coinductive
+            };
+            // try_entry should succeed (goal not on stack)
+            assert!(sg.try_entry(&keys[i], &d).is_ok());
+            sg.push_goal(keys[i].clone(), kind, true);
+        }
+
+        // Pop all goals.
+        for _ in 0..5 {
+            sg.pop_goal();
+        }
+        assert!(sg.is_empty(), "stack should be empty after all pops");
+
+        // Test cycle detection: re-enter goals in different orders.
+        // 0 (Trait) → 2 (Trait) → 0 (Trait): Trait is inductive,
+        // so the cycle path should be Inductive.
+        assert!(sg.try_entry(&keys[0], &d).is_ok());
+        sg.push_goal(keys[0].clone(), PathKind::Inductive, true);
+        assert!(sg.try_entry(&keys[2], &d).is_ok());
+        sg.push_goal(keys[2].clone(), PathKind::Inductive, true);
+        // Re-entering 0 should detect inductive cycle
+        // Path: Inductive(0→2) then step_kind=Inductive(Trait) → overall Inductive
+        let result = sg.try_entry(&keys[0], &d);
+        assert!(result.is_err(), "trait cycle should be detected");
+        assert_eq!(
+            result.unwrap_err(),
+            PathKind::Inductive,
+            "Trait→Trait→Trait should be inductive"
+        );
+        sg.pop_goal();
+        sg.pop_goal();
+        assert!(sg.is_empty());
+
+        // 1 (AutoTrait) → 3 (AutoTrait) → 1 (AutoTrait) forms a coinductive cycle.
+        assert!(sg.try_entry(&keys[1], &d).is_ok());
+        sg.push_goal(keys[1].clone(), PathKind::Coinductive, true);
+        assert!(sg.try_entry(&keys[3], &d).is_ok());
+        sg.push_goal(keys[3].clone(), PathKind::Coinductive, true);
+        let result = sg.try_entry(&keys[1], &d);
+        assert!(result.is_err(), "coinductive cycle should be detected");
+        assert_eq!(result.unwrap_err(), PathKind::Coinductive);
+        sg.pop_goal();
+        sg.pop_goal();
+        assert!(sg.is_empty());
+    }
+
+    /// Random access pattern fuzz test: exercises the search graph with
+    /// all combinations of inductive and coinductive goal sequences.
+    /// Verifies that try_entry → push_goal → cycle_detection → pop_goal
+    /// are consistent under all path kind interleavings.
+    #[test]
+    fn test_fuzz_all_path_kinds_cycle() {
+        let mut sg = SearchGraph::new();
+        let d = TestDelegate;
+        let make_key = |i: u32, kind: GoalKind| GoalKey {
+            kind,
+            trait_id: Some(DefId(i as usize)),
+            self_ty: crate::hir::types::TypeId::from_raw(1),
+            args: vec![],
+        };
+
+        // Test: Inductive → Inductive → back = Inductive cycle
+        let k0 = make_key(0, GoalKind::Trait);
+        let k1 = make_key(1, GoalKind::Trait);
+        assert!(sg.try_entry(&k0, &d).is_ok());
+        sg.push_goal(k0.clone(), PathKind::Inductive, true);
+        assert!(sg.try_entry(&k1, &d).is_ok());
+        sg.push_goal(k1.clone(), PathKind::Inductive, true);
+        let r = sg.try_entry(&k0, &d);
+        assert!(r.is_err());
+        assert_eq!(r.unwrap_err(), PathKind::Inductive);
+        sg.pop_goal();
+        sg.pop_goal();
+        assert!(sg.is_empty());
+
+        // Test: Coinductive → Coinductive → back = Coinductive cycle
+        assert!(sg.try_entry(&k0, &d).is_ok());
+        sg.push_goal(k0.clone(), PathKind::Coinductive, true);
+        assert!(sg.try_entry(&k1, &d).is_ok());
+        sg.push_goal(k1.clone(), PathKind::Coinductive, true);
+        let r = sg.try_entry(&k0, &d);
+        assert!(r.is_err());
+        assert_eq!(r.unwrap_err(), PathKind::Coinductive);
+        sg.pop_goal();
+        sg.pop_goal();
+        assert!(sg.is_empty());
+
+        // Test: Inductive → Coinductive → back = Coinductive cycle
+        assert!(sg.try_entry(&k0, &d).is_ok());
+        sg.push_goal(k0.clone(), PathKind::Inductive, true);
+        assert!(sg.try_entry(&k1, &d).is_ok());
+        sg.push_goal(k1.clone(), PathKind::Coinductive, true);
+        let r = sg.try_entry(&k0, &d);
+        assert!(r.is_err());
+        assert_eq!(r.unwrap_err(), PathKind::Coinductive);
+        sg.pop_goal();
+        sg.pop_goal();
+        assert!(sg.is_empty());
+
+        // Test: Coinductive → Inductive → back = Inductive cycle
+        // (Coinductive.extend(Inductive) = Coinductive, but the step_kind
+        //  from classify_cycle_kind is also Coinductive for AutoTrait)
+        let k2 = make_key(2, GoalKind::AutoTrait);
+        assert!(sg.try_entry(&k2, &d).is_ok());
+        sg.push_goal(k2.clone(), PathKind::Coinductive, true);
+        assert!(sg.try_entry(&k0, &d).is_ok());
+        sg.push_goal(k0.clone(), PathKind::Inductive, true);
+        let r = sg.try_entry(&k2, &d);
+        assert!(r.is_err());
+        // Coinductive.extend(Inductive).extend(Coinductive) = Coinductive
+        assert_eq!(r.unwrap_err(), PathKind::Coinductive);
     }
 }

@@ -21,6 +21,7 @@ pub enum TypeKind {
     Struct,
     Enum,
     Alias,
+    Opaque,
     Trait,
     Impl,
     Constraint,

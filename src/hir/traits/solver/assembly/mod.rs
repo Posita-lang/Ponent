@@ -132,6 +132,7 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
             Predicate::CopyLike { ty, .. } => *ty,
             Predicate::ProjectionEq { self_ty, .. } => *self_ty,
             Predicate::ProjectionNormalize { projection, .. } => projection.self_ty,
+            Predicate::NormalizesTo { projection, .. } => projection.self_ty,
             Predicate::Eq { a, .. } => *a,
             Predicate::Sub { sub, .. } => *sub,
             Predicate::Match { scrutinee, .. } => *scrutinee,
@@ -681,7 +682,7 @@ fn assemble_poly_candidates<D: SolverDelegate>(
 // ── Winnowing ─────────────────────────────────────────────────────
 
 fn winnow(
-    ctx: &TypeContext,
+    ctx: &mut TypeContext,
     trait_env: &TraitEnv,
     candidates: &mut Candidates,
     _resolved: &ResolvedObligation,
@@ -714,7 +715,7 @@ fn winnow(
 
 /// Order candidates by specificity (most specific first).
 fn specificity(
-    ctx: &TypeContext,
+    ctx: &mut TypeContext,
     trait_env: &TraitEnv,
     a: &Candidate,
     b: &Candidate,
@@ -726,13 +727,26 @@ fn specificity(
         // Impl candidates are more specific than builtins
         (Candidate::Impl { .. }, Candidate::Builtin(_)) => std::cmp::Ordering::Less,
         (Candidate::Builtin(_), Candidate::Impl { .. }) => std::cmp::Ordering::Greater,
-        // Impl vs Impl: compare constructor depth of for_type.
+        // Impl vs Impl: compare constructor depth, then specialization.
         (Candidate::Impl { idx: ai, .. }, Candidate::Impl { idx: bi, .. }) => {
             let a_cand = &trait_env.all_impls()[*ai];
             let b_cand = &trait_env.all_impls()[*bi];
             let a_depth = ctx.type_constructor_depth(a_cand.for_type);
             let b_depth = ctx.type_constructor_depth(b_cand.for_type);
-            b_depth.cmp(&a_depth) // higher depth = more specific = Ordering::Less
+            match b_depth.cmp(&a_depth) {
+                std::cmp::Ordering::Equal => {
+                    // Same depth — check impl specialization.
+                    use crate::hir::traits::solver::coherence::specializes;
+                    if specializes(ctx, a_cand, b_cand) {
+                        std::cmp::Ordering::Less
+                    } else if specializes(ctx, b_cand, a_cand) {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                }
+                other => other,
+            }
         }
         // Otherwise equal
         _ => std::cmp::Ordering::Equal,

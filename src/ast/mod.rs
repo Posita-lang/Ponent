@@ -517,6 +517,9 @@ pub enum TypeDefinition {
     },
     Constraint(Vec<Type>),
     Alias(Type, Vec<TypeModifier>),
+    /// Type alias with `impl Trait` (TAIT) — opaque type.
+    /// The `Type` is the trait bound (e.g. `Iterator<Item = u32>`).
+    Opaque(Type, Vec<TypeModifier>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

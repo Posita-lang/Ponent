@@ -40,7 +40,9 @@ use crate::hir::traits::solver::obligation::{
     BuiltinImplSource, ImplSource, Obligation, Predicate, SolveError,
 };
 use crate::hir::traits::solver::search_graph::{
-    FIXPOINT_STEP_LIMIT, GoalKey as SgGoalKey, GoalKind as SgGoalKind, SearchGraph,
+    AvailableDepth, CanonicalPredicate, CanonicalResponse, FIXPOINT_STEP_LIMIT,
+    GoalKey as SgGoalKey, GoalKind as SgGoalKind, PathKind, SearchGraph, canonicalize_goal_key,
+    canonicalize_response,
 };
 use crate::hir::traits::solver::select::MAX_RECURSION_DEPTH;
 use crate::hir::types::{AdtKind, DefId, TypeContext, TypeData, TypeId};
@@ -337,6 +339,7 @@ fn canonicalize_type(ctx: &TypeContext, ty: TypeId, bound: &mut Vec<usize>) -> C
         // and cannot participate in trait solving.
         TypeData::Regex { .. } => CanonTy::Unknown,
         TypeData::Type => CanonTy::Unknown,
+        TypeData::Opaque { .. } => CanonTy::Unknown,
     }
 }
 
@@ -387,12 +390,13 @@ fn evaluate_goal_inner<D: SolverDelegate>(
     }
 
     // ── Cycle detection via SearchGraph (embedded in EvalCtxt) ──
+    // This MUST happen BEFORE canonical cache lookup, because a cache hit
+    // that bypasses cycle detection can cause infinite loops or staleness.
     let goal_key = SgGoalKey::from_obligation(goal, ecx.ctx());
     if let Some(ref key) = goal_key {
         match ecx.search_graph.try_entry(key, ecx.delegate) {
             Ok(()) => {
                 // Push the goal onto the stack for evaluation.
-                // The step_kind is determined by the goal's trait kind.
                 let step_kind = if let Some(trait_id) = key.trait_id {
                     if ecx.delegate.trait_is_coinductive(trait_id) {
                         crate::hir::traits::solver::search_graph::PathKind::Coinductive
@@ -413,6 +417,23 @@ fn evaluate_goal_inner<D: SolverDelegate>(
                 return ecx.search_graph.handle_cycle(key, goal, path_kind);
             }
         }
+    }
+
+    // ── Canonical cache lookup ──
+    // AFTER cycle detection — cache hits can skip evaluation but must not
+    // bypass the search graph's cycle/stack safety invariants.
+    let max_universe = ecx.max_input_universe;
+    let canonical_key = canonicalize_goal_key(goal, ecx.ctx(), max_universe);
+    let cache_hit = canonical_key.as_ref().and_then(|ck| {
+        ecx.search_graph
+            .lookup_global_cache(ck, AvailableDepth(depth))
+    });
+    if let Some(cached_result) = cache_hit {
+        // Pop the goal from the search graph (it was pushed above).
+        if goal_key.is_some() {
+            ecx.search_graph.pop_goal();
+        }
+        return cached_result;
     }
 
     // ── Evaluate using the new builder-pattern probe API ──
@@ -449,11 +470,21 @@ fn evaluate_goal_inner<D: SolverDelegate>(
         ecx.search_graph.pop_goal();
     }
 
-    result
-}
+    // ── Canonical cache store ──
+    // SAFETY: The `predicate_has_unresolved_vars` check in
+    // `canonicalize_goal_key` already ensures we only cache goals
+    // with NO free inference variables.  All ImplSource variants
+    // are safe to cache because their TypeId values are fully
+    // resolved (no InferVars / SkolemVars).
+    if let Some(ck) = canonical_key {
+        // required_depth = current depth; encountered_overflow = false
+        // (overflow causes early return before reaching cache store).
+        if let Some(response) =
+            canonicalize_response(&result, ecx.ctx(), max_universe, depth, false)
+        {
+            ecx.search_graph.insert_global_cache(ck, response);
+        }
+    }
 
-/// Compute the canonical goal key for an obligation, using the
-/// search_graph's key type.
-fn compute_goal_key(obligation: &Obligation, ctx: &TypeContext) -> Option<SgGoalKey> {
-    SgGoalKey::from_obligation(obligation, ctx)
+    result
 }

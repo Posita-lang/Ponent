@@ -3623,6 +3623,17 @@ fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContex
             })
             .unwrap_or(ctx.error())
         }
+        TypeData::Opaque { def_id, hidden } => match hidden {
+            Some(hidden_ty) => {
+                let new_hidden = replace_infer(hidden_ty, solution, ctx);
+                ctx.find_type(&TypeData::Opaque {
+                    def_id,
+                    hidden: Some(new_hidden),
+                })
+                .unwrap_or(ctx.error())
+            }
+            None => ty,
+        },
         TypeData::Coproduct { alternatives } => {
             let new_alts: Vec<TypeId> = alternatives
                 .iter()

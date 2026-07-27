@@ -138,6 +138,7 @@ impl From<&TypeData> for TypeTag {
             TypeData::Error => TypeTag::Error,
             TypeData::Regex { .. } => TypeTag::Regex,
             TypeData::Type => TypeTag::TypeKind,
+            TypeData::Opaque { .. } => TypeTag::TypeKind,
         }
     }
 }
@@ -386,6 +387,14 @@ pub enum TypeData {
     /// `TypeId` value that can be used in type declarations.
     /// Corresponds to `Token::Type` in the parser and `ComptimeValue::Type`.
     Type,
+    /// An opaque type defined via `type T = impl Trait` (TAIT).
+    /// `def_id` identifies the opaque type.  `hidden` is:
+    /// - `None` inside the defining scope (type is opaque)
+    /// - `Some(hidden_ty)` outside the defining scope (revealed)
+    Opaque {
+        def_id: DefId,
+        hidden: Option<TypeId>,
+    },
 }
 
 impl fmt::Display for TypeTag {
@@ -820,7 +829,11 @@ fn is_type_volatile_inner(data: &TypeData, types: Option<&Vec<Arc<TypeData>>>) -
         | TypeData::Error
         | TypeData::Type
         | TypeData::Rational { .. }
-        | TypeData::Regex { .. } => false,
+        | TypeData::Regex { .. }
+        | TypeData::Opaque { hidden: None, .. } => false,
+        TypeData::Opaque {
+            hidden: Some(ty), ..
+        } => is_type_volatile_inner_by_id(*ty, types),
         TypeData::Adt { args, .. } => args.iter().any(|a| is_type_volatile_inner_by_id(*a, types)),
         TypeData::Tuple { elems } => elems
             .iter()
@@ -876,7 +889,12 @@ fn is_type_volatile_inner_by_id(ty: TypeId, types: Option<&Vec<Arc<TypeData>>>) 
                 | TypeData::Error
                 | TypeData::Type
                 | TypeData::Rational { .. }
-                | TypeData::Regex { .. } => false,
+                | TypeData::Regex { .. }
+                | TypeData::Opaque { hidden: None, .. } => false,
+                // Opaque type with a revealed hidden type — recurse.
+                TypeData::Opaque {
+                    hidden: Some(ty), ..
+                } => is_type_volatile_inner_by_id(*ty, Some(types)),
                 TypeData::DynTrait { .. } => false,
                 TypeData::AssociatedType { .. } => false,
                 // Composite types: recurse into children.
@@ -946,6 +964,13 @@ pub struct TypeContext {
     /// Pre-computed variance-annotated outgoing edges for each TypeId.
     /// Built lazily on first variance check, then reused.
     variance_edges: RefCell<HashMap<TypeId, Vec<VarianceEdge>>>,
+    /// Storage for opaque type (TAIT) hidden types.
+    /// When an opaque type's concrete type is inferred inside the defining
+    /// scope, the hidden type is stored here. `resolve_opaque` checks this
+    /// map before falling back to the `TypeData::Opaque.hidden` field.
+    /// Uses `RefCell` because the defining scope may set hidden types
+    /// during type checking after TypeContext creation.
+    opaque_hidden: RefCell<HashMap<TypeId, TypeId>>,
     /// Transaction stack for atomic unification (OmniML-style rollback via undo log).
     /// Each entry is a list of (key, old_value) pairs recording every binding
     /// change made during that transaction.  On rollback the changes are undone
@@ -955,6 +980,10 @@ pub struct TypeContext {
     /// Note: the types arena (self.types) is NOT truncated on rollback because
     /// TypeId values may be held externally; the arena is append-only.
     transaction_stack: RefCell<Vec<Vec<(TypeId, Option<TypeId>)>>>,
+    /// Parallel undo log for `opaque_hidden` changes.  Each transaction
+    /// level has a list of (opaque_type_id, previous_hidden_value) pairs
+    /// that are restored on rollback.
+    opaque_hidden_undo: RefCell<Vec<Vec<(TypeId, Option<TypeId>)>>>,
     /// Cache for unification with variance: prevents infinite recursion on
     /// self-referential types.  Keyed by (a, b, variance_tag) where
     /// variance_tag = 0 for Invariant, 1 for Covariant, 2 for Contravariant.
@@ -998,6 +1027,8 @@ impl TypeContext {
             builtin_layout_descriptor: TypeId::NONE,
             variance_cache: RefCell::new(HashMap::default()),
             variance_edges: RefCell::new(HashMap::default()),
+            opaque_hidden: RefCell::new(HashMap::default()),
+            opaque_hidden_undo: RefCell::new(Vec::new()),
             transaction_stack: RefCell::new(Vec::new()),
             unify_seen: RefCell::new(HashSet::default()),
             kappa_cache: RefCell::new(HashMap::default()),
@@ -1107,7 +1138,12 @@ impl TypeContext {
             | TypeData::Rational { .. }
             | TypeData::Regex { .. }
             | TypeData::GenericParam { .. }
-            | TypeData::Type => false,
+            | TypeData::Type
+            | TypeData::Opaque { hidden: None, .. } => false,
+            // Opaque type with revealed hidden type — recurse.
+            TypeData::Opaque {
+                hidden: Some(ty), ..
+            } => self.type_is_volatile_by_id(*ty),
             // Composite types: check each child TypeId
             TypeData::Fn { params, ret } => {
                 params.iter().any(|&p| self.type_is_volatile_by_id(p))
@@ -1215,6 +1251,73 @@ impl TypeContext {
         }
     }
 
+    /// If the type is an opaque TAIT (`type T = impl Trait`) outside its
+    /// defining scope, resolve to the revealed concrete type.
+    /// Uses an iterative loop with a visited set to handle cycles.
+    /// Recursively follows chains of opaque indirections.
+    pub fn resolve_opaque(&self, id: TypeId) -> TypeId {
+        let mut current = self.resolve_binding(id);
+        let mut visited = rustc_hash::FxHashSet::default();
+        visited.insert(current);
+        loop {
+            // Resolve bindings at each hop — the hidden type may have been
+            // unified with another type after being stored in opaque_hidden.
+            current = self.resolve_binding(current);
+            // Check the opaque_hidden map first (defining scope reveal).
+            if let Some(hidden) = self.opaque_hidden.borrow().get(&current) {
+                let hidden = self.resolve_binding(*hidden);
+                if !visited.insert(hidden) {
+                    return current; // cycle detected
+                }
+                current = hidden;
+                continue;
+            }
+            match &*self.types[current.index()] {
+                TypeData::Opaque {
+                    hidden: Some(hidden),
+                    ..
+                } => {
+                    let hidden = self.resolve_binding(*hidden);
+                    if !visited.insert(hidden) {
+                        return current; // cycle detected
+                    }
+                    current = hidden;
+                }
+                _ => return current,
+            }
+        }
+    }
+
+    /// Set the hidden concrete type for an opaque type within its defining
+    /// scope.  The type checker calls this when the concrete type is inferred.
+    /// Records the previous value in the transaction undo log so that
+    /// `rollback_transaction` can restore it.
+    ///
+    /// If the opaque type already has a hidden type, unifies the new value
+    /// with the existing one instead of silently overwriting.  Returns an
+    /// error if unification fails (conflicting defining uses).
+    pub fn set_opaque_hidden(&mut self, id: TypeId, hidden: TypeId) -> Result<(), String> {
+        // If there is an existing hidden type, unify rather than overwrite.
+        // Copy out the existing value first to avoid borrow conflicts.
+        let existing = self.opaque_hidden.borrow().get(&id).copied();
+        if let Some(existing) = existing {
+            self.unify(existing, hidden).map_err(|_| {
+                format!(
+                    "opaque type {:?} has conflicting hidden types: {:?} vs {:?}",
+                    id, existing, hidden
+                )
+            })?;
+            return Ok(());
+        }
+        // Record undo before inserting, if a transaction is active.
+        if let Some(log) = self.opaque_hidden_undo.borrow_mut().last_mut() {
+            let old = self.opaque_hidden.borrow().get(&id).copied();
+            log.push((id, old));
+        }
+        self.opaque_hidden.borrow_mut().insert(id, hidden);
+        Ok(())
+    }
+
     pub(crate) fn resolve_binding(&self, id: TypeId) -> TypeId {
         // Safety: guard against infinite loops from circular bindings.
         // 10 000 is generous enough for any real program while preventing
@@ -1277,6 +1380,12 @@ impl TypeContext {
         }
 
         root
+    }
+
+    /// Resolve bindings AND resolve opaque types.
+    /// This is the standard entry point for getting the "real" type.
+    pub fn resolve(&self, id: TypeId) -> TypeId {
+        self.resolve_opaque(self.resolve_binding(id))
     }
 
     pub fn alloc_infer_var(&mut self, id: usize) -> TypeId {
@@ -2293,7 +2402,8 @@ impl TypeContext {
             | TypeData::Regex { .. }
             | TypeData::DynTrait { .. }
             | TypeData::SkolemVar { .. }
-            | TypeData::Type => false,
+            | TypeData::Type
+            | TypeData::Opaque { .. } => false,
         }
     }
 
@@ -2815,6 +2925,7 @@ impl TypeContext {
     /// for potential rollback, without cloning the entire binding table.
     pub fn begin_transaction(&self) {
         self.transaction_stack.borrow_mut().push(Vec::new());
+        self.opaque_hidden_undo.borrow_mut().push(Vec::new());
     }
 
     /// Return the current transaction nesting depth.
@@ -2823,22 +2934,23 @@ impl TypeContext {
         self.transaction_stack.borrow().len()
     }
 
-    /// Commit the current transaction: discard the undo log.
+    /// Commit the current transaction: discard the undo logs.
     pub fn commit_transaction(&self) {
-        // Pop the current (innermost) transaction's undo log.
+        // Pop the current (innermost) transaction's binding undo log.
         let committed = self.transaction_stack.borrow_mut().pop();
         // Merge its entries into the parent transaction's log so that if
         // the parent later rolls back, it also undoes changes that were
         // committed by the inner transaction.
-        //
-        // Without this merge, the inner transaction's log is discarded on
-        // commit, leaving the parent unaware of those changes.  A subsequent
-        // parent rollback would then only undo the parent's own direct
-        // changes, leaving the inner transaction's modifications in place
-        // — a semantic mismatch with the original full-snapshot behaviour.
         if let Some(committed_log) = committed {
             if let Some(parent_log) = self.transaction_stack.borrow_mut().last_mut() {
                 parent_log.extend(committed_log);
+            }
+        }
+        // Merge opaque_hidden undo log into parent as well.
+        let committed_opaque = self.opaque_hidden_undo.borrow_mut().pop();
+        if let Some(committed_opaque_log) = committed_opaque {
+            if let Some(parent_log) = self.opaque_hidden_undo.borrow_mut().last_mut() {
+                parent_log.extend(committed_opaque_log);
             }
         }
         // κ cache may be invalidated by binding changes across transaction boundaries.
@@ -2847,7 +2959,7 @@ impl TypeContext {
     }
 
     /// Rollback the current transaction: reverse-apply every binding change
-    /// recorded in this transaction's undo log.
+    /// and opaque_hidden change recorded in this transaction's undo logs.
     /// Also clears the unification cache so subsequent attempts re-evaluate.
     /// Note: the types arena (self.types) is NOT truncated — TypeId values
     /// may be held externally, and the arena is logically append-only.
@@ -2858,6 +2970,16 @@ impl TypeContext {
                 match old {
                     Some(v) => bindings.insert(key, v),
                     None => bindings.remove(&key),
+                };
+            }
+        }
+        // Rollback opaque_hidden changes.
+        if let Some(log) = self.opaque_hidden_undo.borrow_mut().pop() {
+            let mut opaque = self.opaque_hidden.borrow_mut();
+            for (key, old) in log.into_iter().rev() {
+                match old {
+                    Some(v) => opaque.insert(key, v),
+                    None => opaque.remove(&key),
                 };
             }
         }
@@ -3623,7 +3745,8 @@ impl TypeContext {
             | TypeData::Error
             | TypeData::Regex { .. }
             | TypeData::SkolemVar { .. }
-            | TypeData::Type => 1,
+            | TypeData::Type
+            | TypeData::Opaque { .. } => 1,
         }
     }
 
@@ -3724,7 +3847,8 @@ impl TypeContext {
             | TypeData::InferVar { .. }
             | TypeData::DynTrait { .. }
             | TypeData::SkolemVar { .. }
-            | TypeData::Type => false,
+            | TypeData::Type
+            | TypeData::Opaque { .. } => false,
         }
     }
 
@@ -3892,6 +4016,11 @@ impl Subst {
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    /// Iterate over all TypeId values in this substitution.
+    pub fn values(&self) -> impl Iterator<Item = &TypeId> {
+        self.map.values()
     }
 
     /// Return a new `Subst` with the given index removed.

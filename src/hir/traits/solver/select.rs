@@ -236,7 +236,7 @@ impl<'a> SelectionContext<'a> {
             self.symbols,
         );
         match normalized {
-            Some(concrete_ty) => {
+            project::ProjectionResult::Normalized(concrete_ty) => {
                 self.ctx
                     .unify(value, concrete_ty)
                     .map_err(|_| SolveError::Mismatch {
@@ -246,7 +246,10 @@ impl<'a> SelectionContext<'a> {
                     })?;
                 Ok(ImplSource::Param(vec![]))
             }
-            None => Err(SolveError::NotFound {
+            project::ProjectionResult::Deferred(stalled_on) => Ok(ImplSource::Deferred {
+                stalled_on: vec![stalled_on],
+            }),
+            _ => Err(SolveError::NotFound {
                 trait_id,
                 self_ty: resolved_self,
                 span: cause.span,
@@ -256,6 +259,7 @@ impl<'a> SelectionContext<'a> {
 
     /// Handle `<SelfTy as Trait>::AssocName` — normalize the projection
     /// and return the concrete type via an ImplSource.
+    /// NormalizesTo: see rustc_next_trait_solver::solve::normalizes_to
     fn handle_projection_normalize(
         &mut self,
         projection: &ProjectionTy,
@@ -277,7 +281,7 @@ impl<'a> SelectionContext<'a> {
             self.symbols,
         );
         match normalized {
-            Some(concrete_ty) => {
+            project::ProjectionResult::Normalized(concrete_ty) => {
                 self.ctx
                     .unify(target, concrete_ty)
                     .map_err(|_| SolveError::Mismatch {
@@ -287,7 +291,10 @@ impl<'a> SelectionContext<'a> {
                     })?;
                 Ok(ImplSource::Param(vec![]))
             }
-            None => Err(SolveError::NotFound {
+            project::ProjectionResult::Deferred(stalled_on) => Ok(ImplSource::Deferred {
+                stalled_on: vec![stalled_on],
+            }),
+            _ => Err(SolveError::NotFound {
                 trait_id: projection.trait_id,
                 self_ty: resolved_self,
                 span: cause.span,

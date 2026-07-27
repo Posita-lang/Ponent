@@ -282,6 +282,7 @@ impl<'a> NameResolver<'a> {
                     TypeDefinition::Struct(_, _) => TypeKind::Struct,
                     TypeDefinition::Enum(_, _, _) => TypeKind::Enum,
                     TypeDefinition::Alias(_, _) => TypeKind::Alias,
+                    TypeDefinition::Opaque(_, _) => TypeKind::Opaque,
                     TypeDefinition::TraitDef { .. } => TypeKind::Trait,
                     TypeDefinition::ImplBlock { .. } => TypeKind::Impl,
                     TypeDefinition::Constraint(_) => TypeKind::Constraint,

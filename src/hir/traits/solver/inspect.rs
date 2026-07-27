@@ -184,3 +184,93 @@ impl Default for ProofTreeBuilder {
         Self::new(false)
     }
 }
+
+// ── Proof tree analysis ───────────────────────────────────────────
+
+/// Describes why a goal evaluation failed, extracted from the proof tree.
+#[derive(Debug, Clone)]
+pub struct FailureAnalysis {
+    /// The goal that failed.
+    pub goal: GoalNode,
+    /// Why it failed.
+    pub reason: FailureReason,
+}
+
+#[derive(Debug, Clone)]
+pub enum FailureReason {
+    /// No candidates were applicable.
+    NoApplicableCandidates,
+    /// All candidates failed with errors.
+    AllCandidatesFailed(Vec<SolveError>),
+    /// Overflow (recursion depth exceeded).
+    Overflow { depth: usize },
+    /// A nested sub-goal failed.
+    NestedGoalFailed(Box<FailureAnalysis>),
+}
+
+/// Analyze the proof tree and return structured failure information.
+/// Returns `None` if the evaluation succeeded (no failures).
+pub fn analyze_proof_tree(roots: &[GoalNode]) -> Option<Vec<FailureAnalysis>> {
+    let mut failures = Vec::new();
+    for root in roots {
+        if let Some(analysis) = analyze_node(root) {
+            failures.push(analysis);
+        }
+    }
+    if failures.is_empty() {
+        None
+    } else {
+        Some(failures)
+    }
+}
+
+fn analyze_node(node: &GoalNode) -> Option<FailureAnalysis> {
+    // If the result is Ok, this goal succeeded — no failure to analyze.
+    if node.result.is_ok() {
+        return None;
+    }
+
+    // Check for overflow.
+    if let Err(SolveError::Overflow { depth, .. }) = &node.result {
+        return Some(FailureAnalysis {
+            goal: node.clone(),
+            reason: FailureReason::Overflow { depth: *depth },
+        });
+    }
+
+    // Check candidates.
+    if node.candidates.is_empty() {
+        return Some(FailureAnalysis {
+            goal: node.clone(),
+            reason: FailureReason::NoApplicableCandidates,
+        });
+    }
+
+    // Collect candidate errors.
+    let errors: Vec<SolveError> = node
+        .candidates
+        .iter()
+        .filter(|c| !c.success)
+        .filter_map(|c| c.error.clone())
+        .collect();
+
+    if !errors.is_empty() {
+        return Some(FailureAnalysis {
+            goal: node.clone(),
+            reason: FailureReason::AllCandidatesFailed(errors),
+        });
+    }
+
+    // Check nested goals for failures.
+    // The reconstructed GoalNode tree has empty child_indices (see build_subtree
+    // which flattens them away), so we can't recurse into children here.
+    // Instead, check that we have at least some failure info to report.
+    if matches!(&node.result, Err(_)) {
+        return Some(FailureAnalysis {
+            goal: node.clone(),
+            reason: FailureReason::NoApplicableCandidates,
+        });
+    }
+
+    None
+}
