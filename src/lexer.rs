@@ -227,6 +227,8 @@ pub enum Token {
     Set,
     #[token("type")]
     Type,
+    #[token("const")]
+    Const,
     #[token("with")]
     With,
     #[token("default")]
@@ -530,8 +532,12 @@ pub enum Token {
     Caret,
     #[token("<<")]
     Shl,
+    #[token("<<=")]
+    ShlEq,
     #[token(">>")]
     Shr,
+    #[token(">>=")]
+    ShrEq,
     #[token("~")]
     Tilde,
     #[token("==")]
@@ -702,6 +708,8 @@ impl Token {
             Token::MinusEq => "`-=`".to_string(),
             Token::StarEq => "`*=`".to_string(),
             Token::SlashEq => "`/=`".to_string(),
+            Token::ShlEq => "`<<=`".to_string(),
+            Token::ShrEq => "`>>=`".to_string(),
             Token::Shl => "`<<`".to_string(),
             Token::Shr => "`>>`".to_string(),
             Token::At => "`@`".to_string(),
@@ -718,6 +726,7 @@ impl Token {
             Token::Auto => "`auto`".to_string(),
             Token::With => "`with`".to_string(),
             Token::Where => "`where`".to_string(),
+            Token::Const => "`const`".to_string(),
             Token::Finally => "`finally`".to_string(),
             Token::Pub => "`pub`".to_string(),
             Token::Pure => "`pure`".to_string(),
@@ -857,6 +866,7 @@ impl Token {
             Token::Pure => Some(Symbol::intern("pure")),
             Token::Io => Some(Symbol::intern("io")),
             Token::Trusted => Some(Symbol::intern("trusted")),
+            Token::Const => Some(Symbol::intern("const")),
             Token::Ghost => Some(Symbol::intern("ghost")),
             Token::Layout => Some(Symbol::intern("layout")),
             Token::Validate => Some(Symbol::intern("validate")),

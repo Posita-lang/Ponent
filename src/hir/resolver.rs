@@ -1557,26 +1557,36 @@ impl<'a> NameResolver<'a> {
                 if let Type::Path(path, _) = base.as_ref() {
                     if path.len() == 1 {
                         if path[0].eq_str("Int") {
-                            let bits = self.extract_int_from_type(args[0].ty()).unwrap_or(32);
+                            let bits = self
+                                .extract_int_from_type(args[0].ty().as_ref())
+                                .unwrap_or(32);
                             return self.ctx.int(bits, true);
                         } else if path[0].eq_str("UInt") {
-                            let bits = self.extract_int_from_type(args[0].ty()).unwrap_or(32);
+                            let bits = self
+                                .extract_int_from_type(args[0].ty().as_ref())
+                                .unwrap_or(32);
                             return self.ctx.int(bits, false);
                         } else if path[0].eq_str("Float") {
-                            let bits = self.extract_int_from_type(args[0].ty()).unwrap_or(64);
+                            let bits = self
+                                .extract_int_from_type(args[0].ty().as_ref())
+                                .unwrap_or(64);
                             return self.ctx.float(bits);
                         } else if path[0].eq_str("Rational") {
-                            let p = self.extract_int_from_type(args[0].ty()).unwrap_or(16);
-                            let q = self.extract_int_from_type(args[1].ty()).unwrap_or(16);
+                            let p = self
+                                .extract_int_from_type(args[0].ty().as_ref())
+                                .unwrap_or(16);
+                            let q = self
+                                .extract_int_from_type(args[1].ty().as_ref())
+                                .unwrap_or(16);
                             return self.ctx.rational(p, q);
                         } else if path[0].eq_str("Ptr") {
                             let size = args
                                 .get(0)
-                                .map(|a| self.resolve_type_expr(a.ty()))
+                                .map(|a| self.resolve_type_expr(a.ty().as_ref()))
                                 .unwrap_or(self.ctx.usize());
                             let pointee = args
                                 .get(1)
-                                .map(|a| self.resolve_type_expr(a.ty()))
+                                .map(|a| self.resolve_type_expr(a.ty().as_ref()))
                                 .unwrap_or(self.ctx.error());
                             return self.ctx.ptr(size, pointee);
                         } else if path[0].eq_str("USize") {
@@ -1590,7 +1600,7 @@ impl<'a> NameResolver<'a> {
                     if let Some(binding) = binding {
                         let arg_tys: Vec<TypeId> = args
                             .iter()
-                            .map(|a| self.resolve_type_expr(a.ty()))
+                            .map(|a| self.resolve_type_expr(a.ty().as_ref()))
                             .collect();
                         match binding.kind {
                             TypeKind::Struct => self.ctx.struct_ty(def_id, arg_tys),
@@ -1914,6 +1924,10 @@ impl<'a> NameResolver<'a> {
                         GenericArg::Named(n, t) => {
                             GenericArg::Named(n.clone(), self.resolve_self_in_type(t, self_ty))
                         }
+                        GenericArg::Const(ac) => GenericArg::Const(crate::ast::AnonConst {
+                            value: ac.value.clone(),
+                            span: ac.span,
+                        }),
                     })
                     .collect();
                 Type::Generic(Box::new(new_base), new_args, *span)

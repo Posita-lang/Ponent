@@ -2079,25 +2079,31 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         if path[0].eq_str("Int") {
                             let width = args
                                 .get(0)
-                                .and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
+                                .and_then(|arg| {
+                                    self.checker.extract_int_from_type(arg.ty().as_ref())
+                                })
                                 .unwrap_or(32);
                             return Ok(self.checker.ctx.int(width, true));
                         } else if path[0].eq_str("UInt") {
                             let width = args
                                 .get(0)
-                                .and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
+                                .and_then(|arg| {
+                                    self.checker.extract_int_from_type(arg.ty().as_ref())
+                                })
                                 .unwrap_or(32);
                             return Ok(self.checker.ctx.int(width, false));
                         } else if path[0].eq_str("Float") {
                             let width = args
                                 .get(0)
-                                .and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
+                                .and_then(|arg| {
+                                    self.checker.extract_int_from_type(arg.ty().as_ref())
+                                })
                                 .unwrap_or(64);
                             return Ok(self.checker.ctx.float(width));
                         } else if path[0].eq_str("Rational") {
-                            let p = args.get(0).and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
+                            let p = args.get(0).and_then(|arg| self.checker.extract_int_from_type(arg.ty().as_ref()))
                                 .ok_or_else(|| Diagnostic::error("Rational requires a compile-time constant integer bit count for the integer part").with_span(*span))?;
-                            let q = args.get(1).and_then(|arg| self.checker.extract_int_from_type(arg.ty()))
+                            let q = args.get(1).and_then(|arg| self.checker.extract_int_from_type(arg.ty().as_ref()))
                                 .ok_or_else(|| Diagnostic::error("Rational requires a compile-time constant integer bit count for the fractional part").with_span(*span))?;
                             if p == 0 || p > 64 || q == 0 || q > 64 {
                                 return Err(Diagnostic::error("Rational bit counts must be 1..64")
@@ -2108,7 +2114,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             let mut size = self.checker.ctx.usize();
                             let mut pointee = self.checker.ctx.error();
                             for arg in args {
-                                let ty = self.resolve_type(arg.ty())?;
+                                let ty = self.resolve_type(arg.ty().as_ref())?;
                                 match arg {
                                     GenericArg::Named(name, _) if name.eq_str("size") => size = ty,
                                     GenericArg::Named(name, _) if name.eq_str("pointee") => {
@@ -2134,7 +2140,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let expanded = self.expand_base_type(base_ty, *span)?;
                 let mut arg_tys = Vec::new();
                 for arg in args {
-                    arg_tys.push(self.resolve_type(arg.ty())?);
+                    arg_tys.push(self.resolve_type(arg.ty().as_ref())?);
                 }
                 match self.checker.ctx.get(expanded) {
                     TypeData::Adt { def_id, .. } => {

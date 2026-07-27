@@ -1454,6 +1454,10 @@ impl<'a> TypeChecker<'a> {
                                                 GenericArg::Named(_, _) => {
                                                     // Handled below as ProjectionEq
                                                 }
+                                                GenericArg::Const(_) => {
+                                                    // Const generic args are handled by
+                                                    // comptime evaluation, not type resolution.
+                                                }
                                             }
                                         }
                                     }
@@ -1500,6 +1504,9 @@ impl<'a> TypeChecker<'a> {
                                                 }
                                                 GenericArg::Positional(_) => {
                                                     // Already handled above in trait_args extraction
+                                                }
+                                                GenericArg::Const(_) => {
+                                                    // Const generic args: currently no resolution needed
                                                 }
                                             }
                                         }
@@ -3648,6 +3655,14 @@ impl<'a> TypeChecker<'a> {
                         GenericArg::Named(n, t) => {
                             GenericArg::Named(n.clone(), self.resolve_self_ty(t, self_ty))
                         }
+                        GenericArg::Const(ac) => {
+                            // Const generic args: clone as-is (self-type doesn't affect
+                            // const expressions at this stage).
+                            GenericArg::Const(crate::ast::AnonConst {
+                                value: ac.value.clone(),
+                                span: ac.span,
+                            })
+                        }
                     })
                     .collect();
                 Type::Generic(Box::new(new_base), new_args, *span)
@@ -5056,6 +5071,15 @@ impl<'a> TypeChecker<'a> {
                         crate::ast::GenericArg::Positional(t) => Self::type_to_string(t),
                         crate::ast::GenericArg::Named(n, t) => {
                             format!("{} = {}", n, Self::type_to_string(t))
+                        }
+                        crate::ast::GenericArg::Const(ac) => {
+                            format!(
+                                "const {}",
+                                Self::type_to_string(&crate::ast::Type::Expr(
+                                    ac.value.clone(),
+                                    ac.span
+                                ))
+                            )
                         }
                     })
                     .collect();

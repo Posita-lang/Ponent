@@ -1,4 +1,4 @@
-use crate::ast::{EnumVariant, Span, Type, TypeParam};
+use crate::ast::{EnumVariant, Span, Type, TypeParam, TypeParamKind};
 use crate::hir::symbol::{SymbolTable, TraitBinding, TypeBinding, TypeKind};
 use crate::hir::traits::{ImplCandidate, TraitEnv};
 use crate::hir::types::{DefId, TypeContext};
@@ -247,13 +247,13 @@ pub fn register_builtins(
         let result_t = TypeParam {
             name: Symbol::intern("T"),
             bounds: vec![],
-            is_lifetime: false,
+            kind: TypeParamKind::Type,
             span: Span::new(0, 0),
         };
         let result_e = TypeParam {
             name: Symbol::intern("E"),
             bounds: vec![],
-            is_lifetime: false,
+            kind: TypeParamKind::Type,
             span: Span::new(0, 0),
         };
         let ok_variant = EnumVariant {
@@ -301,7 +301,7 @@ pub fn register_builtins(
         let option_t = TypeParam {
             name: Symbol::intern("T"),
             bounds: vec![],
-            is_lifetime: false,
+            kind: TypeParamKind::Type,
             span: Span::new(0, 0),
         };
         let none_variant = EnumVariant {
@@ -364,7 +364,7 @@ pub fn register_builtins(
         let future_t = TypeParam {
             name: Symbol::intern("T"),
             bounds: vec![],
-            is_lifetime: false,
+            kind: TypeParamKind::Type,
             span: Span::new(0, 0),
         };
         let output_variant = EnumVariant {
@@ -455,7 +455,7 @@ pub fn register_builtins(
         let channel_t = TypeParam {
             name: Symbol::intern("T"),
             bounds: vec![],
-            is_lifetime: false,
+            kind: TypeParamKind::Type,
             span: Span::new(0, 0),
         };
         let binding = TypeBinding {

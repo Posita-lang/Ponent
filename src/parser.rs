@@ -296,21 +296,91 @@ impl Parser {
     /// Rustc-style pre-check: does the current token definitively start a
     /// const generic argument rather than a type? When true, the generic arg
     /// loop parses directly as an expression without any type-first attempt.
+    /// Analogous to rustc's `can_begin_const_arg`/`check_const_arg`.
     fn check_const_arg(&mut self) -> bool {
+        // Tokens that definitively cannot start a type
+        // (and therefore MUST be const expressions).
         match self.peek() {
-            Ok(Token::FloatLiteral(_))
-            | Ok(Token::True)
+            Ok(Token::True)
             | Ok(Token::False)
             | Ok(Token::CharLiteral(_))
             | Ok(Token::StringLiteral(_))
             | Ok(Token::ByteStringLiteral(_))
+            | Ok(Token::FloatLiteral(_))
             | Ok(Token::Minus)
-            | Ok(Token::Plus)
-            | Ok(Token::Bang)
-            | Ok(Token::LBracket)
+            | Ok(Token::LBrace)
             | Ok(Token::If)
             | Ok(Token::Match) => true,
+            // For Ident: only if followed by `(` — this catches
+            // comptime function calls like `compute_size!()` which
+            // go through parse_path_or_literal → infix `!(` branch.
             Ok(Token::Ident(_)) => matches!(self.peek_next(), Some(Token::LParen)),
+            _ => false,
+        }
+    }
+
+    /// Parse a const generic argument (value side), e.g. `<{ 2 + 2 }>`, `<N>`, or `{ 42 }`.
+    /// Returns an `AnonConst` wrapping the expression.
+    /// Per the Posita syntax spec: complex expressions MUST be wrapped in `{ }`;
+    /// only simple literals and identifier paths may appear unbraced.
+    /// Analogous to rustc's `parse_const_arg` (rustc_parse/src/parser/path.rs).
+    fn parse_const_arg(&mut self) -> Result<AnonConst, Diagnostic> {
+        let start = self.span().start;
+        let value = if matches!(self.peek(), Ok(Token::LBrace)) {
+            // Brace-delimited const arg: `{ expr }`
+            //
+            // NOTE: parse_block / parse_block_inner stops at `}`
+            // without consuming it (the caller is always responsible
+            // for consuming the closing brace).  We advance past `{`,
+            // parse the block body, then consume `}` ourselves.
+            self.advance().ok();
+            let body = self.parse_block()?;
+            self.expect(Token::RBrace)?;
+            let end = self.span().end;
+            Expr::Block(body, Span::new(start, end))
+        } else {
+            // Unbraced const arg: only simple literals and single-segment
+            // identifiers are allowed.  Complex expressions like `N + 1`
+            // MUST be wrapped in `{ }` to disambiguate from type args.
+            // See SYNTAX.md §Const Generics.
+            let expr =
+                self.with_restrictions(ParseRestrictions::NO_COMPARISON, |this| this.parse_expr())?;
+            // Validate that the unbraced expression is simple enough.
+            if !Self::is_simple_const_expr(&expr) {
+                let span = expr.span();
+                let end = self.span().end;
+                return Err(Diagnostic::error(
+                    "complex const generic argument must be wrapped in `{ }`",
+                )
+                .with_code_str("E004")
+                .with_help(
+                    "wrap the expression in braces — e.g. `<{ N + 1 }>` instead of `<N + 1>`",
+                )
+                .with_suggestion("add `{` before and `}` after the expression")
+                .with_span(Span::new(start, end)));
+            }
+            expr
+        };
+        let end = self.span().end;
+        Ok(AnonConst {
+            value: Box::new(value),
+            span: Span::new(start, end),
+        })
+    }
+
+    /// Check whether an unbraced const generic argument expression is simple
+    /// enough to be unambiguous — a literal, a single-segment identifier path,
+    /// or a unary `-`/`+` applied to one of those.  Complex expressions like
+    /// `N + 1` must be wrapped in `{ }`.
+    fn is_simple_const_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Literal(..) => true,
+            Expr::Ident(..) => true,
+            Expr::Path(path, _) if path.len() <= 1 => true,
+            Expr::UnaryOp {
+                op, expr: inner, ..
+            } if matches!(op, UnaryOp::Neg) => Self::is_simple_const_expr(inner),
+            Expr::Call { comptime: true, .. } => true, // comptime fn call
             _ => false,
         }
     }
@@ -1296,53 +1366,64 @@ impl Parser {
         self.advance().ok(); // consume <
         let mut p = Vec::new();
         loop {
-            let (name, is_lifetime) = if matches!(self.peek(), Ok(Token::Apostrophe)) {
-                self.advance().ok();
-                match self.advance() {
-                    Ok(Token::Ident(name)) => (Symbol::intern(&format!("'{}", name)), true),
-                    _ => {
-                        return Err(Diagnostic::error("expected lifetime name after `'`")
-                            .with_code_str("E004")
-                            .with_help(
-                                "lifetime parameters use `'name` syntax — e.g. `<'a, 'b, T>`",
-                            )
-                            .with_suggestion(
-                                "add a lifetime name after `'`, e.g. `<'a>` or `<'a, T>`",
-                            )
-                            .with_span(self.span()));
-                    }
-                }
+            if matches!(self.peek(), Ok(Token::Const)) {
+                // const N: Type  — const generic parameter
+                let param = self.parse_const_param()?;
+                p.push(param);
             } else {
-                match self.advance() {
-                    Ok(Token::Ident(name)) => (name, false),
-                    _ => {
-                        return Err(Diagnostic::error("expected type parameter name")
-                            .with_code_str("E004")
-                            .with_help("type parameters must have a name — e.g. `<T>` or `<K, V>`")
-                            .with_suggestion(
-                                "use a valid identifier like `T` or `Item` for the type parameter",
-                            )
-                            .with_span(self.span()));
-                    }
-                }
-            };
-            let mut bounds = Vec::new();
-            if !is_lifetime && matches!(self.peek(), Ok(Token::Colon)) {
-                self.advance().ok();
-                loop {
-                    bounds.push(self.parse_type()?);
-                    if !matches!(self.peek(), Ok(Token::Plus)) {
-                        break;
-                    }
+                let (name, is_lifetime) = if matches!(self.peek(), Ok(Token::Apostrophe)) {
                     self.advance().ok();
+                    match self.advance() {
+                        Ok(Token::Ident(name)) => (Symbol::intern(&format!("'{}", name)), true),
+                        _ => {
+                            return Err(Diagnostic::error("expected lifetime name after `'`")
+                                .with_code_str("E004")
+                                .with_help(
+                                    "lifetime parameters use `'name` syntax — e.g. `<'a, 'b, T>`",
+                                )
+                                .with_suggestion(
+                                    "add a lifetime name after `'`, e.g. `<'a>` or `<'a, T>`",
+                                )
+                                .with_span(self.span()));
+                        }
+                    }
+                } else {
+                    match self.advance() {
+                        Ok(Token::Ident(name)) => (name, false),
+                        _ => {
+                            return Err(Diagnostic::error("expected type parameter name")
+                                .with_code_str("E004")
+                                .with_help("type parameters must have a name — e.g. `<T>` or `<K, V>`")
+                                .with_suggestion(
+                                    "use a valid identifier like `T` or `Item` for the type parameter",
+                                )
+                                .with_span(self.span()));
+                        }
+                    }
+                };
+                let mut bounds = Vec::new();
+                if !is_lifetime && matches!(self.peek(), Ok(Token::Colon)) {
+                    self.advance().ok();
+                    loop {
+                        bounds.push(self.parse_type()?);
+                        if !matches!(self.peek(), Ok(Token::Plus)) {
+                            break;
+                        }
+                        self.advance().ok();
+                    }
                 }
+                let kind = if is_lifetime {
+                    TypeParamKind::Lifetime
+                } else {
+                    TypeParamKind::Type
+                };
+                p.push(TypeParam {
+                    name,
+                    bounds,
+                    kind,
+                    span: Span::new(self.span().start, self.span().end),
+                });
             }
-            p.push(TypeParam {
-                name,
-                bounds,
-                is_lifetime,
-                span: Span::new(self.span().start, self.span().end),
-            });
             match self.peek() {
                 Ok(Token::Comma) => {
                     self.advance().ok();
@@ -1361,6 +1442,49 @@ impl Parser {
             }
         }
         Ok(p)
+    }
+
+    /// Parse a const generic parameter: `const N: Type = default_expr`.
+    /// Called when `const` is encountered in a generic parameter list.
+    /// Analogous to rustc's `parse_const_param` (rustc_parse/src/parser/generics.rs).
+    fn parse_const_param(&mut self) -> Result<TypeParam, Diagnostic> {
+        let start = self.span().start;
+        self.advance().ok(); // consume `const`
+        let name = match self.advance() {
+            Ok(Token::Ident(name)) => name,
+            Ok(tok) => {
+                return Err(Diagnostic::error(format!(
+                    "expected parameter name after `const`, found {:?}",
+                    tok
+                ))
+                .with_code_str("E004")
+                .with_help("`const` generic parameters require a name — e.g. `const N: usize`")
+                .with_suggestion("add a parameter name after `const`, like `const N: usize`")
+                .with_span(self.span()));
+            }
+            Err(()) => {
+                return Err(Diagnostic::error("expected parameter name after `const`")
+                    .with_code_str("E002")
+                    .with_help("`const` generic parameters require a name — e.g. `const N: usize`")
+                    .with_suggestion("add a parameter name after `const`, like `const N: usize`")
+                    .with_span(self.span()));
+            }
+        };
+        self.expect(Token::Colon)?;
+        let ty = self.parse_type()?;
+        let default = if matches!(self.peek(), Ok(Token::Assign)) {
+            self.advance().ok();
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        let end = self.span().end;
+        Ok(TypeParam {
+            name,
+            bounds: Vec::new(),
+            kind: TypeParamKind::Const { ty, default },
+            span: Span::new(start, end),
+        })
     }
 
     fn parse_where_clause(&mut self) -> Result<WhereClause, Diagnostic> {
@@ -1824,12 +1948,10 @@ impl Parser {
                                 };
                                 GenericArg::Named(name, value)
                             } else if self.check_const_arg() {
-                                let expr = self.with_restrictions(
-                                    ParseRestrictions::NO_COMPARISON,
-                                    |this| this.parse_expr(),
-                                )?;
-                                let span = expr.span();
-                                GenericArg::Positional(Type::Expr(Box::new(expr), span))
+                                // Definitive const argument — parse as const expression
+                                // and wrap in GenericArg::Const (like rustc's parse_const_arg).
+                                let anon = self.parse_const_arg()?;
+                                GenericArg::Const(anon)
                             } else {
                                 // Ambiguous case (typically an Ident that could be a type
                                 // name or a const variable).  Try type first; if the type
@@ -1875,9 +1997,21 @@ impl Parser {
                                                 ParseRestrictions::NO_COMPARISON,
                                                 |this| this.parse_expr(),
                                             )?;
+                                            if !Self::is_simple_const_expr(&expr) {
+                                                let span = expr.span();
+                                                return Err(Diagnostic::error(
+                                                    "complex const generic argument must be wrapped in `{ }`"
+                                                )
+                                                .with_code_str("E004")
+                                                .with_help("wrap the expression in braces — e.g. `<{ N + 1 }>` instead of `<N + 1>`")
+                                                .with_suggestion("add `{` before and `}` after the expression")
+                                                .with_span(span));
+                                            }
                                             let span = expr.span();
-                                            GenericArg::Positional(
-                                                Type::Expr(Box::new(expr), span))
+                                            GenericArg::Const(AnonConst {
+                                                value: Box::new(expr),
+                                                span,
+                                            })
                                         } else {
                                             GenericArg::Positional(ty)
                                         }
@@ -1888,9 +2022,21 @@ impl Parser {
                                             ParseRestrictions::NO_COMPARISON,
                                             |this| this.parse_expr(),
                                         )?;
+                                        if !Self::is_simple_const_expr(&expr) {
+                                            let span = expr.span();
+                                            return Err(Diagnostic::error(
+                                                "complex const generic argument must be wrapped in `{ }`"
+                                            )
+                                            .with_code_str("E004")
+                                            .with_help("wrap the expression in braces — e.g. `<{ N + 1 }>` instead of `<N + 1>`")
+                                            .with_suggestion("add `{` before and `}` after the expression")
+                                            .with_span(span));
+                                        }
                                         let span = expr.span();
-                                        GenericArg::Positional(
-                                            Type::Expr(Box::new(expr), span))
+                                        GenericArg::Const(AnonConst {
+                                            value: Box::new(expr),
+                                            span,
+                                        })
                                     }
                                 }
                             };
@@ -2246,10 +2392,12 @@ impl Parser {
                         | Ok(Token::MinusEq)
                         | Ok(Token::StarEq)
                         | Ok(Token::SlashEq)
+                        | Ok(Token::ShlEq)
+                        | Ok(Token::ShrEq)
                 ) {
                     let op_token = self.advance().map_err(|_| Diagnostic::error("unexpected token")
                         .with_code_str("E003")
-                        .with_help("expected an assignment operator (`=`, `+=`, `-=`, `*=`, `/=`) after the target")
+                        .with_help("expected an assignment operator (`=`, `+=`, `-=`, `*=`, `/=`, `<<=`, `>>=`) after the target")
                         .with_span(Span::new(0, 0)))?;
                     let op = match op_token {
                         Token::Assign => None,
@@ -2257,6 +2405,8 @@ impl Parser {
                         Token::MinusEq => Some(BinOp::Sub),
                         Token::StarEq => Some(BinOp::Mul),
                         Token::SlashEq => Some(BinOp::Div),
+                        Token::ShlEq => Some(BinOp::Shl),
+                        Token::ShrEq => Some(BinOp::Shr),
                         _ => unreachable!(),
                     };
                     let value = self.parse_expr()?;
@@ -2543,7 +2693,7 @@ impl Parser {
                     params.push(TypeParam {
                         name,
                         bounds: vec![],
-                        is_lifetime: false,
+                        kind: TypeParamKind::Type,
                         span: self.span(),
                     });
                     if matches!(self.peek(), Ok(Token::Comma)) {
@@ -6299,23 +6449,28 @@ mod tests {
 
     #[test]
     fn test_nested_generics_with_shr_expr() {
-        // `>>` as right-shift inside a const generic argument:
-        //   Foo<Int, Val >> 2>
-        // The >> must be consumed by the expression parser as a right-shift,
-        // NOT split into two > by expect_gt.
-        let program = check_parse("def main() { set x: Foo<Int, Val >> 2> = 0; }");
+        // `>>` as right-shift inside a braced const generic argument:
+        //   Foo<Int, { Val >> 2 }>
+        // The >> is inside `{ }`, so the generic argument parser correctly
+        // delegates to parse_block and the `>` closing the generic is
+        // unambiguous.
+        let program = check_parse("def main() { set x: Foo<Int, { Val >> 2 }> = 0; }");
         assert_eq!(program.items.len(), 1);
-        // Verify the second generic arg is Type::Expr, not split into separate args
+        // Verify the second generic arg is GenericArg::Const
         match &program.items[0] {
             Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
                 Stmt::VariableDef {
                     ty: Some(Type::Generic(_, args, _)),
                     ..
                 } => {
-                    assert_eq!(args.len(), 2, "generic should have 2 args: Int and Val>>2");
+                    assert_eq!(
+                        args.len(),
+                        2,
+                        "generic should have 2 args: Int and {{Val>>2}}"
+                    );
                     assert!(
-                        matches!(&args[1], GenericArg::Positional(Type::Expr(..))),
-                        "second arg should be Type::Expr (Val >> 2), got {:?}",
+                        matches!(&args[1], GenericArg::Const(AnonConst { .. })),
+                        "second arg should be GenericArg::Const ({{Val>>2}}), got {:?}",
                         args[1]
                     );
                 }
@@ -6343,7 +6498,7 @@ mod tests {
 
     #[test]
     fn test_const_expr_int_literal_arith() {
-        let program = check_parse("def main() { set x: Foo<Int, 5 + 3> = 0; }");
+        let program = check_parse("def main() { set x: Foo<Int, { 5 + 3 }> = 0; }");
         assert_eq!(program.items.len(), 1);
     }
 
@@ -6355,7 +6510,7 @@ mod tests {
 
     #[test]
     fn test_const_expr_int_literal_sub() {
-        let program = check_parse("def main() { set x: Foo<Int, 10 - 3> = 0; }");
+        let program = check_parse("def main() { set x: Foo<Int, { 10 - 3 }> = 0; }");
         assert_eq!(program.items.len(), 1);
     }
 

@@ -1,5 +1,6 @@
 pub mod visit;
 use crate::symbol::Symbol;
+use std::borrow::Cow;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -495,10 +496,28 @@ pub struct Param {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum TypeParamKind {
+    Type,
+    Lifetime,
+    Const {
+        ty: Type,
+        default: Option<Box<Expr>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TypeParam {
     pub name: Symbol,
     pub bounds: Vec<Type>,
-    pub is_lifetime: bool,
+    pub kind: TypeParamKind,
+    pub span: Span,
+}
+
+/// An anonymous constant expression — used for const generic arguments,
+/// array sizes, etc. Analogous to rustc's `AnonConst`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnonConst {
+    pub value: Box<Expr>,
     pub span: Span,
 }
 
@@ -608,12 +627,14 @@ pub struct ImplMethod {
 pub enum GenericArg {
     Positional(Type),
     Named(Symbol, Type),
+    Const(AnonConst),
 }
 
 impl GenericArg {
-    pub fn ty(&self) -> &Type {
+    pub fn ty(&self) -> Cow<'_, Type> {
         match self {
-            GenericArg::Positional(ty) | GenericArg::Named(_, ty) => ty,
+            GenericArg::Positional(ty) | GenericArg::Named(_, ty) => Cow::Borrowed(ty),
+            GenericArg::Const(ac) => Cow::Owned(Type::Expr(ac.value.clone(), ac.span)),
         }
     }
 }

@@ -132,6 +132,7 @@ pub trait SolverDelegate {
         _scrutinee: TypeId,
         _branches_id: (usize, usize),
     ) -> Result<Vec<super::obligation::Obligation>, ()> {
+        // TODO: ты ещё долго собираешься это откладывать?
         Err(())
     }
 
