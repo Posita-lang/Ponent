@@ -428,12 +428,20 @@ fn evaluate_goal_inner<D: SolverDelegate>(
         ecx.search_graph
             .lookup_global_cache(ck, AvailableDepth(depth))
     });
-    if let Some(cached_result) = cache_hit {
+    if let Some(cached_response) = cache_hit {
         // Pop the goal from the search graph (it was pushed above).
         if goal_key.is_some() {
             ecx.search_graph.pop_goal();
         }
-        return cached_result;
+        // Instantiate canonical variables with fresh inference variables.
+        // SAFETY: The canonicalization guard rejects goals with free InferVars,
+        // so `var_values` is always empty and `infer` is never actually used.
+        let impl_source = crate::hir::traits::solver::search_graph::instantiate_canonical(
+            &cached_response,
+            None,
+            ecx.ctx(),
+        );
+        return Ok(impl_source);
     }
 
     // ── Evaluate using the new builder-pattern probe API ──
@@ -477,10 +485,17 @@ fn evaluate_goal_inner<D: SolverDelegate>(
     // are safe to cache because their TypeId values are fully
     // resolved (no InferVars / SkolemVars).
     if let Some(ck) = canonical_key {
-        // required_depth = current depth; encountered_overflow = false
-        // (overflow causes early return before reaching cache store).
+        // Collect GoalKeys from nested obligations for cycle detection.
+        let nested_goals: Vec<SgGoalKey> = match &result {
+            Ok(src) => src
+                .nested_obligations()
+                .iter()
+                .filter_map(|o| SgGoalKey::from_obligation(o, ecx.ctx()))
+                .collect(),
+            Err(_) => vec![],
+        };
         if let Some(response) =
-            canonicalize_response(&result, ecx.ctx(), max_universe, depth, false)
+            canonicalize_response(&result, ecx.ctx(), max_universe, depth, false, nested_goals)
         {
             ecx.search_graph.insert_global_cache(ck, response);
         }

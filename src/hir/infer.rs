@@ -710,7 +710,7 @@ pub enum VarOrigin {
     Synthetic,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TypeVariableKind {
     Unconstrained,
     Integer,
@@ -1080,6 +1080,22 @@ impl InferenceContext {
         ctx: &mut TypeContext,
         kind: TypeVariableKind,
         origin: VarOrigin,
+    ) -> TypeId {
+        self.new_type_var_with_universe(ctx, kind, origin, 0)
+    }
+
+    /// Create a new type variable with a specific universe index.
+    /// Currently, the universe is accepted but not stored — the body is
+    /// identical to `new_type_var`.  When per-variable universe tracking
+    /// is implemented, this function will store `_universe` in the
+    /// InferVar's metadata for correct HRTB scoping during canonical
+    /// instantiation.
+    pub fn new_type_var_with_universe(
+        &mut self,
+        ctx: &mut TypeContext,
+        kind: TypeVariableKind,
+        origin: VarOrigin,
+        _universe: usize,
     ) -> TypeId {
         let id = self.next_var_id;
         self.next_var_id += 1;
@@ -3436,7 +3452,11 @@ impl Default for InferenceContext {
     }
 }
 
-fn replace_infer(ty: TypeId, solution: &HashMap<usize, TypeId>, ctx: &TypeContext) -> TypeId {
+pub(crate) fn replace_infer(
+    ty: TypeId,
+    solution: &HashMap<usize, TypeId>,
+    ctx: &TypeContext,
+) -> TypeId {
     let resolved = ctx.resolve_binding(ty);
     let data = ctx.get(resolved).clone();
     match data {

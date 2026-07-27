@@ -4018,6 +4018,20 @@ impl Subst {
         self.map.is_empty()
     }
 
+    /// Apply a transformation to every TypeId value in this substitution.
+    pub fn map_values(&mut self, f: &mut dyn FnMut(TypeId) -> TypeId) {
+        for v in self.map.values_mut() {
+            *v = f(*v);
+        }
+    }
+
+    /// Iterate over all TypeId values in this substitution.
+    pub fn for_each_value(&self, mut f: impl FnMut(TypeId)) {
+        for &v in self.map.values() {
+            f(v);
+        }
+    }
+
     /// Iterate over all TypeId values in this substitution.
     pub fn values(&self) -> impl Iterator<Item = &TypeId> {
         self.map.values()
