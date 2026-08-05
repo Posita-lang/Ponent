@@ -177,11 +177,11 @@ impl DepGraph {
         let mut queue = VecDeque::new();
         queue.push_back(node);
         while let Some(current) = queue.pop_front() {
-            if dirty.insert(current) {
-                if let Some(rev_entry) = rev.get(current.0 as usize) {
-                    for &reader in rev_entry {
-                        queue.push_back(reader);
-                    }
+            if dirty.insert(current)
+                && let Some(rev_entry) = rev.get(current.0 as usize)
+            {
+                for &reader in rev_entry {
+                    queue.push_back(reader);
                 }
             }
         }

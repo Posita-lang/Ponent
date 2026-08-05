@@ -165,7 +165,7 @@ pub struct InferRegionTree {
 
 /// Which pool list a Register entry modified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RegisterKind {
+pub(crate) enum RegisterKind {
     Var,
     RigidVar,
 }
@@ -354,6 +354,18 @@ impl InferRegionTree {
             .collect()
     }
 
+    /// Find which region a variable was registered in, by searching all
+    /// region pools.  Returns the root region if not found.
+    /// Used by TcLevel escape checking in try_unify.
+    pub fn region_of_var(&self, var_id: usize) -> InferRegionId {
+        for node in &self.nodes {
+            if node.pool.var_ids.contains(&var_id) {
+                return node.id;
+            }
+        }
+        InferRegionId(0) // root
+    }
+
     pub fn drain_dirty<F>(&mut self, node_id: InferRegionId, f: &mut F)
     where
         F: FnMut(InferRegionId, &mut Self),
@@ -505,7 +517,7 @@ impl InferRegionTree {
 // is open; popped and `reverse()`'d on rollback.
 
 /// A single reversible operation on `InferenceContext` state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum InferUndoLog {
     PushConstraint,
     PushTypeVar,
@@ -636,6 +648,23 @@ impl InferenceContext {
 ///   Priority 4: Sub(concrete, infer) / Sub(infer, concrete)
 ///   Priority 5: Sub(infer, infer)
 ///   Priority 6: Impl constraints
+//
+// Named constants for the priority levels above, so the solver's
+// determinism ordering is not buried as magic numbers.
+const PRIORITY_EQ_CONCRETE: u8 = 0;
+const PRIORITY_EQ_MIXED: u8 = 1;
+const PRIORITY_EQ_INFER: u8 = 2;
+const PRIORITY_SUB_CONCRETE: u8 = 3;
+const PRIORITY_SUB_MIXED: u8 = 4;
+const PRIORITY_MATCH_SUSPENDED: u8 = 6;
+const PRIORITY_MATCH_RESOLVED: u8 = 3;
+const PRIORITY_FORALL: u8 = 6;
+const PRIORITY_DEFER: u8 = 6;
+const PRIORITY_BODY_FLOOR: u8 = 4;
+/// Default bit width for inferred `Int` / `UInt` types.
+const DEFAULT_INT_WIDTH: u8 = 32;
+/// Default bit width for inferred `Float` types.
+const DEFAULT_FLOAT_WIDTH: u8 = 64;
 /// A scoped environment carried with each delayed constraint, mapping
 /// inference variable IDs to Skolem TypeIds introduced by enclosing
 /// Forall binders.  The solver consults this environment before falling
@@ -759,9 +788,15 @@ impl TypeVar {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EqOrigin {
+    /// Normal type inference.
+    Normal,
+}
+
 #[derive(Debug, Clone)]
 pub enum Constraint {
-    Eq(TypeId, TypeId, Span),
+    Eq(TypeId, TypeId, Span, EqOrigin),
     Sub(TypeId, TypeId, Span),
     /// OmniML suspended match constraint (O'Brien, Rémy & Scherer §4.1):
     /// `match τ with patterns` — suspends until the shape of τ is known.
@@ -832,15 +867,15 @@ impl Constraint {
     /// constraints are resolved before those involving inference variables.
     pub fn priority(&self, ctx: &TypeContext) -> u8 {
         match self {
-            Constraint::Eq(a, b, _) => {
+            Constraint::Eq(a, b, _, _) => {
                 let a_is_infer =
                     matches!(ctx.get(ctx.resolve_binding(*a)), TypeData::InferVar { .. });
                 let b_is_infer =
                     matches!(ctx.get(ctx.resolve_binding(*b)), TypeData::InferVar { .. });
                 match (a_is_infer, b_is_infer) {
-                    (false, false) => 0,                // concrete-concrete: highest priority
-                    (true, false) | (false, true) => 1, // one infer var
-                    (true, true) => 2,                  // both infer vars
+                    (false, false) => PRIORITY_EQ_CONCRETE, // concrete-concrete: highest priority
+                    (true, false) | (false, true) => PRIORITY_EQ_MIXED, // one infer var
+                    (true, true) => PRIORITY_EQ_INFER,      // both infer vars
                 }
             }
             Constraint::Sub(sub, sup, _) => {
@@ -853,8 +888,8 @@ impl Constraint {
                     TypeData::InferVar { .. }
                 );
                 match (sub_is_infer, sup_is_infer) {
-                    (false, false) => 3,
-                    _ => 4,
+                    (false, false) => PRIORITY_SUB_CONCRETE,
+                    _ => PRIORITY_SUB_MIXED,
                 }
             }
             Constraint::Match { scrutinee, .. } => {
@@ -862,13 +897,13 @@ impl Constraint {
                 // scrutinee's shape is resolved.
                 let resolved = ctx.resolve_binding(*scrutinee);
                 if matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
-                    6 // still an infer var → needs resolution first
+                    PRIORITY_MATCH_SUSPENDED // still an infer var → needs resolution first
                 } else {
-                    3 // resolved → medium priority
+                    PRIORITY_MATCH_RESOLVED // resolved → medium priority
                 }
             }
             Constraint::Exists { .. } => 2, // exists: medium-high priority
-            Constraint::Forall { .. } => 6, // forall: low priority (skolem)
+            Constraint::Forall { .. } => PRIORITY_FORALL, // forall: low priority (skolem)
             Constraint::Instance { .. } => 1, // instance: high priority
             Constraint::Let { .. } => 2,    // let: medium-high priority
         }
@@ -1028,14 +1063,20 @@ impl InferenceContext {
     /// forms (Eq, Sub, etc.) operate on the rigid type, not the raw InferVar.
     fn resolve_with_env(&self, ty: TypeId, ctx: &TypeContext, env: &SkolemEnv) -> TypeId {
         let r = ctx.resolve_binding(ty);
-        if let TypeData::InferVar { id } = ctx.get(r) {
-            if let Some(skolem) = env.get(id) {
-                return *skolem;
-            }
+        if let TypeData::InferVar { id } = ctx.get(r)
+            && let Some(skolem) = env.get(id)
+        {
+            return *skolem;
         }
         r
     }
 
+    /// Abstract a GADT-refined arm's result type when exiting the arm's
+    /// scope.  Collects variables in the arm's region that got bound to
+    /// concrete types via GADT refinement, creates fresh unbound variables
+    /// for each, and replaces them in `body_ty`.  Returns the abstracted
+    /// type, which can safely participate in cross-arm unification without
+    /// leaking concrete types from the GADT refinement.
     /// If the given type is an InferVar that is NOT bound in the scoped
     /// environment, return its var_id.  Returns None for concrete types,
     /// Skolem-bound variables, or variables bound in ctx.bindings.
@@ -1184,13 +1225,12 @@ impl InferenceContext {
         // After unification, record any new bindings in self.resolutions
         // so that self.resolve() follows the same chain as ctx.resolve_binding().
         let resolved = ctx.resolve_binding(result);
-        if let TypeData::InferVar { id } = ctx.get(resolved) {
-            if *id < self.resolutions.len() {
-                if self.resolutions[*id].is_none() {
-                    self.push_undo(InferUndoLog::SetResolution(*id, self.resolutions[*id]));
-                    self.resolutions[*id] = Some(resolved);
-                }
-            }
+        if let TypeData::InferVar { id } = ctx.get(resolved)
+            && *id < self.resolutions.len()
+            && self.resolutions[*id].is_none()
+        {
+            self.push_undo(InferUndoLog::SetResolution(*id, self.resolutions[*id]));
+            self.resolutions[*id] = Some(resolved);
         }
         Ok(result)
     }
@@ -1335,12 +1375,11 @@ impl InferenceContext {
             let old_reverse = self.reverse_refs[var_id];
             self.reverse_refs[new_id] = old_reverse;
             self.reverse_refs[var_id] = None; // old var is now just an alias
-            if let Some(pg_id) = old_reverse {
-                if pg_id < self.forward_refs.len() {
-                    if let Some(pos) = self.forward_refs[pg_id].iter().position(|&r| r == var_id) {
-                        self.forward_refs[pg_id][pos] = new_id;
-                    }
-                }
+            if let Some(pg_id) = old_reverse
+                && pg_id < self.forward_refs.len()
+                && let Some(pos) = self.forward_refs[pg_id].iter().position(|&r| r == var_id)
+            {
+                self.forward_refs[pg_id][pos] = new_id;
             }
         }
 
@@ -1393,7 +1432,7 @@ impl InferenceContext {
     /// Returns None if both sides are concrete.
     fn infer_var_from_constraint(&self, c: &Constraint, ctx: &TypeContext) -> Option<usize> {
         match c {
-            Constraint::Eq(a, b, _) => {
+            Constraint::Eq(a, b, _, _) => {
                 let ra = ctx.resolve_binding(*a);
                 let rb = ctx.resolve_binding(*b);
                 if let TypeData::InferVar { id } = ctx.get(ra) {
@@ -1649,7 +1688,7 @@ impl InferenceContext {
         // Use each constraint's own env to resolve types (env-mapped
         // skolems from Forall must not be treated as free infer vars).
         for pc in active_constraints {
-            if let Constraint::Eq(a, b, _) = &pc.constraint {
+            if let Constraint::Eq(a, b, _, _) = &pc.constraint {
                 let ra = self.resolve_with_env(*a, ctx, &pc.env);
                 let rb = self.resolve_with_env(*b, ctx, &pc.env);
                 // Check if this Eq constraint involves our variable
@@ -1759,7 +1798,7 @@ impl InferenceContext {
         // ── 2. Collect all equality constraints involving InferVars ──
         let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
         for c in &self.constraints {
-            if let Constraint::Eq(a, b, _) = c {
+            if let Constraint::Eq(a, b, _, _) = c {
                 let ra = ctx.resolve_binding(*a);
                 let rb = ctx.resolve_binding(*b);
                 if let (TypeData::InferVar { id: aid }, TypeData::InferVar { id: bid }) =
@@ -2063,20 +2102,21 @@ impl InferenceContext {
         // Collect roots of already-guarded items.
         let mut guarded_roots: FxHashSet<TypeId> = FxHashSet::default();
         for &j in &dirty {
-            if j < self.var_type_ids.len() && trans_guarded.contains(&j) {
-                if let Some(&root) = roots.get(&j) {
-                    guarded_roots.insert(root);
-                }
+            if j < self.var_type_ids.len()
+                && trans_guarded.contains(&j)
+                && let Some(&root) = roots.get(&j)
+            {
+                guarded_roots.insert(root);
             }
         }
         // Any non-guarded item whose root matches a guarded root becomes guarded.
         for &i in &dirty {
-            if !trans_guarded.contains(&i) && i < self.var_type_ids.len() {
-                if let Some(&root) = roots.get(&i) {
-                    if guarded_roots.contains(&root) {
-                        trans_guarded.insert(i);
-                    }
-                }
+            if !trans_guarded.contains(&i)
+                && i < self.var_type_ids.len()
+                && let Some(&root) = roots.get(&i)
+                && guarded_roots.contains(&root)
+            {
+                trans_guarded.insert(i);
             }
         }
 
@@ -2105,10 +2145,8 @@ impl InferenceContext {
             if matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
                 continue;
             }
-            if level < cur_level {
-                if Self::check_rigid_escape(ctx, resolved, level) {
-                    continue;
-                }
+            if level < cur_level && Self::check_rigid_escape(ctx, resolved, level) {
+                continue;
             }
         }
 
@@ -2377,12 +2415,13 @@ impl InferenceContext {
         if var_id < self.guard_sets.len() {
             self.push_undo(InferUndoLog::RemoveGuard(var_id));
             self.guard_sets[var_id].remove_guard();
-            if self.guard_sets[var_id].is_empty() && var_id < self.gen_statuses.len() {
-                if self.gen_statuses[var_id] == GenStatus::PartiallyGeneralizable {
-                    let old = self.gen_statuses[var_id];
-                    self.gen_statuses[var_id] = GenStatus::Generalized;
-                    self.push_undo(InferUndoLog::SetGenStatus(var_id, old));
-                }
+            if self.guard_sets[var_id].is_empty()
+                && var_id < self.gen_statuses.len()
+                && self.gen_statuses[var_id] == GenStatus::PartiallyGeneralizable
+            {
+                let old = self.gen_statuses[var_id];
+                self.gen_statuses[var_id] = GenStatus::Generalized;
+                self.push_undo(InferUndoLog::SetGenStatus(var_id, old));
             }
         }
     }
@@ -2421,7 +2460,7 @@ impl InferenceContext {
         loop {
             while let Some(pc) = heap.pop() {
                 match &pc.constraint {
-                    Constraint::Eq(a, b, _) => {
+                    Constraint::Eq(a, b, _, _) => {
                         // Check if either side is an InferVar before unifying
                         let ra = ctx.resolve_binding(*a);
                         let rb = ctx.resolve_binding(*b);
@@ -2443,19 +2482,17 @@ impl InferenceContext {
                         // scoped environment (pc.env), it is NOT a free InferVar
                         // — treat it as rigid so the unifier rejects illegal
                         // unification with concrete types.
-                        if a_is_infer {
-                            if let Some(id) = a_var_id {
-                                if pc.env.contains_key(&id) {
-                                    a_is_infer = false;
-                                }
-                            }
+                        if a_is_infer
+                            && let Some(id) = a_var_id
+                            && pc.env.contains_key(&id)
+                        {
+                            a_is_infer = false;
                         }
-                        if b_is_infer {
-                            if let Some(id) = b_var_id {
-                                if pc.env.contains_key(&id) {
-                                    b_is_infer = false;
-                                }
-                            }
+                        if b_is_infer
+                            && let Some(id) = b_var_id
+                            && pc.env.contains_key(&id)
+                        {
+                            b_is_infer = false;
                         }
 
                         // Level-based promotion (Fan, Xu & Xie 2025 §6.2):
@@ -2625,10 +2662,9 @@ impl InferenceContext {
                             // try Z3-backed semantic lowering if uniquely determined.
                             if *var_id < self.gen_statuses.len()
                                 && self.gen_statuses[*var_id] == GenStatus::PartiallyGeneralizable
+                                && self.s_exists_lower(ctx, *var_id)
                             {
-                                if self.s_exists_lower(ctx, *var_id) {
-                                    // lowering succeeded
-                                }
+                                // lowering succeeded
                             }
                         }
                     }
@@ -2640,31 +2676,30 @@ impl InferenceContext {
 
                         // Record bounds only for genuinely free InferVars
                         // (not Forall-bound Skolems).
-                        if let Some(id) = self.free_infer_var_id(*sup, ctx, &pc.env) {
-                            if id < self.lower_bounds.len() {
-                                self.lower_bounds[id].push(resolved_sub);
-                                self.mark_dirty(id);
-                            }
+                        if let Some(id) = self.free_infer_var_id(*sup, ctx, &pc.env)
+                            && id < self.lower_bounds.len()
+                        {
+                            self.lower_bounds[id].push(resolved_sub);
+                            self.mark_dirty(id);
                         }
-                        if let Some(id) = self.free_infer_var_id(*sub, ctx, &pc.env) {
-                            if id < self.upper_bounds.len() {
-                                self.upper_bounds[id].push(resolved_sup);
-                                self.mark_dirty(id);
-                            }
+                        if let Some(id) = self.free_infer_var_id(*sub, ctx, &pc.env)
+                            && id < self.upper_bounds.len()
+                        {
+                            self.upper_bounds[id].push(resolved_sup);
+                            self.mark_dirty(id);
                         }
 
                         // If both sides are resolved (not free InferVars), check
                         // the subtype relationship using the env-resolved types.
                         let sub_is_free = self.free_infer_var_id(*sub, ctx, &pc.env).is_some();
                         let sup_is_free = self.free_infer_var_id(*sup, ctx, &pc.env).is_some();
-                        if !sub_is_free && !sup_is_free {
-                            if !ctx.subtype(resolved_sub, resolved_sup) {
-                                return Err(TypeError::Mismatch {
-                                    expected: resolved_sup,
-                                    found: resolved_sub,
-                                    span: *_span,
-                                });
-                            }
+                        if !sub_is_free && !sup_is_free && !ctx.subtype(resolved_sub, resolved_sup)
+                        {
+                            return Err(TypeError::Mismatch {
+                                expected: resolved_sup,
+                                found: resolved_sub,
+                                span: *_span,
+                            });
                         }
                     }
                     Constraint::Match {
@@ -2740,7 +2775,7 @@ impl InferenceContext {
                                         heap.push(c);
                                     }
                                     // Cannot discharge yet — push back as low priority
-                                    let p = 6u8;
+                                    let p = PRIORITY_DEFER;
                                     heap.push(PrioritizedConstraint {
                                         priority: p,
                                         constraint: pc.constraint.clone(),
@@ -2891,6 +2926,7 @@ impl InferenceContext {
                                         *instantiation_ty,
                                         instantiated,
                                         crate::ast::Span::new(0, 0),
+                                        EqOrigin::Normal,
                                     )
                                 }
                                 InstantiationTarget::Poly {
@@ -2910,12 +2946,14 @@ impl InferenceContext {
                                         *instantiation_ty,
                                         instantiated,
                                         crate::ast::Span::new(0, 0),
+                                        EqOrigin::Normal,
                                     )
                                 }
                                 InstantiationTarget::Concrete(target_ty) => Constraint::Eq(
                                     *instantiation_ty,
                                     target_ty,
                                     crate::ast::Span::new(0, 0),
+                                    EqOrigin::Normal,
                                 ),
                             };
                             let p = eq_c.priority(ctx);
@@ -2939,7 +2977,7 @@ impl InferenceContext {
                             constraint: def_constraint.as_ref().clone(),
                             env: pc.env.clone(),
                         });
-                        let body_p = body_constraint.priority(ctx).max(4);
+                        let body_p = body_constraint.priority(ctx).max(PRIORITY_BODY_FLOOR);
                         heap.push(PrioritizedConstraint {
                             priority: body_p,
                             constraint: body_constraint.as_ref().clone(),
@@ -3257,10 +3295,10 @@ impl InferenceContext {
                     } else {
                         // No bounds — default based on kind
                         match self.type_vars[i].kind {
-                            TypeVariableKind::Integer => ctx.int(32, true),
-                            TypeVariableKind::Float => ctx.float(64),
+                            TypeVariableKind::Integer => ctx.int(DEFAULT_INT_WIDTH, true),
+                            TypeVariableKind::Float => ctx.float(DEFAULT_FLOAT_WIDTH),
                             TypeVariableKind::Bool => ctx.bool(),
-                            TypeVariableKind::Numeric => ctx.int(32, true),
+                            TypeVariableKind::Numeric => ctx.int(DEFAULT_INT_WIDTH, true),
                             _ => ctx.error(),
                         }
                     };
@@ -3432,14 +3470,13 @@ impl InferenceContext {
         let mut results = Vec::new();
         for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
             let resolved = ctx.resolve_binding(ty_id);
-            if matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
-                if i < self.type_vars.len() {
-                    // Only report `Any` — `Unconstrained` is defaulted to error
-                    // by the solver as a normal fallback, not an ambiguity.
-                    if self.type_vars[i].kind == TypeVariableKind::Any {
-                        results.push(format!("unresolved type variable #{} (Any)", i));
-                    }
-                }
+            if matches!(ctx.get(resolved), TypeData::InferVar { .. })
+                && i < self.type_vars.len()
+                && self.type_vars[i].kind == TypeVariableKind::Any
+            {
+                // Only report `Any` — `Unconstrained` is defaulted to error
+                // by the solver as a normal fallback, not an ambiguity.
+                results.push(format!("unresolved type variable #{} (Any)", i));
             }
         }
         results
@@ -3678,7 +3715,7 @@ mod tests {
     #[test]
     fn test_shape_of_fn() {
         let mut ctx = new_ctx();
-        let int_ty = ctx.int(32, true);
+        let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
         let bool_ty = ctx.bool();
         let fn_ty = ctx.function(vec![int_ty], bool_ty);
         let shape = InferenceContext::shape_of_type(&ctx, fn_ty);
@@ -3689,7 +3726,7 @@ mod tests {
     fn test_shape_of_tuple() {
         let mut ctx = new_ctx();
         let bool_ty = ctx.bool();
-        let int_ty = ctx.int(32, true);
+        let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
         let tup = ctx.tuple(vec![bool_ty, int_ty]);
         let shape = InferenceContext::shape_of_type(&ctx, tup);
         assert!(matches!(shape, PrincipalShape::Tuple(2)));
@@ -3720,7 +3757,12 @@ mod tests {
             _ => unreachable!(),
         };
         infer.suspend_on_var(
-            Constraint::Eq(ctx.bool(), ctx.bool(), crate::ast::Span::new(0, 0)),
+            Constraint::Eq(
+                ctx.bool(),
+                ctx.bool(),
+                crate::ast::Span::new(0, 0),
+                EqOrigin::Normal,
+            ),
             var_id,
         );
         // Waking moves suspended constraints back to the active list
@@ -3743,7 +3785,12 @@ mod tests {
             _ => unreachable!(),
         };
         infer.suspend_on_var(
-            Constraint::Eq(ctx.bool(), ctx.bool(), crate::ast::Span::new(0, 0)),
+            Constraint::Eq(
+                ctx.bool(),
+                ctx.bool(),
+                crate::ast::Span::new(0, 0),
+                EqOrigin::Normal,
+            ),
             var_id,
         );
         // wake_var_incremental needs a heap, var_id, and ctx
@@ -3785,8 +3832,13 @@ mod tests {
     fn test_eq_concrete_priority() {
         let mut ctx = TypeContext::new();
         let bool_ty = ctx.bool();
-        let int_ty = ctx.int(32, true);
-        let eq = Constraint::Eq(bool_ty, int_ty, crate::ast::Span::new(0, 0));
+        let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
+        let eq = Constraint::Eq(
+            bool_ty,
+            int_ty,
+            crate::ast::Span::new(0, 0),
+            EqOrigin::Normal,
+        );
         // Both Eq constraints with concrete types have the same priority.
         // This test was originally comparing Eq vs Impl (which was removed
         // in the unified solver migration).  Now it verifies that Eq
@@ -3798,8 +3850,13 @@ mod tests {
     fn test_match_resolved_priority() {
         let mut ctx = TypeContext::new();
         let bool_ty = ctx.bool();
-        let int_ty = ctx.int(32, true);
-        let eq = Constraint::Eq(bool_ty, int_ty, crate::ast::Span::new(0, 0));
+        let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
+        let eq = Constraint::Eq(
+            bool_ty,
+            int_ty,
+            crate::ast::Span::new(0, 0),
+            EqOrigin::Normal,
+        );
         let match_c = Constraint::Match {
             scrutinee: bool_ty,
             branches_id: (0, 0),
@@ -3832,7 +3889,12 @@ mod tests {
             "Match on InferVar should have lowest priority"
         );
         // Eq on concrete types → high priority (0)
-        let eq_c = Constraint::Eq(ctx.bool(), ctx.int(32, true), crate::ast::Span::new(0, 0));
+        let eq_c = Constraint::Eq(
+            ctx.bool(),
+            ctx.int(DEFAULT_INT_WIDTH, true),
+            crate::ast::Span::new(0, 0),
+            EqOrigin::Normal,
+        );
         assert_eq!(
             eq_c.priority(&ctx),
             0,
@@ -3846,7 +3908,7 @@ mod tests {
         let mut ctx = TypeContext::new();
         let infer = InferenceContext::new();
         // Use pre-allocated built-in types
-        let int_ty = ctx.int(32, true);
+        let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
         let shape = InferenceContext::unicity_check(&infer, &ctx, int_ty, &HashMap::default(), &[]);
         assert!(shape.is_some(), "non-variable type should have known shape");
     }
@@ -3855,7 +3917,7 @@ mod tests {
     fn test_unicity_check_fn_type() {
         let mut ctx = TypeContext::new();
         let infer = InferenceContext::new();
-        let int_ty = ctx.int(32, true);
+        let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
         let fn_ty = ctx.function(vec![int_ty], int_ty);
         let shape = InferenceContext::unicity_check(&infer, &ctx, fn_ty, &HashMap::default(), &[]);
         assert!(shape.is_some(), "function type should have known shape");
@@ -3910,9 +3972,10 @@ mod tests {
         let branches = vec![MatchBranchSet {
             shape_pattern: PrincipalShape::Arrow,
             continuation: vec![Constraint::Eq(
-                ctx.int(32, true),
-                ctx.int(32, true),
+                ctx.int(DEFAULT_INT_WIDTH, true),
+                ctx.int(DEFAULT_INT_WIDTH, true),
                 crate::ast::Span::new(0, 0),
+                EqOrigin::Normal,
             )],
             else_continuation: Vec::new(),
         }];
@@ -3937,7 +4000,7 @@ mod tests {
         // Before resolution: low priority
         assert_eq!(match_c.priority(&ctx), 6);
         // After resolution: medium priority
-        let int_ty = ctx.int(32, true);
+        let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
         ctx.bindings.borrow_mut().insert(var, int_ty);
         assert_eq!(
             match_c.priority(&ctx),
@@ -3953,12 +4016,17 @@ mod tests {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
         let mut heap = std::collections::BinaryHeap::new();
-        let int_ty = ctx.int(32, true);
+        let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
 
         let branches = vec![MatchBranchSet {
             shape_pattern: PrincipalShape::Arrow,
             continuation: Vec::new(),
-            else_continuation: vec![Constraint::Eq(int_ty, int_ty, crate::ast::Span::new(0, 0))],
+            else_continuation: vec![Constraint::Eq(
+                int_ty,
+                int_ty,
+                crate::ast::Span::new(0, 0),
+                EqOrigin::Normal,
+            )],
         }];
         let id = infer.register_match_branches(branches);
         let int_ty2 = ctx.int(64, false);
@@ -3980,7 +4048,7 @@ mod tests {
             else_continuation: Vec::new(),
         }];
         let id = infer.register_match_branches(branches);
-        let int_ty = ctx.int(32, true);
+        let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
 
         let result = infer.discharge_match(&mut ctx, int_ty, id, &mut heap, &HashMap::default());
         assert!(!result, "no else_ fallback should still fail");
@@ -4028,7 +4096,7 @@ mod tests {
             infer.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
         }
 
-        let int_ty = ctx.int(32, true);
+        let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
         ctx.bindings.borrow_mut().insert(var, int_ty);
 
         infer.force_generalize(&mut ctx);
@@ -4084,7 +4152,7 @@ mod tests {
         let mut infer = InferenceContext::new();
         let mut heap = std::collections::BinaryHeap::new();
 
-        let int_ty = ctx.int(32, true);
+        let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
         let branches = vec![MatchBranchSet {
             shape_pattern: PrincipalShape::Scalar,
             continuation: Vec::new(),
@@ -4114,11 +4182,13 @@ mod tests {
                 TypeId::from_raw(1),
                 TypeId::from_raw(2),
                 crate::ast::Span::new(0, 0),
+                EqOrigin::Normal,
             )),
             body_constraint: Box::new(Constraint::Eq(
                 TypeId::from_raw(1),
                 TypeId::from_raw(1),
                 crate::ast::Span::new(0, 0),
+                EqOrigin::Normal,
             )),
             span: crate::ast::Span::new(0, 0),
         };
@@ -4313,12 +4383,12 @@ mod tests {
         assert_eq!(type_data_to_shape(ctx.get(fn_ty)), TypeShape::Arrow);
         // Tuple(n) → Tuple(n)
         let b = ctx.bool();
-        let i = ctx.int(32, true);
+        let i = ctx.int(DEFAULT_INT_WIDTH, true);
         let tup = ctx.tuple(vec![b, i]);
         assert_eq!(type_data_to_shape(ctx.get(tup)), TypeShape::Tuple(2));
         // Struct → Constructor(n)
         let b2 = ctx.bool();
-        let i2 = ctx.int(32, true);
+        let i2 = ctx.int(DEFAULT_INT_WIDTH, true);
         let s = ctx.struct_ty(DefId(42), vec![b2, i2]);
         assert_eq!(type_data_to_shape(ctx.get(s)), TypeShape::Constructor(2));
         // Forall → Poly
@@ -4326,7 +4396,7 @@ mod tests {
         let forall = ctx.forall(0, "X".into(), p0);
         assert_eq!(type_data_to_shape(ctx.get(forall)), TypeShape::Poly);
         // Int → Unknown (primitive)
-        let int32 = ctx.int(32, true);
+        let int32 = ctx.int(DEFAULT_INT_WIDTH, true);
         assert_eq!(type_data_to_shape(ctx.get(int32)), TypeShape::Unknown);
         // Bool → Unknown
         let bool_ty = ctx.bool();
@@ -4405,11 +4475,21 @@ mod tests {
 
         // Suspend constraints on it (simulating match/impl obligations)
         infer.suspend_on_var(
-            Constraint::Eq(ctx.bool(), ctx.int(32, true), crate::ast::Span::new(0, 0)),
+            Constraint::Eq(
+                ctx.bool(),
+                ctx.int(DEFAULT_INT_WIDTH, true),
+                crate::ast::Span::new(0, 0),
+                EqOrigin::Normal,
+            ),
             var_id,
         );
         infer.suspend_on_var(
-            Constraint::Eq(ctx.bool(), ctx.bool(), crate::ast::Span::new(0, 0)),
+            Constraint::Eq(
+                ctx.bool(),
+                ctx.bool(),
+                crate::ast::Span::new(0, 0),
+                EqOrigin::Normal,
+            ),
             var_id,
         );
 
@@ -4536,9 +4616,9 @@ mod tests {
         if var_id < infer.gen_statuses.len() {
             infer.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
         }
-        let int32_1 = ctx.int(32, true);
+        let int32_1 = ctx.int(DEFAULT_INT_WIDTH, true);
         infer.suspend_on_var(
-            Constraint::Eq(var, int32_1, crate::ast::Span::new(0, 0)),
+            Constraint::Eq(var, int32_1, crate::ast::Span::new(0, 0), EqOrigin::Normal),
             var_id,
         );
 
@@ -4614,7 +4694,7 @@ mod tests {
     #[test]
     fn test_rigid_escape_concrete_not_detected() {
         let mut ctx = TypeContext::new();
-        let int_ty = ctx.int(32, true);
+        let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
         let not_escaped = InferenceContext::check_rigid_escape(&ctx, int_ty, 0);
         assert!(!not_escaped, "Int<32> is not an escape");
     }
@@ -4650,7 +4730,7 @@ mod tests {
         infer.register_instance(pg_id, inst_id);
 
         // Resolve PG → fn(Int) → Bool
-        let int32_2 = ctx.int(32, true);
+        let int32_2 = ctx.int(DEFAULT_INT_WIDTH, true);
         let bool_ty = ctx.bool();
         let fn_ty = ctx.function(vec![int32_2], bool_ty);
         ctx.bindings.borrow_mut().insert(pg, fn_ty);
@@ -4742,9 +4822,14 @@ mod tests {
         let a = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let b = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         // Add constraint: Eq(a, b)
-        infer.add_constraint(Constraint::Eq(a, b, crate::ast::Span::new(0, 0)));
+        infer.add_constraint(Constraint::Eq(
+            a,
+            b,
+            crate::ast::Span::new(0, 0),
+            EqOrigin::Normal,
+        ));
         // Unify a with Int<32>
-        let int_ty = ctx.int(32, true);
+        let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
         ctx.bindings.borrow_mut().insert(a, int_ty);
 
         let result = infer.solve(&mut ctx, &trait_env, &symbols);
@@ -4772,6 +4857,7 @@ mod tests {
             deep_var,
             shallow_var,
             crate::ast::Span::new(0, 0),
+            EqOrigin::Normal,
         ));
         let bool_ty = ctx.bool();
         ctx.bindings.borrow_mut().insert(shallow_var, bool_ty);
@@ -4791,10 +4877,15 @@ mod tests {
         let mut infer = InferenceContext::new();
 
         // Register a match branch: Arrow → Eq(Int, Int)
-        let int32 = ctx.int(32, true);
+        let int32 = ctx.int(DEFAULT_INT_WIDTH, true);
         let branches = vec![MatchBranchSet {
             shape_pattern: PrincipalShape::Arrow,
-            continuation: vec![Constraint::Eq(int32, int32, crate::ast::Span::new(0, 0))],
+            continuation: vec![Constraint::Eq(
+                int32,
+                int32,
+                crate::ast::Span::new(0, 0),
+                EqOrigin::Normal,
+            )],
             else_continuation: Vec::new(),
         }];
         let bid = infer.register_match_branches(branches);
@@ -4868,7 +4959,7 @@ mod tests {
         );
 
         // Bind x to Int<32>
-        let int32 = ctx.int(32, true);
+        let int32 = ctx.int(DEFAULT_INT_WIDTH, true);
         ctx.bindings.borrow_mut().insert(x, int32);
 
         // Mark the variable PG and then force_generalize
@@ -4933,10 +5024,15 @@ mod tests {
         );
 
         // Eq(a_deep, b_deep) — should promote both to NCA (root) before unifying
-        infer.add_constraint(Constraint::Eq(a_deep, b_deep, crate::ast::Span::new(0, 0)));
+        infer.add_constraint(Constraint::Eq(
+            a_deep,
+            b_deep,
+            crate::ast::Span::new(0, 0),
+            EqOrigin::Normal,
+        ));
 
         // Bind B to Int<32> so the solver can resolve
-        let int32 = ctx.int(32, true);
+        let int32 = ctx.int(DEFAULT_INT_WIDTH, true);
         ctx.bindings.borrow_mut().insert(b_deep, int32);
 
         let result = infer.solve(&mut ctx, &trait_env, &symbols);
@@ -4981,11 +5077,16 @@ mod tests {
 
         // Bind a to Bool, b to Int<32>, then constrain Eq(a, b)
         let bool_ty = ctx.bool();
-        let int32 = ctx.int(32, true);
+        let int32 = ctx.int(DEFAULT_INT_WIDTH, true);
         ctx.bindings.borrow_mut().insert(a, bool_ty);
         ctx.bindings.borrow_mut().insert(b, int32);
 
-        infer.add_constraint(Constraint::Eq(a, b, crate::ast::Span::new(0, 0)));
+        infer.add_constraint(Constraint::Eq(
+            a,
+            b,
+            crate::ast::Span::new(0, 0),
+            EqOrigin::Normal,
+        ));
 
         let result = infer.solve(&mut ctx, &trait_env, &symbols);
         assert!(

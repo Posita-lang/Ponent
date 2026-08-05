@@ -1,5 +1,16 @@
 #![deny(clippy::correctness)]
-#![warn(clippy::suspicious, clippy::style, clippy::complexity, clippy::perf)]
+#![warn(
+    clippy::suspicious,
+    clippy::style,
+    clippy::complexity,
+    clippy::perf,
+    clippy::inline_trait_bounds,
+    clippy::undocumented_unsafe_blocks,
+    clippy::needless_pass_by_value,
+    clippy::redundant_clone,
+    clippy::mem_forget,
+    clippy::large_enum_variant
+)]
 
 mod ast;
 mod cli;
@@ -21,7 +32,11 @@ mod hir {
     pub mod symbol;
     pub mod target;
     pub mod traits;
+    pub mod type_eq;
     pub mod types;
+    // Debug-only tracing / diagnostics module.
+    #[cfg(debug_assertions)]
+    pub mod anya;
 }
 mod lexer;
 mod parser;
@@ -273,6 +288,10 @@ fn main() {
                             Err(errors) => {
                                 let mut diags = errors.into_inner();
                                 attach_source_to_diags(&mut diags, &source, &file);
+                                // Merge checker diagnostics (warnings accumulated
+                                // before the fatal error) into the error output —
+                                // they must not be silently dropped.
+                                diags.extend(checker_diag_vec);
                                 // Merge resolver diagnostics into checker diagnostics.
                                 diags.extend(all_diags);
                                 let mut emitter = make_emitter(json);
@@ -286,6 +305,82 @@ fn main() {
                     attach_source_to_diags(&mut diagnostics, &source, &file);
                     let mut emitter = make_emitter(json);
                     emitter.emit_all(&diagnostics);
+                    process::exit(1);
+                }
+            }
+        }
+        cli::Command::Check { file, json } => {
+            let source = match fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    let mut diag = Diagnostic::error(format!("failed to read `{}`: {}", file, e));
+                    let mut emitter = make_emitter(json);
+                    emitter.emit(&diag);
+                    emitter.emit_summary(1, 0);
+                    process::exit(1);
+                }
+            };
+            let mut parser = parser::Parser::new(&source);
+            let program = match parser.parse_program() {
+                Ok(p) => p,
+                Err(mut diagnostics) => {
+                    attach_source_to_diags(&mut diagnostics, &source, &file);
+                    let mut emitter = make_emitter(json);
+                    emitter.emit_all(&diagnostics);
+                    process::exit(1);
+                }
+            };
+            let target = match resolve_target(&cli.target) {
+                Ok(t) => t,
+                Err(msg) => {
+                    let mut diag = Diagnostic::error(msg);
+                    let mut emitter = make_emitter(json);
+                    emitter.emit(&diag);
+                    emitter.emit_summary(1, 0);
+                    process::exit(1);
+                }
+            };
+            let mut ctx = TypeContext::new_with_target(target);
+            let local_crate_id = CrateId(DefId(0));
+            let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
+            let (symbols, mut trait_env, resolver_diags, resolution_map) =
+                resolver.resolve_program(&program);
+            let mut all_diags = resolver_diags.into_inner();
+            attach_source_to_diags(&mut all_diags, &source, &file);
+            let mut checker = TypeChecker::new_with_source(
+                &mut ctx,
+                &symbols,
+                &mut trait_env,
+                resolution_map,
+                cli.strict,
+                cli.enable_experimental,
+                cli.feature,
+                cli.debug,
+                Some(&source),
+            );
+            let checker_result = checker.check_program(&program);
+            let checker_diags = checker.take_diagnostics();
+            let mut checker_diag_vec: Vec<Diagnostic> = checker_diags.into_inner();
+            attach_source_to_diags(&mut checker_diag_vec, &source, &file);
+            match checker_result {
+                Ok(_hir) => {
+                    let mut diags = checker_diag_vec;
+                    diags.extend(all_diags);
+                    if !diags.is_empty() {
+                        let mut emitter = make_emitter(json);
+                        emitter.emit_all(&diags);
+                        if diags.iter().any(|d| d.is_error()) {
+                            process::exit(1);
+                        }
+                    }
+                    println!("Type checking succeeded.");
+                }
+                Err(errors) => {
+                    let mut diags = errors.into_inner();
+                    attach_source_to_diags(&mut diags, &source, &file);
+                    diags.extend(all_diags);
+                    let mut emitter = make_emitter(json);
+                    emitter.emit_all(&diags);
                     process::exit(1);
                 }
             }
@@ -312,7 +407,7 @@ fn main() {
                     });
 
                     // Serve the explain page using the already-bound listener.
-                    diagnostics::explain_server::serve_explain(listener, &explain_code)
+                    diagnostics::explain_server::serve_explain(&listener, &explain_code)
                         .unwrap_or_else(|e| {
                             eprintln!("warning: explain server error: {e}");
                         });

@@ -803,12 +803,12 @@ impl QuerySystem {
             let vtables = self.vtables.read().unwrap();
             if let Some(boxed) = vtables.get(&TypeId::of::<Q>()) {
                 let vtable = boxed.downcast_ref::<QueryVTable<Q>>().unwrap();
-                if !vtable.descriptor.eval_always {
-                    if let Some(value) = vtable.cache.lookup(&key) {
-                        // Record that the current task (if any) read this node.
-                        self.dep_graph.read(node_index);
-                        return Ok(value);
-                    }
+                if !vtable.descriptor.eval_always
+                    && let Some(value) = vtable.cache.lookup(&key)
+                {
+                    // Record that the current task (if any) read this node.
+                    self.dep_graph.read(node_index);
+                    return Ok(value);
                 }
             }
         }
@@ -931,10 +931,10 @@ impl QuerySystem {
         };
 
         // Normal completion: remove from active keys and signal waiters.
-        if let Some(entry) = active.remove(&akey) {
-            if let ActiveKeyStatus::Started(job) = entry {
-                job.signal_complete();
-            }
+        if let Some(entry) = active.remove(&akey)
+            && let ActiveKeyStatus::Started(job) = entry
+        {
+            job.signal_complete();
         }
         drop(active);
 

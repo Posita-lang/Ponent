@@ -1,5 +1,6 @@
 pub mod checker;
 pub mod cfg;
+pub mod type_eq;
 mod comptime;
 mod generate;
 mod hir;

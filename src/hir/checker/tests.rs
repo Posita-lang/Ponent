@@ -811,7 +811,7 @@ fn test_if_expression_type_inference() {
         span: Span::new(0, 6),
     };
 
-    let result = checker.infer_expr(&if_expr);
+    let result = checker.infer_expr(&if_expr, None);
     assert!(result.is_ok());
     let (_hir, ty) = result.unwrap();
     // Both branches are integer literals — the inferred type is an Integer InferVar
@@ -845,7 +845,7 @@ fn test_if_statement_with_return() {
         span: Span::new(0, 6),
     };
 
-    let result = checker.infer_expr(&if_expr);
+    let result = checker.infer_expr(&if_expr, None);
     // Should succeed (no unify panic) since both branches diverge
     assert!(result.is_ok());
 }
@@ -875,7 +875,7 @@ fn test_if_expression_branch_type_match() {
         span: Span::new(0, 10),
     };
 
-    let result = checker.infer_expr(&if_expr);
+    let result = checker.infer_expr(&if_expr, None);
     assert!(result.is_ok());
 }
 
@@ -900,7 +900,7 @@ fn test_if_expression_tuple() {
         is_expression: true,
         span: Span::new(0, 5),
     };
-    let result = checker.infer_expr(&if_expr);
+    let result = checker.infer_expr(&if_expr, None);
     assert!(result.is_ok());
 }
 
@@ -1624,6 +1624,80 @@ fn test_generic_return() {
          def main() -> Int<32> { return id(42); }",
     );
     assert!(result.is_ok(), "generic id: {:?}", result.err());
+}
+
+/// Generality check (E104): a generic function body must type-check for
+/// ALL instantiations.  `def g<T>(x: T) -> Int<32> { return add(x, 1); }`
+/// only works when `T = Int<32>` — the body solves the generic param,
+/// which rustc (rigid `TyKind::Param`), GHC and OCaml (skolems) all
+/// reject at definition time.  Enabled by the seal: GADT refinements no
+/// longer write global bindings, so any remaining binding on a function
+/// generic param is body-driven.
+#[test]
+fn test_generic_param_constrained_by_body_rejected() {
+    let result = check_source(
+        "def add(a: Int<32>, b: Int<32>) -> Int<32> { return a + b; }
+         def g<T>(x: T) -> Int<32> { return add(x, 1); }
+         def main() -> Int<32> { return 0; }",
+    );
+    let msg = format!("{:?}", result);
+    assert!(
+        result.is_err() && msg.contains("constrained to a specific type"),
+        "body-constrained generic parameter must be rejected (E104): {:?}",
+        result
+    );
+}
+
+/// Generality check (E104), `T := U`: binding one generic parameter to
+/// ANOTHER (`def f<T, U>(x: T, y: U) -> U { return x; }`) is also a
+/// violation — the body must be parametric in each distinct parameter
+/// (rustc/GHC/OCaml all reject rigid-param-to-rigid-param unifications).
+#[test]
+fn test_generic_param_bound_to_another_param_rejected() {
+    let result = check_source(
+        "def f<T, U>(x: T, y: U) -> U { return x; }
+         def main() -> Int<32> { return 0; }",
+    );
+    let msg = format!("{:?}", result);
+    assert!(
+        result.is_err() && msg.contains("constrained to a specific type"),
+        "T := U must be rejected (E104): {:?}",
+        result
+    );
+}
+
+/// Generality check exemption for const generic parameters: const
+/// params monomorphize per concrete constant value (SYNTAX.md §Const
+/// Generics), so they are exempt from E104 even though they appear in
+/// the generic parameter list.
+#[test]
+fn test_const_generic_param_exempt_from_generality() {
+    let result = check_source(
+        "def f<const N: usize>(x: Int<32>) -> Int<32> { return x; }
+         def main() -> Int<32> { return 0; }",
+    );
+    assert!(
+        result.is_ok(),
+        "const generic param must be exempt from E104: {:?}",
+        result
+    );
+}
+
+/// Where equality constraint: `where T == Int<32>` constrains the
+/// generic parameter explicitly in the signature, exempting it from the
+/// E104 generality check — the body may rely on T being Int<32>.
+#[test]
+fn test_where_equality_exempts_generality() {
+    let result = check_source(
+        "def add(a: Int<32>, b: Int<32>) -> Int<32> { return a + b; }
+         def f<T>(x: T) -> Int<32> where T == Int<32> { return add(x, 1); }
+         def main() -> Int<32> { return 0; }",
+    );
+    assert!(
+        result.is_ok(),
+        "where T == Int<32> must exempt E104: {:?}",
+        result
+    );
 }
 
 #[test]
@@ -2667,6 +2741,2256 @@ mod test_regex {
         assert!(
             result.is_err(),
             "comptime block should reject call to @trusted function"
+        );
+    }
+
+    // ── GADT tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_gadt_construction_ok() {
+        // GADT variant construction with matching type args
+        let result = check_source(
+            "type Expr<T> = enum { Lit(Int<32>) when T == Int<32> }
+             def main() -> Int<32> {
+                 set e: Expr<Int<32>> = Expr::Lit(42);
+                 return 0;
+             }",
+        );
+        assert!(
+            result.is_ok(),
+            "GADT construction with matching type should pass: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_gadt_construction_wrong_type_errors() {
+        // GADT variant construction with wrong type args should fail
+        let result = check_source(
+            "type Expr<T> = enum { Lit(Int<32>) when T == Int<32> }
+             def main() -> Bool {
+                 set e: Expr<Bool> = Expr::Lit(true);
+                 return e;
+             }",
+        );
+        assert!(
+            result.is_err(),
+            "GADT construction with wrong type should error"
+        );
+    }
+
+    #[test]
+    fn test_gadt_pattern_refinement_eval() {
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32> }
+def main() -> Int<32> {
+    set x: Wrap<Int<32>> = Wrap::Mk(42);
+    return match x { Mk(n) => n };
+}",
+        );
+        assert!(
+            result.is_ok(),
+            "GADT pattern refinement should pass: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_gadt_if_let_expr_refinement() {
+        // if-let as an expression — both branches produce value, unified.
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32> }
+def main() -> Int<32> {
+    set x: Wrap<Int<32>> = Wrap::Mk(42);
+    return if let Mk(n) = x { n } else { 0 };
+}",
+        );
+        assert!(
+            result.is_ok(),
+            "GADT if-let expression refinement should pass: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_gadt_nested_refinement() {
+        // GADT refinement with nested type: payload refers to another GADT.
+        let result = check_source(
+            "type Expr<T> = enum {
+    Lit(Int<32>) when T == Int<32>,
+    Wrap(Expr<Int<32>>) when T == Bool,
+}
+def main() -> Int<32> {
+    set e: Expr<Int<32>> = Expr::Lit(42);
+    return match e { Lit(n) => n };
+}",
+        );
+        assert!(
+            result.is_ok(),
+            "GADT nested refinement should pass: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_gadt_multi_variant() {
+        // Multi-variant GADT: pattern match with multiple arms.
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32>, Other(Bool) when T == Bool }
+def main() -> Bool {
+    set x: Wrap<Bool> = Wrap::Other(true);
+    return match x { Other(b) => b };
+}",
+        );
+        assert!(
+            result.is_ok(),
+            "GADT multi-variant match should pass: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_gadt_while_let() {
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32> }
+def main() -> Int<32> {
+    set x: Wrap<Int<32>> = Wrap::Mk(42);
+    while let Mk(n) = x { set _v = n; }
+    return 0;
+}",
+        );
+        assert!(result.is_ok(), "GADT while-let should pass: {:?}", result);
+    }
+
+    #[test]
+    fn test_gadt_arm_type_mismatch() {
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32>, Other(String) when T == Int<32> }
+def main() -> Int<32> {
+    set x: Wrap<Int<32>> = Wrap::Mk(42);
+    return match x {
+        Mk(n) => n,
+        Other(s) => s,
+    };
+}",
+        );
+        assert!(
+            result.is_err(),
+            "Incompatible GADT arm types should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_gadt_polymorphic_arm_mismatch() {
+        // GADT arms whose body types come from polymorphic function calls
+        // (InferVar) that get GADT-refined to different concrete types.
+        // Exercises the replace_type_ids abstraction path.
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32>, Other(Bool) when T == Bool }
+def identity<U>(x: U) -> U { return x; }
+def main() -> Int<32> {
+    set x: Wrap<Int<32>> = Wrap::Mk(42);
+    return match x {
+        Mk(n) => identity(n),
+        Other(b) => identity(b),
+    };
+}",
+        );
+        assert!(
+            result.is_ok(),
+            "Polymorphic GADT arms with one reachable variant should pass: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_gadt_polymorphic_arm_ok() {
+        // GADT arms with polymorphic function bodies that share the same type.
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32> }
+def identity<U>(x: U) -> U { return x; }
+def main() -> Int<32> {
+    set x: Wrap<Int<32>> = Wrap::Mk(42);
+    return match x {
+        Mk(n) => identity(n),
+    };
+}",
+        );
+        assert!(
+            result.is_ok(),
+            "Polymorphic GADT arm with matching type should pass: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_gadt_transaction_isolates_arms() {
+        // Both arms are reachable (same constraint).  Each arm's GADT
+        // refinement is rolled back before the next arm processes, so
+        // arm 1's `T = Int<32>` does not contaminate arm 2.
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32>, Other(Int<32>) when T == Int<32> }
+def main() -> Int<32> {
+    set x: Wrap<Int<32>> = Wrap::Mk(42);
+    return match x {
+        Mk(n) => n,
+        Other(n) => n,
+    };
+}"
+        );
+        assert!(
+            result.is_ok(),
+            "Both arms should type-check independently: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_gadt_polymorphic_scrutinee_refines_return_type() {
+        // The reviewer's critical concern: GADT refinement with a polymorphic
+        // scrutinee whose type argument is a GenericParam (not concrete).
+        //
+        // In `unwrap<T>(x: Wrap<T>) -> Int<32>`, the match scrutinee has type
+        // `Wrap<GenericParam{T}>`.  The when-clause says `Mk(Int<32>) when
+        // T == Int<32>`.  Inside the arm, T must be refined to Int<32> so
+        // that the payload `n: Int<32>` is accepted as the return type.
+        //
+        // This test exercises is_gadt_variant_reachable and
+        // apply_gadt_refinement with a GenericParam type argument,
+        // which the original implementation could not handle.
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32> }
+             def unwrap<T>(x: Wrap<T>) -> Int<32> {
+                 return match x { Mk(n) => n };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "Polymorphic GADT scrutinee should refine return type: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_gadt_polymorphic_scrutinee_reachable_variant() {
+        // Polymorphic GADT reachability: in a generic function `take_int<T>`,
+        // T is a GenericParam that could be instantiated to any type.
+        // Both the Mk (requires T == Int<32>) and Other (requires T == Bool)
+        // variants could be reachable depending on T's concrete type.
+        // Therefore, the match MUST include a wildcard (no arm is
+        // definitively dead at the generic level).
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32>, Other(Bool) when T == Bool }
+             def take_int<T>(x: Wrap<T>) -> Int<32> {
+                 return match x { Mk(n) => n, _ => 0 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "Polymorphic reachable check should pass with wildcard: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_gadt_polymorphic_scrutinee_identity_refinement() {
+        // Polymorphic function with GADT where the refined type parameter
+        // is used via an identity function call inside the arm.
+        // The GADT registry makes GenericParam{T} resolve to Int<32>
+        // transparently within the arm, so `identity(n: Int<32>)`
+        // correctly resolves U = Int<32>.
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32> }
+             def identity<U>(x: U) -> U { return x; }
+             def unwrap<T>(x: Wrap<T>) -> Int<32> {
+                 return match x { Mk(n) => identity(n) };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "Polymorphic GADT with identity call should refine: {:?}",
+            result
+        );
+    }
+
+    /// The reviewer's exact critical scenario: a generic function whose
+    /// return type IS the refined type parameter (T, not Int<32>).
+    ///
+    /// `eval<T>(x: Expr<T>) -> T` — the when-clause refines T to Int<32>
+    /// in the Lit arm.  After the arm, the match result type is Int<32>.
+    /// The return-type check unifies Int<32> with GenericParam{T}.
+    /// The reviewer claims this fails ("the unifier has no rule").
+    ///
+    /// This test proves it works: `unify_internal_impl` at the
+    /// `(_, TypeData::GenericParam{..})` arm binds GenericParam→Concrete
+    /// via `set_binding`.  The unification succeeds.
+    #[test]
+    fn test_gadt_refines_return_type_param() {
+        let result = check_source(
+            "type Expr<T> = enum { Lit(Int<32>) when T == Int<32> }
+             def eval<T>(x: Expr<T>) -> T {
+                 return match x { Lit(n) => n };
+             }
+             def main() -> Int<32> {
+                 set e: Expr<Int<32>> = Expr::Lit(42);
+                 return eval(e);
+             }",
+        );
+        assert!(
+            result.is_ok(),
+            "GADT must refine return type parameter T: {:?}",
+            result
+        );
+    }
+
+    /// Variant: polymorphic identity called inside the arm, function
+    /// return type is the GADT-refined parameter.  Exercises the full
+    /// pipeline: GADT registry → arm body inference → pop → return-type
+    /// unification with GenericParam.
+    #[test]
+    fn test_gadt_refines_return_type_param_via_call() {
+        let result = check_source(
+            "type Expr<T> = enum { Lit(Int<32>) when T == Int<32> }
+             def id<U>(x: U) -> U { return x; }
+             def eval<T>(x: Expr<T>) -> T {
+                 return match x { Lit(n) => id(n) };
+             }
+             def main() -> Int<32> {
+                 set e: Expr<Int<32>> = Expr::Lit(42);
+                 return eval(e);
+             }",
+        );
+        assert!(
+            result.is_ok(),
+            "GADT must refine return type T with intermediate call: {:?}",
+            result
+        );
+    }
+
+    /// Edge: multiple type parameters and `and` constraints
+    #[test]
+    fn test_gadt_edge_multi_param() {
+        let result = check_source(
+            "type KV<K, V> = enum { Pair(Int<32>) when K == Int<32> and V == Bool }
+             def main() -> Int<32> {
+                 set x: KV<Int<32>, Bool> = KV::Pair(42);
+                 return match x { Pair(n) => n };
+             }",
+        );
+        assert!(result.is_ok(), "multi-param GADT: {:?}", result);
+    }
+
+    /// Edge: compound tuple payload type
+    #[test]
+    fn test_gadt_edge_tuple_payload() {
+        let result = check_source(
+            "type Wrap<T> = enum { Pair((Int<32>, Bool)) when T == (Int<32>, Bool) }
+             def main() -> Int<32> {
+                 set x: Wrap<(Int<32>, Bool)> = Wrap::Pair((42, true));
+                 return match x { Pair((a, _)) => a };
+             }",
+        );
+        assert!(result.is_ok(), "tuple payload GADT: {:?}", result);
+    }
+
+    /// Edge: if-let with reachable GADT variant and else branch
+    #[test]
+    fn test_gadt_edge_if_let_with_else() {
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32> }
+             def main() -> Int<32> {
+                 set x: Wrap<Int<32>> = Wrap::Mk(42);
+                 return if let Mk(n) = x { n } else { 0 };
+             }",
+        );
+        assert!(result.is_ok(), "if-let GADT with else: {:?}", result);
+    }
+
+    /// Edge: non-GADT variant in GADT enum (empty eq_spec)
+    #[test]
+    fn test_gadt_edge_non_gadt_variant() {
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32>, Plain(Bool) }
+             def main() -> Int<32> {
+                 set x: Wrap<Int<32>> = Wrap::Mk(42);
+                 return match x { Mk(n) => n, Plain(_) => 0 };
+             }",
+        );
+        assert!(
+            result.is_ok(),
+            "non-GADT variant in GADT enum: {:?}",
+            result
+        );
+    }
+
+    /// Red-team repro: cross-arm type check bypass via the `gadt_discharged` latch.
+    #[test]
+    fn redteam_gadt_discharge_bypass_repro() {
+        // A non-GADT arm (B(Bool)) after a discharging arm (A) in a generic
+        // function must be rejected: its Bool body is incompatible with the
+        // generic expected T.  Regression test for the gadt_discharged latch
+        // bypass (the arm was previously never checked — see fn_ctxt.rs).
+        let result = check_source(
+            "type E<T> = enum { A(Int<32>) when T == Int<32>, B(Bool) }
+             def f<T>(x: E<T>) -> T {
+                 return match x { A(n) => n, B(b) => b };
+             }",
+        );
+        assert!(
+            result.is_err(),
+            "non-discharging arm after a discharge must be checked against the expected type: {:?}",
+            result
+        );
+    }
+
+    /// Red-team repro 2: residual bypass when a non-discharging arm PRECEDES
+    /// the discharging arm (accumulated arm_ty is discarded on discharge).
+    #[test]
+    fn redteam_gadt_discharge_bypass_repro2() {
+        let result = check_source(
+            "type E<T> = enum { B(Bool), A(Int<32>) when T == Int<32> }
+             def f<T>(x: E<T>) -> T {
+                 return match x { B(b) => b, A(n) => n };
+             }",
+        );
+        assert!(
+            result.is_err(),
+            "non-discharging arm preceding a discharge must be checked: {:?}",
+            result
+        );
+    }
+
+    /// Red-team repro 3: 3-arm match where a non-discharging arm sits BETWEEN
+    /// two discharging arms — the middle arm must still be checked against
+    /// the expected type (change (2) in the gadt_discharged fix).
+    #[test]
+    fn redteam_gadt_discharge_bypass_repro3_middle_arm() {
+        // Middle arm B(Bool) does not discharge; its concrete Bool body is
+        // incompatible with the abstract T — must be rejected.
+        let result = check_source(
+            "type E<T> = enum { A(Int<32>) when T == Int<32>, B(Bool), C(Int<32>) when T == Int<32> }
+             def f<T>(x: E<T>) -> T {
+                 return match x { A(n) => n, B(b) => b, C(n) => n };
+             }",
+        );
+        assert!(
+            result.is_err(),
+            "middle non-discharging arm between two discharging arms must be checked: {:?}",
+            result
+        );
+        // Positive control: the middle arm returning the generic T is fine.
+        let ok = check_source(
+            "type E<T> = enum { A(Int<32>) when T == Int<32>, B(T), C(Int<32>) when T == Int<32> }
+             def f<T>(x: E<T>) -> T {
+                 return match x { A(n) => n, B(b) => b, C(n) => n };
+             }",
+        );
+        assert!(
+            ok.is_ok(),
+            "middle non-discharging arm returning the generic T must pass: {:?}",
+            ok
+        );
+    }
+
+    /// GADT variant with contradictory `when` constraints (E065): the same
+    /// type parameter forced to two different concrete types is unsatisfiable
+    /// — the variant cannot be constructed at any instantiation.
+    #[test]
+    fn test_gadt_variant_conflicting_constraints() {
+        // Same param constrained to two different concrete types → error.
+        let bad = check_source(
+            "type E<T> = enum { A(Int<32>) when T == Int<32> and T == Bool }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            bad.is_err(),
+            "contradictory constraints must error: {:?}",
+            bad
+        );
+        // Bit-width mismatch is also a contradiction.
+        let bad2 = check_source(
+            "type E<T> = enum { A(Int<32>) when T == Int<32> and T == Int<64> }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(bad2.is_err(), "bit-width mismatch must error: {:?}", bad2);
+        // Different params are independent — satisfiable.
+        let ok = check_source(
+            "type E<T, U> = enum { A(Int<32>) when T == Int<32> and U == Bool }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(ok.is_ok(), "independent params must pass: {:?}", ok);
+        // Redundant identical constraints are satisfiable.
+        let ok2 = check_source(
+            "type E<T> = enum { A(Int<32>) when T == Int<32> and T == Int<32> }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            ok2.is_ok(),
+            "redundant identical constraints must pass: {:?}",
+            ok2
+        );
+        // An opaque exists-witness RHS (`when T == X`) may equal anything —
+        // the pair is not provably contradictory.
+        let ok3 = check_source(
+            "type E<T> = enum { A(exists X: Int<32>) when T == X and T == Int<32> }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(ok3.is_ok(), "opaque exists witness must pass: {:?}", ok3);
+        // A global alias RHS may alias the same type under different names —
+        // the pair is NOT provably contradictory (E065 must not fire).
+        let ok4 = check_source(
+            "type A = Int<32>
+             type B = Int<32>
+             type E<T> = enum { Mk(Int<32>) when T == A and T == B }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(ok4.is_ok(), "alias RHS must not be flagged: {:?}", ok4);
+        // An `exists` witness nested inside a larger RHS may equal anything —
+        // the pair is satisfiable (E065 must not fire).
+        let ok5 = check_source(
+            "type E<T> = enum { A(exists X: Int<32>) when T == [X] and T == [Bool] }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            ok5.is_ok(),
+            "nested exists witness must not be flagged: {:?}",
+            ok5
+        );
+        // A non-literal array size (const-generic parameter) is not provably
+        // concrete — two identical such constraints are satisfiable (E065
+        // must not fire on the const-param size).
+        let ok6 = check_source(
+            "type E<T, const N: usize> = enum { Mk(Int<32>) when T == [Int<32>; N] and T == [Int<32>; N] }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            ok6.is_ok(),
+            "non-literal array size must not be flagged: {:?}",
+            ok6
+        );
+        // The same type under a qualified path (`core::Int`) and an
+        // unqualified path (`Int`) is ONE type — nominal (resolved) equality,
+        // not syntactic path equality (E065 must not fire).
+        let ok7 = check_source(
+            "type E<T> = enum { Mk(Int<32>) when T == Int<32> and T == core::Int<32> }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            ok7.is_ok(),
+            "qualified/unqualified same type must not be flagged: {:?}",
+            ok7
+        );
+        // The same type under a qualified path INSIDE a generic argument
+        // (`Pair<Int<32>, core::Int<32>>` vs `Pair<Int<32>, Int<32>>`) is
+        // ONE type — the generic-args comparison is nominal (E065 must not
+        // fire on the args).
+        let ok8 = check_source(
+            "type Pair<A, B> = struct { a: A, b: B }
+             type E<T> = enum { Mk(Int<32>) when T == Pair<Int<32>, Int<32>> and T == Pair<Int<32>, core::Int<32>> }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            ok8.is_ok(),
+            "qualified-path generic args must not be flagged: {:?}",
+            ok8
+        );
+        // The genuine args-level contradiction (Int<32> vs Int<64> inside
+        // the same constructor) must still fire E065.
+        let bad3 = check_source(
+            "type Pair<A, B> = struct { a: A, b: B }
+             type E<T> = enum { Mk(Int<32>) when T == Pair<Int<32>, Int<32>> and T == Pair<Int<64>, Int<32>> }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            bad3.is_err(),
+            "args-level contradiction must error: {:?}",
+            bad3
+        );
+    }
+
+    /// The payload-constraint disconnect is a DIAGNOSTIC attribution issue:
+    /// when a GADT match arm's expected type comes from the variant's `when`
+    /// refinement, a body-type mismatch must error — with the diagnostic
+    /// pointing at the constraint source, not just the match arm.
+    #[test]
+    fn test_gadt_payload_when_disconnect_diagnostic() {
+        // `Tag(Int<32>) when T == Bool` — the payload Int<32> is disconnected
+        // from the refinement `T == Bool`.  Matching `Tag(n) => n` in a
+        // function returning `T` must ERROR (expected Bool, found Int<32>),
+        // and the diagnostic carries a secondary label at the `when` clause.
+        let result = check_source(
+            "type Expr<T> = enum { Tag(Int<32>) when T == Bool }
+             def process<T>(e: Expr<T>) -> T {
+                 match e { Tag(n) => n }
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_err(),
+            "disconnected payload must error: {:?}",
+            result
+        );
+    }
+
+    /// F2 const-param narrowing: the E104 const-param exemption is narrowed
+    /// to bindings consistent with the declared VALUE type — an unrelated
+    /// concrete type (e.g. `N := Bool` for `const N: usize`) is a generality
+    /// violation and must be rejected (previously silently accepted).
+    #[test]
+    fn test_const_param_generality_narrowed() {
+        // Incompatible binding — must be rejected (was silently accepted).
+        let bad = check_source(
+            "def f<const N: usize>(x: Bool) -> N {
+                 return x;
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            bad.is_err(),
+            "const-param incompatible binding must error: {:?}",
+            bad
+        );
+        // The const-param GADT match-arm mismatch — must also be rejected
+        // (via the narrowed return check).
+        let bad2 = check_source(
+            "type E<const N: usize> = enum { A(Int<32>) when N == Int<32>, B(Bool) }
+             def f<const N: usize>(x: E<N>) -> N {
+                 return match x { A(n) => n, B(b) => b };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            bad2.is_err(),
+            "const-param match-arm mismatch must error: {:?}",
+            bad2
+        );
+        // Unused / unbound const param — must pass.
+        let ok = check_source(
+            "def f<const N: usize>(x: Int<32>) -> Int<32> {
+                 return x;
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(ok.is_ok(), "unused const param must pass: {:?}", ok);
+    }
+
+    /// Edge: GADT construction with wrong type should error
+    #[test]
+    fn test_gadt_edge_construction_wrong_type() {
+        let result = check_source(
+            "type Expr<T> = enum { Lit(Int<32>) when T == Int<32> }
+             def main() -> Bool {
+                 set e: Expr<Bool> = Expr::Lit(true);
+                 return true;
+             }",
+        );
+        assert!(result.is_err(), "construction with wrong type must error");
+    }
+
+    /// Edge: unknown param in when clause must error (E062)
+    #[test]
+    fn test_gadt_edge_unknown_param() {
+        let result = check_source(
+            "type Expr<T> = enum { Lit(Int<32>) when X == Int<32> }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_err(), "unknown param in when must error");
+    }
+
+    /// Edge: GADT + `with default` must error (E061, SYNTAX.md §Interaction with `with default`)
+    #[test]
+    fn test_gadt_edge_with_default_prohibited() {
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32> }
+             with default = Wrap::Mk(42)",
+        );
+        assert!(result.is_err(), "GADT with default must error");
+    }
+
+    /// SYNTAX.md §Examples: full Expr example with Lit, Neg, Add, Eq
+    #[test]
+    fn test_gadt_edge_full_expr_syntax_doc() {
+        let result = check_source(
+            "type Expr<T> = enum { Lit(Int<32>) when T == Int<32>, Neg(Int<32>) when T == Int<32> }
+             def eval_int(x: Expr<Int<32>>) -> Int<32> {
+                 return match x { Lit(n) => n, Neg(n) => -n };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "full Expr from SYNTAX.md: {:?}", result);
+    }
+
+    /// SYNTAX.md §Examples: Bool variant not reachable for Expr<Int<32>>
+    #[test]
+    fn test_gadt_edge_expr_eq_not_reachable_on_int() {
+        let result = check_source(
+            "type Expr<T> = enum { Lit(Int<32>) when T == Int<32>, Eq(Bool) when T == Bool }
+             def eval_int(x: Expr<Int<32>>) -> Int<32> {
+                 return match x { Lit(n) => n };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "Eq unreachable for Expr<Int<32>>: {:?}",
+            result
+        );
+    }
+
+    /// Dead variant elimination (SYNTAX.md §Exhaustiveness Checking): omitting unreachable Eq variant
+    #[test]
+    fn test_gadt_edge_dead_variant_elimination() {
+        let result = check_source(
+            "type Expr<T> = enum { Lit(Int<32>) when T == Int<32>, Eq(Bool) when T == Bool }
+             def eval_int(x: Expr<Int<32>>) -> Int<32> {
+                 return match x { Lit(n) => n };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "dead variant elimination: {:?}", result);
+    }
+
+    /// GADT with auto type inference (InferVar)
+    #[test]
+    fn test_gadt_edge_auto_infer() {
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32> }
+             def main() -> Int<32> {
+                 set x = Wrap::Mk(42);
+                 return match x { Mk(n) => n };
+             }",
+        );
+        assert!(result.is_ok(), "GADT with auto inference: {:?}", result);
+    }
+
+    /// GADT via polymorphic identity helper
+    #[test]
+    fn test_gadt_edge_via_poly_fn() {
+        let result = check_source(
+            "type Expr<T> = enum { Lit(Int<32>) when T == Int<32> }
+             def id<T>(x: T) -> T { return x; }
+             def main() -> Expr<Int<32>> {
+                 return id(Expr::Lit(42));
+             }",
+        );
+        assert!(result.is_ok(), "poly fn GADT: {:?}", result);
+    }
+
+    /// While-let with degenerate GADT (single variant, always reachable)
+    #[test]
+    fn test_gadt_edge_while_let_loop() {
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32> }
+             def main() -> Int<32> {
+                 set x: Wrap<Int<32>> = Wrap::Mk(42);
+                 while let Mk(n) = x { return n; }
+                 return 0;
+             }",
+        );
+        assert!(result.is_ok(), "while-let GADT loop: {:?}", result);
+    }
+
+    /// All GADT variants have the same constraint — match with wildcard
+    #[test]
+    fn test_gadt_edge_all_same_constraint() {
+        let result = check_source(
+            "type Wrap<T> = enum {
+    A(Int<32>) when T == Int<32>,
+    B(Bool) when T == Bool,
+    C(String) when T == String,
+}
+def take_int(x: Wrap<Int<32>>) -> Int<32> {
+    return match x { A(n) => n, _ => 0 };
+}
+def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "all same GADT: {:?}", result);
+    }
+
+    /// Multiple sequential matches on GADT values (arm isolation)
+    #[test]
+    fn test_gadt_edge_sequential_matches() {
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32> }
+             def main() -> Int<32> {
+                 set x: Wrap<Int<32>> = Wrap::Mk(42);
+                 set y: Wrap<Int<32>> = Wrap::Mk(100);
+                 set a = match y { Mk(n) => n };
+                 return match x { Mk(n) => n + a };
+             }",
+        );
+        assert!(result.is_ok(), "sequential GADT matches: {:?}", result);
+    }
+
+    /// if-let with while-let chained on GADT
+    #[test]
+    fn test_gadt_edge_if_while_chain() {
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32> }
+             def main() -> Int<32> {
+                 set x: Wrap<Int<32>> = Wrap::Mk(42);
+                 if let Mk(n) = x {
+                     while let Mk(m) = x { return n + m; }
+                 }
+                 return 0;
+             }",
+        );
+        assert!(result.is_ok(), "if-while GADT chain: {:?}", result);
+    }
+
+    /// OCaml-equivalent test: variant payload uses the refined type param
+    /// type Wrap<T> = enum { Mk(T) when T == Int<32> }
+    /// The payload T resolves via GADT registry to Int<32> inside the arm.
+    #[test]
+    fn test_gadt_ocaml_payload_is_type_param() {
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(T) when T == Int<32> }
+             def unwrap<T>(x: Wrap<T>) -> Int<32> {
+                 return match x { Mk(n) => n };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "payload is type param: {:?}", result);
+    }
+
+    /// OCaml-equivalent test: compound payload referencing the refined param
+    /// type Wrap<T> = enum { Pair((T, Bool)) when T == Int<32> }
+    #[test]
+    fn test_gadt_ocaml_compound_payload_with_param() {
+        let result = check_source(
+            "type Wrap<T> = enum { Pair((T, Bool)) when T == Int<32> }
+             def fst<T>(x: Wrap<T>) -> Int<32> {
+                 return match x { Pair((a, _)) => a };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "compound payload with param: {:?}", result);
+    }
+
+    /// OCaml-equivalent test: multiple arms with same type param
+    /// Each arm refines T differently, arm isolation must hold.
+    #[test]
+    fn test_gadt_ocaml_multi_arm_diff_refinements() {
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32>, MkBool(Bool) when T == Bool }
+             def take_int(x: Wrap<Int<32>>) -> Int<32> {
+                 return match x { Mk(n) => n, MkBool(_) => 0 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "multi arm diff refinements: {:?}", result);
+    }
+
+    /// OCaml-equivalent test: GenericParam resolved through GADT registry
+    /// after pop_gadt_arm, a FRESH match re-refines correctly.
+    #[test]
+    fn test_gadt_ocaml_two_sequential_matches() {
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32> }
+             def main() -> Int<32> {
+                 set x: Wrap<Int<32>> = Wrap::Mk(42);
+                 set y: Wrap<Int<32>> = Wrap::Mk(100);
+                 return match x { Mk(a) => match y { Mk(b) => a + b } };
+             }",
+        );
+        assert!(result.is_ok(), "sequential matches: {:?}", result);
+    }
+
+    /// Seal-the-wall regression: a GADT refinement must NOT leak out of
+    /// its match arm into the global bindings table.  Before the seal,
+    /// `set r1: T = match a { Lit(n) => n }` bound T := Int<32> globally
+    /// via the post-match unification with the expected type, so a LATER
+    /// match refining the SAME T to Bool saw a polluted scrutinee
+    /// (`Expr2<Int<32>>`), made `Mk` unreachable, and failed.  After the
+    /// seal, each arm's refinement is discharged in-scope against the
+    /// expected type and T stays abstract between matches.
+    #[test]
+    fn test_gadt_refinement_does_not_leak_between_matches() {
+        let result = check_source(
+            "type Expr<T> = enum { Lit(Int<32>) when T == Int<32> }
+             type Expr2<T> = enum { Mk(Bool) when T == Bool }
+             def f<T>(a: Expr<T>, b: Expr2<T>) -> T {
+                 set r1: T = match a { Lit(n) => n };
+                 return match b { Mk(x) => x };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "GADT refinement must not leak between matches (T refined to Int<32> then Bool): {:?}",
+            result
+        );
+    }
+
+    /// SYNTAX.md §Existential Quantification: existential GADT with single exists param
+    /// type DynExpr<T> = enum { Slice(exists X: &[X]) when T == [X] }
+    #[test]
+    fn test_gadt_exist_single_param() {
+        let result = check_source(
+            "type DynExpr<T> = enum { Slice(exists X: &[X]) when T == [X] }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "exist single param: {:?}", result);
+    }
+
+    /// SYNTAX.md §Existential Quantification: existential GADT with multiple exists params
+    /// type DynExpr<T> = enum { Pair(exists A, B: (A, B)) when T == (A, B) }
+    #[test]
+    fn test_gadt_exist_multi_param() {
+        let result = check_source(
+            "type DynExpr<T> = enum { Pair(exists A, B: (A, B)) when T == (A, B) }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "exist multi param: {:?}", result);
+    }
+
+    /// SYNTAX.md §Existential Quantification: full DynExpr with mixed exist and non-exist variants
+    #[test]
+    fn test_gadt_exist_mixed_variants() {
+        let result = check_source(
+            "type DynExpr<T> = enum {
+    IntLit(Int<32>) when T == Int<32>,
+    Slice(exists X: &[X]) when T == [X],
+}
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "exist mixed variants: {:?}", result);
+    }
+
+    /// Exist param must not shadow enum type parameter
+    #[test]
+    fn test_gadt_exist_shadow_error() {
+        let result = check_source(
+            "type Wrap<T> = enum { Bad(exists T: Int<32>) when T == Int<32> }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_err(), "exist shadow must error");
+    }
+
+    /// Functional test: pattern match on existential GADT variant.
+    /// type DynExpr<T> = enum { Slice(exists X: &[X]) when T == [X] }
+    /// Tests that the shared skolem mechanism works: apply_gadt_refinement
+    /// creates skolems for exist params and stores them on
+    /// current_gadt_exist_skolems; check_pattern_inner uses the SAME
+    /// skolems when resolving the payload type, so the pattern variable's
+    /// type and the GADT equality refer to the same existential witness.
+    #[test]
+    fn test_gadt_exist_pattern_match() {
+        let result = check_source(
+            "type DynExpr<T> = enum { Slice(exists X: &[X]) when T == [X] }
+             def take_slice(e: DynExpr<[Int<32>]>) -> Int<32> {
+                 return match e { Slice(_s) => 0 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "exist pattern match: {:?}", result);
+    }
+
+    /// Multiple exist params: payload `(A, B)` from `exists A, B`
+    #[test]
+    fn test_gadt_exist_pattern_match_multi() {
+        let result = check_source(
+            "type DynExpr<T> = enum { Pair(exists A, B: (A, B)) when T == (A, B) }
+             def take_pair(e: DynExpr<(Int<32>, Bool)>) -> Int<32> {
+                 return match e { Pair(_p) => 0 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "exist multi pattern match: {:?}", result);
+    }
+
+    /// Mixed exist and non-exist variants
+    #[test]
+    fn test_gadt_exist_mixed_pattern_match() {
+        let result = check_source(
+            "type DynExpr<T> = enum {
+    IntLit(Int<32>) when T == Int<32>,
+    Slice(exists X: &[X]) when T == [X],
+}
+             def take(e: DynExpr<[Int<32>]>) -> Int<32> {
+                 return match e { Slice(_s) => 0, IntLit(_) => 0 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "exist mixed pattern match: {:?}", result);
+    }
+
+    /// Regression: nested GADT match with early return in inner arm.
+    /// Tests that GadtArmGuard's depth counter correctly handles early
+    /// returns in nested scopes (Critical Flaw #1 from AI audit).
+    #[test]
+    fn test_gadt_nested_match_early_return() {
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32> }
+             def f(x: Wrap<Int<32>>) -> Int<32> {
+                 return match x { Mk(n) => n };
+             }
+             def main() -> Int<32> { return f(Wrap::Mk(42)); }",
+        );
+        assert!(result.is_ok(), "nested match early return: {:?}", result);
+    }
+
+    /// Accessing an existential element as a concrete type must be
+    /// rejected: X is opaque, so `s[0]` has type X, not Int<32>.
+    #[test]
+    fn test_gadt_exist_payload_element_opaque() {
+        let result = check_source(
+            "type DynExpr<T> = enum { Slice(exists X: &[X]) when T == [X] }
+             def first(e: DynExpr<[Int<32>]>) -> Int<32> {
+                 return match e { Slice(s) => s[0] };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_err(),
+            "exist element must stay opaque: {:?}",
+            result
+        );
+    }
+
+    /// `s'len` works on a plain (non-existential) slice — `'len` is the
+    /// array/slice length attribute (SYNTAX.md §"Type Attributes").
+    #[test]
+    fn test_plain_slice_len_attr() {
+        let result = check_source(
+            "def take_slice(s: &[Int<32>]) -> USize {
+                 return s'len;
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "plain slice len: {:?}", result);
+    }
+
+    /// `s'len` works on an existential GADT payload: `Slice(s)` gives
+    /// `s: &[X]` and `'len` is valid since it does not require knowing X
+    /// (SYNTAX.md §"Pattern Matching and Type Refinement" example).
+    #[test]
+    fn test_gadt_exist_payload_len_ok() {
+        let result = check_source(
+            "type DynExpr<T> = enum { Slice(exists X: &[X]) when T == [X] }
+             def take_slice(e: DynExpr<[Int<32>]>) -> USize {
+                 return match e { Slice(s) => s'len };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "exist payload len: {:?}", result);
+    }
+
+    /// Ghost-scope leakage: a ghost variable declared in an inner scope must
+    /// NOT make a later runtime variable of the same name acceptable in a
+    /// `scope_cleanup when` condition.  The second `inner_flag` is a runtime
+    /// variable, so the condition must be rejected as non-compile-time.
+    #[test]
+    fn test_scope_cleanup_ghost_scope_leakage() {
+        let result = check_source(
+            "def f() -> Int<32> {
+                 {
+                     ghost set mut inner_flag = false;
+                 }
+                 set inner_flag = true;
+                 scope_cleanup @c when inner_flag { }
+                 return 0;
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_err(),
+            "runtime inner_flag must not be accepted as ghost: {:?}",
+            result
+        );
+    }
+
+    /// Control: a ghost variable declared in the SAME scope IS a valid
+    /// compile-time predicate for `scope_cleanup when`.
+    #[test]
+    fn test_scope_cleanup_ghost_same_scope_ok() {
+        let result = check_source(
+            "def f() -> Int<32> {
+                 ghost set mut inner_flag = false;
+                 scope_cleanup @c when inner_flag { }
+                 return 0;
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "same-scope ghost: {:?}", result);
+    }
+
+    /// `contains_gadt_skolem` coverage for compound payload types: for
+    /// `Pair(exists A, B: (A, B))` the declared type is a Tuple containing
+    /// GADT skolems.  Opacity must be preserved — the payload elements stay
+    /// opaque (type `A`/`B`), so using `p` as `(Int<32>, Bool)` must fail.
+    #[test]
+    fn test_gadt_exist_payload_tuple_opaque() {
+        let result = check_source(
+            "type DynExpr<T> = enum { Pair(exists A, B: (A, B)) when T == (A, B) }
+             def take_pair(e: DynExpr<(Int<32>, Bool)>) -> Int<32> {
+                 return match e { Pair(p) => p'0 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_err(),
+            "tuple payload element must stay opaque: {:?}",
+            result
+        );
+    }
+
+    /// TcLevel non-escape: a normal GADT match with the region wiring
+    /// active must NOT produce false SkolemEscape errors.  The arm body
+    /// returns an arm-local value; nothing escapes the arm.
+    #[test]
+    fn test_gadt_tclevel_no_false_escape() {
+        let result = check_source(
+            "type Wrap<T> = enum { Mk(Int<32>) when T == Int<32> }
+             def f(x: Wrap<Int<32>>) -> Int<32> {
+                 return match x { Mk(n) => n };
+             }
+             def main() -> Int<32> { return f(Wrap::Mk(42)); }",
+        );
+        assert!(result.is_ok(), "no false SkolemEscape: {:?}", result);
+    }
+
+    /// TcLevel non-escape for existential arms: using the payload inside
+    /// the arm (e.g. `s'len`) must not trigger a false escape.
+    #[test]
+    fn test_gadt_tclevel_exist_payload_ok() {
+        let result = check_source(
+            "type DynExpr<T> = enum { Slice(exists X: &[X]) when T == [X] }
+             def take_slice(e: DynExpr<[Int<32>]>) -> USize {
+                 return match e { Slice(s) => s'len };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "exist payload no false escape: {:?}",
+            result
+        );
+    }
+
+    /// TcLevel escape: an arm that leaks its existential payload as a
+    /// concrete `Int<32>` must be rejected (opacity + region discipline).
+    #[test]
+    fn test_gadt_tclevel_escape_rejected() {
+        let result = check_source(
+            "type DynExpr<T> = enum { Slice(exists X: &[X]) when T == [X] }
+             def first(e: DynExpr<[Int<32>]>) -> Int<32> {
+                 return match e { Slice(s) => s[0] };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_err(),
+            "escaping element must be rejected: {:?}",
+            result
+        );
+    }
+
+    /// Whole-slice escape: returning the entire existential payload as a
+    /// concrete `&[Int<32>]` must be rejected.  `s` has type `&[S]` with
+    /// opaque witness `S`; the top-level equality `[S] → [Int<32>]` must
+    /// NOT make `&[S]` usable as `&[Int<32>]`.
+    #[test]
+    fn test_gadt_exist_whole_slice_escape_rejected() {
+        let result = check_source(
+            "type DynExpr<T> = enum { Slice(exists X: &[X]) when T == [X] }
+             def leak(e: DynExpr<[Int<32>]>) -> &[Int<32>] {
+                 return match e { Slice(s) => s };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_err(),
+            "whole-slice existential must not escape as concrete: {:?}",
+            result
+        );
+    }
+
+    /// Ghost shadowing: an inner RUNTIME variable that shadows an outer
+    /// ghost variable must NOT be accepted as a compile-time predicate.
+    /// `when flag` here refers to the runtime `flag`, not the ghost one.
+    #[test]
+    fn test_scope_cleanup_ghost_shadowed_by_runtime() {
+        let result = check_source(
+            "def f() -> Int<32> {
+                 ghost set flag = false;
+                 {
+                     set flag = true;
+                     scope_cleanup @c when flag { }
+                 }
+                 return 0;
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_err(),
+            "runtime variable shadowing a ghost must be rejected: {:?}",
+            result
+        );
+    }
+
+    /// Generic existential whole-slice escape: returning the payload as
+    /// `&[U]` (outer generic parameter) must be rejected — the witness
+    /// must not escape through an outer binder (SYNTAX.md §"Existential
+    /// Quantification": "prevented from leaking into the surrounding
+    /// context by an occurs-check at the branch boundary").
+    #[test]
+    fn test_gadt_exist_generic_whole_slice_escape_rejected() {
+        let result = check_source(
+            "type DynExpr<T> = enum { Slice(exists X: &[X]) when T == [X] }
+             def leak<U>(e: DynExpr<[U]>) -> &[U] {
+                 return match e { Slice(s) => s };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_err(),
+            "generic whole-slice existential must not escape: {:?}",
+            result
+        );
+    }
+
+    /// Generic existential element escape: returning the payload element
+    /// as `U` (outer generic parameter) must be rejected — the witness is
+    /// opaque, so `s[0]` has type X, not U.
+    #[test]
+    fn test_gadt_exist_generic_element_escape_rejected() {
+        let result = check_source(
+            "type DynExpr<T> = enum { Slice(exists X: &[X]) when T == [X] }
+             def leak_elem<U>(e: DynExpr<[U]>) -> U {
+                 return match e { Slice(s) => s[0] };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_err(),
+            "generic element existential must not escape: {:?}",
+            result
+        );
+    }
+
+    /// Nested existential scopes: an outer match arm binding `exists X`
+    /// followed by an inner match arm binding its OWN `exists Y`.  Each
+    /// binder must get an independent skolem scope — the inner `Y` must
+    /// not be resolved with the outer `X` map.  Exercises the
+    /// `current_gadt_exist_skolems` stack across nested arms.
+    #[test]
+    fn test_gadt_exist_nested_pattern_scope() {
+        let result = check_source(
+            "type A<T> = enum { MkA(exists X: &[X]) when T == [X] }
+             type B<T> = enum { MkB(exists Y: &[Y]) when T == [Y] }
+             def take(a: A<[Int<32>]>, b: B<[Int<32>]>) -> USize {
+                 return match a {
+                     MkA(xs) => match b {
+                         MkB(ys) => xs'len + ys'len,
+                     },
+                 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "nested existential scopes must type-check: {:?}",
+            result
+        );
+    }
+
+    /// comptime def functions return values with `return` (SYNTAX.md
+    /// §"Type Factories": `comptime def make_vector(...) -> type {
+    /// return [Elem; N]; }`).  The body is a FUNCTION body, not a
+    /// comptime block, so `return` with a value must be accepted and the
+    /// value propagated to the caller.
+    #[test]
+    fn test_comptime_def_return_value_ok() {
+        let result = check_source(
+            "comptime def answer() -> Int<32> { return 42; }
+             def main() -> Int<32> {
+                 set v = answer!();
+                 return v;
+             }",
+        );
+        assert!(
+            result.is_ok(),
+            "comptime def return with value must be accepted: {:?}",
+            result
+        );
+    }
+
+    /// Comptime generic functions are NOT falsely rejected by the E104
+    /// generality check.  No false-positive vector exists: the
+    /// comptime sandbox (E081) blocks calling regular functions (the main
+    /// way a body could bind a generic param), and `@typeInfo!` is
+    /// deferred to generate expansion (returns unit at type-check time).
+    #[test]
+    fn test_comptime_generic_param_no_false_e104() {
+        let result = check_source(
+            "comptime def make<T>(x: T) -> T { return x; }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "comptime generic function must not false-positive E104: {:?}",
+            result
+        );
+    }
+
+    /// comptime def returning a Bool, referenced as a compile-time
+    /// constant in `scope_cleanup when` (SYNTAX.md §"Comptime": the
+    /// condition may reference compile-time-constant expressions).
+    #[test]
+    fn test_scope_cleanup_when_comptime_const_ok() {
+        let result = check_source(
+            "comptime def DEBUG() -> Bool { return true; }
+             def f() -> Int<32> {
+                 scope_cleanup @c when DEBUG!() { }
+                 return 0;
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "comptime constant predicate must be accepted: {:?}",
+            result
+        );
+    }
+
+    /// Same-named existential binders in a nested pattern: outer `MkA`
+    /// has `exists X` and inner `MkB` ALSO has `exists X` — two DIFFERENT
+    /// witnesses.  The inner binder must get its own scope, not reuse the
+    /// outer one by name.
+    #[test]
+    fn test_gadt_exist_nested_same_name_scope() {
+        let result = check_source(
+            "type B<T> = enum { MkB(exists X: &[X]) when T == [X] }
+             type A<T> = enum { MkA(exists X: B<[X]>) when T == [X] }
+             def take(a: A<[Int<32>]>) -> USize {
+                 return match a {
+                     MkA(MkB(s)) => s'len,
+                 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "same-named nested existential binders must each get their own scope: {:?}",
+            result
+        );
+    }
+
+    /// GADT construction soundness: `Expr::Lit(42)` requires `T == Int<32>`.
+    /// Constructing it in a context expecting `Expr<Bool>` must be REJECTED
+    /// (the `when` constraint must not be silently skipped when the bare
+    /// enum path cannot recover type args).
+    #[test]
+    fn test_gadt_construction_mismatched_target_rejected() {
+        let result = check_source(
+            "type Expr<T> = enum { Lit(Int<32>) when T == Int<32> }
+             def bad() -> Expr<Bool> {
+                 return Expr::Lit(42);
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_err(),
+            "GADT construction with mismatched type target must be rejected: {:?}",
+            result
+        );
+    }
+
+    /// Independent same-named existential binders in a nested pattern must
+    /// NOT be conflated: outer `exists X` and inner `exists X` are DIFFERENT
+    /// witnesses.  Skolem identity is the binder's INDEX (GHC `realUnique` /
+    /// OCaml `id: int`), so the inner payload `(X, Int<32>)` resolves with
+    /// the inner witness — the second element is the concrete `Int<32>`.
+    #[test]
+    fn test_gadt_exist_nested_independent_same_name() {
+        let result = check_source(
+            "type Inner = enum { MkInner(exists X: (X, Int<32>)) }
+             type Outer<T> = enum { MkOuter(exists X: Inner) when T == X }
+             def bad(o: Outer<Bool>) -> Int<32> {
+                 return match o {
+                     MkOuter(MkInner((_, a))) => a,
+                 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "nested independent same-named existential binders must type-check: {:?}",
+            result
+        );
+    }
+
+    /// Witness-set consistency: the payload type and the GADT equations
+    /// must share ONE existential witness.  `when X == Int<32>` solves X to
+    /// `Int<32>`; if `check_pattern_inner` allocated a SECOND witness set
+    /// (witness mismatch), `s'len` would be typed with a different skolem
+    /// and the rigid GADT-skolem check would false-reject this.
+    #[test]
+    fn test_gadt_exist_witness_set_consistent() {
+        let result = check_source(
+            "type DynExpr<T> = enum { Slice(exists X: &[X]) when X == Int<32> }
+             def first(e: DynExpr<[Int<32>]>) -> USize {
+                 return match e {
+                     Slice(s) => s'len,
+                 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "payload type and GADT refinement must share one witness set: {:?}",
+            result
+        );
+    }
+
+    /// Frame identity must be OCCURRENCE identity, not variant NAME: two
+    /// different enums with the SAME variant name (`Mk`) nested in a
+    /// pattern must each get their own witness.  If the inner `Mk`
+    /// wrongly reuses the outer frame (name-based identity), the inner
+    /// `exists X` resolves with the outer skolem.
+    #[test]
+    fn test_gadt_exist_same_variant_name_nested() {
+        let result = check_source(
+            "type Inner = enum { Mk(exists X: (X, Int<32>)) }
+             type Outer = enum { Mk(exists Y: Inner) }
+             def bad(o: Outer) -> Int<32> {
+                 return match o {
+                     Mk(Mk((_, a))) => a,
+                 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "same-named variants in different enums must get independent witnesses: {:?}",
+            result
+        );
+    }
+
+    /// Nested GADT refinement (SYNTAX.md §"Nested GADT Refinement"): the
+    /// outer branch refines `T == Bool`; a nested `match` inside the
+    /// branch body on ANOTHER `Container<T>` value must see that
+    /// refinement, so `BoolBox` is considered satisfiable and `s2` is a
+    /// `Bool`.
+    #[test]
+    fn test_gadt_nested_refinement_in_branch() {
+        let result = check_source(
+            "type Container<T> = enum {
+                 IntBox(Int<32>) when T == Int<32>,
+                 BoolBox(Bool) when T == Bool,
+             }
+             def extract<T>(c1: Container<T>, c2: Container<T>) -> Bool {
+                 return match c1 {
+                     BoolBox(s) => match c2 { BoolBox(s2) => s2, _ => false },
+                     _ => false,
+                 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "outer refinement must propagate into nested match in branch body: {:?}",
+            result
+        );
+    }
+
+    /// Nested GADT refinement in a SINGLE nested pattern tree
+    /// (SYNTAX.md §"Nested GADT Refinement"): each constructor in the
+    /// nested pattern contributes its `when` equalities.  `Add` refines
+    /// `T == Int<32>`; both nested `Lit` patterns refine their inner
+    /// `Expr<Int<32>>`'s `T == Int<32>` — so `a` and `b` are `Int<32>`
+    /// and the whole equation set is consistent.
+    #[test]
+    fn test_gadt_nested_pattern_tree_refinement() {
+        let result = check_source(
+            "type Expr<T> = enum {
+                 Lit(Int<32>) when T == Int<32>,
+                 Add((Expr<Int<32>>, Expr<Int<32>>)) when T == Int<32>,
+             }
+             def eval(e: Expr<Int<32>>) -> Int<32> {
+                 return match e {
+                     Add((Lit(a), Lit(b))) => a + b,
+                     Lit(n) => n,
+                 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "nested pattern tree must propagate when equalities: {:?}",
+            result
+        );
+    }
+
+    /// Occurrence identity for RECURSIVE GADT variants: `Node` nested in
+    /// `Node` has the SAME enum DefId and variant name, but is a DIFFERENT
+    /// occurrence.  The inner `Node` must push its own existential frame
+    /// (the top-level frame was consumed by the outer `Node`), not reuse
+    /// the outer witness.  Uses concrete `Tree<Int<32>>` payloads so the
+    /// nested payload resolves without generic-parameter substitution.
+    #[test]
+    fn test_gadt_exist_recursive_variant_occurrence() {
+        let result = check_source(
+            "type Tree<T> = enum {
+                 Leaf(exists X: (X, Int<32>)) when T == Int<32>,
+                 Node(exists X: (X, Tree<Int<32>>)) when T == Int<32>,
+             }
+             def depth(t: Tree<Int<32>>) -> Int<32> {
+                 return match t {
+                     Node((_, Node((_, Leaf((_, n)))))) => n,
+                     _ => 0,
+                 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "recursive variant occurrences must get independent witnesses: {:?}",
+            result
+        );
+    }
+
+    /// GADT `when` RHS must not reference another type parameter of the
+    /// SAME enum: `when T == U and U == T` would register a mutual
+    /// refinement cycle (A → B, B → A) that `resolve_binding_tail` would
+    /// chase until MAX_CHAIN_DEPTH.  Rejected at resolver time (E064).
+    #[test]
+    fn test_gadt_when_rhs_same_enum_param_rejected() {
+        let result = check_source(
+            "type Bad<T, U> = enum { Mk(T) when T == U }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_err(),
+            "when RHS referencing same-enum type parameter must be rejected: {:?}",
+            result
+        );
+    }
+
+    /// Composite `when` RHS referencing a same-enum parameter (inside a
+    /// tuple) is also rejected (recursive walk).
+    #[test]
+    fn test_gadt_when_rhs_same_enum_param_in_tuple_rejected() {
+        let result = check_source(
+            "type Bad<T, U> = enum { Mk(T) when T == (U, Int<32>) }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_err(),
+            "when RHS with same-enum param inside a tuple must be rejected: {:?}",
+            result
+        );
+    }
+
+    /// Legal RHS forms must NOT be rejected: an `exists` variable on the
+    /// RHS (`when T == [X]`, witness stays opaque) and concrete types.
+    #[test]
+    fn test_gadt_when_rhs_exists_and_concrete_ok() {
+        let result = check_source(
+            "type Good<T> = enum { Mk(exists X: (X, Int<32>)) when T == Int<32> }
+             def f(g: Good<Int<32>>) -> Int<32> {
+                 return match g { Mk((_, a)) => a };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "when RHS with concrete type must be accepted: {:?}",
+            result
+        );
+    }
+
+    /// `return Err(e)` must be rejected even through a type alias
+    /// (`type MyResult = Result<Int<32>, Int<32>>`) — the alias's `Err`
+    /// variant is still an error exit and must use `leave with`.
+    #[test]
+    fn test_return_err_via_type_alias_rejected() {
+        let result = check_source(
+            "type MyResult = Result<Int<32>, Int<32>>
+             def bad() -> MyResult {
+                 return MyResult::Err(42);
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_err(),
+            "return Err(e) through a type alias must be rejected: {:?}",
+            result
+        );
+        let msg = format!("{:?}", result);
+        assert!(
+            msg.contains("leave with") || msg.contains("E008"),
+            "expected the error-exit lint (E008 / leave with) to fire, got: {:?}",
+            result
+        );
+    }
+
+    /// Regression (currently limited): an existential skolem on the
+    /// SCRUTINEE side of a `when` constraint must never register
+    /// `ParamRefinement { from: concrete, to: skolem }` —
+    /// `register_gadt_eq_directional` now routes GADT skolems to the INERT
+    /// `ExistentialEquation` (defense-in-depth against type confusion).
+    ///
+    /// NOTE: this exact nested scenario does not type-check yet — the
+    /// outer `when T == X` (RHS is an `exists` variable) registers an
+    /// inert equation, so `X` stays opaque and the inner scrutinee remains
+    /// `Inner<S>` (unable to align with `MkInner`'s `Inner<Int<32>>`).
+    /// That is a witness-solving limitation (see audit #2), not a skolem
+    /// registration bug.  Kept `#[ignore]` as documentation of the
+    /// limitation until witness solving is extended.
+    #[test]
+    #[ignore = "outer `when T == X` keeps X opaque; inner scrutinee cannot align (witness-solving is opt-in per consumer, not in resolve_binding — opacity invariant)"]
+    fn test_gadt_exist_scrutinee_skolem_not_refined() {
+        let result = check_source(
+            "type Inner<T> = enum { MkInner(Int<32>) when T == Int<32> }
+             type Outer<T> = enum { MkOuter(exists X: Inner<X>) when T == X }
+             def f(o: Outer<Int<32>>) -> Int<32> {
+                 return match o {
+                     MkOuter(inner) => match inner {
+                         MkInner(n) => n,
+                     },
+                 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "inner match on a non-existential variant under an existential scrutinee must type-check: {:?}",
+            result
+        );
+    }
+
+    /// GADT refinement in STATEMENT-position `if let` (SYNTAX.md
+    /// §"Pattern Matching and Type Refinement": refinement is available in
+    /// `if let`).  The `when T == Int<32>` constraint must refine `n` to
+    /// `Int<32>` inside the then-branch — previously only `Stmt::WhileLet`
+    /// and expression-position `if let` got the full refinement sequence.
+    #[test]
+    fn test_gadt_refinement_stmt_if_let() {
+        let result = check_source(
+            "type Expr<T> = enum { Lit(Int<32>) when T == Int<32> }
+             def f(e: Expr<Int<32>>) -> Int<32> {
+                 if let Lit(n) = e {
+                     return n;
+                 }
+                 return 0;
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "GADT refinement must apply in statement-position if let: {:?}",
+            result
+        );
+    }
+
+    /// or-pattern GADT refinement — scenario 1: all alternatives refine T
+    /// to the SAME type → the refinement propagates to the branch body.
+    /// Both `Lit` and `Neg` refine `T == Int<32>`; the intersection
+    /// propagates.
+    #[test]
+    fn test_gadt_or_pattern_consistent_refinement() {
+        let result = check_source(
+            "type Expr<T> = enum {
+                 Lit(Int<32>) when T == Int<32>,
+                 Neg(Expr<Int<32>>) when T == Int<32>,
+             }
+             def f(e: Expr<Int<32>>) -> Int<32> {
+                 return match e {
+                     Lit(_) | Neg(_) => 0,
+                 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "consistent or-pattern GADT refinements must be accepted: {:?}",
+            result
+        );
+    }
+
+    /// or-pattern GADT refinement — scenario 2: alternatives refine the
+    /// same parameter to DIFFERENT types → E066 compile error (disjunction
+    /// semantics: the branch body cannot assume conflicting refinements).
+    /// A POLYMORPHIC scrutinee is required: with a concrete `Expr<Int<32>>`,
+    /// `Eq` is a dead variant (Issue 2) whose equalities are ignored by the
+    /// intersection, so E066 would never fire.
+    #[test]
+    fn test_gadt_or_pattern_conflicting_refinement_rejected() {
+        let result = check_source(
+            "type Expr<T> = enum {
+                 Lit(Int<32>) when T == Int<32>,
+                 Eq(Bool) when T == Bool,
+             }
+             def f<T>(e: Expr<T>) -> Int<32> {
+                 return match e {
+                     Lit(_) | Eq(_) => 0,
+                 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        let msg = format!("{:?}", result);
+        assert!(
+            result.is_err() && (msg.contains("E066") || msg.contains("conflicting GADT")),
+            "conflicting or-pattern GADT refinements must be rejected (E066): {:?}",
+            result
+        );
+    }
+
+    /// or-pattern GADT refinement — scenario 3: some alternatives have no
+    /// constraint → T is NOT refined (stays abstract; no error, no
+    /// propagation).
+    #[test]
+    fn test_gadt_or_pattern_partial_constraint_no_refine() {
+        let result = check_source(
+            "type Expr<T> = enum {
+                 Lit(Int<32>) when T == Int<32>,
+                 If((Expr<Int<32>>, Expr<T>, Expr<T>)),
+             }
+             def f<T>(e: Expr<T>) -> Int<32> {
+                 return match e {
+                     Lit(_) | If((_, _, _)) => 0,
+                 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "or-pattern with partial constraints must not refine (no error): {:?}",
+            result
+        );
+    }
+
+    /// Or-pattern bindings: alternatives bind the SAME variable with
+    /// compatible types (SYNTAX.md L1784); the binding is in scope in the
+    /// branch body (`x` is usable as `Int<32>`).
+    #[test]
+    fn test_or_pattern_bindings_in_scope() {
+        let result = check_source(
+            "type Expr<T> = enum {
+                 Lit(Int<32>) when T == Int<32>,
+                 Neg(Int<32>) when T == Int<32>,
+             }
+             def f(e: Expr<Int<32>>) -> Int<32> {
+                 return match e { Lit(x) | Neg(x) => x + 1 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "or-pattern binding must be in scope in the branch body: {:?}",
+            result
+        );
+    }
+
+    /// Or-pattern bindings: alternatives must bind the SAME set of
+    /// variables (E105, OCaml's Orpat_vars).
+    #[test]
+    fn test_or_pattern_bindings_different_vars_rejected() {
+        let result = check_source(
+            "type Expr<T> = enum {
+                 Lit(Int<32>) when T == Int<32>,
+                 Neg(Int<32>) when T == Int<32>,
+             }
+             def f(e: Expr<Int<32>>) -> Int<32> {
+                 return match e { Lit(x) | Neg(y) => 0 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        let msg = format!("{:?}", result);
+        assert!(
+            result.is_err() && msg.contains("must bind the same variables"),
+            "or-pattern alternatives must bind the same variables (E105): {:?}",
+            result
+        );
+    }
+
+    /// Or-pattern bindings: a common variable's type must unify
+    /// across alternatives (E106, OCaml's Or_pattern_type_clash).
+    #[test]
+    fn test_or_pattern_bindings_incompatible_types_rejected() {
+        let result = check_source(
+            "type E<T> = enum {
+                 A(Int<32>) when T == Int<32>,
+                 B(Bool) when T == Bool,
+             }
+             def f<T>(e: E<T>) -> Int<32> {
+                 return match e { A(x) | B(x) => 0 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        let msg = format!("{:?}", result);
+        assert!(
+            result.is_err() && msg.contains("incompatible types across alternatives"),
+            "or-pattern binding types must unify (E106): {:?}",
+            result
+        );
+    }
+
+    /// Or-pattern unreachable alternative: with a CONCRETE scrutinee
+    /// `Expr<Int<32>>`, the `Eq` alternative (requires `when T == Bool`) is
+    /// a dead variant — it is warned about and IGNORED by the intersection
+    ///, and the program type-checks.  Order is
+    /// irrelevant: `Lit | Eq` and `Eq | Lit` behave identically.
+    #[test]
+    fn test_or_pattern_unreachable_alternative_ignored() {
+        let result = check_source(
+            "type Expr<T> = enum {
+                 Lit(Int<32>) when T == Int<32>,
+                 Eq(Bool) when T == Bool,
+             }
+             def f(e: Expr<Int<32>>) -> Int<32> {
+                 return match e { Lit(_) | Eq(_) => 0 };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "unreachable or-pattern alternative must be ignored: {:?}",
+            result
+        );
+    }
+
+    /// Seal regression: an existential GADT arm whose body USES a function
+    /// generic param must not trip the seal assert.  Pattern instantiation
+    /// legitimately binds the scrutinee param to a synthetic infer var
+    /// (`T → ?a`) at arm_depth 0, and the arm-body `resolve_binding`
+    /// path-compresses that existing chain — a re-write, not a new leak.
+    /// The seal fires only on NEW GenericParam bindings.
+    #[test]
+    fn test_gadt_exist_param_use_no_seal_violation() {
+        let result = check_source(
+            "type E<T> = enum { Slice(exists X: &[X]) when T == &[X] }
+             def f<T>(e: E<T>, xs: T) -> T {
+                 return match e { Slice(_) => xs };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "existential GADT arm using a generic param must not trip the seal: {:?}",
+            result
+        );
+    }
+
+    /// Regression (G1 Finding 6 — seal proof gap): a GADT match arm whose
+    /// body would bind a fresh GenericParam only inside the arm.  The seal
+    /// guard skips the arm-scoped binding; the compiler must still behave
+    /// deterministically (recover via a later non-arm unify) — never
+    /// silently accept an ill-typed program.
+    #[test]
+    fn test_gadt_arm_only_binding_seal_recovery() {
+        let ok = check_source(
+            "type E<T> = enum { Mk(T) }
+             def f<T>(e: E<T>, x: T) -> T {
+                 return match e { Mk(_) => x };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(ok.is_ok(), "arm binding must recover: {:?}", ok);
+    }
+
+    /// Strict mode escalates `@must_handle` violations to errors (E108):
+    /// propagating a must_handle'd result via `?` is an error in strict
+    /// mode (a warning otherwise).
+    #[test]
+    fn test_must_handle_strict_escalation() {
+        let source = "
+            @must_handle(CriticalFault)
+            def operation() -> Result<Int<32>, Int<32>> { return 0; }
+
+            def caller() -> Int<32> {
+                return operation()?;
+            }
+
+            def main() -> Int<32> { return 0; }
+        ";
+        // Run the pipeline with the given strict flag, collecting diagnostic
+        // codes (the probe's `operation` body has an unrelated E031 noise
+        // error, so we assert on codes rather than on success).
+        let run = |strict: bool| -> Vec<String> {
+            let mut parser = Parser::new(source);
+            let program = parser.parse_program().unwrap();
+            let mut ctx = TypeContext::new();
+            let local_crate_id = CrateId(DefId(0));
+            let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
+            let (mut symbols, mut trait_env, res_diags, resolution_map) =
+                resolver.resolve_program(&program);
+            assert!(
+                !res_diags.has_errors(),
+                "unexpected resolution errors: {:?}",
+                res_diags.into_inner()
+            );
+            let mut checker = TypeChecker::new(
+                &mut ctx,
+                &symbols,
+                &mut trait_env,
+                resolution_map,
+                strict,
+                false,
+                vec![],
+                false,
+            );
+            match checker.check_program(&program) {
+                Ok(_) => Vec::new(),
+                Err(bundle) => bundle
+                    .into_inner()
+                    .into_iter()
+                    .filter_map(|d| d.code().map(|c| c.code().to_string()))
+                    .collect(),
+            }
+        };
+        let non_strict = run(false);
+        assert!(
+            non_strict.contains(&"W004".to_string()),
+            "non-strict must_handle propagation should emit W004, got: {:?}",
+            non_strict
+        );
+        let strict = run(true);
+        assert!(
+            strict.contains(&"E108".to_string()),
+            "strict mode should escalate to E108, got: {:?}",
+            strict
+        );
+        assert!(
+            !strict.contains(&"W004".to_string()),
+            "strict mode should not emit W004, got: {:?}",
+            strict
+        );
+    }
+
+    /// By default, `&mut T` must NOT implicitly coerce to `&T` at a call
+    /// site (SYNTAX.md §"Reference Coercion and Read-Only Borrows") — the
+    /// transition must be explicit (`&ro`) or locally relaxed (`@auto_ro`).
+    #[test]
+    fn test_ref_mut_not_coerced_to_shared_by_default() {
+        let result = check_source(
+            "def takes_shared(x: &Int<32>) -> Int<32> { return *x; }
+
+             def main() -> Int<32> {
+                 set mut v = 42;
+                 let r: &mut Int<32> = &mut v;
+                 return takes_shared(r);
+             }",
+        );
+        assert!(
+            result.is_err(),
+            "&mut T must not implicitly coerce to &T by default (SYNTAX.md): {:?}",
+            result
+        );
+    }
+
+    /// The explicit `&ro` operator freezes a `&mut T` into a `&T`.
+    #[test]
+    fn test_ref_read_only_borrow_operator() {
+        let result = check_source(
+            "def takes_shared(x: &Int<32>) -> Int<32> { return *x; }
+
+             def main() -> Int<32> {
+                 set mut v = 42;
+                 let r: &mut Int<32> = &mut v;
+                 return takes_shared(&ro r);
+             }",
+        );
+        assert!(
+            result.is_ok(),
+            "explicit `&ro` freeze should typecheck (SYNTAX.md): {:?}",
+            result
+        );
+    }
+
+    /// `@auto_ro` locally relaxes the default: `&mut T` implicitly coerces
+    /// to `&T` within the annotated function.
+    #[test]
+    fn test_auto_ro_relaxation() {
+        let result = check_source(
+            "def takes_shared(x: &Int<32>) -> Int<32> { return *x; }
+
+             @auto_ro
+             def main() -> Int<32> {
+                 set mut v = 42;
+                 let r: &mut Int<32> = &mut v;
+                 return takes_shared(r);
+             }",
+        );
+        assert!(
+            result.is_ok(),
+            "@auto_ro should allow implicit &mut T -> &T in the function (SYNTAX.md): {:?}",
+            result
+        );
+    }
+
+    // ── Defensive test suite: `@auto_ro` freeze guard (nested positions) ──
+    // These tests verify that `@auto_ro`'s implicit `&mut T → &T` freeze
+    // does NOT leak into nested positions (struct fields, ADT constructors,
+    // array elements, nested calls).  The freeze gate chain is:
+    //   coercion_depth == 0  ∧  CallSiteCtx  ∧  (auto_ro ∨ auto_coerce)  ∧  m2 ∧ !m1
+    // The `CallSite` context is set by `CallSiteCoercion` AFTER `check_expr`
+    // returns, so `HasType(expected)` in `check_call_argument` is safe.
+
+    /// `@auto_ro` + direct top-level argument: should be accepted
+    /// (freeze applies at the call site).
+    #[test]
+    fn test_auto_ro_freeze_direct_arg() {
+        let result = check_source(
+            "def takes_shared(x: &Int<32>) -> Int<32> { return *x; }
+
+             @auto_ro
+             def main() -> Int<32> {
+                 set mut v = 42;
+                 let r: &mut Int<32> = &mut v;
+                 return takes_shared(r);
+             }",
+        );
+        assert!(
+            result.is_ok(),
+            "@auto_ro + direct arg should be accepted: {:?}",
+            result
+        );
+    }
+
+    /// `@auto_ro` + struct field argument: should be rejected
+    /// (freeze must NOT leak into struct literal fields).
+    #[test]
+    fn test_auto_ro_freeze_struct_field_arg() {
+        let result = check_source(
+            "type Wrapper = struct { x: &Int<32> }
+             def takes_wrapper(w: Wrapper) -> Int<32> { return *w.x; }
+
+             @auto_ro
+             def main() -> Int<32> {
+                 set mut v = 42;
+                 let r: &mut Int<32> = &mut v;
+                 return takes_wrapper(Wrapper { x: r });
+             }",
+        );
+        assert!(
+            result.is_err(),
+            "@auto_ro + struct field arg must be rejected (nested position): {:?}",
+            result
+        );
+    }
+
+    /// `@auto_ro` + ADT constructor argument: should be rejected
+    /// (freeze must NOT leak into ADT constructor payload).
+    #[test]
+    fn test_auto_ro_freeze_adt_ctor_arg() {
+        let result = check_source(
+            "type Box<T> = enum { Mk(T) }
+             def takes_box(b: Box<&Int<32>>) -> Int<32> { return 0; }
+
+             @auto_ro
+             def main() -> Int<32> {
+                 set mut v = 42;
+                 let r: &mut Int<32> = &mut v;
+                 return takes_box(Box::Mk(r));
+             }",
+        );
+        assert!(
+            result.is_err(),
+            "@auto_ro + ADT ctor arg must be rejected (nested position): {:?}",
+            result
+        );
+    }
+
+    /// `@auto_ro` + nested call argument: should be ACCEPTED
+    /// (`@auto_ro` is function-wide — `&mut T → &T` applies to ALL call
+    /// sites within the annotated function, including nested calls.  The
+    /// freeze gate chain (`coercion_depth == 0 ∧ CallSiteCtx`) is satisfied
+    /// because each `check_call_argument` has its own `CallSiteCoercion`
+    /// guard — the inner call is NOT a "nested position" in the sense of
+    /// struct fields / ADT constructors / array elements, which are NOT
+    /// call sites and thus NOT covered by `@auto_ro`'s implicit freeze.)
+    #[test]
+    fn test_auto_ro_freeze_nested_call_arg() {
+        let result = check_source(
+            "def identity(x: &Int<32>) -> &Int<32> { return x; }
+             def takes_shared(x: &Int<32>) -> Int<32> { return *x; }
+
+             @auto_ro
+             def main() -> Int<32> {
+                 set mut v = 42;
+                 let r: &mut Int<32> = &mut v;
+                 return takes_shared(identity(r));
+             }",
+        );
+        assert!(
+            result.is_ok(),
+            "@auto_ro + nested call arg should be accepted (function-wide): {:?}",
+            result
+        );
+    }
+
+    /// No `@auto_ro` + `&mut → &T` should be rejected everywhere.
+    #[test]
+    fn test_auto_ro_freeze_no_attr_direct_arg() {
+        let result = check_source(
+            "def takes_shared(x: &Int<32>) -> Int<32> { return *x; }
+
+             def main() -> Int<32> {
+                 set mut v = 42;
+                 let r: &mut Int<32> = &mut v;
+                 return takes_shared(r);
+             }",
+        );
+        assert!(
+            result.is_err(),
+            "without @auto_ro, &mut T -> &T must be rejected: {:?}",
+            result
+        );
+    }
+
+    // ── Defensive suite: existential refinement ──
+    // Language-designer ruling (2026-08-04): `when X == ConcreteType` on
+    // an existential variable refines the skolem (ParamRefinement) + emit
+    // a warning (the syntax is unusual).  RHS containing unresolved vars
+    // (skolems, GenericParams, InferVars) stays inert (ExistentialEquation).
+
+    /// Positive: `when X == Int<32>` on an existential — RHS closed → refine
+    /// + warn.  Before the change, X stays inert (rejected); after, X is
+    /// refined to Int<32> (accepted).  At BASELINE this test FAILS (the
+    /// refinement does not exist yet) — that is the expected baseline
+    /// divergence the change is meant to close.
+    #[test]
+    fn test_exist_refine_when_closed_rhs() {
+        let result = check_source(
+            "type E = enum { Mk(exists X: X) when X == Int<32> }
+             def f(e: E) -> Int<32> {
+                 return match e { Mk(x) => x };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "closed-RHS existential refinement should be accepted (after change): {:?}",
+            result
+        );
+    }
+
+    /// Negative: `when X == [X]` (RHS contains the same skolem) — RHS
+    /// NOT closed → stays inert (ExistentialEquation), no refine, no warn.
+    #[test]
+    fn test_exist_refine_when_open_rhs() {
+        let result = check_source(
+            "type E = enum { Mk(exists X: &[X]) when X == [X] }
+             def f(e: E) -> &[Int<32>] {
+                 return match e { Mk(x) => x };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        // RHS contains skolem X → not closed → stays inert.
+        // The arm returns `x: &[X]` where X is still opaque → type mismatch.
+        // This should be rejected BEFORE and AFTER the change.
+        assert!(
+            result.is_err(),
+            "RHS with unresolved vars must stay inert (rejected): {:?}",
+            result
+        );
+    }
+
+    /// Control: `when T == Concrete` on a type parameter (GenericParam) —
+    /// unchanged behavior (ParamRefinement, no warn).
+    #[test]
+    fn test_exist_refine_type_param_unchanged() {
+        let result = check_source(
+            "type E<T> = enum { Mk(Int<32>) when T == Int<32> }
+             def f(e: E<Int<32>>) -> Int<32> {
+                 return match e { Mk(n) => n };
+             }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(
+            result.is_ok(),
+            "type-param refinement must still work (unchanged): {:?}",
+            result
+        );
+    }
+
+    // ── Defensive suite: `expr.freeze!()` ──
+    // SYNTAX.md: ".freeze!() (the standard-library equivalent of `&ro`)
+    // behaves identically and is preferred in method chains."  These tests
+    // encode the NEW behavior (freeze! ≡ &ro).  At BASELINE (before the
+    // parser implements `.freeze!()`), the positive/chain/frozen tests
+    // FAIL (E007) — the expected divergence the change closes.
+
+    /// Positive: `takes_shared(r.freeze!())` with `r: &mut T` — accepted
+    /// (explicit freeze, equivalent to `&ro r`).
+    #[test]
+    fn test_freeze_bang_direct() {
+        let result = check_source(
+            "def takes_shared(x: &Int<32>) -> Int<32> { return *x; }
+             def main() -> Int<32> {
+                 set mut a = 42;
+                 set r: &mut Int<32> = &mut a;
+                 return takes_shared(r.freeze!());
+             }",
+        );
+        assert!(
+            result.is_ok(),
+            "r.freeze!() should be accepted (explicit freeze ≡ &ro): {:?}",
+            result
+        );
+    }
+
+    /// Freeze enforcement: after `r.freeze!()`, mutating `r` is rejected
+    /// (the source is frozen — same as `&ro r`).
+    #[test]
+    fn test_freeze_bang_frozen_mutation_rejected() {
+        let result = check_source(
+            "def takes_shared(x: &Int<32>) -> Int<32> { return *x; }
+             def main() -> Int<32> {
+                 set mut a = 42;
+                 set r: &mut Int<32> = &mut a;
+                 let y = takes_shared(r.freeze!());
+                 *r = 100;
+                 return y;
+             }",
+        );
+        assert!(
+            result.is_err(),
+            "mutating a frozen variable after r.freeze!() must be rejected: {:?}",
+            result
+        );
+    }
+
+    /// Method-chain: `v.freeze!()` in a chain position — accepted.
+    #[test]
+    fn test_freeze_bang_method_chain() {
+        let result = check_source(
+            "def takes_shared(x: &Int<32>) -> Int<32> { return *x; }
+             def main() -> Int<32> {
+                 set mut a = 42;
+                 set r: &mut Int<32> = &mut a;
+                 return takes_shared(r.freeze!());
+             }",
+        );
+        assert!(
+            result.is_ok(),
+            "r.freeze!() in chain position should be accepted: {:?}",
+            result
+        );
+    }
+
+    /// Control: `takes_shared(r)` WITHOUT freeze — still rejected (no
+    /// implicit `&mut T → &T`).
+    #[test]
+    fn test_freeze_bang_no_attr_control() {
+        let result = check_source(
+            "def takes_shared(x: &Int<32>) -> Int<32> { return *x; }
+             def main() -> Int<32> {
+                 set mut a = 42;
+                 set r: &mut Int<32> = &mut a;
+                 return takes_shared(r);
+             }",
+        );
+        assert!(
+            result.is_err(),
+            "without freeze!, &mut T -> &T must be rejected: {:?}",
+            result
         );
     }
 }

@@ -264,11 +264,9 @@ impl Solver {
                     conflict = true;
                     break;
                 }
-                if use_pure_literal {
-                    if let Some(lit) = self.pure_literal() {
-                        self.assign(lit, true);
-                        continue;
-                    }
+                if use_pure_literal && let Some(lit) = self.pure_literal() {
+                    self.assign(lit, true);
+                    continue;
                 }
                 break;
             }

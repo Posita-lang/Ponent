@@ -259,6 +259,27 @@ impl SymbolTable {
         Ok(())
     }
 
+    /// Insert a function binding into the ROOT scope — used for nested
+    /// function definitions: the checker's `update_function_return_type`
+    /// patches return types starting from the root scope, so nested defs
+    /// must be visible there (rustc-style item collection).
+    pub fn insert_function_at_root(
+        &mut self,
+        name: Symbol,
+        binding: FunctionBinding,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let scope = &mut self.scopes[0];
+        if scope.functions.contains_key(&name) {
+            return Err(
+                Diagnostic::error(format!("function '{}' already defined", name.as_str()))
+                    .with_span(span),
+            );
+        }
+        scope.functions.insert(name, binding);
+        Ok(())
+    }
+
     /// Check if a function with the given name exists in the root scope.
     /// Used to verify entry-point functions like `main`.
     pub fn has_function(&self, name: &str) -> bool {

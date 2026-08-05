@@ -6,6 +6,217 @@ use crate::hir::symbol::*;
 use crate::hir::traits::{ImplCandidate, TraitEnv};
 use crate::symbol::Symbol;
 use regex_syntax;
+
+/// Recursively search an AST type for a reference to one of `params`
+/// (the enum's declared type parameters).  Used to reject GADT `when`
+/// constraints whose RIGHT-HAND side references another type parameter
+/// of the same enum (`when T == U and U == T` would register a mutual
+/// refinement cycle that `resolve_binding_tail` chases until
+/// `MAX_CHAIN_DEPTH`).  `exists` variables are NOT in `params`, so
+/// `when T == X` (witness stays opaque) is unaffected.
+fn find_param_ref_in_type(ty: &Type, params: &[TypeParam]) -> Option<Symbol> {
+    match ty {
+        Type::Path(path, _) if path.len() == 1 => params
+            .iter()
+            .find(|tp| tp.name == path[0])
+            .map(|tp| tp.name),
+        Type::Generic(base, args, _) => find_param_ref_in_type(base, params).or_else(|| {
+            args.iter().find_map(|arg| match arg {
+                GenericArg::Positional(t) | GenericArg::Named(_, t) => {
+                    find_param_ref_in_type(t, params)
+                }
+                GenericArg::Const(_) => None,
+            })
+        }),
+        Type::Tuple(elems, _) => elems.iter().find_map(|e| find_param_ref_in_type(e, params)),
+        Type::Slice(elem, _) => find_param_ref_in_type(elem, params),
+        Type::Array(elem, _, _) => find_param_ref_in_type(elem, params),
+        Type::Reference { inner, .. } => find_param_ref_in_type(inner, params),
+        Type::Pointer(inner, _) => find_param_ref_in_type(inner, params),
+        Type::Function {
+            params: ps, ret, ..
+        } => ps
+            .iter()
+            .find_map(|e| find_param_ref_in_type(e, params))
+            .or_else(|| find_param_ref_in_type(ret, params)),
+        Type::Projection {
+            impl_type,
+            trait_path,
+            ..
+        } => find_param_ref_in_type(impl_type, params)
+            .or_else(|| find_param_ref_in_type(trait_path, params)),
+        Type::DynTrait(bounds, _) => bounds
+            .iter()
+            .find_map(|e| find_param_ref_in_type(e, params)),
+        // Defensive: `Type::Expr` arises from const-generic / array-size
+        // positions (`[T; N]`'s `N`).  Unreachable as a `when` RHS via
+        // `parse_type`, but a recursive walk keeps E064 complete if a
+        // future syntax route reaches here.
+        Type::Expr(expr, _) => find_param_ref_in_expr(expr, params),
+        // Existential binding: search the base type for same-enum parameter
+        // references (e.g. `exists X: T` where `T` is a same-enum param).
+        Type::Exists { base, .. } => find_param_ref_in_type(base, params),
+        _ => None,
+    }
+}
+
+/// Minimal source-like display of an AST type for diagnostics (path joins +
+/// generic args + literal values), falling back to Debug for exotic forms.
+fn ast_type_display(ty: &crate::ast::Type) -> String {
+    match ty {
+        crate::ast::Type::Path(p, _) => p.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
+        crate::ast::Type::Generic(base, args, _) => {
+            let args = args
+                .iter()
+                .map(|a| match a {
+                    crate::ast::GenericArg::Positional(t) => ast_type_display(t),
+                    crate::ast::GenericArg::Named(n, t) => {
+                        format!("{}: {}", n, ast_type_display(t))
+                    }
+                    crate::ast::GenericArg::Const(ac) => match ac.value.as_ref() {
+                        crate::ast::Expr::Literal(l, _) => format!("{:?}", l),
+                        e => format!("{:?}", e),
+                    },
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}<{}>", ast_type_display(base), args)
+        }
+        crate::ast::Type::Literal(e, _) => match e.as_ref() {
+            crate::ast::Expr::Literal(l, _) => format!("{:?}", l),
+            _ => format!("{:?}", e),
+        },
+        _ => format!("{:?}", ty),
+    }
+}
+
+/// A GADT `when` RHS is "provably concrete" for the E065 contradiction check
+/// when it mentions no `exists` witness (at ANY depth — an opaque witness may
+/// equal anything) and every path it references resolves to a non-alias
+/// binding (two different alias names may still alias the same type).  Any
+/// other shape (forward references, unregistered names, projection/exists
+/// forms) is not provable at the resolver stage and must NOT trigger a hard
+/// error — a false positive (rejecting valid code) is worse than a missed
+/// diagnostic.
+fn rhs_is_provably_concrete(
+    ct: &crate::ast::Type,
+    exists_params: &[Symbol],
+    symbols: &SymbolTable,
+) -> bool {
+    match ct {
+        crate::ast::Type::Path(p, _) => {
+            // A bare single-segment path naming an `exists` witness is opaque.
+            if p.len() == 1 && exists_params.iter().any(|ep| ep == &p[0]) {
+                return false;
+            }
+            // The builtin primitives are concrete by construction (they are
+            // not symbol-table bindings, so the lookup below would fail).
+            if p.len() == 1
+                && (p[0].eq_str("Int")
+                    || p[0].eq_str("UInt")
+                    || p[0].eq_str("Float")
+                    || p[0].eq_str("Bool")
+                    || p[0].eq_str("Char")
+                    || p[0].eq_str("Byte")
+                    || p[0].eq_str("USize"))
+            {
+                return true;
+            }
+            // The path must resolve to a concrete (non-alias) binding.
+            match symbols
+                .lookup_type_by_path(p)
+                .and_then(|d| symbols.lookup_type_by_def_id(d))
+            {
+                Some(b) => !matches!(b.kind, TypeKind::Alias),
+                None => false,
+            }
+        }
+        crate::ast::Type::Generic(base, args, _) => {
+            rhs_is_provably_concrete(base, exists_params, symbols)
+                && args.iter().all(|a| match a {
+                    crate::ast::GenericArg::Positional(t) | crate::ast::GenericArg::Named(_, t) => {
+                        rhs_is_provably_concrete(t, exists_params, symbols)
+                    }
+                    crate::ast::GenericArg::Const(ac) => {
+                        crate::hir::type_eq::const_expr_is_ground(&ac.value)
+                    }
+                })
+        }
+        crate::ast::Type::Reference { inner, .. } => {
+            rhs_is_provably_concrete(inner, exists_params, symbols)
+        }
+        crate::ast::Type::Pointer(t, _) => rhs_is_provably_concrete(t, exists_params, symbols),
+        crate::ast::Type::Slice(t, _) => rhs_is_provably_concrete(t, exists_params, symbols),
+        crate::ast::Type::Array(t, size, _) => {
+            rhs_is_provably_concrete(t, exists_params, symbols)
+                && crate::hir::type_eq::const_expr_is_ground(size)
+        }
+        crate::ast::Type::Tuple(es, _) => es
+            .iter()
+            .all(|e| rhs_is_provably_concrete(e, exists_params, symbols)),
+        crate::ast::Type::Function { params, ret, .. } => {
+            params
+                .iter()
+                .all(|p| rhs_is_provably_concrete(p, exists_params, symbols))
+                && rhs_is_provably_concrete(ret, exists_params, symbols)
+        }
+        crate::ast::Type::Union(es, _) => es
+            .iter()
+            .all(|e| rhs_is_provably_concrete(e, exists_params, symbols)),
+        crate::ast::Type::Never(_)
+        | crate::ast::Type::Literal(..)
+        | crate::ast::Type::Regex(..)
+        | crate::ast::Type::Error(_) => true,
+        // Projection, DynTrait, Exists, WhereShorthand, Expr: not provably
+        // concrete at the resolver stage — be conservative (skip the check).
+        _ => false,
+    }
+}
+
+/// Expression-side counterpart of `find_param_ref_in_type`: recursively
+/// search an AST expression for an `Ident` whose name is one of `params`.
+/// Used for `Type::Expr` (const-generic / array-size) positions.
+fn find_param_ref_in_expr(expr: &Expr, params: &[TypeParam]) -> Option<Symbol> {
+    match expr {
+        Expr::Ident(name, _) => params.iter().find(|tp| tp.name == *name).map(|tp| tp.name),
+        Expr::Literal(_, _) => None,
+        Expr::TypeAnnotated { expr: inner, .. }
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => find_param_ref_in_expr(inner, params),
+        Expr::BinaryOp { left, right, .. } => {
+            find_param_ref_in_expr(left, params).or_else(|| find_param_ref_in_expr(right, params))
+        }
+        Expr::Call { callee, args, .. } => find_param_ref_in_expr(callee, params)
+            .or_else(|| args.iter().find_map(|a| find_param_ref_in_expr(a, params))),
+        Expr::Index { base, index, .. } => {
+            find_param_ref_in_expr(base, params).or_else(|| find_param_ref_in_expr(index, params))
+        }
+        Expr::FieldAccess { base, .. } | Expr::AttrAccess { base, .. } => {
+            find_param_ref_in_expr(base, params)
+        }
+        Expr::Range { start, end, .. } => start
+            .as_ref()
+            .and_then(|s| find_param_ref_in_expr(s, params))
+            .or_else(|| end.as_ref().and_then(|e| find_param_ref_in_expr(e, params))),
+        Expr::Tuple(elems, _) | Expr::Array(elems, _) => {
+            elems.iter().find_map(|e| find_param_ref_in_expr(e, params))
+        }
+        Expr::Block(stmts, _) => stmts.iter().find_map(|s| match s {
+            Stmt::Expression(e) => find_param_ref_in_expr(e, params),
+            // Defensive: `Type::Expr` cannot currently appear as a `when`
+            // RHS (`parse_type` does not route through `parse_expr`), so
+            // this branch is unreachable today — but if a future grammar
+            // change makes it reachable, every statement's expression
+            // positions must be traversed or E064's param-reference check
+            // silently under-reports.  The arms below keep the traversal
+            // complete for the statement kinds that can carry expressions.
+            Stmt::VariableDef { value: Some(v), .. } => find_param_ref_in_expr(v, params),
+            Stmt::If { cond, .. } => find_param_ref_in_expr(cond, params),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
 use rustc_hash::FxHashMap;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -190,8 +401,8 @@ impl<'a> NameResolver<'a> {
                 // so that resolve_type_expr can resolve T in `def foo<T>(x: T) -> T`.
                 let mut param_map = HashMap::default();
                 for (i, tp) in type_params.iter().enumerate() {
-                    let ty_id = self.ctx.generic_param(i, tp.name.clone());
-                    param_map.insert(tp.name.clone(), ty_id);
+                    let ty_id = self.ctx.generic_param(i, tp.name);
+                    param_map.insert(tp.name, ty_id);
                 }
                 self.current_impl_type_params = Some(param_map);
 
@@ -213,7 +424,14 @@ impl<'a> NameResolver<'a> {
                     contracts: contracts.clone(),
                     attributes: attributes.clone(),
                 };
-                if let Err(diag) = self.symbols.insert_function(name.clone(), binding, *span) {
+                // Nested function definitions are resolved via `resolve_stmt`
+                // inside an enclosing function's body scope — but the checker
+                // patches the return type via `update_function_return_type`
+                // starting from the ROOT scope, so nested defs must be
+                // registered at the root too (rustc-style item collection).
+                // (The resolver's own `current_scope` does NOT control the
+                // SymbolTable's scope — hence the dedicated root insert.)
+                if let Err(diag) = self.symbols.insert_function_at_root(*name, binding, *span) {
                     self.diagnostics.push(diag);
                 }
                 if name.eq_str("main") {
@@ -235,9 +453,9 @@ impl<'a> NameResolver<'a> {
                         span: param.span,
                         def_id: self.allocate_def_id(),
                     };
-                    if let Err(diag) =
-                        self.symbols
-                            .insert_variable(param.name.clone(), binding, param.span)
+                    if let Err(diag) = self
+                        .symbols
+                        .insert_variable(param.name, binding, param.span)
                     {
                         self.diagnostics.push(diag);
                     }
@@ -263,17 +481,15 @@ impl<'a> NameResolver<'a> {
             } => {
                 let def_id = self.allocate_def_id();
                 // Register type name in the resolution map for the type checker
-                self.resolution_map
-                    .type_def_ids
-                    .insert(name.clone(), def_id);
+                self.resolution_map.type_def_ids.insert(*name, def_id);
                 let type_params = params.clone();
 
                 // Register generic parameters so that resolve_type_expr can
                 // resolve T in `type Option<T> = enum { None, Some(T) }`.
                 let mut param_map = HashMap::default();
                 for (i, tp) in params.iter().enumerate() {
-                    let ty_id = self.ctx.generic_param(i, tp.name.clone());
-                    param_map.insert(tp.name.clone(), ty_id);
+                    let ty_id = self.ctx.generic_param(i, tp.name);
+                    param_map.insert(tp.name, ty_id);
                 }
                 // Save the previous param map and install the new one.
                 let prev_param_map = self.current_impl_type_params.take();
@@ -304,7 +520,7 @@ impl<'a> NameResolver<'a> {
                             .map(|f| {
                                 let field_ty = self.resolve_type_expr(&f.ty);
                                 FieldBinding {
-                                    name: f.name.clone(),
+                                    name: f.name,
                                     ty: field_ty,
                                     default: f.default.clone(),
                                     span: f.span,
@@ -312,9 +528,203 @@ impl<'a> NameResolver<'a> {
                             })
                             .collect();
                     }
-                    TypeDefinition::Enum(variants_def, mm, _) => {
+                    TypeDefinition::Enum(variants_def, mm, modifiers) => {
                         variants = variants_def.clone();
                         missing_match = mm.clone();
+                        // ── GADT constraint parameter name validation ───
+                        // Check that every `when` constraint parameter is a
+                        // declared type parameter of this enum, OR an
+                        // existentially quantified variable in this variant.
+                        for v in &variants {
+                            for (pn, ct) in &v.eq_spec {
+                                let in_params = params.iter().any(|tp| tp.name == *pn);
+                                let in_exists = v.exists_params.iter().any(|ep| ep == pn);
+                                if !in_params && !in_exists {
+                                    self.diagnostics.push(
+                                        Diagnostic::error(format!(
+                                            "unknown type parameter `{}` in GADT `when` constraint",
+                                            pn,
+                                        ))
+                                        .with_code_str("E062")
+                                        .with_span(*span)
+                                        .with_help(
+                                            format!(
+                                                "`{}` is not a type parameter of this enum \
+                                                 or an `exists` variable in this variant; \
+                                                 use one of: {}",
+                                                pn,
+                                                params
+                                                    .iter()
+                                                    .map(|tp| tp.name.as_str())
+                                                    .chain(
+                                                        v.exists_params
+                                                            .iter()
+                                                            .map(|ep| ep.as_str())
+                                                    )
+                                                    .collect::<Vec<_>>()
+                                                    .join(", "),
+                                            ),
+                                        ),
+                                    );
+                                }
+                                // ── GADT constraint RHS validation ──
+                                // The right-hand side of a `when` constraint
+                                // must NOT reference another type parameter
+                                // of the SAME enum: `when T == U and U == T`
+                                // would register a mutual refinement cycle
+                                // (A → B, B → A) that `resolve_binding_tail`
+                                // would chase until MAX_CHAIN_DEPTH.  An
+                                // `exists` variable IS allowed on the RHS
+                                // (`when T == X` — the witness stays opaque).
+                                if let Some(bad) = find_param_ref_in_type(ct, &params) {
+                                    self.diagnostics.push(
+                                        Diagnostic::error(format!(
+                                            "GADT `when` constraint right-hand side references \
+                                             type parameter `{}` of the same enum",
+                                            bad,
+                                        ))
+                                        .with_code_str("E064")
+                                        .with_span(ct.span())
+                                        .with_help(
+                                            "the right-hand side of `when` must be a concrete \
+                                             type or an `exists` variable, not another type \
+                                             parameter of this enum",
+                                        ),
+                                    );
+                                }
+                            }
+                            // ── Exists parameter name duplication check ──
+                            // An `exists X` variable must not shadow an enum
+                            // type parameter name.
+                            for ep in &v.exists_params {
+                                if params.iter().any(|tp| tp.name == *ep) {
+                                    self.diagnostics.push(
+                                        Diagnostic::error(format!(
+                                            "`exists {}` shadows enum type parameter `{}`",
+                                            ep, ep,
+                                        ))
+                                        .with_code_str("E063")
+                                        .with_span(*span)
+                                        .with_help(
+                                            format!(
+                                                "rename the `exists` variable or the type parameter"
+                                            ),
+                                        ),
+                                    );
+                                }
+                            }
+                            // ── GADT constraint satisfiability check (E065) ──
+                            // A variant whose `when` constraints force the same
+                            // type parameter to two DIFFERENT concrete types
+                            // (`when T == Int<32> and T == Bool`) is unsatisfiable:
+                            // the variant cannot be constructed at ANY instantiation
+                            // — a provable logical contradiction (unlike the
+                            // payload/constraint heuristic, which stays a warning).
+                            for (i, (pn, ct1)) in v.eq_spec.iter().enumerate() {
+                                for (pn2, ct2) in v.eq_spec.iter().skip(i + 1) {
+                                    if pn2 != pn {
+                                        continue;
+                                    }
+                                    // Only fire when BOTH RHS are provably concrete:
+                                    // an `exists` witness (at ANY depth — the witness
+                                    // may equal anything) or an alias path (two names
+                                    // may alias the same type) keeps the pair
+                                    // satisfiable, so the syntactic inequality is not
+                                    // a provable contradiction.
+                                    if !rhs_is_provably_concrete(
+                                        ct1,
+                                        &v.exists_params,
+                                        &self.symbols,
+                                    ) || !rhs_is_provably_concrete(
+                                        ct2,
+                                        &v.exists_params,
+                                        &self.symbols,
+                                    ) {
+                                        continue;
+                                    }
+                                    // Nominal comparison: the RESOLVED top-level
+                                    // constructor identity (`Int` and `core::Int`
+                                    // are the same type), then the generic args.
+                                    // `None` (unresolvable form) is conservative —
+                                    // no contradiction asserted.
+                                    let differ = match (
+                                        crate::hir::type_eq::concrete_ctor_key(
+                                            ct1,
+                                            &v.exists_params,
+                                            &self.symbols,
+                                        ),
+                                        crate::hir::type_eq::concrete_ctor_key(
+                                            ct2,
+                                            &v.exists_params,
+                                            &self.symbols,
+                                        ),
+                                    ) {
+                                        (Some(k1), Some(k2)) => {
+                                            k1 != k2
+                                                || !crate::hir::type_eq::type_args_eq_ignoring_spans(
+                                                    ct1,
+                                                    ct2,
+                                                    &v.exists_params,
+                                                    &self.symbols,
+                                                )
+                                        }
+                                        _ => false,
+                                    };
+                                    if differ {
+                                        self.diagnostics.push(
+                                            Diagnostic::error(format!(
+                                                "GADT `when` constraints on `{}` are \
+                                                 contradictory ({} vs {}); the variant cannot \
+                                                 be constructed at any instantiation",
+                                                pn,
+                                                ast_type_display(ct1),
+                                                ast_type_display(ct2),
+                                            ))
+                                            .with_code_str("E065")
+                                            .with_span(ct2.span())
+                                            .with_help(
+                                                "the same type parameter is constrained to two \
+                                                 different concrete types; make the constraints \
+                                                 consistent",
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        // ── GADT + `with default` prohibition (SYNTAX.md §"Type-level Default Values") ──
+                        // Only *generic* GADT enums whose `when` constraints involve
+                        // their type parameters (or `exists` variables) cannot have a
+                        // default value — a single default cannot satisfy all possible
+                        // instantiations.  Non-generic enums whose constraints reference
+                        // only global constants are unaffected.
+                        let constraints_involve_type_params = !params.is_empty()
+                            && variants.iter().any(|v| {
+                                v.eq_spec.iter().any(|(pn, _)| {
+                                    params.iter().any(|tp| tp.name == *pn)
+                                        || v.exists_params.contains(pn)
+                                })
+                            });
+                        if constraints_involve_type_params {
+                            for m in modifiers {
+                                if matches!(m, crate::ast::TypeModifier::Default(_)) {
+                                    self.diagnostics.push(
+                                        Diagnostic::error(
+                                            "GADT enum with generic type parameters cannot have a `with default` clause"
+                                        )
+                                        .with_code_str("E061")
+                                        .with_span(*span)
+                                        .with_help(
+                                            "a GADT enum's type parameters are constrained by `when` clauses, \
+                                             so a single default value cannot satisfy all variants"
+                                        )
+                                        .with_suggestion(
+                                            "remove the `with default` clause, or make the enum non-generic"
+                                        ),
+                                    );
+                                }
+                            }
+                        }
                     }
                     TypeDefinition::Alias(ty, mods) => {
                         alias_ast = Some(ty.clone());
@@ -496,13 +906,13 @@ impl<'a> NameResolver<'a> {
                     align,
                     pad,
                 };
-                if let Err(diag) = self.symbols.insert_type(name.clone(), binding, *span) {
+                if let Err(diag) = self.symbols.insert_type(*name, binding, *span) {
                     self.diagnostics.push(diag);
                 }
                 // Register the fully-qualified path for multi-segment resolution.
                 {
                     let mut full_path = self.module_path.clone();
-                    full_path.push(name.clone());
+                    full_path.push(*name);
                     let full = Symbol::intern(
                         &full_path
                             .iter()
@@ -536,7 +946,7 @@ impl<'a> NameResolver<'a> {
                 let mut method_bindings = Vec::new();
                 for method in methods {
                     let sig = self.collect_trait_method_signature(method);
-                    method_bindings.push((method.name.clone(), sig));
+                    method_bindings.push((method.name, sig));
                 }
                 self.current_impl_for_type = None;
 
@@ -545,14 +955,14 @@ impl<'a> NameResolver<'a> {
                     methods: method_bindings,
                     associated_types: associated_types
                         .iter()
-                        .map(|at| (at.name.clone(), at.default.clone()))
+                        .map(|at| (at.name, at.default.clone()))
                         .collect(),
                     super_traits: vec![],
                     span: *span,
                     attributes: attributes.clone(),
                     crate_id: self.symbols.local_crate_id,
                 };
-                if let Err(diag) = self.symbols.insert_trait(name.clone(), binding, *span) {
+                if let Err(diag) = self.symbols.insert_trait(*name, binding, *span) {
                     self.diagnostics.push(diag);
                 }
             }
@@ -570,8 +980,8 @@ impl<'a> NameResolver<'a> {
                 // Build mapping of type parameter names for this impl block
                 let mut param_map = HashMap::default();
                 for (i, tp) in type_params.iter().enumerate() {
-                    let ty_id = self.ctx.generic_param(i, tp.name.clone());
-                    param_map.insert(tp.name.clone(), ty_id);
+                    let ty_id = self.ctx.generic_param(i, tp.name);
+                    param_map.insert(tp.name, ty_id);
                 }
                 self.current_impl_type_params = Some(param_map);
 
@@ -620,7 +1030,7 @@ impl<'a> NameResolver<'a> {
                     let resolved_ret = self.resolve_self_in_type(&method.return_type, for_type);
                     let ret_ty = self.resolve_type_expr(&resolved_ret);
                     resolved_methods.push(crate::hir::traits::MethodInfo {
-                        name: method.name.clone(),
+                        name: method.name,
                         param_tys,
                         ret_ty,
                         span: method.span,
@@ -634,7 +1044,7 @@ impl<'a> NameResolver<'a> {
                 for at in associated_types {
                     if let Some(ref default) = at.default {
                         let resolved = self.resolve_type_expr(default);
-                        assoc_tys.push((at.name.clone(), resolved));
+                        assoc_tys.push((at.name, resolved));
                     }
                 }
 
@@ -680,7 +1090,7 @@ impl<'a> NameResolver<'a> {
             } => {
                 self.import_map.push(ImportEntry {
                     path: path.clone(),
-                    alias: alias.clone(),
+                    alias: *alias,
                     items: items.clone(),
                     span: *span,
                 });
@@ -712,7 +1122,7 @@ impl<'a> NameResolver<'a> {
                             .with_span(Span::new(0, 0)),
                     );
                 } else {
-                    self.layout_aliases.insert(name.clone(), attributes.clone());
+                    self.layout_aliases.insert(*name, attributes.clone());
                 }
             }
             Stmt::Constraint {
@@ -725,7 +1135,7 @@ impl<'a> NameResolver<'a> {
                 // Register type parameters so T resolves in constraint body.
                 let mut param_map = HashMap::default();
                 for (i, tp) in params.iter().enumerate() {
-                    let ty_id = self.ctx.generic_param(i, tp.name.clone());
+                    let ty_id = self.ctx.generic_param(i, tp.name);
                     param_map.insert(tp.name, ty_id);
                 }
                 self.current_impl_type_params = Some(param_map);
@@ -740,14 +1150,11 @@ impl<'a> NameResolver<'a> {
                                 // Before attempting type resolution, check whether this
                                 // bound is a trait name — traits are not registered as
                                 // types, so resolve_type_expr would produce an error.
-                                if let Type::Path(path, _) = b {
-                                    if path.len() == 1 {
-                                        if let Some(trait_binding) =
-                                            self.symbols.lookup_trait(path[0])
-                                        {
-                                            return self.ctx.dyn_trait(vec![trait_binding.def_id]);
-                                        }
-                                    }
+                                if let Type::Path(path, _) = b
+                                    && path.len() == 1
+                                    && let Some(trait_binding) = self.symbols.lookup_trait(path[0])
+                                {
+                                    return self.ctx.dyn_trait(vec![trait_binding.def_id]);
                                 }
                                 self.resolve_type_expr(b)
                             })
@@ -761,7 +1168,7 @@ impl<'a> NameResolver<'a> {
                     params: params.clone(),
                     span: *span,
                 };
-                if let Err(diag) = self.symbols.insert_constraint(name.clone(), binding, *span) {
+                if let Err(diag) = self.symbols.insert_constraint(*name, binding, *span) {
                     self.diagnostics.push(diag);
                 }
             }
@@ -787,7 +1194,7 @@ impl<'a> NameResolver<'a> {
                     contracts: Vec::new(),
                     attributes: attributes.clone(),
                 };
-                if let Err(diag) = self.symbols.insert_function(name.clone(), binding, *span) {
+                if let Err(diag) = self.symbols.insert_function(*name, binding, *span) {
                     self.diagnostics.push(diag);
                 }
             }
@@ -807,6 +1214,12 @@ impl<'a> NameResolver<'a> {
 
     fn resolve_stmt(&mut self, stmt: &Stmt) {
         match stmt {
+            // Nested function definitions: register them like items
+            // (rustc-style — items in blocks are collected and
+            // referenced).  Without this, a nested `def` would never be
+            // registered and the checker's `update_function_return_type`
+            // would panic ("function not found in any scope").
+            Stmt::FunctionDef { .. } => self.resolve_item(stmt),
             Stmt::VariableDef {
                 kind,
                 mutable,
@@ -841,7 +1254,7 @@ impl<'a> NameResolver<'a> {
                         def_id: self.allocate_def_id(),
                     };
                     // Pre-populate resolution map for the type checker
-                    if let Err(diag) = self.symbols.insert_variable(name.clone(), binding, *span) {
+                    if let Err(diag) = self.symbols.insert_variable(*name, binding, *span) {
                         self.diagnostics.push(diag);
                     }
                 }
@@ -855,7 +1268,7 @@ impl<'a> NameResolver<'a> {
                     let _placeholder = self.ctx.error();
                     self.resolution_map
                         .type_def_ids
-                        .insert(cap.name.clone(), cap_def_id);
+                        .insert(cap.name, cap_def_id);
                     // The actual type binding will be updated by the checker
                     // after inferring the expression's type.
                     let binding = TypeBinding {
@@ -882,9 +1295,7 @@ impl<'a> NameResolver<'a> {
                         align: None,
                         pad: None,
                     };
-                    self.symbols
-                        .insert_type(cap.name.clone(), binding, *span)
-                        .ok();
+                    self.symbols.insert_type(cap.name, binding, *span).ok();
                 }
 
                 if let Some(pattern) = pattern {
@@ -1144,12 +1555,11 @@ impl<'a> NameResolver<'a> {
                 for (_, value) in fields {
                     self.resolve_expr(value);
                 }
-                if let Some(def_id) = def_id {
-                    if let Some(binding) = self.symbols.lookup_type_by_def_id(def_id) {
-                        if binding.kind == TypeKind::Struct {
-                            return Some(self.ctx.struct_ty(def_id, vec![]));
-                        }
-                    }
+                if let Some(def_id) = def_id
+                    && let Some(binding) = self.symbols.lookup_type_by_def_id(def_id)
+                    && binding.kind == TypeKind::Struct
+                {
+                    return Some(self.ctx.struct_ty(def_id, vec![]));
                 }
                 None
             }
@@ -1162,12 +1572,11 @@ impl<'a> NameResolver<'a> {
                 if let Some(payload) = payload {
                     self.resolve_expr(payload);
                 }
-                if let Some(def_id) = self.resolve_type_path(path) {
-                    if let Some(binding) = self.symbols.lookup_type_by_def_id(def_id) {
-                        if binding.kind == TypeKind::Enum {
-                            return Some(self.ctx.enum_ty(def_id, vec![]));
-                        }
-                    }
+                if let Some(def_id) = self.resolve_type_path(path)
+                    && let Some(binding) = self.symbols.lookup_type_by_def_id(def_id)
+                    && binding.kind == TypeKind::Enum
+                {
+                    return Some(self.ctx.enum_ty(def_id, vec![]));
                 }
                 None
             }
@@ -1189,10 +1598,10 @@ impl<'a> NameResolver<'a> {
             Expr::Array(exprs, ..) => {
                 let mut elem_ty = None;
                 for e in exprs {
-                    if let Some(ty) = self.resolve_expr(e) {
-                        if elem_ty.is_none() {
-                            elem_ty = Some(ty);
-                        }
+                    if let Some(ty) = self.resolve_expr(e)
+                        && elem_ty.is_none()
+                    {
+                        elem_ty = Some(ty);
                     }
                 }
                 Some(
@@ -1219,9 +1628,9 @@ impl<'a> NameResolver<'a> {
                         span: param.span,
                         def_id: self.allocate_def_id(),
                     };
-                    if let Err(diag) =
-                        self.symbols
-                            .insert_variable(param.name.clone(), binding, param.span)
+                    if let Err(diag) = self
+                        .symbols
+                        .insert_variable(param.name, binding, param.span)
                     {
                         self.diagnostics.push(diag);
                     }
@@ -1271,9 +1680,7 @@ impl<'a> NameResolver<'a> {
                             span: branch.span,
                             def_id: self.allocate_def_id(),
                         };
-                        if let Err(diag) =
-                            self.symbols
-                                .insert_variable(bind.clone(), binding, branch.span)
+                        if let Err(diag) = self.symbols.insert_variable(*bind, binding, branch.span)
                         {
                             self.diagnostics.push(diag);
                         }
@@ -1432,7 +1839,7 @@ impl<'a> NameResolver<'a> {
                     span: *span,
                     def_id: self.allocate_def_id(),
                 };
-                if let Err(diag) = self.symbols.insert_variable(name.clone(), binding, *span) {
+                if let Err(diag) = self.symbols.insert_variable(*name, binding, *span) {
                     self.diagnostics.push(diag);
                 }
             }
@@ -1478,18 +1885,18 @@ impl<'a> NameResolver<'a> {
         match ty {
             Type::Path(path, span) => {
                 // Check if this name refers to `Self` in an impl block.
-                if path.len() == 1 && path[0].eq_str("Self") {
-                    if let Some(self_ty) = self.current_impl_for_type {
-                        return self_ty;
-                    }
+                if path.len() == 1
+                    && path[0].eq_str("Self")
+                    && let Some(self_ty) = self.current_impl_for_type
+                {
+                    return self_ty;
                 }
                 // Check if this name refers to an impl type parameter (e.g. `T` in `impl<T>`)
-                if path.len() == 1 {
-                    if let Some(ref param_map) = self.current_impl_type_params {
-                        if let Some(&ty_id) = param_map.get(&path[0]) {
-                            return ty_id;
-                        }
-                    }
+                if path.len() == 1
+                    && let Some(ref param_map) = self.current_impl_type_params
+                    && let Some(&ty_id) = param_map.get(&path[0])
+                {
+                    return ty_id;
                 }
                 if let Some(def_id) = self.resolve_type_path(path) {
                     let alias = self
@@ -1554,44 +1961,44 @@ impl<'a> NameResolver<'a> {
             }
             Type::Generic(base, args, span) => {
                 // Handle generic built-in types (Int, UInt, Float) by matching base path
-                if let Type::Path(path, _) = base.as_ref() {
-                    if path.len() == 1 {
-                        if path[0].eq_str("Int") {
-                            let bits = self
-                                .extract_int_from_type(args[0].ty().as_ref())
-                                .unwrap_or(32);
-                            return self.ctx.int(bits, true);
-                        } else if path[0].eq_str("UInt") {
-                            let bits = self
-                                .extract_int_from_type(args[0].ty().as_ref())
-                                .unwrap_or(32);
-                            return self.ctx.int(bits, false);
-                        } else if path[0].eq_str("Float") {
-                            let bits = self
-                                .extract_int_from_type(args[0].ty().as_ref())
-                                .unwrap_or(64);
-                            return self.ctx.float(bits);
-                        } else if path[0].eq_str("Rational") {
-                            let p = self
-                                .extract_int_from_type(args[0].ty().as_ref())
-                                .unwrap_or(16);
-                            let q = self
-                                .extract_int_from_type(args[1].ty().as_ref())
-                                .unwrap_or(16);
-                            return self.ctx.rational(p, q);
-                        } else if path[0].eq_str("Ptr") {
-                            let size = args
-                                .get(0)
-                                .map(|a| self.resolve_type_expr(a.ty().as_ref()))
-                                .unwrap_or(self.ctx.usize());
-                            let pointee = args
-                                .get(1)
-                                .map(|a| self.resolve_type_expr(a.ty().as_ref()))
-                                .unwrap_or(self.ctx.error());
-                            return self.ctx.ptr(size, pointee);
-                        } else if path[0].eq_str("USize") {
-                            return self.ctx.usize();
-                        }
+                if let Type::Path(path, _) = base.as_ref()
+                    && path.len() == 1
+                {
+                    if path[0].eq_str("Int") {
+                        let bits = self
+                            .extract_int_from_type(args[0].ty().as_ref())
+                            .unwrap_or(32);
+                        return self.ctx.int(bits, true);
+                    } else if path[0].eq_str("UInt") {
+                        let bits = self
+                            .extract_int_from_type(args[0].ty().as_ref())
+                            .unwrap_or(32);
+                        return self.ctx.int(bits, false);
+                    } else if path[0].eq_str("Float") {
+                        let bits = self
+                            .extract_int_from_type(args[0].ty().as_ref())
+                            .unwrap_or(64);
+                        return self.ctx.float(bits);
+                    } else if path[0].eq_str("Rational") {
+                        let p = self
+                            .extract_int_from_type(args[0].ty().as_ref())
+                            .unwrap_or(16);
+                        let q = self
+                            .extract_int_from_type(args[1].ty().as_ref())
+                            .unwrap_or(16);
+                        return self.ctx.rational(p, q);
+                    } else if path[0].eq_str("Ptr") {
+                        let size = args
+                            .get(0)
+                            .map(|a| self.resolve_type_expr(a.ty().as_ref()))
+                            .unwrap_or(self.ctx.usize());
+                        let pointee = args
+                            .get(1)
+                            .map(|a| self.resolve_type_expr(a.ty().as_ref()))
+                            .unwrap_or(self.ctx.error());
+                        return self.ctx.ptr(size, pointee);
+                    } else if path[0].eq_str("USize") {
+                        return self.ctx.usize();
                     }
                 }
                 let base_ty = self.resolve_type_expr(base);
@@ -1692,7 +2099,7 @@ impl<'a> NameResolver<'a> {
                 let base_ty = self.resolve_type_expr(base);
                 self.ctx.exists(
                     self.ctx.fresh_param_index(),
-                    name.clone(),
+                    *name,
                     base_ty,
                     invariant.as_ref().clone(),
                 )
@@ -1844,7 +2251,7 @@ impl<'a> NameResolver<'a> {
                         p.ty.as_ref()
                             .map_or(self.ctx.error(), |t| self.resolve_type_expr(t));
                     Parameter {
-                        name: p.name.clone(),
+                        name: p.name,
                         ty,
                         span: p.span,
                         default: p.default.clone(),
@@ -1870,7 +2277,7 @@ impl<'a> NameResolver<'a> {
                         p.ty.as_ref()
                             .map_or(self.ctx.error(), |t| self.resolve_type_expr(t));
                     Parameter {
-                        name: p.name.clone(),
+                        name: p.name,
                         ty,
                         span: p.span,
                         default: p.default.clone(),
@@ -1922,7 +2329,7 @@ impl<'a> NameResolver<'a> {
                             GenericArg::Positional(self.resolve_self_in_type(t, self_ty))
                         }
                         GenericArg::Named(n, t) => {
-                            GenericArg::Named(n.clone(), self.resolve_self_in_type(t, self_ty))
+                            GenericArg::Named(*n, self.resolve_self_in_type(t, self_ty))
                         }
                         GenericArg::Const(ac) => GenericArg::Const(crate::ast::AnonConst {
                             value: ac.value.clone(),
@@ -1969,7 +2376,7 @@ impl<'a> NameResolver<'a> {
             } => Type::Projection {
                 impl_type: Box::new(self.resolve_self_in_type(impl_type, self_ty)),
                 trait_path: Box::new(self.resolve_self_in_type(trait_path, self_ty)),
-                assoc_name: assoc_name.clone(),
+                assoc_name: *assoc_name,
                 span: *span,
             },
             other => other.clone(),
@@ -2036,40 +2443,38 @@ impl<'a> NameResolver<'a> {
         }
 
         // Try as a trait — supports multi-segment paths.
-        if let Some(trait_def_id) = self.symbols.lookup_trait_by_path(path) {
-            if let Some(trait_binding) = self.symbols.lookup_trait_by_def_id(trait_def_id).cloned()
-            {
-                if let Some(name) = &import_name {
-                    self.symbols.insert_trait(*name, trait_binding, span).ok();
-                }
-                // `from path import { items }` — also import traits
-                if let Some(item_list) = items {
-                    for item in item_list {
-                        let item_path = [*item];
-                        if let Some(item_def_id) = self.symbols.lookup_trait_by_path(&item_path) {
-                            if let Some(item_binding) =
-                                self.symbols.lookup_trait_by_def_id(item_def_id).cloned()
-                            {
-                                self.symbols.insert_trait(*item, item_binding, span).ok();
-                            }
-                        }
+        if let Some(trait_def_id) = self.symbols.lookup_trait_by_path(path)
+            && let Some(trait_binding) = self.symbols.lookup_trait_by_def_id(trait_def_id).cloned()
+        {
+            if let Some(name) = &import_name {
+                self.symbols.insert_trait(*name, trait_binding, span).ok();
+            }
+            // `from path import { items }` — also import traits
+            if let Some(item_list) = items {
+                for item in item_list {
+                    let item_path = [*item];
+                    if let Some(item_def_id) = self.symbols.lookup_trait_by_path(&item_path)
+                        && let Some(item_binding) =
+                            self.symbols.lookup_trait_by_def_id(item_def_id).cloned()
+                    {
+                        self.symbols.insert_trait(*item, item_binding, span).ok();
                     }
                 }
-                return Ok(());
             }
+            return Ok(());
         }
 
         // Try as a function — single-segment only for now;
         // multi-segment function imports require module hierarchy support.
-        if path.len() == 1 {
-            if let Some(func_binding) = self.symbols.lookup_function(path[0]).cloned() {
-                if let Some(name) = &import_name {
-                    if let Err(diag) = self.symbols.insert_function(*name, func_binding, span) {
-                        self.diagnostics.push(diag);
-                    }
-                }
-                return Ok(());
+        if path.len() == 1
+            && let Some(func_binding) = self.symbols.lookup_function(path[0]).cloned()
+        {
+            if let Some(name) = &import_name
+                && let Err(diag) = self.symbols.insert_function(*name, func_binding, span)
+            {
+                self.diagnostics.push(diag);
             }
+            return Ok(());
         }
 
         Err(Diagnostic::error(format!(

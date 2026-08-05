@@ -138,47 +138,58 @@ impl<'a, D: SolverDelegate> FulfillmentContext<'a, D> {
             }
 
             // ── Defaulting ──
-            if !self.infer_var_type_ids.is_empty() {
-                if let Err(e) = defaulting::default_variables(
+            if !self.infer_var_type_ids.is_empty()
+                && let Err(e) = defaulting::default_variables(
                     self.delegate.ctx(),
                     &self.infer_var_type_ids,
                     &self.infer_type_vars,
                     &self.infer_gen_statuses,
-                ) {
-                    let span = last_span.unwrap_or(crate::ast::Span::new(0, 0));
-                    // Prefer the current goal from the search graph stack.
-                    // If the stack is empty (defaulting runs before mark_evaluating),
-                    // fall back to the first pending obligation in the forest.
-                    let (actual_trait_id, actual_self_ty) = 'fetch: {
-                        if let Some(entry) = self.search_graph.current_goal() {
-                            break 'fetch (
-                                entry.key.trait_id.unwrap_or(crate::hir::types::DefId(0)),
-                                entry.key.self_ty,
-                            );
-                        }
-                        if let Some(idx) = self.forest.next_pending() {
-                            let ob = self.forest.obligation_at(idx);
-                            match &ob.predicate {
-                                crate::hir::traits::solver::obligation::Predicate::Trait { trait_id, self_ty, .. }
-                                | crate::hir::traits::solver::obligation::Predicate::AutoTrait { trait_id, self_ty, .. }
-                                | crate::hir::traits::solver::obligation::Predicate::ProjectionEq { trait_id, self_ty, .. } => {
-                                    break 'fetch (*trait_id, *self_ty);
-                                }
-                                _ => {}
+                )
+            {
+                let span = last_span.unwrap_or(crate::ast::Span::new(0, 0));
+                // Prefer the current goal from the search graph stack.
+                // If the stack is empty (defaulting runs before mark_evaluating),
+                // fall back to the first pending obligation in the forest.
+                let (actual_trait_id, actual_self_ty) = 'fetch: {
+                    if let Some(entry) = self.search_graph.current_goal() {
+                        break 'fetch (
+                            entry.key.trait_id.unwrap_or(crate::hir::types::DefId(0)),
+                            entry.key.self_ty,
+                        );
+                    }
+                    if let Some(idx) = self.forest.next_pending() {
+                        let ob = self.forest.obligation_at(idx);
+                        match &ob.predicate {
+                            crate::hir::traits::solver::obligation::Predicate::Trait {
+                                trait_id,
+                                self_ty,
+                                ..
                             }
+                            | crate::hir::traits::solver::obligation::Predicate::AutoTrait {
+                                trait_id,
+                                self_ty,
+                                ..
+                            }
+                            | crate::hir::traits::solver::obligation::Predicate::ProjectionEq {
+                                trait_id,
+                                self_ty,
+                                ..
+                            } => {
+                                break 'fetch (*trait_id, *self_ty);
+                            }
+                            _ => {}
                         }
-                        (crate::hir::types::DefId(0), self.delegate.ctx().error())
-                    };
-                    errors.push(SolveError::Ambiguous {
-                        trait_id: actual_trait_id,
-                        self_ty: actual_self_ty,
-                        span,
-                        num_candidates: 0,
-                    });
-                    break;
-                }
+                    }
+                    (crate::hir::types::DefId(0), self.delegate.ctx().error())
+                };
+                errors.push(SolveError::Ambiguous {
+                    trait_id: actual_trait_id,
+                    self_ty: actual_self_ty,
+                    span,
+                    num_candidates: 0,
+                });
+                break;
             }
-
             // ── Fixpoint check ──
             // If no goal was entered in this iteration, we have converged.
             if !self.search_graph.has_changed() {

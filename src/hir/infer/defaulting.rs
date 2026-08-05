@@ -103,14 +103,6 @@ pub fn default_variables(
             // then propagates through the type system — any downstream use
             // of this variable will produce a concrete type error, surfacing
             // the original inference failure naturally.
-            if matches!(
-                kind,
-                TypeVariableKind::Unconstrained | TypeVariableKind::Any
-            ) {
-                if let VarOrigin::Expression(Some(span)) = origin {
-                    // Fall through to defaulting: bound to ctx.error() below.
-                }
-            }
             let default_ty = match kind {
                 TypeVariableKind::Unconstrained => ctx.error(),
                 TypeVariableKind::Any => ctx.error(),

@@ -136,18 +136,18 @@ impl HtmlEmitter {
         }
 
         // Call chain (Zig-style)
-        if let Some(ref chain) = diag.call_chain {
-            if !chain.is_empty() {
-                html.push_str("<div class='chain'>referenced by:\n");
-                for entry in chain.entries() {
-                    html.push_str(&format!(
-                        "<div class='entry'><span class='label'>{}</span>: {}</div>\n",
-                        self.escape(&entry.message),
-                        entry.kind.as_str(),
-                    ));
-                }
-                html.push_str("</div>\n");
+        if let Some(ref chain) = diag.call_chain
+            && !chain.is_empty()
+        {
+            html.push_str("<div class='chain'>referenced by:\n");
+            for entry in chain.entries() {
+                html.push_str(&format!(
+                    "<div class='entry'><span class='label'>{}</span>: {}</div>\n",
+                    self.escape(&entry.message),
+                    entry.kind.as_str(),
+                ));
             }
+            html.push_str("</div>\n");
         }
 
         // Explain section (if error code present)

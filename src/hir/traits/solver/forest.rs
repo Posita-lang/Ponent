@@ -127,11 +127,11 @@ impl ObligationForest {
     pub fn recycle_ready_deferred(&mut self, ctx: &TypeContext) -> bool {
         let mut any_ready = false;
         for node in &mut self.nodes {
-            if matches!(node.state, ObligationState::Deferred) {
-                if node.stalled_on.iter().any(|&ty| !ctx.is_infer_var(ty)) {
-                    node.state = ObligationState::Pending;
-                    any_ready = true;
-                }
+            if matches!(node.state, ObligationState::Deferred)
+                && node.stalled_on.iter().any(|&ty| !ctx.is_infer_var(ty))
+            {
+                node.state = ObligationState::Pending;
+                any_ready = true;
             }
         }
         if any_ready {

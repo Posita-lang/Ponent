@@ -155,6 +155,8 @@ pub enum HirStmt {
     },
     ScopeCleanup {
         name: Symbol,
+        /// Optional compile-time guard: `scope_cleanup @name when condition { }`
+        when_condition: Option<Box<HirExpr>>,
         body: Vec<HirStmt>,
         propagates: bool,
         overrides: bool,
@@ -309,6 +311,14 @@ pub enum HirExpr {
         ty: TypeId,
         span: Span,
     },
+    /// Success-return terminator (`return expr`).  Kept DISTINCT from
+    /// `LeaveWith` (the error exit) — SYNTAX.md requires `leave with` to
+    /// retain its distinct identity throughout compilation.
+    Return {
+        value: Box<HirExpr>,
+        ty: TypeId,
+        span: Span,
+    },
     Await {
         expr: Box<HirExpr>,
         ty: TypeId,
@@ -454,7 +464,7 @@ impl HirExpr {
             HirExpr::Try { ty, .. } => *ty,
             HirExpr::UnsafeBlock { ty, .. } => *ty,
             HirExpr::Catch { ty, .. } => *ty,
-            HirExpr::LeaveWith { ty, .. } => *ty,
+            HirExpr::LeaveWith { ty, .. } | HirExpr::Return { ty, .. } => *ty,
             HirExpr::Await { ty, .. } => *ty,
             HirExpr::If { ty, .. } => *ty,
             HirExpr::IfLet { ty, .. } => *ty,
@@ -494,7 +504,7 @@ impl HirExpr {
             HirExpr::Try { span, .. } => *span,
             HirExpr::UnsafeBlock { span, .. } => *span,
             HirExpr::Catch { span, .. } => *span,
-            HirExpr::LeaveWith { span, .. } => *span,
+            HirExpr::LeaveWith { span, .. } | HirExpr::Return { span, .. } => *span,
             HirExpr::Await { span, .. } => *span,
             HirExpr::If { span, .. } => *span,
             HirExpr::IfLet { span, .. } => *span,

@@ -7,7 +7,7 @@ use crate::diagnostics::error_code::ErrCode;
 /// Serve the explanation for `code` on an already-bound `listener`.
 /// The listener must have been bound to `127.0.0.1:<port>` by the caller
 /// (e.g. via `TcpListener::bind("127.0.0.1:0")`).
-pub fn serve_explain(listener: TcpListener, code: &str) -> std::io::Result<()> {
+pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> {
     listener.set_nonblocking(true)?;
 
     let ec = ErrCode::new(code);

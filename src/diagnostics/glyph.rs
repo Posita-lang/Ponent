@@ -267,34 +267,34 @@ impl GlyphRenderer {
         // away (e.g. a "previous definition here" on a different function)
         // would be silently dropped.  This fallback loop ensures they are
         // still visible, matching the old emitters' behaviour.
-        if let Some(ref source) = diag.source {
-            if let Some(span) = diag.spans.first() {
-                let start_pos = byte_to_linecol(source, span.start);
-                let end_pos = byte_to_linecol(source, span.end);
-                let lines: Vec<&str> = source.lines().collect();
-                let first_line = start_pos.line.saturating_sub(self.context_lines);
-                let last_line = std::cmp::min(
-                    end_pos.line + 1 + self.context_lines,
-                    lines.len().saturating_sub(1),
-                );
-                for lbl in &diag.labels {
-                    let lbl_line = span_line(lbl.span, source);
-                    if lbl_line < first_line || lbl_line > last_line {
-                        // Render labels outside the source-context range as
-                        // notes, matching the style of `write_note_line`.
-                        let pos = byte_to_linecol(source, lbl.span.start);
-                        let _ = writeln!(
-                            out,
-                            "{v}  {cyan}= {bold}note{reset}: {msg} at {line}:{col}",
-                            v = self.bc.v,
-                            cyan = self.s.bright_blue,
-                            bold = self.s.bold,
-                            reset = self.s.reset,
-                            msg = lbl.message,
-                            line = pos.line + 1,
-                            col = pos.col + 1,
-                        );
-                    }
+        if let Some(ref source) = diag.source
+            && let Some(span) = diag.spans.first()
+        {
+            let start_pos = byte_to_linecol(source, span.start);
+            let end_pos = byte_to_linecol(source, span.end);
+            let lines: Vec<&str> = source.lines().collect();
+            let first_line = start_pos.line.saturating_sub(self.context_lines);
+            let last_line = std::cmp::min(
+                end_pos.line + 1 + self.context_lines,
+                lines.len().saturating_sub(1),
+            );
+            for lbl in &diag.labels {
+                let lbl_line = span_line(lbl.span, source);
+                if lbl_line < first_line || lbl_line > last_line {
+                    // Render labels outside the source-context range as
+                    // notes, matching the style of `write_note_line`.
+                    let pos = byte_to_linecol(source, lbl.span.start);
+                    let _ = writeln!(
+                        out,
+                        "{v}  {cyan}= {bold}note{reset}: {msg} at {line}:{col}",
+                        v = self.bc.v,
+                        cyan = self.s.bright_blue,
+                        bold = self.s.bold,
+                        reset = self.s.reset,
+                        msg = lbl.message,
+                        line = pos.line + 1,
+                        col = pos.col + 1,
+                    );
                 }
             }
         }

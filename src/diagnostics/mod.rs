@@ -746,10 +746,10 @@ impl Diagnostic {
     /// progressively enriching a diagnostic as it passes through compiler
     /// passes (the "context augmentation" pattern inspired by Austral).
     pub fn augment(&mut self, other: &Diagnostic) {
-        if self.spans.first().is_none() {
-            if let Some(span) = other.spans.first() {
-                self.spans = MultiSpan::new(span);
-            }
+        if self.spans.first().is_none()
+            && let Some(span) = other.spans.first()
+        {
+            self.spans = MultiSpan::new(span);
         }
         if self.source.is_none() {
             self.source.clone_from(&other.source);
@@ -866,10 +866,10 @@ impl fmt::Display for Diagnostic {
         }
 
         // Call chain
-        if let Some(ref chain) = self.call_chain {
-            if !chain.is_empty() {
-                write!(f, "{}", chain.render(false))?;
-            }
+        if let Some(ref chain) = self.call_chain
+            && !chain.is_empty()
+        {
+            write!(f, "{}", chain.render(false))?;
         }
 
         // Help

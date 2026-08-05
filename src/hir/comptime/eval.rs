@@ -443,10 +443,10 @@ impl<'a> ComptimeEvalContext<'a> {
                     }
                 }
                 // Try user-defined types via symbol table.
-                if let Some(def_id) = self.symbols.lookup_type_by_path(path) {
-                    if let Some(ty_id) = self.ctx.get_type_id_for_def_id(def_id) {
-                        return Ok(ty_id);
-                    }
+                if let Some(def_id) = self.symbols.lookup_type_by_path(path)
+                    && let Some(ty_id) = self.ctx.get_type_id_for_def_id(def_id)
+                {
+                    return Ok(ty_id);
                 }
                 let name_str = path
                     .iter()
@@ -460,73 +460,72 @@ impl<'a> ComptimeEvalContext<'a> {
             }
             Type::Generic(base, args, _) => {
                 // Handle Int<N>, UInt<N>, Float<N>.
-                if let Type::Path(path, _) = base.as_ref() {
-                    if path.len() == 1 {
-                        let name = path[0].as_str();
-                        // Extract the bit-width from the first positional argument.
-                        let bits = match args.first() {
-                            Some(GenericArg::Positional(Type::Literal(expr, _))) => {
-                                if let crate::ast::Expr::Literal(Literal::Int(bits), _) =
-                                    expr.as_ref()
-                                {
-                                    *bits
-                                } else {
-                                    return Err(ComptimeError::type_error(format!(
-                                        "expected a numeric literal argument for `{}<N>` in layout_of!, found non-literal expression",
-                                        name,
-                                    )));
-                                }
-                            }
-                            _ => {
+                if let Type::Path(path, _) = base.as_ref()
+                    && path.len() == 1
+                {
+                    let name = path[0].as_str();
+                    // Extract the bit-width from the first positional argument.
+                    let bits = match args.first() {
+                        Some(GenericArg::Positional(Type::Literal(expr, _))) => {
+                            if let crate::ast::Expr::Literal(Literal::Int(bits), _) = expr.as_ref()
+                            {
+                                *bits
+                            } else {
                                 return Err(ComptimeError::type_error(format!(
-                                    "expected a numeric literal argument for `{}<N>` in layout_of!",
+                                    "expected a numeric literal argument for `{}<N>` in layout_of!, found non-literal expression",
                                     name,
                                 )));
                             }
-                        };
-                        let bits_u8 = u8::try_from(bits).map_err(|_| {
-                            ComptimeError::type_error(format!(
-                                "invalid bit width {} for `{}` in layout_of!",
-                                bits, name,
-                            ))
-                        })?;
-                        match name.as_str() {
-                            "Int" => {
-                                if bits_u8 < 1 || bits_u8 > 64 {
-                                    return Err(ComptimeError::type_error(format!(
-                                        "Int<{}> is out of range; bits must be 1..64",
-                                        bits_u8,
-                                    )));
-                                }
-                                return Ok(self.ctx.alloc(TypeData::Int {
-                                    bits: bits_u8,
-                                    signed: true,
-                                    overflow_policy: crate::ast::OverflowPolicy::Trap,
-                                }));
-                            }
-                            "UInt" => {
-                                if bits_u8 < 1 || bits_u8 > 64 {
-                                    return Err(ComptimeError::type_error(format!(
-                                        "UInt<{}> is out of range; bits must be 1..64",
-                                        bits_u8,
-                                    )));
-                                }
-                                return Ok(self.ctx.alloc(TypeData::UInt {
-                                    bits: bits_u8,
-                                    overflow_policy: crate::ast::OverflowPolicy::Trap,
-                                }));
-                            }
-                            "Float" => {
-                                if bits_u8 != 32 && bits_u8 != 64 {
-                                    return Err(ComptimeError::type_error(format!(
-                                        "Float<{}> is not a valid IEEE 754 type; bits must be 32 or 64",
-                                        bits_u8,
-                                    )));
-                                }
-                                return Ok(self.ctx.alloc(TypeData::Float { bits: bits_u8 }));
-                            }
-                            _ => {}
                         }
+                        _ => {
+                            return Err(ComptimeError::type_error(format!(
+                                "expected a numeric literal argument for `{}<N>` in layout_of!",
+                                name,
+                            )));
+                        }
+                    };
+                    let bits_u8 = u8::try_from(bits).map_err(|_| {
+                        ComptimeError::type_error(format!(
+                            "invalid bit width {} for `{}` in layout_of!",
+                            bits, name,
+                        ))
+                    })?;
+                    match name.as_str() {
+                        "Int" => {
+                            if bits_u8 < 1 || bits_u8 > 64 {
+                                return Err(ComptimeError::type_error(format!(
+                                    "Int<{}> is out of range; bits must be 1..64",
+                                    bits_u8,
+                                )));
+                            }
+                            return Ok(self.ctx.alloc(TypeData::Int {
+                                bits: bits_u8,
+                                signed: true,
+                                overflow_policy: crate::ast::OverflowPolicy::Trap,
+                            }));
+                        }
+                        "UInt" => {
+                            if bits_u8 < 1 || bits_u8 > 64 {
+                                return Err(ComptimeError::type_error(format!(
+                                    "UInt<{}> is out of range; bits must be 1..64",
+                                    bits_u8,
+                                )));
+                            }
+                            return Ok(self.ctx.alloc(TypeData::UInt {
+                                bits: bits_u8,
+                                overflow_policy: crate::ast::OverflowPolicy::Trap,
+                            }));
+                        }
+                        "Float" => {
+                            if bits_u8 != 32 && bits_u8 != 64 {
+                                return Err(ComptimeError::type_error(format!(
+                                    "Float<{}> is not a valid IEEE 754 type; bits must be 32 or 64",
+                                    bits_u8,
+                                )));
+                            }
+                            return Ok(self.ctx.alloc(TypeData::Float { bits: bits_u8 }));
+                        }
+                        _ => {}
                     }
                 }
                 // Fall through to error for unknown generic types.
@@ -565,30 +564,30 @@ impl<'a> ComptimeEvalContext<'a> {
         new_val: &ComptimeValue,
     ) -> Result<(), ComptimeError> {
         // Subtract old value's memory if a slot is provided and it exists.
-        if let Some(slot) = slot {
-            if let Some(old) = self.variables.get(slot) {
-                let old_size = old.memory_size();
-                // In debug builds, catch accounting errors where memory_used
-                // is less than the old value's size.  Only assert when
-                // memory_used > 0, since direct HashMap inserts (e.g. in tests)
-                // bypass tracking and leave memory_used at 0.
-                debug_assert!(
-                    self.memory_used == 0 || self.memory_used >= old_size,
+        if let Some(slot) = slot
+            && let Some(old) = self.variables.get(slot)
+        {
+            let old_size = old.memory_size();
+            // In debug builds, catch accounting errors where memory_used
+            // is less than the old value's size.  Only assert when
+            // memory_used > 0, since direct HashMap inserts (e.g. in tests)
+            // bypass tracking and leave memory_used at 0.
+            debug_assert!(
+                self.memory_used == 0 || self.memory_used >= old_size,
+                "memory accounting error: memory_used ({}) < old value size ({}) for slot {:?}",
+                self.memory_used,
+                old_size,
+                slot,
+            );
+            // In release builds the assertion is stripped, so we use
+            // checked_sub to detect the same accounting bug and surface it
+            // as a hard error rather than silently lying about memory usage.
+            self.memory_used = self.memory_used.checked_sub(old_size).ok_or_else(|| {
+                ComptimeError::Internal(format!(
                     "memory accounting error: memory_used ({}) < old value size ({}) for slot {:?}",
-                    self.memory_used,
-                    old_size,
-                    slot,
-                );
-                // In release builds the assertion is stripped, so we use
-                // checked_sub to detect the same accounting bug and surface it
-                // as a hard error rather than silently lying about memory usage.
-                self.memory_used = self.memory_used
-                    .checked_sub(old_size)
-                    .ok_or_else(|| ComptimeError::Internal(format!(
-                        "memory accounting error: memory_used ({}) < old value size ({}) for slot {:?}",
-                        self.memory_used, old_size, slot,
-                    )))?;
-            }
+                    self.memory_used, old_size, slot,
+                ))
+            })?;
         }
         let new_size = new_val.memory_size();
         let new_total = self.memory_used.saturating_add(new_size);
@@ -653,10 +652,10 @@ impl<'a> ComptimeEvalContext<'a> {
                         // Track shadowing: if we're inside a scoped block (while body)
                         // and this `set` shadows an outer variable, record the old
                         // slot ID so `cur_slot` can be restored after the block exits.
-                        if let Some(shadows) = self.scope_shadows.last_mut() {
-                            if let Some(&old_slot) = self.cur_slot.get(n) {
-                                shadows.entry(*n).or_insert(old_slot);
-                            }
+                        if let Some(shadows) = self.scope_shadows.last_mut()
+                            && let Some(&old_slot) = self.cur_slot.get(n)
+                        {
+                            shadows.entry(*n).or_insert(old_slot);
                         }
                         // Memory tracking: new slot, no old value to subtract.
                         self.track_variable_memory(None, &val)?;
@@ -1061,21 +1060,21 @@ impl<'a> ComptimeEvalContext<'a> {
             }
             HirExpr::Ident(name, _ty, _span) => {
                 // 1. Check local variables first via the name→slot mapping.
-                if let Some(&slot) = self.cur_slot.get(name) {
-                    if let Some(val) = self.variables.get(&slot) {
-                        return Ok(val.clone());
-                    }
+                if let Some(&slot) = self.cur_slot.get(name)
+                    && let Some(val) = self.variables.get(&slot)
+                {
+                    return Ok(val.clone());
                 }
                 // 2. Check if the name is a zero-argument comptime function
                 //    (e.g. `comptime def N() -> Int<32> { 5 }` referenced as `N`).
-                if let Some((params, body)) = self.fn_registry.get(name) {
-                    if params.is_empty() {
-                        let body = Arc::clone(body);
-                        let saved = std::mem::take(&mut self.variables);
-                        let result = self.eval_block(&body);
-                        self.variables = saved;
-                        return result;
-                    }
+                if let Some((params, body)) = self.fn_registry.get(name)
+                    && params.is_empty()
+                {
+                    let body = Arc::clone(body);
+                    let saved = std::mem::take(&mut self.variables);
+                    let result = self.eval_block(&body);
+                    self.variables = saved;
+                    return result;
                 }
                 // 3. Check the symbol table for runtime variables.
                 //    These are variables declared outside the comptime block
@@ -1149,22 +1148,22 @@ impl<'a> ComptimeEvalContext<'a> {
                     // ── @trusted/@io boundary check ──────────────────
                     // If this comptime block is not @trusted, reject calls
                     // to functions marked @trusted or @io.
-                    if !self.allow_trusted {
-                        if let Some(func) = self.symbols.lookup_function(fn_name) {
-                            if func.attributes.iter().any(|a| a.name.eq_str("trusted")) {
-                                return Err(ComptimeError::not_allowed(format!(
-                                    "cannot call @trusted function `{}` from a non-@trusted \
-                                     comptime block; annotate the block with `comptime @trusted`",
-                                    fn_name,
-                                )));
-                            }
-                            if func.attributes.iter().any(|a| a.name.eq_str("io")) {
-                                return Err(ComptimeError::not_allowed(format!(
-                                    "cannot call @io function `{}` from a non-@trusted \
-                                     comptime block; annotate the block with `comptime @trusted`",
-                                    fn_name,
-                                )));
-                            }
+                    if !self.allow_trusted
+                        && let Some(func) = self.symbols.lookup_function(fn_name)
+                    {
+                        if func.attributes.iter().any(|a| a.name.eq_str("trusted")) {
+                            return Err(ComptimeError::not_allowed(format!(
+                                "cannot call @trusted function `{}` from a non-@trusted \
+                                 comptime block; annotate the block with `comptime @trusted`",
+                                fn_name,
+                            )));
+                        }
+                        if func.attributes.iter().any(|a| a.name.eq_str("io")) {
+                            return Err(ComptimeError::not_allowed(format!(
+                                "cannot call @io function `{}` from a non-@trusted \
+                                 comptime block; annotate the block with `comptime @trusted`",
+                                fn_name,
+                            )));
                         }
                     }
                     // Look up the function in the registry.

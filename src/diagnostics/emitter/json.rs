@@ -147,23 +147,23 @@ impl JsonEmitter {
         }
 
         // call chain
-        if let Some(ref chain) = diag.call_chain {
-            if !chain.is_empty() {
-                s.push_str(&format!("{}  \"callChain\": [\n", Self::indent(i)));
-                for (idx, entry) in chain.entries().iter().enumerate() {
-                    s.push_str(&format!(
-                        "{}    {{\"label\": {}, \"kind\": {:?}}}",
-                        Self::indent(i),
-                        Self::escape_json(&entry.message),
-                        entry.kind,
-                    ));
-                    if idx < chain.entries().len() - 1 {
-                        s.push(',');
-                    }
-                    s.push('\n');
+        if let Some(ref chain) = diag.call_chain
+            && !chain.is_empty()
+        {
+            s.push_str(&format!("{}  \"callChain\": [\n", Self::indent(i)));
+            for (idx, entry) in chain.entries().iter().enumerate() {
+                s.push_str(&format!(
+                    "{}    {{\"label\": {}, \"kind\": {:?}}}",
+                    Self::indent(i),
+                    Self::escape_json(&entry.message),
+                    entry.kind,
+                ));
+                if idx < chain.entries().len() - 1 {
+                    s.push(',');
                 }
-                s.push_str(&format!("{}  ],\n", Self::indent(i)));
+                s.push('\n');
             }
+            s.push_str(&format!("{}  ],\n", Self::indent(i)));
         }
 
         s.push_str(&format!("{}}}", Self::indent(i)));

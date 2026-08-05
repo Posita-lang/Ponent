@@ -228,6 +228,7 @@ pub fn specializes(
         return false;
     }
 
+    let depth = ctx.transaction_depth();
     ctx.begin_transaction();
 
     // Step 1: Create fresh inference variables for the general impl's type
@@ -243,8 +244,12 @@ pub fn specializes(
         .collect();
 
     // Step 2: Unify specific.for_type with the freshened general.for_type.
+    // Use one transaction for the whole conjunction so shared substitutions
+    // across for_type, trait_args, and where-clause bounds are preserved.
+    ctx.begin_transaction();
+
     let for_type_ok = ctx
-        .try_unify(more_specific.for_type, fresh_for_type)
+        .try_unify(more_specific.for_type, fresh_for_type, None)
         .is_ok();
 
     // Step 3: Check trait args unify.
@@ -254,7 +259,7 @@ pub fn specializes(
                 .trait_args
                 .iter()
                 .zip(&fresh_args)
-                .all(|(a, b)| ctx.try_unify(*a, *b).is_ok())
+                .all(|(a, b)| ctx.try_unify(*a, *b, None).is_ok())
     } else {
         false
     };
@@ -276,12 +281,12 @@ pub fn specializes(
                     more_specific.where_clause_bounds.iter().any(
                         |(s_self_ty, s_trait_id, s_args)| {
                             s_trait_id == g_trait_id
-                                && ctx.try_unify(*s_self_ty, g_fresh_self).is_ok()
+                                && ctx.try_unify(*s_self_ty, g_fresh_self, None).is_ok()
                                 && s_args.len() == g_fresh_args.len()
                                 && s_args
                                     .iter()
                                     .zip(&g_fresh_args)
-                                    .all(|(a, b)| ctx.try_unify(*a, *b).is_ok())
+                                    .all(|(a, b)| ctx.try_unify(*a, *b, None).is_ok())
                         },
                     )
                 })
@@ -295,7 +300,14 @@ pub fn specializes(
     // appear only in where_clause_bounds, which were not checked by earlier passes.
     let direction_ok = where_ok && generic_params_untouched_all(more_specific, ctx);
 
-    ctx.rollback_transaction();
+    // Pop BOTH transactions: the outer one (opened before freshening) and
+    // the inner one (the unification conjunction).  Leaving the outer frame
+    // on the stack would grow `transaction_stack` by one entry per call and
+    // shift every later rollback checkpoint.
+    // Depth-based rollback to the entry depth (pops the inner conjunction
+    // frame AND the outer freshening frame) — balanced by target depth,
+    // not by counting rollback calls.
+    ctx.rollback_to(depth);
     direction_ok
 }
 
@@ -480,12 +492,16 @@ pub fn check_overlap(
             .collect();
 
         // Step 4: Unify the normalized for_type and trait_args.
-        let for_type_ok = ctx.try_unify(new_for_ty, existing_for_ty).is_ok();
+        // Use try_unify (not can_unify) because the caller wraps this
+        // in begin_transaction/rollback_transaction.  Using can_unify
+        // would create a nested inner transaction that rolls back before
+        // the caller's outer transaction, losing shared substitutions.
+        let for_type_ok = ctx.try_unify(new_for_ty, existing_for_ty, None).is_ok();
         let trait_args_ok = new_trait_args.len() == existing_trait_args.len()
             && new_trait_args
                 .iter()
                 .zip(existing_trait_args.iter())
-                .all(|(a, b)| ctx.try_unify(*a, *b).is_ok());
+                .all(|(a, b)| ctx.try_unify(*a, *b, None).is_ok());
 
         if for_type_ok && trait_args_ok {
             return Some(OverlapConflict {
@@ -605,7 +621,7 @@ pub fn check_inherent_overlap(
 ) -> Option<OverlapConflict> {
     for (existing_idx, existing) in existing_impls.iter().enumerate() {
         ctx.begin_transaction();
-        let unification = ctx.try_unify(new_for_type, existing.for_type);
+        let unification = ctx.try_unify(new_for_type, existing.for_type, None);
         ctx.rollback_transaction();
 
         if unification.is_ok() {

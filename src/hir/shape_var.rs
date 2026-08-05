@@ -347,14 +347,12 @@ impl ShapeVarContext {
         self.vars[source.0].alias = Some(target);
 
         // If target is already resolved and source wasn't, fire source's waiters.
-        if !fired {
-            if let Some(shape) = self.vars[target.0].resolved {
-                let pending = std::mem::take(&mut self.vars[target.0].wait_list);
-                for cb in pending {
-                    cb(shape);
-                }
-                fired = true;
+        if !fired && let Some(shape) = self.vars[target.0].resolved {
+            let pending = std::mem::take(&mut self.vars[target.0].wait_list);
+            for cb in pending {
+                cb(shape);
             }
+            fired = true;
         }
 
         fired

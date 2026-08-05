@@ -120,14 +120,12 @@ impl TraitEnv {
             let d = ctx.type_constructor_depth(ctx_ty);
             if d >= head_depth {
                 // Allow if both are the same GenericParam
-                if head_as_generic {
-                    if let TypeData::GenericParam { index: hi, .. } = head_data {
-                        if let TypeData::GenericParam { index: ci, .. } = ctx.get(ctx_ty) {
-                            if hi == ci {
-                                continue;
-                            }
-                        }
-                    }
+                if head_as_generic
+                    && let TypeData::GenericParam { index: hi, .. } = head_data
+                    && let TypeData::GenericParam { index: ci, .. } = ctx.get(ctx_ty)
+                    && hi == ci
+                {
+                    continue;
                 }
                 return Err(TraitError::Orphan {
                     trait_id: candidate.trait_id,
@@ -375,10 +373,9 @@ impl TraitEnv {
         // avoiding mismatches when multiple impls share the same trait_id.
         if let Some(Some((cached_idx, cached_subst))) =
             self.impl_generic_cache.borrow().get(&cache_key)
+            && *cached_idx < self.impls.len()
         {
-            if *cached_idx < self.impls.len() {
-                return Some((&self.impls[*cached_idx], cached_subst.clone()));
-            }
+            return Some((&self.impls[*cached_idx], cached_subst.clone()));
         }
         for cand_idx in 0..self.impls.len() {
             if self.impls[cand_idx].trait_id != trait_id {

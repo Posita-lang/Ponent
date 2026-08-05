@@ -210,6 +210,8 @@ impl<'a> TypeChecker<'a> {
         VarScopeGuard::new(
             self.local_variable_types.rc_clone(),
             self.local_variable_spans.clone(),
+            self.ghost_var_scopes.clone(),
+            self.runtime_var_scopes.clone(),
         )
     }
 
@@ -227,10 +229,10 @@ impl<'a> TypeChecker<'a> {
                     continue;
                 }
                 CtxKind::LabeledBlock => {
-                    if let Some(lbl) = label {
-                        if frame.label.as_deref() == Some(lbl) {
-                            return Some((frame.span, Some(lbl)));
-                        }
+                    if let Some(lbl) = label
+                        && frame.label.as_deref() == Some(lbl)
+                    {
+                        return Some((frame.span, Some(lbl)));
                     }
                 }
                 CtxKind::Closure | CtxKind::AsyncBlock => {

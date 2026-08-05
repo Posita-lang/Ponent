@@ -473,6 +473,9 @@ pub(super) fn assemble_and_evaluate_candidates<D: SolverDelegate>(
     {
         let trait_env_ptr = ecx.trait_env;
         let ctx = ecx.ctx();
+        // SAFETY: `trait_env_ptr` points to the `TraitEnv` owned by `ecx`; the
+        // mutable borrow is released before this line, and `trait_env` is only
+        // read (immutably) within `winnow`.
         let trait_env = unsafe { &*trait_env_ptr };
         winnow(ctx, trait_env, &mut all_candidates, &resolved)?;
     }
@@ -498,6 +501,8 @@ pub(super) fn assemble_and_evaluate_candidates<D: SolverDelegate>(
         1 => {
             let trait_env_ptr = ecx.trait_env;
             let ctx = ecx.ctx();
+            // SAFETY: `trait_env_ptr` points to the `TraitEnv` owned by `ecx`;
+            // the mutable borrow is released above and `trait_env` is only read.
             let trait_env = unsafe { &*trait_env_ptr };
             confirm_candidate(ctx, trait_env, &resolved, &all_candidates.vec[0])
         }
@@ -532,6 +537,9 @@ fn assemble_impl_candidates<D: SolverDelegate>(
     // the compiler would reject `unsafe { &*trait_env_ptr }` because ecx
     // could still be immutably borrowed via field access.  DO NOT REMOVE.
     let _ctx = ecx.ctx();
+    // SAFETY: `trait_env_ptr` points to the `TraitEnv` owned by `ecx`; the
+    // mutable borrow barrier above (`let _ctx = ecx.ctx()`) ensures ecx is
+    // not immutably borrowed here, and `trait_env` is only read below.
     let trait_env = unsafe { &*trait_env_ptr };
     for (idx, impl_cand) in trait_env.all_impls().iter().enumerate() {
         if impl_cand.trait_id != trait_id {
@@ -578,6 +586,9 @@ fn assemble_caller_bound_candidates<D: SolverDelegate>(
     // ecx.caller_bounds (immutable field access) and ecx.ctx() (mutable
     // method call) when the caller_bound reference is later used.
     let _ctx = ecx.ctx();
+    // SAFETY: `caller_bounds_ptr` points to the caller-bounds slice owned by
+    // `ecx`; the borrow barrier above (`let _ctx = ecx.ctx()`) ensures ecx is
+    // not immutably borrowed here, and `caller_bounds` is only read below.
     let caller_bounds = unsafe { &*caller_bounds_ptr };
     for bound in caller_bounds {
         let (bound_trait_id, self_ty, args) = match bound {
@@ -604,7 +615,12 @@ fn assemble_builtin_candidates<D: SolverDelegate>(
     candidates: &mut Vec<Candidate>,
     ambiguous: &mut bool,
 ) {
-    let builtin_registry = unsafe { &*ecx.builtin_registry };
+    let builtin_registry = {
+        // SAFETY: `ecx.builtin_registry` points to the builtin trait registry
+        // owned by `ecx`; the registry outlives this function and is only
+        // read (immutably) below via `lookup`.
+        unsafe { &*ecx.builtin_registry }
+    };
     let ctx = ecx.ctx();
     let builtin_kind = builtin_registry.lookup(resolved.trait_id);
 

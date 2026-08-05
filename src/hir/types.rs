@@ -169,7 +169,13 @@ impl TypeId {
     /// `usize::MAX >> 5 - 1`, an unreachable index.
     /// Both paths are guarded by `debug_assert!` checks that fire before
     /// any unsound action.
-    pub const NONE: TypeId = TypeId(unsafe { NonZeroUsize::new_unchecked(usize::MAX) });
+    pub const NONE: TypeId = TypeId(unsafe {
+        // SAFETY: `usize::MAX` is non-zero, so `NonZeroUsize::new_unchecked`
+        // never creates an invalid value; the encoding is a sentinel whose
+        // `index()` lands on the reserved `Reserved31` variant (guarded by
+        // `debug_assert!` in `index()`).
+        NonZeroUsize::new_unchecked(usize::MAX)
+    });
 
     /// Create a `TypeId` from a raw encoded value.
     /// Panics if `raw` is zero (which can never be a valid `NonZeroUsize`).
@@ -190,7 +196,7 @@ impl TypeId {
     /// base value is never zero (guaranteeing `NonZeroUsize` validity).
     /// This method subtracts the bias to recover the true 0-based index.
     pub fn index(self) -> usize {
-        debug_assert!(
+        assert!(
             self.0.get() != usize::MAX,
             "TypeId::index() called on sentinel NONE"
         );
@@ -940,6 +946,93 @@ fn is_type_volatile_inner_by_id(ty: TypeId, types: Option<&Vec<Arc<TypeData>>>) 
     true
 }
 
+/// The context of a unification: whether it is a call-site argument check
+/// (where `@auto_ro`'s `&mut T → &T` relaxation applies — SYNTAX.md "at
+/// function call sites and method resolution") or a structural position
+/// (array/ADT elements, struct fields, ...) where the relaxation must NOT
+/// apply.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CoercionContext {
+    CallSite,
+    Structural,
+}
+
+/// RAII: mark the enclosing unification as a call-site argument check for
+/// the duration of the scope.  `@auto_ro`'s implicit freeze is thereby
+/// confined to function call sites (SYNTAX.md), never structural positions.
+///
+/// The guard holds a raw pointer to the context CELL (not the whole
+/// `TypeContext`).  WHY a raw pointer rather than a shared `&Cell`
+/// reference: a held `&Cell<CoercionContext>` borrow of
+/// `self.checker.ctx.current_coercion_ctx` would live across the fallible
+/// argument-checking loop and conflict with the enclosing `&mut self`
+/// calls inside it (E0502 — the field is reached through `&mut self`, so
+/// the borrow checker cannot split it while the guard is alive).  The raw
+/// address is borrow-free: `?` early-returns cannot skip the restore, and
+/// the enclosing `&mut self` calls do not conflict.  (SAFETY: the `Cell`
+/// belongs to the `TypeContext`, which outlives this method-local guard;
+/// the interior mutability makes the write well-defined under
+/// `&TypeContext`.)
+pub(crate) struct CallSiteCoercion {
+    ctx: *const std::cell::Cell<CoercionContext>,
+    prev: CoercionContext,
+}
+
+impl CallSiteCoercion {
+    pub fn enter(ctx: &TypeContext) -> Self {
+        let prev = ctx.current_coercion_ctx.replace(CoercionContext::CallSite);
+        CallSiteCoercion {
+            ctx: &ctx.current_coercion_ctx as *const std::cell::Cell<CoercionContext>,
+            prev,
+        }
+    }
+}
+
+impl Drop for CallSiteCoercion {
+    fn drop(&mut self) {
+        // SAFETY: the cell belongs to the `TypeContext` that outlives this
+        // method-local guard; the pointer was taken from a shared borrow of
+        // the field inside `enter`, and the cell's interior mutability makes
+        // the write well-defined under `&TypeContext`.
+        unsafe { &*self.ctx }.set(self.prev);
+    }
+}
+
+/// RAII: mark the enclosing unification as a structural position (not a
+/// call site) for the duration of the scope.  Data-constructor positions
+/// (struct fields, ADT payloads, array elements) must NOT inherit the
+/// `CallSite` coercion context — if they did, `@auto_ro`'s implicit freeze
+/// would be applied to nested positions, bypassing SYNTAX.md's scoping
+/// requirement (freeze only at function call sites).
+///
+/// Same lifetime discipline as `CallSiteCoercion`: the raw pointer avoids
+/// re-borrowing the `Cell` under a live `&mut self` in the enclosing
+/// method (see `CallSiteCoercion` doc).
+pub(crate) struct StructuralCoercion {
+    ctx: *const std::cell::Cell<CoercionContext>,
+    prev: CoercionContext,
+}
+
+impl StructuralCoercion {
+    pub fn enter(ctx: &TypeContext) -> Self {
+        let prev = ctx
+            .current_coercion_ctx
+            .replace(CoercionContext::Structural);
+        StructuralCoercion {
+            ctx: &ctx.current_coercion_ctx as *const std::cell::Cell<CoercionContext>,
+            prev,
+        }
+    }
+}
+
+impl Drop for StructuralCoercion {
+    fn drop(&mut self) {
+        // SAFETY: same as `CallSiteCoercion` — the cell belongs to the
+        // `TypeContext` that outlives this method-local guard.
+        unsafe { &*self.ctx }.set(self.prev);
+    }
+}
+
 pub struct TypeContext {
     types: Vec<Arc<TypeData>>,
     pub(crate) bindings: RefCell<HashMap<TypeId, TypeId>>,
@@ -988,11 +1081,52 @@ pub struct TypeContext {
     /// self-referential types.  Keyed by (a, b, variance_tag) where
     /// variance_tag = 0 for Invariant, 1 for Covariant, 2 for Contravariant.
     unify_seen: RefCell<HashSet<(TypeId, TypeId, u8)>>,
+    /// Current "operation span" hint: set by `unify_tracked` so that
+    /// `set_binding` can record WHERE a GenericParam got bound (precise
+    /// E104 error location).  `None` outside span-carrying unifications,
+    /// so solver-driven bindings do not inherit a stale span.
+    pub(crate) current_unify_span: RefCell<Option<crate::ast::Span>>,
+    /// The current unification's coercion context: `@auto_ro`'s
+    /// `&mut T → &T` relaxation applies ONLY at function call sites
+    /// (SYNTAX.md) — set to `CallSite` while checking call arguments, and
+    /// `Structural` elsewhere (array/ADT elements, struct fields, ...).
+    pub(crate) current_coercion_ctx: std::cell::Cell<CoercionContext>,
+    /// Count of seal-the-wall violations (GADT refinements attempting to
+    /// NEWLY bind a GenericParam into the global table).  Incremented in
+    /// ALL builds — the binding is skipped, so the global table is never
+    /// polluted; the counter keeps the violation observable.
+    pub(crate) seal_violations: std::cell::Cell<usize>,
+    /// Variables currently frozen by an active `&ro` borrow (SYNTAX.md
+    /// §Reference Coercion: the source `&mut T` is frozen for the borrow's
+    /// lifetime).  `UnaryOp::Ro` registers the operand's name; any later
+    /// mutation of a frozen variable is rejected by the checker.
+    pub(crate) frozen_vars: RefCell<Vec<Symbol>>,
+    /// Whether the function currently being checked has `@auto_ro`
+    /// (SYNTAX.md §Local Relaxation): allows `&mut T` to be implicitly
+    /// coerced to `&T` within the function body.  Set/restored around
+    /// each function body check (save/restore, so nested functions nest).
+    pub(crate) auto_ro: std::cell::Cell<bool>,
+    /// Whether the function currently being checked has `@auto_coerce`
+    /// (SYNTAX.md §Local Relaxation): enables ALL safe implicit
+    /// coercions (`&mut T` → `&T` like `@auto_ro`, plus deref coercions).
+    /// Set/restored around the function body; forbidden in `@trusted`
+    /// functions and Strict Mode.
+    pub(crate) auto_coerce: std::cell::Cell<bool>,
+    /// Binding origins for GenericParams: param TypeId → span of the
+    /// unifying operation that bound it.  Consulted by the E104
+    /// generality check to point at the precise binding site instead of
+    /// the whole function definition.
+    pub(crate) generic_binding_origins: RefCell<HashMap<TypeId, crate::ast::Span>>,
     /// Cache for κ(A) characteristic results.  Cleared when bindings change.
     kappa_cache: RefCell<HashMap<TypeId, Characteristic>>,
     /// Universe counter for Higher-Ranked Type skolemization (rustc-style).
     /// Each `for<'a>` binder comparison enters a fresh universe.
     next_universe: Cell<usize>,
+    /// Counter for GADT existential skolem IDs.  Separate from
+    /// `next_universe` so that `while-let` loops on existential
+    /// GADT variants don't perpetually increment the universe counter.
+    /// Reset between compilation units.
+    next_gadt_skolem_id: Cell<usize>,
     /// Counter for generating fresh parameter indices (used by Exists/Forall).
     next_param_index: Cell<usize>,
     /// Language edition for this compilation unit.
@@ -1001,6 +1135,164 @@ pub struct TypeContext {
     pub target: crate::hir::target::Target,
     /// A type factory for comptime code that needs to create new types.
     pub factory: TypeFactory,
+    /// GADT equality registry — stack of per-arm equality lists.
+    ///
+    /// Each entry records `(from_type, to_type)` meaning "within the
+    /// current arm, `from_type` is equivalent to `to_type`".
+    ///
+    /// This is the OCaml approach (see `ctype.ml:3926-3949`): instead of
+    /// calling `set_binding` (which modifies global state and requires
+    /// transaction/rollback), GADT arm processing registers equalities
+    /// here.  `resolve_binding` consults this registry after following
+    /// the normal binding chain, making GADT refinements transparently
+    /// visible to all type operations within the arm.
+    /// Scoped GADT facts for the current arm, split into two kinds:
+    /// `ParamRefinement` (visible to `resolve_binding`) and
+    /// `ExistentialEquation` (inert — never used as a rewrite rule, so an
+    /// existential witness stays opaque even inside compound types).
+    /// All GADT-related state (fact registry + depth counter + existential
+    /// scope stack + pending inner equalities) aggregated into one
+    /// structure; see `GadtContext`.
+    pub(crate) gadt: GadtContext,
+}
+
+/// A fact established by a GADT `when` clause, scoped to one match arm.
+/// Split so that existential opacity is enforced structurally rather than
+/// by convention: only `ParamRefinement` is consulted by `resolve_binding`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum GadtFact {
+    /// Non-existential refinement: a refinable variable (`GenericParam` or
+    /// a non-arm-local `InferVar`) maps to a concrete type.  Safe for
+    /// `resolve_binding` to follow.
+    ParamRefinement { from: TypeId, to: TypeId },
+    /// An equality involving existential skolems (e.g. `[S] ~ [Int<32>]`).
+    /// Never used as a rewrite rule — the witness must remain opaque
+    /// (SYNTAX.md §"Existential Quantification").
+    ///
+    /// Read only via explicit `resolve_existential_witness` calls; never
+    /// through `resolve_binding` (which would transparently expose the
+    /// witness and break opacity).  It is retained because it (a) makes
+    /// opacity a STRUCTURAL guarantee — the compiler cannot accidentally
+    /// rewrite an existential equation, since `resolve_gadt_eq` only
+    /// matches `ParamRefinement` — and (b) is the future carrier for the
+    /// existential elimination rules (branch-boundary occurs-check,
+    /// length/projection rules, injectivity checks).
+    ExistentialEquation { lhs: TypeId, rhs: TypeId },
+}
+
+/// One existential scope frame: the variant it was created for (identified
+/// by enum DefId AND variant name — occurrence identity) and the skolems
+/// allocated for that variant, indexed by binder position in
+/// `exists_params` (GHC `realUnique` / OCaml `id: int` identity).
+/// `check_pattern_inner` reuses the frame that `precreate_exist_skolems`
+/// pushed for the SAME top-level variant occurrence (same DefId + name +
+/// not yet consumed); nested existential variants, same-named variants in
+/// DIFFERENT enums, and recursive variants (frame already `used`) all push
+/// their own frame.
+#[derive(Debug, Clone)]
+pub(crate) struct ExistScopeFrame {
+    pub(crate) def_id: DefId,
+    pub(crate) variant_name: Symbol,
+    /// Whether the top-level `check_pattern_inner` has already consumed
+    /// this frame.  Once consumed, a recursive re-encounter of the same
+    /// (DefId, variant) must push a fresh frame instead of reusing.
+    pub(crate) used: bool,
+    /// Skolems for each `exists` binder, in `exists_params` order.
+    pub(crate) skolems: Vec<TypeId>,
+}
+
+/// One inner GADT pattern `when` equality collected during
+/// `check_pattern_inner` (which runs BEFORE `push_gadt_arm`).  Registered
+/// by `apply_gadt_refinement` after the arm is pushed, so the GADT fact
+/// registry has an active arm to write into — nested GADT refinement
+/// (SYNTAX.md §"Nested GADT Refinement").
+#[derive(Debug, Clone)]
+pub(crate) struct PendingInnerGadtEq {
+    pub(crate) param_name: Symbol,
+    pub(crate) concrete_ty: crate::ast::Type,
+    pub(crate) binding: crate::hir::symbol::TypeBinding,
+    pub(crate) args: Vec<TypeId>,
+    pub(crate) exist_params: Vec<Symbol>,
+    pub(crate) skolems: Vec<TypeId>,
+}
+
+/// All GADT-related state for the type checker, aggregated into a single
+/// structure so that arm entry/exit is ATOMIC and the invariant "stack
+/// depth == registry depth" can be verified locally instead of across
+/// scattered fields (`TypeChecker::current_gadt_exist_skolems` +
+/// `pending_inner_gadt_eqs` and `TypeContext::{gadt_facts,gadt_arm_depth}`
+/// were previously four unrelated mutable fields with implicit ordering
+/// constraints).
+///
+/// Exists refinement — three mechanical rules:
+///   Rule 1 — `when X == ConcreteType`: X resolves to `ConcreteType` and is
+///     REMOVED from the facts; every use of X ≡ a use of `ConcreteType`.
+///   Rule 2 — `when T == Expr<X₁, X₂, ...>`: T is refined to the compound
+///     type; the Xᵢ stay opaque (registered as inert `ExistentialEquation`s).
+///   Rule 3 — `when X == Y` (equality between TWO exists vars): X ≡ Y, both
+///     opaque, interchangeable.  No dedicated syntax: the common case (two
+///     payload components sharing a type) is expressed by REUSING the same
+///     exists variable (`MkPair(exists A: (A, A))` — the same skolem
+///     appearing twice unifies to equivalence).  Explicit cross-variant
+///     exists equivalence is reserved for future use cases.
+pub(crate) struct GadtContext {
+    /// The GADT fact registry: a stack of per-arm fact lists.
+    pub(crate) facts: RefCell<Vec<Vec<GadtFact>>>,
+    /// Depth counter for `facts`, kept in sync with its length.
+    pub(crate) arm_depth: Cell<usize>,
+    /// Per-variant existential skolem scope stack (occurrence identity).
+    pub(crate) exist_skolems: RefCell<Vec<ExistScopeFrame>>,
+    /// Inner GADT `when` equalities collected before `push_gadt_arm`.
+    pub(crate) pending_eqs: Vec<PendingInnerGadtEq>,
+}
+
+impl GadtContext {
+    pub(crate) fn new() -> Self {
+        GadtContext {
+            facts: RefCell::new(Vec::new()),
+            arm_depth: Cell::new(0),
+            exist_skolems: RefCell::new(Vec::new()),
+            pending_eqs: Vec::new(),
+        }
+    }
+
+    /// Enter a new GADT arm: push a fresh fact list and bump the depth.
+    pub(crate) fn enter_arm(&self) {
+        self.facts.borrow_mut().push(Vec::new());
+        self.arm_depth.set(self.arm_depth.get() + 1);
+    }
+
+    /// Exit the current GADT arm, discarding its equalities.
+    pub(crate) fn exit_arm(&self) {
+        self.facts.borrow_mut().pop();
+        let d = self.arm_depth.get();
+        self.arm_depth.set(d.saturating_sub(1));
+    }
+
+    /// Register a GADT **param refinement** within the current arm.
+    pub(crate) fn register_param_refinement(&self, from: TypeId, to: TypeId) {
+        if let Some(arm) = self.facts.borrow_mut().last_mut() {
+            arm.push(GadtFact::ParamRefinement { from, to });
+        }
+    }
+
+    /// Register an **inert existential equation** within the current arm.
+    pub(crate) fn register_existential_equation(&self, lhs: TypeId, rhs: TypeId) {
+        if let Some(arm) = self.facts.borrow_mut().last_mut() {
+            arm.push(GadtFact::ExistentialEquation { lhs, rhs });
+        }
+    }
+
+    /// Push an existential scope frame (occurrence identity).
+    /// Collect one inner `when` equality for later registration.
+    pub(crate) fn push_pending_eq(&mut self, eq: PendingInnerGadtEq) {
+        self.pending_eqs.push(eq);
+    }
+
+    /// Take the collected inner `when` equalities (clearing the queue).
+    pub(crate) fn take_pending_eqs(&mut self) -> Vec<PendingInnerGadtEq> {
+        std::mem::take(&mut self.pending_eqs)
+    }
 }
 
 impl TypeContext {
@@ -1031,12 +1323,21 @@ impl TypeContext {
             opaque_hidden_undo: RefCell::new(Vec::new()),
             transaction_stack: RefCell::new(Vec::new()),
             unify_seen: RefCell::new(HashSet::default()),
+            current_unify_span: RefCell::new(None),
+            current_coercion_ctx: std::cell::Cell::new(CoercionContext::Structural),
+            seal_violations: std::cell::Cell::new(0),
+            frozen_vars: RefCell::new(Vec::new()),
+            auto_ro: std::cell::Cell::new(false),
+            auto_coerce: std::cell::Cell::new(false),
+            generic_binding_origins: RefCell::new(HashMap::default()),
             kappa_cache: RefCell::new(HashMap::default()),
             next_universe: Cell::new(0),
+            next_gadt_skolem_id: Cell::new(0),
             next_param_index: Cell::new(0),
             edition: Edition::latest(),
             target,
             factory,
+            gadt: GadtContext::new(),
         };
         ctx.builtin_unit = ctx.alloc(TypeData::Unit);
         ctx.builtin_never = ctx.alloc(TypeData::Never);
@@ -1318,6 +1619,93 @@ impl TypeContext {
         Ok(())
     }
 
+    /// Push a new GADT arm scope onto the equality registry stack.
+    ///
+    /// All GADT equalities registered via `register_gadt_eq` after this
+    /// call are scoped to this arm and will be discarded on `pop_gadt_arm`.
+    ///
+    /// This replaces the old approach of `begin_transaction` + `try_unify`
+    /// + `rollback_transaction` for GADT pattern matching.  Instead of
+    /// writing type equalities into the global bindings table (which
+    /// requires a transaction to undo), we record them in this scoped
+    /// registry.  `resolve_binding` transparently consults the registry,
+    /// so all type operations within the arm see the refined types.
+    ///
+    /// This is directly inspired by OCaml's `Pattern` unification mode
+    /// (ctype.ml:446-459).  In OCaml, `link_type` (≈`set_binding`) is
+    /// never called in `Pattern` mode; instead, constraint equations
+    /// are collected in `equated_types`:
+    ///
+    /// ```ocaml
+    /// (* ctype.ml:446-459 *)
+    /// type unification_environment =
+    ///   | Expression of { env : Env.t; in_subst : bool; }
+    ///   | Pattern of
+    ///       { penv : Pattern_env.t;
+    ///         equated_types : TypePairs.t;  (* ← no link_type, collect here *)
+    ///         assume_injective : bool;
+    ///         unify_eq_set : TypePairs.t; }
+    /// ```
+    pub fn push_gadt_arm(&self) {
+        self.gadt.enter_arm();
+    }
+
+    /// Pop the current GADT arm scope, discarding its equalities.
+    ///
+    /// After this call, `resolve_binding` no longer sees the
+    /// GADT refinements from this arm.
+    ///
+    /// See `push_gadt_arm` for the OCaml `Pattern` mode reference
+    /// (ctype.ml:3926-3936: `equated_types` discarded on scope exit).
+    pub fn pop_gadt_arm(&self) {
+        self.gadt.exit_arm();
+    }
+
+    /// Register a GADT **param refinement** within the current arm.
+    ///
+    /// `from` is a refinable variable (typically a `GenericParam` or a
+    /// non-arm-local `InferVar`), and `to` is the concrete type from the
+    /// `when` clause.  Within the arm, `resolve_binding(from)` returns `to`.
+    /// Safe for `resolve_binding` to follow because `from` is a variable,
+    /// not a closed type.
+    pub fn register_param_refinement(&self, from: TypeId, to: TypeId) {
+        self.gadt.register_param_refinement(from, to);
+    }
+
+    /// Register an **inert existential equation** within the current arm.
+    ///
+    /// `lhs` is a type containing an existential skolem (e.g. `[S]`), `rhs`
+    /// is the concrete scrutinee side (e.g. `[Int<32>]`).  This fact is
+    /// NEVER consulted by `resolve_binding`, so the existential witness
+    /// stays opaque (SYNTAX.md §"Existential Quantification").
+    pub fn register_existential_equation(&self, lhs: TypeId, rhs: TypeId) {
+        self.gadt.register_existential_equation(lhs, rhs);
+    }
+
+    /// Register a GADT equality that holds within the current arm.
+    ///
+    /// `from` is the scrutinee's type argument (typically a `GenericParam`
+    /// or `InferVar`), and `to` is the concrete type from the `when`
+    /// clause.  Within the arm, `resolve_binding(from)` will return `to`.
+    ///
+    /// Multiple equalities can be registered per arm.  They are checked
+    /// in reverse registration order (LIFO) during resolution.
+    ///
+    /// See `push_gadt_arm` for the OCaml equivalent (`record_equation`,
+    /// ctype.ml:506-511).
+    // (register_gadt_eq removed: it was an unclassified pub API that could
+    // bypass the ParamRefinement/ExistentialEquation split.  Use
+    // `register_param_refinement` or `register_existential_equation`.)
+
+    /// Resolve a TypeId by following the binding chain, then checking
+    /// the GADT equality registry.
+    ///
+    /// The GADT registry is consulted AFTER the binding chain: if the
+    /// root of the binding chain appears as a key in the current arm's
+    /// GADT equalities, the corresponding value is returned instead.
+    /// This makes GADT type refinements transparently visible to all
+    /// type operations (type checking, unification, etc.) without
+    /// modifying the global bindings table.
     pub(crate) fn resolve_binding(&self, id: TypeId) -> TypeId {
         // Safety: guard against infinite loops from circular bindings.
         // 10 000 is generous enough for any real program while preventing
@@ -1334,41 +1722,57 @@ impl TypeContext {
         // First pass: follow the binding chain to the root with a single
         // immutable borrow.  This is a simple linked-list traversal through
         // the bindings map until we reach an unbound TypeId.
-        let root = {
+        //
+        // ALSO check the GADT equality registry at each step: if any node
+        // along the chain (including the starting `id` and the final root)
+        // appears as a key in the current arm's GADT equalities, the
+        // mapping takes effect at that point.  We return the mapped value
+        // directly (resolved through its own binding chain) WITHOUT
+        // path-compressing it into the global bindings table, because the
+        // GADT equality is scoped to the current arm and must not leak
+        // after pop_gadt_arm().  See push_gadt_arm for the OCaml reference.
+        let mut current = id;
+        let mut depth = 0;
+        loop {
+            // Check GADT registry at each step before following bindings.
+            if let Some(mapped) = self.resolve_gadt_eq(current) {
+                return self.resolve_binding_tail(mapped);
+            }
             let bindings = self.bindings.borrow();
-            let mut current = id;
-            let mut depth = 0;
-            while let Some(&next) = bindings.get(&current) {
+            if let Some(&next) = bindings.get(&current) {
+                drop(bindings);
                 current = next;
                 depth += 1;
                 if depth > MAX_CHAIN_DEPTH {
-                    // Cycle detected — break and return what we have.
                     break;
                 }
+            } else {
+                drop(bindings);
+                break;
             }
-            current
-        };
-
-        // Second pass: path compression.  Point every node along the chain
-        // directly to the root so that future lookups are O(1) instead of
-        // O(depth).  Uses set_binding per step to ensure the transaction undo
-        // log captures each mutation (OmniML-style Ref-level logging).
+        }
+        // Also check the final node (the root of the binding chain).
+        if let Some(mapped) = self.resolve_gadt_eq(current) {
+            return self.resolve_binding_tail(mapped);
+        }
+        // Path compression (only for non-GADT bindings): point every node
+        // along the chain directly to the root so that future lookups are
+        // O(1) instead of O(depth).  Uses set_binding per step to ensure
+        // the transaction undo log captures each mutation.
         // If no transaction is active, set_binding still performs the
         // mutation but skips undo logging — path compression is safe in
         // either mode.
-        if root != id {
-            let mut current = id;
+        if current != id {
+            let mut path = id;
             let mut depth = 0;
-            while current != root {
+            while path != current {
                 let next = {
                     let bindings = self.bindings.borrow();
-                    bindings.get(&current).copied()
+                    bindings.get(&path).copied()
                 };
                 if let Some(next_val) = next {
-                    // set_binding records the old value in the undo log so
-                    // that rollback can restore the exact pre-transaction chain.
-                    self.set_binding(current, root);
-                    current = next_val;
+                    self.set_binding(path, current);
+                    path = next_val;
                     depth += 1;
                     if depth > MAX_CHAIN_DEPTH {
                         break;
@@ -1379,7 +1783,129 @@ impl TypeContext {
             }
         }
 
-        root
+        current
+    }
+
+    /// Follow the binding chain from `id` to the root, checking the GADT
+    /// registry at each step.  Used internally by `resolve_binding` to
+    /// resolve the target of a GADT equality mapping.
+    ///
+    /// Unlike `resolve_binding`, this does NOT path-compress because the
+    /// GADT equality is scoped to the current arm and must not leak.
+    /// It DOES chase GADT registry entries so that transitive equalities
+    /// like `A →[GADT] B →[GADT] C` resolve correctly.
+    /// Follow ONLY the `bindings` chain to the root, NEVER consulting the
+    /// GADT registry.  Used to canonicalize a refinement key to the chain
+    /// root BEFORE registering a GADT equality, so path compression cannot
+    /// hide the key from `resolve_binding` (which checks the GADT registry
+    /// at each step of a possibly-compressed chain).
+    pub(crate) fn resolve_binding_no_gadt(&self, id: TypeId) -> TypeId {
+        const MAX_CHAIN_DEPTH: usize = 10_000;
+        let mut current = id;
+        let mut depth = 0;
+        loop {
+            let bindings = self.bindings.borrow();
+            match bindings.get(&current) {
+                Some(&next) => {
+                    drop(bindings);
+                    current = next;
+                    depth += 1;
+                    if depth > MAX_CHAIN_DEPTH {
+                        return current;
+                    }
+                }
+                None => return current,
+            }
+        }
+    }
+
+    fn resolve_binding_tail(&self, id: TypeId) -> TypeId {
+        const MAX_CHAIN_DEPTH: usize = 10_000;
+        let mut current = id;
+        let mut depth = 0;
+        loop {
+            // Follow bindings one step.
+            let bound = {
+                let bindings = self.bindings.borrow();
+                bindings.get(&current).copied()
+            };
+            if let Some(next) = bound {
+                current = next;
+                depth += 1;
+                if depth > MAX_CHAIN_DEPTH {
+                    break;
+                }
+                // After following a binding, also check GADT registry.
+                if let Some(mapped) = self.resolve_gadt_eq(current) {
+                    current = mapped;
+                }
+                continue;
+            }
+            // No binding found — check GADT registry before returning.
+            if let Some(mapped) = self.resolve_gadt_eq(current) {
+                current = mapped;
+                depth += 1;
+                if depth > MAX_CHAIN_DEPTH {
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        current
+    }
+
+    /// Look up `id` in the GADT fact registry, checking arms from
+    /// innermost (current) to outermost.  Only `ParamRefinement` facts are
+    /// consulted — `ExistentialEquation` facts are inert and never used as
+    /// rewrite rules, so an existential witness stays opaque.
+    /// Returns the mapped TypeId if found, or `None` if `id` is not
+    /// registered as a param refinement.
+    ///
+    /// See `push_gadt_arm` (OCaml `equated_types` lookup, ctype.ml:3926-3936).
+    fn resolve_gadt_eq(&self, id: TypeId) -> Option<TypeId> {
+        let facts = self.gadt.facts.borrow();
+        for arm in facts.iter().rev() {
+            for fact in arm.iter() {
+                if let GadtFact::ParamRefinement { from, to } = fact
+                    && *from == id
+                {
+                    return Some(*to);
+                }
+            }
+        }
+        None
+    }
+
+    /// Explicit witness-solving API (GHC-style coercion / OCaml GADT
+    /// constraint mode): given a GADT existential skolem, return the
+    /// concrete type it was solved to by a `when` constraint within the
+    /// current arm, if any.  Opacity is the DEFAULT — `resolve_binding`
+    /// NEVER follows existential equations; consumers that need the solved
+    /// witness (payload type resolution, `'len` lookup) call this
+    /// explicitly.  This is the single observation point for witness
+    /// solving, so `resolve_binding` (transparent) and unification (rigid)
+    /// cannot drift apart.
+    /// Opt-in existential witness solving: consumers that legitimately need
+    /// a solved witness (e.g. `'len`/projection rules) call this explicitly
+    /// at the point of use — it is intentionally NOT part of
+    /// `resolve_binding` (which must keep witnesses opaque).  The test
+    /// consumer (`test_resolve_existential_witness_opt_in`) exercises the
+    /// observation point; production consumers land with the `'len`/projection
+    /// rules (future).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resolve_existential_witness(&self, skolem: TypeId) -> Option<TypeId> {
+        let facts = self.gadt.facts.borrow();
+        for arm in facts.iter().rev() {
+            for fact in arm.iter() {
+                if let GadtFact::ExistentialEquation { lhs, rhs } = fact
+                    && *lhs == skolem
+                {
+                    return Some(*rhs);
+                }
+            }
+        }
+        None
     }
 
     /// Resolve bindings AND resolve opaque types.
@@ -1679,7 +2205,7 @@ impl TypeContext {
                         param_name: on,
                         body: ob,
                     } => {
-                        outer_quantifiers.push((*oi, on.clone()));
+                        outer_quantifiers.push((*oi, *on));
                         inner = *ob;
                     }
                     _ => break,
@@ -1721,7 +2247,7 @@ impl TypeContext {
                                 param_name: fn_,
                                 body: b,
                             } => {
-                                inner_quantifiers.push((*fi, fn_.clone()));
+                                inner_quantifiers.push((*fi, *fn_));
                                 inner = *b;
                             }
                             _ => break,
@@ -1767,11 +2293,11 @@ impl TypeContext {
                                     if fresh_idx == pi {
                                         fresh_idx = self.fresh_param_index();
                                     }
-                                    let fresh_gp = self.generic_param(fresh_idx, en.clone());
+                                    let fresh_gp = self.generic_param(fresh_idx, *en);
                                     w = self.replace_generic(w, *eq, fresh_gp);
                                     w = self.exists(
                                         fresh_idx,
-                                        en.clone(),
+                                        *en,
                                         w,
                                         crate::ast::Expr::Literal(
                                             crate::ast::Literal::Bool(true),
@@ -1803,9 +2329,9 @@ impl TypeContext {
                                     if fresh_idx == pi {
                                         fresh_idx = self.fresh_param_index();
                                     }
-                                    let fresh_gp = self.generic_param(fresh_idx, en.clone());
+                                    let fresh_gp = self.generic_param(fresh_idx, *en);
                                     w = self.replace_generic(w, *eq, fresh_gp);
-                                    w = self.forall(fresh_idx, en.clone(), w);
+                                    w = self.forall(fresh_idx, *en, w);
                                 }
                                 w
                             };
@@ -1997,12 +2523,11 @@ impl TypeContext {
             }
         }
         // No edges → no sub-types (leaf node). Check if THIS node is the param.
-        if edges.is_empty() {
-            if let TypeData::GenericParam { index, .. } = self.get(ty) {
-                if *index == param {
-                    return cumulative_sign == expected_sign;
-                }
-            }
+        if edges.is_empty()
+            && let TypeData::GenericParam { index, .. } = self.get(ty)
+            && *index == param
+        {
+            return cumulative_sign == expected_sign;
         }
         true
     }
@@ -2193,7 +2718,7 @@ impl TypeContext {
                     ty
                 } else {
                     let new_body = self.replace_generic(*body, param_index, replacement);
-                    self.forall(*pi, param_name.clone(), new_body)
+                    self.forall(*pi, *param_name, new_body)
                 }
             }
             TypeData::Exists {
@@ -2208,7 +2733,7 @@ impl TypeContext {
                     let new_base = self.replace_generic(*base, param_index, replacement);
                     let new_id = self.alloc(TypeData::Exists {
                         param_index: *pi,
-                        name: name.clone(),
+                        name: *name,
                         base: new_base,
                     });
                     // Preserve Exists metadata (invariant, default_value), matching
@@ -2231,7 +2756,7 @@ impl TypeContext {
                     let new_body = self.replace_generic(*body, param_index, replacement);
                     self.alloc(TypeData::Mu {
                         param_index: *pi,
-                        param_name: param_name.clone(),
+                        param_name: *param_name,
                         body: new_body,
                     })
                 }
@@ -2248,7 +2773,7 @@ impl TypeContext {
                     let new_body = self.replace_generic(*body, param_index, replacement);
                     self.alloc(TypeData::Nu {
                         param_index: *pi,
-                        param_name: param_name.clone(),
+                        param_name: *param_name,
                         body: new_body,
                     })
                 }
@@ -2291,7 +2816,7 @@ impl TypeContext {
                 self_ty,
             } => {
                 let new_self = self.replace_generic(*self_ty, param_index, replacement);
-                self.associated_type(*trait_id, name.clone(), new_self)
+                self.associated_type(*trait_id, *name, new_self)
             }
             TypeData::Tuple { elems } => {
                 let new_elems: Vec<TypeId> = elems
@@ -2407,6 +2932,23 @@ impl TypeContext {
         }
     }
 
+    /// Unify with a span hint: like `unify`, but records the operation
+    /// span so `set_binding` can capture WHERE a GenericParam got bound
+    /// (precise E104 error location).  The hint is restored afterwards —
+    /// bindings created outside a span-carrying unify (e.g. by the trait
+    /// solver) record no origin, and E104 falls back to the function span.
+    pub(crate) fn unify_tracked(
+        &mut self,
+        a: TypeId,
+        b: TypeId,
+        span: crate::ast::Span,
+    ) -> Result<TypeId, TypeError> {
+        let prev = self.current_unify_span.replace(Some(span));
+        let r = self.unify(a, b);
+        *self.current_unify_span.borrow_mut() = prev;
+        r
+    }
+
     #[must_use]
     pub fn unify(&mut self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
         // ── Transaction: capture current bindings for rollback ──
@@ -2415,7 +2957,7 @@ impl TypeContext {
         // Clear the seen-set before each top-level unification.
         self.unify_seen.borrow_mut().clear();
 
-        let result = self.unify_internal(a, b, Variance::Invariant);
+        let result = self.unify_internal(a, b, Variance::Invariant, None, 0);
 
         // ── Commit or rollback ──
         match result {
@@ -2442,9 +2984,29 @@ impl TypeContext {
     /// The caller MUST call `rollback_transaction()` to undo them if the
     /// result is only being used for a check (like overlap detection).
     #[must_use]
-    pub fn try_unify(&mut self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
+    pub fn try_unify(
+        &mut self,
+        a: TypeId,
+        b: TypeId,
+        // Optional region tree for TcLevel escape checking.
+        // When present, binding an InferVar from a shallower level
+        // to a type from a deeper scope is rejected. (GHC §TcLevel)
+        region_tree: Option<&super::infer::InferRegionTree>,
+    ) -> Result<TypeId, TypeError> {
         self.unify_seen.borrow_mut().clear();
-        self.unify_internal(a, b, Variance::Invariant)
+        self.unify_internal(a, b, Variance::Invariant, region_tree, 0)
+    }
+    /// Pure query: can `a` and `b` be unified?  Returns `true`/`false`
+    /// without mutating the global unification state.  Uses a temporary
+    /// transaction internally to discard any side effects.
+    pub fn can_unify(&mut self, a: TypeId, b: TypeId) -> bool {
+        self.begin_transaction();
+        let saved_seen = self.unify_seen.borrow().clone();
+        self.unify_seen.borrow_mut().clear();
+        let result = self.unify_internal(a, b, Variance::Invariant, None, 0);
+        *self.unify_seen.borrow_mut() = saved_seen;
+        self.rollback_transaction();
+        result.is_ok()
     }
 
     fn variance_tag(v: Variance) -> u8 {
@@ -2452,6 +3014,128 @@ impl TypeContext {
             Variance::Invariant => 0,
             Variance::Covariant => 1,
             Variance::Contravariant => 2,
+        }
+    }
+
+    /// Snapshot the `unify_seen` cycle-detection cache so a transactional
+    /// query can restore it afterwards (same discipline as `can_unify`).
+    pub(crate) fn save_unify_seen(&self) -> std::collections::HashSet<(TypeId, TypeId, u8)> {
+        self.unify_seen.borrow().clone()
+    }
+
+    /// Restore a previously saved `unify_seen` cache snapshot.
+    pub(crate) fn restore_unify_seen(
+        &self,
+        saved: std::collections::HashSet<(TypeId, TypeId, u8)>,
+    ) {
+        *self.unify_seen.borrow_mut() = saved;
+    }
+
+    /// Whether a type contains a GADT existential skolem anywhere in its
+    /// structure (not just at the top level).  Used by variable-binding
+    /// unification rules to prevent an arm-local witness from escaping
+    /// inside a compound type (e.g. `GenericParam ~ [S]`).
+    pub(crate) fn contains_gadt_skolem(&self, ty: TypeId) -> bool {
+        match self.get(ty) {
+            TypeData::SkolemVar { universe_num, .. }
+                if *universe_num == Self::GADT_SKOLEM_UNIVERSE =>
+            {
+                true
+            }
+            // Non-GADT skolems (HRTB / higher-ranked, different universe)
+            // are NOT existential witnesses — do not over-approximate them.
+            TypeData::SkolemVar { .. } => false,
+            TypeData::Slice { elem } => self.contains_gadt_skolem(*elem),
+            TypeData::Ref { ty: inner, .. } => self.contains_gadt_skolem(*inner),
+            TypeData::Tuple { elems } => elems.iter().any(|&e| self.contains_gadt_skolem(e)),
+            TypeData::Adt { args, .. } => args.iter().any(|&a| self.contains_gadt_skolem(a)),
+            TypeData::Array { elem, .. } => self.contains_gadt_skolem(*elem),
+            TypeData::Pointer { ty: inner } => self.contains_gadt_skolem(*inner),
+            TypeData::Ptr { size, pointee } => {
+                self.contains_gadt_skolem(*size) || self.contains_gadt_skolem(*pointee)
+            }
+            TypeData::Fn { params, ret, .. } => {
+                params.iter().any(|&p| self.contains_gadt_skolem(p))
+                    || self.contains_gadt_skolem(*ret)
+            }
+            TypeData::Exists { base, .. } => self.contains_gadt_skolem(*base),
+            TypeData::Forall { body, .. } => self.contains_gadt_skolem(*body),
+            TypeData::AssociatedType { self_ty, .. } => self.contains_gadt_skolem(*self_ty),
+            TypeData::Coproduct { alternatives } => {
+                alternatives.iter().any(|&a| self.contains_gadt_skolem(a))
+            }
+            TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => {
+                self.contains_gadt_skolem(*body)
+            }
+            TypeData::Poly { body, .. } => self.contains_gadt_skolem(*body),
+            // Leaf / closed types never contain a GADT skolem.
+            TypeData::Int { .. }
+            | TypeData::UInt { .. }
+            | TypeData::Float { .. }
+            | TypeData::Bool
+            | TypeData::Char
+            | TypeData::Byte
+            | TypeData::USize
+            | TypeData::Unit
+            | TypeData::Never
+            | TypeData::Error
+            | TypeData::GenericParam { .. }
+            | TypeData::InferVar { .. }
+            | TypeData::Rational { .. }
+            | TypeData::Regex { .. } => false,
+            // Conservative: unknown forms may contain a skolem.
+            _ => true,
+        }
+    }
+
+    /// Whether the type contains a GenericParam that the current GADT
+    /// context cannot refine (no active `ParamRefinement` fact and no
+    /// binding).  `get` resolves bindings + facts first, so this arm only
+    /// fires for a COMPLETELY unbound GenericParam — one the in-arm unify
+    /// would bind into the global table (seal).  Used by the seal
+    /// discharge guard: a compound expected/body type with an unrefined
+    /// interior GenericParam (e.g. an inert existential witness, or an
+    /// unrelated parameter) must skip the in-arm discharge.
+    pub(crate) fn type_contains_unrefined_generic_param(&self, ty: TypeId) -> bool {
+        // Follow bindings first: a bound GenericParam is no longer
+        // "unrefined" even if the arena still shows the raw param.
+        let resolved = self.resolve_binding(ty);
+        match self.get(resolved) {
+            TypeData::GenericParam { .. } => true,
+            TypeData::Slice { elem } => self.type_contains_unrefined_generic_param(*elem),
+            TypeData::Ref { ty: inner, .. } => self.type_contains_unrefined_generic_param(*inner),
+            TypeData::Tuple { elems } => elems
+                .iter()
+                .any(|&e| self.type_contains_unrefined_generic_param(e)),
+            TypeData::Adt { args, .. } => args
+                .iter()
+                .any(|&a| self.type_contains_unrefined_generic_param(a)),
+            TypeData::Array { elem, .. } => self.type_contains_unrefined_generic_param(*elem),
+            TypeData::Pointer { ty: inner } => self.type_contains_unrefined_generic_param(*inner),
+            TypeData::Ptr { size, pointee } => {
+                self.type_contains_unrefined_generic_param(*size)
+                    || self.type_contains_unrefined_generic_param(*pointee)
+            }
+            TypeData::Fn { params, ret, .. } => {
+                params
+                    .iter()
+                    .any(|&p| self.type_contains_unrefined_generic_param(p))
+                    || self.type_contains_unrefined_generic_param(*ret)
+            }
+            TypeData::Exists { base, .. } => self.type_contains_unrefined_generic_param(*base),
+            TypeData::Forall { body, .. } => self.type_contains_unrefined_generic_param(*body),
+            TypeData::AssociatedType { self_ty, .. } => {
+                self.type_contains_unrefined_generic_param(*self_ty)
+            }
+            TypeData::Coproduct { alternatives } => alternatives
+                .iter()
+                .any(|&a| self.type_contains_unrefined_generic_param(a)),
+            TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => {
+                self.type_contains_unrefined_generic_param(*body)
+            }
+            TypeData::Poly { body, .. } => self.type_contains_unrefined_generic_param(*body),
+            // Leaf / closed types contain no GenericParam.
+            _ => false,
         }
     }
 
@@ -2470,8 +3154,19 @@ impl TypeContext {
         a: TypeId,
         b: TypeId,
         variance: Variance,
+        region_tree: Option<&super::infer::InferRegionTree>,
+        coercion_depth: usize,
     ) -> Result<TypeId, TypeError> {
-        // ── Caching: skip if we've already checked this (a, b, variance) pair ──
+        // ── Cycle detection, NOT a result cache ─────────────────────
+        // `unify_seen` records which (a, b, variance) pairs are already
+        // being visited in the CURRENT recursive descent, so that cyclic
+        // type structures (e.g. recursive ADTs) terminate instead of
+        // looping forever.  It deliberately does NOT memoize the outcome
+        // of a unification: it holds no "success/failure" result, so a
+        // probe inside a transaction (see `can_unify` /
+        // `is_gadt_variant_reachable`) cannot poison later real checks —
+        // entries are removed on error below so a failed attempt can be
+        // retried after rollback.
         let tag = Self::variance_tag(variance);
         let key = (a, b, tag);
         if !self.unify_seen.borrow_mut().insert(key) {
@@ -2479,7 +3174,7 @@ impl TypeContext {
             return Ok(a);
         }
 
-        let result = self.unify_internal_impl(a, b, variance);
+        let result = self.unify_internal_impl(a, b, variance, region_tree, coercion_depth);
 
         // On error, remove the cache entry so future attempts can retry.
         if result.is_err() {
@@ -2495,10 +3190,28 @@ impl TypeContext {
         a: TypeId,
         b: TypeId,
         variance: Variance,
+        region_tree: Option<&super::infer::InferRegionTree>,
+        coercion_depth: usize,
     ) -> Result<TypeId, TypeError> {
+        // Fail-closed: a NONE TypeId is the error-path sentinel (`HirExpr::Error`
+        // reports `ty() == TypeId::NONE`).  It must never reach arena indexing —
+        // the originating error was already reported, so the unify resolves to
+        // the non-NONE side instead of panicking (an ICE on user code).
+        if a == TypeId::NONE {
+            return Ok(b);
+        }
+        if b == TypeId::NONE {
+            return Ok(a);
+        }
         let data_a = self.get_arc(a);
         let data_b = self.get_arc(b);
 
+        // Reflexivity fast path: `unify(T, T)` always succeeds for the
+        // SAME TypeId, including a GADT existential skolem unified with
+        // itself.  This guard runs BEFORE the match below, so the rigid
+        // GADT-skolem arms (which reject skolem vs. anything-else) never
+        // see an identical pair — the `(SkolemVar, SkolemVar)` equality
+        // arm is not shadowed and same-skolem reflexivity is preserved.
         if *data_a == *data_b {
             return Ok(a);
         }
@@ -2510,21 +3223,82 @@ impl TypeContext {
                 TypeData::GenericParam { index: i1, .. },
                 TypeData::GenericParam { index: i2, .. },
             ) if i1 == i2 => Ok(a),
+            // GADT existential skolems are RIGID: a GADT skolem (sentinelled
+            // by `GADT_SKOLEM_UNIVERSE`) can only unify with ITSELF.  It must
+            // never be bound to, or bound by, a `GenericParam`, an outer
+            // `InferVar`, or a concrete type — otherwise the arm-local
+            // existential witness would escape through the outer binder
+            // (SYNTAX.md §"Existential Quantification": "prevented from
+            // leaking into the surrounding context").  Placed BEFORE the
+            // `(_, GenericParam)` / `(InferVar, _)` binding arms so that a
+            // GADT skolem never falls through to a variable-binding rule.
+            (
+                TypeData::SkolemVar {
+                    universe_num: u1, ..
+                },
+                _,
+            ) if *u1 == Self::GADT_SKOLEM_UNIVERSE => {
+                return Err(TypeError::SkolemEscape {
+                    var_id: usize::MAX,
+                    var_level: *u1,
+                    current_level: 0,
+                    span: (*self.current_unify_span.borrow())
+                        .unwrap_or(crate::ast::Span::new(0, 0)),
+                });
+            }
+            (
+                _,
+                TypeData::SkolemVar {
+                    universe_num: u2, ..
+                },
+            ) if *u2 == Self::GADT_SKOLEM_UNIVERSE => {
+                return Err(TypeError::SkolemEscape {
+                    var_id: usize::MAX,
+                    var_level: *u2,
+                    current_level: 0,
+                    span: (*self.current_unify_span.borrow())
+                        .unwrap_or(crate::ast::Span::new(0, 0)),
+                });
+            }
             (TypeData::GenericParam { .. }, _) => {
+                // A GADT skolem must not be bound into a variable through a
+                // compound type (e.g. `GenericParam ~ [S]`): the witness
+                // would escape the arm (SYNTAX.md §"Existential
+                // Quantification").
+                if self.contains_gadt_skolem(b) {
+                    return Err(TypeError::SkolemEscape {
+                        var_id: usize::MAX,
+                        var_level: Self::GADT_SKOLEM_UNIVERSE,
+                        current_level: 0,
+                        span: (*self.current_unify_span.borrow())
+                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                    });
+                }
                 if self.occurs_check(a, b) {
                     return Err(TypeError::RecursiveType {
                         ty: a,
-                        span: crate::ast::Span::new(0, 0), // TODO: pass span from caller
+                        span: (*self.current_unify_span.borrow())
+                            .unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 self.set_binding(a, b);
                 Ok(b)
             }
             (_, TypeData::GenericParam { .. }) => {
+                if self.contains_gadt_skolem(a) {
+                    return Err(TypeError::SkolemEscape {
+                        var_id: usize::MAX,
+                        var_level: Self::GADT_SKOLEM_UNIVERSE,
+                        current_level: 0,
+                        span: (*self.current_unify_span.borrow())
+                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                    });
+                }
                 if self.occurs_check(b, a) {
                     return Err(TypeError::RecursiveType {
                         ty: b,
-                        span: crate::ast::Span::new(0, 0), // TODO: pass span from caller
+                        span: (*self.current_unify_span.borrow())
+                            .unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 self.set_binding(b, a);
@@ -2542,20 +3316,74 @@ impl TypeContext {
                 },
             ) if id1 == id2 && u1 == u2 => Ok(a),
             (TypeData::InferVar { .. }, _) => {
+                // TcLevel escape check (GHC §TcLevel): if the InferVar is
+                // from a shallower region level than the current level,
+                // binding it to a type from a deeper scope is forbidden.
+                if let Some(rt) = region_tree
+                    && let TypeData::InferVar { id } = self.get(a)
+                {
+                    let var_region = rt.region_of_var(*id);
+                    let var_level = rt.get_level(var_region);
+                    let current = rt.current;
+                    let cur_level = rt.get_level(current);
+                    if var_level < cur_level {
+                        return Err(TypeError::SkolemEscape {
+                            var_id: *id,
+                            var_level,
+                            current_level: cur_level,
+                            span: (*self.current_unify_span.borrow())
+                                .unwrap_or(crate::ast::Span::new(0, 0)),
+                        });
+                    }
+                }
                 if self.occurs_check(a, b) {
                     return Err(TypeError::RecursiveType {
                         ty: a,
-                        span: crate::ast::Span::new(0, 0), // TODO: pass span from caller
+                        span: (*self.current_unify_span.borrow())
+                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                    });
+                }
+                // A GADT skolem must not be bound into an InferVar through
+                // a compound type (arm-local witness escaping the arm).
+                if self.contains_gadt_skolem(b) {
+                    return Err(TypeError::SkolemEscape {
+                        var_id: usize::MAX,
+                        var_level: Self::GADT_SKOLEM_UNIVERSE,
+                        current_level: 0,
+                        span: (*self.current_unify_span.borrow())
+                            .unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 self.set_binding(a, b);
                 Ok(b)
             }
             (_, TypeData::InferVar { .. }) => {
+                // Symmetric TcLevel escape check (GHC §TcLevel): if the
+                // InferVar `b` is from a shallower region level than the
+                // current level, binding it to a type from a deeper scope
+                // is forbidden.  Mirrors the check in the (InferVar, _) arm.
+                if let Some(rt) = region_tree
+                    && let TypeData::InferVar { id } = self.get(b)
+                {
+                    let var_region = rt.region_of_var(*id);
+                    let var_level = rt.get_level(var_region);
+                    let current = rt.current;
+                    let cur_level = rt.get_level(current);
+                    if var_level < cur_level {
+                        return Err(TypeError::SkolemEscape {
+                            var_id: *id,
+                            var_level,
+                            current_level: cur_level,
+                            span: (*self.current_unify_span.borrow())
+                                .unwrap_or(crate::ast::Span::new(0, 0)),
+                        });
+                    }
+                }
                 if self.occurs_check(b, a) {
                     return Err(TypeError::RecursiveType {
                         ty: b,
-                        span: crate::ast::Span::new(0, 0), // TODO: pass span from caller
+                        span: (*self.current_unify_span.borrow())
+                            .unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 self.set_binding(b, a);
@@ -2578,7 +3406,13 @@ impl TypeContext {
                 },
             ) if d1 == d2 && a1.len() == a2.len() => {
                 for (t1, t2) in a1.iter().zip(a2.iter()) {
-                    self.unify_internal(*t1, *t2, Variance::Invariant)?;
+                    self.unify_internal(
+                        *t1,
+                        *t2,
+                        Variance::Invariant,
+                        region_tree,
+                        coercion_depth + 1,
+                    )?;
                 }
                 self.set_binding(a, b);
                 Ok(b)
@@ -2590,7 +3424,7 @@ impl TypeContext {
             {
                 let elem_variance = variance.xform(Variance::Covariant);
                 for (t1, t2) in e1.iter().zip(e2.iter()) {
-                    self.unify_internal(*t1, *t2, elem_variance)?;
+                    self.unify_internal(*t1, *t2, elem_variance, region_tree, coercion_depth + 1)?;
                 }
                 self.set_binding(a, b);
                 Ok(b)
@@ -2609,10 +3443,10 @@ impl TypeContext {
             ) if p1.len() == p2.len() => {
                 let param_variance = variance.xform(Variance::Contravariant);
                 for (t1, t2) in p1.iter().zip(p2.iter()) {
-                    self.unify_internal(*t1, *t2, param_variance)?;
+                    self.unify_internal(*t1, *t2, param_variance, region_tree, coercion_depth + 1)?;
                 }
                 let ret_variance = variance.xform(Variance::Covariant);
-                self.unify_internal(*r1, *r2, ret_variance)?;
+                self.unify_internal(*r1, *r2, ret_variance, region_tree, coercion_depth + 1)?;
                 self.set_binding(a, b);
                 Ok(b)
             }
@@ -2622,7 +3456,7 @@ impl TypeContext {
                 if s1 == s2 =>
             {
                 let elem_variance = variance.xform(Variance::Covariant);
-                self.unify_internal(*e1, *e2, elem_variance)?;
+                self.unify_internal(*e1, *e2, elem_variance, region_tree, coercion_depth + 1)?;
                 self.set_binding(a, b);
                 Ok(b)
             }
@@ -2630,7 +3464,7 @@ impl TypeContext {
             // Slice: element is COVARIANT
             (TypeData::Slice { elem: e1 }, TypeData::Slice { elem: e2 }) => {
                 let elem_variance = variance.xform(Variance::Covariant);
-                self.unify_internal(*e1, *e2, elem_variance)?;
+                self.unify_internal(*e1, *e2, elem_variance, region_tree, coercion_depth + 1)?;
                 self.set_binding(a, b);
                 Ok(b)
             }
@@ -2655,19 +3489,49 @@ impl TypeContext {
                 },
             ) => {
                 let allow_mutable_coerce = match variance {
-                    Variance::Invariant => *m1 == *m2,
-                    Variance::Covariant => !(*m1 == false && *m2 == true),
-                    Variance::Contravariant => !(*m2 == false && *m1 == true),
+                    // `@auto_ro` relaxes ONLY at call sites (Invariant — per
+                    // SYNTAX.md "at function call sites and method
+                    // resolution"): the `&mut T` argument (b) may coerce to
+                    // a `&T` parameter (a), the sound direction that
+                    // surrenders mutability.  Structural covariant /
+                    // contravariant positions (function-type returns/params,
+                    // nested reference containers) NEVER relax: the only
+                    // sound mutability coercion is `&mut T → &T`, and
+                    // relaxing there would let a shared reference stand in
+                    // for a mutable one (phantom mutation).
+                    Variance::Invariant => {
+                        // NOTE (language-design committee, 2026-08-05): the
+                        // implicit `@auto_ro`/`@auto_coerce` downgrade below
+                        // does NOT register the source in `frozen_vars`,
+                        // unlike the explicit `&ro` / `.freeze!()` forms —
+                        // under `@auto_ro` the source remains mutable after
+                        // the read-only reborrow.  This divergence is a
+                        // KNOWN limitation: Posita has no lifetime-based
+                        // borrow checker yet, and once one lands the
+                        // read-only guarantee is enforced structurally,
+                        // making the `frozen_vars` bookkeeping moot for the
+                        // implicit form.  `&ro` / `.freeze!()` remain the
+                        // strictly-frozen explicit forms.
+                        *m1 == *m2
+                            || (coercion_depth == 0
+                                && self.current_coercion_ctx.get() == CoercionContext::CallSite
+                                && (self.auto_ro.get() || self.auto_coerce.get())
+                                && *m2 == true
+                                && *m1 == false)
+                    }
+                    Variance::Covariant => *m1 == *m2,
+                    Variance::Contravariant => *m1 == *m2,
                 };
                 if !allow_mutable_coerce {
                     return Err(TypeError::Mismatch {
                         expected: b,
                         found: a,
-                        span: crate::ast::Span::new(0, 0), // TODO: pass span from caller
+                        span: (*self.current_unify_span.borrow())
+                            .unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 let ty_variance = variance.xform(Variance::Invariant);
-                self.unify_internal(*t1, *t2, ty_variance)?;
+                self.unify_internal(*t1, *t2, ty_variance, region_tree, coercion_depth + 1)?;
                 self.set_binding(a, b);
                 Ok(b)
             }
@@ -2677,7 +3541,7 @@ impl TypeContext {
             // conservatively marks them invariant for type safety.
             (TypeData::Pointer { ty: t1 }, TypeData::Pointer { ty: t2 }) => {
                 let ty_variance = variance.xform(Variance::Invariant);
-                self.unify_internal(*t1, *t2, ty_variance)?;
+                self.unify_internal(*t1, *t2, ty_variance, region_tree, coercion_depth + 1)?;
                 self.set_binding(a, b);
                 Ok(b)
             }
@@ -2693,8 +3557,20 @@ impl TypeContext {
                     pointee: p2,
                 },
             ) => {
-                self.unify_internal(*s1, *s2, Variance::Invariant)?;
-                self.unify_internal(*p1, *p2, Variance::Invariant)?;
+                self.unify_internal(
+                    *s1,
+                    *s2,
+                    Variance::Invariant,
+                    region_tree,
+                    coercion_depth + 1,
+                )?;
+                self.unify_internal(
+                    *p1,
+                    *p2,
+                    Variance::Invariant,
+                    region_tree,
+                    coercion_depth + 1,
+                )?;
                 self.set_binding(a, b);
                 Ok(b)
             }
@@ -2706,7 +3582,7 @@ impl TypeContext {
             ) if a1.len() == a2.len() => {
                 let alt_variance = variance.xform(Variance::Covariant);
                 for (t1, t2) in a1.iter().zip(a2.iter()) {
-                    self.unify_internal(*t1, *t2, alt_variance)?;
+                    self.unify_internal(*t1, *t2, alt_variance, region_tree, coercion_depth + 1)?;
                 }
                 self.set_binding(a, b);
                 Ok(b)
@@ -2730,12 +3606,18 @@ impl TypeContext {
                     // α-conversion with capture avoidance: rename BOTH bodies
                     // to a FRESH index that cannot appear free in either body.
                     let fresh_idx = self.fresh_param_index();
-                    let fresh_gp = self.generic_param(fresh_idx, pn2.clone());
+                    let fresh_gp = self.generic_param(fresh_idx, *pn2);
                     let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
                     let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
-                    self.unify_internal(b1_renamed, b2_renamed, body_variance)?;
+                    self.unify_internal(
+                        b1_renamed,
+                        b2_renamed,
+                        body_variance,
+                        region_tree,
+                        coercion_depth + 1,
+                    )?;
                 } else {
-                    self.unify_internal(*b1, *b2, body_variance)?;
+                    self.unify_internal(*b1, *b2, body_variance, region_tree, coercion_depth + 1)?;
                 }
                 self.set_binding(a, b);
                 Ok(b)
@@ -2757,12 +3639,18 @@ impl TypeContext {
                 let base_variance = variance.xform(Variance::Covariant);
                 if *pi1 != *pi2 {
                     let fresh_idx = self.fresh_param_index();
-                    let fresh_gp = self.generic_param(fresh_idx, n2.clone());
+                    let fresh_gp = self.generic_param(fresh_idx, *n2);
                     let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
                     let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
-                    self.unify_internal(b1_renamed, b2_renamed, base_variance)?;
+                    self.unify_internal(
+                        b1_renamed,
+                        b2_renamed,
+                        base_variance,
+                        region_tree,
+                        coercion_depth + 1,
+                    )?;
                 } else {
-                    self.unify_internal(*b1, *b2, base_variance)?;
+                    self.unify_internal(*b1, *b2, base_variance, region_tree, coercion_depth + 1)?;
                 }
                 self.set_binding(a, b);
                 Ok(b)
@@ -2787,12 +3675,18 @@ impl TypeContext {
                 for ((i1, _), (i2, pn2)) in q1.iter().zip(q2.iter()) {
                     if i1 != i2 {
                         let fresh_idx = self.fresh_param_index();
-                        let fresh_gp = self.generic_param(fresh_idx, pn2.clone());
+                        let fresh_gp = self.generic_param(fresh_idx, *pn2);
                         b1_renamed = self.replace_generic(b1_renamed, *i1, fresh_gp);
                         b2_renamed = self.replace_generic(b2_renamed, *i2, fresh_gp);
                     }
                 }
-                self.unify_internal(b1_renamed, b2_renamed, body_variance)?;
+                self.unify_internal(
+                    b1_renamed,
+                    b2_renamed,
+                    body_variance,
+                    region_tree,
+                    coercion_depth + 1,
+                )?;
                 self.set_binding(a, b);
                 Ok(b)
             }
@@ -2813,12 +3707,18 @@ impl TypeContext {
                 let body_variance = variance.xform(Variance::Covariant);
                 if *pi1 != *pi2 {
                     let fresh_idx = self.fresh_param_index();
-                    let fresh_gp = self.generic_param(fresh_idx, pn2.clone());
+                    let fresh_gp = self.generic_param(fresh_idx, *pn2);
                     let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
                     let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
-                    self.unify_internal(b1_renamed, b2_renamed, body_variance)?;
+                    self.unify_internal(
+                        b1_renamed,
+                        b2_renamed,
+                        body_variance,
+                        region_tree,
+                        coercion_depth + 1,
+                    )?;
                 } else {
-                    self.unify_internal(*b1, *b2, body_variance)?;
+                    self.unify_internal(*b1, *b2, body_variance, region_tree, coercion_depth + 1)?;
                 }
                 self.set_binding(a, b);
                 Ok(b)
@@ -2840,12 +3740,18 @@ impl TypeContext {
                 let body_variance = variance.xform(Variance::Covariant);
                 if *pi1 != *pi2 {
                     let fresh_idx = self.fresh_param_index();
-                    let fresh_gp = self.generic_param(fresh_idx, pn2.clone());
+                    let fresh_gp = self.generic_param(fresh_idx, *pn2);
                     let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
                     let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
-                    self.unify_internal(b1_renamed, b2_renamed, body_variance)?;
+                    self.unify_internal(
+                        b1_renamed,
+                        b2_renamed,
+                        body_variance,
+                        region_tree,
+                        coercion_depth + 1,
+                    )?;
                 } else {
-                    self.unify_internal(*b1, *b2, body_variance)?;
+                    self.unify_internal(*b1, *b2, body_variance, region_tree, coercion_depth + 1)?;
                 }
                 self.set_binding(a, b);
                 Ok(b)
@@ -2886,7 +3792,7 @@ impl TypeContext {
                 },
             ) if ti1 == ti2 && n1 == n2 => {
                 let self_variance = variance.xform(Variance::Covariant);
-                self.unify_internal(*s1, *s2, self_variance)?;
+                self.unify_internal(*s1, *s2, self_variance, region_tree, coercion_depth + 1)?;
                 self.set_binding(a, b);
                 Ok(b)
             }
@@ -2905,7 +3811,8 @@ impl TypeContext {
                     Err(TypeError::Mismatch {
                         expected: b,
                         found: a,
-                        span: crate::ast::Span::new(0, 0), // TODO: pass span from caller
+                        span: (*self.current_unify_span.borrow())
+                            .unwrap_or(crate::ast::Span::new(0, 0)),
                     })
                 }
             }
@@ -2913,7 +3820,7 @@ impl TypeContext {
             _ => Err(TypeError::Mismatch {
                 expected: b,
                 found: a,
-                span: crate::ast::Span::new(0, 0), // TODO: pass span from caller
+                span: (*self.current_unify_span.borrow()).unwrap_or(crate::ast::Span::new(0, 0)),
             }),
         }
     }
@@ -2941,17 +3848,17 @@ impl TypeContext {
         // Merge its entries into the parent transaction's log so that if
         // the parent later rolls back, it also undoes changes that were
         // committed by the inner transaction.
-        if let Some(committed_log) = committed {
-            if let Some(parent_log) = self.transaction_stack.borrow_mut().last_mut() {
-                parent_log.extend(committed_log);
-            }
+        if let Some(committed_log) = committed
+            && let Some(parent_log) = self.transaction_stack.borrow_mut().last_mut()
+        {
+            parent_log.extend(committed_log);
         }
         // Merge opaque_hidden undo log into parent as well.
         let committed_opaque = self.opaque_hidden_undo.borrow_mut().pop();
-        if let Some(committed_opaque_log) = committed_opaque {
-            if let Some(parent_log) = self.opaque_hidden_undo.borrow_mut().last_mut() {
-                parent_log.extend(committed_opaque_log);
-            }
+        if let Some(committed_opaque_log) = committed_opaque
+            && let Some(parent_log) = self.opaque_hidden_undo.borrow_mut().last_mut()
+        {
+            parent_log.extend(committed_opaque_log);
         }
         // κ cache may be invalidated by binding changes across transaction boundaries.
         self.kappa_cache.borrow_mut().clear();
@@ -2960,6 +3867,15 @@ impl TypeContext {
 
     /// Rollback the current transaction: reverse-apply every binding change
     /// and opaque_hidden change recorded in this transaction's undo logs.
+    /// Roll back to a previously captured transaction depth (pops exactly
+    /// the frames opened since `depth`).  Prefer this over balancing
+    /// `begin_transaction`/`rollback_transaction` calls by counting.
+    pub fn rollback_to(&self, depth: usize) {
+        while self.transaction_depth() > depth {
+            self.rollback_transaction();
+        }
+    }
+
     /// Also clears the unification cache so subsequent attempts re-evaluate.
     /// Note: the types arena (self.types) is NOT truncated — TypeId values
     /// may be held externally, and the arena is logically append-only.
@@ -2993,6 +3909,52 @@ impl TypeContext {
     /// `self.bindings.borrow_mut().insert(...)` so that transactions can
     /// correctly roll back.
     pub(crate) fn set_binding(&self, key: TypeId, value: TypeId) {
+        // ── Seal-the-wall guard ─────────────────────────────────────
+        // GADT arm processing must never bind a GenericParam into the
+        // global bindings table: refinements live in GadtContext.facts
+        // (scoped, popped with the arm) and resolve_binding consults them
+        // while an arm is active.  A GenericParam bound here while
+        // `arm_depth > 0` means the refinement machinery leaked into the
+        // global table (cross-arm contamination / post-arm leakage).
+        //
+        // Exemption: PATH-COMPRESSION re-writes.  Pattern instantiation
+        // legitimately binds a scrutinee generic param to a synthetic
+        // infer var (`T → ?a`) at arm_depth 0 (before push), and
+        // `resolve_binding` inside the arm then path-compresses that
+        // existing chain — a re-write of an already-bound key to the
+        // SAME resolved type, not a new leak.
+        // Fail closed in ALL builds (not just debug): a seal violation
+        // means the refinement machinery leaked a GenericParam binding
+        // into the global table.  Recoverable: SKIP the binding (do not
+        // pollute the table) and record the violation — no panic (which
+        // would abort the compiler process).
+        if self.gadt.arm_depth.get() > 0
+            && matches!(self.get_raw(key), TypeData::GenericParam { .. })
+        {
+            // Check if this is path compression (re-binding to the same
+            // resolved type) — the ONLY permitted GenericParam binding
+            // inside an arm.  Any DIFFERENT binding is a seal violation.
+            if self.bindings.borrow().contains_key(&key)
+                && self.resolve_binding_no_gadt(key) == value
+            {
+                // Path compression to the same type — no-op, skip the
+                // unnecessary write.
+                return;
+            }
+            self.seal_violations.set(self.seal_violations.get() + 1);
+            return;
+        }
+        // Record the origin span for GenericParam bindings (precise E104
+        // error location).  Only recorded inside a span-carrying unify
+        // (`unify_tracked`); solver-driven bindings record nothing and
+        // E104 falls back to the function span.
+        if matches!(self.get_raw(key), TypeData::GenericParam { .. })
+            && let Some(origin) = *self.current_unify_span.borrow()
+        {
+            self.generic_binding_origins
+                .borrow_mut()
+                .insert(key, origin);
+        }
         if let Some(log) = self.transaction_stack.borrow_mut().last_mut() {
             let old = self.bindings.borrow().get(&key).copied();
             log.push((key, old));
@@ -3020,6 +3982,25 @@ impl TypeContext {
             universe_num: universe,
         });
         (universe, skolem)
+    }
+
+    /// Allocate a fresh SkolemVar for a GADT existential parameter.
+    /// Unlike `enter_universe`, this does NOT increment the universe
+    /// counter — it uses a separate counter (`next_gadt_skolem_id`)
+    /// that is not tied to the Forall-level universe hierarchy.
+    /// This prevents unbounded `next_universe` growth in `while-let`
+    /// loops on existential GADT variants.
+    /// A sentinel universe number for GADT existential skolems.
+    /// Must be larger than any HRTB universe to ensure escape detection.
+    pub const GADT_SKOLEM_UNIVERSE: usize = usize::MAX;
+
+    pub fn fresh_gadt_skolem(&mut self) -> TypeId {
+        let id = self.next_gadt_skolem_id.get();
+        self.next_gadt_skolem_id.set(id + 1);
+        self.alloc(TypeData::SkolemVar {
+            id,
+            universe_num: Self::GADT_SKOLEM_UNIVERSE,
+        })
     }
 
     pub fn check_skolem_escape(&self, ty: TypeId, max_universe: usize) -> Option<usize> {
@@ -3273,7 +4254,7 @@ impl TypeContext {
                 for ((i1, _), (i2, pn2)) in q1.iter().zip(q2.iter()) {
                     if i1 != i2 {
                         let fresh_idx = self.fresh_param_index();
-                        let fresh_gp = self.generic_param(fresh_idx, pn2.clone());
+                        let fresh_gp = self.generic_param(fresh_idx, *pn2);
                         b1_renamed = self.replace_generic(b1_renamed, *i1, fresh_gp);
                         b2_renamed = self.replace_generic(b2_renamed, *i2, fresh_gp);
                     }
@@ -3415,7 +4396,7 @@ impl TypeContext {
                         let new_body = self.subst(*body, &filtered);
                         self.alloc(TypeData::Forall {
                             param_index: *param_index,
-                            param_name: param_name.clone(),
+                            param_name: *param_name,
                             body: new_body,
                         })
                     }
@@ -3423,7 +4404,7 @@ impl TypeContext {
                     let new_body = self.subst(*body, subst);
                     self.alloc(TypeData::Forall {
                         param_index: *param_index,
-                        param_name: param_name.clone(),
+                        param_name: *param_name,
                         body: new_body,
                     })
                 }
@@ -3441,7 +4422,7 @@ impl TypeContext {
                         let new_body = self.subst(*body, &filtered);
                         self.alloc(TypeData::Mu {
                             param_index: *param_index,
-                            param_name: param_name.clone(),
+                            param_name: *param_name,
                             body: new_body,
                         })
                     }
@@ -3449,7 +4430,7 @@ impl TypeContext {
                     let new_body = self.subst(*body, subst);
                     self.alloc(TypeData::Mu {
                         param_index: *param_index,
-                        param_name: param_name.clone(),
+                        param_name: *param_name,
                         body: new_body,
                     })
                 }
@@ -3467,7 +4448,7 @@ impl TypeContext {
                         let new_body = self.subst(*body, &filtered);
                         self.alloc(TypeData::Nu {
                             param_index: *param_index,
-                            param_name: param_name.clone(),
+                            param_name: *param_name,
                             body: new_body,
                         })
                     }
@@ -3475,7 +4456,7 @@ impl TypeContext {
                     let new_body = self.subst(*body, subst);
                     self.alloc(TypeData::Nu {
                         param_index: *param_index,
-                        param_name: param_name.clone(),
+                        param_name: *param_name,
                         body: new_body,
                     })
                 }
@@ -3493,7 +4474,7 @@ impl TypeContext {
                         let new_base = self.subst(*base, &filtered);
                         let new_id = self.alloc(TypeData::Exists {
                             param_index: *param_index,
-                            name: name.clone(),
+                            name: *name,
                             base: new_base,
                         });
                         // Copy the original Exists meta (invariant, default_value) to the new node
@@ -3506,7 +4487,7 @@ impl TypeContext {
                     let new_base = self.subst(*base, subst);
                     let new_id = self.alloc(TypeData::Exists {
                         param_index: *param_index,
-                        name: name.clone(),
+                        name: *name,
                         base: new_base,
                     });
                     // Copy the original Exists meta (invariant, default_value) to the new node
@@ -3527,9 +4508,172 @@ impl TypeContext {
                 self_ty,
             } => {
                 let new_self = self.subst(*self_ty, subst);
-                self.associated_type(*trait_id, name.clone(), new_self)
+                self.associated_type(*trait_id, *name, new_self)
             }
             _ => ty,
+        }
+    }
+
+    /// Walk a type tree and replace every occurrence of any `TypeId` that
+    /// appears as a key in `replacements` with the corresponding value.
+    /// Uses a worklist to avoid recursive self-calls and borrow conflicts.
+    /// TODO: wire into cross-arm type abstraction in match-arm exit path.
+    #[allow(dead_code)]
+    pub fn replace_type_ids(
+        &mut self,
+        ty: TypeId,
+        replacements: &std::collections::HashMap<TypeId, TypeId>,
+    ) -> TypeId {
+        if let Some(&replacement) = replacements.get(&ty) {
+            return replacement;
+        }
+        let resolved = self.resolve_binding(ty);
+        // Also check the resolved type: if `ty → B` via bindings and
+        // `replacements[B] = C`, we must return C, not process B's
+        // structure as if unmodified.
+        if resolved != ty
+            && let Some(&replacement) = replacements.get(&resolved)
+        {
+            return replacement;
+        }
+        let data = self.types[resolved.index()].clone();
+        match &*data {
+            TypeData::Int { .. }
+            | TypeData::UInt { .. }
+            | TypeData::Float { .. }
+            | TypeData::Bool
+            | TypeData::Char
+            | TypeData::Byte
+            | TypeData::USize
+            | TypeData::Never
+            | TypeData::Unit
+            | TypeData::Error
+            | TypeData::InferVar { .. }
+            | TypeData::GenericParam { .. } => ty,
+            TypeData::Adt { kind, def_id, args } => {
+                let new_args: Vec<TypeId> = args
+                    .iter()
+                    .map(|&a| self.replace_type_ids(a, replacements))
+                    .collect();
+                self.alloc(TypeData::Adt {
+                    kind: *kind,
+                    def_id: *def_id,
+                    args: new_args,
+                })
+            }
+            TypeData::Tuple { elems } => {
+                let new_elems: Vec<TypeId> = elems
+                    .iter()
+                    .map(|&e| self.replace_type_ids(e, replacements))
+                    .collect();
+                self.tuple(new_elems)
+            }
+            TypeData::Array { elem, size } => {
+                let e = self.replace_type_ids(*elem, replacements);
+                self.array(e, *size)
+            }
+            TypeData::Slice { elem } => {
+                let e = self.replace_type_ids(*elem, replacements);
+                self.slice(e)
+            }
+            TypeData::Ref { ty: rt, mutable } => {
+                let r = self.replace_type_ids(*rt, replacements);
+                self.reference(r, *mutable)
+            }
+            TypeData::Pointer { ty: pt } => {
+                let p = self.replace_type_ids(*pt, replacements);
+                self.pointer(p)
+            }
+            TypeData::Ptr { size, pointee } => {
+                let ns = self.replace_type_ids(*size, replacements);
+                let np = self.replace_type_ids(*pointee, replacements);
+                self.ptr(ns, np)
+            }
+            TypeData::Fn { params, ret } => {
+                let new_ret = self.replace_type_ids(*ret, replacements);
+                let new_params: Vec<TypeId> = params
+                    .iter()
+                    .map(|&p| self.replace_type_ids(p, replacements))
+                    .collect();
+                self.function(new_params, new_ret)
+            }
+            TypeData::Poly { quantifiers, body } => {
+                let b = self.replace_type_ids(*body, replacements);
+                self.poly(quantifiers.clone(), b)
+            }
+            TypeData::Forall {
+                param_index,
+                param_name,
+                body,
+            } => {
+                let b = self.replace_type_ids(*body, replacements);
+                self.alloc(TypeData::Forall {
+                    param_index: *param_index,
+                    param_name: *param_name,
+                    body: b,
+                })
+            }
+            TypeData::Mu {
+                param_index,
+                param_name,
+                body,
+            } => {
+                let b = self.replace_type_ids(*body, replacements);
+                self.alloc(TypeData::Mu {
+                    param_index: *param_index,
+                    param_name: *param_name,
+                    body: b,
+                })
+            }
+            TypeData::Nu {
+                param_index,
+                param_name,
+                body,
+            } => {
+                let b = self.replace_type_ids(*body, replacements);
+                self.alloc(TypeData::Nu {
+                    param_index: *param_index,
+                    param_name: *param_name,
+                    body: b,
+                })
+            }
+            TypeData::Coproduct { alternatives } => {
+                let new_alts: Vec<TypeId> = alternatives
+                    .iter()
+                    .map(|&a| self.replace_type_ids(a, replacements))
+                    .collect();
+                self.coproduct(new_alts)
+            }
+            TypeData::Exists {
+                param_index,
+                name,
+                base,
+            } => {
+                let b = self.replace_type_ids(*base, replacements);
+                self.alloc(TypeData::Exists {
+                    param_index: *param_index,
+                    name: *name,
+                    base: b,
+                })
+            }
+            TypeData::AssociatedType {
+                trait_id,
+                name,
+                self_ty,
+            } => {
+                let s = self.replace_type_ids(*self_ty, replacements);
+                self.alloc(TypeData::AssociatedType {
+                    trait_id: *trait_id,
+                    name: *name,
+                    self_ty: s,
+                })
+            }
+            TypeData::DynTrait { .. }
+            | TypeData::Rational { .. }
+            | TypeData::SkolemVar { .. }
+            | TypeData::Regex { .. }
+            | TypeData::Opaque { .. }
+            | TypeData::Type { .. } => ty,
         }
     }
 
@@ -3620,10 +4764,10 @@ impl TypeContext {
     }
 
     pub fn is_integer(&self, ty: TypeId) -> bool {
-        match self.get(ty) {
-            TypeData::Int { .. } | TypeData::UInt { .. } | TypeData::USize => true,
-            _ => false,
-        }
+        matches!(
+            self.get(ty),
+            TypeData::Int { .. } | TypeData::UInt { .. } | TypeData::USize
+        )
     }
 
     pub fn is_unsigned(&self, ty: TypeId) -> bool {
@@ -4521,11 +5665,9 @@ impl TypeContext {
 
         for &(from, to, sign) in &graph.edges {
             // Only consider edges where BOTH ends are in the remaining subgraph.
-            if undetermined_set.contains(&from) && undetermined_set.contains(&to) {
-                if sign != 1 {
-                    has_non_covariant = true;
-                    break;
-                }
+            if undetermined_set.contains(&from) && undetermined_set.contains(&to) && sign != 1 {
+                has_non_covariant = true;
+                break;
             }
         }
 
@@ -4758,6 +5900,14 @@ pub enum TypeError {
     InvariantViolation {
         ty: TypeId,
         expr: String,
+        span: crate::ast::Span,
+    },
+    /// Skolem escape: a type variable was unified with a type from a deeper
+    /// scope (e.g. a GADT arm), violating the level invariant.
+    SkolemEscape {
+        var_id: usize,
+        var_level: usize,
+        current_level: usize,
         span: crate::ast::Span,
     },
     MutableBorrow {
@@ -5815,4 +6965,24 @@ fn test_occurs_check_through_binding() {
         ctx.occurs_check(param, ty),
         "occurs_check should find param through binding chain ty→mid→param"
     );
+}
+
+/// Witness solving is opt-in and explicit: `resolve_existential_witness`
+/// is the single observation point — an INERT existential equation
+/// registered via `register_existential_equation` is returned to
+/// consumers that explicitly ask, and never leaks into `resolve_binding`.
+#[test]
+fn test_resolve_existential_witness_opt_in() {
+    let mut ctx = TypeContext::new();
+    ctx.push_gadt_arm();
+    let skolem = ctx.generic_param(0, Symbol::intern("X"));
+    let concrete = ctx.int(32, true);
+    ctx.register_existential_equation(skolem, concrete);
+    // Explicit opt-in observation:
+    assert_eq!(ctx.resolve_existential_witness(skolem), Some(concrete));
+    // Opacity is the default — resolve_binding must NOT follow it:
+    assert_eq!(ctx.resolve_binding(skolem), skolem);
+    // Unknown skolem: no witness.
+    let other = ctx.generic_param(1, Symbol::intern("Y"));
+    assert_eq!(ctx.resolve_existential_witness(other), None);
 }

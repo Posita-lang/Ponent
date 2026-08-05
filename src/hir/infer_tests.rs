@@ -197,7 +197,7 @@ fn test_add_constraint_eq() {
     let int32 = ctx.int(32, true);
 
     // Eq(a, b) with b bound to Int<32>
-    infer.add_constraint(Constraint::Eq(a, b, span()));
+    infer.add_constraint(Constraint::Eq(a, b, span(), EqOrigin::Normal));
     ctx.set_binding(b, int32);
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
@@ -218,7 +218,7 @@ fn test_add_constraint_sub() {
 
     // Sub(a, b) + Eq(b, int32) — Sub records bounds, Eq resolves b
     infer.add_constraint(Constraint::Sub(a, b, span()));
-    infer.add_constraint(Constraint::Eq(b, int32, span()));
+    infer.add_constraint(Constraint::Eq(b, int32, span(), EqOrigin::Normal));
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
     assert!(result.is_ok(), "sub solve should succeed: {:?}", result);
@@ -239,7 +239,7 @@ fn test_add_constraint_mismatch_fails() {
     let bool_ty = ctx.bool();
     let int32 = ctx.int(32, true);
 
-    infer.add_constraint(Constraint::Eq(a, bool_ty, span()));
+    infer.add_constraint(Constraint::Eq(a, bool_ty, span(), EqOrigin::Normal));
     ctx.set_binding(a, int32);
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
@@ -334,7 +334,7 @@ fn test_suspend_on_var_basic() {
     let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let id = infer_var_id(&ctx, var);
 
-    let cst = Constraint::Eq(ctx.bool(), ctx.bool(), span());
+    let cst = Constraint::Eq(ctx.bool(), ctx.bool(), span(), EqOrigin::Normal);
     infer.suspend_on_var(cst, id);
 
     // After suspend_on_var, the constraint is moved to the wait list
@@ -369,7 +369,7 @@ fn test_suspend_on_var_adds_guard() {
     let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let id = infer_var_id(&ctx, var);
 
-    let cst = Constraint::Eq(ctx.bool(), ctx.bool(), span());
+    let cst = Constraint::Eq(ctx.bool(), ctx.bool(), span(), EqOrigin::Normal);
     infer.suspend_on_var(cst, id);
 
     // Suspending a constraint should add a guard (PG state)
@@ -426,7 +426,7 @@ fn test_force_generalize_pg_with_waitlist_stays_pg() {
     let id = infer_var_id(&ctx, var);
 
     // Suspend a constraint — adds guard AND wait list entry
-    let cst = Constraint::Eq(ctx.bool(), ctx.bool(), span());
+    let cst = Constraint::Eq(ctx.bool(), ctx.bool(), span(), EqOrigin::Normal);
     infer.suspend_on_var(cst, id);
 
     let generalized = infer.force_root_generalization(&mut ctx);
@@ -675,7 +675,7 @@ fn test_s_exists_lower_forall() {
     let fn_ty = ctx.function(vec![p0], p0);
     let forall = ctx.forall(0, "X".into(), fn_ty);
     // The Eq constraint gives the Z3/unicity check a concrete type to work with
-    infer.add_constraint(Constraint::Eq(var, forall, span()));
+    infer.add_constraint(Constraint::Eq(var, forall, span(), EqOrigin::Normal));
     infer.add_guard(id);
     infer.exit_level(prev);
 
@@ -700,8 +700,8 @@ fn test_solve_multiple_eq() {
     let int32 = ctx.int(32, true);
 
     // Chain: a == b == c, with c bound to Int<32>
-    infer.add_constraint(Constraint::Eq(a, b, span()));
-    infer.add_constraint(Constraint::Eq(b, c, span()));
+    infer.add_constraint(Constraint::Eq(a, b, span(), EqOrigin::Normal));
+    infer.add_constraint(Constraint::Eq(b, c, span(), EqOrigin::Normal));
     ctx.set_binding(c, int32);
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
@@ -732,7 +732,7 @@ fn test_solve_eq_with_guard() {
     infer.add_guard(a_id);
 
     // Eq(a, b) with b bound to Int<32>
-    infer.add_constraint(Constraint::Eq(a, b, span()));
+    infer.add_constraint(Constraint::Eq(a, b, span(), EqOrigin::Normal));
     ctx.set_binding(b, int32);
 
     // Solve should handle guarded variables correctly
@@ -758,7 +758,7 @@ fn test_solve_subtype_constraint() {
 
     // Sub(a, b) and Eq(b, Int<32>) — Sub records bounds, Eq resolves b
     infer.add_constraint(Constraint::Sub(a, b, span()));
-    infer.add_constraint(Constraint::Eq(b, int32, span()));
+    infer.add_constraint(Constraint::Eq(b, int32, span(), EqOrigin::Normal));
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
     assert!(result.is_ok(), "subtype solve should succeed: {:?}", result);
@@ -780,7 +780,7 @@ fn test_solve_with_promotion() {
     infer.exit_level(prev);
 
     let int32 = ctx.int(32, true);
-    infer.add_constraint(Constraint::Eq(deep, shallow, span()));
+    infer.add_constraint(Constraint::Eq(deep, shallow, span(), EqOrigin::Normal));
     ctx.set_binding(shallow, int32);
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
@@ -817,7 +817,7 @@ fn test_solve_cross_branch_promotion() {
     infer.exit_level(_r2);
 
     let int32 = ctx.int(32, true);
-    infer.add_constraint(Constraint::Eq(a_deep, b_deep, span()));
+    infer.add_constraint(Constraint::Eq(a_deep, b_deep, span(), EqOrigin::Normal));
     ctx.set_binding(b_deep, int32);
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
@@ -857,7 +857,7 @@ fn test_solve_cross_branch_mismatch_fails() {
     ctx.set_binding(a, bool_ty);
     ctx.set_binding(b, int32);
 
-    infer.add_constraint(Constraint::Eq(a, b, span()));
+    infer.add_constraint(Constraint::Eq(a, b, span(), EqOrigin::Normal));
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
     assert!(result.is_err(), "Bool vs Int cross-branch should fail");
 }
@@ -975,8 +975,8 @@ fn test_solve_pipeline_end_to_end() {
     let c = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let int32 = ctx.int(32, true);
 
-    infer.add_constraint(Constraint::Eq(a, b, span()));
-    infer.add_constraint(Constraint::Eq(b, c, span()));
+    infer.add_constraint(Constraint::Eq(a, b, span(), EqOrigin::Normal));
+    infer.add_constraint(Constraint::Eq(b, c, span(), EqOrigin::Normal));
     ctx.set_binding(c, int32);
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
@@ -1026,7 +1026,7 @@ fn test_solve_pipeline_with_promotion_and_generalization() {
     let int32 = ctx.int(32, true);
 
     // Eq(deep, shallow) should promote deep to shallow's level
-    infer.add_constraint(Constraint::Eq(deep, shallow, span()));
+    infer.add_constraint(Constraint::Eq(deep, shallow, span(), EqOrigin::Normal));
     ctx.set_binding(shallow, int32);
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
@@ -1205,7 +1205,7 @@ fn test_kind_check_integer_unified_with_bool_fails() {
     let bool_ty = ctx.bool();
 
     // Unifying an Integer variable with Bool should fail kind checking
-    infer.add_constraint(Constraint::Eq(int_var, bool_ty, span()));
+    infer.add_constraint(Constraint::Eq(int_var, bool_ty, span(), EqOrigin::Normal));
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
     assert!(result.is_err(), "Integer var unified with Bool should fail");
 }
@@ -1219,7 +1219,7 @@ fn test_kind_check_float_unified_with_int_fails() {
     let float_var = infer.new_type_var(&mut ctx, TypeVariableKind::Float, VarOrigin::Synthetic);
     let int32 = ctx.int(32, true);
 
-    infer.add_constraint(Constraint::Eq(float_var, int32, span()));
+    infer.add_constraint(Constraint::Eq(float_var, int32, span(), EqOrigin::Normal));
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
     assert!(
         result.is_err(),
@@ -1243,7 +1243,7 @@ fn test_forall_constraint_creates_skolem() {
     let alpha_id = infer_var_id(&ctx, alpha);
     let int32 = ctx.int(32, true);
 
-    let body = Constraint::Eq(alpha, int32, span());
+    let body = Constraint::Eq(alpha, int32, span(), EqOrigin::Normal);
     infer.add_constraint(Constraint::Forall {
         var_id: alpha_id,
         constraint: Box::new(body),
@@ -1270,7 +1270,7 @@ fn test_forall_skolem_does_not_leak_after_body() {
 
     infer.add_constraint(Constraint::Forall {
         var_id: alpha_id,
-        constraint: Box::new(Constraint::Eq(alpha, alpha, span())),
+        constraint: Box::new(Constraint::Eq(alpha, alpha, span(), EqOrigin::Normal)),
         span: span(),
     });
 
@@ -1312,7 +1312,7 @@ fn test_forall_skolem_restored_after_body_error() {
 
     infer.add_constraint(Constraint::Forall {
         var_id: alpha_id,
-        constraint: Box::new(Constraint::Eq(alpha, int32, span())),
+        constraint: Box::new(Constraint::Eq(alpha, int32, span(), EqOrigin::Normal)),
         span: span(),
     });
 
@@ -1344,7 +1344,7 @@ fn test_exists_constraint_foralls_skolem_escape() {
     let alpha_id = infer_var_id(&ctx, alpha);
     let int32 = ctx.int(32, true);
 
-    let body = Constraint::Eq(alpha, int32, span());
+    let body = Constraint::Eq(alpha, int32, span(), EqOrigin::Normal);
     infer.add_constraint(Constraint::Exists {
         var_id: alpha_id,
         constraint: Box::new(body),
@@ -1392,7 +1392,12 @@ fn test_instance_constraint_mismatch_rejected() {
     // Constrain instance_var to the bad type — Instance should replace both
     // occurrences of T with the SAME fresh variable, so Fn(Int<32>, Bool) must
     // fail because one fresh var would have to unify with both Int<32> and Bool.
-    infer.add_constraint(Constraint::Eq(instance_var, bad_fn, span()));
+    infer.add_constraint(Constraint::Eq(
+        instance_var,
+        bad_fn,
+        span(),
+        EqOrigin::Normal,
+    ));
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
     assert!(
@@ -1424,7 +1429,12 @@ fn test_instance_constraint_valid_instantiation_succeeds() {
         span: span(),
     });
     // Constrain instance_var to the expected type after instantiation
-    infer.add_constraint(Constraint::Eq(instance_var, good_fn, span()));
+    infer.add_constraint(Constraint::Eq(
+        instance_var,
+        good_fn,
+        span(),
+        EqOrigin::Normal,
+    ));
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
     assert!(
@@ -1447,7 +1457,7 @@ fn test_error_type_mismatch_on_incompatible_types() {
     let int32 = ctx.int(32, true);
 
     // a is unified with Bool, then bound to Int<32> — conflict
-    infer.add_constraint(Constraint::Eq(a, bool_ty, span()));
+    infer.add_constraint(Constraint::Eq(a, bool_ty, span(), EqOrigin::Normal));
     ctx.set_binding(a, int32);
 
     let result = infer.solve(&mut ctx, &trait_env, &symbols);
@@ -1501,7 +1511,12 @@ fn test_forall_match_unicity_does_not_treat_skolem_as_free_var() {
     // is Eq(Bool, Int<32>) which always fails if executed.
     let branches = vec![crate::hir::infer::MatchBranchSet {
         shape_pattern: PrincipalShape::Arrow,
-        continuation: vec![Constraint::Eq(ctx.bool(), ctx.int(32, true), span())],
+        continuation: vec![Constraint::Eq(
+            ctx.bool(),
+            ctx.int(32, true),
+            span(),
+            EqOrigin::Normal,
+        )],
         else_continuation: Vec::new(),
     }];
     let bid = infer.register_match_branches(branches);
@@ -1562,7 +1577,7 @@ fn test_forall_skolem_cannot_unify_with_free_infer_var() {
 
     infer.add_constraint(Constraint::Forall {
         var_id: alpha_id,
-        constraint: Box::new(Constraint::Eq(alpha, beta, span())),
+        constraint: Box::new(Constraint::Eq(alpha, beta, span(), EqOrigin::Normal)),
         span: span(),
     });
 

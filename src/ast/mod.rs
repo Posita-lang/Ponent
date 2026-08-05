@@ -64,6 +64,9 @@ pub enum UnaryOp {
     Deref,
     Ref,
     RefMut,
+    /// Read-only borrow: `&ro r` freezes a `&mut T` into a `&T`
+    /// (SYNTAX.md §"Reference Coercion and Read-Only Borrows").
+    Ro,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +178,9 @@ pub enum Expr {
     },
     LeaveWith {
         expr: Box<Expr>,
+        /// `true` if from `return expr` (value return),
+        /// `false` if from `leave with expr` (error propagation).
+        is_return: bool,
         span: Span,
     },
     Await {
@@ -193,6 +199,7 @@ pub enum Expr {
         scrutinee: Box<Expr>,
         then_branch: Vec<Stmt>,
         else_branch: Option<Vec<Stmt>>,
+        is_expression: bool,
         span: Span,
     },
     Match {
@@ -280,6 +287,11 @@ pub enum CaptureMode {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+// `#[non_exhaustive]` forces DOWNSTREAM matches to add a `_` arm for
+// future variants (within this crate, matches stay exhaustive).  The
+// `@auto_ro`/`@auto_coerce` placement validation is kept fail-closed
+// via its own wildcard arm (see `validate_auto_ro_placement`).
+#[non_exhaustive]
 pub enum Stmt {
     VariableDef {
         kind: VariableKind,
@@ -437,6 +449,8 @@ pub enum Stmt {
     },
     ScopeCleanup {
         name: Symbol,
+        /// Optional compile-time guard: `scope_cleanup @name when condition { }`
+        when_condition: Option<Box<Expr>>,
         body: Vec<Stmt>,
         propagates: bool,
         overrides: bool,
@@ -577,9 +591,22 @@ pub struct WherePredicate {
     pub span: Span,
 }
 
+/// An equality constraint in a where clause: `where T == Int<32>`.
+/// The left side must name a generic parameter; the right side is the
+/// concrete type it is constrained to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WhereEquality {
+    pub left: Type,
+    pub right: Type,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WhereClause {
     pub predicates: Vec<WherePredicate>,
+    /// Equality constraints: `where T == Int<32>`.
+    /// Params constrained here are exempt from the E104 generality check.
+    pub equalities: Vec<WhereEquality>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -594,7 +621,25 @@ pub struct StructField {
 pub struct EnumVariant {
     pub name: Symbol,
     pub payload: Option<Type>,
+    /// GADT constraints: `(T, Int<32>)` means `T == Int<32>`.
+    /// Parsed from `when T == ConcreteType [and ...]`.
+    /// Only type equality constraints are supported.
+    pub eq_spec: Vec<(Symbol, Type)>,
+    /// Existentially quantified type variables: `exists X, Y`.
+    /// These are scoped to the variant's fields and `when` clause.
+    pub exists_params: Vec<Symbol>,
     pub span: Span,
+}
+
+impl EnumVariant {
+    /// Whether this variant is a GADT constructor — i.e. it carries either
+    /// `when` type constraints (`eq_spec`) or existentially quantified
+    /// type variables (`exists_params`).  An explicit predicate (mirroring
+    /// Dromedary's `is_constr_generalized`) so call sites do not have to
+    /// inline `!eq_spec.is_empty() || !exists_params.is_empty()`.
+    pub fn is_gadt(&self) -> bool {
+        !self.eq_spec.is_empty() || !self.exists_params.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

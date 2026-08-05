@@ -322,7 +322,7 @@ fn canonicalize_type(ctx: &TypeContext, ty: TypeId, bound: &mut Vec<usize>) -> C
             self_ty,
         } => CanonTy::AssociatedType {
             trait_id: *trait_id,
-            name: name.clone(),
+            name: *name,
             self_ty: Box::new(canonicalize_type(ctx, *self_ty, bound)),
         },
         TypeData::DynTrait { traits } => CanonTy::DynTrait {

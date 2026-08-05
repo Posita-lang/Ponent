@@ -51,6 +51,13 @@ pub enum Command {
         #[arg(long, help = "Output diagnostics as JSON (instead of colored text)")]
         json: bool,
     },
+    /// Parse, resolve, and type-check a source file without generating code.
+    /// Exits 0 on success, 1 if any errors were reported.
+    Check {
+        file: String,
+        #[arg(long, help = "Output diagnostics as JSON (instead of colored text)")]
+        json: bool,
+    },
     /// Show detailed explanation for an error code (e.g. `ponent explain E030`).
     /// Without a code, lists all available error codes.
     Explain {

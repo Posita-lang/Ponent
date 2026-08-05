@@ -259,11 +259,15 @@ pub fn register_builtins(
         let ok_variant = EnumVariant {
             name: Symbol::intern("Ok"),
             payload: Some(Type::Path(vec![Symbol::intern("T")], Span::new(0, 0))),
+            eq_spec: Vec::new(),
+            exists_params: Vec::new(),
             span: Span::new(0, 0),
         };
         let err_variant = EnumVariant {
             name: Symbol::intern("Err"),
             payload: Some(Type::Path(vec![Symbol::intern("E")], Span::new(0, 0))),
+            eq_spec: Vec::new(),
+            exists_params: Vec::new(),
             span: Span::new(0, 0),
         };
         let binding = TypeBinding {
@@ -307,11 +311,15 @@ pub fn register_builtins(
         let none_variant = EnumVariant {
             name: Symbol::intern("None"),
             payload: None,
+            eq_spec: Vec::new(),
+            exists_params: Vec::new(),
             span: Span::new(0, 0),
         };
         let some_variant = EnumVariant {
             name: Symbol::intern("Some"),
             payload: Some(Type::Path(vec![Symbol::intern("T")], Span::new(0, 0))),
+            eq_spec: Vec::new(),
+            exists_params: Vec::new(),
             span: Span::new(0, 0),
         };
         let binding = TypeBinding {
@@ -370,6 +378,8 @@ pub fn register_builtins(
         let output_variant = EnumVariant {
             name: Symbol::intern("Output"),
             payload: Some(Type::Path(vec![Symbol::intern("T")], Span::new(0, 0))),
+            eq_spec: Vec::new(),
+            exists_params: Vec::new(),
             span: Span::new(0, 0),
         };
         let binding = TypeBinding {

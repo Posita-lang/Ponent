@@ -435,12 +435,11 @@ fn resolve_single_ast_type(
 ) -> TypeId {
     match ty {
         Type::Path(path, _) => {
-            if let Some(symbols) = symbols {
-                if let Some(def_id) = symbols.lookup_type_by_path(path) {
-                    if let Some(ty_id) = ctx.get_type_id_for_def_id(def_id) {
-                        return ty_id;
-                    }
-                }
+            if let Some(symbols) = symbols
+                && let Some(def_id) = symbols.lookup_type_by_path(path)
+                && let Some(ty_id) = ctx.get_type_id_for_def_id(def_id)
+            {
+                return ty_id;
             }
             // Fallback: try to match known names.
             if path.len() == 1 {

@@ -444,11 +444,11 @@ impl SmtSolver {
             }
         };
 
-        if let Some(mut stdin) = child.stdin.take() {
-            if stdin.write_all(smt_with_limits.as_bytes()).is_err() {
-                let _ = child.kill();
-                return SmtResult::Error("stdin write failed".into());
-            }
+        if let Some(mut stdin) = child.stdin.take()
+            && stdin.write_all(smt_with_limits.as_bytes()).is_err()
+        {
+            let _ = child.kill();
+            return SmtResult::Error("stdin write failed".into());
         }
 
         let output = match child.wait_with_output() {
@@ -494,7 +494,7 @@ impl SmtSolver {
                 if unique_shape.is_some() {
                     return None; // multiple shapes possible — ambiguous
                 }
-                unique_shape = Some(shape_names[i].1.clone());
+                unique_shape = Some(shape_names[i].1);
             }
         }
         unique_shape

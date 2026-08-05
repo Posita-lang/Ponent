@@ -1614,10 +1614,10 @@ impl SearchGraph {
 
     /// Classify a cycle based on the goal's trait kind.
     fn classify_cycle_kind(key: &GoalKey, delegate: &dyn SolverDelegate) -> PathKind {
-        if let Some(trait_id) = key.trait_id {
-            if delegate.trait_is_coinductive(trait_id) {
-                return PathKind::Coinductive;
-            }
+        if let Some(trait_id) = key.trait_id
+            && delegate.trait_is_coinductive(trait_id)
+        {
+            return PathKind::Coinductive;
         }
         match key.kind {
             GoalKind::Sized | GoalKind::CopyLike => PathKind::Coinductive,

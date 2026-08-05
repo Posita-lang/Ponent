@@ -209,11 +209,11 @@ impl Humanizer for DiagnosticKind {
                 ..
             } => {
                 let mut msg = format!("type mismatch: expected `{expected}`, found `{found}`");
-                if let Some(ctx) = context {
-                    if !matches!(ctx, TypeCtx::Unspecified) {
-                        use std::fmt::Write;
-                        let _ = write!(msg, " ({ctx})");
-                    }
+                if let Some(ctx) = context
+                    && !matches!(ctx, TypeCtx::Unspecified)
+                {
+                    use std::fmt::Write;
+                    let _ = write!(msg, " ({ctx})");
                 }
                 if let Some(r) = reason {
                     use std::fmt::Write;

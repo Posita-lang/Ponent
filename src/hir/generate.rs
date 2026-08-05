@@ -113,7 +113,7 @@ impl<'a> GenerateExpander<'a> {
                     let before = result.len();
                     if self.symbols.is_some() {
                         // Phase 2: full expansion with @typeInfo! support.
-                        self.expand_generate_block(for_type, body, span, &mut result);
+                        self.expand_generate_block(&for_type, body, span, &mut result);
                     } else {
                         // Phase 1: preserve the Generate node so Phase 2 can
                         // evaluate @typeInfo! conditions and expand it properly.
@@ -141,7 +141,7 @@ impl<'a> GenerateExpander<'a> {
     /// name-mapped templates.
     fn expand_generate_block(
         &mut self,
-        for_type: Box<Type>,
+        for_type: &Type,
         body: Vec<Stmt>,
         _span: Span,
         result: &mut Vec<Stmt>,
@@ -253,12 +253,11 @@ impl<'a> GenerateExpander<'a> {
                     // `@typeInfo!(T).variants.len` — runtime syntax, rejected.
                     return CondValue::Bool(false);
                 }
-                if field.eq_str("name") {
-                    if let Expr::TypeInfo(ty, _) = base.as_ref() {
-                        if let Some(ty_id) = self.resolve_type_ast(ty, _symbols) {
-                            return CondValue::Str(type_name(self.ctx, ty_id, Some(_symbols)));
-                        }
-                    }
+                if field.eq_str("name")
+                    && let Expr::TypeInfo(ty, _) = base.as_ref()
+                    && let Some(ty_id) = self.resolve_type_ast(ty, _symbols)
+                {
+                    return CondValue::Str(type_name(self.ctx, ty_id, Some(_symbols)));
                 }
                 // Unknown field access — return empty string (falsy).
                 CondValue::Str(String::new())
@@ -267,32 +266,25 @@ impl<'a> GenerateExpander<'a> {
                 // `@typeInfo!(T).fields'len` is parsed as:
                 //   AttrAccess { base: FieldAccess { base: TypeInfo, field: "fields" }, attr: "len" }
                 // Same for `variants'len`.
-                if attr.eq_str("len") {
-                    if let Expr::FieldAccess {
+                if attr.eq_str("len")
+                    && let Expr::FieldAccess {
                         base: inner_base,
                         field,
                         ..
                     } = base.as_ref()
+                {
+                    if field.eq_str("fields")
+                        && let Expr::TypeInfo(ty, _) = inner_base.as_ref()
+                        && let Some(ty_id) = self.resolve_type_ast(ty, _symbols)
                     {
-                        if field.eq_str("fields") {
-                            if let Expr::TypeInfo(ty, _) = inner_base.as_ref() {
-                                if let Some(ty_id) = self.resolve_type_ast(ty, _symbols) {
-                                    let info = crate::hir::generate::get_type_info(
-                                        self.ctx, _symbols, ty_id,
-                                    );
-                                    return CondValue::Int(info.fields.len() as i128);
-                                }
-                            }
-                        } else if field.eq_str("variants") {
-                            if let Expr::TypeInfo(ty, _) = inner_base.as_ref() {
-                                if let Some(ty_id) = self.resolve_type_ast(ty, _symbols) {
-                                    let info = crate::hir::generate::get_type_info(
-                                        self.ctx, _symbols, ty_id,
-                                    );
-                                    return CondValue::Int(info.variants.len() as i128);
-                                }
-                            }
-                        }
+                        let info = crate::hir::generate::get_type_info(self.ctx, _symbols, ty_id);
+                        return CondValue::Int(info.fields.len() as i128);
+                    } else if field.eq_str("variants")
+                        && let Expr::TypeInfo(ty, _) = inner_base.as_ref()
+                        && let Some(ty_id) = self.resolve_type_ast(ty, _symbols)
+                    {
+                        let info = crate::hir::generate::get_type_info(self.ctx, _symbols, ty_id);
+                        return CondValue::Int(info.variants.len() as i128);
                     }
                 }
                 CondValue::Str(String::new())
@@ -481,10 +473,10 @@ fn type_name(ctx: &TypeContext, resolved: TypeId, symbols: Option<&SymbolTable>)
         TypeData::Unit => "()".to_string(),
         TypeData::Adt { def_id, .. } => {
             // Look up the type name from the symbol table if available.
-            if let Some(symbols) = symbols {
-                if let Some(name) = symbols.type_name_by_def_id(*def_id) {
-                    return name.as_str();
-                }
+            if let Some(symbols) = symbols
+                && let Some(name) = symbols.type_name_by_def_id(*def_id)
+            {
+                return name.as_str();
             }
             // Fallback: show the DefId.
             format!("{:?}", def_id)
@@ -532,10 +524,10 @@ fn tuple_fields(ctx: &mut TypeContext, ty: &Type, symbols: &SymbolTable) -> Vec<
 fn resolve_ast_type_to_typeid(ctx: &mut TypeContext, ty: &Type, symbols: &SymbolTable) -> TypeId {
     match ty {
         Type::Path(path, _) => {
-            if let Some(def_id) = symbols.lookup_type_by_path(path) {
-                if let Some(ty_id) = ctx.get_type_id_for_def_id(def_id) {
-                    return ty_id;
-                }
+            if let Some(def_id) = symbols.lookup_type_by_path(path)
+                && let Some(ty_id) = ctx.get_type_id_for_def_id(def_id)
+            {
+                return ty_id;
             }
             // Try to match known type names (bare names without generic args).
             if path.len() == 1 {
@@ -558,27 +550,27 @@ fn resolve_ast_type_to_typeid(ctx: &mut TypeContext, ty: &Type, symbols: &Symbol
         }
         Type::Generic(base, args, _) => {
             // Handle Int<N>, UInt<N>, Float<N>.
-            if let Type::Path(path, _) = base.as_ref() {
-                if path.len() == 1 {
-                    let name = path[0].as_str();
-                    let bits = args.first().and_then(|arg| {
-                        if let GenericArg::Positional(Type::Literal(expr, _)) = arg {
-                            if let Expr::Literal(Literal::Int(bits), _) = expr.as_ref() {
-                                return Some(*bits as u8);
-                            }
-                        }
-                        None
-                    });
-                    if let Some(bits) = bits {
-                        match name.as_str() {
-                            "Int" if bits >= 1 && bits <= 64 => return ctx.int(bits, true),
-                            "Int" => return ctx.error(), // out-of-range Int rejected
-                            "UInt" if bits >= 1 && bits <= 64 => return ctx.uint(bits),
-                            "UInt" => return ctx.error(), // out-of-range UInt rejected
-                            "Float" if bits == 32 || bits == 64 => return ctx.float(bits),
-                            "Float" => return ctx.error(), // non-32/64 Float rejected
-                            _ => {}
-                        }
+            if let Type::Path(path, _) = base.as_ref()
+                && path.len() == 1
+            {
+                let name = path[0].as_str();
+                let bits = args.first().and_then(|arg| {
+                    if let GenericArg::Positional(Type::Literal(expr, _)) = arg
+                        && let Expr::Literal(Literal::Int(bits), _) = expr.as_ref()
+                    {
+                        return Some(*bits as u8);
+                    }
+                    None
+                });
+                if let Some(bits) = bits {
+                    match name.as_str() {
+                        "Int" if bits >= 1 && bits <= 64 => return ctx.int(bits, true),
+                        "Int" => return ctx.error(), // out-of-range Int rejected
+                        "UInt" if bits >= 1 && bits <= 64 => return ctx.uint(bits),
+                        "UInt" => return ctx.error(), // out-of-range UInt rejected
+                        "Float" if bits == 32 || bits == 64 => return ctx.float(bits),
+                        "Float" => return ctx.error(), // non-32/64 Float rejected
+                        _ => {}
                     }
                 }
             }

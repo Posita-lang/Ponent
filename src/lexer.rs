@@ -21,10 +21,10 @@ fn parse_char_literal(s: &str) -> Result<u8, String> {
                 if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
                     return Err("invalid hex digit in char literal".to_string());
                 }
-                if let Some(c) = chars.clone().next() {
-                    if c.is_ascii_hexdigit() {
-                        return Err("expected exactly 2 hex digits after \\x".to_string());
-                    }
+                if let Some(c) = chars.clone().next()
+                    && c.is_ascii_hexdigit()
+                {
+                    return Err("expected exactly 2 hex digits after \\x".to_string());
                 }
                 u8::from_str_radix(&hex, 16)
                     .map_err(|_| "invalid hex digit in char literal".to_string())
@@ -102,10 +102,10 @@ fn parse_string_literal(s: &str) -> Result<String, String> {
                     if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
                         return Err("invalid hex digit in string literal".to_string());
                     }
-                    if let Some(c) = chars.clone().next() {
-                        if c.is_ascii_hexdigit() {
-                            return Err("expected exactly 2 hex digits after \\x".to_string());
-                        }
+                    if let Some(c) = chars.clone().next()
+                        && c.is_ascii_hexdigit()
+                    {
+                        return Err("expected exactly 2 hex digits after \\x".to_string());
                     }
                     let byte = u8::from_str_radix(&hex, 16)
                         .map_err(|_| "invalid hex digit in string literal".to_string())?;
@@ -184,10 +184,10 @@ fn parse_byte_string_literal(s: &str) -> Result<Vec<u8>, String> {
                     if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
                         return Err("invalid hex digit in byte string literal".to_string());
                     }
-                    if let Some(c) = chars.clone().next() {
-                        if c.is_ascii_hexdigit() {
-                            return Err("expected exactly 2 hex digits after \\x".to_string());
-                        }
+                    if let Some(c) = chars.clone().next()
+                        && c.is_ascii_hexdigit()
+                    {
+                        return Err("expected exactly 2 hex digits after \\x".to_string());
                     }
                     let byte = u8::from_str_radix(&hex, 16)
                         .map_err(|_| "invalid hex digit in byte string literal".to_string())?;
@@ -289,6 +289,8 @@ pub enum Token {
     Finally,
     #[token("where")]
     Where,
+    #[token("when")]
+    When,
     #[token("requires")]
     Requires,
     #[token("ensures")]
@@ -375,6 +377,8 @@ pub enum Token {
     Exists,
     #[token("forall")]
     Forall,
+    #[token("implies")]
+    Implies,
     #[token("on")]
     On,
     #[token("on_timeout")]
@@ -387,6 +391,8 @@ pub enum Token {
     Impl,
     #[token("decreases")]
     Decreases,
+    #[token("diverges")]
+    Diverges,
     #[token("terminates")]
     Terminates,
     #[token("cfg")]
@@ -726,6 +732,7 @@ impl Token {
             Token::Auto => "`auto`".to_string(),
             Token::With => "`with`".to_string(),
             Token::Where => "`where`".to_string(),
+            Token::When => "`when`".to_string(),
             Token::Const => "`const`".to_string(),
             Token::Finally => "`finally`".to_string(),
             Token::Pub => "`pub`".to_string(),
@@ -777,6 +784,7 @@ impl Token {
             Token::Pad => "`pad`".to_string(),
             Token::Packed => "`packed`".to_string(),
             Token::Decreases => "`decreases`".to_string(),
+            Token::Diverges => "`diverges`".to_string(),
             Token::Terminates => "`terminates`".to_string(),
             Token::Exhaustive => "`exhaustive`".to_string(),
             Token::NoAllocError => "`no_alloc_error`".to_string(),
@@ -796,6 +804,7 @@ impl Token {
             Token::Hint => "`hint`".to_string(),
             Token::Exists => "`exists`".to_string(),
             Token::Forall => "`forall`".to_string(),
+            Token::Implies => "`implies`".to_string(),
             Token::Ceil => "`ceil`".to_string(),
             Token::Floor => "`floor`".to_string(),
             Token::Round => "`round`".to_string(),
@@ -857,6 +866,7 @@ impl Token {
             Token::Catch => Some(Symbol::intern("catch")),
             Token::Let => Some(Symbol::intern("let")),
             Token::Where => Some(Symbol::intern("where")),
+            Token::When => Some(Symbol::intern("when")),
             Token::As => Some(Symbol::intern("as")),
             Token::In => Some(Symbol::intern("in")),
             Token::And => Some(Symbol::intern("and")),
@@ -872,12 +882,14 @@ impl Token {
             Token::Validate => Some(Symbol::intern("validate")),
             Token::Exists => Some(Symbol::intern("exists")),
             Token::Forall => Some(Symbol::intern("forall")),
+            Token::Implies => Some(Symbol::intern("implies")),
             Token::On => Some(Symbol::intern("on")),
             Token::Trait => Some(Symbol::intern("trait")),
             Token::Impl => Some(Symbol::intern("impl")),
             Token::Cfg => Some(Symbol::intern("cfg")),
             Token::Hint => Some(Symbol::intern("hint")),
             Token::Old => Some(Symbol::intern("old")),
+            Token::Diverges => Some(Symbol::intern("diverges")),
             Token::Overrides => Some(Symbol::intern("overrides")),
             Token::Propagates => Some(Symbol::intern("propagates")),
             Token::Poly => Some(Symbol::intern("poly")),

@@ -126,14 +126,14 @@ impl ProofTreeBuilder {
             Ok(()) => (true, None),
             Err(e) => (false, Some(e)),
         };
-        if let Some(&idx) = self.stack.last() {
-            if let Some(node) = self.nodes.get_mut(idx) {
-                node.candidates.push(CandidateResult {
-                    candidate_idx,
-                    success,
-                    error,
-                });
-            }
+        if let Some(&idx) = self.stack.last()
+            && let Some(node) = self.nodes.get_mut(idx)
+        {
+            node.candidates.push(CandidateResult {
+                candidate_idx,
+                success,
+                error,
+            });
         }
     }
 
@@ -142,10 +142,10 @@ impl ProofTreeBuilder {
         if !self.active {
             return;
         }
-        if let Some(idx) = self.stack.pop() {
-            if let Some(node) = self.nodes.get_mut(idx) {
-                node.result = result;
-            }
+        if let Some(idx) = self.stack.pop()
+            && let Some(node) = self.nodes.get_mut(idx)
+        {
+            node.result = result;
         }
     }
 

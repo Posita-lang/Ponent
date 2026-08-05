@@ -370,17 +370,16 @@ pub fn is_provably_reachable(attr: &Attribute, strict_mode: bool, diag: &mut Dia
         .named_args
         .iter()
         .find(|(k, _)| k.eq_str("target_arch"))
+        && let Expr::Literal(Literal::String(s), _) = &arch.1
     {
-        if let Expr::Literal(Literal::String(s), _) = &arch.1 {
-            let arch_name = format!("cfg_target_arch_{}", s);
-            if let Some(&arch_lit) = var_map.get(&arch_name) {
-                // Look up the pointer width from target specs instead of
-                // hardcoding arch→pointer_width mappings here.
-                if let Some(width) = crate::hir::target::Target::arch_pointer_width(s.as_str()) {
-                    let width_name = format!("cfg_target_pointer_width_{}", width);
-                    if let Some(&width_lit) = var_map.get(&width_name) {
-                        solver.add_implies(arch_lit, width_lit);
-                    }
+        let arch_name = format!("cfg_target_arch_{}", s);
+        if let Some(&arch_lit) = var_map.get(&arch_name) {
+            // Look up the pointer width from target specs instead of
+            // hardcoding arch→pointer_width mappings here.
+            if let Some(width) = crate::hir::target::Target::arch_pointer_width(s.as_str()) {
+                let width_name = format!("cfg_target_pointer_width_{}", width);
+                if let Some(&width_lit) = var_map.get(&width_name) {
+                    solver.add_implies(arch_lit, width_lit);
                 }
             }
         }

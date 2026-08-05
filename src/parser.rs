@@ -803,7 +803,7 @@ impl Parser {
                                     break;
                                 }
                                 Ok(Token::Ident(name)) => {
-                                    captures.push((name.clone(), name_span));
+                                    captures.push((*name, name_span));
                                     self.advance().ok();
                                     match self.peek() {
                                         Ok(Token::Comma) => {
@@ -1491,29 +1491,44 @@ impl Parser {
         let start = self.span().start;
         self.advance().ok(); // consume 'where'
         let mut predicates = Vec::new();
+        let mut equalities = Vec::new();
         loop {
             let ty = self.parse_type()?;
-            self.expect(Token::Colon)?;
-            let mut bounds = Vec::new();
-            loop {
-                bounds.push(self.parse_type()?);
-                if !matches!(self.peek(), Ok(Token::Plus)) {
-                    break;
+            if matches!(self.peek(), Ok(Token::EqEq)) {
+                // Equality constraint: `where T == Int<32>`.
+                self.advance().ok(); // consume '=='
+                let right = self.parse_type()?;
+                equalities.push(WhereEquality {
+                    left: ty,
+                    right,
+                    span: Span::new(start, self.span().end),
+                });
+            } else {
+                self.expect(Token::Colon)?;
+                let mut bounds = Vec::new();
+                loop {
+                    bounds.push(self.parse_type()?);
+                    if !matches!(self.peek(), Ok(Token::Plus)) {
+                        break;
+                    }
+                    self.advance().ok();
                 }
-                self.advance().ok();
+                let end = self.span().end;
+                predicates.push(WherePredicate {
+                    ty,
+                    bounds,
+                    span: Span::new(start, end),
+                });
             }
-            let end = self.span().end;
-            predicates.push(WherePredicate {
-                ty,
-                bounds,
-                span: Span::new(start, end),
-            });
             if !matches!(self.peek(), Ok(Token::Comma)) {
                 break;
             }
             self.advance().ok();
         }
-        Ok(WhereClause { predicates })
+        Ok(WhereClause {
+            predicates,
+            equalities,
+        })
     }
 
     fn parse_param(&mut self) -> Result<Param, Diagnostic> {
@@ -1562,6 +1577,47 @@ impl Parser {
             default,
             span: Span::new(start, end),
         })
+    }
+
+    /// Parse GADT `when` constraints: `Ident == Type [and Ident == Type]*`.
+    /// This is a dedicated syntax, NOT a general expression parser, to avoid
+    /// the `<` ambiguity where `Int<32>` would be parsed as `Int < 32`.
+    fn parse_gadt_constraints(&mut self) -> Result<Vec<(Symbol, Type)>, Diagnostic> {
+        let mut constraints = Vec::new();
+        loop {
+            let param_name = match self.advance() {
+                Ok(Token::Ident(name)) => name,
+                Ok(tok) => {
+                    return Err(Diagnostic::error(format!(
+                        "expected type parameter name in GADT constraint, found {:?}",
+                        tok
+                    ))
+                    .with_code_str("E004")
+                    .with_help("GADT constraints use `Param == ConcreteType` syntax")
+                    .with_suggestion("use `T == Int<32>` where `T` is a type parameter of the enum")
+                    .with_span(self.span()));
+                }
+                Err(()) => {
+                    return Err(
+                        Diagnostic::error("unexpected end of file in GADT constraint")
+                            .with_code_str("E002")
+                            .with_help("GADT constraints use `Param == ConcreteType` syntax")
+                            .with_span(self.span()),
+                    );
+                }
+            };
+            self.expect(Token::EqEq)?;
+            let concrete_ty = self.parse_type()?;
+            constraints.push((param_name, concrete_ty));
+            match self.peek() {
+                Ok(Token::And) => {
+                    self.advance().ok();
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        Ok(constraints)
     }
 
     fn parse_contract(&mut self) -> Result<Contract, Diagnostic> {
@@ -1659,12 +1715,20 @@ impl Parser {
                     _ => {}
                 }
                 let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
+
+                // Labels are `@`-prefixed identifiers (`ensures @label expr`),
+                // but `@` is not a valid identifier start character in the
+                // lexer, so no `@label` can reach the AST as an `Ident` yet.
+                // Keep the field empty until `@label` expression support
+                // lands in the lexer/parser.
+                let labels = Vec::new();
+
                 let end = self.span().end;
                 Ok(Contract::Ensures {
                     expr,
                     span: Span::new(start, end),
                     target,
-                    labels: Vec::new(), // extracted from expr during type checking
+                    labels,
                 })
             }
             Token::Invariant => {
@@ -2281,7 +2345,7 @@ impl Parser {
                                 break;
                             }
                             Ok(Token::Ident(name)) => {
-                                captures.push((name.clone(), name_span));
+                                captures.push((*name, name_span));
                                 self.advance().ok();
                                 match self.peek() {
                                     Ok(Token::Comma) => {
@@ -2381,6 +2445,15 @@ impl Parser {
                 self.expect(Token::Semicolon)?;
                 let _end = self.span().end;
                 Ok(Stmt::Expression(expr))
+            }
+            Ok(Token::Def) => {
+                // Nested function definitions: parse them as function
+                // definitions (rustc-style — items in blocks are collected
+                // and referenced, not rejected).
+                self.advance().ok(); // consume `def`
+                self.with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
+                    this.parse_function_def(Vec::new(), None, false, false)
+                })
             }
             _ => {
                 let _start = self.span().start;
@@ -2686,7 +2759,7 @@ impl Parser {
                     break;
                 }
                 Ok(Token::Ident(name)) => {
-                    let name = name.clone();
+                    let name = *name;
                     self.advance().ok();
                     // Each capture param is currently treated as a type parameter
                     // (compile-time constant captures to be added in a future pass).
@@ -2724,7 +2797,7 @@ impl Parser {
         self.advance().ok();
         if matches!(self.peek(), Ok(Token::Let)) {
             self.advance().ok();
-            let pattern = self.parse_pattern()?;
+            let pattern = self.parse_or_pattern()?;
             self.expect(Token::Assign)?;
             let scrutinee = self
                 .with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
@@ -2788,7 +2861,7 @@ impl Parser {
         self.advance().ok();
         if matches!(self.peek(), Ok(Token::Let)) {
             self.advance().ok();
-            let pattern = self.parse_pattern()?;
+            let pattern = self.parse_or_pattern()?;
             self.expect(Token::Assign)?;
             let scrutinee = self
                 .with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
@@ -2937,12 +3010,13 @@ impl Parser {
             let end = self.span().end;
             Ok(Stmt::Expression(Expr::LeaveWith {
                 expr: Box::new(expr),
+                is_return: false,
                 span: Span::new(start, end),
             }))
         } else {
             let label = if let Ok(Token::Ident(l)) = self.peek().clone() {
                 self.advance().ok();
-                Some(l.clone())
+                Some(l)
             } else {
                 None
             };
@@ -2960,7 +3034,7 @@ impl Parser {
         self.advance().ok();
         let label = if let Ok(Token::Ident(l)) = self.peek().clone() {
             self.advance().ok();
-            Some(l.clone())
+            Some(l)
         } else {
             None
         };
@@ -3032,6 +3106,16 @@ impl Parser {
                     .with_span(self.span(),));
             }
         };
+        // Optional compile-time guard: `when condition`
+        let when_condition = if matches!(self.peek(), Ok(Token::When)) {
+            self.advance().ok();
+            let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+                this.parse_expr()
+            })?;
+            Some(Box::new(expr))
+        } else {
+            None
+        };
         let mut propagates = false;
         let mut overrides = false;
         if matches!(self.peek(), Ok(Token::Propagates)) {
@@ -3055,6 +3139,7 @@ impl Parser {
         let end = self.span().end;
         Ok(Stmt::ScopeCleanup {
             name,
+            when_condition,
             body,
             propagates,
             overrides,
@@ -3464,17 +3549,69 @@ impl Parser {
                                 .with_span(self.span()));
                         }
                     };
+                    let mut variant_exists_params = Vec::new();
                     let payload = if matches!(self.peek(), Ok(Token::LParen)) {
                         self.advance().ok();
+                        // Check for existentially quantified type variables: `exists X, Y: type`
+                        if matches!(self.peek(), Ok(Token::Exists)) {
+                            self.advance().ok();
+                            loop {
+                                match self.advance() {
+                                    Ok(Token::Ident(name)) => variant_exists_params.push(name),
+                                    Ok(tok) => {
+                                        return Err(Diagnostic::error(format!(
+                                            "expected type variable name in `exists` clause, found {:?}", tok
+                                        ))
+                                        .with_span(self.span()));
+                                    }
+                                    Err(()) => {
+                                        return Err(Diagnostic::error(
+                                            "unexpected end of file in `exists` clause",
+                                        )
+                                        .with_span(self.span()));
+                                    }
+                                }
+                                match self.peek() {
+                                    Ok(Token::Comma) => {
+                                        self.advance().ok();
+                                        continue;
+                                    }
+                                    Ok(Token::Colon) => {
+                                        self.advance().ok();
+                                        break;
+                                    }
+                                    _ => {
+                                        return Err(Diagnostic::error(
+                                            "expected `:` after `exists` variable list",
+                                        )
+                                        .with_help(
+                                            "use `exists X: Type` or `exists X, Y: Type` syntax",
+                                        )
+                                        .with_span(self.span()));
+                                    }
+                                }
+                            }
+                        }
                         let ty = self.parse_type()?;
                         self.expect(Token::RParen)?;
                         Some(ty)
                     } else {
                         None
                     };
+                    // GADT `when` constraint: `Variant(..) when T == ConcreteType`
+                    // Parse as a special constraint syntax, not as a general expression,
+                    // to avoid the `<` ambiguity (Int<32> vs Int < 32).
+                    let eq_spec = if matches!(self.peek(), Ok(Token::When)) {
+                        self.advance().ok();
+                        self.parse_gadt_constraints()?
+                    } else {
+                        Vec::new()
+                    };
                     variants.push(EnumVariant {
                         name: v_name,
                         payload,
+                        eq_spec,
+                        exists_params: variant_exists_params,
                         span: Span::new(start, self.span().end),
                     });
                     if matches!(self.peek(), Ok(Token::Comma)) {
@@ -3891,6 +4028,27 @@ impl Parser {
         let result = self.parse_pattern_inner();
         self.recursion_depth -= 1;
         result
+    }
+
+    /// Parse an or-pattern: `pattern1 | pattern2 | ...` (SYNTAX.md
+    /// §"Or patterns").  Used ONLY at or-pattern sites (match arms), NOT in
+    /// generic pattern contexts — `catch { |NetworkError| ... }` uses a
+    /// pipe-wrapped pattern whose `|` must not be consumed as an or
+    /// separator.
+    fn parse_or_pattern(&mut self) -> Result<Pattern, Diagnostic> {
+        let start = self.span().start;
+        let first = self.parse_pattern()?;
+        if matches!(self.peek(), Ok(Token::Pipe)) {
+            let mut patterns = vec![first];
+            while matches!(self.peek(), Ok(Token::Pipe)) {
+                self.advance().ok();
+                let p = self.parse_pattern()?;
+                patterns.push(p);
+            }
+            Ok(Pattern::Or(patterns, Span::new(start, self.span().end)))
+        } else {
+            Ok(first)
+        }
     }
 
     fn parse_pattern_inner(&mut self) -> Result<Pattern, Diagnostic> {
@@ -4349,6 +4507,20 @@ impl Parser {
                 let end = self.span().end;
                 Ok(Expr::LeaveWith {
                     expr: Box::new(expr),
+                    is_return: false,
+                    span: Span::new(start, end),
+                })
+            }
+            Ok(Token::Return) => {
+                let value = if !matches!(self.peek(), Ok(Token::Semicolon) | Ok(Token::RBrace)) {
+                    Some(Box::new(self.parse_expr()?))
+                } else {
+                    None
+                };
+                let end = self.span().end;
+                Ok(Expr::LeaveWith {
+                    expr: value.unwrap_or_else(|| Box::new(Expr::Tuple(Vec::new(), Span::new(start, end)))),
+                    is_return: true,
                     span: Span::new(start, end),
                 })
             }
@@ -4417,14 +4589,23 @@ impl Parser {
             }
             Ok(Token::Ampersand) => {
                 self.advance().ok();
-                let mutable = matches!(self.peek(), Ok(Token::Mut));
+                // `&ro` freezes a `&mut T` into a `&T` (SYNTAX.md §Reference
+                // Coercion): `ro` only has special meaning immediately
+                // following `&` in a borrow expression.
+                let read_only = matches!(self.peek(), Ok(Token::Ident(s)) if s.eq_str("ro"));
+                if read_only {
+                    self.advance().ok();
+                }
+                let mutable = !read_only && matches!(self.peek(), Ok(Token::Mut));
                 if mutable {
                     self.advance().ok();
                 }
                 let expr = self.parse_prefix()?;
                 let end = self.span().end;
                 Ok(Expr::UnaryOp {
-                    op: if mutable {
+                    op: if read_only {
+                        UnaryOp::Ro
+                    } else if mutable {
                         UnaryOp::RefMut
                     } else {
                         UnaryOp::Ref
@@ -4768,8 +4949,8 @@ impl Parser {
             Ok(Token::LParen) => {
                 // Two-segment path + ( → enum variant construction: `Opt::Some(42)`
                 if path.len() == 2 {
-                    let variant = path[1].clone();
-                    let enum_path = vec![path[0].clone()];
+                    let variant = path[1];
+                    let enum_path = vec![path[0]];
                     self.parse_enum_lit(enum_path, variant, start)
                 } else if path.len() >= 2 {
                     // Longer path + ( → associated function call: `module::Type::method(args)`
@@ -5221,11 +5402,25 @@ impl Parser {
             Ok(Token::Dot) => {
                 self.advance().ok();
                 if let Ok(Token::Ident(field)) = self.advance() {
-                    Ok(Expr::FieldAccess {
-                        base: Box::new(lhs),
-                        field,
-                        span: Span::new(start, self.span().end),
-                    })
+                    // `.freeze!()` — explicit read-only freeze, equivalent
+                    // to `&ro expr` (SYNTAX.md: ".freeze!() ... behaves
+                    // identically and is preferred in method chains").
+                    if field.eq_str("freeze") && matches!(self.peek(), Ok(Token::Bang)) {
+                        self.advance().ok(); // consume `!`
+                        self.expect(Token::LParen)?;
+                        self.expect(Token::RParen)?;
+                        Ok(Expr::UnaryOp {
+                            op: crate::ast::UnaryOp::Ro,
+                            expr: Box::new(lhs),
+                            span: Span::new(start, self.span().end),
+                        })
+                    } else {
+                        Ok(Expr::FieldAccess {
+                            base: Box::new(lhs),
+                            field,
+                            span: Span::new(start, self.span().end),
+                        })
+                    }
                 } else {
                     Err(Diagnostic::error("expected field name after '.'")
                         .with_code_str("E004")
@@ -5334,7 +5529,7 @@ impl Parser {
         self.advance().ok();
         if matches!(self.peek(), Ok(Token::Let)) {
             self.advance().ok();
-            let pattern = self.parse_pattern()?;
+            let pattern = self.parse_or_pattern()?;
             self.expect(Token::Assign)?;
             let scrutinee = self
                 .with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
@@ -5365,6 +5560,7 @@ impl Parser {
                 scrutinee: Box::new(scrutinee),
                 then_branch,
                 else_branch,
+                is_expression: true,
                 span: Span::new(start, end),
             });
         }
@@ -5413,7 +5609,9 @@ impl Parser {
                 break;
             }
             let arm_start = self.span().start;
-            let pattern = self.parse_pattern()?;
+            // Match arms are the primary or-pattern site (SYNTAX.md
+            // §"Or patterns"): `pattern1 | pattern2 => body`.
+            let pattern = self.parse_or_pattern()?;
             let guard = if matches!(self.peek(), Ok(Token::If)) {
                 self.advance().ok();
                 Some(Box::new(self.parse_expr()?))
@@ -6330,6 +6528,89 @@ mod tests {
                 assert_eq!(msg, "missing variants");
             }
             _ => panic!("expected Enum with missing_match"),
+        }
+    }
+
+    #[test]
+    fn test_gadt_when_clause() {
+        // Single GADT constraint
+        let src = "type Expr<T> = enum { Lit(Int<32>) when T == Int<32> }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+        match &program.items[0] {
+            Stmt::TypeDef {
+                definition: TypeDefinition::Enum(variants, _, _),
+                params,
+                ..
+            } => {
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0].name.as_str(), "T");
+                assert_eq!(variants.len(), 1);
+                let lit = &variants[0];
+                assert_eq!(lit.name.as_str(), "Lit");
+                assert_eq!(lit.eq_spec.len(), 1);
+                let (param, concrete) = &lit.eq_spec[0];
+                assert_eq!(param.as_str(), "T");
+                // Int<32> parses as Type::Generic(Path(["Int"]), [Positional(Path(["32"]))])
+                assert!(
+                    matches!(concrete, Type::Generic(..)),
+                    "expected Generic type for Int<32>, got {:?}",
+                    concrete
+                );
+            }
+            _ => panic!("expected TypeDef with Enum"),
+        }
+    }
+
+    #[test]
+    fn test_gadt_when_multi_and() {
+        // Multiple GADT constraints with `and` (single payload per variant)
+        let src = "type KV<K, V> = enum { Pair(Int<32>) when K == Int<32> and V == String }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+        match &program.items[0] {
+            Stmt::TypeDef {
+                definition: TypeDefinition::Enum(variants, _, _),
+                ..
+            } => {
+                assert_eq!(variants.len(), 1);
+                let ik = &variants[0];
+                assert_eq!(ik.name.as_str(), "Pair");
+                assert_eq!(ik.eq_spec.len(), 2, "should have K and V constraints");
+                assert_eq!(ik.eq_spec[0].0.as_str(), "K");
+                assert_eq!(ik.eq_spec[1].0.as_str(), "V");
+            }
+            _ => panic!("expected TypeDef with Enum"),
+        }
+    }
+
+    #[test]
+    fn test_gadt_mixed() {
+        // Mixture of GADT and non-GADT variants
+        let src = "type Expr<T> = enum {
+            Lit(Int<32>) when T == Int<32>,
+            Not(Expr<Bool>) when T == Bool,
+            Wrap(Expr<T>)
+        }";
+        let program = check_parse(src);
+        assert_eq!(program.items.len(), 1);
+        match &program.items[0] {
+            Stmt::TypeDef {
+                definition: TypeDefinition::Enum(variants, _, _),
+                ..
+            } => {
+                assert_eq!(variants.len(), 3);
+                // Lit has eq_spec
+                assert_eq!(variants[0].name.as_str(), "Lit");
+                assert_eq!(variants[0].eq_spec.len(), 1);
+                // Not has eq_spec
+                assert_eq!(variants[1].name.as_str(), "Not");
+                assert_eq!(variants[1].eq_spec.len(), 1);
+                // Wrap has NO eq_spec
+                assert_eq!(variants[2].name.as_str(), "Wrap");
+                assert_eq!(variants[2].eq_spec.len(), 0);
+            }
+            _ => panic!("expected TypeDef with Enum"),
         }
     }
 
