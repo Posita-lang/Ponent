@@ -122,10 +122,8 @@ impl ProofTreeBuilder {
         if !self.active {
             return;
         }
-        let (success, error) = match result {
-            Ok(()) => (true, None),
-            Err(e) => (false, Some(e)),
-        };
+        let success = result.is_ok();
+        let error = result.err();
         if let Some(&idx) = self.stack.last()
             && let Some(node) = self.nodes.get_mut(idx)
         {

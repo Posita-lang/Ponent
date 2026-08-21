@@ -1,32 +1,40 @@
 use crate::ast::*;
 use crate::hir::symbol::SymbolTable;
 use crate::hir::types::{TypeContext, TypeData, TypeId};
+use std::borrow::Cow;
 
 /// Information about a type's structure, computed from a `TypeId` at compile time.
 /// Equivalent to Zig's `@typeInfo` result.
+///
+/// String fields use `Cow<'input, str>` so that primitive type names
+/// (`Int<32>`, `Bool`, `()`, …) can be returned as `Cow::Borrowed` from
+/// static tables without allocating.  ADT-derived names (struct/enum/field/
+/// variant names) still go through `Symbol::as_str() -> String` and are
+/// stored as `Cow::Owned`, since the interner does not expose a
+/// lifetime-erased `&'input str` view.
 #[derive(Debug, Clone)]
-pub struct TypeInfo {
-    pub name: String,
-    pub params: Vec<String>,
-    pub fields: Vec<FieldInfo>,
-    pub variants: Vec<VariantInfo>,
+pub struct TypeInfo<'input> {
+    pub name: Cow<'input, str>,
+    pub params: Vec<Cow<'input, str>>,
+    pub fields: Vec<FieldInfo<'input>>,
+    pub variants: Vec<VariantInfo<'input>>,
     pub kind: TypeKind,
     /// For Int<Bits> / UInt<Bits>, the bit width.
-    pub bits: Option<u8>,
+    pub bits: Option<u32>,
     /// For Float<Bits>, the bit width.
-    pub float_bits: Option<u8>,
+    pub float_bits: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
-pub struct FieldInfo {
-    pub name: String,
+pub struct FieldInfo<'input> {
+    pub name: Cow<'input, str>,
     pub ty: TypeId,
 }
 
 #[derive(Debug, Clone)]
-pub struct VariantInfo {
-    pub name: String,
-    pub payload: Vec<FieldInfo>,
+pub struct VariantInfo<'input> {
+    pub name: Cow<'input, str>,
+    pub payload: Vec<FieldInfo<'input>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,12 +50,12 @@ pub enum TypeKind {
 /// The `generate` block expansion engine.
 ///
 /// Operates on the AST **before** name resolution (Phase 1), and again
-/// **after** name resolution (Phase 2) when the `SymbolTable` is available.
+/// **after** name resolution (Phase 2) when the `SymbolTable<'input>` is available.
 ///
 /// Pipeline: parse → Phase 1 expand → resolve → Phase 2 expand → type check.
-pub struct GenerateExpander<'a> {
-    ctx: &'a mut TypeContext,
-    symbols: Option<&'a SymbolTable>,
+pub struct GenerateExpander<'a, 'input> {
+    ctx: &'a mut TypeContext<'input>,
+    symbols: Option<&'a SymbolTable<'input>>,
 }
 
 /// A value produced by evaluating a generate-block condition.
@@ -56,13 +64,13 @@ pub struct GenerateExpander<'a> {
 /// `BinOp::Eq`/`BinOp::Neq` compare these values directly rather than
 /// first coercing everything to bool (which would lose information).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum CondValue {
+enum CondValue<'input> {
     Bool(bool),
     Int(i128),
-    Str(String),
+    Str(Cow<'input, str>),
 }
 
-impl CondValue {
+impl<'input> CondValue<'input> {
     fn truthy(&self) -> bool {
         match self {
             CondValue::Bool(b) => *b,
@@ -76,18 +84,18 @@ impl CondValue {
     }
 }
 
-impl<'a> GenerateExpander<'a> {
+impl<'a, 'input> GenerateExpander<'a, 'input> {
     /// Create a new expander for Phase 1 (before name resolution).
-    /// The `SymbolTable` is not yet available, so `@typeInfo!` evaluations
+    /// The `SymbolTable<'input>` is not yet available, so `@typeInfo!` evaluations
     /// will return placeholder data.
-    pub fn new_phase1(ctx: &'a mut TypeContext) -> Self {
+    pub fn new_phase1(ctx: &'a mut TypeContext<'input>) -> Self {
         GenerateExpander { ctx, symbols: None }
     }
 
     /// Create a new expander for Phase 2 (after name resolution).
-    /// The `SymbolTable` is available, so `@typeInfo!` evaluations return
+    /// The `SymbolTable<'input>` is available, so `@typeInfo!` evaluations return
     /// real type information.
-    pub fn new_phase2(ctx: &'a mut TypeContext, symbols: &'a SymbolTable) -> Self {
+    pub fn new_phase2(ctx: &'a mut TypeContext<'input>, symbols: &'a SymbolTable<'input>) -> Self {
         GenerateExpander {
             ctx,
             symbols: Some(symbols),
@@ -99,7 +107,10 @@ impl<'a> GenerateExpander<'a> {
     /// In Phase 1, the body is simply passed through since type info
     /// is not yet available.  Conditional generation and name-mapped
     /// templates are expanded in Phase 2 (after name resolution).
-    pub fn expand_program(&mut self, items: Vec<Stmt>) -> (Vec<Stmt>, Vec<Stmt>) {
+    pub fn expand_program(
+        &mut self,
+        items: Vec<Stmt<'input>>,
+    ) -> (Vec<Stmt<'input>>, Vec<Stmt<'input>>) {
         let mut result = Vec::new();
         let mut new_items = Vec::new();
         for item in items {
@@ -136,15 +147,15 @@ impl<'a> GenerateExpander<'a> {
     }
 
     /// Expand a single `generate for <Type> { ... }` block using the
-    /// available `SymbolTable` (Phase 2).  Evaluates `@typeInfo!`
+    /// available `SymbolTable<'input>` (Phase 2).  Evaluates `@typeInfo!`
     /// expressions, processes conditional generation, and expands
     /// name-mapped templates.
     fn expand_generate_block(
         &mut self,
-        for_type: &Type,
-        body: Vec<Stmt>,
+        for_type: &Type<'input>,
+        body: Vec<Stmt<'input>>,
         _span: Span,
-        result: &mut Vec<Stmt>,
+        result: &mut Vec<Stmt<'input>>,
     ) {
         let symbols = match self.symbols {
             Some(s) => s,
@@ -169,10 +180,10 @@ impl<'a> GenerateExpander<'a> {
     /// evaluating `if` conditions, and expanding name-mapped templates.
     fn expand_generate_body(
         &mut self,
-        stmts: &[Stmt],
+        stmts: &[Stmt<'input>],
         for_type_id: Option<TypeId>,
-        symbols: &SymbolTable,
-    ) -> Vec<Stmt> {
+        symbols: &SymbolTable<'input>,
+    ) -> Vec<Stmt<'input>> {
         let mut result = Vec::new();
         for stmt in stmts {
             match stmt {
@@ -208,10 +219,10 @@ impl<'a> GenerateExpander<'a> {
     /// Returns a `CondValue` (bool, int, or string) for use in comparisons.
     fn eval_generate_condition(
         &mut self,
-        cond: &Expr,
+        cond: &Expr<'input>,
         for_type_id: Option<TypeId>,
-        _symbols: &SymbolTable,
-    ) -> CondValue {
+        _symbols: &SymbolTable<'input>,
+    ) -> CondValue<'input> {
         match cond {
             Expr::BinaryOp {
                 left, op, right, ..
@@ -254,13 +265,13 @@ impl<'a> GenerateExpander<'a> {
                     return CondValue::Bool(false);
                 }
                 if field.eq_str("name")
-                    && let Expr::TypeInfo(ty, _) = base.as_ref()
+                    && let Expr::TypeInfo(ty, _) = base
                     && let Some(ty_id) = self.resolve_type_ast(ty, _symbols)
                 {
                     return CondValue::Str(type_name(self.ctx, ty_id, Some(_symbols)));
                 }
                 // Unknown field access — return empty string (falsy).
-                CondValue::Str(String::new())
+                CondValue::Str(Cow::Borrowed(""))
             }
             Expr::AttrAccess { base, attr, .. } => {
                 // `@typeInfo!(T).fields'len` is parsed as:
@@ -271,39 +282,53 @@ impl<'a> GenerateExpander<'a> {
                         base: inner_base,
                         field,
                         ..
-                    } = base.as_ref()
+                    } = base
                 {
                     if field.eq_str("fields")
-                        && let Expr::TypeInfo(ty, _) = inner_base.as_ref()
+                        && let Expr::TypeInfo(ty, _) = inner_base
                         && let Some(ty_id) = self.resolve_type_ast(ty, _symbols)
                     {
                         let info = crate::hir::generate::get_type_info(self.ctx, _symbols, ty_id);
                         return CondValue::Int(info.fields.len() as i128);
                     } else if field.eq_str("variants")
-                        && let Expr::TypeInfo(ty, _) = inner_base.as_ref()
+                        && let Expr::TypeInfo(ty, _) = inner_base
                         && let Some(ty_id) = self.resolve_type_ast(ty, _symbols)
                     {
                         let info = crate::hir::generate::get_type_info(self.ctx, _symbols, ty_id);
                         return CondValue::Int(info.variants.len() as i128);
                     }
                 }
-                CondValue::Str(String::new())
+                CondValue::Str(Cow::Borrowed(""))
             }
             Expr::Literal(Literal::Bool(b), _) => CondValue::Bool(*b),
-            Expr::Literal(Literal::Int(n), _) => CondValue::Int(*n),
-            Expr::Literal(Literal::String(s), _) => CondValue::Str(s.clone()),
+            Expr::Literal(Literal::Int(n), _) => CondValue::Int(
+                n.to_i128()
+                    .unwrap_or_else(|| if *n < 0 { i128::MIN } else { i128::MAX }),
+            ),
+            // `Literal::String(String)` — the AST owns the storage, so we must
+            // clone into a `Cow::Owned`.  (If the AST ever switches to
+            // `Literal::String(&'input str)`, this becomes `Cow::Borrowed(*s)`.)
+            Expr::Literal(Literal::String(s), _) => CondValue::Str(Cow::Owned(s.clone())),
             _ => CondValue::Bool(false),
         }
     }
 
     /// Resolve an AST type to a TypeId using the symbol table.
     /// This is a simplified resolver that handles basic type paths.
-    fn resolve_type_for_generate(&mut self, ty: &Type, symbols: &SymbolTable) -> Option<TypeId> {
+    fn resolve_type_for_generate(
+        &mut self,
+        ty: &Type<'input>,
+        symbols: &SymbolTable<'input>,
+    ) -> Option<TypeId> {
         self.resolve_type_ast(ty, symbols)
     }
 
     /// Resolve an AST type to a TypeId.
-    fn resolve_type_ast(&mut self, ty: &Type, symbols: &SymbolTable) -> Option<TypeId> {
+    fn resolve_type_ast(
+        &mut self,
+        ty: &Type<'input>,
+        symbols: &SymbolTable<'input>,
+    ) -> Option<TypeId> {
         match ty {
             Type::Path(path, _) => {
                 // Single-segment path: look up by name.
@@ -317,7 +342,7 @@ impl<'a> GenerateExpander<'a> {
             Type::Generic(base, args, _) => {
                 // Handle generic types like `Option<Int<32>>`.
                 // Resolve the base type to get its DefId.
-                let base_path = match base.as_ref() {
+                let base_path = match base {
                     Type::Path(p, _) => p.clone(),
                     _ => return None,
                 };
@@ -347,31 +372,37 @@ impl<'a> GenerateExpander<'a> {
 
 /// Compute the full `TypeInfo` for a resolved `TypeId`.
 ///
-/// Uses the `TypeContext` for structural type data and the `SymbolTable`
-/// to look up `TypeBinding` (field lists, enum variants, generic params).
-pub fn get_type_info(ctx: &mut TypeContext, symbols: &SymbolTable, ty: TypeId) -> TypeInfo {
+/// Uses the `TypeContext<'input>` for structural type data and the `SymbolTable<'input>`
+/// to look up `TypeBinding<'input>` (field lists, enum variants, generic params).
+pub fn get_type_info<'input>(
+    ctx: &mut TypeContext<'input>,
+    symbols: &SymbolTable<'input>,
+    ty: TypeId,
+) -> TypeInfo<'input> {
     let resolved = ctx.resolve_binding(ty);
     let name = type_name(ctx, resolved, Some(symbols));
     let kind = determine_kind(ctx, resolved);
 
-    // Collect fields, variants, params from the TypeBinding (if ADT).
-    let mut fields: Vec<FieldInfo> = Vec::new();
-    let mut variants: Vec<VariantInfo> = Vec::new();
-    let mut params: Vec<String> = Vec::new();
-    let mut bits: Option<u8> = None;
-    let mut float_bits: Option<u8> = None;
+    // Collect fields, variants, params from the TypeBinding<'input> (if ADT).
+    let mut fields: Vec<FieldInfo<'input>> = Vec::new();
+    let mut variants: Vec<VariantInfo<'input>> = Vec::new();
+    let mut params: Vec<Cow<'input, str>> = Vec::new();
+    let mut bits: Option<u32> = None;
+    let mut float_bits: Option<u32> = None;
 
     match ctx.get(resolved) {
         TypeData::Adt { def_id, .. } => {
             if let Some(binding) = symbols.lookup_type_by_def_id(*def_id) {
-                // Generic parameters
+                // Generic parameters.  `Symbol::as_str()` returns `String`
+                // (the interner does not expose a `&'input str` view), so we
+                // store these as `Cow::Owned`.
                 for p in &binding.params {
-                    params.push(p.name.as_str());
+                    params.push(Cow::Owned(p.name.as_str()));
                 }
                 // Struct fields
                 for f in &binding.fields {
                     fields.push(FieldInfo {
-                        name: f.name.as_str(),
+                        name: Cow::Owned(f.name.as_str()),
                         ty: f.ty,
                     });
                 }
@@ -385,7 +416,7 @@ pub fn get_type_info(ctx: &mut TypeContext, symbols: &SymbolTable, ty: TypeId) -
                         None => Vec::new(),
                     };
                     variants.push(VariantInfo {
-                        name: v.name.as_str(),
+                        name: Cow::Owned(v.name.as_str()),
                         payload,
                     });
                 }
@@ -420,7 +451,7 @@ const UINT_TYPE_NAMES: [&str; 5] = ["UInt<8>", "UInt<16>", "UInt<32>", "UInt<64>
 /// and are rejected by the type checker.  Custom widths fall back to format!.
 const FLOAT_TYPE_NAMES: [&str; 2] = ["Float<32>", "Float<64>"];
 
-fn int_type_name(bits: u8, signed: bool) -> String {
+fn int_type_name<'input>(bits: u32, signed: bool) -> Cow<'input, str> {
     let idx = match bits {
         8 => Some(0),
         16 => Some(1),
@@ -430,29 +461,24 @@ fn int_type_name(bits: u8, signed: bool) -> String {
         _ => None,
     };
     if let Some(i) = idx {
-        if signed {
-            INT_TYPE_NAMES[i].to_string()
+        Cow::Borrowed(if signed {
+            INT_TYPE_NAMES[i]
         } else {
-            UINT_TYPE_NAMES[i].to_string()
-        }
+            UINT_TYPE_NAMES[i]
+        })
     } else if signed {
-        format!("Int<{}>", bits)
+        Cow::Owned(format!("Int<{}>", bits))
     } else {
-        format!("UInt<{}>", bits)
+        Cow::Owned(format!("UInt<{}>", bits))
     }
 }
 
-fn float_type_name(bits: u8) -> String {
-    // FLOAT_TYPE_NAMES caches only IEEE 754 widths (32, 64).
-    let idx = match bits {
-        32 => Some(0),
-        64 => Some(1),
-        _ => None,
-    };
-    if let Some(i) = idx {
-        FLOAT_TYPE_NAMES[i].to_string()
-    } else {
-        format!("Float<{}>", bits)
+fn float_type_name<'input>(bits: u32) -> Cow<'input, str> {
+    // FLOAT_TYPE_NAMES only caches the 32-bit and 64-bit widths of the IEEE 754 standard.
+    match bits {
+        32 => Cow::Borrowed(FLOAT_TYPE_NAMES[0]),
+        64 => Cow::Borrowed(FLOAT_TYPE_NAMES[1]),
+        _ => Cow::Owned(format!("Float<{}>", bits)),
     }
 }
 
@@ -460,34 +486,41 @@ fn float_type_name(bits: u8) -> String {
 /// Takes a pre-resolved `TypeId` to avoid redundant `resolve_binding` calls.
 /// When `symbols` is `Some`, ADT types (structs, enums) are rendered with
 /// their actual name (e.g. `MyStruct`) instead of a generic `DefId(N)`.
-fn type_name(ctx: &TypeContext, resolved: TypeId, symbols: Option<&SymbolTable>) -> String {
+fn type_name<'input>(
+    ctx: &TypeContext<'input>,
+    resolved: TypeId,
+    symbols: Option<&SymbolTable<'input>>,
+) -> Cow<'input, str> {
     match ctx.get(resolved) {
         TypeData::Int { bits, signed, .. } => int_type_name(*bits, *signed),
         TypeData::UInt { bits, .. } => int_type_name(*bits, false),
         TypeData::Float { bits } => float_type_name(*bits),
-        TypeData::Bool => "Bool".to_string(),
-        TypeData::Char => "Char".to_string(),
-        TypeData::Byte => "Byte".to_string(),
-        TypeData::USize => "usize".to_string(),
-        TypeData::Never => "!".to_string(),
-        TypeData::Unit => "()".to_string(),
+
+        TypeData::Bool => Cow::Borrowed("Bool"),
+        TypeData::Char => Cow::Borrowed("Char"),
+        TypeData::Byte => Cow::Borrowed("Byte"),
+        TypeData::USize => Cow::Borrowed("usize"),
+        TypeData::Never => Cow::Borrowed("!"),
+        TypeData::Unit => Cow::Borrowed("()"),
+
         TypeData::Adt { def_id, .. } => {
-            // Look up the type name from the symbol table if available.
-            if let Some(symbols) = symbols
-                && let Some(name) = symbols.type_name_by_def_id(*def_id)
-            {
-                return name.as_str();
+            if let Some(symbols) = symbols {
+                if let Some(name) = symbols.type_name_by_def_id(*def_id) {
+                    // `Symbol::as_str()` returns `String` (the interner does
+                    // not expose a `&'input str` view), so we must own it.
+                    return Cow::Owned(name.as_str());
+                }
             }
-            // Fallback: show the DefId.
-            format!("{:?}", def_id)
+            Cow::Owned(format!("{:?}", def_id))
         }
-        _ => format!("{:?}", ctx.get(resolved)),
+
+        _ => Cow::Owned(format!("{:?}", ctx.get(resolved))),
     }
 }
 
 /// Determine the `TypeKind` for a type.
 /// Takes a pre-resolved `TypeId` to avoid redundant `resolve_binding` calls.
-fn determine_kind(ctx: &TypeContext, resolved: TypeId) -> TypeKind {
+fn determine_kind<'input>(ctx: &TypeContext<'input>, resolved: TypeId) -> TypeKind {
     match ctx.get(resolved) {
         TypeData::Adt { kind: adt_kind, .. } => match adt_kind {
             crate::hir::types::AdtKind::Struct => TypeKind::Struct,
@@ -501,19 +534,23 @@ fn determine_kind(ctx: &TypeContext, resolved: TypeId) -> TypeKind {
 }
 
 /// Extract tuple fields from a resolution-phase `Type`.
-fn tuple_fields(ctx: &mut TypeContext, ty: &Type, symbols: &SymbolTable) -> Vec<FieldInfo> {
+fn tuple_fields<'input>(
+    ctx: &mut TypeContext<'input>,
+    ty: &Type<'input>,
+    symbols: &SymbolTable<'input>,
+) -> Vec<FieldInfo<'input>> {
     match ty {
         Type::Tuple(tys, _) => tys
             .iter()
             .enumerate()
             .map(|(i, elem_ty)| FieldInfo {
-                name: format!("_{}", i),
+                name: Cow::Owned(format!("_{}", i)),
                 ty: resolve_ast_type_to_typeid(ctx, elem_ty, symbols),
             })
             .collect(),
         // Single unnamed field (no tuple syntax)
         _ => vec![FieldInfo {
-            name: "value".to_string(),
+            name: Cow::Borrowed("value"),
             ty: resolve_ast_type_to_typeid(ctx, ty, symbols),
         }],
     }
@@ -521,7 +558,11 @@ fn tuple_fields(ctx: &mut TypeContext, ty: &Type, symbols: &SymbolTable) -> Vec<
 
 /// Resolve an AST `Type` to a `TypeId` using the symbol table.
 /// Falls back to `ctx.error()` if resolution fails.
-fn resolve_ast_type_to_typeid(ctx: &mut TypeContext, ty: &Type, symbols: &SymbolTable) -> TypeId {
+fn resolve_ast_type_to_typeid<'input>(
+    ctx: &mut TypeContext<'input>,
+    ty: &Type<'input>,
+    symbols: &SymbolTable<'input>,
+) -> TypeId {
     match ty {
         Type::Path(path, _) => {
             if let Some(def_id) = symbols.lookup_type_by_path(path)
@@ -550,15 +591,15 @@ fn resolve_ast_type_to_typeid(ctx: &mut TypeContext, ty: &Type, symbols: &Symbol
         }
         Type::Generic(base, args, _) => {
             // Handle Int<N>, UInt<N>, Float<N>.
-            if let Type::Path(path, _) = base.as_ref()
+            if let Type::Path(path, _) = base
                 && path.len() == 1
             {
                 let name = path[0].as_str();
                 let bits = args.first().and_then(|arg| {
                     if let GenericArg::Positional(Type::Literal(expr, _)) = arg
-                        && let Expr::Literal(Literal::Int(bits), _) = expr.as_ref()
+                        && let Expr::Literal(Literal::Int(bits), _) = expr
                     {
-                        return Some(*bits as u8);
+                        return bits.to_u64().and_then(|n| u32::try_from(n).ok());
                     }
                     None
                 });
@@ -577,9 +618,14 @@ fn resolve_ast_type_to_typeid(ctx: &mut TypeContext, ty: &Type, symbols: &Symbol
             // Fallback: resolve the base type (ignoring args).
             resolve_ast_type_to_typeid(ctx, base, symbols)
         }
-        Type::Reference { inner, .. } => {
+        Type::Reference {
+            inner,
+            mutable,
+            lifetime,
+            ..
+        } => {
             let inner_id = resolve_ast_type_to_typeid(ctx, inner, symbols);
-            ctx.reference(inner_id, false)
+            ctx.reference_with_lifetime(inner_id, *mutable, *lifetime)
         }
         _ => ctx.error(),
     }

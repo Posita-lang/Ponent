@@ -51,7 +51,7 @@ pub(crate) fn did_you_mean_suggestion(name: &str, candidates: &[String]) -> Opti
 }
 
 /// Check whether an expression is a valid assignment target (lvalue).
-pub(crate) fn is_valid_lvalue(expr: &Expr) -> bool {
+pub(crate) fn is_valid_lvalue<'input>(expr: &Expr<'input>) -> bool {
     match expr {
         Expr::Ident(_, _) => true,
         Expr::FieldAccess { .. } => true,

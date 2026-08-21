@@ -1,13 +1,13 @@
 //! # SolverDelegate — Trait Solver Abstraction Layer
 //!
 //! Decouples the generic trait-solving logic from the concrete compiler
-//! types (`TypeContext`, `TraitEnv`, `SymbolTable`, …), following the
+//! types (`TypeContext<'input>`, `TraitEnv`, `SymbolTable<'input>`, …), following the
 //! same pattern as `rustc_next_trait_solver::delegate::SolverDelegate`.
 //!
 //! ## Design
 //!
 //! The solver (`FulfillmentContext`, `evaluate_goal`, `SelectionContext`)
-//! previously depended directly on concrete types like `&mut TypeContext`
+//! previously depended directly on concrete types like `&mut TypeContext<'input>`
 //! and `&TraitEnv`.  This made it impossible to:
 //! - Unit‑test the solver with a mock environment
 //! - Swap out the internals without touching every solver method
@@ -41,15 +41,15 @@ use crate::hir::types::{DefId, TypeContext, TypeId};
 /// type context, trait environment, symbol table, and so on, plus the
 /// core selection method that drives candidate assembly → winnowing →
 /// confirmation.
-pub trait SolverDelegate {
+pub trait SolverDelegate<'input> {
     /// Mutable reference to the type context (arena, bindings, …).
-    fn ctx(&mut self) -> &mut TypeContext;
+    fn ctx(&mut self) -> &mut TypeContext<'input>;
 
     /// Read‑only reference to the trait environment (registered impls).
-    fn trait_env(&self) -> &TraitEnv;
+    fn trait_env(&self) -> &TraitEnv<'input>;
 
     /// Read‑only reference to the symbol table.
-    fn symbols(&self) -> &SymbolTable;
+    fn symbols(&self) -> &SymbolTable<'input>;
 
     /// Built‑in trait registry (Sized, Copy, Clone, …).
     fn builtin_registry(&self) -> &BuiltinTraitRegistry;
@@ -88,7 +88,8 @@ pub trait SolverDelegate {
     // ── Trait classification helpers ─────────────────────────────────
 
     /// Whether the trait identified by `def_id` is coinductive
-    /// (auto‑traits like `Sized`, `Copy`, `Clone`).
+    /// (auto‑traits like `Sized`, `Copy`, `Clone`, or user traits
+    /// declared `@coinductive`).
     fn trait_is_coinductive(&self, def_id: DefId) -> bool;
 
     /// If the given `def_id` identifies a built‑in trait, return its
@@ -157,7 +158,7 @@ pub trait SolverDelegate {
 /// Extension trait for `SolverDelegate` that provides methods used by `EvalCtxt`.
 ///
 /// Analogous to Rust's `SolverDelegateEvalExt` in `eval_ctxt/mod.rs`.
-pub trait SolverDelegateEvalExt: SolverDelegate + Sized {
+pub trait SolverDelegateEvalExt<'input>: SolverDelegate<'input> + Sized {
     /// Evaluate a goal from outside the trait solver.
     fn evaluate_root_goal(
         &mut self,
@@ -175,7 +176,7 @@ pub trait SolverDelegateEvalExt: SolverDelegate + Sized {
 }
 
 /// Blanket implementation of `SolverDelegateEvalExt` for all `Sized` `SolverDelegate` types.
-impl<D: SolverDelegate + Sized> SolverDelegateEvalExt for D {
+impl<'input, D: SolverDelegate<'input> + Sized> SolverDelegateEvalExt<'input> for D {
     fn evaluate_root_goal(
         &mut self,
         goal: &crate::hir::traits::solver::obligation::Obligation,

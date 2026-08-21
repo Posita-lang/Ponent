@@ -13,7 +13,6 @@
 //!   has its own execution context.  This is the same pattern used
 //!   by Rust's `DepGraph` for implicit task deps.
 
-use std::collections::VecDeque;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -97,6 +96,10 @@ pub struct DepGraph {
     /// Which nodes are dirty (need re-computation).
     /// Protected by RwLock for concurrent read access.
     dirty: RwLock<HashSet<DepNodeIndex>>,
+    /// Per-node value fingerprints (red-green verification).
+    /// `None` until the node has been computed at least once.
+    /// Protected by RwLock for concurrent read access.
+    fingerprints: RwLock<Vec<Option<u64>>>,
 }
 
 impl DepGraph {
@@ -106,6 +109,7 @@ impl DepGraph {
             edges: RwLock::new(Vec::new()),
             rev_edges: RwLock::new(Vec::new()),
             dirty: RwLock::new(HashSet::default()),
+            fingerprints: RwLock::new(Vec::new()),
         }
     }
 
@@ -116,9 +120,11 @@ impl DepGraph {
         let idx_u = idx.0 as usize;
         let mut edges = self.edges.write().unwrap();
         let mut rev = self.rev_edges.write().unwrap();
+        let mut fps = self.fingerprints.write().unwrap();
         if idx_u >= edges.len() {
             edges.resize_with(idx_u + 1, HashSet::default);
             rev.resize_with(idx_u + 1, HashSet::default);
+            fps.resize_with(idx_u + 1, || None);
         }
         idx
     }
@@ -169,22 +175,47 @@ impl DepGraph {
         }
     }
 
-    /// Mark a node as dirty and propagate to all transitive readers.
-    /// Uses reverse edges for O(1) per dirty node instead of O(N) scan.
+    /// Mark a node as dirty.  LAZY invalidation (replaces the old eager
+    /// transitive BFS): only the node itself is marked red.  Readers are
+    /// not touched here — propagation happens lazily, after the node is
+    /// recomputed and its fingerprint compared: an UNCHANGED fingerprint
+    /// keeps readers green (they stay cached); a CHANGED fingerprint
+    /// marks only the DIRECT readers dirty (see [`DepGraph::dirty_readers`]),
+    /// and they re-verify in turn when next requested.
     pub fn invalidate(&self, node: DepNodeIndex) {
+        self.dirty.write().unwrap().insert(node);
+    }
+
+    /// Mark the DIRECT readers of `node` dirty (one level, not transitive).
+    /// Called when a recomputed node's fingerprint changed, so readers
+    /// re-verify lazily on their next request.
+    pub fn dirty_readers(&self, node: DepNodeIndex) {
         let mut dirty = self.dirty.write().unwrap();
         let rev = self.rev_edges.read().unwrap();
-        let mut queue = VecDeque::new();
-        queue.push_back(node);
-        while let Some(current) = queue.pop_front() {
-            if dirty.insert(current)
-                && let Some(rev_entry) = rev.get(current.0 as usize)
-            {
-                for &reader in rev_entry {
-                    queue.push_back(reader);
-                }
-            }
+        if let Some(readers) = rev.get(node.0 as usize) {
+            dirty.extend(readers.iter().copied());
         }
+    }
+
+    /// Store the value fingerprint of a node (red-green verification).
+    pub fn set_fingerprint(&self, node: DepNodeIndex, fp: u64) {
+        let mut fps = self.fingerprints.write().unwrap();
+        let idx = node.0 as usize;
+        if idx >= fps.len() {
+            fps.resize_with(idx + 1, || None);
+        }
+        fps[idx] = Some(fp);
+    }
+
+    /// The previously stored fingerprint of a node, if it has been
+    /// computed at least once.
+    pub fn fingerprint(&self, node: DepNodeIndex) -> Option<u64> {
+        self.fingerprints
+            .read()
+            .unwrap()
+            .get(node.0 as usize)
+            .copied()
+            .flatten()
     }
 
     /// Check whether a node is green (up-to-date, not dirty).
@@ -204,6 +235,7 @@ impl DepGraph {
         self.edges.write().unwrap().clear();
         self.rev_edges.write().unwrap().clear();
         self.dirty.write().unwrap().clear();
+        self.fingerprints.write().unwrap().clear();
         TASK_STACK.with(|s| s.borrow_mut().clear());
     }
 }
@@ -233,14 +265,42 @@ mod tests {
         (a, b, c)
     }
 
+    /// Lazy invalidation: `invalidate(c)` marks ONLY `c` red.  Readers are
+    /// dirtied lazily via `dirty_readers` when a recomputed fingerprint
+    /// changes (the old eager transitive BFS was removed by design).
     #[test]
-    fn test_rev_edges_enables_o1_invalidation() {
+    fn test_invalidate_marks_node_only_not_readers() {
         let dg = DepGraph::new();
         let (a, b, c) = setup_chain(&dg);
         dg.invalidate(c);
         assert!(!dg.is_green(c));
-        assert!(!dg.is_green(b));
-        assert!(!dg.is_green(a));
+        assert!(dg.is_green(b), "lazy invalidation: readers must stay green");
+        assert!(dg.is_green(a));
+    }
+
+    /// A changed fingerprint marks only DIRECT readers dirty (one level).
+    #[test]
+    fn test_fingerprint_change_dirties_direct_readers_only() {
+        let dg = DepGraph::new();
+        let (a, b, c) = setup_chain(&dg); // a reads b reads c
+        dg.set_fingerprint(c, 1);
+        dg.dirty_readers(c);
+        assert!(!dg.is_green(b), "b reads c directly, must be dirtied");
+        assert!(
+            dg.is_green(a),
+            "a reads b only transitively, must stay green"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_roundtrip() {
+        let dg = DepGraph::new();
+        let n = dg.allocate_node_index();
+        assert_eq!(dg.fingerprint(n), None);
+        dg.set_fingerprint(n, 42);
+        assert_eq!(dg.fingerprint(n), Some(42));
+        dg.set_fingerprint(n, 43);
+        assert_eq!(dg.fingerprint(n), Some(43));
     }
 
     #[test]
@@ -256,6 +316,8 @@ mod tests {
         assert!(dg.is_green(b));
     }
 
+    /// Fan-out under lazy invalidation: a fingerprint change on the root
+    /// dirties ALL direct readers (the fan-out is one level).
     #[test]
     fn test_rev_edges_fan_out() {
         let dg = DepGraph::new();
@@ -269,6 +331,11 @@ mod tests {
             dg.finish_task();
         }
         dg.invalidate(root);
+        assert!(!dg.is_green(root));
+        assert!(dg.is_green(x), "invalidate alone must not propagate");
+        assert!(dg.is_green(y));
+        assert!(dg.is_green(z));
+        dg.dirty_readers(root);
         assert!(!dg.is_green(x));
         assert!(!dg.is_green(y));
         assert!(!dg.is_green(z));

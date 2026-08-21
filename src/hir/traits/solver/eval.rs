@@ -59,16 +59,16 @@ use crate::symbol::Symbol;
 enum CanonTy {
     // ── Primitives ──
     Int {
-        bits: u8,
+        bits: u32,
         signed: bool,
         overflow_policy: OverflowPolicy,
     },
     UInt {
-        bits: u8,
+        bits: u32,
         overflow_policy: OverflowPolicy,
     },
     Float {
-        bits: u8,
+        bits: u32,
     },
     Bool,
     Char,
@@ -161,7 +161,11 @@ enum CanonTy {
 /// IMPORTANT: bound-variable detection must happen BEFORE binding resolution.
 /// We use `ctx.get_raw(ty)` to inspect the raw type first, and only call
 /// `ctx.resolve_binding(ty)` for non-bound variables.
-fn canonicalize_type(ctx: &TypeContext, ty: TypeId, bound: &mut Vec<usize>) -> CanonTy {
+fn canonicalize_type<'input>(
+    ctx: &TypeContext<'input>,
+    ty: TypeId,
+    bound: &mut Vec<usize>,
+) -> CanonTy {
     // Check the raw type for bound GenericParam BEFORE resolving bindings.
     // If we resolved first, a bound variable bound to a concrete type
     // (e.g. GenericParam(0) ↦ Int) would lose its binder identity.
@@ -206,7 +210,7 @@ fn canonicalize_type(ctx: &TypeContext, ty: TypeId, bound: &mut Vec<usize>) -> C
         TypeData::GenericParam { index, .. } if bound.contains(index) => {
             CanonTy::GenericParam { index: *index }
         }
-        TypeData::InferVar { id } => CanonTy::InferVar { id: *id },
+        TypeData::InferVar { id, .. } => CanonTy::InferVar { id: *id },
         TypeData::GenericParam { index, .. } => CanonTy::GenericParam { index: *index },
         TypeData::SkolemVar { id, universe_num } => CanonTy::SkolemVar {
             id: *id,
@@ -228,7 +232,7 @@ fn canonicalize_type(ctx: &TypeContext, ty: TypeId, bound: &mut Vec<usize>) -> C
                 .map(|&e| canonicalize_type(ctx, e, bound))
                 .collect(),
         ),
-        TypeData::Ref { ty, mutable } => CanonTy::Ref {
+        TypeData::Ref { ty, mutable, .. } => CanonTy::Ref {
             ty: Box::new(canonicalize_type(ctx, *ty, bound)),
             mutable: *mutable,
         },
@@ -346,8 +350,8 @@ fn canonicalize_type(ctx: &TypeContext, ty: TypeId, bound: &mut Vec<usize>) -> C
 // ── Goal key ── (now in search_graph.rs — GoalKey, GoalKind)
 
 // ── Evaluate a goal and all its nested obligations recursively. ──
-pub fn evaluate_goal<D: SolverDelegate>(
-    ecx: &mut EvalCtxt<D>,
+pub fn evaluate_goal<'input, D: SolverDelegate<'input>>(
+    ecx: &mut EvalCtxt<'_, 'input, D>,
     goal: &Obligation,
 ) -> Result<ImplSource, SolveError> {
     // Fixpoint iteration: re-evaluate if the goal was ambiguous and the
@@ -377,8 +381,8 @@ pub fn evaluate_goal<D: SolverDelegate>(
 
 /// Inner recursive evaluation with explicit depth, using SearchGraph
 /// for cycle detection (now embedded in EvalCtxt).
-fn evaluate_goal_inner<D: SolverDelegate>(
-    ecx: &mut EvalCtxt<D>,
+fn evaluate_goal_inner<'input, D: SolverDelegate<'input>>(
+    ecx: &mut EvalCtxt<'_, 'input, D>,
     goal: &Obligation,
     depth: usize,
 ) -> Result<ImplSource, SolveError> {

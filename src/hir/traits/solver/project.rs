@@ -52,12 +52,12 @@ impl ProjectionCache {
     }
 
     /// Try to get a cached normalized type.
-    pub fn get(
+    pub fn get<'input>(
         &self,
         trait_id: DefId,
         self_ty: TypeId,
         assoc_name: &Symbol,
-        ctx: &TypeContext,
+        ctx: &TypeContext<'input>,
     ) -> Option<TypeId> {
         let resolved = ctx.resolve_binding(self_ty);
         let key = ProjectionKey(trait_id, resolved, *assoc_name);
@@ -76,13 +76,13 @@ impl ProjectionCache {
 
     /// Insert a normalized type into the cache.
     /// If the cache exceeds MAX_CACHE_SIZE, it is fully cleared first.
-    pub fn insert(
+    pub fn insert<'input>(
         &self,
         trait_id: DefId,
         self_ty: TypeId,
         assoc_name: Symbol,
         ty: TypeId,
-        ctx: &TypeContext,
+        ctx: &TypeContext<'input>,
     ) {
         let resolved = ctx.resolve_binding(self_ty);
         let key = ProjectionKey(trait_id, resolved, assoc_name);
@@ -90,12 +90,12 @@ impl ProjectionCache {
     }
 
     /// Mark a projection as ambiguous (should not be cached permanently).
-    pub fn mark_ambiguous(
+    pub fn mark_ambiguous<'input>(
         &self,
         trait_id: DefId,
         self_ty: TypeId,
         assoc_name: Symbol,
-        ctx: &TypeContext,
+        ctx: &TypeContext<'input>,
     ) {
         let resolved = ctx.resolve_binding(self_ty);
         let key = ProjectionKey(trait_id, resolved, assoc_name);
@@ -119,13 +119,13 @@ impl ProjectionCache {
 /// to TraitEnv for impl lookup and does NOT modify the inference context
 /// (no unification, no transaction). The caller is responsible for
 /// committing or rolling back.
-pub fn resolve_projection(
-    trait_env: &TraitEnv,
+pub fn resolve_projection<'input>(
+    trait_env: &TraitEnv<'input>,
     trait_id: DefId,
     self_ty: TypeId,
     assoc_name: &Symbol,
-    ctx: &mut TypeContext,
-    symbols: &SymbolTable,
+    ctx: &mut TypeContext<'input>,
+    symbols: &SymbolTable<'input>,
 ) -> Option<TypeId> {
     // Try exact match first
     if let Some(cand) = trait_env.lookup_impl(trait_id, self_ty) {
@@ -166,12 +166,12 @@ pub enum ProjectionResult {
 /// and then recursively normalizes the result. If the projection's
 /// self_ty is an inference variable, normalization is deferred
 /// (returns `Deferred(stalled_on)`).
-pub fn normalize_projection(
+pub fn normalize_projection<'input>(
     proj: &ProjectionTy,
-    trait_env: &TraitEnv,
-    ctx: &mut TypeContext,
+    trait_env: &TraitEnv<'input>,
+    ctx: &mut TypeContext<'input>,
     cache: &ProjectionCache,
-    symbols: &SymbolTable,
+    symbols: &SymbolTable<'input>,
 ) -> ProjectionResult {
     // Check cache first
     if let Some(cached) = cache.get(proj.trait_id, proj.self_ty, &proj.assoc_name, ctx) {

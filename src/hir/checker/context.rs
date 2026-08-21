@@ -1,14 +1,19 @@
-use super::*;
+use std::mem;
 
-/// A scoped guard that owns the inference-scope lifecycle.
+use super::region::RegionTree;
+use super::{CtxFrame, CtxKind, TypeChecker, VarScopeGuard};
+use crate::ast::Span;
+use crate::diagnostics::{ComptimeReason, DiagCtxt, Diagnostic};
+use crate::hir::infer::InferenceContext;
+use crate::hir::types::{DefId, TypeId};
 ///
 /// Responsibilities:
 /// - Pops the infer stack on `commit` (before fallible work).
 /// - Holds the saved `RegionTree` snapshot so `Drop` can restore it
 ///   if a panic occurs during solving.
 /// - Restores saved fields (`current_function`, …) on drop.
-pub(crate) struct ScopeGuard<'a, 'tcx> {
-    pub(crate) checker: &'tcx mut TypeChecker<'a>,
+pub(crate) struct ScopeGuard<'a, 'tcx, 'input> {
+    pub(crate) checker: &'tcx mut TypeChecker<'a, 'input>,
     pub(crate) old_function: Option<DefId>,
     pub(crate) old_return: Option<TypeId>,
     pub(crate) old_trusted: bool,
@@ -18,11 +23,11 @@ pub(crate) struct ScopeGuard<'a, 'tcx> {
     /// Saved region tree snapshot — used on panic to discard frames pushed
     /// inside this scope.  Taken from `infer_stack` during `commit` and
     /// stored here before any fallible work runs.
-    saved_tree: Option<region::RegionTree>,
+    saved_tree: Option<RegionTree>,
 }
 
-impl<'a, 'tcx> ScopeGuard<'a, 'tcx> {
-    pub(crate) fn new(checker: &'tcx mut TypeChecker<'a>) -> Self {
+impl<'a, 'tcx, 'input> ScopeGuard<'a, 'tcx, 'input> {
+    pub(crate) fn new(checker: &'tcx mut TypeChecker<'a, 'input>) -> Self {
         let old_function = checker.current_function;
         let old_return = checker.current_return_type;
         let old_trusted = checker.current_function_trusted;
@@ -96,7 +101,7 @@ impl<'a, 'tcx> ScopeGuard<'a, 'tcx> {
     }
 }
 
-impl<'a, 'tcx> Drop for ScopeGuard<'a, 'tcx> {
+impl<'a, 'tcx, 'input> Drop for ScopeGuard<'a, 'tcx, 'input> {
     fn drop(&mut self) {
         if self.should_restore {
             // Always roll back the transaction.
@@ -119,7 +124,7 @@ impl<'a, 'tcx> Drop for ScopeGuard<'a, 'tcx> {
     }
 }
 
-impl<'a> TypeChecker<'a> {
+impl<'a, 'input> TypeChecker<'a, 'input> {
     /// Save the current inference context and push a fresh one.
     pub(crate) fn enter_inference_scope(&mut self) {
         self.ctx.begin_transaction();
@@ -223,10 +228,13 @@ impl<'a> TypeChecker<'a> {
         for frame in self.region_tree.iter_frames_rev() {
             match &frame.kind {
                 CtxKind::Loop | CtxKind::While | CtxKind::For => {
-                    if label.is_none() {
-                        return Some((frame.span, None));
+                    if let Some(lbl) = label {
+                        if frame.label.as_deref() == Some(lbl) {
+                            return Some((frame.span, Some(lbl)));
+                        }
+                        continue;
                     }
-                    continue;
+                    return Some((frame.span, None));
                 }
                 CtxKind::LabeledBlock => {
                     if let Some(lbl) = label
@@ -244,13 +252,20 @@ impl<'a> TypeChecker<'a> {
         None
     }
 
-    /// Find the innermost continue target (only Loop, While, For).
+    /// Find the continue target (Loop, While, For).
+    ///
+    /// With no label, returns the innermost loop.  With a label, returns
+    /// the innermost loop whose own label matches — `continue 'label;`
+    /// (SYNTAX.md §Loops) jumps to the continue point of that loop even
+    /// when a nested unlabeled loop sits between.
     pub(crate) fn find_continue_target(&self, label: Option<&str>) -> Option<(Span, &str)> {
         for frame in self.region_tree.iter_frames_rev() {
             match &frame.kind {
                 CtxKind::Loop | CtxKind::While | CtxKind::For => {
-                    if label.is_some() {
-                        continue;
+                    if let Some(lbl) = label {
+                        if frame.label.as_deref() != Some(lbl) {
+                            continue;
+                        }
                     }
                     let kind_str = match frame.kind {
                         CtxKind::Loop => "loop",

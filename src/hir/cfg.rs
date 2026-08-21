@@ -22,8 +22,8 @@ type CfgKey = (String, Option<String>);
 /// - `@cfg(all(...))` — all conditions must be true
 /// - `@cfg(any(...))` — any condition must be true
 /// - `@cfg(not(...))` — negate a condition
-pub fn eval_cfg(
-    attr: &Attribute,
+pub fn eval_cfg<'input>(
+    attr: &Attribute<'input>,
     target: &Target,
     features: &[String],
     debug: bool,
@@ -79,8 +79,8 @@ pub fn eval_cfg(
 }
 
 /// Evaluate a cfg expression.
-fn eval_cfg_expr(
-    expr: &Expr,
+fn eval_cfg_expr<'input>(
+    expr: &Expr<'input>,
     target: &Target,
     features: &[String],
     debug: bool,
@@ -96,7 +96,7 @@ fn eval_cfg_expr(
         Expr::Literal(Literal::Bool(b), _) => *b,
         Expr::Literal(Literal::Int(n), _) => *n != 0,
         Expr::Call { callee, args, .. } => {
-            let callee_name = match callee.as_ref() {
+            let callee_name = match callee {
                 Expr::Ident(name, _) => name.as_str(),
                 _ => return false,
             };
@@ -130,11 +130,11 @@ fn eval_cfg_expr(
             match op {
                 BinOp::Eq => {
                     // `key = "value"` — compare left identifier to right string
-                    let key = match left.as_ref() {
+                    let key = match left {
                         Expr::Ident(name, _) => name.as_str(),
                         _ => return false,
                     };
-                    let val = match right.as_ref() {
+                    let val = match right {
                         Expr::Literal(Literal::String(s), _) => s.clone(),
                         _ => return false,
                     };
@@ -148,11 +148,11 @@ fn eval_cfg_expr(
                     )
                 }
                 BinOp::Neq => {
-                    let key = match left.as_ref() {
+                    let key = match left {
                         Expr::Ident(name, _) => name.as_str(),
                         _ => return false,
                     };
-                    let val = match right.as_ref() {
+                    let val = match right {
                         Expr::Literal(Literal::String(s), _) => s.clone(),
                         _ => return false,
                     };
@@ -281,7 +281,11 @@ fn eval_cfg_key(
 /// 3. Target architecture axioms: `arch → pointer_width`
 /// 4. The cfg expression is converted to CNF clauses
 /// 5. `solver.solve()` determines satisfiability
-pub fn is_provably_reachable(attr: &Attribute, strict_mode: bool, diag: &mut DiagCtxt) -> bool {
+pub fn is_provably_reachable<'input>(
+    attr: &Attribute<'input>,
+    strict_mode: bool,
+    diag: &mut DiagCtxt,
+) -> bool {
     if !attr.name.eq_str("cfg") {
         return true;
     }
@@ -418,8 +422,8 @@ pub fn is_provably_reachable(attr: &Attribute, strict_mode: bool, diag: &mut Dia
 
 /// Build a list of CNF clauses from a cfg expression.
 /// Variable indices are resolved via `var_map`.
-fn build_clauses(
-    expr: &Expr,
+fn build_clauses<'input>(
+    expr: &Expr<'input>,
     var_map: &mut std::collections::HashMap<String, i32>,
     var_counter: &mut i32,
     var_keyvals: &mut std::collections::HashMap<i32, (String, String)>,
@@ -438,8 +442,8 @@ fn build_clauses(
     clauses
 }
 
-fn build_clauses_inner(
-    expr: &Expr,
+fn build_clauses_inner<'input>(
+    expr: &Expr<'input>,
     var_map: &mut std::collections::HashMap<String, i32>,
     var_counter: &mut i32,
     clauses: &mut Vec<Vec<i32>>,
@@ -449,7 +453,7 @@ fn build_clauses_inner(
 ) {
     match expr {
         Expr::Call { callee, args, .. } => {
-            if let Expr::Ident(name, _) = callee.as_ref() {
+            if let Expr::Ident(name, _) = callee {
                 let name_s = name.as_str();
                 match name_s.as_str() {
                     "all" => {
@@ -587,9 +591,7 @@ fn build_clauses_inner(
             left, op, right, ..
         } if *op == BinOp::Eq => {
             // key = "value" → unit clause
-            if let (Expr::Ident(key, _), Expr::Literal(Literal::String(val), _)) =
-                (left.as_ref(), right.as_ref())
-            {
+            if let (Expr::Ident(key, _), Expr::Literal(Literal::String(val), _)) = (left, right) {
                 let name = format!("cfg_{}_{}", key.as_str(), val);
                 let lit = *var_map.entry(name).or_insert_with(|| {
                     let id = *var_counter;
@@ -610,9 +612,7 @@ fn build_clauses_inner(
             left, op, right, ..
         } if *op == BinOp::Neq => {
             // key != "value" → ¬variable
-            if let (Expr::Ident(key, _), Expr::Literal(Literal::String(val), _)) =
-                (left.as_ref(), right.as_ref())
-            {
+            if let (Expr::Ident(key, _), Expr::Literal(Literal::String(val), _)) = (left, right) {
                 let name = format!("cfg_{}_{}", key.as_str(), val);
                 let lit = *var_map.entry(name).or_insert_with(|| {
                     let id = *var_counter;
@@ -645,9 +645,32 @@ fn build_clauses_inner(
     }
 }
 
+/// Add a `key == "value"` literal to the clause — the shared variable-ID
+/// allocation + key/value bookkeeping for `push_literals`.
+fn add_literal(
+    key: &str,
+    val: &str,
+    var_map: &mut std::collections::HashMap<String, i32>,
+    var_counter: &mut i32,
+    clause: &mut Vec<i32>,
+    negated: bool,
+    var_keyvals: &mut std::collections::HashMap<i32, (String, String)>,
+) {
+    let name = format!("cfg_{}_{}", key, val);
+    let lit = *var_map.entry(name).or_insert_with(|| {
+        let id = *var_counter;
+        *var_counter += 1;
+        id
+    });
+    var_keyvals
+        .entry(lit)
+        .or_insert_with(|| (key.to_string(), val.to_string()));
+    clause.push(if negated { -lit } else { lit });
+}
+
 /// Push literals for an expression into a clause (for `any()`).
-fn push_literals(
-    expr: &Expr,
+fn push_literals<'input>(
+    expr: &Expr<'input>,
     var_map: &mut std::collections::HashMap<String, i32>,
     var_counter: &mut i32,
     clause: &mut Vec<i32>,
@@ -658,23 +681,22 @@ fn push_literals(
         Expr::BinaryOp {
             left, op, right, ..
         } if *op == BinOp::Eq => {
-            if let (Expr::Ident(key, _), Expr::Literal(Literal::String(val), _)) =
-                (left.as_ref(), right.as_ref())
-            {
-                let name = format!("cfg_{}_{}", key.as_str(), val);
-                let lit = *var_map.entry(name).or_insert_with(|| {
-                    let id = *var_counter;
-                    *var_counter += 1;
-                    id
-                });
-                var_keyvals
-                    .entry(lit)
-                    .or_insert_with(|| (key.as_str().to_string(), val.clone()));
-                if negated {
-                    clause.push(-lit);
-                } else {
-                    clause.push(lit);
+            match (left, right) {
+                (Expr::Ident(key, _), Expr::Literal(Literal::String(val), _)) => {
+                    add_literal(
+                        key.as_str().as_str(),
+                        val.as_str(),
+                        var_map,
+                        var_counter,
+                        clause,
+                        negated,
+                        var_keyvals,
+                    );
                 }
+                // The cfg syntax only allows the key on the left
+                // (`cfg_os == "linux"`); the reversed form is not
+                // supported (see the direction investigation).
+                _ => {}
             }
         }
         Expr::UnaryOp { op, expr, .. } if *op == UnaryOp::Not => {
@@ -694,7 +716,7 @@ mod tests {
         Target::builtin("x86_64-linux-gnu").expect("builtin target")
     }
 
-    fn make_cfg_attr(named_args: Vec<(&str, &str)>) -> Attribute {
+    fn make_cfg_attr(named_args: Vec<(&str, &str)>) -> Attribute<'static> {
         Attribute {
             name: Symbol::intern("cfg"),
             args: Vec::new(),
@@ -855,28 +877,41 @@ mod tests {
     /// and verifies the SAT solver correctly reports it as unsatisfiable,
     /// because `x86_64` and `aarch64` are mutually exclusive.
     fn test_cfg_mutual_exclusion_with_underscores() {
+        let callee: &'static Expr<'static> = Box::leak(Box::new(Expr::Ident(
+            Symbol::intern("all"),
+            Span::new(0, 0),
+        )));
+        let left1: &'static Expr<'static> = Box::leak(Box::new(Expr::Ident(
+            Symbol::intern("target_arch"),
+            Span::new(0, 0),
+        )));
+        let right1: &'static Expr<'static> = Box::leak(Box::new(Expr::Literal(
+            Literal::String("x86_64".into()),
+            Span::new(0, 0),
+        )));
+        let binop1 = Expr::BinaryOp {
+            left: left1,
+            op: BinOp::Eq,
+            right: right1,
+            span: Span::new(0, 0),
+        };
+        let left2: &'static Expr<'static> = Box::leak(Box::new(Expr::Ident(
+            Symbol::intern("target_arch"),
+            Span::new(0, 0),
+        )));
+        let right2: &'static Expr<'static> = Box::leak(Box::new(Expr::Literal(
+            Literal::String("aarch64".into()),
+            Span::new(0, 0),
+        )));
+        let binop2 = Expr::BinaryOp {
+            left: left2,
+            op: BinOp::Eq,
+            right: right2,
+            span: Span::new(0, 0),
+        };
         let expr = Expr::Call {
-            callee: Box::new(Expr::Ident(Symbol::intern("all"), Span::new(0, 0))),
-            args: vec![
-                Expr::BinaryOp {
-                    left: Box::new(Expr::Ident(Symbol::intern("target_arch"), Span::new(0, 0))),
-                    op: BinOp::Eq,
-                    right: Box::new(Expr::Literal(
-                        Literal::String("x86_64".into()),
-                        Span::new(0, 0),
-                    )),
-                    span: Span::new(0, 0),
-                },
-                Expr::BinaryOp {
-                    left: Box::new(Expr::Ident(Symbol::intern("target_arch"), Span::new(0, 0))),
-                    op: BinOp::Eq,
-                    right: Box::new(Expr::Literal(
-                        Literal::String("aarch64".into()),
-                        Span::new(0, 0),
-                    )),
-                    span: Span::new(0, 0),
-                },
-            ],
+            callee,
+            args: vec![binop1, binop2],
             comptime: false,
             span: Span::new(0, 0),
         };

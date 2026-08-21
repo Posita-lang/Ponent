@@ -1,10 +1,13 @@
 pub mod checker;
 pub mod cfg;
+pub mod cfg_graph;
 pub mod type_eq;
 mod comptime;
 mod generate;
 mod hir;
 mod infer;
+pub(crate) mod loop_ir;
+pub(crate) mod octagon;
 mod resolver;
 mod shape_var;
 pub mod target;

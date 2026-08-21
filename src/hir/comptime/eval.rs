@@ -1,3 +1,4 @@
+use crate::ast::IntLit;
 use crate::diagnostics::DiagCtxt;
 use crate::diagnostics::kind::{ComptimeErrorKind, ComptimeReason, DiagnosticKind};
 use crate::hir::hir::{HirExpr, HirMatchArm, HirPattern, HirProgram, HirStmt};
@@ -16,10 +17,10 @@ use std::sync::OnceLock;
 
 /// A registered comptime function: (parameter_names, body_statements).
 /// The body is wrapped in `Arc` to avoid deep-cloning the AST on every call.
-type ComptimeFn = (Vec<Symbol>, Arc<[HirStmt]>);
+type ComptimeFn<'input> = (Vec<Symbol>, Arc<[HirStmt<'input>]>);
 
 /// Compute the representable range for a signed integer of `bits` width.
-fn signed_range(bits: u8) -> (i128, i128) {
+fn signed_range(bits: u32) -> (i128, i128) {
     if bits == 0 {
         (0, 0)
     } else if bits >= 127 {
@@ -32,7 +33,7 @@ fn signed_range(bits: u8) -> (i128, i128) {
 }
 
 /// Compute the representable range for an unsigned integer of `bits` width.
-fn unsigned_range(bits: u8) -> (i128, i128) {
+fn unsigned_range(bits: u32) -> (i128, i128) {
     if bits >= 128 {
         (0, i128::MAX)
     } else {
@@ -43,7 +44,7 @@ fn unsigned_range(bits: u8) -> (i128, i128) {
 
 /// Apply the overflow policy to `result` given the type's representable range.
 /// Returns the corrected value, or `Overflow` error if the policy is `Trap`.
-fn apply_overflow_policy(
+fn apply_overflow_policy<'input>(
     result: i128,
     min: i128,
     max: i128,
@@ -71,13 +72,39 @@ fn apply_overflow_policy(
                 Ok(max)
             }
         }
-        crate::ast::OverflowPolicy::Trap => Err(ComptimeError::Overflow),
+        // `Ieee` is a FLOAT opt-in; an integer hitting it is a
+        // misconfiguration — trap is the safest behavior.
+        crate::ast::OverflowPolicy::Trap | crate::ast::OverflowPolicy::Ieee => {
+            Err(ComptimeError::Overflow)
+        }
     }
 }
 
 /// Check `result` against the type's bit width and overflow policy.
 /// Returns the (possibly adjusted) value, or `Overflow` if the policy is `Trap`.
-fn check_range(result: i128, ty: TypeId, ctx: &TypeContext) -> Result<i128, ComptimeError> {
+/// SYNTAX.md:346 — comptime float ops use IEEE 754 semantics on the host
+/// FPU and CHECK the anomaly flags (FE_OVERFLOW / FE_INVALID /
+/// FE_DIVBYZERO): a flagged result (overflow → ±inf, or NaN) is a
+/// COMPILE ERROR.
+fn checked_float<'input>(r: f64, op: &str) -> Result<f64, ComptimeError> {
+    if r.is_finite() {
+        Ok(r)
+    } else if r.is_infinite() {
+        Err(ComptimeError::AssertionFailed(format!(
+            "{op} overflowed (IEEE 754 → ±∞) — SYNTAX.md float default is `trap`"
+        )))
+    } else {
+        Err(ComptimeError::AssertionFailed(format!(
+            "{op} produced NaN (IEEE 754 invalid operation) — SYNTAX.md float default is `trap`"
+        )))
+    }
+}
+
+fn check_range<'input>(
+    result: i128,
+    ty: TypeId,
+    ctx: &TypeContext<'input>,
+) -> Result<i128, ComptimeError> {
     match ctx.get(ty) {
         crate::hir::types::TypeData::Int {
             bits,
@@ -168,7 +195,7 @@ fn array_field_name(i: usize) -> Symbol {
 
 /// Check if a block's statements are all pure expressions (no side effects).
 /// Used to refine `is_pure_expr` for `Block` and `If` branches.
-fn is_pure_block(stmts: &[HirStmt]) -> bool {
+fn is_pure_block<'input>(stmts: &[HirStmt<'input>]) -> bool {
     stmts.iter().all(|stmt| match stmt {
         HirStmt::Expression(expr) => is_pure_expr(expr),
         // VariableDef, Assign, While, and other statement kinds have side effects.
@@ -176,9 +203,9 @@ fn is_pure_block(stmts: &[HirStmt]) -> bool {
     })
 }
 
-/// Check if a HirExpr is a pure computation with no side effects.
+/// Check if a HirExpr<'input> is a pure computation with no side effects.
 /// Pure expressions can be evaluated and discarded without affecting state.
-fn is_pure_expr(expr: &HirExpr) -> bool {
+fn is_pure_expr<'input>(expr: &HirExpr<'input>) -> bool {
     match expr {
         HirExpr::Literal(..) => true,
         HirExpr::BinaryOp {
@@ -224,8 +251,8 @@ fn is_pure_expr(expr: &HirExpr) -> bool {
 
 /// Evaluation context for comptime blocks.
 /// Tracks step budget and provides expression evaluation.
-pub struct ComptimeEvalContext<'a> {
-    ctx: &'a mut TypeContext,
+pub struct ComptimeEvalContext<'a, 'input> {
+    ctx: &'a mut TypeContext<'input>,
     diag: &'a mut DiagCtxt,
     steps: usize,
     step_limit: usize,
@@ -234,16 +261,16 @@ pub struct ComptimeEvalContext<'a> {
     /// Maximum memory allowed for comptime evaluation (in bytes).
     memory_limit: usize,
     /// The HIR program, used to lookup comptime function definitions.
-    /// Optional because the HirProgram is not available during type checking
+    /// Optional because the HirProgram<'input> is not available during type checking
     /// (it is the output of check_program).  Will be populated when comptime
     /// function calls are implemented.
-    hir_program: Option<&'a HirProgram>,
+    hir_program: Option<&'a HirProgram<'input>>,
     /// The symbol table, used for name resolution.
-    symbols: &'a SymbolTable,
+    symbols: &'a SymbolTable<'input>,
     /// Variable storage: each comptime variable gets a unique `SlotId`.
     /// The slot ID stays the same for the lifetime of the binding, so pointers
     /// (which hold `SlotId`) are immune to variable shadowing.
-    pub variables: HashMap<SlotId, ComptimeValue>,
+    pub variables: HashMap<SlotId, ComptimeValue<'input>>,
     /// Maps variable name → current slot ID for name-based lookups (e.g. `Ident`).
     /// When a `VariableDef` shadows an outer variable, this is updated to point
     /// to the new slot; the old slot remains in `variables` until the scope exits.
@@ -252,7 +279,7 @@ pub struct ComptimeEvalContext<'a> {
     next_slot: u32,
     /// Registry of comptime functions: name → (param_names, body).
     /// Populated by the checker as it encounters comptime function definitions.
-    fn_registry: HashMap<Symbol, ComptimeFn>,
+    fn_registry: HashMap<Symbol, ComptimeFn<'input>>,
     /// Call stack for comptime traceback.
     /// Each entry is (function_name, reason, span).
     call_stack: Vec<(Symbol, ComptimeReason, crate::ast::Span)>,
@@ -274,14 +301,18 @@ pub struct ComptimeEvalContext<'a> {
     scope_shadows: Vec<HashMap<Symbol, SlotId>>,
 }
 
-impl<'a> ComptimeEvalContext<'a> {
-    pub fn new(ctx: &'a mut TypeContext, symbols: &'a SymbolTable, diag: &'a mut DiagCtxt) -> Self {
+impl<'a, 'input> ComptimeEvalContext<'a, 'input> {
+    pub fn new(
+        ctx: &'a mut TypeContext<'input>,
+        symbols: &'a SymbolTable<'input>,
+        diag: &'a mut DiagCtxt,
+    ) -> Self {
         Self::new_with_source(ctx, symbols, diag, Vec::new(), None)
     }
 
     pub fn new_with_source(
-        ctx: &'a mut TypeContext,
-        symbols: &'a SymbolTable,
+        ctx: &'a mut TypeContext<'input>,
+        symbols: &'a SymbolTable<'input>,
         diag: &'a mut DiagCtxt,
         outer_traceback: Vec<(ComptimeReason, crate::ast::Span)>,
         source: Option<&'a str>,
@@ -315,7 +346,7 @@ impl<'a> ComptimeEvalContext<'a> {
     }
 
     /// Register a comptime function so it can be called from within comptime blocks.
-    pub fn register_fn(&mut self, name: Symbol, params: Vec<Symbol>, body: Vec<HirStmt>) {
+    pub fn register_fn(&mut self, name: Symbol, params: Vec<Symbol>, body: Vec<HirStmt<'input>>) {
         self.fn_registry.insert(name, (params, Arc::from(body)));
     }
 
@@ -395,7 +426,7 @@ impl<'a> ComptimeEvalContext<'a> {
     }
 
     /// Resolve an AST type to a TypeId for layout_of! evaluation.
-    /// Creates the type in the TypeContext arena if needed (via ctx.alloc),
+    /// Creates the type in the TypeContext<'input> arena if needed (via ctx.alloc),
     /// so the returned TypeId is always valid for ctx.get() and layout functions.
     fn resolve_ast_type(&mut self, ty: &crate::ast::Type) -> Result<TypeId, ComptimeError> {
         // ── Future enhancement ─────────────────────────────────────
@@ -404,7 +435,7 @@ impl<'a> ComptimeEvalContext<'a> {
         // generic projections (e.g. <T as Trait>::Assoc), and multi-
         // segment paths (mod::Type) are not yet supported — they fall
         // through to type_error at the end.  A future pass should
-        // resolve these through the symbol table and TypeContext's
+        // resolve these through the symbol table and TypeContext<'input>'s
         // resolve_binding mechanism.
         // ───────────────────────────────────────────────────────────
         use crate::ast::{GenericArg, Literal, Type};
@@ -460,16 +491,15 @@ impl<'a> ComptimeEvalContext<'a> {
             }
             Type::Generic(base, args, _) => {
                 // Handle Int<N>, UInt<N>, Float<N>.
-                if let Type::Path(path, _) = base.as_ref()
+                if let Type::Path(path, _) = base
                     && path.len() == 1
                 {
                     let name = path[0].as_str();
                     // Extract the bit-width from the first positional argument.
-                    let bits = match args.first() {
+                    let bits_lit: &IntLit = match args.first() {
                         Some(GenericArg::Positional(Type::Literal(expr, _))) => {
-                            if let crate::ast::Expr::Literal(Literal::Int(bits), _) = expr.as_ref()
-                            {
-                                *bits
+                            if let crate::ast::Expr::Literal(Literal::Int(bits), _) = expr {
+                                bits
                             } else {
                                 return Err(ComptimeError::type_error(format!(
                                     "expected a numeric literal argument for `{}<N>` in layout_of!, found non-literal expression",
@@ -484,52 +514,60 @@ impl<'a> ComptimeEvalContext<'a> {
                             )));
                         }
                     };
-                    let bits_u8 = u8::try_from(bits).map_err(|_| {
+
+                    let bits_u64 = bits_lit.to_u64().ok_or_else(|| {
+                        ComptimeError::type_error(format!(
+                            "bit width for `{}` in layout_of! is too large or negative",
+                            name,
+                        ))
+                    })?;
+
+                    let bits = u32::try_from(bits_u64).map_err(|_| {
                         ComptimeError::type_error(format!(
                             "invalid bit width {} for `{}` in layout_of!",
-                            bits, name,
+                            bits_u64, name,
                         ))
                     })?;
                     match name.as_str() {
                         "Int" => {
-                            if bits_u8 < 1 || bits_u8 > 64 {
+                            if bits < 1 || bits > 64 {
                                 return Err(ComptimeError::type_error(format!(
                                     "Int<{}> is out of range; bits must be 1..64",
-                                    bits_u8,
+                                    bits,
                                 )));
                             }
                             return Ok(self.ctx.alloc(TypeData::Int {
-                                bits: bits_u8,
+                                bits: bits,
                                 signed: true,
                                 overflow_policy: crate::ast::OverflowPolicy::Trap,
                             }));
                         }
                         "UInt" => {
-                            if bits_u8 < 1 || bits_u8 > 64 {
+                            if bits < 1 || bits > 64 {
                                 return Err(ComptimeError::type_error(format!(
                                     "UInt<{}> is out of range; bits must be 1..64",
-                                    bits_u8,
+                                    bits,
                                 )));
                             }
                             return Ok(self.ctx.alloc(TypeData::UInt {
-                                bits: bits_u8,
+                                bits: bits,
                                 overflow_policy: crate::ast::OverflowPolicy::Trap,
                             }));
                         }
                         "Float" => {
-                            if bits_u8 != 32 && bits_u8 != 64 {
+                            if bits != 32 && bits != 64 {
                                 return Err(ComptimeError::type_error(format!(
                                     "Float<{}> is not a valid IEEE 754 type; bits must be 32 or 64",
-                                    bits_u8,
+                                    bits,
                                 )));
                             }
-                            return Ok(self.ctx.alloc(TypeData::Float { bits: bits_u8 }));
+                            return Ok(self.ctx.alloc(TypeData::Float { bits: bits }));
                         }
                         _ => {}
                     }
                 }
                 // Fall through to error for unknown generic types.
-                let name_str = match base.as_ref() {
+                let name_str = match base {
                     Type::Path(p, _) => p.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
                     _ => "<complex>".to_string(),
                 };
@@ -608,7 +646,10 @@ impl<'a> ComptimeEvalContext<'a> {
     /// Returns `Err(ComptimeError)` if the step limit is exceeded, a variable
     /// is not found, a type mismatch occurs, or division by zero is attempted.
     #[must_use]
-    pub fn eval_block(&mut self, stmts: &[HirStmt]) -> Result<ComptimeValue, ComptimeError> {
+    pub fn eval_block(
+        &mut self,
+        stmts: &[HirStmt<'input>],
+    ) -> Result<ComptimeValue<'input>, ComptimeError> {
         let mut result = ComptimeValue::Unit;
         let len = stmts.len();
         for (i, stmt) in stmts.iter().enumerate() {
@@ -796,7 +837,10 @@ impl<'a> ComptimeEvalContext<'a> {
     /// Returns `Err(ComptimeError)` if the step limit is exceeded, a variable
     /// is not found, a type mismatch occurs, or division by zero is attempted.
     #[must_use]
-    pub fn eval_expr(&mut self, expr: &HirExpr) -> Result<ComptimeValue, ComptimeError> {
+    pub fn eval_expr(
+        &mut self,
+        expr: &HirExpr<'input>,
+    ) -> Result<ComptimeValue<'input>, ComptimeError> {
         if self.steps >= self.step_limit {
             return Err(ComptimeError::StepLimitExceeded);
         }
@@ -804,7 +848,9 @@ impl<'a> ComptimeEvalContext<'a> {
 
         match expr {
             HirExpr::Literal(lit, _ty, _span) => match lit {
-                crate::ast::Literal::Int(n) => Ok(ComptimeValue::Int(*n)),
+                crate::ast::Literal::Int(n) => Ok(ComptimeValue::Int(
+                    n.to_i128().ok_or(ComptimeError::Overflow)?,
+                )),
                 crate::ast::Literal::Float(f) => Ok(ComptimeValue::Float(*f)),
                 crate::ast::Literal::Char(c) => Ok(ComptimeValue::Int(*c as i128)),
                 crate::ast::Literal::Bool(b) => Ok(ComptimeValue::Bool(*b)),
@@ -889,17 +935,33 @@ impl<'a> ComptimeEvalContext<'a> {
                         Ok(ComptimeValue::Bool(a >= b))
                     }
                     // ── Float arithmetic ───────────────────────────────
+                    // SYNTAX.md:346 — comptime float ops use IEEE 754
+                    // semantics on the host FPU and CHECK the anomaly
+                    // flags (FE_OVERFLOW / FE_INVALID / FE_DIVBYZERO): a
+                    // flagged result is a COMPILE ERROR.
                     (ComptimeValue::Float(a), ComptimeValue::Float(b), crate::ast::BinOp::Add) => {
-                        Ok(ComptimeValue::Float(a + b))
+                        Ok(ComptimeValue::Float(checked_float(
+                            a + b,
+                            "comptime float addition",
+                        )?))
                     }
                     (ComptimeValue::Float(a), ComptimeValue::Float(b), crate::ast::BinOp::Sub) => {
-                        Ok(ComptimeValue::Float(a - b))
+                        Ok(ComptimeValue::Float(checked_float(
+                            a - b,
+                            "comptime float subtraction",
+                        )?))
                     }
                     (ComptimeValue::Float(a), ComptimeValue::Float(b), crate::ast::BinOp::Mul) => {
-                        Ok(ComptimeValue::Float(a * b))
+                        Ok(ComptimeValue::Float(checked_float(
+                            a * b,
+                            "comptime float multiplication",
+                        )?))
                     }
                     (ComptimeValue::Float(a), ComptimeValue::Float(b), crate::ast::BinOp::Div) => {
-                        Ok(ComptimeValue::Float(a / b))
+                        Ok(ComptimeValue::Float(checked_float(
+                            a / b,
+                            "comptime float division",
+                        )?))
                     }
                     // ── Float comparisons ──────────────────────────────
                     (ComptimeValue::Float(a), ComptimeValue::Float(b), crate::ast::BinOp::Eq) => {
@@ -1239,7 +1301,7 @@ impl<'a> ComptimeEvalContext<'a> {
                 match base_val {
                     ComptimeValue::TypeInfo(info) => {
                         if field.eq_str("name") {
-                            Ok(ComptimeValue::String(Arc::from(info.name.as_str())))
+                            Ok(ComptimeValue::String(Arc::from(info.name.as_ref())))
                         } else if field.eq_str("kind") {
                             Ok(ComptimeValue::String(Arc::from(format!("{:?}", info.kind))))
                         } else if field.eq_str("bits") {
@@ -1532,7 +1594,7 @@ impl<'a> ComptimeEvalContext<'a> {
             } => {
                 let val = self.eval_expr(scrutinee)?;
                 if self.eval_pattern(pattern, &val) {
-                    // ⚠️  Pattern bindings are not yet extracted (see
+                    // ⚠️  Pattern<'input> bindings are not yet extracted (see
                     // eval_pattern doc) — this is a known limitation until
                     // we have a MIR layer.
                     self.eval_block(then_branch)
@@ -1551,7 +1613,7 @@ impl<'a> ComptimeEvalContext<'a> {
                     // Zero-parameter closure: evaluate the body immediately.
                     self.eval_block(body)
                 } else {
-                    Err(ComptimeError::Deferred)
+                    { Err(ComptimeError::Deferred) }
                 }
             }
             HirExpr::Try { expr, .. } => {
@@ -1618,13 +1680,13 @@ impl<'a> ComptimeEvalContext<'a> {
     /// Supports guard expressions (`if guard` on each arm).
     fn eval_match(
         &mut self,
-        scrutinee: &HirExpr,
-        arms: &[HirMatchArm],
-    ) -> Result<ComptimeValue, ComptimeError> {
+        scrutinee: &HirExpr<'input>,
+        arms: &[HirMatchArm<'input>],
+    ) -> Result<ComptimeValue<'input>, ComptimeError> {
         let val = self.eval_expr(scrutinee)?;
         for arm in arms {
             if self.eval_pattern(&arm.pattern, &val) {
-                // ⚠️  Pattern bindings are not yet extracted (see
+                // ⚠️  Pattern<'input> bindings are not yet extracted (see
                 // eval_pattern doc) — this is a known limitation until
                 // we have a MIR layer.
                 if let Some(guard) = &arm.guard {
@@ -1659,7 +1721,7 @@ impl<'a> ComptimeEvalContext<'a> {
     /// variables are simply ignored; code that references them in comptime will
     /// hit "unknown identifier" at eval time.
     // TODO: implement pattern variable binding at the MIR layer.
-    fn eval_pattern(&mut self, pattern: &HirPattern, val: &ComptimeValue) -> bool {
+    fn eval_pattern(&mut self, pattern: &HirPattern<'input>, val: &ComptimeValue<'input>) -> bool {
         match pattern {
             HirPattern::Wildcard(_) => true,
             HirPattern::Ident(_, _, _) => true,

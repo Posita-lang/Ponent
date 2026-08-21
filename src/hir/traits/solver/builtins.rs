@@ -135,7 +135,7 @@ impl BuiltinTrait {
 /// Inference variables are conservatively considered Sized (they will be
 /// resolved to concrete types). This is sound because Posita does not
 /// allow unsized inference variables — all unsized types are explicit.
-pub fn compute_sized(ty: TypeId, ctx: &TypeContext) -> bool {
+pub fn compute_sized<'input>(ty: TypeId, ctx: &TypeContext<'input>) -> bool {
     !is_unsized(ty, ctx)
 }
 
@@ -147,7 +147,7 @@ pub fn compute_sized(ty: TypeId, ctx: &TypeContext) -> bool {
 /// - `Str` (string slices — unsized in Posita per SYNTAX.md)
 ///
 /// Inference variables are conservatively considered Sized (returns `false`).
-pub fn is_unsized(ty: TypeId, ctx: &TypeContext) -> bool {
+pub fn is_unsized<'input>(ty: TypeId, ctx: &TypeContext<'input>) -> bool {
     match ctx.get(ty) {
         TypeData::Slice { .. } | TypeData::DynTrait { .. } => true,
         _ => {
@@ -171,15 +171,15 @@ pub fn is_unsized(ty: TypeId, ctx: &TypeContext) -> bool {
 /// If the type is an inference variable, returns `false` conservatively.
 ///
 /// NOTE: For ADTs (structs/enums), this function conservatively returns `false`
-/// because checking field types requires access to the SymbolTable for type
+/// because checking field types requires access to the SymbolTable<'input> for type
 /// bindings, and checking for Drop impls requires access to the TraitEnv.
 /// A full implementation would:
-///   - Look up the ADT definition via SymbolTable
+///   - Look up the ADT definition via SymbolTable<'input>
 ///   - Recursively check that every field is Copy
 ///   - Reject any ADT with an explicit Drop impl
 /// Until then, returning `false` is the safe conservative choice — denying
 /// Copy is always sound (it just means more explicit Clone calls).
-pub fn compute_copy(ty: TypeId, ctx: &TypeContext) -> bool {
+pub fn compute_copy<'input>(ty: TypeId, ctx: &TypeContext<'input>) -> bool {
     match ctx.get(ty) {
         // Primitives: always Copy
         TypeData::Int { .. }
@@ -212,7 +212,7 @@ pub fn compute_copy(ty: TypeId, ctx: &TypeContext) -> bool {
 
         // ADT: conservatively NOT Copy.
         // A full implementation would check all fields recursively and
-        // verify no Drop impl, but that requires SymbolTable + TraitEnv
+        // verify no Drop impl, but that requires SymbolTable<'input> + TraitEnv
         // access which this function doesn't have.  Denying Copy is the
         // sound conservative choice.
         TypeData::Adt { .. } => false,
@@ -233,6 +233,6 @@ pub fn compute_copy(ty: TypeId, ctx: &TypeContext) -> bool {
 /// In Posita, if a type is `Copy`, then `Clone` is automatically derived
 /// with `fn clone(&self) -> Self { *self }` (see SYNTAX.md § Automatic
 /// Clone for Copy Types).
-pub fn compute_clone(ty: TypeId, ctx: &TypeContext) -> bool {
+pub fn compute_clone<'input>(ty: TypeId, ctx: &TypeContext<'input>) -> bool {
     compute_copy(ty, ctx)
 }

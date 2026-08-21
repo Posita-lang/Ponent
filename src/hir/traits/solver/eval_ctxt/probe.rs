@@ -29,7 +29,7 @@ pub enum CandidateSource {
     /// A user-defined impl, identified by its index in `TraitEnv`.
     Impl(usize),
     /// A builtin trait impl (Sized, Copy, Clone, etc.).
-    Builtin(BuiltinImplSource),
+    Builtin(crate::hir::traits::solver::obligation::BuiltinImplSource),
     /// A caller-provided bound (where-clause).
     Param,
     /// An object type bound (`dyn Trait`).
@@ -41,13 +41,9 @@ pub enum CandidateSource {
 }
 
 /// Builtin impl source kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BuiltinImplSource {
-    Sized,
-    Copy,
-    Clone,
-    Misc,
-}
+/// NOTE: the single source of truth is `obligation::BuiltinImplSource`
+/// (Sized/Copy/Clone/DiscriminantKind/FnPtr) — this module previously had
+/// its own copy (with a dead `Misc` variant); merged to avoid duplication.
 
 // ── Candidate head usages ─────────────────────────────────────────
 
@@ -95,13 +91,13 @@ impl CandidateHeadUsages {
 ///
 /// Created by `EvalCtxt::probe(kind)` and consumed by `.enter(f)` /
 /// `.enter_single_candidate(f)` / `.enter_without_propagated_nested_goals(f)`.
-pub struct ProbeCtxt<'me, 'a, D: SolverDelegate, T> {
-    pub(crate) ecx: &'me mut EvalCtxt<'a, D>,
+pub struct ProbeCtxt<'me, 'a, 'input, D: SolverDelegate<'input>, T> {
+    pub(crate) ecx: &'me mut EvalCtxt<'a, 'input, D>,
     pub(crate) probe_kind: ProbeKind,
     pub(crate) _result: PhantomData<T>,
 }
 
-impl<D: SolverDelegate, T> ProbeCtxt<'_, '_, D, T> {
+impl<'input, D: SolverDelegate<'input>, T> ProbeCtxt<'_, '_, 'input, D, T> {
     /// Enter a basic probe with full transaction rollback.
     ///
     /// Snapshots `nested_goals` before calling `f`, and propagates them
@@ -109,7 +105,7 @@ impl<D: SolverDelegate, T> ProbeCtxt<'_, '_, D, T> {
     /// (including nested goals) are rolled back.
     pub fn enter(
         self,
-        f: impl FnOnce(&mut EvalCtxt<'_, D>) -> Result<T, SolveError>,
+        f: impl FnOnce(&mut EvalCtxt<'_, 'input, D>) -> Result<T, SolveError>,
     ) -> Result<T, SolveError> {
         let nested_goals = self.ecx.nested_goals.clone();
         self.enter_inner(f, nested_goals)
@@ -121,7 +117,7 @@ impl<D: SolverDelegate, T> ProbeCtxt<'_, '_, D, T> {
     /// cycle head dependencies of this candidate if it fails.
     pub fn enter_single_candidate(
         self,
-        f: impl FnOnce(&mut EvalCtxt<'_, D>) -> Result<T, SolveError>,
+        f: impl FnOnce(&mut EvalCtxt<'_, 'input, D>) -> Result<T, SolveError>,
     ) -> (Result<T, SolveError>, CandidateHeadUsages) {
         let mut candidate_usages = CandidateHeadUsages::new();
 
@@ -143,7 +139,7 @@ impl<D: SolverDelegate, T> ProbeCtxt<'_, '_, D, T> {
     /// probe should not affect the outer context.
     pub fn enter_without_propagated_nested_goals(
         self,
-        f: impl FnOnce(&mut EvalCtxt<'_, D>) -> Result<T, SolveError>,
+        f: impl FnOnce(&mut EvalCtxt<'_, 'input, D>) -> Result<T, SolveError>,
     ) -> Result<T, SolveError> {
         self.enter_inner(f, Default::default())
     }
@@ -151,10 +147,10 @@ impl<D: SolverDelegate, T> ProbeCtxt<'_, '_, D, T> {
     /// Inner implementation shared by all `enter` variants.
     ///
     /// Uses a snapshot of the `EvalCtxt` state and a transaction on
-    /// `TypeContext` to enable clean rollback on failure.
+    /// `TypeContext<'input>` to enable clean rollback on failure.
     fn enter_inner(
         self,
-        f: impl FnOnce(&mut EvalCtxt<'_, D>) -> Result<T, SolveError>,
+        f: impl FnOnce(&mut EvalCtxt<'_, 'input, D>) -> Result<T, SolveError>,
         propagated_nested_goals: Vec<(GoalSource, Obligation, Option<GoalStalledOn>)>,
     ) -> Result<T, SolveError> {
         let ProbeCtxt {
@@ -197,17 +193,17 @@ impl<D: SolverDelegate, T> ProbeCtxt<'_, '_, D, T> {
 /// Wraps a `ProbeCtxt<ImplSource>` and adds candidate source
 /// tracking.  The `.enter()` method returns a `Candidate` with the
 /// source and head usages attached.
-pub struct TraitProbeCtxt<'me, 'a, D: SolverDelegate> {
-    pub(crate) cx: ProbeCtxt<'me, 'a, D, ImplSource>,
+pub struct TraitProbeCtxt<'me, 'a, 'input, D: SolverDelegate<'input>> {
+    pub(crate) cx: ProbeCtxt<'me, 'a, 'input, D, ImplSource>,
     pub(crate) source: CandidateSource,
 }
 
-impl<D: SolverDelegate> TraitProbeCtxt<'_, '_, D> {
+impl<'input, D: SolverDelegate<'input>> TraitProbeCtxt<'_, '_, 'input, D> {
     /// Evaluate the candidate inside a transaction, returning a
     /// `Candidate` with the source and head usages.
     pub fn enter(
         self,
-        f: impl FnOnce(&mut EvalCtxt<'_, D>) -> Result<ImplSource, SolveError>,
+        f: impl FnOnce(&mut EvalCtxt<'_, 'input, D>) -> Result<ImplSource, SolveError>,
     ) -> Result<Candidate, SolveError> {
         let (result, head_usages) = self.cx.enter_single_candidate(f);
         result.map(|r| Candidate {

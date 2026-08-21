@@ -3,3 +3,4 @@
 Cargo.lock
 .cargo/
 *.tmp
+src/.vscode/

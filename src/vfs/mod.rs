@@ -129,7 +129,14 @@ impl MemoryBackend {
 
     /// Recursively ensure all ancestor directories have entries.
     fn ensure_dir_entries(&mut self, path: &str) {
-        if path.is_empty() || path == "/" {
+        if path.is_empty() {
+            return;
+        }
+        // Register the current path itself as a directory so that
+        // root "/" is always known to `path_type` / `read_dir`.
+        self.dirs.entry(path.to_string()).or_default();
+
+        if path == "/" {
             return;
         }
         if let Some(parent) = Path::new(path).parent() {
@@ -187,18 +194,22 @@ impl Default for MemoryBackend {
 /// `parent_id` rather than an owned `parent` pointer, avoiding recursive
 /// cloning of the entire ancestor chain.
 #[derive(Debug, Clone)]
-pub struct VfsNode {
+pub struct VfsNode<'input> {
     pub kind: VfsNodeKind,
     pub name: String,
     pub id: usize,
     pub src: Option<String>,
     pub tokens: Option<Vec<Token>>,
-    pub ast: Option<Program>,
-    pub children: Option<Vec<VfsNode>>,
+    pub ast: Option<Program<'input>>,
+    pub children: Option<Vec<VfsNode<'input>>>,
     /// Absolute virtual path in the VFS tree (e.g. `/src/main.ps`).
     pub abs_path: Option<String>,
     /// Absolute filesystem path this node maps to (if backed by a real file).
     pub fs_path: Option<String>,
+    /// Shared arena backing every node's parsed AST — owned by the caller
+    /// of `scan` and threaded through the whole tree, so re-parsing a node
+    /// never leaks a fresh arena.
+    pub arena: &'input bumpalo::Bump,
 }
 
 /// Errors that can occur during VFS operations.
@@ -210,9 +221,9 @@ pub enum VfsError {
     Diagnostics(Vec<Diagnostic>),
 }
 
-impl VfsNode {
+impl<'input> VfsNode<'input> {
     /// Create a new file node.
-    pub fn new_file(id: usize, name: &str) -> Self {
+    pub fn new_file(id: usize, name: &str, arena: &'input bumpalo::Bump) -> Self {
         VfsNode {
             kind: VfsNodeKind::File,
             name: name.to_string(),
@@ -223,11 +234,12 @@ impl VfsNode {
             children: None,
             abs_path: None,
             fs_path: None,
+            arena,
         }
     }
 
     /// Create a new directory node.
-    pub fn new_dir(id: usize, name: &str, kind: VfsNodeKind) -> Self {
+    pub fn new_dir(id: usize, name: &str, kind: VfsNodeKind, arena: &'input bumpalo::Bump) -> Self {
         VfsNode {
             kind,
             name: name.to_string(),
@@ -238,6 +250,7 @@ impl VfsNode {
             children: Some(Vec::new()),
             abs_path: None,
             fs_path: None,
+            arena,
         }
     }
 
@@ -306,7 +319,11 @@ impl VfsNode {
             .as_ref()
             .ok_or(VfsError::Io("source not loaded".to_string()))?
             .clone();
-        let mut parser = Parser::new(&src);
+        // The parsed `Program<'input>` borrows from the TREE-level shared
+        // arena (owned by the caller of `scan`), so re-parsing a node
+        // never leaks a fresh arena.
+        let arena = self.arena;
+        let mut parser = Parser::new(&src, arena);
         match parser.parse_program() {
             Ok(program) => {
                 self.ast = Some(program);
@@ -317,19 +334,24 @@ impl VfsNode {
     }
 
     /// Return the absolute virtual path in the VFS tree.
-    /// Panics if `abs_path` was not set during construction.
-    pub fn absolute_path(&self) -> &str {
-        self.abs_path.as_deref().unwrap_or("<unknown>")
+    /// Return the absolute virtual path in the VFS tree, if set.
+    pub fn absolute_path(&self) -> Option<&str> {
+        self.abs_path.as_deref()
     }
 
     /// Recursively scan a directory tree using the given backend and build
     /// a VFS tree from it.  Only `.ps` files are included; hidden files
     /// (dot-prefixed) and common build directories are skipped.
+    ///
+    /// The caller owns `arena` and must keep it alive for as long as the
+    /// returned tree is used: every node's parsed `Program<'input>` borrows
+    /// from it, so re-parsing a node never leaks a fresh arena.
     pub fn scan(
         backend: &dyn VfsBackend,
         root: &str,
         id_counter: &mut usize,
-    ) -> Result<VfsNode, VfsError> {
+        arena: &'input bumpalo::Bump,
+    ) -> Result<VfsNode<'input>, VfsError> {
         let path = Path::new(root);
         let name = path
             .file_name()
@@ -338,7 +360,7 @@ impl VfsNode {
 
         match backend.path_type(root) {
             Some(VfsNodeKind::Directory) => {
-                let mut node = VfsNode::new_dir(*id_counter, &name, VfsNodeKind::Directory);
+                let mut node = VfsNode::new_dir(*id_counter, &name, VfsNodeKind::Directory, arena);
                 *id_counter += 1;
                 node.fs_path = Some(root.to_string());
                 node.abs_path = Some(root.to_string());
@@ -359,13 +381,13 @@ impl VfsNode {
 
                     match entry.kind {
                         VfsNodeKind::Directory => {
-                            let child = Self::scan(backend, &child_path_str, id_counter)?;
+                            let child = Self::scan(backend, &child_path_str, id_counter, arena)?;
                             children.push(child);
                         }
                         VfsNodeKind::File => {
                             // Only include .ps files
                             if child_path.extension().is_some_and(|ext| ext == "ps") {
-                                let mut f = VfsNode::new_file(*id_counter, &entry.name);
+                                let mut f = VfsNode::new_file(*id_counter, &entry.name, arena);
                                 *id_counter += 1;
                                 f.abs_path = Some(child_path_str.clone());
                                 f.fs_path = Some(child_path_str);
@@ -380,7 +402,7 @@ impl VfsNode {
                 Ok(node)
             }
             Some(VfsNodeKind::File) => {
-                let mut node = VfsNode::new_file(*id_counter, &name);
+                let mut node = VfsNode::new_file(*id_counter, &name, arena);
                 *id_counter += 1;
                 node.abs_path = Some(root.to_string());
                 node.fs_path = Some(root.to_string());
@@ -391,9 +413,45 @@ impl VfsNode {
     }
 }
 
-impl fmt::Display for VfsNode {
+impl<'input> fmt::Display for VfsNode<'input> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let path = self.absolute_path();
-        write!(f, "{} ({:?})", path, self.kind)
+        match self.absolute_path() {
+            Some(path) => write!(f, "{} ({:?})", path, self.kind),
+            None => write!(f, "<unnamed {:?}>", self.kind),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Defensive regression: `scan` must NOT leak an arena via
+    /// `Box::leak`; the caller owns the `Bump` and threads it through the
+    /// whole tree, so repeated scans stay bounded. This locks in the
+    /// caller-owned-arena API contract.
+    #[test]
+    fn scan_borrows_caller_owned_arena() {
+        let mut backend = MemoryBackend::new();
+        backend.insert_file("/src/main.ps", "def main() -> Int<32> { return 42; }");
+
+        // The arena is owned HERE, by the caller, and outlives the tree.
+        let arena = bumpalo::Bump::new();
+        let mut id_counter = 0;
+        let mut root =
+            VfsNode::scan(&backend, "/src", &mut id_counter, &arena).expect("scan should succeed");
+        assert_eq!(id_counter, 2, "one dir + one file node allocated");
+
+        // Parsing borrows from the caller-owned arena — no fresh arena.
+        let file = root
+            .children
+            .as_ref()
+            .expect("dir has children")
+            .iter()
+            .find(|c| c.kind == VfsNodeKind::File)
+            .expect("one file child");
+        let mut file = file.clone();
+        file.ensure_ast(&backend).expect("ast should parse");
+        assert!(file.ast.is_some(), "parsed program is retained");
     }
 }

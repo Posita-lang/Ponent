@@ -1,4 +1,4 @@
-// ── Anya Module ────────────────────────────────────────────────────
+// ── Anya Module ────────────────────────────────────────────────────────
 //
 use crate::hir::infer::{GenStatus, InferRegionTree, PoolUndoEntry};
 use crate::hir::shape_var::Status;
@@ -51,7 +51,12 @@ pub(crate) fn trace_line(args: std::fmt::Arguments<'_>) {
         return;
     }
     let depth = TRACE_DEPTH.with(|d| d.get());
-    eprintln!("{}[TRACE] {}", "  ".repeat(depth), args);
+    // Write the indentation without allocating (the `"  ".repeat(depth)`
+    // alternative allocates a fresh String on every trace line).
+    for _ in 0..depth {
+        eprint!("  ");
+    }
+    eprintln!("[TRACE] {}", args);
 }
 
 /// Trace one step of type resolution: entry (the type being resolved, the
@@ -217,7 +222,7 @@ pub fn log_gen_statuses(gen_statuses: &[GenStatus]) {
 
 /// Print the current GADT fact registry for debugging.
 /// Shows each arm's facts: param refinements and existential equations.
-pub fn log_gadt_registry(ctx: &TypeContext) {
+pub fn log_gadt_registry<'input>(ctx: &TypeContext<'input>) {
     let facts = ctx.gadt.facts.borrow();
     let depth = facts.len();
     eprintln!("[GADT registry] {} arm(s) active:", depth);
@@ -227,14 +232,13 @@ pub fn log_gadt_registry(ctx: &TypeContext) {
             eprintln!("    {:?}", fact);
         }
     }
-    drop(facts);
 }
 
 /// Assert that push_gadt_arm / pop_gadt_arm calls are balanced.
 /// The GADT registry should be empty outside of pattern-match arms.
 /// Also cross-validates the depth counter with the stack length.
 /// Panics if the registry depth is non-zero when expected to be zero.
-pub fn assert_gadt_registry_empty(ctx: &TypeContext) {
+pub fn assert_gadt_registry_empty<'input>(ctx: &TypeContext<'input>) {
     let eq_depth = ctx.gadt.facts.borrow().len();
     let counter = ctx.gadt.arm_depth.get();
     assert_eq!(
@@ -246,5 +250,95 @@ pub fn assert_gadt_registry_empty(ctx: &TypeContext) {
         eq_depth == 0,
         "GADT registry invariant violated: expected 0 active arms, found {} (push/pop mismatch)",
         eq_depth,
+    );
+}
+
+// ── CFG / borrow-check tracing ────────────────────────────────────────
+// Added for the borrow-check and CFG troubleshooting: the leave-with,
+// catch, and place-precision investigations all required temporary
+// eprintln! probes.  These make the data directly visible under
+// `PONENT_TRACE=1` without touching the code.
+
+use crate::hir::cfg_graph::{BlockId, CfgGraph, Point};
+use crate::hir::types::{FrozenPlace, LoanKind};
+use crate::symbol::Symbol;
+
+/// Dump the CFG structure: per block — the id, the statement count, the
+/// terminator, the successors, and the back edges.
+pub fn log_cfg(cfg: &CfgGraph) {
+    if !tracing_enabled() {
+        return;
+    }
+    eprintln!("── CFG ──");
+    eprintln!("blocks: {}", cfg.blocks().len());
+    for (i, blk) in cfg.blocks().iter().enumerate() {
+        eprintln!(
+            "  block {i}: {} stmts, terminator {:?}, successors {:?}",
+            blk.stmts.len(),
+            blk.terminator,
+            cfg.successors(BlockId(i)),
+        );
+    }
+    eprintln!("  back_edges: {:?}", cfg.back_edges());
+}
+
+/// Dump the borrow-check data: the loans and the access events collected
+/// by the post-pass.
+pub fn log_borrow_data(
+    loans: &[(
+        FrozenPlace,
+        Option<Symbol>,
+        LoanKind,
+        Point,
+        crate::ast::Span,
+        bool,
+    )],
+    events: &[(FrozenPlace, Point, bool, crate::ast::Span)],
+) {
+    if !tracing_enabled() {
+        return;
+    }
+    eprintln!("── borrow data ──");
+    for (i, (place, var, kind, pt, _, _)) in loans.iter().enumerate() {
+        eprintln!("  loan {i}: place {place:?}, var {var:?}, kind {kind:?}, point {pt:?}");
+    }
+    for (i, (place, pt, is_read, _)) in events.iter().enumerate() {
+        eprintln!("  event {i}: place {place:?}, point {pt:?}, read {is_read}");
+    }
+}
+
+/// Dump the point-level liveness: per block, per variable, the live
+/// statement runs (the sparse-interval liveness).
+pub fn log_point_liveness(live: &crate::hir::cfg_graph::PointLiveness) {
+    if !tracing_enabled() {
+        return;
+    }
+    eprintln!("── point liveness ──");
+    for (bi, blk) in live.live_intervals().iter().enumerate() {
+        for (var, runs) in blk {
+            eprintln!("  block {bi}: var {var:?} live runs {runs:?}");
+        }
+    }
+}
+
+/// Dump the extracted Polonius facts (the polonius_int.dl input schema).
+pub fn log_facts(facts: &crate::hir::polonius::PoloniusFacts) {
+    if !tracing_enabled() {
+        return;
+    }
+    eprintln!("── Polonius facts ──");
+    eprintln!("  cfg_edge: {:?}", facts.cfg_edge);
+    eprintln!("  loan_issued_at: {:?}", facts.loan_issued_at);
+    eprintln!("  loan_invalidated_at: {:?}", facts.loan_invalidated_at);
+    eprintln!("  var_used_at: {:?}", facts.var_used_at);
+    eprintln!(
+        "  use_of_var_derefs_origin: {:?}",
+        facts.use_of_var_derefs_origin
+    );
+    eprintln!("  subset_base: {:?}", facts.subset_base);
+    eprintln!("  universal_region: {:?}", facts.universal_region);
+    eprintln!(
+        "  known_placeholder_subset: {:?}",
+        facts.known_placeholder_subset
     );
 }

@@ -14,7 +14,10 @@ use regex_syntax;
 /// refinement cycle that `resolve_binding_tail` chases until
 /// `MAX_CHAIN_DEPTH`).  `exists` variables are NOT in `params`, so
 /// `when T == X` (witness stays opaque) is unaffected.
-fn find_param_ref_in_type(ty: &Type, params: &[TypeParam]) -> Option<Symbol> {
+fn find_param_ref_in_type<'input>(
+    ty: &Type<'input>,
+    params: &[TypeParam<'input>],
+) -> Option<Symbol> {
     match ty {
         Type::Path(path, _) if path.len() == 1 => params
             .iter()
@@ -60,36 +63,6 @@ fn find_param_ref_in_type(ty: &Type, params: &[TypeParam]) -> Option<Symbol> {
     }
 }
 
-/// Minimal source-like display of an AST type for diagnostics (path joins +
-/// generic args + literal values), falling back to Debug for exotic forms.
-fn ast_type_display(ty: &crate::ast::Type) -> String {
-    match ty {
-        crate::ast::Type::Path(p, _) => p.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
-        crate::ast::Type::Generic(base, args, _) => {
-            let args = args
-                .iter()
-                .map(|a| match a {
-                    crate::ast::GenericArg::Positional(t) => ast_type_display(t),
-                    crate::ast::GenericArg::Named(n, t) => {
-                        format!("{}: {}", n, ast_type_display(t))
-                    }
-                    crate::ast::GenericArg::Const(ac) => match ac.value.as_ref() {
-                        crate::ast::Expr::Literal(l, _) => format!("{:?}", l),
-                        e => format!("{:?}", e),
-                    },
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{}<{}>", ast_type_display(base), args)
-        }
-        crate::ast::Type::Literal(e, _) => match e.as_ref() {
-            crate::ast::Expr::Literal(l, _) => format!("{:?}", l),
-            _ => format!("{:?}", e),
-        },
-        _ => format!("{:?}", ty),
-    }
-}
-
 /// A GADT `when` RHS is "provably concrete" for the E065 contradiction check
 /// when it mentions no `exists` witness (at ANY depth — an opaque witness may
 /// equal anything) and every path it references resolves to a non-alias
@@ -98,10 +71,10 @@ fn ast_type_display(ty: &crate::ast::Type) -> String {
 /// forms) is not provable at the resolver stage and must NOT trigger a hard
 /// error — a false positive (rejecting valid code) is worse than a missed
 /// diagnostic.
-fn rhs_is_provably_concrete(
+fn rhs_is_provably_concrete<'input>(
     ct: &crate::ast::Type,
     exists_params: &[Symbol],
-    symbols: &SymbolTable,
+    symbols: &SymbolTable<'input>,
 ) -> bool {
     match ct {
         crate::ast::Type::Path(p, _) => {
@@ -167,7 +140,7 @@ fn rhs_is_provably_concrete(
         | crate::ast::Type::Literal(..)
         | crate::ast::Type::Regex(..)
         | crate::ast::Type::Error(_) => true,
-        // Projection, DynTrait, Exists, WhereShorthand, Expr: not provably
+        // Projection, DynTrait, Exists, WhereShorthand, Expr<'input>: not provably
         // concrete at the resolver stage — be conservative (skip the check).
         _ => false,
     }
@@ -176,7 +149,10 @@ fn rhs_is_provably_concrete(
 /// Expression-side counterpart of `find_param_ref_in_type`: recursively
 /// search an AST expression for an `Ident` whose name is one of `params`.
 /// Used for `Type::Expr` (const-generic / array-size) positions.
-fn find_param_ref_in_expr(expr: &Expr, params: &[TypeParam]) -> Option<Symbol> {
+fn find_param_ref_in_expr<'input>(
+    expr: &Expr<'input>,
+    params: &[TypeParam<'input>],
+) -> Option<Symbol> {
     match expr {
         Expr::Ident(name, _) => params.iter().find(|tp| tp.name == *name).map(|tp| tp.name),
         Expr::Literal(_, _) => None,
@@ -245,9 +221,9 @@ pub enum Res {
 
 /// Pre-resolved name resolution results, populated by NameResolver and consumed by TypeChecker.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ResolutionMap {
+pub(crate) struct ResolutionMap<'input> {
     pub type_def_ids: FxHashMap<Symbol, DefId>,
-    pub type_bindings: FxHashMap<DefId, TypeBinding>,
+    pub type_bindings: FxHashMap<DefId, TypeBinding<'input>>,
     /// Partial resolution of value paths (multi-segment), keyed by the first segment.
     pub value_resolutions: FxHashMap<Symbol, PartialRes>,
     /// Partial resolution of type paths (multi-segment), keyed by the first segment.
@@ -258,10 +234,10 @@ pub(crate) struct ResolutionMap {
 use crate::hir::types::*;
 use rustc_hash::FxHashMap as HashMap;
 
-pub struct NameResolver<'a> {
-    ctx: &'a mut TypeContext,
-    symbols: SymbolTable,
-    trait_env: TraitEnv,
+pub struct NameResolver<'a, 'input> {
+    ctx: &'a mut TypeContext<'input>,
+    symbols: SymbolTable<'input>,
+    trait_env: TraitEnv<'input>,
     diagnostics: DiagCtxt,
     current_scope: usize,
     current_function: Option<DefId>,
@@ -277,11 +253,18 @@ pub struct NameResolver<'a> {
     /// `Self` in method bodies and associated type defaults.
     current_impl_for_type: Option<TypeId>,
     /// Pre-resolved name resolutions for the type checker.
-    resolution_map: ResolutionMap,
+    resolution_map: ResolutionMap<'input>,
     /// Current module path for registering full-qualified type paths.
     module_path: Vec<Symbol>,
     /// Layout aliases defined with `layout Name { ... }`.
-    layout_aliases: HashMap<Symbol, Vec<Attribute>>,
+    layout_aliases: HashMap<Symbol, Vec<Attribute<'input>>>,
+    /// The builtin `Drop` trait's DefId — LAZILY resolved on the first
+    /// `is_drop` check and cached (the builtin traits may not all be
+    /// registered by `register_builtins` at `NameResolver::new` time;
+    /// by the first `impl` resolution the symbols are populated).  The
+    /// `is_drop` comparison uses this anchor instead of re-querying the
+    /// symbol table on every `impl`.
+    builtin_drop_def_id: Option<DefId>,
 }
 
 struct ImportEntry {
@@ -291,8 +274,8 @@ struct ImportEntry {
     span: Span,
 }
 
-impl<'a> NameResolver<'a> {
-    pub fn new(ctx: &'a mut TypeContext, local_crate_id: CrateId) -> Self {
+impl<'input: 'a, 'a> NameResolver<'a, 'input> {
+    pub fn new(ctx: &'a mut TypeContext<'input>, local_crate_id: CrateId) -> Self {
         let mut symbols = SymbolTable::new(local_crate_id);
         let mut trait_env = TraitEnv::new();
         // Register built-in types (Result, Option, Channel, etc.) so that
@@ -315,13 +298,19 @@ impl<'a> NameResolver<'a> {
             resolution_map: ResolutionMap::default(),
             module_path: Vec::new(),
             layout_aliases: HashMap::default(),
+            builtin_drop_def_id: None,
         }
     }
 
     pub fn resolve_program(
         &mut self,
-        program: &Program,
-    ) -> (SymbolTable, TraitEnv, DiagCtxt, ResolutionMap) {
+        program: &Program<'input>,
+    ) -> (
+        SymbolTable<'input>,
+        TraitEnv<'input>,
+        DiagCtxt,
+        ResolutionMap<'input>,
+    ) {
         for item in &program.items {
             self.resolve_item(item);
         }
@@ -351,11 +340,16 @@ impl<'a> NameResolver<'a> {
     /// previous resolution left off, so there is no DefId collision risk.
     pub fn resolve_incremental(
         &mut self,
-        new_items: &[Stmt],
-        existing_symbols: SymbolTable,
-        existing_trait_env: TraitEnv,
-        existing_resolution_map: ResolutionMap,
-    ) -> (SymbolTable, TraitEnv, DiagCtxt, ResolutionMap) {
+        new_items: &[Stmt<'input>],
+        existing_symbols: SymbolTable<'input>,
+        existing_trait_env: TraitEnv<'input>,
+        existing_resolution_map: ResolutionMap<'input>,
+    ) -> (
+        SymbolTable<'input>,
+        TraitEnv<'input>,
+        DiagCtxt,
+        ResolutionMap<'input>,
+    ) {
         // Restore existing resolution state.
         self.has_main = existing_resolution_map.has_main;
         self.symbols = existing_symbols;
@@ -379,7 +373,7 @@ impl<'a> NameResolver<'a> {
         (symbols, trait_env, diags, resolution_map)
     }
 
-    fn resolve_item(&mut self, item: &Stmt) {
+    fn resolve_item(&mut self, item: &Stmt<'input>) {
         match item {
             Stmt::FunctionDef {
                 span,
@@ -406,21 +400,32 @@ impl<'a> NameResolver<'a> {
                 }
                 self.current_impl_type_params = Some(param_map);
 
+                // Compute the attribute-derived flags BEFORE the mutable
+                // `collect_function_signature` call (which holds a `&mut
+                // self` borrow through its returned signature).
+                let is_pure = self.has_pure_attribute(attributes);
+                let is_ieee_contracts = self.has_ieee_contracts_attribute(attributes);
+                let hints = self.extract_hints(attributes);
+
                 let sig = self.collect_function_signature(
                     *name,
                     params,
                     return_type.as_ref(),
                     type_params,
                 );
+                // Own the signature so the `&mut self` borrow from
+                // `collect_function_signature` ends before the root insert
+                // below re-borrows `self.symbols`.
+                let sig = sig.clone();
 
                 let binding = FunctionBinding {
                     def_id,
                     signature: sig,
                     is_comptime: *is_comptime,
                     is_async: *is_async,
-                    is_pure: self.has_pure_attribute(attributes),
-                    is_ieee_contracts: self.has_ieee_contracts_attribute(attributes),
-                    hints: self.extract_hints(attributes),
+                    is_pure,
+                    is_ieee_contracts,
+                    hints,
                     contracts: contracts.clone(),
                     attributes: attributes.clone(),
                 };
@@ -430,7 +435,7 @@ impl<'a> NameResolver<'a> {
                 // starting from the ROOT scope, so nested defs must be
                 // registered at the root too (rustc-style item collection).
                 // (The resolver's own `current_scope` does NOT control the
-                // SymbolTable's scope — hence the dedicated root insert.)
+                // SymbolTable<'input>'s scope — hence the dedicated root insert.)
                 if let Err(diag) = self.symbols.insert_function_at_root(*name, binding, *span) {
                     self.diagnostics.push(diag);
                 }
@@ -530,6 +535,34 @@ impl<'a> NameResolver<'a> {
                     }
                     TypeDefinition::Enum(variants_def, mm, modifiers) => {
                         variants = variants_def.clone();
+                        // The §Copy derivation: a generic enum is Copy iff
+                        // EVERY variant payload is Copy (the value holds
+                        // one variant) — collect the payloads into the ADT
+                        // fields so `adt_is_copy` checks them uniformly.
+                        for v in variants_def {
+                            if let Some(p) = &v.payload {
+                                // Recursive payloads (`Cons((Int<32>, &mut List))`)
+                                // reference the ADT itself, which is not yet in
+                                // the symbol table at this point — drop the
+                                // "undefined type" diagnostics produced here;
+                                // the field's type is then the error type
+                                // (conservative for the §Copy derivation).
+                                // The type checker RE-VALIDATES the field type
+                                // later, so a genuine error (e.g. a misspelled
+                                // payload type) is reported there, not lost.
+                                let before = self.diagnostics.unreported_len();
+                                let pt = self.resolve_type_expr(p);
+                                if self.diagnostics.unreported_len() > before {
+                                    self.diagnostics.truncate_unreported(before);
+                                }
+                                fields.push(FieldBinding {
+                                    name: v.name,
+                                    ty: pt,
+                                    default: None,
+                                    span: v.span,
+                                });
+                            }
+                        }
                         missing_match = mm.clone();
                         // ── GADT constraint parameter name validation ───
                         // Check that every `when` constraint parameter is a
@@ -847,10 +880,10 @@ impl<'a> NameResolver<'a> {
                         match attr.args.first() {
                             Some(crate::ast::Expr::Literal(crate::ast::Literal::Int(n), _)) => {
                                 if attr.name.eq_str("align") {
-                                    align = Some(*n as u64);
+                                    align = Some(n.to_u64().unwrap_or(0));
                                 }
                                 if attr.name.eq_str("pad") {
-                                    pad = Some(*n as u64);
+                                    pad = Some(n.to_u64().unwrap_or(0));
                                 }
                             }
                             Some(_) => {
@@ -880,6 +913,18 @@ impl<'a> NameResolver<'a> {
                             }
                         }
                     }
+                }
+
+                // Register the ADT definition (struct/enum) — the §Copy
+                // derivation (`type_is_copy`) queries the fields.
+                if matches!(kind, TypeKind::Struct | TypeKind::Enum) {
+                    self.ctx.register_adt(
+                        def_id,
+                        crate::hir::types::AdtDef {
+                            fields: fields.iter().map(|f| f.ty).collect(),
+                            has_drop: false,
+                        },
+                    );
                 }
 
                 let binding = TypeBinding {
@@ -945,7 +990,10 @@ impl<'a> NameResolver<'a> {
                 self.current_impl_for_type = Some(self_param);
                 let mut method_bindings = Vec::new();
                 for method in methods {
-                    let sig = self.collect_trait_method_signature(method);
+                    // Own the signature so the `&mut self` borrow from
+                    // `collect_trait_method_signature` ends before the next
+                    // loop iteration.
+                    let sig = self.collect_trait_method_signature(method).clone();
                     method_bindings.push((method.name, sig));
                 }
                 self.current_impl_for_type = None;
@@ -989,7 +1037,7 @@ impl<'a> NameResolver<'a> {
                 self.current_impl_for_type = Some(resolved_for);
                 let resolved_trait = trait_path.as_ref().and_then(|tp| {
                     // Extract the path from the trait type for lookup.
-                    match tp.as_ref() {
+                    match tp {
                         Type::Path(path, _) => self.resolve_trait_path(path),
                         _ => {
                             // For complex trait types (e.g. `Add<Int<32>>`),
@@ -999,6 +1047,35 @@ impl<'a> NameResolver<'a> {
                         }
                     }
                 });
+
+                // The §Copy derivation: an `impl Drop for T` marks the
+                // ADT as non-Copy (`type_is_copy` consults `has_drop`).
+                if let Some(rt) = &resolved_trait {
+                    // The fully precise check: compare the RESOLVED trait
+                    // DefId against the builtin `Drop` DefId.  The anchor
+                    // is lazily resolved from the resolver's own `symbols`
+                    // (the builtin traits are registered into it; NOT the
+                    // TypeChecker's `builtin_registry`, which is populated
+                    // only AFTER name resolution — the resolver runs
+                    // first) and cached — a user-defined trait named
+                    // `Drop` has a DIFFERENT DefId and no longer marks
+                    // the ADT non-Copy.
+                    if self.builtin_drop_def_id.is_none() {
+                        self.builtin_drop_def_id = self
+                            .symbols
+                            .lookup_trait(Symbol::intern("Drop"))
+                            .map(|b| b.def_id);
+                    }
+                    let is_drop = Some(*rt) == self.builtin_drop_def_id;
+                    if is_drop {
+                        if let crate::hir::types::TypeData::Adt { def_id, .. } =
+                            *self.ctx.get(resolved_for)
+                        {
+                            self.ctx.set_adt_has_drop(def_id);
+                        }
+                    }
+                    let _ = rt;
+                }
 
                 self.enter_scope();
                 let binding = ImplBinding {
@@ -1016,8 +1093,19 @@ impl<'a> NameResolver<'a> {
 
                 // Pre-resolve method param types using the impl's type param mapping,
                 // so generic params like `T` are properly substituted in lookup_method.
+                // Each method ALSO gets its OWN DefId here — the "assoc item"
+                // identity (mirroring rustc's `AssocItem.def_id`) — registered
+                // under (receiver type DefId, name) so the AST pre-scan
+                // (`collect_function_effects`) and the checker agree on the
+                // method's identity even before the impl is registered.
+                let receiver_def = self.ctx.get_def_id_for_type(resolved_for);
                 let mut resolved_methods = Vec::new();
                 for method in methods {
+                    let method_def = self.allocate_def_id();
+                    if let Some(receiver_def) = receiver_def {
+                        self.symbols
+                            .insert_method_def_id(receiver_def, method.name, method_def);
+                    }
                     let mut param_tys = Vec::with_capacity(method.params.len());
                     for p in &method.params {
                         if let Some(ref param_ty) = p.ty {
@@ -1030,6 +1118,7 @@ impl<'a> NameResolver<'a> {
                     let resolved_ret = self.resolve_self_in_type(&method.return_type, for_type);
                     let ret_ty = self.resolve_type_expr(&resolved_ret);
                     resolved_methods.push(crate::hir::traits::MethodInfo {
+                        def_id: method_def,
                         name: method.name,
                         param_tys,
                         ret_ty,
@@ -1182,6 +1271,10 @@ impl<'a> NameResolver<'a> {
                 ..
             } => {
                 let def_id = self.allocate_def_id();
+                // Compute attribute-derived flags BEFORE the mutable
+                // `collect_function_signature` call.
+                let is_ieee_contracts = self.has_ieee_contracts_attribute(attributes);
+                let hints = self.extract_hints(attributes);
                 let sig = self.collect_function_signature(*name, params, Some(return_type), &[]);
                 let binding = FunctionBinding {
                     def_id,
@@ -1189,8 +1282,8 @@ impl<'a> NameResolver<'a> {
                     is_comptime: false,
                     is_async: false,
                     is_pure: false,
-                    is_ieee_contracts: self.has_ieee_contracts_attribute(attributes),
-                    hints: self.extract_hints(attributes),
+                    is_ieee_contracts,
+                    hints,
                     contracts: Vec::new(),
                     attributes: attributes.clone(),
                 };
@@ -1212,7 +1305,7 @@ impl<'a> NameResolver<'a> {
         }
     }
 
-    fn resolve_stmt(&mut self, stmt: &Stmt) {
+    fn resolve_stmt(&mut self, stmt: &Stmt<'input>) {
         match stmt {
             // Nested function definitions: register them like items
             // (rustc-style — items in blocks are collected and
@@ -1220,6 +1313,13 @@ impl<'a> NameResolver<'a> {
             // registered and the checker's `update_function_return_type`
             // would panic ("function not found in any scope").
             Stmt::FunctionDef { .. } => self.resolve_item(stmt),
+            // Nested type definitions — register them like items
+            // (rustc-style, mirroring the FunctionDef<'input> arm above).  Before
+            // this arm existed, a `type R = ...` inside a function body was
+            // silently dropped: `R` was never registered in the symbol
+            // table, so a later reference (`set x: R`) reported
+            // "undefined type: R".
+            Stmt::TypeDef { .. } => self.resolve_item(stmt),
             Stmt::VariableDef {
                 kind,
                 mutable,
@@ -1475,7 +1575,7 @@ impl<'a> NameResolver<'a> {
         }
     }
 
-    fn resolve_expr(&mut self, expr: &Expr) -> Option<TypeId> {
+    fn resolve_expr(&mut self, expr: &Expr<'input>) -> Option<TypeId> {
         match expr {
             Expr::Literal(lit, _span) => {
                 let ty = self.literal_type(lit);
@@ -1829,7 +1929,7 @@ impl<'a> NameResolver<'a> {
         }
     }
 
-    fn resolve_pattern(&mut self, pattern: &Pattern) {
+    fn resolve_pattern(&mut self, pattern: &Pattern<'input>) {
         match pattern {
             Pattern::Wildcard(..) => {}
             Pattern::Ident(name, span) => {
@@ -1881,7 +1981,7 @@ impl<'a> NameResolver<'a> {
         }
     }
 
-    fn resolve_type_expr(&mut self, ty: &Type) -> TypeId {
+    fn resolve_type_expr(&mut self, ty: &Type<'input>) -> TypeId {
         match ty {
             Type::Path(path, span) => {
                 // Check if this name refers to `Self` in an impl block.
@@ -1961,7 +2061,7 @@ impl<'a> NameResolver<'a> {
             }
             Type::Generic(base, args, span) => {
                 // Handle generic built-in types (Int, UInt, Float) by matching base path
-                if let Type::Path(path, _) = base.as_ref()
+                if let Type::Path(path, _) = base
                     && path.len() == 1
                 {
                     if path[0].eq_str("Int") {
@@ -1986,7 +2086,7 @@ impl<'a> NameResolver<'a> {
                         let q = self
                             .extract_int_from_type(args[1].ty().as_ref())
                             .unwrap_or(16);
-                        return self.ctx.rational(p, q);
+                        return self.ctx.rational(p as u8, q as u8);
                     } else if path[0].eq_str("Ptr") {
                         let size = args
                             .get(0)
@@ -2033,10 +2133,15 @@ impl<'a> NameResolver<'a> {
                 }
             }
             Type::Reference {
-                inner: ty, mutable, ..
+                inner: ty,
+                mutable,
+                lifetime,
+                ..
             } => {
                 let inner = self.resolve_type_expr(ty);
-                self.ctx.reference(inner, *mutable)
+                // Keep the explicit lifetime annotation (`&'a T`) in the
+                // resolved type for the region solver.
+                self.ctx.reference_with_lifetime(inner, *mutable, *lifetime)
             }
             Type::Pointer(ty, ..) => {
                 let inner = self.resolve_type_expr(ty);
@@ -2048,8 +2153,8 @@ impl<'a> NameResolver<'a> {
             }
             Type::Array(ty, size, span) => {
                 let inner = self.resolve_type_expr(ty);
-                if let Expr::Literal(Literal::Int(size_val), _) = size.as_ref() {
-                    self.ctx.array(inner, *size_val as u64)
+                if let Expr::Literal(Literal::Int(size_val), _) = size {
+                    self.ctx.array(inner, size_val.to_u64().unwrap_or(0))
                 } else {
                     self.diagnostics.push(
                         Diagnostic::error("array size must be a compile-time constant integer")
@@ -2066,6 +2171,14 @@ impl<'a> NameResolver<'a> {
                 let param_tys = params.iter().map(|p| self.resolve_type_expr(p)).collect();
                 let ret_ty = self.resolve_type_expr(ret);
                 self.ctx.function(param_tys, ret_ty)
+            }
+            Type::Forall { lifetime, body, .. } => {
+                // Higher-ranked type `for<'a> T`: the lifetime is
+                // universally quantified — allocate a fresh binder index
+                // (the checker skolemizes it at the call site).
+                let body_ty = self.resolve_type_expr(body);
+                self.ctx
+                    .forall(self.ctx.fresh_param_index(), *lifetime, body_ty)
             }
             Type::Projection {
                 impl_type,
@@ -2101,7 +2214,7 @@ impl<'a> NameResolver<'a> {
                     self.ctx.fresh_param_index(),
                     *name,
                     base_ty,
-                    invariant.as_ref().clone(),
+                    (*invariant).clone(),
                 )
             }
             Type::WhereShorthand {
@@ -2111,11 +2224,14 @@ impl<'a> NameResolver<'a> {
             } => {
                 // Desugar `type T = Base where value > 0` into `exists _where_N: Base invariant _where_N > 0`.
                 let name = Symbol::intern(&format!("_where_{}", span.start));
-                let mut inv = invariant.as_ref().clone();
-                replace_ident_in_expr(&mut inv, Symbol::intern("value"), name);
+                let arena = self
+                    .ctx
+                    .arena
+                    .expect("arena required for the where-invariant desugar");
+                let inv = replace_ident_in_expr(arena, &invariant, Symbol::intern("value"), name);
                 let base_ty = self.resolve_type_expr(base);
                 self.ctx
-                    .exists(self.ctx.fresh_param_index(), name, base_ty, inv)
+                    .exists(self.ctx.fresh_param_index(), name, base_ty, (*inv).clone())
             }
             Type::Literal(expr, ..) => self.resolve_expr(expr).unwrap_or(self.ctx.error()),
             Type::Never(..) => self.ctx.never(),
@@ -2123,7 +2239,7 @@ impl<'a> NameResolver<'a> {
             Type::Error(..) => self.ctx.error(),
             Type::Expr(expr, ..) => self.resolve_expr(expr).unwrap_or(self.ctx.error()),
             Type::Regex(pattern, _) => {
-                // Pattern validated by the parser at parse time.  `Type::Regex` is
+                // Pattern<'input> validated by the parser at parse time.  `Type::Regex` is
                 // only constructed by the parser — there is no macro expansion or
                 // deserialization path that produces `ast::Type::Regex` nodes.
                 // The `debug_assert!` below is a safety net for debug builds only.
@@ -2153,10 +2269,10 @@ impl<'a> NameResolver<'a> {
 
     /// Resolve a trait path from a bound `Type` (e.g. `Foo` or `Add<Int<32>>`).
     /// Extracts the path from the `Type` and calls `resolve_trait_path`.
-    fn resolve_trait_path_from_bound(&mut self, bound: &Type) -> Option<DefId> {
+    fn resolve_trait_path_from_bound(&mut self, bound: &Type<'input>) -> Option<DefId> {
         let path = match bound {
             Type::Path(path, _) => path,
-            Type::Generic(base, _, _) => match base.as_ref() {
+            Type::Generic(base, _, _) => match base {
                 Type::Path(path, _) => path,
                 _ => return None,
             },
@@ -2165,14 +2281,14 @@ impl<'a> NameResolver<'a> {
         self.resolve_trait_path(path)
     }
 
-    fn extract_int_from_type(&self, ty: &Type) -> Option<u8> {
+    fn extract_int_from_type(&self, ty: &Type<'input>) -> Option<u32> {
         match ty {
             Type::Literal(expr, _) => {
-                if let Expr::Literal(Literal::Int(val), _) = expr.as_ref() {
+                if let Expr::Literal(Literal::Int(val), _) = expr {
                     if *val > 64 {
                         return None;
                     }
-                    Some(*val as u8)
+                    val.to_u64().and_then(|n| u32::try_from(n).ok())
                 } else {
                     None
                 }
@@ -2193,7 +2309,7 @@ impl<'a> NameResolver<'a> {
         self.symbols.allocate_def_id()
     }
 
-    fn get_stmt_span(&self, stmt: &Stmt) -> Option<Span> {
+    fn get_stmt_span(&self, stmt: &Stmt<'input>) -> Option<Span> {
         match stmt {
             Stmt::VariableDef { span, .. } => Some(*span),
             Stmt::FunctionDef { span, .. } => Some(*span),
@@ -2207,17 +2323,17 @@ impl<'a> NameResolver<'a> {
         }
     }
 
-    fn has_pure_attribute(&self, attributes: &[Attribute]) -> bool {
+    fn has_pure_attribute(&self, attributes: &[Attribute<'input>]) -> bool {
         attributes.iter().any(|attr| attr.name.eq_str("pure"))
     }
 
-    fn has_ieee_contracts_attribute(&self, attributes: &[Attribute]) -> bool {
+    fn has_ieee_contracts_attribute(&self, attributes: &[Attribute<'input>]) -> bool {
         attributes
             .iter()
             .any(|attr| attr.name.eq_str("ieee_contracts"))
     }
 
-    fn extract_hints(&self, attributes: &[Attribute]) -> Vec<Expr> {
+    fn extract_hints(&self, attributes: &[Attribute<'input>]) -> Vec<Expr<'input>> {
         attributes
             .iter()
             .filter(|attr| attr.name.eq_str("hint"))
@@ -2239,10 +2355,10 @@ impl<'a> NameResolver<'a> {
     fn collect_function_signature(
         &mut self,
         name: Symbol,
-        params: &[Param],
-        return_type: Option<&Type>,
-        type_params: &[TypeParam],
-    ) -> FunctionSignature {
+        params: &[Param<'input>],
+        return_type: Option<&Type<'input>>,
+        type_params: &[TypeParam<'input>],
+    ) -> FunctionSignature<'input> {
         FunctionSignature {
             params: params
                 .iter()
@@ -2267,7 +2383,10 @@ impl<'a> NameResolver<'a> {
         }
     }
 
-    fn collect_trait_method_signature(&mut self, method: &TraitMethod) -> FunctionSignature {
+    fn collect_trait_method_signature(
+        &mut self,
+        method: &TraitMethod<'input>,
+    ) -> FunctionSignature<'input> {
         FunctionSignature {
             params: method
                 .params
@@ -2290,7 +2409,7 @@ impl<'a> NameResolver<'a> {
         }
     }
 
-    pub fn into_symbols(self) -> SymbolTable {
+    pub fn into_symbols(self) -> SymbolTable<'input> {
         self.symbols
     }
 
@@ -2301,7 +2420,7 @@ impl<'a> NameResolver<'a> {
     /// Recursively substitute `Self` in an AST type with `self_ty`.
     /// Needed for resolving method signatures in impl blocks, where
     /// `&self` desugars to `Self` which resolve_type_expr cannot handle.
-    fn resolve_self_in_type(&self, ty: &Type, self_ty: &Type) -> Type {
+    fn resolve_self_in_type(&self, ty: &Type<'input>, self_ty: &Type<'input>) -> Type<'input> {
         match ty {
             Type::Path(p, s) if p.len() == 1 && (p[0].eq_str("Self") || p[0].eq_str("self")) => {
                 self_ty.clone()
@@ -2312,17 +2431,25 @@ impl<'a> NameResolver<'a> {
                 span: s,
                 ..
             } => Type::Reference {
-                inner: Box::new(self.resolve_self_in_type(inner, self_ty)),
+                inner: self
+                    .ctx
+                    .arena
+                    .expect("arena required for type construction")
+                    .alloc(self.resolve_self_in_type(inner, self_ty)),
                 mutable: *mutable,
                 lifetime: None,
                 span: *s,
             },
-            Type::Pointer(inner, s) => {
-                Type::Pointer(Box::new(self.resolve_self_in_type(inner, self_ty)), *s)
-            }
+            Type::Pointer(inner, s) => Type::Pointer(
+                self.ctx
+                    .arena
+                    .expect("arena required for type construction")
+                    .alloc(self.resolve_self_in_type(inner, self_ty)),
+                *s,
+            ),
             Type::Generic(base, args, span) => {
                 let new_base = self.resolve_self_in_type(base, self_ty);
-                let new_args: Vec<GenericArg> = args
+                let new_args: Vec<GenericArg<'input>> = args
                     .iter()
                     .map(|a| match a {
                         GenericArg::Positional(t) => {
@@ -2332,12 +2459,19 @@ impl<'a> NameResolver<'a> {
                             GenericArg::Named(*n, self.resolve_self_in_type(t, self_ty))
                         }
                         GenericArg::Const(ac) => GenericArg::Const(crate::ast::AnonConst {
-                            value: ac.value.clone(),
+                            value: ac.value,
                             span: ac.span,
                         }),
                     })
                     .collect();
-                Type::Generic(Box::new(new_base), new_args, *span)
+                Type::Generic(
+                    self.ctx
+                        .arena
+                        .expect("arena required for type construction")
+                        .alloc(new_base),
+                    new_args,
+                    *span,
+                )
             }
             Type::Tuple(tys, span) => Type::Tuple(
                 tys.iter()
@@ -2345,11 +2479,18 @@ impl<'a> NameResolver<'a> {
                     .collect(),
                 *span,
             ),
-            Type::Slice(inner, span) => {
-                Type::Slice(Box::new(self.resolve_self_in_type(inner, self_ty)), *span)
-            }
+            Type::Slice(inner, span) => Type::Slice(
+                self.ctx
+                    .arena
+                    .expect("arena required for type construction")
+                    .alloc(self.resolve_self_in_type(inner, self_ty)),
+                *span,
+            ),
             Type::Array(inner, size, span) => Type::Array(
-                Box::new(self.resolve_self_in_type(inner, self_ty)),
+                self.ctx
+                    .arena
+                    .expect("arena required for type construction")
+                    .alloc(self.resolve_self_in_type(inner, self_ty)),
                 size.clone(),
                 *span,
             ),
@@ -2365,7 +2506,11 @@ impl<'a> NameResolver<'a> {
                     .iter()
                     .map(|p| self.resolve_self_in_type(p, self_ty))
                     .collect(),
-                ret: Box::new(self.resolve_self_in_type(ret, self_ty)),
+                ret: self
+                    .ctx
+                    .arena
+                    .expect("arena required for type construction")
+                    .alloc(self.resolve_self_in_type(ret, self_ty)),
                 span: *span,
             },
             Type::Projection {
@@ -2374,8 +2519,16 @@ impl<'a> NameResolver<'a> {
                 assoc_name,
                 span,
             } => Type::Projection {
-                impl_type: Box::new(self.resolve_self_in_type(impl_type, self_ty)),
-                trait_path: Box::new(self.resolve_self_in_type(trait_path, self_ty)),
+                impl_type: self
+                    .ctx
+                    .arena
+                    .expect("arena required for type construction")
+                    .alloc(self.resolve_self_in_type(impl_type, self_ty)),
+                trait_path: self
+                    .ctx
+                    .arena
+                    .expect("arena required for type construction")
+                    .alloc(self.resolve_self_in_type(trait_path, self_ty)),
                 assoc_name: *assoc_name,
                 span: *span,
             },
@@ -2496,9 +2649,18 @@ mod tests {
     /// Parse and resolve a Posita source, returning the resolver's symbol table.
     fn resolve_source(
         source: &str,
-    ) -> Result<(SymbolTable, TraitEnv, ResolutionMap, TypeContext), Vec<String>> {
+    ) -> Result<
+        (
+            SymbolTable<'static>,
+            TraitEnv<'static>,
+            ResolutionMap<'static>,
+            TypeContext<'static>,
+        ),
+        Vec<String>,
+    > {
+        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let mut ctx = TypeContext::new();
-        let mut parser = Parser::new(source);
+        let mut parser = Parser::new(source, arena);
         let program = parser.parse_program().map_err(|diags| {
             diags
                 .into_iter()

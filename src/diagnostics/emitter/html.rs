@@ -1,6 +1,7 @@
 use crate::ast::Span;
 use crate::diagnostics::Diagnostic;
-use crate::diagnostics::glyph::{byte_to_linecol, compute_line_underlines};
+use crate::diagnostics::byte_to_linecol;
+use crate::diagnostics::glyph::compute_line_underlines;
 use crate::diagnostics::label::{AnnotationKind, Label};
 use std::fmt::Write;
 

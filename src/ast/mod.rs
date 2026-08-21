@@ -1,6 +1,9 @@
 pub mod visit;
+use num_bigint::{BigInt, Sign};
+
 use crate::symbol::Symbol;
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,14 +13,191 @@ pub struct Span {
 }
 
 impl Span {
-    pub fn new(start: usize, end: usize) -> Self {
+    pub const fn new(start: usize, end: usize) -> Self {
         Span { start, end }
+    }
+}
+
+/// Sentinel span for "no source location known" (start == end == 0).
+/// Used as a fallback in internal error paths that lack a real span;
+/// diagnostic emitters treat it as an unanchored location.
+pub const DUMMY_SPAN: Span = Span::new(0, 0);
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IntLit {
+    Small(i128),
+    Large(Box<BigInt>),
+}
+
+impl IntLit {
+    pub fn normalize(v: BigInt) -> Self {
+        use num_traits::ToPrimitive;
+        match v.to_i128() {
+            Some(n) => IntLit::Small(n),
+            None => IntLit::Large(Box::new(v)),
+        }
+    }
+
+    pub fn fits_unsigned(&self, bits: u64) -> bool {
+        match self {
+            IntLit::Small(n) => *n >= 0 && (bits >= 127 || (*n as u128) < (1u128 << bits)),
+            IntLit::Large(b) => b.sign() != Sign::Minus && b.bits() <= bits,
+        }
+    }
+
+    pub fn fits_signed(&self, bits: u64) -> bool {
+        match self {
+            IntLit::Small(n) => match bits {
+                0 => false,
+                b if b >= 128 => true,
+                b => *n >= -(1i128 << (b - 1)) && *n < (1i128 << (b - 1)),
+            },
+            IntLit::Large(b) => {
+                let half = BigInt::from(1) << ((bits - 1) as usize); // 2^(N-1)
+                *b >= Box::new(-&half) && *b < Box::new(half)
+            }
+        }
+    }
+
+    pub fn to_u64(&self) -> Option<u64> {
+        match self {
+            IntLit::Small(n) => u64::try_from(*n).ok(),
+            IntLit::Large(b) => {
+                use num_traits::ToPrimitive;
+                b.to_u64()
+            }
+        }
+    }
+
+    pub fn to_i128(&self) -> Option<i128> {
+        match self {
+            IntLit::Small(n) => Some(*n),
+            IntLit::Large(b) => {
+                use num_traits::ToPrimitive;
+                b.to_i128()
+            }
+        }
+    }
+
+    /// `self + other` with i128 overflow detection — `None` on overflow
+    /// or when `self` is Large (beyond i128; callers fail closed).
+    pub fn checked_add(&self, other: i128) -> Option<i128> {
+        match self {
+            IntLit::Small(n) => n.checked_add(other),
+            IntLit::Large(_) => None,
+        }
+    }
+
+    /// `self - other` with i128 overflow detection — `None` on overflow
+    /// or when `self` is Large (callers fail closed).
+    pub fn checked_sub(&self, other: i128) -> Option<i128> {
+        match self {
+            IntLit::Small(n) => n.checked_sub(other),
+            IntLit::Large(_) => None,
+        }
+    }
+
+    /// Absolute value as `u128` (i128's `unsigned_abs`), saturating to
+    /// `u128::MAX` for Large values (any threshold check then passes).
+    pub fn unsigned_abs(&self) -> u128 {
+        match self {
+            IntLit::Small(n) => n.unsigned_abs(),
+            IntLit::Large(b) => {
+                use num_traits::ToPrimitive;
+                (**b).to_u128().unwrap_or(u128::MAX)
+            }
+        }
+    }
+}
+
+/// Unary negation of a borrowed literal — used in i128 constant contexts
+/// (`-c` for descending counters); Large values fail closed to
+/// `i128::MIN` (they cannot fit i128).
+impl std::ops::Neg for &IntLit {
+    type Output = i128;
+    fn neg(self) -> i128 {
+        match self {
+            IntLit::Small(n) => -n,
+            IntLit::Large(_) => i128::MIN,
+        }
+    }
+}
+
+impl std::fmt::Display for IntLit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IntLit::Small(n) => write!(f, "{n}"),
+            IntLit::Large(b) => write!(f, "{b}"),
+        }
+    }
+}
+
+impl From<IntLit> for BigInt {
+    fn from(v: IntLit) -> Self {
+        match v {
+            IntLit::Small(n) => BigInt::from(n),
+            IntLit::Large(b) => *b,
+        }
+    }
+}
+
+impl PartialOrd<i32> for IntLit {
+    fn partial_cmp(&self, other: &i32) -> Option<Ordering> {
+        Some(match self {
+            IntLit::Small(n) => n.cmp(&i128::from(*other)),
+            IntLit::Large(b) => (**b).cmp(&BigInt::from(*other)),
+        })
+    }
+}
+
+impl PartialEq<i32> for IntLit {
+    fn eq(&self, other: &i32) -> bool {
+        match self {
+            IntLit::Small(n) => *n == i128::from(*other),
+            IntLit::Large(b) => **b == BigInt::from(*other),
+        }
+    }
+}
+
+impl PartialEq<i64> for IntLit {
+    fn eq(&self, other: &i64) -> bool {
+        match self {
+            IntLit::Small(n) => *n == i128::from(*other),
+            IntLit::Large(b) => **b == BigInt::from(*other),
+        }
+    }
+}
+
+impl PartialOrd<i128> for IntLit {
+    fn partial_cmp(&self, other: &i128) -> Option<Ordering> {
+        Some(match self {
+            IntLit::Small(n) => n.cmp(other),
+            IntLit::Large(b) => (**b).cmp(&BigInt::from(*other)),
+        })
+    }
+}
+
+impl PartialEq<i128> for IntLit {
+    fn eq(&self, other: &i128) -> bool {
+        match self {
+            IntLit::Small(n) => *n == *other,
+            IntLit::Large(b) => **b == BigInt::from(*other),
+        }
+    }
+}
+
+impl PartialOrd<i64> for IntLit {
+    fn partial_cmp(&self, other: &i64) -> Option<Ordering> {
+        Some(match self {
+            IntLit::Small(n) => n.cmp(&i128::from(*other)),
+            IntLit::Large(b) => (**b).cmp(&BigInt::from(*other)),
+        })
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
-    Int(i128),
+    Int(IntLit),
     Float(f64),
     Char(u8),
     String(String),
@@ -37,6 +217,10 @@ pub enum BinOp {
     MulWrap,
     AddSaturate,
     SubSaturate,
+    /// `*?` — saturating multiplication. STILL UNDER RESEARCH: the BII
+    /// template domain is linear (multiplication is not in the subset);
+    /// lowering fails closed on it. `/?` (saturating division) is not
+    /// defined yet — both await a separate RFC.
     MulSaturate,
     AddTrap,
     SubTrap,
@@ -85,141 +269,141 @@ pub enum Quantifier {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
+pub enum Expr<'input> {
     Literal(Literal, Span),
     Ident(Symbol, Span),
     TypeAnnotated {
-        expr: Box<Expr>,
-        ty: Box<Type>,
+        expr: &'input Expr<'input>,
+        ty: &'input Type<'input>,
         span: Span,
     },
     BinaryOp {
-        left: Box<Expr>,
+        left: &'input Expr<'input>,
         op: BinOp,
-        right: Box<Expr>,
+        right: &'input Expr<'input>,
         span: Span,
     },
     UnaryOp {
         op: UnaryOp,
-        expr: Box<Expr>,
+        expr: &'input Expr<'input>,
         span: Span,
     },
     Call {
-        callee: Box<Expr>,
-        args: Vec<Expr>,
+        callee: &'input Expr<'input>,
+        args: Vec<Expr<'input>>,
         comptime: bool,
         span: Span,
     },
     Index {
-        base: Box<Expr>,
-        index: Box<Expr>,
+        base: &'input Expr<'input>,
+        index: &'input Expr<'input>,
         span: Span,
     },
     FieldAccess {
-        base: Box<Expr>,
+        base: &'input Expr<'input>,
         field: Symbol,
         span: Span,
     },
     AttrAccess {
-        base: Box<Expr>,
+        base: &'input Expr<'input>,
         attr: Symbol,
         span: Span,
     },
     Cast {
-        expr: Box<Expr>,
-        ty: Box<Type>,
+        expr: &'input Expr<'input>,
+        ty: &'input Type<'input>,
         safe: bool,
         rounding: Option<Rounding>,
         span: Span,
     },
     Range {
-        start: Option<Box<Expr>>,
-        end: Option<Box<Expr>>,
+        start: Option<&'input Expr<'input>>,
+        end: Option<&'input Expr<'input>>,
         inclusive: bool,
         span: Span,
     },
     StructLit {
         path: Vec<Symbol>,
-        fields: Vec<(Symbol, Expr)>,
+        fields: Vec<(Symbol, Expr<'input>)>,
         span: Span,
     },
     EnumLit {
         path: Vec<Symbol>,
         variant: Symbol,
-        payload: Option<Box<Expr>>,
+        payload: Option<&'input Expr<'input>>,
         span: Span,
     },
-    Move(Box<Expr>, Span),
+    Move(&'input Expr<'input>, Span),
     /// Multi-segment path: `Module::Type::item`. Preserves `::` semantics,
     /// distinct from FieldAccess (`.`). Used for associated fn calls,
     /// enum variant construction, etc.
-    Path(Vec<Symbol>, Span),
-    Tuple(Vec<Expr>, Span),
-    Array(Vec<Expr>, Span),
+    Path(smallvec::SmallVec<[Symbol; 4]>, Span),
+    Tuple(Vec<Expr<'input>>, Span),
+    Array(Vec<Expr<'input>>, Span),
     Closure {
-        params: Vec<Param>,
-        return_type: Option<Type>,
+        params: Vec<Param<'input>>,
+        return_type: Option<Type<'input>>,
         captures: Vec<Capture>,
-        body: Vec<Stmt>,
+        body: Vec<Stmt<'input>>,
         span: Span,
     },
     Try {
-        expr: Box<Expr>,
+        expr: &'input Expr<'input>,
         span: Span,
     },
     UnsafeBlock {
-        body: Vec<Stmt>,
+        body: Vec<Stmt<'input>>,
         span: Span,
     },
     Catch {
-        expr: Box<Expr>,
-        branches: Vec<CatchBranch>,
+        expr: &'input Expr<'input>,
+        branches: Vec<CatchBranch<'input>>,
         span: Span,
     },
     LeaveWith {
-        expr: Box<Expr>,
+        expr: &'input Expr<'input>,
         /// `true` if from `return expr` (value return),
         /// `false` if from `leave with expr` (error propagation).
         is_return: bool,
         span: Span,
     },
     Await {
-        expr: Box<Expr>,
+        expr: &'input Expr<'input>,
         span: Span,
     },
     If {
-        cond: Box<Expr>,
-        then_branch: Vec<Stmt>,
-        else_branch: Option<Vec<Stmt>>,
+        cond: &'input Expr<'input>,
+        then_branch: Vec<Stmt<'input>>,
+        else_branch: Option<Vec<Stmt<'input>>>,
         is_expression: bool,
         span: Span,
     },
     IfLet {
-        pattern: Pattern,
-        scrutinee: Box<Expr>,
-        then_branch: Vec<Stmt>,
-        else_branch: Option<Vec<Stmt>>,
+        pattern: Pattern<'input>,
+        scrutinee: &'input Expr<'input>,
+        then_branch: Vec<Stmt<'input>>,
+        else_branch: Option<Vec<Stmt<'input>>>,
         is_expression: bool,
         span: Span,
     },
     Match {
-        scrutinee: Box<Expr>,
-        arms: Vec<MatchArm>,
+        scrutinee: &'input Expr<'input>,
+        arms: Vec<MatchArm<'input>>,
         span: Span,
     },
-    Block(Vec<Stmt>, Span),
+    Block(Vec<Stmt<'input>>, Span),
     /// `poly(expr)` — implicit poly box, or `poly : Scheme(expr)` — explicit.
     PolyBox {
-        expr: Box<Expr>,
+        expr: &'input Expr<'input>,
         /// Optional scheme: `forall T1, T2, ... . body`
-        scheme: Option<TypeScheme>,
+        scheme: Option<TypeScheme<'input>>,
         span: Span,
     },
     /// `unbox(expr)` — implicit poly unbox, or `unbox : Scheme(expr)` — explicit.
     PolyUnbox {
-        expr: Box<Expr>,
+        expr: &'input Expr<'input>,
         /// Optional expected result scheme type.
-        scheme: Option<TypeScheme>,
+        scheme: Option<TypeScheme<'input>>,
         span: Span,
     },
     /// Quantified expression: `forall i in 0..n: body` or `exists i in range: body`.
@@ -227,27 +411,27 @@ pub enum Expr {
     Quantified {
         quantifier: Quantifier,
         binder: Symbol,
-        range: Box<Expr>,
-        body: Box<Expr>,
+        range: &'input Expr<'input>,
+        body: &'input Expr<'input>,
         span: Span,
     },
     /// `old(expr)` — captures the value of `expr` at function entry.
     /// Used in `ensures` clauses: `ensures *x == old(*x) + 1`.
-    Old(Box<Expr>, Span),
+    Old(&'input Expr<'input>, Span),
     /// Spawn a task: `task { body }`
     Task {
-        body: Vec<Stmt>,
+        body: Vec<Stmt<'input>>,
         span: Span,
     },
     /// Compile-time type reflection: `@typeInfo!(Type)` — returns a
     /// `TypeInfo` value describing the type's structure at comptime.
     /// Inspired by Zig's `@typeInfo`.
-    TypeInfo(Box<Type>, Span),
+    TypeInfo(&'input Type<'input>, Span),
     /// Compile-time layout reflection: `layout_of!(Type)` — returns a
     /// `LayoutDescriptor` describing the type's size, alignment, and
     /// field offsets at comptime.  `layout_of!` is comptime-only and
     /// thus requires `!`.
-    LayoutOf(Box<Type>, Span),
+    LayoutOf(&'input Type<'input>, Span),
     /// Compile-time error: `@compile_error!("msg")` unconditionally halts
     /// compilation with the given message when evaluated (comptime-only).
     /// Parsed as an expression so it can be guarded by `if` / `match`.
@@ -256,18 +440,18 @@ pub enum Expr {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct CatchBranch {
-    pub pattern: Pattern,
+pub struct CatchBranch<'input> {
+    pub pattern: Pattern<'input>,
     pub bind: Option<Symbol>,
-    pub body: Vec<Stmt>,
+    pub body: Vec<Stmt<'input>>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct MatchArm {
-    pub pattern: Pattern,
-    pub guard: Option<Box<Expr>>,
-    pub body: Expr,
+pub struct MatchArm<'input> {
+    pub pattern: Pattern<'input>,
+    pub guard: Option<&'input Expr<'input>>,
+    pub body: Expr<'input>,
     pub span: Span,
 }
 
@@ -292,53 +476,57 @@ pub enum CaptureMode {
 // `@auto_ro`/`@auto_coerce` placement validation is kept fail-closed
 // via its own wildcard arm (see `validate_auto_ro_placement`).
 #[non_exhaustive]
-pub enum Stmt {
+pub enum Stmt<'input> {
     VariableDef {
         kind: VariableKind,
         mutable: bool,
         name: Option<Symbol>,
-        pattern: Option<Pattern>,
-        ty: Option<Type>,
-        value: Option<Expr>,
-        else_branch: Option<Vec<Stmt>>,
+        pattern: Option<Pattern<'input>>,
+        ty: Option<Type<'input>>,
+        value: Option<Expr<'input>>,
+        else_branch: Option<Vec<Stmt<'input>>>,
         span: Span,
-        attributes: Vec<Attribute>,
+        attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
         /// Type/const captures: `set auto<T, N, L> = expr`.
         /// Bound at comptime after inferring `expr`'s type.
-        type_captures: Vec<TypeParam>,
+        type_captures: Vec<TypeParam<'input>>,
+        /// Type-level modifiers (`with overflow = saturate` etc.) on the
+        /// annotated type — applied by the checker when the type is
+        /// resolved.
+        type_modifiers: Vec<TypeModifier<'input>>,
     },
     FunctionDef {
         span: Span,
-        attributes: Vec<Attribute>,
-        contracts: Vec<Contract>,
+        attributes: Vec<Attribute<'input>>,
+        contracts: Vec<Contract<'input>>,
         doc: Option<String>,
         name: Symbol,
-        params: Vec<Param>,
-        return_type: Option<Type>,
-        body: Option<Vec<Stmt>>,
-        type_params: Vec<TypeParam>,
-        where_clause: Option<WhereClause>,
-        finally: Option<Vec<Stmt>>,
+        params: Vec<Param<'input>>,
+        return_type: Option<Type<'input>>,
+        body: Option<Vec<Stmt<'input>>>,
+        type_params: Vec<TypeParam<'input>>,
+        where_clause: Option<WhereClause<'input>>,
+        finally: Option<Vec<Stmt<'input>>>,
         is_comptime: bool,
         is_async: bool,
     },
     TypeDef {
         span: Span,
-        attributes: Vec<Attribute>,
+        attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
         name: Symbol,
-        params: Vec<TypeParam>,
-        definition: TypeDefinition,
-        contracts: Vec<Contract>,
+        params: Vec<TypeParam<'input>>,
+        definition: TypeDefinition<'input>,
+        contracts: Vec<Contract<'input>>,
     },
     TraitDef {
         span: Span,
-        attributes: Vec<Attribute>,
+        attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
         name: Symbol,
-        methods: Vec<TraitMethod>,
-        associated_types: Vec<AssociatedType>,
+        methods: Vec<TraitMethod<'input>>,
+        associated_types: Vec<AssociatedType<'input>>,
     },
     Import {
         path: Vec<Symbol>,
@@ -349,57 +537,61 @@ pub enum Stmt {
     ExternFunction {
         abi: String,
         name: Symbol,
-        params: Vec<Param>,
-        return_type: Type,
+        params: Vec<Param<'input>>,
+        return_type: Type<'input>,
         span: Span,
-        attributes: Vec<Attribute>,
+        attributes: Vec<Attribute<'input>>,
     },
     Constraint {
         name: Symbol,
-        params: Vec<TypeParam>,
-        predicates: Vec<WherePredicate>,
+        params: Vec<TypeParam<'input>>,
+        predicates: smallvec::SmallVec<[WherePredicate<'input>; 2]>,
         span: Span,
     },
     Edition(String, Span),
-    Expression(Expr),
+    Expression(Expr<'input>),
     If {
-        cond: Expr,
-        then_branch: Vec<Stmt>,
-        else_branch: Option<Vec<Stmt>>,
+        cond: Expr<'input>,
+        then_branch: Vec<Stmt<'input>>,
+        else_branch: Option<Vec<Stmt<'input>>>,
         span: Span,
     },
     IfLet {
-        pattern: Pattern,
-        scrutinee: Expr,
-        then_branch: Vec<Stmt>,
-        else_branch: Option<Vec<Stmt>>,
+        pattern: Pattern<'input>,
+        scrutinee: Expr<'input>,
+        then_branch: Vec<Stmt<'input>>,
+        else_branch: Option<Vec<Stmt<'input>>>,
         span: Span,
     },
     While {
-        cond: Expr,
-        body: Vec<Stmt>,
-        invariant: Option<Expr>,
-        decreases: Option<Expr>,
+        label: Option<Symbol>,
+        cond: Expr<'input>,
+        body: Vec<Stmt<'input>>,
+        invariant: Option<Expr<'input>>,
+        decreases: Option<Expr<'input>>,
         span: Span,
     },
     WhileLet {
-        pattern: Pattern,
-        scrutinee: Expr,
-        body: Vec<Stmt>,
-        invariant: Option<Expr>,
-        decreases: Option<Expr>,
+        label: Option<Symbol>,
+        pattern: Pattern<'input>,
+        scrutinee: Expr<'input>,
+        body: Vec<Stmt<'input>>,
+        invariant: Option<Expr<'input>>,
+        decreases: Option<Expr<'input>>,
         span: Span,
     },
     For {
-        pattern: Pattern,
-        iterable: Expr,
-        body: Vec<Stmt>,
-        invariant: Option<Expr>,
-        decreases: Option<Expr>,
+        label: Option<Symbol>,
+        pattern: Pattern<'input>,
+        iterable: Expr<'input>,
+        body: Vec<Stmt<'input>>,
+        invariant: Option<Expr<'input>>,
+        decreases: Option<Expr<'input>>,
         span: Span,
     },
     Loop {
-        body: Vec<Stmt>,
+        label: Option<Symbol>,
+        body: Vec<Stmt<'input>>,
         span: Span,
     },
     Leave {
@@ -411,16 +603,16 @@ pub enum Stmt {
         span: Span,
     },
     Return {
-        value: Option<Expr>,
+        value: Option<Expr<'input>>,
         /// Path labels attached to this return: `return @label1 @label2 expr`.
         /// Used to match specific return paths to `ensures @label` clauses.
         labels: Vec<Symbol>,
         span: Span,
     },
     Assign {
-        target: Box<Expr>,
+        target: &'input Expr<'input>,
         op: Option<BinOp>,
-        value: Expr,
+        value: Expr<'input>,
         span: Span,
     },
     ComptimeBlock {
@@ -433,8 +625,8 @@ pub enum Stmt {
         /// Whether this block is annotated `@trusted`, granting access to
         /// `@trusted` functions and `unsafe` operations during comptime.
         trusted: bool,
-        attributes: Vec<Attribute>,
-        body: Vec<Stmt>,
+        attributes: Vec<Attribute<'input>>,
+        body: Vec<Stmt<'input>>,
         span: Span,
     },
     /// A `generate` block: declarative, auditable code generation
@@ -442,16 +634,16 @@ pub enum Stmt {
     /// to produce module-level declarations (impl, def, type, const).
     /// See SYNTAX.md §1029.
     Generate {
-        attributes: Vec<Attribute>,
-        for_type: Box<Type>,
-        body: Vec<Stmt>,
+        attributes: Vec<Attribute<'input>>,
+        for_type: &'input Type<'input>,
+        body: Vec<Stmt<'input>>,
         span: Span,
     },
     ScopeCleanup {
         name: Symbol,
         /// Optional compile-time guard: `scope_cleanup @name when condition { }`
-        when_condition: Option<Box<Expr>>,
-        body: Vec<Stmt>,
+        when_condition: Option<&'input Expr<'input>>,
+        body: Vec<Stmt<'input>>,
         propagates: bool,
         overrides: bool,
         span: Span,
@@ -461,35 +653,35 @@ pub enum Stmt {
         span: Span,
     },
     Unsafe {
-        body: Vec<Stmt>,
+        body: Vec<Stmt<'input>>,
         span: Span,
     },
     GhostVariableDef {
-        inner: Box<Stmt>,
+        inner: &'input Stmt<'input>,
         span: Span,
     },
     Isolate {
-        attributes: Vec<Attribute>,
-        body: Vec<Stmt>,
+        attributes: Vec<Attribute<'input>>,
+        body: Vec<Stmt<'input>>,
         span: Span,
     },
     ImplBlock {
         span: Span,
-        attributes: Vec<Attribute>,
+        attributes: Vec<Attribute<'input>>,
         /// The trait path (`Add<Int<32>>`), or `None` for inherent impls.
         /// Stored as a `Type` so that generic arguments on the trait are
         /// preserved in the AST (e.g. `impl Add<Int<32>> for Type`).
-        trait_path: Option<Box<Type>>,
-        for_type: Type,
-        methods: Vec<ImplMethod>,
-        associated_types: Vec<AssociatedType>,
-        where_clause: Option<WhereClause>,
-        type_params: Vec<TypeParam>,
+        trait_path: Option<&'input Type<'input>>,
+        for_type: Type<'input>,
+        methods: Vec<ImplMethod<'input>>,
+        associated_types: Vec<AssociatedType<'input>>,
+        where_clause: Option<WhereClause<'input>>,
+        type_params: Vec<TypeParam<'input>>,
     },
     /// A layout alias definition: `layout Name { packed, little_endian; }`
     LayoutDef {
         name: Symbol,
-        attributes: Vec<Attribute>,
+        attributes: Vec<Attribute<'input>>,
         span: Span,
     },
     Error(Span),
@@ -502,64 +694,68 @@ pub enum VariableKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Param {
+pub struct Param<'input> {
     pub name: Symbol,
-    pub ty: Option<Type>,
-    pub default: Option<Expr>,
+    pub ty: Option<Type<'input>>,
+    pub default: Option<Expr<'input>>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum TypeParamKind {
+pub enum TypeParamKind<'input> {
     Type,
     Lifetime,
     Const {
-        ty: Type,
-        default: Option<Box<Expr>>,
+        ty: Type<'input>,
+        default: Option<&'input Expr<'input>>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TypeParam {
+pub struct TypeParam<'input> {
     pub name: Symbol,
-    pub bounds: Vec<Type>,
-    pub kind: TypeParamKind,
+    pub bounds: Vec<Type<'input>>,
+    pub kind: TypeParamKind<'input>,
     pub span: Span,
 }
 
 /// An anonymous constant expression — used for const generic arguments,
-/// array sizes, etc. Analogous to rustc's `AnonConst`.
+/// array sizes, etc. Analogous to rustc's `AnonConst<'input>`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct AnonConst {
-    pub value: Box<Expr>,
+pub struct AnonConst<'input> {
+    pub value: &'input Expr<'input>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum TypeDefinition {
-    Struct(Vec<StructField>, Vec<TypeModifier>),
-    Enum(Vec<EnumVariant>, Option<String>, Vec<TypeModifier>),
+pub enum TypeDefinition<'input> {
+    Struct(Vec<StructField<'input>>, Vec<TypeModifier<'input>>),
+    Enum(
+        Vec<EnumVariant<'input>>,
+        Option<String>,
+        Vec<TypeModifier<'input>>,
+    ),
     TraitDef {
-        methods: Vec<TraitMethod>,
-        associated_types: Vec<AssociatedType>,
+        methods: Vec<TraitMethod<'input>>,
+        associated_types: Vec<AssociatedType<'input>>,
     },
     ImplBlock {
         trait_path: Option<Vec<Symbol>>,
-        for_type: Type,
-        methods: Vec<ImplMethod>,
+        for_type: Type<'input>,
+        methods: Vec<ImplMethod<'input>>,
     },
-    Constraint(Vec<Type>),
-    Alias(Type, Vec<TypeModifier>),
+    Constraint(Vec<Type<'input>>),
+    Alias(Type<'input>, Vec<TypeModifier<'input>>),
     /// Type alias with `impl Trait` (TAIT) — opaque type.
     /// The `Type` is the trait bound (e.g. `Iterator<Item = u32>`).
-    Opaque(Type, Vec<TypeModifier>),
+    Opaque(Type<'input>, Vec<TypeModifier<'input>>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum TypeModifier {
+pub enum TypeModifier<'input> {
     Overflow(OverflowPolicy),
-    Default(Expr),
-    Validate(Expr),
+    Default(Expr<'input>),
+    Validate(Expr<'input>),
     NoDefault,
 }
 
@@ -568,6 +764,9 @@ pub enum OverflowPolicy {
     Wrap,
     Saturate,
     Trap,
+    /// IEEE 754 semantics for floats (`with overflow = ieee` — explicit
+    /// opt-in; the default is `trap` per the committee ruling).
+    Ieee,
 }
 
 /// Byte order for `@endian` attribute.
@@ -585,9 +784,9 @@ pub enum BitOrder {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct WherePredicate {
-    pub ty: Type,
-    pub bounds: Vec<Type>,
+pub struct WherePredicate<'input> {
+    pub ty: Type<'input>,
+    pub bounds: Vec<Type<'input>>,
     pub span: Span,
 }
 
@@ -595,43 +794,51 @@ pub struct WherePredicate {
 /// The left side must name a generic parameter; the right side is the
 /// concrete type it is constrained to.
 #[derive(Debug, Clone, PartialEq)]
-pub struct WhereEquality {
-    pub left: Type,
-    pub right: Type,
+pub struct WhereEquality<'input> {
+    pub left: Type<'input>,
+    pub right: Type<'input>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct WhereClause {
-    pub predicates: Vec<WherePredicate>,
+pub struct WhereClause<'input> {
+    pub predicates: smallvec::SmallVec<[WherePredicate<'input>; 2]>,
     /// Equality constraints: `where T == Int<32>`.
     /// Params constrained here are exempt from the E104 generality check.
-    pub equalities: Vec<WhereEquality>,
+    pub equalities: Vec<WhereEquality<'input>>,
+    /// LIFETIME outlives constraints: `where 'a: 'b` (each entry is the
+    /// left lifetime followed by the lifetimes it must outlive — rustc's
+    /// `WherePredicateKind::RegionPredicate` `'a: 'b + 'c`).  Collected
+    /// into the region solver's constraint graph and verified at the
+    /// signature boundary (SYNTAX.md §Explicit Lifetime Parameters —
+    /// "verified by the borrow checker; mismatches cause compile
+    /// errors").
+    pub lifetime_outlives: Vec<(Symbol, Vec<Symbol>)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct StructField {
+pub struct StructField<'input> {
     pub name: Symbol,
-    pub ty: Type,
-    pub default: Option<Expr>,
+    pub ty: Type<'input>,
+    pub default: Option<Expr<'input>>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct EnumVariant {
+pub struct EnumVariant<'input> {
     pub name: Symbol,
-    pub payload: Option<Type>,
+    pub payload: Option<Type<'input>>,
     /// GADT constraints: `(T, Int<32>)` means `T == Int<32>`.
     /// Parsed from `when T == ConcreteType [and ...]`.
     /// Only type equality constraints are supported.
-    pub eq_spec: Vec<(Symbol, Type)>,
+    pub eq_spec: Vec<(Symbol, Type<'input>)>,
     /// Existentially quantified type variables: `exists X, Y`.
     /// These are scoped to the variant's fields and `when` clause.
     pub exists_params: Vec<Symbol>,
     pub span: Span,
 }
 
-impl EnumVariant {
+impl<'input> EnumVariant<'input> {
     /// Whether this variant is a GADT constructor — i.e. it carries either
     /// `when` type constraints (`eq_spec`) or existentially quantified
     /// type variables (`exists_params`).  An explicit predicate (mirroring
@@ -643,93 +850,108 @@ impl EnumVariant {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TraitMethod {
+pub struct TraitMethod<'input> {
     pub name: Symbol,
-    pub params: Vec<Param>,
-    pub return_type: Type,
+    pub params: Vec<Param<'input>>,
+    pub return_type: Type<'input>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct AssociatedType {
+pub struct AssociatedType<'input> {
     pub name: Symbol,
-    pub default: Option<Type>,
+    /// GAT lifetime parameters: `type Item<'a> [where ...] = ...;`
+    /// (SYNTAX.md §GAT Declaration — a GAT may be parameterized by
+    /// lifetimes; no new TYPE parameters are permitted).  Empty for a
+    /// plain associated type.
+    pub lifetime_params: Vec<Symbol>,
+    pub default: Option<Type<'input>>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ImplMethod {
+pub struct ImplMethod<'input> {
     pub name: Symbol,
-    pub attributes: Vec<Attribute>,
-    pub params: Vec<Param>,
-    pub return_type: Type,
-    pub body: Option<Vec<Stmt>>,
+    pub attributes: Vec<Attribute<'input>>,
+    pub params: Vec<Param<'input>>,
+    pub return_type: Type<'input>,
+    pub body: Option<Vec<Stmt<'input>>>,
     pub span: Span,
 }
 
 /// A single generic argument, either positional (`T`) or named (`size = T`).
 #[derive(Debug, Clone, PartialEq)]
-pub enum GenericArg {
-    Positional(Type),
-    Named(Symbol, Type),
-    Const(AnonConst),
+pub enum GenericArg<'input> {
+    Positional(Type<'input>),
+    Named(Symbol, Type<'input>),
+    Const(AnonConst<'input>),
 }
 
-impl GenericArg {
-    pub fn ty(&self) -> Cow<'_, Type> {
+impl<'input> GenericArg<'input> {
+    pub fn ty(&self) -> Cow<'_, Type<'input>> {
         match self {
             GenericArg::Positional(ty) | GenericArg::Named(_, ty) => Cow::Borrowed(ty),
-            GenericArg::Const(ac) => Cow::Owned(Type::Expr(ac.value.clone(), ac.span)),
+            GenericArg::Const(ac) => Cow::Owned(Type::Expr(ac.value, ac.span)),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Type {
-    Path(Vec<Symbol>, Span),
-    Generic(Box<Type>, Vec<GenericArg>, Span),
+pub enum Type<'input> {
+    Path(smallvec::SmallVec<[Symbol; 4]>, Span),
+    Generic(&'input Type<'input>, Vec<GenericArg<'input>>, Span),
     Reference {
-        inner: Box<Type>,
+        inner: &'input Type<'input>,
         mutable: bool,
         lifetime: Option<Symbol>,
         span: Span,
     },
-    Pointer(Box<Type>, Span),
-    Slice(Box<Type>, Span),
-    Array(Box<Type>, Box<Expr>, Span),
-    Tuple(Vec<Type>, Span),
+    Pointer(&'input Type<'input>, Span),
+    Slice(&'input Type<'input>, Span),
+    Array(&'input Type<'input>, &'input Expr<'input>, Span),
+    Tuple(Vec<Type<'input>>, Span),
     Function {
-        params: Vec<Type>,
-        ret: Box<Type>,
+        params: Vec<Type<'input>>,
+        ret: &'input Type<'input>,
         span: Span,
     },
     /// Qualified path projection: `<ImplType as TraitPath>::AssocName`
     Projection {
-        impl_type: Box<Type>,
-        trait_path: Box<Type>,
+        impl_type: &'input Type<'input>,
+        trait_path: &'input Type<'input>,
         assoc_name: Symbol,
         span: Span,
     },
-    DynTrait(Vec<Type>, Span),
+    DynTrait(Vec<Type<'input>>, Span),
+    /// Higher-ranked type: `for<'a> T` (SYNTAX.md §Higher-Ranked Trait
+    /// Bounds — "for<'a> introduces one or more lifetime parameters scoped
+    /// over the subsequent trait bound").  The lifetime is universally
+    /// quantified over `body`; the checker skolemizes it at the call site
+    /// (rustc's HRTB instantiation) and rejects if it escapes.
+    Forall {
+        lifetime: Symbol,
+        body: &'input Type<'input>,
+        span: Span,
+    },
     Exists {
         name: Symbol,
-        base: Box<Type>,
-        invariant: Box<Expr>,
+        base: &'input Type<'input>,
+        invariant: &'input Expr<'input>,
         span: Span,
     },
     /// Shorthand `type T = Base where value > 0` — the parser produces this instead of
     /// doing semantic name generation. A later desugaring pass rewrites it to `Exists`.
     WhereShorthand {
-        base: Box<Type>,
-        invariant: Box<Expr>,
+        base: &'input Type<'input>,
+        invariant: &'input Expr<'input>,
         span: Span,
     },
-    Literal(Box<Expr>, Span),
+    Literal(&'input Expr<'input>, Span),
     Never(Span),
-    Union(Vec<Type>, Span),
+    Union(Vec<Type<'input>>, Span),
     /// A constant expression where a type is expected, e.g. array sizes
     /// `[Int<32>; N + 1]` or generic const args `<Array<Int, N>>`.
-    Expr(Box<Expr>, Span),
+    Expr(&'input Expr<'input>, Span),
     /// A compile-time validated regular expression: `Regex<"pattern">`.
     Regex(String, Span),
     Error(Span),
@@ -737,72 +959,77 @@ pub enum Type {
 
 /// A polymorphic type scheme: `forall T1, T2, ... . body`
 #[derive(Debug, Clone, PartialEq)]
-pub struct TypeScheme {
+pub struct TypeScheme<'input> {
     pub quantifiers: Vec<(Span, Symbol)>,
-    pub body: Box<Type>,
+    pub body: &'input Type<'input>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Pattern {
+pub enum Pattern<'input> {
     Wildcard(Span),
     Ident(Symbol, Span),
-    Literal(Box<Expr>, Span),
-    Tuple(Vec<Pattern>, Span),
+    Literal(&'input Expr<'input>, Span),
+    Tuple(Vec<Pattern<'input>>, Span),
     Struct {
         path: Vec<Symbol>,
-        fields: Vec<(Symbol, Pattern)>,
+        fields: Vec<(Symbol, Pattern<'input>)>,
         rest: bool,
         span: Span,
     },
     Enum {
         path: Vec<Symbol>,
         variant: Symbol,
-        inner: Option<Box<Pattern>>,
+        inner: Option<&'input Pattern<'input>>,
         span: Span,
     },
-    Or(Vec<Pattern>, Span),
-    Slice(Vec<Pattern>, Option<Box<Pattern>>, Vec<Pattern>, Span),
+    Or(Vec<Pattern<'input>>, Span),
+    Slice(
+        Vec<Pattern<'input>>,
+        Option<&'input Pattern<'input>>,
+        Vec<Pattern<'input>>,
+        Span,
+    ),
     Error(Span),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Attribute {
+pub struct Attribute<'input> {
     pub name: Symbol,
-    pub args: Vec<Expr>,
-    pub named_args: Vec<(Symbol, Expr)>,
+    pub args: Vec<Expr<'input>>,
+    pub named_args: Vec<(Symbol, Expr<'input>)>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum EnsuresTarget {
+pub enum EnsuresTarget<'input> {
     Unconditional,
-    OnOk(Option<Pattern>),
-    OnErr(Option<Pattern>),
+    OnOk(Option<Pattern<'input>>),
+    OnErr(Option<Pattern<'input>>),
     OnTimeout,
     OnCancel,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Contract {
-    Requires(Expr, Span),
+pub enum Contract<'input> {
+    Requires(Expr<'input>, Span),
     Ensures {
-        expr: Expr,
+        expr: Expr<'input>,
         span: Span,
-        target: EnsuresTarget,
+        target: EnsuresTarget<'input>,
         /// Path labels referenced in this ensures clause: `ensures @label expr`.
         /// Each label acts as a placeholder for the value returned on paths
         /// marked with that label.
         labels: Vec<Symbol>,
     },
-    Invariant(Expr, Span),
-    Decreases(Expr, Span),
-    Terminates(Expr, Span),
+    Invariant(Expr<'input>, Span),
+    Decreases(Expr<'input>, Span),
+    Terminates(Expr<'input>, Span),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Program {
-    pub items: Vec<Stmt>,
+pub struct Program<'input> {
+    pub items: Vec<Stmt<'input>>,
     pub span: Span,
 }
 
@@ -812,7 +1039,7 @@ impl fmt::Display for Span {
     }
 }
 
-impl Type {
+impl<'input> Type<'input> {
     pub fn span(&self) -> Span {
         match self {
             Type::Path(_, span)
@@ -826,6 +1053,7 @@ impl Type {
             | Type::DynTrait(_, span)
             | Type::Exists { span, .. }
             | Type::WhereShorthand { span, .. }
+            | Type::Forall { span, .. }
             | Type::Literal(_, span)
             | Type::Never(span)
             | Type::Union(_, span)
@@ -837,7 +1065,7 @@ impl Type {
     }
 }
 
-impl Stmt {
+impl<'input> Stmt<'input> {
     pub fn span(&self) -> Span {
         match self {
             Stmt::VariableDef { span, .. } => *span,
@@ -873,7 +1101,7 @@ impl Stmt {
     }
 }
 
-impl Expr {
+impl<'input> Expr<'input> {
     pub fn span(&self) -> Span {
         match self {
             Expr::Literal(_, span) => *span,
@@ -913,5 +1141,36 @@ impl Expr {
             Expr::CompileError(_, span) => *span,
             Expr::Error(span) => *span,
         }
+    }
+}
+
+/// Display an AST type as a human-readable string (path/generic/literal
+/// recursion).  Single source of truth — previously duplicated verbatim in
+/// `checker::fn_ctxt::ast_type_display` and `resolver::ast_type_display`.
+pub(crate) fn ast_type_display(ty: &Type) -> String {
+    match ty {
+        Type::Path(p, _) => p.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
+        Type::Generic(base, args, _) => {
+            let args = args
+                .iter()
+                .map(|a| match a {
+                    GenericArg::Positional(t) => ast_type_display(t),
+                    GenericArg::Named(n, t) => {
+                        format!("{}: {}", n, ast_type_display(t))
+                    }
+                    GenericArg::Const(ac) => match ac.value {
+                        Expr::Literal(l, _) => format!("{:?}", l),
+                        e => format!("{:?}", e),
+                    },
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}<{}>", ast_type_display(base), args)
+        }
+        Type::Literal(e, _) => match e {
+            Expr::Literal(l, _) => format!("{:?}", l),
+            _ => format!("{:?}", e),
+        },
+        _ => format!("{:?}", ty),
     }
 }

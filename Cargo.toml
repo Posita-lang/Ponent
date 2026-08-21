@@ -7,20 +7,46 @@ license = "MIT OR Apache-2.0"
 [features]
 default = []
 omniml_pool = []
+# Gates the ~17-min LIA ∃∀ BII integration test
+# (`test_bitwise_bii_support3_converges`): run it explicitly with
+# `--features slow-tests`. NOT part of the default/release test run.
+slow-tests = []
 
 [package.metadata.cargo-machete]
 ignored = ["z3"]
 
 [dependencies]
 textwrap = "0.16"
+smallvec = "1.13"
 bitflags = "2.13.0"
 clap = { version = "4.6.1", features = ["derive"] }
 indexmap = "2.14.0"
 logos = "0.16.1"
-mimalloc = "0.1.52"
-rayon = "1.10.0"
+bumpalo = "3"
+rustc-hash = "2"
 regex-syntax = "0.8"
-rustc-hash = "2.1.2"
+mimalloc = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rayon = "1.10"
 z3 = { version = "0.20.2", features = ["vendored"] }
+stacker = "0.1.25"
+num-bigint = "0.4"
+num-traits = "0.2"
+sexp = "1.1.4"
+
+# The AUTHORITATIVE Polonius R1-R8 engine (rustc's own), used as a
+# differential oracle in tests: our `evaluate_rules` must agree with it
+# on accept/reject.  Pulled from crates.io (no hard-coded local path).
+[dev-dependencies]
+polonius-engine = "0.13"
+
+# The runtime support for the flowlog-build-generated `DatalogBatchEngine`
+# (differential dataflow primitives) — library mode, crates.io.
+flowlog-runtime = "0.3"
+
+# The FlowLog library-mode compiler (build.rs) — compiles the vendored
+# `polonius_int.dl` rule set into a Rust module for the differential
+# benchmark (crates.io, no hard-coded paths).
+[build-dependencies]
+flowlog-build = "0.4"

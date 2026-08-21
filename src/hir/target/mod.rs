@@ -206,13 +206,13 @@ impl Target {
     }
 
     /// Integer ABI size in bytes for a given bit width.
-    pub fn int_abi_size(&self, bits: u8) -> u64 {
+    pub fn int_abi_size(&self, bits: u32) -> u64 {
         if bits == 0 {
             return 0;
         }
         self.spec
             .int_sizes
-            .get(&bits)
+            .get(&(bits as u8))
             .copied()
             .map(|s| s as u64)
             .unwrap_or_else(|| {
@@ -227,13 +227,13 @@ impl Target {
     /// - `Int<0>` → alignment 1
     /// - Non-power-of-2 sizes → rounded up to the next power of 2
     /// - Architecture-specific overrides (e.g. x86 Linux: Int<64> → 4)
-    pub fn int_abi_align(&self, bits: u8) -> u64 {
+    pub fn int_abi_align(&self, bits: u32) -> u64 {
         if bits == 0 {
             return 1;
         }
         // Look up in data_layout integer alignments first.
         for &(b, _size, align) in &self.data_layout.integer_align {
-            if b == bits {
+            if b == bits as u8 {
                 // DataLayout stores alignment in bits; convert to bytes.
                 return align / 8;
             }
@@ -261,19 +261,19 @@ impl Target {
     }
 
     /// Float ABI size in bytes for a given bit width.
-    pub fn float_abi_size(&self, bits: u8) -> u64 {
+    pub fn float_abi_size(&self, bits: u32) -> u64 {
         self.spec
             .float_sizes
-            .get(&bits)
+            .get(&(bits as u8))
             .copied()
             .map(|s| s as u64)
             .unwrap_or_else(|| bits as u64 / 8)
     }
 
     /// Float ABI alignment in bytes for a given bit width.
-    pub fn float_abi_align(&self, bits: u8) -> u64 {
+    pub fn float_abi_align(&self, bits: u32) -> u64 {
         for &(b, _size, align) in &self.data_layout.float_align {
-            if b == bits {
+            if b == bits as u8 {
                 // align in data_layout is in bits; convert to bytes.
                 return align / 8;
             }

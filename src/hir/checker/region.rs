@@ -1,4 +1,5 @@
-use super::*;
+use super::CtxFrame;
+use crate::hir::types::TypeId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegionId(pub usize);

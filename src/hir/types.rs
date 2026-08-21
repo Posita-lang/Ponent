@@ -13,9 +13,11 @@ use std::fmt;
 
 /// Global atomic counter for DefId allocation.
 /// Used by `SymbolTable::allocate_def_id()` to ensure globally unique DefId
-/// values across all SymbolTable instances.  Without this, each SymbolTable
+/// values across all SymbolTable<'input> instances.  Without this, each SymbolTable<'input>
 /// starts its own counter from 0, causing DefId collisions between different
 /// traits/types in different symbol tables (e.g., test isolation breaks).
+/// The counter starts at 1 because `DefId(0)` is reserved as the sentinel
+/// for the local crate (see `alloc_def_id`) — values begin after it.
 static NEXT_DEF_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Allocate a globally unique DefId.
@@ -232,16 +234,16 @@ pub struct CrateId(pub DefId);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeData {
     Int {
-        bits: u8,
+        bits: u32,
         signed: bool,
         overflow_policy: OverflowPolicy,
     },
     UInt {
-        bits: u8,
+        bits: u32,
         overflow_policy: OverflowPolicy,
     },
     Float {
-        bits: u8,
+        bits: u32,
     },
     Bool,
     Char,
@@ -259,6 +261,9 @@ pub enum TypeData {
         def_id: DefId,
         args: Vec<TypeId>,
     },
+    /// (Mac Lane §III.4): the product a × b is the universal
+    /// object with projections p: a×b → a, q: a×b → b, satisfying
+    /// C(c, a×b) ≅ C(c, a) × C(c, b).  Dual to Coproduct (§III.3).    
     Tuple {
         elems: Vec<TypeId>,
     },
@@ -272,6 +277,12 @@ pub enum TypeData {
     Ref {
         ty: TypeId,
         mutable: bool,
+        /// The explicit lifetime annotation (`&'a mut T` — `Some('a)`),
+        /// or `None` for an elided/inferred lifetime.  Previously
+        /// dropped in the AST→HIR lowering (`Type::Reference { .. }`
+        /// swallowed it); kept now so the borrow checker can map the
+        /// annotation to the UniversalRegions early-bound region.
+        lifetime: Option<Symbol>,
     },
     Pointer {
         ty: TypeId,
@@ -312,21 +323,39 @@ pub enum TypeData {
     },
     InferVar {
         id: usize,
+        /// The per-variable universe (rustc's `CanonicalVarKind::Ty { ui }`):
+        /// 0 for ordinary variables; higher for HRTB/forall-introduced
+        /// variables — the unify check forbids binding a LOWER-universe
+        /// variable to a higher-universe type (escape).
+        universe: usize,
     },
     /// A named coproduct (sum type), Σᵢ Aᵢ.
     /// Introduced by Yoneda reduction of ∀X.(A₁⇒X)⇒...⇒(Aₙ⇒X)⇒X → Σᵢ Aᵢ.
     /// Unlike Tuple (product), Coproduct represents "one of the alternatives."
+    ///
+    /// (Mac Lane §III.3): the coproduct a ⊔ b is the universal
+    /// object receiving injections i: a → a⊔b, j: b → a⊔b, satisfying
+    /// C(a⊔b, c) ≅ C(a, c) × C(b, c).  The Yoneda-reduced form
+    /// ∀X.(A₁⇒X)⇒⋯⇒(Aₙ⇒X)⇒X is exactly this universal property internalized
+    /// as a polymorphic type.
     Coproduct {
         alternatives: Vec<TypeId>,
     },
     /// Least fixed-point type: μX.A⟨X⟩.
     /// X is the recursive type variable, identified by param_index in body.
+    ///
+    /// (Mac Lane §VI.2): μX.F(X) is the initial algebra of
+    /// the endofunctor F — the least fixed point in the category of F-algebras.
+    /// Produced by Yoneda reduction (≡_X) when the branch product depends on X.
     Mu {
         param_index: usize,
         param_name: Symbol,
         body: TypeId,
     },
     /// Greatest fixed-point type: νX.A⟨X⟩.
+    ///
+    /// (Mac Lane §VI.2, dual): νX.F(X) is the final coalgebra
+    /// of F — the greatest fixed point.  Produced by co-Yoneda reduction (≡^X).
     Nu {
         param_index: usize,
         param_name: Symbol,
@@ -475,7 +504,7 @@ impl fmt::Display for TypeData {
             }
             TypeData::Array { elem, size } => write!(f, "[{}; {}]", elem.tag(), size),
             TypeData::Slice { elem } => write!(f, "&[{}]", elem.tag()),
-            TypeData::Ref { ty, mutable } => {
+            TypeData::Ref { ty, mutable, .. } => {
                 if *mutable {
                     write!(f, "&mut {}", ty.tag())
                 } else {
@@ -500,7 +529,7 @@ impl fmt::Display for TypeData {
             TypeData::Exists { name, .. } => write!(f, "exists {}", name),
             TypeData::Forall { .. } => write!(f, "forall ..."),
             TypeData::Poly { .. } => write!(f, "poly"),
-            TypeData::InferVar { id } => write!(f, "infer#{}", id),
+            TypeData::InferVar { id, .. } => write!(f, "infer#{}", id),
             TypeData::GenericParam { index, .. } => write!(f, "T{}", index),
             TypeData::SkolemVar { .. } => write!(f, "skolem"),
             TypeData::Never => write!(f, "!"),
@@ -519,17 +548,17 @@ impl TypeData {
     /// Render the type to a human-readable string, resolving nested `TypeId`
     /// values through `ctx` so that e.g. `&Str` is printed as `&Str` rather
     /// than `&struct/enum`.  This is the preferred formatting method when a
-    /// `TypeContext` is available.
+    /// `TypeContext<'input>` is available.
     ///
     /// When `symbols` is `Some`, ADT types (structs, enums) are rendered with
     /// their actual name (e.g. `MyStruct`) instead of a generic `struct`/`enum`.
-    pub fn display_with(
+    pub fn display_with<'input>(
         &self,
-        ctx: &TypeContext,
+        ctx: &TypeContext<'input>,
         symbols: Option<&crate::hir::symbol::SymbolTable>,
     ) -> String {
         match self {
-            TypeData::Ref { ty, mutable } => {
+            TypeData::Ref { ty, mutable, .. } => {
                 let inner = ctx.get(*ty).display_with(ctx, symbols);
                 if *mutable {
                     format!("&mut {}", inner)
@@ -607,9 +636,9 @@ impl TypeData {
                 frac_bits,
                 ..
             } => format!("Rational<{}, {}>", int_bits, frac_bits),
-            TypeData::InferVar { id } => format!("infer#{}", id),
+            TypeData::InferVar { id, .. } => format!("infer#{}", id),
             // For all other types, use the Display trait (which shows TypeTag
-            // for leaf types and doesn't need TypeContext).
+            // for leaf types and doesn't need TypeContext<'input>).
             other => format!("{}", other),
         }
     }
@@ -630,9 +659,9 @@ impl DefId {
 }
 
 #[derive(Debug, Clone)]
-pub struct TypeMeta {
-    pub default_value: Option<crate::ast::Expr>,
-    pub invariant: Option<crate::ast::Expr>,
+pub struct TypeMeta<'input> {
+    pub default_value: Option<crate::ast::Expr<'input>>,
+    pub invariant: Option<crate::ast::Expr<'input>>,
     pub no_default: bool,
 }
 
@@ -680,19 +709,19 @@ struct VarianceEdge {
 
 /// A type factory that can create new types with shared (immutable) access.
 /// The type arena is wrapped in `RefCell` so that types can be created
-/// without `&mut` access to the `TypeContext`.
+/// without `&mut` access to the `TypeContext<'input>`.
 #[derive(Debug)]
 pub struct TypeFactory {
     types: RefCell<Vec<Arc<TypeData>>>,
     type_map: RefCell<HashMap<TypeData, TypeId>>,
-    /// Index up to which types have been synced by TypeContext.
+    /// Index up to which types have been synced by TypeContext<'input>.
     /// `drain_new_types()` returns all types from this index onward
     /// and advances it.  This avoids the O(n) while loop in
     /// `TypeContext::alloc` that previously scanned the entire arena.
     sync_index: Cell<usize>,
 }
 
-impl TypeFactory {
+impl<'input> TypeFactory {
     pub fn new() -> Self {
         TypeFactory {
             types: RefCell::new(Vec::new()),
@@ -740,7 +769,7 @@ impl TypeFactory {
     /// Drain newly created types since the last call to this method.
     /// Returns `Arc` clones for all types from the current sync index
     /// to the end of the arena, then advances the sync index.
-    /// Used by `TypeContext` to keep its `self.types` cache in sync
+    /// Used by `TypeContext<'input>` to keep its `self.types` cache in sync
     /// without scanning the entire arena on every allocation.
     pub fn drain_new_types(&self) -> Vec<Arc<TypeData>> {
         let types = self.types.borrow();
@@ -761,7 +790,7 @@ impl TypeFactory {
         self.types.borrow()
     }
 
-    pub fn int(&self, bits: u8, signed: bool) -> TypeId {
+    pub fn int(&self, bits: u32, signed: bool) -> TypeId {
         self.alloc(TypeData::Int {
             bits,
             signed,
@@ -770,7 +799,7 @@ impl TypeFactory {
         .0
     }
 
-    pub fn uint(&self, bits: u8) -> TypeId {
+    pub fn uint(&self, bits: u32) -> TypeId {
         self.alloc(TypeData::UInt {
             bits,
             overflow_policy: OverflowPolicy::Trap,
@@ -778,7 +807,7 @@ impl TypeFactory {
         .0
     }
 
-    pub fn float(&self, bits: u8) -> TypeId {
+    pub fn float(&self, bits: u32) -> TypeId {
         self.alloc(TypeData::Float { bits }).0
     }
 
@@ -795,7 +824,28 @@ impl TypeFactory {
     }
 
     pub fn reference(&self, ty: TypeId, mutable: bool) -> TypeId {
-        self.alloc(TypeData::Ref { ty, mutable }).0
+        self.reference_with_lifetime(ty, mutable, None)
+    }
+
+    /// `&'a T` / `&'a mut T` with an EXPLICIT lifetime annotation (the
+    /// region name — `'a` → interned `Symbol`), or `None` for an
+    /// elided/inferred region.  The explicit annotation survives into the
+    /// type so the region solver can map it to the function's early-bound
+    /// UniversalRegion and verify `'a: 'b` outlives constraints
+    /// (SYNTAX.md §Explicit Lifetime Parameters: "verified by the borrow
+    /// checker; mismatches cause compile errors").
+    pub fn reference_with_lifetime(
+        &self,
+        ty: TypeId,
+        mutable: bool,
+        lifetime: Option<Symbol>,
+    ) -> TypeId {
+        self.alloc(TypeData::Ref {
+            ty,
+            mutable,
+            lifetime,
+        })
+        .0
     }
 
     pub fn pointer(&self, ty: TypeId) -> TypeId {
@@ -817,6 +867,119 @@ impl TypeFactory {
         );
         self.alloc(TypeData::Regex { pattern }).0
     }
+}
+
+/// Visit every TypeId child of a resolved type by calling `f` on each one.
+/// This is the SINGLE source of truth for which TypeData variants contain
+/// TypeId children.  When a new TypeData variant with TypeId fields is added,
+/// update this function — all downstream walkers (ty_has_unresolved_vars,
+/// collect_from_ty, type_is_volatile, etc.) automatically benefit.
+/// See rustc's `TypeSuperFoldable` for the analogous pattern.
+///
+/// Lives at the `types` layer (not the traits solver) because it is a
+/// pure TypeData structural walker — the traits solver, inference, and
+/// the checker all consume it.  (Previously hosted in
+/// `traits::solver::search_graph`, which forced `types` → `traits`
+/// dependencies for consumers of `ty_contains_foreign_universe`.)
+pub fn visit_type_children<'input, F: FnMut(TypeId)>(
+    ty: TypeId,
+    ctx: &TypeContext<'input>,
+    f: &mut F,
+) {
+    let resolved = ctx.resolve_binding(ty);
+    match ctx.get(resolved) {
+        TypeData::Adt { args, .. } => {
+            for a in args {
+                f(*a);
+            }
+        }
+        TypeData::Tuple { elems } => {
+            for e in elems {
+                f(*e);
+            }
+        }
+        TypeData::Ref { ty, .. } => f(*ty),
+        TypeData::Fn { params, ret, .. } => {
+            for p in params {
+                f(*p);
+            }
+            f(*ret);
+        }
+        TypeData::Array { elem, .. } => f(*elem),
+        TypeData::Slice { elem } => f(*elem),
+        TypeData::Pointer { ty } => f(*ty),
+        TypeData::Ptr { size, pointee } => {
+            f(*size);
+            f(*pointee);
+        }
+        TypeData::AssociatedType { self_ty, .. } => f(*self_ty),
+        TypeData::Opaque {
+            hidden: Some(h), ..
+        } => f(*h),
+        TypeData::Coproduct { alternatives } => {
+            for a in alternatives {
+                f(*a);
+            }
+        }
+        TypeData::Forall { body, .. } | TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => {
+            f(*body)
+        }
+        TypeData::Exists { base, .. } => f(*base),
+        TypeData::Poly { body, .. } => f(*body),
+        // Leaf types have no TypeId children.
+        _ => {}
+    }
+}
+
+/// The universe-escape check: binding a variable to
+/// a type that CONTAINS an InferVar from a DIFFERENT universe (directly or
+/// nested inside a composite type) lets a forall-introduced variable
+/// escape.  Recurses through composite types via the shared walker.
+///
+/// Lives at the `types` layer (not inference) because the checker-global
+/// unify path (`types::TypeContext`) uses it; moving it here removes the
+/// `types` → `infer` dependency inversion.
+pub(crate) fn ty_contains_foreign_universe<'input>(
+    ctx: &TypeContext<'input>,
+    ty: TypeId,
+    uni: usize,
+) -> bool {
+    match ctx.get(ctx.resolve_binding(ty)) {
+        TypeData::InferVar { universe, .. } => *universe > uni,
+        _ => {
+            let mut found = false;
+            visit_type_children(ty, ctx, &mut |c| {
+                if ty_contains_foreign_universe(ctx, c, uni) {
+                    found = true;
+                }
+            });
+            found
+        }
+    }
+}
+
+/// The signature facts (the polonius_int.dl placeholder inputs).
+///
+/// Lives at the `types` layer (not the borrow checker) because it is a
+/// pure data contract shared by `cfg_graph` (the CFG collector) and
+/// `polonius` (the rules engine) — hosting it in either would force a
+/// module-level cycle between them.
+#[derive(Default)]
+pub struct SignatureFacts {
+    /// `universal_region(origin)`: the input borrow origins are
+    /// placeholders (the placeholder machinery is adopted — rejection
+    /// of undeclared placeholder subsets via R9).
+    pub universal_region: Vec<u32>,
+    /// `known_placeholder_subset(input, output)`: the DECLARED A(ρ)
+    /// constraint — the output borrow alive ⟹ the input borrow considered
+    /// alive (the call-site instantiation turns this into per-point
+    /// `subset_base` facts).
+    pub known_placeholder_subset: Vec<(u32, u32)>,
+    /// The MUTABILITY of each input borrow (in input order) — the
+    /// call-site cross-function loans use it to issue `Exclusive` only for mutable
+    /// inputs (`&mut`); read-only inputs (`&T`/`&ro`) get `ReadOnly`
+    /// (previously every return-borrow was `Exclusive`).
+    pub input_borrow_mutable: Vec<bool>,
 }
 
 fn is_type_volatile_inner(data: &TypeData, types: Option<&Vec<Arc<TypeData>>>) -> bool {
@@ -962,7 +1125,7 @@ pub(crate) enum CoercionContext {
 /// confined to function call sites (SYNTAX.md), never structural positions.
 ///
 /// The guard holds a raw pointer to the context CELL (not the whole
-/// `TypeContext`).  WHY a raw pointer rather than a shared `&Cell`
+/// `TypeContext<'input>`).  WHY a raw pointer rather than a shared `&Cell`
 /// reference: a held `&Cell<CoercionContext>` borrow of
 /// `self.checker.ctx.current_coercion_ctx` would live across the fallible
 /// argument-checking loop and conflict with the enclosing `&mut self`
@@ -970,16 +1133,16 @@ pub(crate) enum CoercionContext {
 /// the borrow checker cannot split it while the guard is alive).  The raw
 /// address is borrow-free: `?` early-returns cannot skip the restore, and
 /// the enclosing `&mut self` calls do not conflict.  (SAFETY: the `Cell`
-/// belongs to the `TypeContext`, which outlives this method-local guard;
+/// belongs to the `TypeContext<'input>`, which outlives this method-local guard;
 /// the interior mutability makes the write well-defined under
-/// `&TypeContext`.)
+/// `&TypeContext<'input>`.)
 pub(crate) struct CallSiteCoercion {
     ctx: *const std::cell::Cell<CoercionContext>,
     prev: CoercionContext,
 }
 
 impl CallSiteCoercion {
-    pub fn enter(ctx: &TypeContext) -> Self {
+    pub fn enter<'input>(ctx: &TypeContext<'input>) -> Self {
         let prev = ctx.current_coercion_ctx.replace(CoercionContext::CallSite);
         CallSiteCoercion {
             ctx: &ctx.current_coercion_ctx as *const std::cell::Cell<CoercionContext>,
@@ -990,10 +1153,10 @@ impl CallSiteCoercion {
 
 impl Drop for CallSiteCoercion {
     fn drop(&mut self) {
-        // SAFETY: the cell belongs to the `TypeContext` that outlives this
+        // SAFETY: the cell belongs to the `TypeContext<'input>` that outlives this
         // method-local guard; the pointer was taken from a shared borrow of
         // the field inside `enter`, and the cell's interior mutability makes
-        // the write well-defined under `&TypeContext`.
+        // the write well-defined under `&TypeContext<'input>`.
         unsafe { &*self.ctx }.set(self.prev);
     }
 }
@@ -1014,7 +1177,7 @@ pub(crate) struct StructuralCoercion {
 }
 
 impl StructuralCoercion {
-    pub fn enter(ctx: &TypeContext) -> Self {
+    pub fn enter<'input>(ctx: &TypeContext<'input>) -> Self {
         let prev = ctx
             .current_coercion_ctx
             .replace(CoercionContext::Structural);
@@ -1028,16 +1191,80 @@ impl StructuralCoercion {
 impl Drop for StructuralCoercion {
     fn drop(&mut self) {
         // SAFETY: same as `CallSiteCoercion` — the cell belongs to the
-        // `TypeContext` that outlives this method-local guard.
+        // `TypeContext<'input>` that outlives this method-local guard.
         unsafe { &*self.ctx }.set(self.prev);
     }
 }
 
-pub struct TypeContext {
+/// A place (variable / field / index / deref chain) whose storage can be
+/// borrowed.  Statement-level loan tracking: the freeze scope of a borrow
+/// is the enclosing lexical block, and the frozen entity is the exact
+/// place, not merely the root variable.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub(crate) enum FrozenPlace {
+    Root(Symbol),
+    Field(Box<FrozenPlace>, Symbol),
+    /// Dynamic index (`a[i]`): the index VALUE is not statically known, so
+    /// every element is treated as potentially touched — two dynamic
+    /// indexes on the same base are indistinguishable (conservative).
+    Index(Box<FrozenPlace>),
+    /// Constant index (`a[0]`, `a[3]`): the offset is statically known, so
+    /// `a[0]` and `a[1]` are distinct places — freezing `a[0]` does NOT
+    /// freeze `a[1]` (mirrors rustc's `ProjectionElem::ConstantIndex`).
+    ConstIndex(Box<FrozenPlace>, u64),
+    Deref(Box<FrozenPlace>),
+}
+
+/// The kind of a borrow, which determines how strictly the source place is
+/// frozen (SYNTAX.md §References / §Reference Coercion).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LoanKind {
+    /// `&ro expr` / `expr.freeze!()` — read-only borrow: the source place is
+    /// frozen against MUTATION for the borrow's lifetime.
+    ReadOnly,
+    /// `&mut expr` — exclusive borrow: the source place is frozen — neither
+    /// readable nor writable — for the borrow's lifetime.  The read side is
+    /// enforced by the flow-sensitive borrow-check post-pass (E109).
+    Exclusive,
+}
+
+impl LoanKind {
+    /// The borrow-syntax family name (the borrow diagnostics use it to
+    /// name the mechanism; the key is `Hash`-able for the error dedup).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LoanKind::ReadOnly => "ReadOnly",
+            LoanKind::Exclusive => "Exclusive",
+        }
+    }
+}
+
+/// The registered definition of an ADT (struct/enum), used by
+/// `type_is_copy` to decide the §Copy derivation (all fields recursively
+/// Copy + no Drop impl).
+#[derive(Debug, Clone)]
+pub(crate) struct AdtDef {
+    pub fields: Vec<TypeId>,
+    pub has_drop: bool,
+}
+
+pub struct TypeContext<'input> {
+    /// The parser's arena — set in the compiler driver (main.rs) so the
+    /// checker can allocate NEW AST nodes (e.g. the `type T = Base where
+    /// value > 0` desugar builds `invariant _where_N > 0`).  `None` in
+    /// unit tests / target-layout tests that don't desugar.
+    pub arena: Option<&'input bumpalo::Bump>,
+    /// The regex-pattern validation cache (pattern → valid) — repeated
+    /// `Regex<"pattern">` constructions skip the re-parse.
+    regex_cache: HashMap<String, bool>,
     types: Vec<Arc<TypeData>>,
     pub(crate) bindings: RefCell<HashMap<TypeId, TypeId>>,
-    meta: HashMap<TypeId, TypeMeta>,
+    meta: HashMap<TypeId, TypeMeta<'input>>,
     def_id_to_type_id: HashMap<DefId, TypeId>,
+    /// The registered ADT definitions (def_id → fields + Drop) — used by
+    /// `type_is_copy` to decide the §Copy derivation (all fields
+    /// recursively Copy + no Drop impl).
+    adt_defs: RefCell<HashMap<DefId, AdtDef>>,
     pub builtin_unit: TypeId,
     pub builtin_never: TypeId,
     pub builtin_error: TypeId,
@@ -1049,7 +1276,7 @@ pub struct TypeContext {
     pub builtin_str: TypeId,
     /// Built-in reference to string slice `&Str` — a `Ref { ty: Str, mutable: false }`.
     pub builtin_str_ref: TypeId,
-    /// Return type of `layout_of!(Type)` — a dedicated struct-like type
+    /// `Type` — a dedicated struct-like type
     /// for comptime layout descriptors, replacing the old `ctx.error()` fallback.
     pub builtin_layout_descriptor: TypeId,
     /// Cache for variance check results: (param_index, TypeId, expected_sign, cumulative_sign) → bool.
@@ -1057,12 +1284,20 @@ pub struct TypeContext {
     /// Pre-computed variance-annotated outgoing edges for each TypeId.
     /// Built lazily on first variance check, then reused.
     variance_edges: RefCell<HashMap<TypeId, Vec<VarianceEdge>>>,
-    /// Storage for opaque type (TAIT) hidden types.
+    /// Region-subtype collection switch + collected outlives pairs.
+    /// When the checker enables region collection (per function
+    /// signature), `subtype`'s Ref arm records `(l1, l2)` for
+    /// `&'a T <: &'b T` (rustc's `make_subregion(b, a)` — the covariance
+    /// constraint `'a: 'b`) instead of rejecting; the solver consumes the
+    /// collected pairs.  When disabled (pure-relation calls, tests), the
+    /// old strict rejection stands.
+    pub(crate) region_subtype_collect: Cell<bool>,
+    pub(crate) region_subtype_outlives: RefCell<Vec<(Symbol, Symbol)>>,
     /// When an opaque type's concrete type is inferred inside the defining
     /// scope, the hidden type is stored here. `resolve_opaque` checks this
     /// map before falling back to the `TypeData::Opaque.hidden` field.
     /// Uses `RefCell` because the defining scope may set hidden types
-    /// during type checking after TypeContext creation.
+    /// during type checking after TypeContext<'input> creation.
     opaque_hidden: RefCell<HashMap<TypeId, TypeId>>,
     /// Transaction stack for atomic unification (OmniML-style rollback via undo log).
     /// Each entry is a list of (key, old_value) pairs recording every binding
@@ -1096,11 +1331,6 @@ pub struct TypeContext {
     /// ALL builds — the binding is skipped, so the global table is never
     /// polluted; the counter keeps the violation observable.
     pub(crate) seal_violations: std::cell::Cell<usize>,
-    /// Variables currently frozen by an active `&ro` borrow (SYNTAX.md
-    /// §Reference Coercion: the source `&mut T` is frozen for the borrow's
-    /// lifetime).  `UnaryOp::Ro` registers the operand's name; any later
-    /// mutation of a frozen variable is rejected by the checker.
-    pub(crate) frozen_vars: RefCell<Vec<Symbol>>,
     /// Whether the function currently being checked has `@auto_ro`
     /// (SYNTAX.md §Local Relaxation): allows `&mut T` to be implicitly
     /// coerced to `&T` within the function body.  Set/restored around
@@ -1129,6 +1359,13 @@ pub struct TypeContext {
     next_gadt_skolem_id: Cell<usize>,
     /// Counter for generating fresh parameter indices (used by Exists/Forall).
     next_param_index: Cell<usize>,
+    /// Local counter for the overlap/specialization freshening variables
+    /// (replaces the former process-global `OVERLAP_FRESH_VAR_ID`).
+    /// Per-`TypeContext`, so long-running processes never accumulate a
+    /// single unbounded global and tests are isolated (each context starts
+    /// at the same base and allocates upward).  The base offset keeps the
+    /// fresh vars out of the ID space used by the main inference context.
+    next_overlap_fresh_id: Cell<usize>,
     /// Language edition for this compilation unit.
     edition: Edition,
     /// Target platform information (arch, ABI, sizes, alignments).
@@ -1153,7 +1390,7 @@ pub struct TypeContext {
     /// All GADT-related state (fact registry + depth counter + existential
     /// scope stack + pending inner equalities) aggregated into one
     /// structure; see `GadtContext`.
-    pub(crate) gadt: GadtContext,
+    pub(crate) gadt: GadtContext<'input>,
 }
 
 /// A fact established by a GADT `when` clause, scoped to one match arm.
@@ -1207,10 +1444,10 @@ pub(crate) struct ExistScopeFrame {
 /// registry has an active arm to write into — nested GADT refinement
 /// (SYNTAX.md §"Nested GADT Refinement").
 #[derive(Debug, Clone)]
-pub(crate) struct PendingInnerGadtEq {
+pub(crate) struct PendingInnerGadtEq<'input> {
     pub(crate) param_name: Symbol,
-    pub(crate) concrete_ty: crate::ast::Type,
-    pub(crate) binding: crate::hir::symbol::TypeBinding,
+    pub(crate) concrete_ty: crate::ast::Type<'input>,
+    pub(crate) binding: crate::hir::symbol::TypeBinding<'input>,
     pub(crate) args: Vec<TypeId>,
     pub(crate) exist_params: Vec<Symbol>,
     pub(crate) skolems: Vec<TypeId>,
@@ -1235,7 +1472,7 @@ pub(crate) struct PendingInnerGadtEq {
 ///     exists variable (`MkPair(exists A: (A, A))` — the same skolem
 ///     appearing twice unifies to equivalence).  Explicit cross-variant
 ///     exists equivalence is reserved for future use cases.
-pub(crate) struct GadtContext {
+pub(crate) struct GadtContext<'input> {
     /// The GADT fact registry: a stack of per-arm fact lists.
     pub(crate) facts: RefCell<Vec<Vec<GadtFact>>>,
     /// Depth counter for `facts`, kept in sync with its length.
@@ -1243,10 +1480,10 @@ pub(crate) struct GadtContext {
     /// Per-variant existential skolem scope stack (occurrence identity).
     pub(crate) exist_skolems: RefCell<Vec<ExistScopeFrame>>,
     /// Inner GADT `when` equalities collected before `push_gadt_arm`.
-    pub(crate) pending_eqs: Vec<PendingInnerGadtEq>,
+    pub(crate) pending_eqs: Vec<PendingInnerGadtEq<'input>>,
 }
 
-impl GadtContext {
+impl<'input> GadtContext<'input> {
     pub(crate) fn new() -> Self {
         GadtContext {
             facts: RefCell::new(Vec::new()),
@@ -1285,17 +1522,37 @@ impl GadtContext {
 
     /// Push an existential scope frame (occurrence identity).
     /// Collect one inner `when` equality for later registration.
-    pub(crate) fn push_pending_eq(&mut self, eq: PendingInnerGadtEq) {
+    pub(crate) fn push_pending_eq(&mut self, eq: PendingInnerGadtEq<'input>) {
         self.pending_eqs.push(eq);
     }
 
     /// Take the collected inner `when` equalities (clearing the queue).
-    pub(crate) fn take_pending_eqs(&mut self) -> Vec<PendingInnerGadtEq> {
+    pub(crate) fn take_pending_eqs(&mut self) -> Vec<PendingInnerGadtEq<'input>> {
         std::mem::take(&mut self.pending_eqs)
     }
 }
 
-impl TypeContext {
+impl<'input> TypeContext<'input> {
+    /// Register an ADT definition (struct/enum) — used by `type_is_copy`
+    /// to decide the §Copy derivation.
+    pub(crate) fn register_adt(&self, def_id: DefId, def: AdtDef) {
+        self.adt_defs.borrow_mut().insert(def_id, def);
+    }
+
+    /// Look up a registered ADT definition.
+    pub(crate) fn adt_def(&self, def_id: DefId) -> Option<AdtDef> {
+        self.adt_defs.borrow().get(&def_id).cloned()
+    }
+
+    /// Mark an ADT as implementing `Drop` (an `impl Drop for T` exists) —
+    /// the §Copy derivation must exclude it.
+    pub(crate) fn set_adt_has_drop(&self, def_id: DefId) {
+        if let Some(mut def) = self.adt_def(def_id) {
+            def.has_drop = true;
+            self.register_adt(def_id, def);
+        }
+    }
+
     pub fn new() -> Self {
         Self::new_with_target(crate::hir::target::Target::host())
     }
@@ -1303,10 +1560,13 @@ impl TypeContext {
     pub fn new_with_target(target: crate::hir::target::Target) -> Self {
         let factory = TypeFactory::new();
         let mut ctx = TypeContext {
+            arena: None,
+            regex_cache: HashMap::default(),
             types: Vec::new(),
             bindings: RefCell::new(HashMap::default()),
             meta: HashMap::default(),
             def_id_to_type_id: HashMap::default(),
+            adt_defs: RefCell::new(HashMap::default()),
             builtin_unit: TypeId::NONE,
             builtin_never: TypeId::NONE,
             builtin_error: TypeId::NONE,
@@ -1319,6 +1579,8 @@ impl TypeContext {
             builtin_layout_descriptor: TypeId::NONE,
             variance_cache: RefCell::new(HashMap::default()),
             variance_edges: RefCell::new(HashMap::default()),
+            region_subtype_collect: Cell::new(false),
+            region_subtype_outlives: RefCell::new(Vec::new()),
             opaque_hidden: RefCell::new(HashMap::default()),
             opaque_hidden_undo: RefCell::new(Vec::new()),
             transaction_stack: RefCell::new(Vec::new()),
@@ -1326,7 +1588,6 @@ impl TypeContext {
             current_unify_span: RefCell::new(None),
             current_coercion_ctx: std::cell::Cell::new(CoercionContext::Structural),
             seal_violations: std::cell::Cell::new(0),
-            frozen_vars: RefCell::new(Vec::new()),
             auto_ro: std::cell::Cell::new(false),
             auto_coerce: std::cell::Cell::new(false),
             generic_binding_origins: RefCell::new(HashMap::default()),
@@ -1334,6 +1595,10 @@ impl TypeContext {
             next_universe: Cell::new(0),
             next_gadt_skolem_id: Cell::new(0),
             next_param_index: Cell::new(0),
+            // Base offset mirrors the former global `OVERLAP_FRESH_VAR_ID`
+            // (1_000_000): keeps overlap-fresh vars out of the main
+            // inference context's low ID space.
+            next_overlap_fresh_id: Cell::new(1_000_000),
             edition: Edition::latest(),
             target,
             factory,
@@ -1363,7 +1628,7 @@ impl TypeContext {
         ctx
     }
 
-    pub fn get_invariant(&self, id: TypeId) -> Option<&crate::ast::Expr> {
+    pub fn get_invariant(&self, id: TypeId) -> Option<&crate::ast::Expr<'input>> {
         self.meta.get(&id).and_then(|m| m.invariant.as_ref())
     }
 
@@ -1497,6 +1762,77 @@ impl TypeContext {
         self.type_is_volatile(&self.types[resolved.index()])
     }
 
+    /// The Copy determination (§Copy): the scalars are Copy; the function
+    /// types and the String (an `Adt`) are not; the aggregates recurse.
+    pub(crate) fn type_is_copy(&self, ty: TypeId) -> bool {
+        match self.get(ty) {
+            TypeData::Int { .. }
+            | TypeData::UInt { .. }
+            | TypeData::Float { .. }
+            | TypeData::Bool
+            | TypeData::Char
+            | TypeData::Byte
+            | TypeData::USize
+            | TypeData::Rational { .. }
+            // Unit (zero fields, no Drop) and Never (uninhabited) satisfy
+            // the §Copy derivation rule vacuously — they must not fall
+            // through to `_ => false` (an affine `()` would demand an
+            // explicit `move`, contradicting SYNTAX.md §Value Semantics).
+            | TypeData::Unit
+            // Raw pointers (`Pointer`/`Ptr`) are Copy: a raw pointer is
+            // essentially a usize-sized integer — it owns nothing and has
+            // no `Drop`; copying an address has no memory cost and no
+            // ownership consequence (committee ruling).  The pointee does
+            // not matter — the pointer does not own it.
+            | TypeData::Never
+            | TypeData::Pointer { .. }
+            | TypeData::Ptr { .. } => true,
+            TypeData::Fn { .. } => false,
+            TypeData::Tuple { elems } => elems.iter().all(|e| self.type_is_copy(*e)),
+            TypeData::Array { elem, .. } | TypeData::Slice { elem, .. } => self.type_is_copy(*elem),
+            // The reference types: `&T` (immutable — e.g. `&Str`) is Copy;
+            // `&mut T` is not (§References — exclusive, non-copyable).
+            TypeData::Ref { mutable, .. } => !*mutable,
+            // The §Copy derivation for ADTs (SYNTAX.md §Value Semantics):
+            // no Drop impl + all fields recursively Copy — the definition
+            // table is populated by the resolver (def_id → fields + Drop).
+            TypeData::Adt { def_id, args, .. } => self.adt_is_copy(*def_id, args),
+            // Fail closed: the remaining types
+            // (Coproduct, Exists, Poly, DynTrait, Opaque, Mu, Nu,
+            // AssociatedType, ...) default to non-Copy unless proven
+            // bitwise-replicable — the `_ => true` fallthrough was the
+            // wrong direction for an affine language.
+            _ => false,
+        }
+    }
+
+    /// The §Copy derivation for an ADT: no Drop impl + all fields
+    /// recursively Copy.
+    fn adt_is_copy(&self, def_id: DefId, args: &[TypeId]) -> bool {
+        match self.adt_def(def_id) {
+            Some(def) => {
+                if def.has_drop {
+                    return false;
+                }
+                def.fields.iter().all(|f| self.adt_field_is_copy(*f, args))
+            }
+            // Unregistered ADT (e.g. a builtin like `String`): conservative.
+            None => false,
+        }
+    }
+
+    /// A field of an ADT instantiation: a generic parameter is replaced by
+    /// its argument (`Option<Int<32>>` — the field `T` → `Int<32>`); other
+    /// fields recurse (nested ADTs carry their own args in their TypeData).
+    fn adt_field_is_copy(&self, field: TypeId, args: &[TypeId]) -> bool {
+        match self.get(field) {
+            TypeData::GenericParam { index, .. } => {
+                args.get(*index).is_some_and(|&a| self.type_is_copy(a))
+            }
+            _ => self.type_is_copy(field),
+        }
+    }
+
     /// Returns the resolved `TypeData` for a `TypeId`, following bindings.
     pub fn get(&self, id: TypeId) -> &TypeData {
         let resolved = self.resolve_binding(id);
@@ -1545,7 +1881,7 @@ impl TypeContext {
     /// follow `set_binding` chains, so it correctly identifies the
     /// original InferVar even after it has been unified with a concrete type.
     pub(crate) fn get_infer_var_id(&self, id: TypeId) -> Option<usize> {
-        if let TypeData::InferVar { id: raw_id } = &*self.types[id.index()] {
+        if let TypeData::InferVar { id: raw_id, .. } = &*self.types[id.index()] {
             Some(*raw_id)
         } else {
             None
@@ -1631,16 +1967,16 @@ impl TypeContext {
     /// registry.  `resolve_binding` transparently consults the registry,
     /// so all type operations within the arm see the refined types.
     ///
-    /// This is directly inspired by OCaml's `Pattern` unification mode
+    /// This is directly inspired by OCaml's `Pattern<'input>` unification mode
     /// (ctype.ml:446-459).  In OCaml, `link_type` (≈`set_binding`) is
-    /// never called in `Pattern` mode; instead, constraint equations
+    /// never called in `Pattern<'input>` mode; instead, constraint equations
     /// are collected in `equated_types`:
     ///
     /// ```ocaml
     /// (* ctype.ml:446-459 *)
     /// type unification_environment =
     ///   | Expression of { env : Env.t; in_subst : bool; }
-    ///   | Pattern of
+    ///   | Pattern<'input> of
     ///       { penv : Pattern_env.t;
     ///         equated_types : TypePairs.t;  (* ← no link_type, collect here *)
     ///         assume_injective : bool;
@@ -1655,7 +1991,7 @@ impl TypeContext {
     /// After this call, `resolve_binding` no longer sees the
     /// GADT refinements from this arm.
     ///
-    /// See `push_gadt_arm` for the OCaml `Pattern` mode reference
+    /// See `push_gadt_arm` for the OCaml `Pattern<'input>` mode reference
     /// (ctype.ml:3926-3936: `equated_types` discarded on scope exit).
     pub fn pop_gadt_arm(&self) {
         self.gadt.exit_arm();
@@ -1771,7 +2107,7 @@ impl TypeContext {
                     bindings.get(&path).copied()
                 };
                 if let Some(next_val) = next {
-                    self.set_binding(path, current);
+                    let _ = self.set_binding(path, current);
                     path = next_val;
                     depth += 1;
                     if depth > MAX_CHAIN_DEPTH {
@@ -1914,8 +2250,18 @@ impl TypeContext {
         self.resolve_opaque(self.resolve_binding(id))
     }
 
-    pub fn alloc_infer_var(&mut self, id: usize) -> TypeId {
-        self.alloc(TypeData::InferVar { id })
+    pub fn alloc_infer_var(&mut self, id: usize, universe: usize) -> TypeId {
+        self.alloc(TypeData::InferVar { id, universe })
+    }
+
+    /// Allocate a fresh inference variable from the TypeContext-LOCAL
+    /// overlap counter (replaces the former process-global
+    /// `OVERLAP_FRESH_VAR_ID`).  Per-context, so long-running processes
+    /// and parallel tests never share a single unbounded counter.
+    pub fn alloc_overlap_fresh_var(&mut self, universe: usize) -> TypeId {
+        let id = self.next_overlap_fresh_id.get();
+        self.next_overlap_fresh_id.set(id + 1);
+        self.alloc(TypeData::InferVar { id, universe })
     }
 
     pub fn get_def_id_for_type(&self, id: TypeId) -> Option<DefId> {
@@ -1935,7 +2281,7 @@ impl TypeContext {
         self.def_id_to_type_id.get(&def_id).copied()
     }
 
-    pub fn int(&mut self, bits: u8, signed: bool) -> TypeId {
+    pub fn int(&mut self, bits: u32, signed: bool) -> TypeId {
         debug_assert!(
             bits >= 1 && bits <= 64,
             "Int<{}> out of range (SYNTAX.md: bits 1..64)",
@@ -1948,7 +2294,7 @@ impl TypeContext {
         })
     }
 
-    pub fn uint(&mut self, bits: u8) -> TypeId {
+    pub fn uint(&mut self, bits: u32) -> TypeId {
         debug_assert!(
             bits >= 1 && bits <= 64,
             "UInt<{}> out of range (SYNTAX.md: bits 1..64)",
@@ -1961,7 +2307,7 @@ impl TypeContext {
     }
 
     /// Create an Int type with a specific overflow policy.
-    pub fn int_with_overflow(&mut self, bits: u8, signed: bool, policy: OverflowPolicy) -> TypeId {
+    pub fn int_with_overflow(&mut self, bits: u32, signed: bool, policy: OverflowPolicy) -> TypeId {
         self.alloc(TypeData::Int {
             bits,
             signed,
@@ -1970,7 +2316,7 @@ impl TypeContext {
     }
 
     /// Create a UInt type with a specific overflow policy.
-    pub fn uint_with_overflow(&mut self, bits: u8, policy: OverflowPolicy) -> TypeId {
+    pub fn uint_with_overflow(&mut self, bits: u32, policy: OverflowPolicy) -> TypeId {
         self.alloc(TypeData::UInt {
             bits,
             overflow_policy: policy,
@@ -1990,7 +2336,7 @@ impl TypeContext {
         }
     }
 
-    pub fn float(&mut self, bits: u8) -> TypeId {
+    pub fn float(&mut self, bits: u32) -> TypeId {
         self.alloc(TypeData::Float { bits })
     }
 
@@ -2005,11 +2351,11 @@ impl TypeContext {
     /// pattern before emitting `Type::Regex`, so this `debug_assert!` is
     /// a safety net for debug builds only.
     pub fn regex(&mut self, pattern: String) -> TypeId {
-        debug_assert!(
-            regex_syntax::parse(&pattern).is_ok(),
-            "Regex pattern must be valid: {}",
-            pattern,
-        );
+        let valid = *self
+            .regex_cache
+            .entry(pattern.clone())
+            .or_insert_with(|| regex_syntax::parse(&pattern).is_ok());
+        debug_assert!(valid, "regex() called with an invalid pattern");
         self.alloc(TypeData::Regex { pattern })
     }
 
@@ -2089,7 +2435,24 @@ impl TypeContext {
     }
 
     pub fn reference(&mut self, ty: TypeId, mutable: bool) -> TypeId {
-        self.alloc(TypeData::Ref { ty, mutable })
+        self.reference_with_lifetime(ty, mutable, None)
+    }
+
+    /// Construct a `&T` / `&mut T` reference, PRESERVING the explicit
+    /// lifetime annotation (`&'a T` — `Some('a)`) when the caller threads
+    /// it through — substitution / generic replacement must NOT silently
+    /// erase user-written lifetimes (SYNTAX.md explicit lifetime rule).
+    pub fn reference_with_lifetime(
+        &mut self,
+        ty: TypeId,
+        mutable: bool,
+        lifetime: Option<Symbol>,
+    ) -> TypeId {
+        self.alloc(TypeData::Ref {
+            ty,
+            mutable,
+            lifetime,
+        })
     }
 
     pub fn pointer(&mut self, ty: TypeId) -> TypeId {
@@ -2108,7 +2471,128 @@ impl TypeContext {
     /// `quantifiers` are (index, name) pairs for universally quantified variables.
     /// `body` references them via `GenericParam`.
     pub fn poly(&mut self, quantifiers: Vec<(usize, Symbol)>, body: TypeId) -> TypeId {
+        // Defense-in-depth: enforce the OmniML closedness invariant
+        // (omniml/lib/constraint_solver/principal_shape.ml — `Poly.invariant`):
+        // the polytope body must be closed — no `InferVar`, no nested `Poly`.
+        // If a bug elsewhere creates an open body, catch it at the
+        // construction site instead of silently propagating a stale
+        // inference variable (which `replace_infer` would miss).
+        //
+        // This is a COMPILER-correctness invariant, not a user-code
+        // constraint: a violation means a bug in the inference engine,
+        // `replace_generic`, or the Yoneda reduction.  It FAILS CLOSED
+        // (ICE) in BOTH debug and release builds — degrading to the
+        // `Error` type in release would let the malformed polytope unify
+        // with anything and silently cascade into type confusion.
+        assert!(
+            !self.poly_body_is_open(body, &quantifiers),
+            "poly() invariant violated: polytope body must be closed (no InferVar, no nested Poly, no unbound GenericParam)"
+        );
         self.alloc(TypeData::Poly { quantifiers, body })
+    }
+
+    /// Whether `ty` (a polytope body) violates the OmniML closedness
+    /// invariant: it contains an `InferVar` or a nested `Poly`.
+    /// See the `TypeData::Poly` doc comment for the invariant.
+    fn poly_body_is_open(&self, ty: TypeId, quantifiers: &[(usize, Symbol)]) -> bool {
+        self.poly_body_is_open_inner(ty, quantifiers, &mut Vec::new())
+    }
+
+    /// Recursive core of `poly_body_is_open` — threads the set of indices
+    /// bound by INNER binders (`Forall`/`Exists`/`Mu`/`Nu`): a
+    /// `GenericParam` shadowed by an inner binder is NOT a free variable
+    /// of the outer `Poly`, so it must not flag the body as open.  The
+    /// old implementation recursed with only the outer quantifiers and
+    /// falsely rejected closed nested quantifiers; the binder stack
+    /// (verified regression) fixes that.
+    fn poly_body_is_open_inner(
+        &self,
+        ty: TypeId,
+        quantifiers: &[(usize, Symbol)],
+        locally_bound: &mut Vec<usize>,
+    ) -> bool {
+        match self.get(ty) {
+            TypeData::InferVar { .. } => true,
+            TypeData::Poly { .. } => true,
+            // OmniML closedness (principal_shape.ml + OmniML.md): a polytope
+            // annotation is closed iff every free type variable is bound by
+            // its quantifiers.  A GenericParam whose index is NOT among the
+            // quantifiers — and NOT shadowed by an inner binder — is a free
+            // variable: the body is open.
+            TypeData::GenericParam { index, .. } => {
+                if locally_bound.contains(index) {
+                    return false; // bound by an INNER binder — shadowed.
+                }
+                !quantifiers.iter().any(|(i, _)| *i == *index)
+            }
+            TypeData::Slice { elem } => {
+                self.poly_body_is_open_inner(*elem, quantifiers, locally_bound)
+            }
+            TypeData::Ref { ty: inner, .. } => {
+                self.poly_body_is_open_inner(*inner, quantifiers, locally_bound)
+            }
+            TypeData::Tuple { elems } => elems
+                .iter()
+                .any(|&e| self.poly_body_is_open_inner(e, quantifiers, locally_bound)),
+            TypeData::Adt { args, .. } => args
+                .iter()
+                .any(|&a| self.poly_body_is_open_inner(a, quantifiers, locally_bound)),
+            TypeData::Array { elem, .. } => {
+                self.poly_body_is_open_inner(*elem, quantifiers, locally_bound)
+            }
+            TypeData::Pointer { ty: inner } => {
+                self.poly_body_is_open_inner(*inner, quantifiers, locally_bound)
+            }
+            TypeData::Ptr { size, pointee } => {
+                self.poly_body_is_open_inner(*size, quantifiers, locally_bound)
+                    || self.poly_body_is_open_inner(*pointee, quantifiers, locally_bound)
+            }
+            TypeData::Fn { params, ret, .. } => {
+                params
+                    .iter()
+                    .any(|&p| self.poly_body_is_open_inner(p, quantifiers, locally_bound))
+                    || self.poly_body_is_open_inner(*ret, quantifiers, locally_bound)
+            }
+            TypeData::Exists {
+                param_index, base, ..
+            } => {
+                locally_bound.push(*param_index);
+                let open = self.poly_body_is_open_inner(*base, quantifiers, locally_bound);
+                locally_bound.pop();
+                open
+            }
+            TypeData::Forall {
+                param_index, body, ..
+            } => {
+                locally_bound.push(*param_index);
+                let open = self.poly_body_is_open_inner(*body, quantifiers, locally_bound);
+                locally_bound.pop();
+                open
+            }
+            TypeData::AssociatedType { self_ty, .. } => {
+                self.poly_body_is_open_inner(*self_ty, quantifiers, locally_bound)
+            }
+            TypeData::Coproduct { alternatives } => alternatives
+                .iter()
+                .any(|&a| self.poly_body_is_open_inner(a, quantifiers, locally_bound)),
+            TypeData::Mu {
+                param_index, body, ..
+            }
+            | TypeData::Nu {
+                param_index, body, ..
+            } => {
+                locally_bound.push(*param_index);
+                let open = self.poly_body_is_open_inner(*body, quantifiers, locally_bound);
+                locally_bound.pop();
+                open
+            }
+            TypeData::Opaque { hidden, .. } => {
+                hidden.is_some_and(|h| self.poly_body_is_open_inner(h, quantifiers, locally_bound))
+            }
+            // Leaf / closed types never contain an inference variable, a
+            // nested polytope, or an unbound generic parameter.
+            _ => false,
+        }
     }
 
     pub fn rational(&mut self, int_bits: u8, frac_bits: u8) -> TypeId {
@@ -2148,6 +2632,9 @@ impl TypeContext {
     /// Single-pass Yoneda reduction (used internally by `try_yoneda_reduce`).
     ///
     /// Matches the ≡_X / ≡_X schemas from Pistone & Tranchini (2022) §2.
+    /// These are type-level instances of the Yoneda Lemma and its dual
+    /// (Mac Lane §III.2): Nat(D(r, —), K) ≅ K(r), applied to the
+    /// representable functor D(X, —) in the category of types.
     ///
     /// **≡_X (Yoneda)** – each branch's *return* is the bound variable X:
     /// ```text
@@ -2343,6 +2830,14 @@ impl TypeContext {
                 // ALL branches must match the SAME schema.  Mixed branches
                 // (some Yoneda, some co-Yoneda) cannot be reduced.
                 if !branch_replacements.is_empty() && !coyoneda_replacements.is_empty() {
+                    return ty;
+                }
+                // EVERY parameter must match the schema — a non-matching
+                // parameter (e.g. `Int` in `∀X. (A → X) → Int → X`) aborts
+                // the reduction (fail-closed): silently dropping it would
+                // equate `A` with `Int → A`, breaking type soundness.
+                let total_matches = branch_replacements.len() + coyoneda_replacements.len();
+                if total_matches == 0 || total_matches != normalized_params.len() {
                     return ty;
                 }
                 if !branch_replacements.is_empty() || !coyoneda_replacements.is_empty() {
@@ -2659,7 +3154,7 @@ impl TypeContext {
         param_index: usize,
         name: Symbol,
         base: TypeId,
-        invariant: crate::ast::Expr,
+        invariant: crate::ast::Expr<'input>,
     ) -> TypeId {
         let id = self.alloc(TypeData::Exists {
             param_index,
@@ -2789,9 +3284,13 @@ impl TypeContext {
                 }
             }
             // ── Composite types: recurse into all sub-components ──
-            TypeData::Ref { ty: inner, mutable } => {
+            TypeData::Ref {
+                ty: inner,
+                mutable,
+                lifetime,
+            } => {
                 let new_inner = self.replace_generic(*inner, param_index, replacement);
-                self.reference(new_inner, *mutable)
+                self.reference_with_lifetime(new_inner, *mutable, *lifetime)
             }
             TypeData::Pointer { ty: inner } => {
                 let new_inner = self.replace_generic(*inner, param_index, replacement);
@@ -3281,7 +3780,13 @@ impl TypeContext {
                             .unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
             (_, TypeData::GenericParam { .. }) => {
@@ -3301,7 +3806,13 @@ impl TypeContext {
                             .unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
-                self.set_binding(b, a);
+                if !self.set_binding(b, a) {
+                    return Err(TypeError::Mismatch {
+                        expected: b,
+                        found: a,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(a)
             }
             // SkolemVar: identical skolems are equal; different skolems cannot unify.
@@ -3320,7 +3831,7 @@ impl TypeContext {
                 // from a shallower region level than the current level,
                 // binding it to a type from a deeper scope is forbidden.
                 if let Some(rt) = region_tree
-                    && let TypeData::InferVar { id } = self.get(a)
+                    && let TypeData::InferVar { id, .. } = self.get(a)
                 {
                     let var_region = rt.region_of_var(*id);
                     let var_level = rt.get_level(var_region);
@@ -3354,7 +3865,30 @@ impl TypeContext {
                             .unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
-                self.set_binding(a, b);
+                // Per-variable universe escape check (rustc `can_define`):
+                // binding a type that CONTAINS a higher-universe InferVar
+                // into this var lets a forall-introduced variable escape.
+                // The solver-local path checks this; the checker-global
+                // path must too (canonical instantiation introduces
+                // high-universe vars that flow back through this unify).
+                if let TypeData::InferVar { universe, .. } = self.get(a)
+                    && ty_contains_foreign_universe(self, b, *universe)
+                {
+                    return Err(TypeError::SkolemEscape {
+                        var_id: usize::MAX,
+                        var_level: *universe,
+                        current_level: 0,
+                        span: (*self.current_unify_span.borrow())
+                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                    });
+                }
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
             (_, TypeData::InferVar { .. }) => {
@@ -3363,7 +3897,7 @@ impl TypeContext {
                 // current level, binding it to a type from a deeper scope
                 // is forbidden.  Mirrors the check in the (InferVar, _) arm.
                 if let Some(rt) = region_tree
-                    && let TypeData::InferVar { id } = self.get(b)
+                    && let TypeData::InferVar { id, .. } = self.get(b)
                 {
                     let var_region = rt.region_of_var(*id);
                     let var_level = rt.get_level(var_region);
@@ -3386,7 +3920,39 @@ impl TypeContext {
                             .unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
-                self.set_binding(b, a);
+                // The FOREIGN-UNIVERSE guard (mirrors the `(InferVar, _)`
+                // arm): binding a type that CONTAINS a higher-universe
+                // InferVar into this variable would let forall-introduced
+                // variables escape.  (The GADT-skolem containment check is
+                // NOT mirrored here: the REGION-LEVEL arm scope — the
+                // TcLevel check above — already rejects a binding into an
+                // OUTER (shallower) variable, which is precisely the
+                // existential-witness escape through a compound type
+                // (`unify(&[S], outer_var)`: the outer var's region level
+                // is below the current arm's).  An arm-LOCAL unwrap
+                // (`MkA(MkB(s))` binding the witness to an arm-fresh
+                // variable, region level >= current) is legal — a naive
+                // `contains_gadt_skolem` mirror cannot tell these apart
+                // (all GADT skolems share GADT_SKOLEM_UNIVERSE) and
+                // rejects legal same-name nested existential patterns.)
+                if let TypeData::InferVar { universe, .. } = self.get(b)
+                    && ty_contains_foreign_universe(self, a, *universe)
+                {
+                    return Err(TypeError::SkolemEscape {
+                        var_id: usize::MAX,
+                        var_level: *universe,
+                        current_level: 0,
+                        span: (*self.current_unify_span.borrow())
+                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                    });
+                }
+                if !self.set_binding(b, a) {
+                    return Err(TypeError::Mismatch {
+                        expected: b,
+                        found: a,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(a)
             }
 
@@ -3414,7 +3980,13 @@ impl TypeContext {
                         coercion_depth + 1,
                     )?;
                 }
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
@@ -3426,7 +3998,13 @@ impl TypeContext {
                 for (t1, t2) in e1.iter().zip(e2.iter()) {
                     self.unify_internal(*t1, *t2, elem_variance, region_tree, coercion_depth + 1)?;
                 }
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
@@ -3447,7 +4025,13 @@ impl TypeContext {
                 }
                 let ret_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*r1, *r2, ret_variance, region_tree, coercion_depth + 1)?;
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
@@ -3457,7 +4041,13 @@ impl TypeContext {
             {
                 let elem_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*e1, *e2, elem_variance, region_tree, coercion_depth + 1)?;
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
@@ -3465,29 +4055,78 @@ impl TypeContext {
             (TypeData::Slice { elem: e1 }, TypeData::Slice { elem: e2 }) => {
                 let elem_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*e1, *e2, elem_variance, region_tree, coercion_depth + 1)?;
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
             // Ref: pointee is INVARIANT (per compute_variance_edges signing it sign: 0).
-            // MUTABILITY:
-            // - &mut T <: &T allowed in Covariant direction (borrow shortening)
-            // - &T <: &mut T NEVER allowed
-            //
-            // NOTE on mutable subtyping: this language permits &mut T <: &T in
-            // covariant contexts (a "borrow shortening" rule).  This is NOT the
-            // same as Rust's semantics where &mut T is invariant; it is a
-            // deliberate design choice to support safe temporary reborrowing.
+            // MUTABILITY: the ONLY sound coercion is `&mut T → &T` (surrendering
+            // mutability), and it is gated to the INVARIANT call-site under
+            // `@auto_ro`/`@auto_coerce` (coercion_depth == 0 ∧ CallSite —
+            // SYNTAX.md §Local Relaxation).  Covariant/contravariant structural
+            // positions require the EXACT mutability match — the OLD covariant
+            // "borrow shortening" permission was never surface-documented and is
+            // removed (the implicit downgrade must not leak outside the gate).
             (
                 TypeData::Ref {
                     ty: t1,
                     mutable: m1,
+                    lifetime: l1,
+                    ..
                 },
                 TypeData::Ref {
                     ty: t2,
                     mutable: m2,
+                    lifetime: l2,
+                    ..
                 },
             ) => {
+                // Explicit-lifetime consistency (SYNTAX.md §Explicit
+                // Lifetime Parameters — "verified by the borrow checker;
+                // mismatches cause compile errors"): `&'a T` unifies with
+                // `&'b T` only when the annotations AGREE (or either side
+                // is elided).  The region solver verifies `'a: 'b`
+                // outlives at the signature level; at the UNIFICATION
+                // site two different explicit regions are a mismatch
+                // (rustc: "lifetime mismatch").
+                if let (Some(l1), Some(l2)) = (l1, l2)
+                    && l1 != l2
+                {
+                    // Region SUBTYPE collection (symmetric with the
+                    // subtype Ref arm — rustc `make_subregion(b, a)`, the
+                    // covariance constraint `'a: 'b`): when the checker
+                    // has enabled per-signature collection, record the
+                    // pair and continue (the region solver decides
+                    // satisfiability against the `where 'a: 'b`
+                    // predicates); otherwise two different explicit
+                    // regions are a unification mismatch (rustc:
+                    // "lifetime mismatch").
+                    //
+                    // ORIENTATION: `unify` is called as
+                    // `unify_with(expected, actual)` — `l1` is the
+                    // EXPECTED region, `l2` the ACTUAL one.  The required
+                    // outlives for `&'actual T` flowing into an
+                    // `&'expected T` position is `actual : expected`, so
+                    // record `(l2, l1)` (the subtype arm records
+                    // `(sub, sup)` — its l1 IS the sub side, already
+                    // correct).
+                    if self.region_subtype_collect.get() {
+                        self.region_subtype_outlives.borrow_mut().push((*l2, *l1));
+                    } else {
+                        return Err(TypeError::Mismatch {
+                            expected: b,
+                            found: a,
+                            span: (*self.current_unify_span.borrow())
+                                .unwrap_or(crate::ast::Span::new(0, 0)),
+                        });
+                    }
+                }
                 let allow_mutable_coerce = match variance {
                     // `@auto_ro` relaxes ONLY at call sites (Invariant — per
                     // SYNTAX.md "at function call sites and method
@@ -3502,14 +4141,21 @@ impl TypeContext {
                     Variance::Invariant => {
                         // NOTE (language-design committee, 2026-08-05): the
                         // implicit `@auto_ro`/`@auto_coerce` downgrade below
-                        // does NOT register the source in `frozen_vars`,
-                        // unlike the explicit `&ro` / `.freeze!()` forms —
+                        // does NOT register a loan — AND the borrow-check
+                        // post-pass CANNOT see it either (the HIR has no node
+                        // for the type-level implicit downgrade).  The freeze
+                        // is unobservable in the current grammar (argument
+                        // expressions are pure); a future effectful-argument
+                        // feature must add an explicit HIR marker first.  The
+                        // type checker no longer
+                        // participates; the old `loans` bookkeeping was
+                        // removed) —
                         // under `@auto_ro` the source remains mutable after
                         // the read-only reborrow.  This divergence is a
                         // KNOWN limitation: Posita has no lifetime-based
                         // borrow checker yet, and once one lands the
                         // read-only guarantee is enforced structurally,
-                        // making the `frozen_vars` bookkeeping moot for the
+                        // making the removed `loans` bookkeeping moot for the
                         // implicit form.  `&ro` / `.freeze!()` remain the
                         // strictly-frozen explicit forms.
                         *m1 == *m2
@@ -3521,6 +4167,12 @@ impl TypeContext {
                     }
                     Variance::Covariant => *m1 == *m2,
                     Variance::Contravariant => *m1 == *m2,
+                    // NOTE: both positions require EXACT mutability match.
+                    // `@auto_ro`/`@auto_coerce` is scoped to
+                    // `coercion_depth == 0 ∧ CallSite` (SYNTAX.md §Local
+                    // Relaxation), so covariant/contravariant structural
+                    // positions never relax — the old code's covariant
+                    // `&mut T → &T` permission was never surface-documented.
                 };
                 if !allow_mutable_coerce {
                     return Err(TypeError::Mismatch {
@@ -3532,7 +4184,13 @@ impl TypeContext {
                 }
                 let ty_variance = variance.xform(Variance::Invariant);
                 self.unify_internal(*t1, *t2, ty_variance, region_tree, coercion_depth + 1)?;
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
@@ -3542,7 +4200,13 @@ impl TypeContext {
             (TypeData::Pointer { ty: t1 }, TypeData::Pointer { ty: t2 }) => {
                 let ty_variance = variance.xform(Variance::Invariant);
                 self.unify_internal(*t1, *t2, ty_variance, region_tree, coercion_depth + 1)?;
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
@@ -3571,7 +4235,13 @@ impl TypeContext {
                     region_tree,
                     coercion_depth + 1,
                 )?;
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
@@ -3584,7 +4254,13 @@ impl TypeContext {
                 for (t1, t2) in a1.iter().zip(a2.iter()) {
                     self.unify_internal(*t1, *t2, alt_variance, region_tree, coercion_depth + 1)?;
                 }
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
@@ -3619,7 +4295,13 @@ impl TypeContext {
                 } else {
                     self.unify_internal(*b1, *b2, body_variance, region_tree, coercion_depth + 1)?;
                 }
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
@@ -3652,7 +4334,13 @@ impl TypeContext {
                 } else {
                     self.unify_internal(*b1, *b2, base_variance, region_tree, coercion_depth + 1)?;
                 }
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
@@ -3687,7 +4375,13 @@ impl TypeContext {
                     region_tree,
                     coercion_depth + 1,
                 )?;
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
@@ -3720,7 +4414,13 @@ impl TypeContext {
                 } else {
                     self.unify_internal(*b1, *b2, body_variance, region_tree, coercion_depth + 1)?;
                 }
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
@@ -3753,7 +4453,13 @@ impl TypeContext {
                 } else {
                     self.unify_internal(*b1, *b2, body_variance, region_tree, coercion_depth + 1)?;
                 }
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
@@ -3768,13 +4474,25 @@ impl TypeContext {
                     frac_bits: f2,
                 },
             ) if i1 == i2 && f1 == f2 => {
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
             // DynTrait: same trait list (invariant)
             (TypeData::DynTrait { traits: t1 }, TypeData::DynTrait { traits: t2 }) if t1 == t2 => {
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
@@ -3793,7 +4511,13 @@ impl TypeContext {
             ) if ti1 == ti2 && n1 == n2 => {
                 let self_variance = variance.xform(Variance::Covariant);
                 self.unify_internal(*s1, *s2, self_variance, region_tree, coercion_depth + 1)?;
-                self.set_binding(a, b);
+                if !self.set_binding(a, b) {
+                    return Err(TypeError::Mismatch {
+                        expected: a,
+                        found: b,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 Ok(b)
             }
 
@@ -3805,7 +4529,13 @@ impl TypeContext {
                     _ => unreachable!(),
                 };
                 if self.subtype(sub, sup) {
-                    self.set_binding(a, b);
+                    if !self.set_binding(a, b) {
+                        return Err(TypeError::Mismatch {
+                            expected: a,
+                            found: b,
+                            span: crate::ast::Span::new(0, 0),
+                        });
+                    }
                     Ok(b)
                 } else {
                     Err(TypeError::Mismatch {
@@ -3908,7 +4638,7 @@ impl TypeContext {
     /// undo log if one is active.  Always use this instead of
     /// `self.bindings.borrow_mut().insert(...)` so that transactions can
     /// correctly roll back.
-    pub(crate) fn set_binding(&self, key: TypeId, value: TypeId) {
+    pub(crate) fn set_binding(&self, key: TypeId, value: TypeId) -> bool {
         // ── Seal-the-wall guard ─────────────────────────────────────
         // GADT arm processing must never bind a GenericParam into the
         // global bindings table: refinements live in GadtContext.facts
@@ -3917,7 +4647,7 @@ impl TypeContext {
         // `arm_depth > 0` means the refinement machinery leaked into the
         // global table (cross-arm contamination / post-arm leakage).
         //
-        // Exemption: PATH-COMPRESSION re-writes.  Pattern instantiation
+        // Exemption: PATH-COMPRESSION re-writes.  Pattern<'input> instantiation
         // legitimately binds a scrutinee generic param to a synthetic
         // infer var (`T → ?a`) at arm_depth 0 (before push), and
         // `resolve_binding` inside the arm then path-compresses that
@@ -3935,14 +4665,14 @@ impl TypeContext {
             // resolved type) — the ONLY permitted GenericParam binding
             // inside an arm.  Any DIFFERENT binding is a seal violation.
             if self.bindings.borrow().contains_key(&key)
-                && self.resolve_binding_no_gadt(key) == value
+                && self.resolve_binding_no_gadt(key) == self.resolve_binding_no_gadt(value)
             {
                 // Path compression to the same type — no-op, skip the
                 // unnecessary write.
-                return;
+                return true;
             }
             self.seal_violations.set(self.seal_violations.get() + 1);
-            return;
+            return false;
         }
         // Record the origin span for GenericParam bindings (precise E104
         // error location).  Only recorded inside a span-carrying unify
@@ -3960,6 +4690,7 @@ impl TypeContext {
             log.push((key, old));
         }
         self.bindings.borrow_mut().insert(key, value);
+        true
     }
 
     /// When `self_ty` resolves to a concrete ADT, return its `DefId`.
@@ -4124,10 +4855,14 @@ impl TypeContext {
                 TypeData::Ref {
                     ty: t1,
                     mutable: m1,
+                    lifetime: l1,
+                    ..
                 },
                 TypeData::Ref {
                     ty: t2,
                     mutable: m2,
+                    lifetime: l2,
+                    ..
                 },
             ) => {
                 // Aligned with unify_internal_impl's Ref handling:
@@ -4135,17 +4870,48 @@ impl TypeContext {
                 // - &T <: &mut T NEVER allowed
                 // - same mutability → invariant inner type
                 //
+                // Explicit-lifetime consistency (SYNTAX.md §Explicit
+                // Lifetime Parameters — "verified by the borrow checker;
+                // mismatches cause compile errors"): two DIFFERENT explicit
+                // regions are not in a subtype relation at the pure-type
+                // level (the region solver verifies `'a: 'b` outlives at
+                // the signature level); an ELIDED side does not constrain.
+                //
                 // Resolve bindings so that inference variables that have been
                 // bound to concrete types are compared by their resolved form.
                 let r1 = self.resolve_binding(*t1);
                 let r2 = self.resolve_binding(*t2);
-                if *m1 == *m2 {
-                    r1 == r2 // same mutability, invariant
-                } else if *m1 == true && *m2 == false {
-                    r1 == r2 // &mut T <: &T, invariant
-                } else {
-                    false // &T <: &mut T: never allowed
+                if *m1 != *m2 {
+                    // SYNTAX.md §Reference Coercion: by default Posita
+                    // does NOT allow `&mut T` to be implicitly coerced to
+                    // `&T` — the (gated) coercion path in unification is
+                    // the ONLY place that permits it (@auto_ro/@auto_coerce
+                    // + CallSite + depth == 0).  `subtype` is a pure
+                    // relation and must reject it (an ungated
+                    // `&mut T <: &T` here would silently reintroduce the
+                    // forbidden coercion from any future call site).
+                    return false;
                 }
+                if let (Some(l1), Some(l2)) = (l1, l2)
+                    && l1 != l2
+                {
+                    // Region SUBTYPE collection (rustc's
+                    // `make_subregion(b, a)` — the covariance constraint
+                    // `'a: 'b` for `&'a T <: &'b T`): when the checker has
+                    // enabled per-signature collection, record the pair
+                    // and ACCEPT (the solver decides satisfiability
+                    // against the where-constraints); otherwise this is a
+                    // pure-relation call (tests, structural checks) and
+                    // the strict rejection stands.
+                    if self.region_subtype_collect.get() {
+                        self.region_subtype_outlives.borrow_mut().push((*l1, *l2));
+                        // The pointee must still match (invariant) — the
+                        // lifetime covariance is the only relaxation.
+                        return r1 == r2;
+                    }
+                    return false;
+                }
+                r1 == r2 // same mutability, invariant
             }
             (TypeData::Pointer { ty: t1 }, TypeData::Pointer { ty: t2 }) => {
                 // Invariant — exact equality required after resolving bindings.
@@ -4329,9 +5095,13 @@ impl TypeContext {
                 let new_elem = self.subst(*elem, subst);
                 self.slice(new_elem)
             }
-            TypeData::Ref { ty, mutable } => {
+            TypeData::Ref {
+                ty,
+                mutable,
+                lifetime,
+            } => {
                 let new_ty = self.subst(*ty, subst);
-                self.reference(new_ty, *mutable)
+                self.reference_with_lifetime(new_ty, *mutable, *lifetime)
             }
             TypeData::Pointer { ty } => {
                 let new_ty = self.subst(*ty, subst);
@@ -4576,9 +5346,13 @@ impl TypeContext {
                 let e = self.replace_type_ids(*elem, replacements);
                 self.slice(e)
             }
-            TypeData::Ref { ty: rt, mutable } => {
+            TypeData::Ref {
+                ty: rt,
+                mutable,
+                lifetime,
+            } => {
                 let r = self.replace_type_ids(*rt, replacements);
-                self.reference(r, *mutable)
+                self.reference_with_lifetime(r, *mutable, *lifetime)
             }
             TypeData::Pointer { ty: pt } => {
                 let p = self.replace_type_ids(*pt, replacements);
@@ -4706,7 +5480,11 @@ impl TypeContext {
     }
 
     fn ref_ty_no_alloc(&self, ty: TypeId, mutable: bool) -> Option<TypeId> {
-        self.find_type(&TypeData::Ref { ty, mutable })
+        self.find_type(&TypeData::Ref {
+            ty,
+            mutable,
+            lifetime: None,
+        })
     }
 
     fn pointer_ty_no_alloc(&self, ty: TypeId) -> Option<TypeId> {
@@ -4816,6 +5594,40 @@ impl TypeContext {
 
     pub fn is_error(&self, ty: TypeId) -> bool {
         matches!(self.get(ty), TypeData::Error)
+    }
+
+    /// Whether the error-recovery sentinel occurs ANYWHERE in the type —
+    /// at the top level or nested inside a composite (e.g. `Vec<Error>`,
+    /// `Ref<Error>`, `Adt<Error>`).  A composite type wrapping the sentinel
+    /// is a recovery artifact just like a bare sentinel: enforcing traits on
+    /// it surfaces cascading `... on type Vec<!!>` errors on top of an
+    /// already-recovered expression.  (The resolution skips in the trait
+    /// solver use this instead of the shallow `is_error` check.)
+    pub fn contains_error(&self, ty: TypeId) -> bool {
+        match self.get(ty) {
+            TypeData::Error => true,
+            TypeData::Adt { args, .. } => args.iter().any(|a| self.contains_error(*a)),
+            TypeData::Tuple { elems } => elems.iter().any(|e| self.contains_error(*e)),
+            TypeData::Array { elem, .. } => self.contains_error(*elem),
+            TypeData::Slice { elem } => self.contains_error(*elem),
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => self.contains_error(*ty),
+            TypeData::Ptr { size, pointee } => {
+                self.contains_error(*size) || self.contains_error(*pointee)
+            }
+            TypeData::Fn { params, ret } => {
+                params.iter().any(|p| self.contains_error(*p)) || self.contains_error(*ret)
+            }
+            TypeData::Exists { base, .. } | TypeData::Forall { body: base, .. } => {
+                self.contains_error(*base)
+            }
+            TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => self.contains_error(*body),
+            TypeData::Poly { body, .. } => self.contains_error(*body),
+            TypeData::AssociatedType { self_ty, .. } => self.contains_error(*self_ty),
+            TypeData::Coproduct { alternatives } => {
+                alternatives.iter().any(|a| self.contains_error(*a))
+            }
+            _ => false,
+        }
     }
 
     pub fn is_reference(&self, ty: TypeId) -> bool {
@@ -5018,7 +5830,7 @@ impl TypeContext {
         matches!(self.get(ty), TypeData::AssociatedType { .. })
     }
 
-    pub fn bits_of_int(&self, ty: TypeId) -> Option<u8> {
+    pub fn bits_of_int(&self, ty: TypeId) -> Option<u32> {
         match self.get(ty) {
             TypeData::Int { bits, .. } | TypeData::UInt { bits, .. } => Some(*bits),
             _ => None,
@@ -5033,7 +5845,7 @@ impl TypeContext {
         }
     }
 
-    pub fn bits_of_float(&self, ty: TypeId) -> Option<u8> {
+    pub fn bits_of_float(&self, ty: TypeId) -> Option<u32> {
         match self.get(ty) {
             TypeData::Float { bits } => Some(*bits),
             _ => None,
@@ -5117,11 +5929,11 @@ impl TypeContext {
         }
     }
 
-    pub fn set_meta(&mut self, id: TypeId, meta: TypeMeta) {
+    pub fn set_meta(&mut self, id: TypeId, meta: TypeMeta<'input>) {
         self.meta.insert(id, meta);
     }
 
-    pub fn get_meta(&self, id: TypeId) -> Option<&TypeMeta> {
+    pub fn get_meta(&self, id: TypeId) -> Option<&TypeMeta<'input>> {
         self.meta.get(&id)
     }
 }
@@ -5225,7 +6037,7 @@ struct KappaGraph {
     edges: Vec<(usize, usize, isize)>,
 }
 
-impl TypeContext {
+impl<'input> TypeContext<'input> {
     /// Compute the characteristic κ(A) of a type, used for exhaustiveness checking.
     ///
     /// Two-phase algorithm (Pistone & Tranchini 2022 §5):
@@ -5241,204 +6053,21 @@ impl TypeContext {
             return cached;
         }
         let reduced = self.try_yoneda_reduce(ty);
-        let result = self.characteristic_of_reduced(reduced);
+        // The κ computation is the FIXED-POINT GRAPH SOLVER (the
+        // `rewrite κ(A) as fixed-point graph solver + cache` design):
+        // build the type-dependency graph rooted at the reduced type and
+        // solve it — recursive (μ/ν) types are solved by the graph's
+        // fixpoint iteration (termination is structural), not by a
+        // recursive `match` that relies on the Yoneda reduction to
+        // terminate.
+        let result = self.solve_kappa(&self.build_kappa_graph(reduced));
         // Cache the result.
         self.kappa_cache.borrow_mut().insert(ty, result);
         result
     }
 
-    /// Compute κ on a Yoneda-reduced type (monomorphic + μ/ν only).
-    fn characteristic_of_reduced(&self, ty: TypeId) -> Characteristic {
-        use Characteristic::*;
-        let data = self.get(ty);
-        match data {
-            // ── Base types ──────────────────────────────────
-            TypeData::Never | TypeData::Error => FiniteExhaustible(0),
-            TypeData::Unit => FiniteExhaustible(1),
-            TypeData::Bool => FiniteExhaustible(2),
-            TypeData::Char | TypeData::Byte | TypeData::USize => FiniteExhaustible(256),
-            TypeData::Int { bits, .. } | TypeData::UInt { bits, .. } => {
-                FiniteExhaustible(1usize.checked_shl(*bits as u32).unwrap_or(usize::MAX))
-            }
-            TypeData::Float { .. } => InfiniteEnumerable,
-            TypeData::Rational {
-                int_bits,
-                frac_bits,
-            } => FiniteExhaustible(
-                1usize
-                    .checked_shl((*int_bits + *frac_bits) as u32)
-                    .unwrap_or(usize::MAX),
-            ),
-
-            // ── Composite types: recurse combinatorially ─────
-            TypeData::Tuple { elems } => {
-                let mut k = FiniteExhaustible(1usize);
-                for &e in elems {
-                    k = Self::kappa_mul(k, self.characteristic_of_reduced(e));
-                }
-                k
-            }
-            TypeData::Fn { params, ret } => {
-                // |A ⇒ B| = |B| ^ |A|
-                let mut domain = FiniteExhaustible(1usize);
-                for &p in params {
-                    domain = Self::kappa_mul(domain, self.characteristic_of_reduced(p));
-                }
-                Self::kappa_pow(self.characteristic_of_reduced(*ret), domain)
-            }
-            TypeData::Coproduct { alternatives } => {
-                let mut k = FiniteExhaustible(0usize);
-                for &a in alternatives {
-                    k = Self::kappa_add(k, self.characteristic_of_reduced(a));
-                }
-                k
-            }
-            TypeData::Array { elem, size } => {
-                // |[T; N]| = |T| ^ N
-                Self::kappa_pow(
-                    self.characteristic_of_reduced(*elem),
-                    FiniteExhaustible(*size as usize),
-                )
-            }
-            TypeData::Slice { elem } => {
-                // [T] is an unsized type — any length, so infinitely enumerable.
-                let _ = self.characteristic_of_reduced(*elem);
-                InfiniteEnumerable
-            }
-            TypeData::Ptr { size, pointee } => {
-                // Ptr<size=S, pointee=T> memory cell: S × T
-                Self::kappa_mul(
-                    self.characteristic_of_reduced(*size),
-                    self.characteristic_of_reduced(*pointee),
-                )
-            }
-
-            // ── Data types ──────────────────────────────────
-            TypeData::Adt { args, .. } => {
-                // ADT arguments are invariant — ensure none is undecidable.
-                for &a in args {
-                    if self.characteristic_of_reduced(a) == Undecidable {
-                        return Undecidable;
-                    }
-                }
-                // Conservative upper bound; real value depends on the ADT definition.
-                FiniteExhaustible(usize::MAX)
-            }
-            TypeData::AssociatedType { self_ty, .. } => {
-                // Projection: treat as infinite (depends on impl).
-                let _ = self.characteristic_of_reduced(*self_ty);
-                InfiniteEnumerable
-            }
-
-            // ── Fixpoints: μX.T / νX.T ─────────────────────
-            TypeData::Mu {
-                param_index, body, ..
-            }
-            | TypeData::Nu {
-                param_index, body, ..
-            } => {
-                if !self.type_contains_param(*param_index, *body) {
-                    // X does not appear in body — degenerate, just compute body.
-                    self.characteristic_of_reduced(*body)
-                } else if self.check_positive_only(*param_index, *body) {
-                    // Only covariant self-reference → infinite enumerable
-                    InfiniteEnumerable
-                } else {
-                    // Contains contravariant/invariant self-reference → undecidable
-                    Undecidable
-                }
-            }
-
-            // ── Existentials: produced by Yoneda reduction ─────
-            TypeData::Exists {
-                param_index, base, ..
-            } => {
-                // ∃Z.A: if Z does not appear in A, the quantifier is vacuous.
-                if !self.type_contains_param(*param_index, *base) {
-                    self.characteristic_of_reduced(*base)
-                } else {
-                    // Z ranges over all types → infinite many inhabitants.
-                    InfiniteEnumerable
-                }
-            }
-
-            // ── Should not remain after Yoneda reduction ────
-            TypeData::Forall { .. }
-            | TypeData::Poly { .. }
-            | TypeData::GenericParam { .. }
-            | TypeData::InferVar { .. }
-            | TypeData::SkolemVar { .. } => Undecidable,
-
-            // ── Fallback ────────────────────────────────────
-            _ => FiniteExhaustible(usize::MAX),
-        }
-    }
-
-    /// κ1 × κ2
-    fn kappa_mul(a: Characteristic, b: Characteristic) -> Characteristic {
-        use Characteristic::*;
-        match (a, b) {
-            (FiniteExhaustible(0), _) | (_, FiniteExhaustible(0)) => FiniteExhaustible(0),
-            (FiniteExhaustible(a), FiniteExhaustible(b)) => a
-                .checked_mul(b)
-                .map_or(FiniteExhaustible(usize::MAX), FiniteExhaustible),
-            (FiniteExhaustible(_), InfiniteEnumerable)
-            | (InfiniteEnumerable, FiniteExhaustible(_))
-            | (InfiniteEnumerable, InfiniteEnumerable) => InfiniteEnumerable,
-            _ => Undecidable,
-        }
-    }
-
-    /// κ1 + κ2
-    #[inline(always)]
-    fn kappa_add(a: Characteristic, b: Characteristic) -> Characteristic {
-        use Characteristic::*;
-        match (a, b) {
-            (FiniteExhaustible(0), x) | (x, FiniteExhaustible(0)) => x,
-            (FiniteExhaustible(a), FiniteExhaustible(b)) => a
-                .checked_add(b)
-                .map_or(FiniteExhaustible(usize::MAX), FiniteExhaustible),
-            (FiniteExhaustible(_), InfiniteEnumerable)
-            | (InfiniteEnumerable, FiniteExhaustible(_))
-            | (InfiniteEnumerable, InfiniteEnumerable) => InfiniteEnumerable,
-            _ => Undecidable,
-        }
-    }
-
-    /// κ2 ^ κ1
-    #[inline(always)]
-    fn kappa_pow(base: Characteristic, exp: Characteristic) -> Characteristic {
-        use Characteristic::*;
-        match (base, exp) {
-            // |A|^0 = 1
-            (_, FiniteExhaustible(0)) => FiniteExhaustible(1),
-            // 0^|A| = 0 (for |A| > 0)
-            (FiniteExhaustible(0), _) => FiniteExhaustible(0),
-            // 1^|A| = 1
-            (FiniteExhaustible(1), _) => FiniteExhaustible(1),
-            // |A|^1 = |A|
-            (x, FiniteExhaustible(1)) => x,
-            // |A|^|B| = finite
-            (FiniteExhaustible(b), FiniteExhaustible(e)) => b
-                .checked_pow(e as u32)
-                .map_or(FiniteExhaustible(usize::MAX), FiniteExhaustible),
-            // |A|^∞ = ∞ (if |A| > 1) or 0 (if |A| = 0) or 1 (if |A| = 1)
-            (FiniteExhaustible(n), InfiniteEnumerable) if n > 1 => InfiniteEnumerable,
-            (FiniteExhaustible(0), InfiniteEnumerable) => FiniteExhaustible(0),
-            (FiniteExhaustible(1), InfiniteEnumerable) => FiniteExhaustible(1),
-            // ∞^|A| = ∞ (for |A| > 0)
-            (InfiniteEnumerable, FiniteExhaustible(n)) if n > 0 => InfiniteEnumerable,
-            // ∞^0 = 1
-            (InfiniteEnumerable, FiniteExhaustible(0)) => FiniteExhaustible(1),
-            // ∞^∞ = ∞
-            (InfiniteEnumerable, InfiniteEnumerable) => InfiniteEnumerable,
-            _ => Undecidable,
-        }
-    }
-
     /// Build the type graph from root, collecting all reachable nodes,
     /// variance edges, and axiom links for bound GenericParam occurrences.
-    #[allow(dead_code)]
     fn build_kappa_graph(&self, root: TypeId) -> KappaGraph {
         use std::collections::HashSet as Set;
 
@@ -5453,9 +6082,9 @@ impl TypeContext {
         let mut param_occurrences: HashMap<(usize, usize), Vec<usize>> = HashMap::default();
 
         // Recursive traversal.
-        fn traverse(
+        fn traverse<'input>(
             ty: TypeId,
-            ctx: &TypeContext,
+            ctx: &TypeContext<'input>,
             nodes: &mut Vec<TypeId>,
             edges: &mut Vec<(usize, usize, isize)>,
             node_map: &mut HashMap<TypeId, usize>,
@@ -5749,8 +6378,8 @@ impl TypeContext {
         kappa_map: &HashMap<TypeId, Characteristic>,
     ) -> Characteristic {
         /// Helper: look up a child's κ — must be resolved at this point.
-        fn ck(
-            ctx: &TypeContext,
+        fn ck<'input>(
+            ctx: &TypeContext<'input>,
             child: TypeId,
             map: &HashMap<TypeId, Characteristic>,
         ) -> Characteristic {
@@ -5968,12 +6597,136 @@ pub enum TypeError {
     },
 }
 
+impl TypeError {
+    /// The source span the error is anchored at.
+    pub fn span(&self) -> crate::ast::Span {
+        match self {
+            TypeError::Mismatch { span, .. }
+            | TypeError::UndefinedName { span, .. }
+            | TypeError::TypeNotFound { span, .. }
+            | TypeError::GenericArgumentCount { span, .. }
+            | TypeError::TraitNotImplemented { span, .. }
+            | TypeError::InvariantViolation { span, .. }
+            | TypeError::SkolemEscape { span, .. }
+            | TypeError::OutOfBounds { span, .. }
+            | TypeError::CircularDependency { span, .. }
+            | TypeError::DuplicateDefinition { span, .. }
+            | TypeError::PrivateField { span, .. }
+            | TypeError::PrivateType { span, .. }
+            | TypeError::PrivateFunction { span, .. }
+            | TypeError::PatternTypeMismatch { span, .. }
+            | TypeError::RecursiveType { span, .. }
+            | TypeError::CannotInfer { span }
+            | TypeError::MutableBorrow { span }
+            | TypeError::ImmutableBorrow { span }
+            | TypeError::DivisionByZero { span }
+            | TypeError::Overflow { span }
+            | TypeError::NeverType { span }
+            | TypeError::PatternNotExhaustive { span }
+            | TypeError::PatternRedundant { span } => *span,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn new_ctx() -> TypeContext {
+    fn new_ctx() -> TypeContext<'static> {
         TypeContext::new()
+    }
+
+    /// Review-fix pin: `place_is_prefix_of` implements "target is a PREFIX
+    /// of frozen" (target equals some ancestor along frozen's base chain) —
+    /// NOT a structure-aligned match.  `a.b` is a prefix of `a.b.c`;
+    /// `a.b` is NOT a prefix of `a.c` (sibling fields).  A proposed
+    /// "simultaneous decomposition" rewrite would break the first case
+    /// (field names at the same depth differ: `b` vs `c`), so this test
+    /// pins the correct semantics against misrepairs.
+    #[test]
+    fn test_place_is_prefix_of() {
+        use crate::hir::place::place_is_prefix_of;
+        let root_a = FrozenPlace::Root(Symbol::intern("a"));
+        let ab = FrozenPlace::Field(
+            Box::new(FrozenPlace::Root(Symbol::intern("a"))),
+            Symbol::intern("b"),
+        );
+        let abc = FrozenPlace::Field(
+            Box::new(FrozenPlace::Field(
+                Box::new(FrozenPlace::Root(Symbol::intern("a"))),
+                Symbol::intern("b"),
+            )),
+            Symbol::intern("c"),
+        );
+        let ac = FrozenPlace::Field(
+            Box::new(FrozenPlace::Root(Symbol::intern("a"))),
+            Symbol::intern("c"),
+        );
+        // `a` is a prefix of `a.b` and `a.b.c`.
+        assert!(place_is_prefix_of(&root_a, &ab));
+        assert!(place_is_prefix_of(&root_a, &abc));
+        // `a.b` is a prefix of `a.b.c`.
+        assert!(place_is_prefix_of(&ab, &abc));
+        // `a.b` is NOT a prefix of `a.c` (siblings) — in either direction.
+        assert!(!place_is_prefix_of(&ab, &ac));
+        assert!(!place_is_prefix_of(&ac, &ab));
+        // Equality is a prefix.
+        assert!(place_is_prefix_of(&abc, &abc));
+    }
+
+    /// Constant-index granularity (`FrozenPlace::ConstIndex`, mirroring
+    /// rustc's `ProjectionElem::ConstantIndex`): `a[0]` and `a[1]` are
+    /// DISTINCT places — freezing `a[0]` does NOT freeze `a[1]`; a DYNAMIC
+    /// index (`a[i]`) conservatively overlaps every constant index on the
+    /// same base, in both directions.
+    #[test]
+    fn test_place_is_prefix_of_const_index() {
+        use crate::hir::place::place_is_prefix_of;
+        let root_a = FrozenPlace::Root(Symbol::intern("a"));
+        let a0 = FrozenPlace::ConstIndex(Box::new(root_a.clone()), 0);
+        let a1 = FrozenPlace::ConstIndex(Box::new(root_a.clone()), 1);
+        let ai = FrozenPlace::Index(Box::new(root_a.clone()));
+
+        // `a` is a prefix of `a[0]` / `a[1]` (writing the whole array
+        // touches every element).
+        assert!(place_is_prefix_of(&root_a, &a0));
+        assert!(place_is_prefix_of(&root_a, &a1));
+        // `a[0]` is a prefix of itself (equality).
+        assert!(place_is_prefix_of(&a0, &a0));
+        // `a[0]` and `a[1]` are DISTINCT constant elements — neither is a
+        // prefix of the other (freezing `a[0]` must NOT freeze `a[1]`).
+        assert!(!place_is_prefix_of(&a0, &a1));
+        assert!(!place_is_prefix_of(&a1, &a0));
+        // Dynamic `a[i]` conservatively overlaps constant `a[0]` — in
+        // BOTH directions (`a[i]` may equal `a[0]`).
+        assert!(place_is_prefix_of(&a0, &ai));
+        assert!(place_is_prefix_of(&ai, &a0));
+        // Dynamic `a[i]` overlaps itself (equality).
+        assert!(place_is_prefix_of(&ai, &ai));
+    }
+
+    /// Committee ruling: raw pointers (`Pointer`/`Ptr`) are Copy — a raw
+    /// pointer is a usize-sized integer that owns nothing and has no
+    /// `Drop`; copying an address has no memory cost or ownership
+    /// consequence.  The pointee does not matter.
+    #[test]
+    fn test_type_is_copy_raw_pointer() {
+        let mut ctx = TypeContext::new();
+        let int_ty = ctx.int(32, true);
+        let ptr = ctx.alloc(TypeData::Pointer { ty: int_ty });
+        assert!(
+            ctx.type_is_copy(ptr),
+            "raw `Pointer` must be Copy (committee ruling)"
+        );
+        let usize_ty = ctx.alloc(TypeData::USize);
+        let ptr2 = ctx.alloc(TypeData::Ptr {
+            size: usize_ty,
+            pointee: int_ty,
+        });
+        assert!(
+            ctx.type_is_copy(ptr2),
+            "raw `Ptr` must be Copy (committee ruling)"
+        );
     }
 
     // -- TypeId tag --
@@ -6013,6 +6766,90 @@ mod tests {
         // A covariant tuple containing the param works
         let tup_ty = ctx.tuple(vec![p0]);
         assert!(ctx.check_variance(0, tup_ty, 1));
+    }
+
+    /// The region solver's unification consistency: `&'a T` must NOT
+    /// unify with `&'b T` when both explicit lifetimes differ (SYNTAX.md
+    /// §Explicit Lifetime Parameters — "mismatches cause compile
+    /// errors"; rustc's "lifetime mismatch").
+    #[test]
+    fn test_unify_explicit_lifetime_mismatch_rejected() {
+        let mut ctx = TypeContext::new();
+        let int_ty = ctx.int(32, true);
+        let a = ctx.reference_with_lifetime(int_ty, false, Some(Symbol::intern("a")));
+        let b = ctx.reference_with_lifetime(int_ty, false, Some(Symbol::intern("b")));
+        assert!(
+            ctx.unify(a, b).is_err(),
+            "&'a T must not unify with &'b T (different explicit lifetimes)"
+        );
+    }
+
+    /// The SAME explicit lifetime unifies with itself.
+    #[test]
+    fn test_unify_same_explicit_lifetime_ok() {
+        let mut ctx = TypeContext::new();
+        let int_ty = ctx.int(32, true);
+        let a = ctx.reference_with_lifetime(int_ty, false, Some(Symbol::intern("a")));
+        assert!(ctx.unify(a, a).is_ok(), "&'a T must unify with itself");
+    }
+
+    /// An ELIDED lifetime (`&T` — `None`) is compatible with an explicit
+    /// one (`&'a T`): the elided side does not constrain the region.
+    #[test]
+    fn test_unify_elided_with_explicit_ok() {
+        let mut ctx = TypeContext::new();
+        let int_ty = ctx.int(32, true);
+        let elided = ctx.reference(int_ty, false);
+        let explicit = ctx.reference_with_lifetime(int_ty, false, Some(Symbol::intern("a")));
+        assert!(
+            ctx.unify(elided, explicit).is_ok(),
+            "elided &T must unify with explicit &'a T"
+        );
+    }
+
+    /// SUBTYPE-level explicit-lifetime consistency (rustc `regions()`'s
+    /// invariant branch): `&'a T` is NOT a subtype of `&'b T` when the
+    /// two explicit regions differ — the pure-type relation stays
+    /// invariant; the region solver verifies `'a: 'b` at the signature
+    /// level (SYNTAX.md §Explicit Lifetime Parameters).
+    #[test]
+    fn test_subtype_explicit_lifetime_mismatch_rejected() {
+        let mut ctx = TypeContext::new();
+        let int_ty = ctx.int(32, true);
+        let a = ctx.reference_with_lifetime(int_ty, false, Some(Symbol::intern("a")));
+        let b = ctx.reference_with_lifetime(int_ty, false, Some(Symbol::intern("b")));
+        assert!(
+            !ctx.subtype(a, b),
+            "&'a T must NOT be a subtype of &'b T (different explicit lifetimes)"
+        );
+        assert!(
+            !ctx.subtype(b, a),
+            "&'b T must NOT be a subtype of &'a T (different explicit lifetimes)"
+        );
+    }
+
+    /// The SAME explicit lifetime is trivially in subtype relation.
+    #[test]
+    fn test_subtype_same_explicit_lifetime_ok() {
+        let mut ctx = TypeContext::new();
+        let int_ty = ctx.int(32, true);
+        let a = ctx.reference_with_lifetime(int_ty, false, Some(Symbol::intern("a")));
+        assert!(ctx.subtype(a, a), "&'a T must be a subtype of itself");
+    }
+
+    /// An ELIDED lifetime is compatible with an explicit one in BOTH
+    /// directions at the subtype level (the `None` side does not
+    /// constrain the region).
+    #[test]
+    fn test_subtype_elided_with_explicit_ok() {
+        let mut ctx = TypeContext::new();
+        let int_ty = ctx.int(32, true);
+        let elided = ctx.reference(int_ty, false);
+        let explicit = ctx.reference_with_lifetime(int_ty, false, Some(Symbol::intern("a")));
+        assert!(
+            ctx.subtype(elided, explicit) && ctx.subtype(explicit, elided),
+            "elided &T and explicit &'a T must be mutually subtypeable"
+        );
     }
 
     #[test]
@@ -6279,6 +7116,30 @@ mod tests {
         let fn_ty = ctx.function(vec![int_ty], int_ty);
         let forall = ctx.forall(0, "X".into(), fn_ty);
         assert!(matches!(ctx.get(forall), TypeData::Forall { .. }));
+    }
+
+    #[test]
+    fn test_yoneda_partial_match_no_reduction() {
+        // Review-fix regression: a PARTIAL Yoneda match must NOT reduce.
+        // `∀X. (A → X) → Int → X` — `A → X` matches the schema but `Int`
+        // does not; silently dropping `Int` would reduce the type to `A`
+        // (mathematically it is `Int → A`).  The reduction must abort and
+        // return the type unchanged (fail-closed).
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "X".into());
+        let int_ty = ctx.int(32, true);
+        let branch = ctx.function(vec![int_ty], p0); // A → X (A = Int)
+        let outer_fn = ctx.function(vec![branch, int_ty], p0); // (A → X) → Int → X
+        let forall_id = ctx.forall(0, "X".into(), outer_fn);
+        let reduced = ctx.try_yoneda_reduce(forall_id);
+        assert_eq!(
+            reduced, forall_id,
+            "a partial Yoneda match must NOT reduce (Int must not be dropped)"
+        );
+        assert!(
+            matches!(ctx.get(reduced), TypeData::Forall { .. }),
+            "the type stays a forall after a rejected reduction"
+        );
     }
 
     #[test]
@@ -6786,7 +7647,7 @@ mod tests {
     #[test]
     fn test_normalize_associated_type_abstract_self() {
         let mut ctx = TypeContext::new();
-        let var_id = ctx.alloc(TypeData::InferVar { id: 0 });
+        let var_id = ctx.alloc(TypeData::InferVar { id: 0, universe: 0 });
         assert_eq!(ctx.try_normalize_associated_type_def_id(var_id), None);
     }
 
@@ -6800,9 +7661,9 @@ mod tests {
         // NOTE: resolve_binding triggers path compression as a side effect,
         // so we must NOT call it before setting up the transaction.
         let mut ctx = TypeContext::new();
-        let a = ctx.alloc(TypeData::InferVar { id: 1 });
-        let b = ctx.alloc(TypeData::InferVar { id: 2 });
-        let c = ctx.alloc(TypeData::InferVar { id: 3 });
+        let a = ctx.alloc(TypeData::InferVar { id: 1, universe: 0 });
+        let b = ctx.alloc(TypeData::InferVar { id: 2, universe: 0 });
+        let c = ctx.alloc(TypeData::InferVar { id: 3, universe: 0 });
 
         // Build a binding chain: a → b → c
         ctx.set_binding(a, b);
@@ -6838,7 +7699,10 @@ mod tests {
         // return Bool's κ (2), not the κ of InferVar (usize::MAX fallback).
         let mut ctx = TypeContext::new();
         let bool_ty = ctx.bool();
-        let infer = ctx.alloc(TypeData::InferVar { id: 42 });
+        let infer = ctx.alloc(TypeData::InferVar {
+            id: 42,
+            universe: 0,
+        });
 
         // Bind infer → Bool
         ctx.set_binding(infer, bool_ty);
@@ -6956,9 +7820,9 @@ fn test_alpha_conv_poly_unify_and_subtype() {
 #[test]
 fn test_occurs_check_through_binding() {
     let mut ctx = TypeContext::new();
-    let param = ctx.alloc(TypeData::InferVar { id: 0 });
-    let mid = ctx.alloc(TypeData::InferVar { id: 1 });
-    let ty = ctx.alloc(TypeData::InferVar { id: 2 });
+    let param = ctx.alloc(TypeData::InferVar { id: 0, universe: 0 });
+    let mid = ctx.alloc(TypeData::InferVar { id: 1, universe: 0 });
+    let ty = ctx.alloc(TypeData::InferVar { id: 2, universe: 0 });
     ctx.set_binding(ty, mid);
     ctx.set_binding(mid, param);
     assert!(

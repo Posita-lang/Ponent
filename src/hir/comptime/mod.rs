@@ -30,7 +30,7 @@
 /// - `UnsafeBlock` in comptime
 ///
 /// ## Design notes
-/// - The evaluator holds `&'a mut TypeContext` to support type creation during
+/// - The evaluator holds `&'a mut TypeContext<'input>` to support type creation during
 ///   comptime (e.g. `layout_of!` needs to allocate types).  The old
 ///   `ctx.factory()` approach via `RefCell` is no longer the primary path —
 ///   the evaluator allocates types directly through `ctx.alloc()`.

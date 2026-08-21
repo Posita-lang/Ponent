@@ -63,9 +63,9 @@ pub struct VariantLayout {
 ///
 /// Returns `None` if the type is not an ADT or the symbol table is
 /// unavailable.
-pub fn compute_adt_layout(
-    ctx: &mut TypeContext,
-    symbols: Option<&SymbolTable>,
+pub fn compute_adt_layout<'input>(
+    ctx: &mut TypeContext<'input>,
+    symbols: Option<&SymbolTable<'input>>,
     target: &Target,
     ty: TypeId,
     diag: &mut DiagCtxt,
@@ -186,15 +186,15 @@ pub fn compute_adt_layout(
 /// `field_types` is a list of (field_name, TypeId) pairs.
 /// `packed`, `align_override`, `c_layout`, and `transparent` control
 /// layout attributes.
-pub fn compute_struct_layout(
-    ctx: &mut TypeContext,
+pub fn compute_struct_layout<'input>(
+    ctx: &mut TypeContext<'input>,
     target: &Target,
     field_types: &[(String, TypeId)],
     packed: bool,
     align_override: Option<u64>,
     c_layout: bool,
     transparent: bool,
-    symbols: Option<&SymbolTable>,
+    symbols: Option<&SymbolTable<'input>>,
     diag: &mut DiagCtxt,
 ) -> Option<LayoutDescriptor> {
     if transparent && field_types.len() == 1 {
@@ -299,15 +299,15 @@ pub fn compute_struct_layout(
 /// is it — see also `TypeId(NonZeroUsize)` in types.rs for an
 /// encoding-level niche trick.
 /// ─────────────────────────────────────────────────────────────
-pub fn compute_enum_layout(
-    ctx: &mut TypeContext,
+pub fn compute_enum_layout<'input>(
+    ctx: &mut TypeContext<'input>,
     target: &Target,
     discr_size: u64,
     discr_align: u64,
     variant_payloads: &[(String, Vec<(String, TypeId)>)],
     packed: bool,
     align_override: Option<u64>,
-    symbols: Option<&SymbolTable>,
+    symbols: Option<&SymbolTable<'input>>,
     diag: &mut DiagCtxt,
 ) -> Option<EnumLayout> {
     // Compute layout of each variant's payload.
@@ -404,10 +404,10 @@ fn align_up(offset: u64, alignment: u64) -> u64 {
 
 /// Resolve an AST `Type` (enum variant payload) to a list of (name, TypeId) fields.
 /// Handles tuples, named types, and basic primitives.
-fn resolve_ast_type_payload(
-    ty: &Type,
-    ctx: &mut TypeContext,
-    symbols: Option<&SymbolTable>,
+fn resolve_ast_type_payload<'input>(
+    ty: &Type<'input>,
+    ctx: &mut TypeContext<'input>,
+    symbols: Option<&SymbolTable<'input>>,
 ) -> Vec<(String, TypeId)> {
     match ty {
         Type::Tuple(tys, _) => tys
@@ -428,10 +428,10 @@ fn resolve_ast_type_payload(
 }
 
 /// Resolve a single AST `Type` to a `TypeId`.
-fn resolve_single_ast_type(
-    ty: &Type,
-    ctx: &mut TypeContext,
-    symbols: Option<&SymbolTable>,
+fn resolve_single_ast_type<'input>(
+    ty: &Type<'input>,
+    ctx: &mut TypeContext<'input>,
+    symbols: Option<&SymbolTable<'input>>,
 ) -> TypeId {
     match ty {
         Type::Path(path, _) => {

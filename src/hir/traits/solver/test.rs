@@ -7,7 +7,7 @@
 use crate::ast::Span;
 use crate::hir::infer::TypeVariableKind;
 use crate::hir::traits::ImplCandidate;
-use crate::hir::traits::solver::coherence::check_overlap;
+use crate::hir::traits::solver::coherence::{check_overlap, specializes};
 use crate::hir::traits::solver::obligation::{
     Obligation, ObligationCause, ObligationCauseCode, Predicate,
 };
@@ -22,7 +22,7 @@ fn make_candidate(
     trait_id: DefId,
     for_type: crate::hir::types::TypeId,
     trait_args: Vec<crate::hir::types::TypeId>,
-) -> ImplCandidate {
+) -> ImplCandidate<'static> {
     ImplCandidate {
         trait_id,
         for_type,
@@ -33,6 +33,33 @@ fn make_candidate(
         has_auto_deref: false,
         context: vec![],
         where_clause_bounds: vec![],
+        arity: 0,
+        trait_args,
+    }
+}
+
+/// Like `make_candidate`, but with where-clause bounds
+/// `(self_ty, trait_id, args)` — for the where-clause overlap tests.
+fn make_candidate_with_bounds(
+    trait_id: DefId,
+    for_type: crate::hir::types::TypeId,
+    trait_args: Vec<crate::hir::types::TypeId>,
+    where_clause_bounds: Vec<(
+        crate::hir::types::TypeId,
+        DefId,
+        Vec<crate::hir::types::TypeId>,
+    )>,
+) -> ImplCandidate<'static> {
+    ImplCandidate {
+        trait_id,
+        for_type,
+        methods: vec![],
+        resolved_methods: vec![],
+        assoc_tys: vec![],
+        span: Span::new(0, 0),
+        has_auto_deref: false,
+        context: vec![],
+        where_clause_bounds,
         arity: 0,
         trait_args,
     }
@@ -601,5 +628,374 @@ fn test_different_goal_different_canonical_key() {
     assert_ne!(
         key32, key64,
         "structurally different goals should produce different canonical keys"
+    );
+}
+
+// ── Regression: Ref lifetime preservation in freshening ────────────
+
+/// The `specializes` freshening must PRESERVE explicit Ref lifetimes.
+/// Two impls `impl<T> Tr for &'a T` and `impl<T> Tr for &'b T` with
+/// DIFFERENT explicit lifetimes must NOT specialize: the unifier treats
+/// two distinct explicit regions as a mismatch.  Regression: freshening
+/// dropped the lifetime to `None`, making both sides "elided" and unifying
+/// — a false-positive specialization.
+#[test]
+fn test_specializes_distinguishes_ref_lifetimes() {
+    let mut ctx = TypeContext::new();
+    let trait_id = DefId(42);
+    let gp = ctx.generic_param(0, Symbol::intern("T"));
+    let ref_a = ctx.reference_with_lifetime(gp, false, Some(Symbol::intern("'a")));
+    let ref_b = ctx.reference_with_lifetime(gp, false, Some(Symbol::intern("'b")));
+    let specific = make_candidate(trait_id, ref_a, vec![]);
+    let general = make_candidate(trait_id, ref_b, vec![]);
+    assert!(
+        !specializes(&mut ctx, &specific, &general),
+        "impls differing only in an explicit Ref lifetime must not specialize"
+    );
+}
+
+/// The `specializes` freshening must ALSO preserve the shared-lifetime
+/// case: `&'a T` vs `&'a T` (same explicit lifetime) DOES specialize —
+/// the fix must not over-reject.
+#[test]
+fn test_specializes_same_ref_lifetime_specializes() {
+    let mut ctx = TypeContext::new();
+    let trait_id = DefId(42);
+    let gp = ctx.generic_param(0, Symbol::intern("T"));
+    let ref_a1 = ctx.reference_with_lifetime(gp, false, Some(Symbol::intern("'a")));
+    let ref_a2 = ctx.reference_with_lifetime(gp, false, Some(Symbol::intern("'a")));
+    let specific = make_candidate(trait_id, ref_a1, vec![]);
+    let general = make_candidate(trait_id, ref_a2, vec![]);
+    assert!(
+        specializes(&mut ctx, &specific, &general),
+        "impls with the SAME explicit Ref lifetime must specialize"
+    );
+}
+
+// ── Regression: check_overlap slow-path iteration isolation ────────
+
+/// The slow path must be self-contained per iteration: a PARTIAL
+/// unification (for_type unifies but a trait_arg does not) must not leak
+/// bindings into the next iteration's judgement.  Regression: the slow
+/// path had no per-iteration transaction (only the caller's outer one),
+/// so iteration i's leftover bindings could pollute iteration i+1.
+#[test]
+fn test_overlap_slow_path_iteration_isolation() {
+    let mut ctx = TypeContext::new();
+    let trait_id = DefId(42);
+    // existing[0]: impl Tr for (T,) with trait_arg Int<32> — the FIRST
+    // iteration's for_type (both contain GenericParam(0)) unifies, but the
+    // trait_arg Int<32> vs Int<64> does NOT: a partial failure that, before
+    // the fix, left fresh-var bindings behind.
+    let gp = ctx.generic_param(0, Symbol::intern("T"));
+    let tuple = ctx.tuple(vec![gp]);
+    let int32 = ctx.int(32, true);
+    let int64 = ctx.int(64, true);
+    let existing0 = make_candidate(trait_id, tuple, vec![int32]);
+    // existing[1]: impl Tr for (Int<64>,) — unrelated, must NOT overlap.
+    let tuple64 = ctx.tuple(vec![int64]);
+    let existing1 = make_candidate(trait_id, tuple64, vec![]);
+    let new = make_candidate(trait_id, ctx.tuple(vec![gp]), vec![int64]);
+
+    let existing = vec![existing0, existing1];
+    ctx.begin_transaction();
+    let conflict = check_overlap(&existing, &new, &mut ctx);
+    ctx.rollback_transaction();
+
+    // new (T,) with Int<64> vs existing0 (T,) with Int<32>: for_type
+    // unifies but trait args differ → NOT a conflict; existing1 (Int<64>,)
+    // is unrelated → overall no conflict.  A leaked binding from iteration 0
+    // (fresh var T := (T,)) would corrupt iteration 1's unification.
+    assert!(
+        conflict.is_none(),
+        "the slow path must isolate iterations — no overlap expected here: {:?}",
+        conflict
+    );
+}
+
+// ── where-clause overlap detection ─────────────────────────────────
+
+/// Two impls whose where-clause bounds are MUTUALLY EXCLUSIVE (same trait,
+/// same self type, but incompatible concrete args — `MyType: Foo<Int<32>>`
+/// vs `MyType: Foo<Int<64>>`) must NOT overlap.  This mirrors the existing
+/// fast-path rule ("two impls of the same trait with different generic
+/// arguments on the same type are NOT overlapping") applied to bounds.
+/// Regression: `check_overlap` ignored `where_clause_bounds` entirely.
+#[test]
+fn test_where_clause_exclusive_bounds_no_overlap_fast_path() {
+    let mut ctx = TypeContext::new();
+    let trait_id = DefId(42);
+    let foo_trait = DefId(200);
+    let for_ty = ctx.struct_ty(DefId(100), vec![]);
+    let int32 = ctx.int(32, true);
+    let int64 = ctx.int(64, true);
+    // impl Tr for MyType where MyType: Foo<Int<32>>
+    let existing = make_candidate_with_bounds(
+        trait_id,
+        for_ty,
+        vec![],
+        vec![(for_ty, foo_trait, vec![int32])],
+    );
+    // impl Tr for MyType where MyType: Foo<Int<64>>
+    let new = make_candidate_with_bounds(
+        trait_id,
+        for_ty,
+        vec![],
+        vec![(for_ty, foo_trait, vec![int64])],
+    );
+
+    ctx.begin_transaction();
+    let conflict = check_overlap(&[existing], &new, &mut ctx);
+    ctx.rollback_transaction();
+
+    assert!(
+        conflict.is_none(),
+        "mutually exclusive where-clause bounds must NOT overlap (fast path): {:?}",
+        conflict
+    );
+}
+
+/// Same as above, but through the SLOW path (for_type contains a
+/// GenericParam, so unification is used).
+#[test]
+fn test_where_clause_exclusive_bounds_no_overlap_slow_path() {
+    let mut ctx = TypeContext::new();
+    let trait_id = DefId(42);
+    let foo_trait = DefId(200);
+    let gp = ctx.generic_param(0, Symbol::intern("T"));
+    let tuple = ctx.tuple(vec![gp]);
+    let int32 = ctx.int(32, true);
+    let int64 = ctx.int(64, true);
+    // impl<T: Foo<Int<32>>> Tr for (T,)
+    let existing =
+        make_candidate_with_bounds(trait_id, tuple, vec![], vec![(gp, foo_trait, vec![int32])]);
+    // impl<T: Foo<Int<64>>> Tr for (T,)
+    let new = make_candidate_with_bounds(
+        trait_id,
+        ctx.tuple(vec![gp]),
+        vec![],
+        vec![(gp, foo_trait, vec![int64])],
+    );
+
+    ctx.begin_transaction();
+    let conflict = check_overlap(&[existing], &new, &mut ctx);
+    ctx.rollback_transaction();
+
+    assert!(
+        conflict.is_none(),
+        "mutually exclusive where-clause bounds must NOT overlap (slow path): {:?}",
+        conflict
+    );
+}
+
+/// Two impls with DIFFERENT trait bounds (`MyType: Display` vs
+/// `MyType: Debug`) DO overlap — a type can satisfy both, so the bounds
+/// are not mutually exclusive.  Matches rustc coherence.
+#[test]
+fn test_where_clause_different_traits_still_overlap() {
+    let mut ctx = TypeContext::new();
+    let trait_id = DefId(42);
+    let display_trait = DefId(200);
+    let debug_trait = DefId(201);
+    let for_ty = ctx.struct_ty(DefId(100), vec![]);
+    let existing = make_candidate_with_bounds(
+        trait_id,
+        for_ty,
+        vec![],
+        vec![(for_ty, display_trait, vec![])],
+    );
+    let new = make_candidate_with_bounds(
+        trait_id,
+        for_ty,
+        vec![],
+        vec![(for_ty, debug_trait, vec![])],
+    );
+
+    ctx.begin_transaction();
+    let conflict = check_overlap(&[existing], &new, &mut ctx);
+    ctx.rollback_transaction();
+
+    assert!(
+        conflict.is_some(),
+        "different trait bounds can hold simultaneously — still overlapping: {:?}",
+        conflict
+    );
+}
+
+/// Two impls with IDENTICAL where-clause bounds DO overlap.
+#[test]
+fn test_where_clause_same_bounds_still_overlap() {
+    let mut ctx = TypeContext::new();
+    let trait_id = DefId(42);
+    let foo_trait = DefId(200);
+    let for_ty = ctx.struct_ty(DefId(100), vec![]);
+    let int32 = ctx.int(32, true);
+    let existing = make_candidate_with_bounds(
+        trait_id,
+        for_ty,
+        vec![],
+        vec![(for_ty, foo_trait, vec![int32])],
+    );
+    let new = make_candidate_with_bounds(
+        trait_id,
+        for_ty,
+        vec![],
+        vec![(for_ty, foo_trait, vec![int32])],
+    );
+
+    ctx.begin_transaction();
+    let conflict = check_overlap(&[existing], &new, &mut ctx);
+    ctx.rollback_transaction();
+
+    assert!(
+        conflict.is_some(),
+        "identical where-clause bounds — still overlapping: {:?}",
+        conflict
+    );
+}
+
+// ── fresh-var counter is TypeContext-local (regression: was process-global) ──
+
+/// The overlap-fresh-var counter must be per-`TypeContext`: two contexts
+/// each start their own counter at the base offset, so (a) parallel tests
+/// and long-running processes never share a monotonic global, and (b) the
+/// first fresh var of every context has the SAME id (deterministic).
+#[test]
+fn test_overlap_fresh_var_counter_is_context_local() {
+    let mut ctx1 = TypeContext::new();
+    let mut ctx2 = TypeContext::new();
+    let fv1 = ctx1.alloc_overlap_fresh_var(0);
+    let fv2 = ctx2.alloc_overlap_fresh_var(0);
+    let id1 = match ctx1.get(fv1) {
+        crate::hir::types::TypeData::InferVar { id, .. } => *id,
+        other => panic!("expected InferVar, got {:?}", other),
+    };
+    let id2 = match ctx2.get(fv2) {
+        crate::hir::types::TypeData::InferVar { id, .. } => *id,
+        other => panic!("expected InferVar, got {:?}", other),
+    };
+    assert_eq!(
+        id1, id2,
+        "each TypeContext must start its own fresh-var counter at the same base"
+    );
+    // And within one context the counter is monotonic.
+    let fv3 = ctx1.alloc_overlap_fresh_var(0);
+    let id3 = match ctx1.get(fv3) {
+        crate::hir::types::TypeData::InferVar { id, .. } => *id,
+        other => panic!("expected InferVar, got {:?}", other),
+    };
+    assert!(
+        id3 > id1,
+        "within one context the counter must be monotonic"
+    );
+}
+
+// ── slow path reuses freshen_generics (with binder shadowing) ─────
+
+/// The slow path now normalizes via the SAME `freshen_generics` as
+/// `specializes` (binder shadowing included): a free GenericParam outside
+/// a Forall is freshened, while the quantifier-BOUND variable inside is
+/// kept — alpha-equivalent composite types still overlap.
+#[test]
+fn test_overlap_slow_path_freshen_with_binder_shadowing() {
+    let mut ctx = TypeContext::new();
+    let trait_id = DefId(42);
+    // ∀X. (X,) paired with a free GenericParam: Tuple([Forall(0,X,X), GP(0)])
+    let gp0 = ctx.generic_param(0, Symbol::intern("X"));
+    let forall_a = ctx.forall(0, Symbol::intern("X"), gp0);
+    let outer_a = ctx.tuple(vec![forall_a, gp0]);
+    // Alpha-equivalent: ∀Y. (Y,) with a free GP at a different index.
+    let gp1 = ctx.generic_param(1, Symbol::intern("Y"));
+    let forall_b = ctx.forall(1, Symbol::intern("Y"), gp1);
+    let outer_b = ctx.tuple(vec![forall_b, gp1]);
+
+    let existing = make_candidate(trait_id, outer_a, vec![]);
+    let new = make_candidate(trait_id, outer_b, vec![]);
+    ctx.begin_transaction();
+    let conflict = check_overlap(&[existing], &new, &mut ctx);
+    ctx.rollback_transaction();
+    assert!(
+        conflict.is_some(),
+        "alpha-equivalent Forall+free-GP composites must overlap: {:?}",
+        conflict
+    );
+}
+
+// ── DynTrait explicit leaf (fast-path structural comparison) ────────
+
+/// DynTrait holds only `Vec<DefId>` — no GenericParam — so it is a leaf
+/// for `contains_generic_param` and overlaps are decided by structural
+/// comparison: identical dyn types overlap, different ones do not.
+#[test]
+fn test_overlap_dyn_trait_structural_leaf() {
+    let mut ctx = TypeContext::new();
+    let trait_id = DefId(42);
+    let dyn_a1 = ctx.alloc(crate::hir::types::TypeData::DynTrait {
+        traits: vec![DefId(100)],
+    });
+    let dyn_a2 = ctx.alloc(crate::hir::types::TypeData::DynTrait {
+        traits: vec![DefId(100)],
+    });
+    let dyn_b = ctx.alloc(crate::hir::types::TypeData::DynTrait {
+        traits: vec![DefId(101)],
+    });
+
+    // Identical dyn types → overlap (fast path).
+    ctx.begin_transaction();
+    let same = check_overlap(
+        &[make_candidate(trait_id, dyn_a1, vec![])],
+        &make_candidate(trait_id, dyn_a2, vec![]),
+        &mut ctx,
+    );
+    ctx.rollback_transaction();
+    assert!(
+        same.is_some(),
+        "identical dyn trait types must overlap: {:?}",
+        same
+    );
+
+    // Different dyn types → no overlap (fast path structural difference).
+    ctx.begin_transaction();
+    let diff = check_overlap(
+        &[make_candidate(trait_id, dyn_a1, vec![])],
+        &make_candidate(trait_id, dyn_b, vec![]),
+        &mut ctx,
+    );
+    ctx.rollback_transaction();
+    assert!(
+        diff.is_none(),
+        "different dyn trait types must NOT overlap: {:?}",
+        diff
+    );
+}
+
+// ── specializes explicit balanced transactions (no frame leak) ─────
+
+/// `specializes` opens TWO transactions (freshening + unification) and must
+/// pop BOTH symmetrically: after any call the transaction depth returns to
+/// its entry value, so repeated calls never grow the stack.
+#[test]
+fn test_specializes_balanced_transactions_no_depth_leak() {
+    let mut ctx = TypeContext::new();
+    let trait_id = DefId(42);
+    let gp = ctx.generic_param(0, Symbol::intern("T"));
+    let tuple = ctx.tuple(vec![gp]);
+    let specific = make_candidate(trait_id, tuple, vec![]);
+    let gp_u = ctx.generic_param(0, Symbol::intern("U"));
+    let general = make_candidate(trait_id, ctx.tuple(vec![gp_u]), vec![]);
+
+    let depth_before = ctx.transaction_depth();
+    let _ = specializes(&mut ctx, &specific, &general);
+    assert_eq!(
+        ctx.transaction_depth(),
+        depth_before,
+        "specializes must not leak transaction frames"
+    );
+    // And a second call is equally clean (no accumulated growth).
+    let _ = specializes(&mut ctx, &specific, &general);
+    assert_eq!(
+        ctx.transaction_depth(),
+        depth_before,
+        "repeated specializes calls must not grow the transaction stack"
     );
 }

@@ -57,6 +57,30 @@ pub enum ObligationState {
     Deferred,
 }
 
+/// The outcome of [`ObligationForest::mark_evaluating`].
+///
+/// An enum (not a bool) so the caller's control flow is forced to
+/// distinguish the two cases at compile time: a node whose evaluation was
+/// ENTERED must be paired with [`leave_evaluating`], while a node that hit
+/// a cycle must NOT — the active-path key belongs to the ancestor that
+/// inserted it, and a spurious `leave_evaluating` would remove the
+/// ancestor's key and corrupt its cycle detection for the rest of its
+/// evaluation.
+///
+/// [`leave_evaluating`]: ObligationForest::leave_evaluating
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnterEvaluation {
+    /// Evaluation was entered.  The node's key is on the active path (or
+    /// the predicate does not participate in cycle detection, in which
+    /// case no key was inserted and `leave_evaluating` is a harmless
+    /// no-op).  The caller MUST call `leave_evaluating` when done.
+    Entered,
+    /// A cycle was detected.  `mark_evaluating` set the node's state to
+    /// `CycleDetected` (coinductive) or `Error` (inductive).  The caller
+    /// must NOT call `leave_evaluating`.
+    CycleDetected,
+}
+
 impl ObligationForest {
     pub fn new() -> Self {
         ObligationForest {
@@ -114,6 +138,16 @@ impl ObligationForest {
         None
     }
 
+    /// Peek at the next pending node WITHOUT popping it — for error
+    /// reporting paths that must not consume the queue (a popped-but-
+    /// unprocessed node would be silently dropped).
+    pub fn peek_pending(&self) -> Option<usize> {
+        self.pending
+            .iter()
+            .copied()
+            .find(|idx| matches!(self.nodes[*idx].state, ObligationState::Pending))
+    }
+
     /// Move deferred nodes whose `stalled_on` variables have been resolved
     /// (are no longer inference variables) back to the `Pending` state and
     /// push them onto the pending queue for re-evaluation.
@@ -124,7 +158,7 @@ impl ObligationForest {
     /// `stalled_on` and the fulfillment loop: the loop calls this method
     /// before checking for progress, so that ready deferred nodes are
     /// picked up by `next_pending`.
-    pub fn recycle_ready_deferred(&mut self, ctx: &TypeContext) -> bool {
+    pub fn recycle_ready_deferred<'input>(&mut self, ctx: &TypeContext<'input>) -> bool {
         let mut any_ready = false;
         for node in &mut self.nodes {
             if matches!(node.state, ObligationState::Deferred)
@@ -174,6 +208,15 @@ impl ObligationForest {
             .count()
     }
 
+    /// The first deferred obligation (in registration order), for reporting
+    /// the obligation that could not be resolved after the final pass.
+    pub fn first_deferred(&self) -> Option<&Obligation> {
+        self.nodes
+            .iter()
+            .find(|n| matches!(n.state, ObligationState::Deferred))
+            .map(|n| &n.obligation)
+    }
+
     /// Mark a node as evaluating (entering cycle detection).
     ///
     /// Uses *resolved* TypeIds for cycle detection so that two obligations
@@ -183,13 +226,31 @@ impl ObligationForest {
     /// Stores the resolved key alongside the node index so that
     /// `leave_evaluating` can remove the entry by index, avoiding the problem
     /// of a key changing under unification.
-    pub fn mark_evaluating(&mut self, idx: usize, ctx: &TypeContext) -> bool {
+    ///
+    /// Returns [`EnterEvaluation::Entered`] when the caller owns evaluation
+    /// and MUST call `leave_evaluating` afterwards.  Returns
+    /// [`EnterEvaluation::CycleDetected`] when the node's key is already on
+    /// the active path (inserted by an ancestor) — the node's state has been
+    /// set to `CycleDetected` (coinductive) or `Error` (inductive), and the
+    /// caller must NOT call `leave_evaluating` (that would remove the
+    /// ancestor's key).
+    ///
+    /// `coinductive_trait` reports whether the node's trait (for
+    /// `Predicate::Trait` goals) is a user-declared coinductive trait
+    /// (`@coinductive`).  The caller computes it because the forest has no
+    /// access to the symbol table.
+    pub fn mark_evaluating<'input>(
+        &mut self,
+        idx: usize,
+        ctx: &TypeContext<'input>,
+        coinductive_trait: bool,
+    ) -> EnterEvaluation {
         let node = &self.nodes[idx];
 
         // Compute the resolved cycle key (following bindings through inference vars).
         let Some(resolved_key) = self.resolved_key_for_node(node, ctx) else {
             // Other predicates don't participate in cycle detection
-            return true;
+            return EnterEvaluation::Entered;
         };
 
         // Check for cycles using resolved keys: two obligations form a cycle
@@ -207,23 +268,23 @@ impl ObligationForest {
             let is_coinductive = matches!(
                 &node.obligation.predicate,
                 Predicate::AutoTrait { .. } | Predicate::Sized { .. }
-            );
+            ) || coinductive_trait;
             if is_coinductive {
                 // Coinductive cycles are ok (e.g., Send: Send)
                 self.nodes[idx].state = ObligationState::CycleDetected;
-                false
+                EnterEvaluation::CycleDetected
             } else {
                 // Non-coinductive cycle is an error
                 self.nodes[idx].state = ObligationState::Error(SolveError::CycleDetected {
                     predicate: node.obligation.predicate.clone(),
                 });
-                false
+                EnterEvaluation::CycleDetected
             }
         } else {
             let (trait_id, self_ty, args_hash) = resolved_key;
             self.active_path.insert((idx, trait_id, self_ty, args_hash));
             self.nodes[idx].state = ObligationState::Evaluating;
-            true
+            EnterEvaluation::Entered
         }
     }
 
@@ -251,7 +312,7 @@ impl ObligationForest {
     /// concrete type, the node is ready for re-evaluation.  The fulfillment
     /// loop uses this to avoid stalling while there is still progress to
     /// be made by re-evaluating unblocked deferred nodes.
-    pub fn has_ready_deferred(&self, ctx: &TypeContext) -> bool {
+    pub fn has_ready_deferred<'input>(&self, ctx: &TypeContext<'input>) -> bool {
         self.nodes.iter().any(|n| {
             matches!(n.state, ObligationState::Deferred)
                 && n.stalled_on.iter().any(|&ty| !ctx.is_infer_var(ty))
@@ -374,12 +435,12 @@ impl ObligationForest {
     }
 
     /// Compute the resolved active_path key for a node, resolving inference
-    /// variables through the TypeContext so that semantically equivalent
+    /// variables through the TypeContext<'input> so that semantically equivalent
     /// obligations (after unification) are detected as cycles.
-    fn resolved_key_for_node(
+    fn resolved_key_for_node<'input>(
         &self,
         node: &ObligationNode,
-        ctx: &TypeContext,
+        ctx: &TypeContext<'input>,
     ) -> Option<(DefId, TypeId, u64)> {
         match &node.obligation.predicate {
             Predicate::Trait {
@@ -416,9 +477,9 @@ fn args_hash(args: &[TypeId]) -> u64 {
 }
 
 /// Compute a hash for a slice of TypeIds, resolving each through the
-/// TypeContext first so that semantically equivalent args (after unification)
+/// TypeContext<'input> first so that semantically equivalent args (after unification)
 /// produce the same hash.
-fn resolved_args_hash(ctx: &TypeContext, args: &[TypeId]) -> u64 {
+fn resolved_args_hash<'input>(ctx: &TypeContext<'input>, args: &[TypeId]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = rustc_hash::FxHasher::default();
     args.len().hash(&mut hasher);
@@ -427,4 +488,180 @@ fn resolved_args_hash(ctx: &TypeContext, args: &[TypeId]) -> u64 {
         resolved.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::traits::solver::obligation::{ObligationCause, ObligationCauseCode};
+
+    fn sized_obligation(ty: TypeId) -> Obligation {
+        Obligation {
+            cause: ObligationCause {
+                span: crate::ast::DUMMY_SPAN,
+                code: ObligationCauseCode::Misc,
+            },
+            predicate: Predicate::Sized { ty },
+            recursion_depth: 0,
+        }
+    }
+
+    fn trait_obligation(trait_id: crate::hir::types::DefId, self_ty: TypeId) -> Obligation {
+        Obligation {
+            cause: ObligationCause {
+                span: crate::ast::DUMMY_SPAN,
+                code: ObligationCauseCode::Misc,
+            },
+            predicate: Predicate::Trait {
+                trait_id,
+                self_ty,
+                args: vec![],
+            },
+            recursion_depth: 0,
+        }
+    }
+
+    /// A `Predicate::Trait` cycle is classified by the caller-supplied
+    /// `coinductive_trait` flag: `true` (a user trait declared `@coinductive`)
+    /// leaves the node in `CycleDetected` state, `false` records an inductive
+    /// `CycleDetected` error.
+    #[test]
+    fn test_mark_evaluating_user_coinductive_trait() {
+        let mut ctx = TypeContext::new();
+        let mut forest = ObligationForest::new();
+        let int_ty = ctx.int(32, true);
+
+        let a = forest.register(trait_obligation(crate::hir::types::DefId(42), int_ty));
+        assert_eq!(
+            forest.mark_evaluating(a, &ctx, true),
+            EnterEvaluation::Entered,
+            "first entry of a key must be Entered"
+        );
+
+        let b = forest.register(trait_obligation(crate::hir::types::DefId(42), int_ty));
+        assert_eq!(
+            forest.mark_evaluating(b, &ctx, true),
+            EnterEvaluation::CycleDetected,
+            "a nested same-key trait obligation must be CycleDetected"
+        );
+        assert!(
+            matches!(forest.state_at(b), ObligationState::CycleDetected),
+            "an @coinductive trait cycle must leave the node in CycleDetected state"
+        );
+
+        let c = forest.register(trait_obligation(crate::hir::types::DefId(42), int_ty));
+        assert_eq!(
+            forest.mark_evaluating(c, &ctx, false),
+            EnterEvaluation::CycleDetected,
+            "a nested same-key trait obligation must be CycleDetected"
+        );
+        assert!(
+            matches!(
+                forest.state_at(c),
+                ObligationState::Error(SolveError::CycleDetected { .. })
+            ),
+            "an inductive trait cycle must record a CycleDetected error"
+        );
+
+        forest.leave_evaluating(a);
+    }
+
+    /// Pins the `EnterEvaluation` contract: only an `Entered` node owns an
+    /// active-path key and may call `leave_evaluating`; a `CycleDetected`
+    /// node must NOT (the key belongs to the ancestor).  A spurious
+    /// `leave_evaluating` after a cycle would corrupt the ancestor's cycle
+    /// detection for the rest of its evaluation.
+    #[test]
+    fn test_mark_evaluating_enter_leave_contract() {
+        let mut ctx = TypeContext::new();
+        let mut forest = ObligationForest::new();
+        let int_ty = ctx.int(32, true);
+
+        // First entry of the key: Entered — owns the active-path key.
+        let a = forest.register(sized_obligation(int_ty));
+        assert_eq!(
+            forest.mark_evaluating(a, &ctx, false),
+            EnterEvaluation::Entered,
+            "first entry of a key must be Entered"
+        );
+
+        // Nested same-key obligations: CycleDetected — the caller must NOT
+        // call leave_evaluating, and the node state records the cycle.
+        let b = forest.register(sized_obligation(int_ty));
+        assert_eq!(
+            forest.mark_evaluating(b, &ctx, false),
+            EnterEvaluation::CycleDetected,
+            "a nested same-key obligation must be CycleDetected"
+        );
+        assert!(
+            matches!(forest.state_at(b), ObligationState::CycleDetected),
+            "coinductive cycle must leave the node in CycleDetected state"
+        );
+
+        // The ancestor's key must still be owned by the ancestor: a third
+        // same-key obligation is STILL a cycle (the key was not removed by
+        // the intermediate node's non-leave).
+        let c = forest.register(sized_obligation(int_ty));
+        assert_eq!(
+            forest.mark_evaluating(c, &ctx, false),
+            EnterEvaluation::CycleDetected,
+            "the ancestor's key must survive the intermediate node (no spurious leave)"
+        );
+
+        // Once the ancestor leaves, the key is free again.
+        forest.leave_evaluating(a);
+        let d = forest.register(sized_obligation(int_ty));
+        assert_eq!(
+            forest.mark_evaluating(d, &ctx, false),
+            EnterEvaluation::Entered,
+            "the key must be re-entered after the ancestor leaves"
+        );
+        forest.leave_evaluating(d);
+    }
+
+    /// A non-cycle-participant predicate (e.g. `Eq`) is `Entered` without
+    /// inserting a key, so `leave_evaluating` afterwards is a harmless
+    /// no-op — the pair must not disturb a real ancestor's key.
+    #[test]
+    fn test_mark_evaluating_non_participant_leave_is_noop() {
+        let mut ctx = TypeContext::new();
+        let mut forest = ObligationForest::new();
+        let int_ty = ctx.int(32, true);
+
+        let a = forest.register(sized_obligation(int_ty));
+        assert_eq!(
+            forest.mark_evaluating(a, &ctx, false),
+            EnterEvaluation::Entered
+        );
+
+        // Eq predicates do not participate in cycle detection.
+        let eq = Obligation {
+            cause: ObligationCause {
+                span: crate::ast::DUMMY_SPAN,
+                code: ObligationCauseCode::Misc,
+            },
+            predicate: Predicate::Eq {
+                a: int_ty,
+                b: int_ty,
+            },
+            recursion_depth: 0,
+        };
+        let e = forest.register(eq);
+        assert_eq!(
+            forest.mark_evaluating(e, &ctx, false),
+            EnterEvaluation::Entered,
+            "non-participant predicates enter without a cycle check"
+        );
+        // leave_evaluating on the non-participant must NOT remove the
+        // ancestor's key.
+        forest.leave_evaluating(e);
+
+        let c = forest.register(sized_obligation(int_ty));
+        assert_eq!(
+            forest.mark_evaluating(c, &ctx, false),
+            EnterEvaluation::CycleDetected,
+            "the ancestor's key must survive a non-participant leave"
+        );
+        forest.leave_evaluating(a);
+    }
 }

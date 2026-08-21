@@ -1,4 +1,5 @@
 use crate::ast::Span;
+use crate::diagnostics::byte_to_linecol;
 use std::fmt;
 
 /// Kind of annotation underline.
@@ -81,19 +82,6 @@ pub struct SourcePos {
     pub line: usize,
     /// 0-based byte offset from the start of the line.
     pub col: usize,
-}
-
-/// Convert a byte-offset span into a 0-based (line, col) pair.
-pub fn byte_to_linecol(source: &str, byte_offset: usize) -> SourcePos {
-    let len = source.len();
-    let clamped = std::cmp::min(byte_offset, len);
-    let prefix = &source[..clamped];
-    let line = prefix.matches('\n').count();
-    let start_of_line = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    SourcePos {
-        line,
-        col: clamped - start_of_line,
-    }
 }
 
 /// Convert byte offset to human-readable "line:col" string (1-based).

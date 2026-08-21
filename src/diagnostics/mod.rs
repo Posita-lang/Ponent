@@ -1016,6 +1016,21 @@ pub fn emit_collector(collector: &DiagCtxt, use_color: bool) {
     emit_diagnostics(&diags, use_color);
 }
 
+/// Convert a byte-offset span into a 0-based (line, col) pair.
+/// Single source of truth — previously duplicated verbatim in
+/// `glyph::byte_to_linecol` and `label::byte_to_linecol`.
+pub(crate) fn byte_to_linecol(source: &str, byte_offset: usize) -> label::SourcePos {
+    let len = source.len();
+    let clamped = std::cmp::min(byte_offset, len);
+    let prefix = &source[..clamped];
+    let line = prefix.matches('\n').count();
+    let start_of_line = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    label::SourcePos {
+        line,
+        col: clamped - start_of_line,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

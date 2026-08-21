@@ -42,6 +42,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub mod dep_graph;
 pub mod job;
 
+#[cfg(test)]
+mod defense_tests;
+
 /// Status of a query key that is currently being computed by some thread.
 ///
 /// Analogous to Rust's `ActiveKeyStatus` in `plumbing.rs`.
@@ -576,6 +579,27 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<crate::hir::types::DefId, V> for
 
 // ── Query trait ───────────────────────────────────────────────────
 
+/// Marker trait for types that may be used as query keys.
+///
+/// This is the type-level gate for the "identity only" discipline: a query
+/// key must be pure *semantic identity* (`DefId`, paths, structural
+/// indices).  Positional data — `Span`s, byte offsets, source text — MUST
+/// NOT implement this trait, so any attempt to put position into a key or
+/// its fingerprint fails to compile (the gate is checked at compile time).
+pub trait QueryKey: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static {}
+
+/// Position-free, stable fingerprint of a query value.
+///
+/// Used for red-green incremental verification: after a node is
+/// recomputed, its fingerprint is compared against the previously stored
+/// one.  Implementations MUST exclude positional data (spans, byte
+/// offsets, source text) — the fingerprint is the value's *semantic*
+/// identity.  Spans stay available at runtime for diagnostics but never
+/// take part in incremental identity.
+pub trait StableHash {
+    fn stable_hash(&self) -> u64;
+}
+
 /// Defines a compiler query: a mapping from `Key → Value` that is
 /// computed on demand and cached for subsequent lookups.
 ///
@@ -586,14 +610,16 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<crate::hir::types::DefId, V> for
 ///
 /// Analogous to Rust's `QueryConfig` + `QueryKey::Cache`.
 pub trait Query: Sized + 'static {
-    type Key: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static;
-    type Value: Clone + std::fmt::Debug + Send + 'static;
+    type Key: QueryKey;
+    type Value: Clone + std::fmt::Debug + Send + 'static + StableHash;
     /// The cache implementation for this query's key type.
     type Cache: QueryCacheType<Self::Key, Self::Value> + Default + Send + Sync;
 
     fn descriptor() -> QueryDescriptor;
     fn compute(key: &Self::Key, provider: &dyn QueryProvider) -> Self::Value;
 }
+
+impl QueryKey for crate::hir::types::DefId {}
 
 // ── QueryVTable ─────────────────────────────────────────────────
 
@@ -605,11 +631,12 @@ pub trait Query: Sized + 'static {
 pub(crate) struct QueryVTable<Q: Query> {
     pub descriptor: QueryDescriptor,
     pub cache: Q::Cache,
-    /// Stack of active keys for cycle detection.
-    /// Uses the actual `Q::Key` type (with `Eq` comparison) instead of
-    /// Debug strings, so cycle detection is exact and avoids the cost
-    /// of `format!` on every query entry.
-    pub active: Vec<Q::Key>,
+    /// Per-thread stacks of active keys for cycle detection and depth
+    /// limiting.  Keyed by `ThreadId` so that parallel executions on
+    /// different threads never share cycle/depth state: depth
+    /// accounting and cycle diagnostics only ever see the current
+    /// thread's keys.
+    pub active: HashMap<std::thread::ThreadId, Vec<Q::Key>>,
 }
 
 impl<Q: Query> QueryVTable<Q> {
@@ -617,59 +644,68 @@ impl<Q: Query> QueryVTable<Q> {
         QueryVTable {
             descriptor: Q::descriptor(),
             cache: Q::Cache::default(),
-            active: Vec::new(),
+            active: HashMap::new(),
         }
     }
 
     /// Try to enter the query with the given key.
-    /// Returns `Err(QueryCycleError)` if the key is already active
-    /// (cycle) or if the query is depth-limited and the stack is too deep.
+    /// Returns `Err(QueryCycleError)` if the key is already active on the
+    /// CURRENT thread's stack (cycle) or if the query is depth-limited and
+    /// the current thread's stack is too deep.
     pub fn enter(&mut self, key: &Q::Key) -> Result<(), QueryCycleError> {
-        if let Some(_prev) = self.active.iter().find(|k| *k == key) {
-            // Build a full call stack from the active keys.
-            let mut stack: Vec<String> = self.active.iter().map(|k| format!("{:?}", k)).collect();
-            stack.push(format!("{:?}", key)); // the repeated key
+        let tid = std::thread::current().id();
+        let stack = self.active.entry(tid).or_default();
+        if let Some(_prev) = stack.iter().find(|k| *k == key) {
+            // Build a full call stack from the current thread's active keys.
+            let mut keys: Vec<String> = stack.iter().map(|k| format!("{:?}", k)).collect();
+            keys.push(format!("{:?}", key)); // the repeated key
             return Err(QueryCycleError {
                 query_name: self.descriptor.name,
                 message: format!(
                     "query cycle detected: `{}` with key `{:?}`\n  call stack:\n    {}",
                     self.descriptor.name,
                     key,
-                    stack
-                        .iter()
+                    keys.iter()
                         .enumerate()
                         .map(|(i, s)| format!("  {}: {}", i, s))
                         .collect::<Vec<_>>()
                         .join("\n    "),
                 ),
-                stack,
+                stack: keys,
             });
         }
-        if self.descriptor.depth_limit && self.active.len() >= MAX_QUERY_DEPTH {
-            let stack: Vec<String> = self.active.iter().map(|k| format!("{:?}", k)).collect();
+        if self.descriptor.depth_limit && stack.len() >= MAX_QUERY_DEPTH {
+            let keys: Vec<String> = stack.iter().map(|k| format!("{:?}", k)).collect();
             return Err(QueryCycleError {
                 query_name: self.descriptor.name,
                 message: format!(
                     "query depth limit exceeded: `{}` depth {} >= {}\n  call stack:\n    {}",
                     self.descriptor.name,
-                    self.active.len() + 1,
+                    stack.len() + 1,
                     MAX_QUERY_DEPTH,
-                    stack
-                        .iter()
+                    keys.iter()
                         .enumerate()
                         .map(|(i, s)| format!("  {}: {}", i, s))
                         .collect::<Vec<_>>()
                         .join("\n    "),
                 ),
-                stack,
+                stack: keys,
             });
         }
-        self.active.push(key.clone());
+        stack.push(key.clone());
         Ok(())
     }
 
+    /// Pop the current thread's key off its active stack.  When the stack
+    /// becomes empty, the thread's entry is removed entirely.
     pub fn leave(&mut self) {
-        self.active.pop();
+        let tid = std::thread::current().id();
+        if let Some(stack) = self.active.get_mut(&tid) {
+            stack.pop();
+            if stack.is_empty() {
+                self.active.remove(&tid);
+            }
+        }
     }
 }
 
@@ -742,12 +778,25 @@ impl std::fmt::Display for QueryCycleError {
 /// cache, and active-key state together.  Also owns a `DepGraph` for
 /// tracking dependencies between query executions, enabling incremental
 /// re-evaluation when inputs change.
+/// A concrete per-query-type shard of the node map: real keys
+/// (`Q::Key`, Eq-checked by the standard HashMap) → stable
+/// `DepNodeIndex`.  Zero collision across and within query types.
+struct ConcreteNodeMap<Q: Query> {
+    map: std::collections::HashMap<Q::Key, dep_graph::DepNodeIndex>,
+}
+
 pub struct QuerySystem {
     vtables: RwLock<HashMap<TypeId, Box<dyn std::any::Any + Send + Sync>>>,
     /// Dependency graph for incremental re-evaluation.
     pub dep_graph: dep_graph::DepGraph,
     /// Maps `hash(TypeId, key)` → stable `DepNodeIndex`.
-    node_map: RwLock<HashMap<u64, dep_graph::DepNodeIndex>>,
+    /// Type-sharded node map: the first level is the query
+    /// `TypeId`; each shard is a CONCRETE `HashMap<Q::Key, DepNodeIndex>`
+    /// keyed by the real key (Eq-checked) — NOT a 64-bit hash — so
+    /// different `(query_type, key)` pairs can never collide on a shared
+    /// `DepNodeIndex` (incremental pollution).  The downcast follows the
+    /// existing `vtables` pattern (`TypeId::of::<Q>()` + `downcast_mut`).
+    node_map: RwLock<HashMap<TypeId, Box<dyn std::any::Any + Send + Sync>>>,
     /// Registered query names for debugging / introspection.
     query_names: RwLock<HashMap<TypeId, &'static str>>,
     /// Active keys: tracks which keys are currently being computed by some
@@ -755,9 +804,14 @@ pub struct QuerySystem {
     /// Key is `(TypeId, hash_of_key)` — the TypeId eliminates cross-query-type
     /// hash collisions that could cause one query to wait on another's latch.
     active_keys: RwLock<HashMap<(TypeId, u64), ActiveKeyStatus>>,
+    /// Cross-thread wait graph: `waiter thread → owner thread` for
+    /// every thread currently blocked on another thread's job latch.
+    /// Registered just before `wait_on` and removed right after it returns
+    /// (both Ok and Err), so it always reflects in-flight waits.
+    wait_graph: RwLock<HashMap<std::thread::ThreadId, std::thread::ThreadId>>,
 }
 
-impl QuerySystem {
+impl<'input> QuerySystem {
     pub fn new() -> Self {
         QuerySystem {
             vtables: RwLock::new(HashMap::default()),
@@ -765,18 +819,27 @@ impl QuerySystem {
             node_map: RwLock::new(HashMap::default()),
             query_names: RwLock::new(HashMap::default()),
             active_keys: RwLock::new(HashMap::default()),
+            wait_graph: RwLock::new(HashMap::default()),
         }
     }
 
     /// Get or create a stable `DepNodeIndex` for a `(query_type, key)` pair.
     fn get_or_create_node<Q: Query>(&self, key: &Q::Key) -> dep_graph::DepNodeIndex {
-        let hash = query_key_hash::<Q>(key);
+        let type_id = TypeId::of::<Q>();
         let mut node_map = self.node_map.write().unwrap();
-        if let Some(&node) = node_map.get(&hash) {
+        let shard = node_map.entry(type_id).or_insert_with(|| {
+            Box::new(ConcreteNodeMap::<Q> {
+                map: Default::default(),
+            })
+        });
+        let shard = shard
+            .downcast_mut::<ConcreteNodeMap<Q>>()
+            .expect("query node map type mismatch — corrupted QuerySystem internal registry");
+        if let Some(&node) = shard.map.get(key) {
             return node;
         }
         let node = self.dep_graph.allocate_node_index();
-        node_map.insert(hash, node);
+        shard.map.insert(key.clone(), node);
         node
     }
 
@@ -813,79 +876,134 @@ impl QuerySystem {
             }
         }
 
-        // Get or create the vtable for cycle detection.
-        let mut vtables = self.vtables.write().unwrap();
-
-        // Check if another thread is already computing this key.
-        // (Parallel query execution: wait on the latch instead of re-computing.)
         let akey = active_key::<Q>(&key);
-        {
-            let mut active = self.active_keys.write().unwrap();
-            match active.get(&akey) {
-                Some(ActiveKeyStatus::Started(job)) => {
-                    // Another thread is computing this key.  Wait for it.
-                    let latch = job.latch.clone();
-                    drop(active);
-                    drop(vtables);
-                    latch.wait_on().map_err(|_| QueryCycleError {
-                        query_name: Q::descriptor().name,
-                        message: format!(
-                            "query poisoned: `{}` with key `{:?}`",
-                            Q::descriptor().name,
-                            key
-                        ),
-                        stack: vec![format!("{:?}", key)],
-                    })?;
-                    // Now the result should be in the cache.
-                    let vtables = self.vtables.read().unwrap();
-                    if let Some(boxed) = vtables.get(&TypeId::of::<Q>()) {
-                        let vtable = boxed.downcast_ref::<QueryVTable<Q>>().unwrap();
-                        if let Some(value) = vtable.cache.lookup(&key) {
-                            return Ok(value);
+        let me = std::thread::current().id();
+
+        // Attempt loop: either become the computing thread, or wait for
+        // the owner and consume its published value.  A waiter loops back
+        // when a concurrent invalidation removed the value from the cache
+        // between the owner's publish and the waiter's lookup — it must
+        // recompute, never report "not found after waiting".
+        loop {
+            // Get or create the vtable for cycle detection.
+            let mut vtables = self.vtables.write().unwrap();
+            let vtable: &mut QueryVTable<Q> = vtables
+                .entry(TypeId::of::<Q>())
+                .or_insert_with(|| Box::new(QueryVTable::<Q>::new()))
+                .downcast_mut::<QueryVTable<Q>>()
+                .expect("vtable type mismatch: the query system's internal type registry is corrupted — this is a compiler bug");
+            let eval_always = vtable.descriptor.eval_always;
+
+            // Same-thread cycle detection FIRST — before any
+            // cross-thread dedup wait.  A key already on the CURRENT
+            // thread's active stack is a re-entrant cycle; checking it
+            // here (via `enter`) makes the detection reachable instead of
+            // deadlocking on our own latch.
+            vtable.enter(&key)?;
+
+            // Check if another thread is already computing this key.
+            // (Parallel query execution: wait on the latch instead of
+            // re-computing.)
+            // `eval_always` queries bypass dedup entirely — they are
+            // never cached, so a waiter would find no result after the
+            // latch.  Each requester computes its own value.
+            let mut waiter: Option<job::QueryJob> = None;
+            if !eval_always {
+                let mut active = self.active_keys.write().unwrap();
+                match active.get(&akey) {
+                    Some(ActiveKeyStatus::Started(job)) => {
+                        // Double-safety guard: a job owned by the
+                        // current thread should already have been caught by
+                        // `enter` above.  Treat it as a cycle rather than
+                        // waiting on our own latch.
+                        if job.owner == me {
+                            vtable.leave();
+                            return Err(QueryCycleError {
+                                query_name: Q::descriptor().name,
+                                message: format!(
+                                    "query cycle detected (owner thread): `{}` with key `{:?}`",
+                                    Q::descriptor().name,
+                                    key
+                                ),
+                                stack: vec![format!("{:?}", key)],
+                            });
                         }
+                        // Another thread is computing this key.  Wait for it.
+                        vtable.leave(); // undo our own enter() push
+                        waiter = Some(job.clone());
                     }
-                    return Err(QueryCycleError {
-                        query_name: Q::descriptor().name,
-                        message: format!(
-                            "query result not found after waiting: `{}` with key `{:?}`",
-                            Q::descriptor().name,
-                            key
-                        ),
-                        stack: vec![format!("{:?}", key)],
-                    });
-                }
-                Some(ActiveKeyStatus::Poisoned) => {
-                    return Err(QueryCycleError {
-                        query_name: Q::descriptor().name,
-                        message: format!(
-                            "query previously panicked: `{}` with key `{:?}`",
-                            Q::descriptor().name,
-                            key
-                        ),
-                        stack: vec![format!("{:?}", key)],
-                    });
-                }
-                None => {
-                    // We'll be the one computing this key.
-                    let job = job::QueryJob::new(node_index);
-                    active.insert(akey, ActiveKeyStatus::Started(job));
+                    Some(ActiveKeyStatus::Poisoned) => {
+                        vtable.leave();
+                        return Err(QueryCycleError {
+                            query_name: Q::descriptor().name,
+                            message: format!(
+                                "query previously panicked: `{}` with key `{:?}`",
+                                Q::descriptor().name,
+                                key
+                            ),
+                            stack: vec![format!("{:?}", key)],
+                        });
+                    }
+                    None => {
+                        // We'll be the one computing this key.
+                        let job = job::QueryJob::new(node_index);
+                        active.insert(akey, ActiveKeyStatus::Started(job));
+                    }
                 }
             }
-        }
-        let vtable: &mut QueryVTable<Q> = vtables
-            .entry(TypeId::of::<Q>())
-            .or_insert_with(|| Box::new(QueryVTable::<Q>::new()))
-            .downcast_mut::<QueryVTable<Q>>()
-            .expect("vtable type mismatch: the query system's internal type registry is corrupted — this is a compiler bug");
+            // Drop the mutable borrows so the latch wait / compute can
+            // use QuerySystem.
+            drop(vtables);
 
-        // Enter the query: cycle detection + depth_limit (if configured).
-        vtable.enter(&key)?;
+            if let Some(job) = waiter {
+                // Register the wait edge and detect cross-thread
+                // cycles BEFORE blocking.  Without this, two threads
+                // waiting on each other's latch would wedge forever.
+                if let Err(chain) = self.register_wait(&job) {
+                    return Err(QueryCycleError {
+                        query_name: Q::descriptor().name,
+                        message: format!(
+                            "query cycle detected across threads: `{}` with key `{:?}`\n  wait chain: {:?}",
+                            Q::descriptor().name,
+                            key,
+                            chain
+                        ),
+                        stack: chain.iter().map(|t| format!("{:?}", t)).collect(),
+                    });
+                }
+                let wait_result = job.latch.wait_on();
+                // Remove the wait edge on BOTH the Ok and the Err path.
+                self.remove_wait();
+                wait_result.map_err(|_| QueryCycleError {
+                    query_name: Q::descriptor().name,
+                    message: format!(
+                        "query poisoned: `{}` with key `{:?}`",
+                        Q::descriptor().name,
+                        key
+                    ),
+                    stack: vec![format!("{:?}", key)],
+                })?;
+                // Consume the published value, if it is still there.
+                let vtables = self.vtables.read().unwrap();
+                let mut found = None;
+                if let Some(boxed) = vtables.get(&TypeId::of::<Q>()) {
+                    let vtable = boxed.downcast_ref::<QueryVTable<Q>>().unwrap();
+                    if !vtable.descriptor.eval_always {
+                        found = vtable.cache.lookup(&key);
+                    }
+                }
+                if let Some(value) = found {
+                    return Ok(value);
+                }
+                // The value was invalidated/removed while we waited —
+                // loop back and become the computing thread.
+                continue;
+            }
+            break; // we are the computing thread
+        }
 
         // Start tracking dependencies for this node.
         self.dep_graph.start_task(node_index);
-
-        // Drop the mutable borrows so that compute can use QuerySystem.
-        drop(vtables);
 
         // Compute the value, wrapped in catch_unwind for panic safety.
         // If the compute panics, we must clean up:
@@ -914,15 +1032,34 @@ impl QuerySystem {
         vtable.leave();
 
         // Signal completion or poisoning to any waiting threads.
-        let hash = query_key_hash::<Q>(&key);
         let mut active = self.active_keys.write().unwrap();
 
         // Handle the computation result.
         let value = match compute_result {
             Ok(v) => v,
             Err(panic_payload) => {
-                // Mark the query as poisoned so waiting threads get an error.
-                active.insert(akey, ActiveKeyStatus::Poisoned);
+                // Take the old `Started(job)` FIRST and poison its
+                // latch so every blocked waiter is woken with an error.
+                // Only then mark the key poisoned (inserting `Poisoned`
+                // over the entry must not silently drop the job with
+                // waiters still sleeping on its latch).
+                // Note: the outer `active` guard is still held here —
+                // re-acquiring it would self-deadlock on the RwLock.
+                if let Some(entry) = active.remove(&akey)
+                    && let ActiveKeyStatus::Started(job) = entry
+                {
+                    // Drop every incoming wait edge BEFORE waking the
+                    // waiters.  A waiter's edge is live only while this job
+                    // is running; clearing it at signal time eliminates the
+                    // stale-edge window between a waiter waking up and its
+                    // own `remove_wait`, which otherwise caused
+                    // false-positive cycle detections under load.
+                    self.clear_waiters_of_me();
+                    job.latch.poison();
+                }
+                if !vtable.descriptor.eval_always {
+                    active.insert(akey, ActiveKeyStatus::Poisoned);
+                }
                 drop(active);
                 drop(vtables);
                 // Resume the panic — the compiler will abort or catch it higher up.
@@ -930,23 +1067,42 @@ impl QuerySystem {
             }
         };
 
+        // Publish the result BEFORE waking waiters: a waiter must always
+        // find the value in the cache once its latch completes (otherwise
+        // it reports "not found after waiting" under parallel load).
+        if !vtable.descriptor.eval_always {
+            vtable.cache.insert(key, value.clone());
+
+            // Red-green verification: fingerprint the new value.  If the
+            // fingerprint is UNCHANGED from the previous computation,
+            // readers stay green (cached, no propagation) — this is what
+            // makes a whitespace/comment edit recompute only the parse
+            // node.  If it CHANGED, only the DIRECT readers are marked
+            // dirty; they re-verify lazily when next requested.
+            let fp = Q::Value::stable_hash(&value);
+            let changed = self
+                .dep_graph
+                .fingerprint(node_index)
+                .is_some_and(|old| old != fp);
+            self.dep_graph.set_fingerprint(node_index, fp);
+            self.dep_graph.mark_green(node_index);
+            if changed {
+                self.dep_graph.dirty_readers(node_index);
+            }
+        }
+
         // Normal completion: remove from active keys and signal waiters.
         if let Some(entry) = active.remove(&akey)
             && let ActiveKeyStatus::Started(job) = entry
         {
+            // Same as the panic path — incoming wait edges are live
+            // only while this job runs; clear them before waking waiters
+            // so the cycle walker never follows a completed wait.
+            self.clear_waiters_of_me();
             job.signal_complete();
         }
         drop(active);
-
-        // Cache the result (unless eval_always).
-        if !vtable.descriptor.eval_always {
-            vtable.cache.insert(key, value.clone());
-        }
-
-        // Mark the node as green after successful re-computation.
-        if !vtable.descriptor.eval_always {
-            self.dep_graph.mark_green(node_index);
-        }
+        drop(vtables);
 
         Ok(value)
     }
@@ -956,6 +1112,51 @@ impl QuerySystem {
         self.dep_graph.read(other);
     }
 
+    /// Register that the current thread is about to block on the job
+    /// owned by `job.owner`, and detect cross-thread wait cycles before
+    /// blocking.  The edge is registered only when no cycle is found.
+    /// On a cycle, returns the wait chain (me → owner → …) for diagnostics.
+    fn register_wait(&self, job: &job::QueryJob) -> Result<(), Vec<std::thread::ThreadId>> {
+        let me = std::thread::current().id();
+        let owner = job.owner;
+        let mut wg = self.wait_graph.write().unwrap();
+        let mut chain = vec![me];
+        let mut cur = owner;
+        loop {
+            if cur == me {
+                return Err(chain);
+            }
+            match wg.get(&cur) {
+                Some(&next) => {
+                    chain.push(cur);
+                    cur = next;
+                }
+                None => break,
+            }
+        }
+        wg.insert(me, owner);
+        Ok(())
+    }
+
+    /// Remove the current thread's wait edge after the latch wait finishes.
+    fn remove_wait(&self) {
+        let me = std::thread::current().id();
+        self.wait_graph.write().unwrap().remove(&me);
+    }
+
+    /// Remove every wait edge pointing at the CURRENT thread.  The
+    /// owner calls this at completion/poison time, before waking waiters.
+    /// With this, an edge (waiter → me) exists in the graph only while my
+    /// job is still running, so the cycle walker can never mistake a
+    /// completed wait for a live one.
+    fn clear_waiters_of_me(&self) {
+        let me = std::thread::current().id();
+        self.wait_graph
+            .write()
+            .unwrap()
+            .retain(|_, owner| *owner != me);
+    }
+
     /// Invalidate a specific node in the dependency graph.
     pub fn invalidate_node(&self, node: dep_graph::DepNodeIndex) {
         self.dep_graph.invalidate(node);
@@ -963,9 +1164,15 @@ impl QuerySystem {
 
     /// Invalidate a cache entry for a specific query key.
     pub fn invalidate<Q: Query>(&self, key: &Q::Key) {
-        let hash = query_key_hash::<Q>(key);
-        if let Some(&node) = self.node_map.read().unwrap().get(&hash) {
-            self.dep_graph.invalidate(node);
+        let type_id = TypeId::of::<Q>();
+        let node_map = self.node_map.read().unwrap();
+        if let Some(shard) = node_map.get(&type_id) {
+            if let Some(shard) = shard.downcast_ref::<ConcreteNodeMap<Q>>() {
+                if let Some(&node) = shard.map.get(key) {
+                    drop(node_map);
+                    self.dep_graph.invalidate(node);
+                }
+            }
         }
         let mut vtables = self.vtables.write().unwrap();
         if let Some(vtable) = vtables.get_mut(&TypeId::of::<Q>()) {
@@ -988,6 +1195,7 @@ impl QuerySystem {
         self.vtables.write().unwrap().clear();
         self.node_map.write().unwrap().clear();
         self.active_keys.write().unwrap().clear();
+        self.wait_graph.write().unwrap().clear();
         self.dep_graph.reset();
     }
 
@@ -1048,7 +1256,7 @@ impl Default for QuerySystem {
 /// Queries can call other queries through `query_get::<Q>(provider, key)`.
 /// Must be `Sync` to support parallel query execution via rayon.
 pub trait QueryProvider: Sync {
-    fn query_system(&self) -> &QuerySystem;
+    fn query_system<'input>(&self) -> &QuerySystem;
 }
 
 /// Execute a query through a provider, returning the cached or computed value.
@@ -1068,7 +1276,7 @@ pub struct DefaultQueryProvider<'a> {
 }
 
 impl<'a> DefaultQueryProvider<'a> {
-    pub fn new(system: &'a QuerySystem) -> Self {
+    pub fn new<'input>(system: &'a QuerySystem) -> Self {
         DefaultQueryProvider { system }
     }
 }
@@ -1088,7 +1296,7 @@ pub struct QueryHandle<'a> {
 }
 
 impl<'a> QueryHandle<'a> {
-    pub fn new(system: &'a QuerySystem, provider: &'a dyn QueryProvider) -> Self {
+    pub fn new<'input>(system: &'a QuerySystem, provider: &'a dyn QueryProvider) -> Self {
         QueryHandle { system, provider }
     }
     pub fn get<Q: Query>(
@@ -1118,6 +1326,16 @@ mod tests {
     struct TestKey(usize);
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct TestValue(String);
+
+    impl QueryKey for TestKey {}
+
+    impl StableHash for TestValue {
+        fn stable_hash(&self) -> u64 {
+            let mut h = rustc_hash::FxHasher::default();
+            self.0.hash(&mut h);
+            h.finish()
+        }
+    }
 
     impl Query for TestQuery {
         type Key = TestKey;
@@ -1260,10 +1478,17 @@ mod tests {
         let r2 = system.get::<Q>(TestKey(1), &provider).unwrap();
         assert_eq!(r2, TestValue("computed_1".into()));
 
-        // Invalidate the node for Q(1) via the dep_graph.
-        let hash = query_key_hash::<Q>(&TestKey(1));
-        if let Some(&node) = system.node_map.read().unwrap().get(&hash) {
-            system.invalidate_node(node);
+        // Invalidate the node for Q(1) via the dep_graph (the node map is
+        // type-sharded — look up the shard by TypeId, then the real key).
+        let type_id = TypeId::of::<Q>();
+        let node_map = system.node_map.read().unwrap();
+        if let Some(shard) = node_map.get(&type_id) {
+            if let Some(shard) = shard.downcast_ref::<ConcreteNodeMap<Q>>() {
+                if let Some(&node) = shard.map.get(&TestKey(1)) {
+                    drop(node_map);
+                    system.invalidate_node(node);
+                }
+            }
         }
 
         // Third call: should be re-computed (same value since Q is deterministic).

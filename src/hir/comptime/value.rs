@@ -15,8 +15,14 @@ use std::sync::Arc;
 pub struct SlotId(pub u32);
 
 /// The result of evaluating a comptime expression.
+///
+/// The `'input` lifetime parameter is carried solely by the
+/// `TypeInfo(Box<TypeInfo<'input>>)` variant — primitive type names inside
+/// `TypeInfo` are stored as `Cow<'input, str>` so that `Int<32>`/`Bool`/…
+/// can borrow from static tables without allocating.  All other variants
+/// are lifetime-erased.
 #[derive(Debug, Clone)]
-pub enum ComptimeValue {
+pub enum ComptimeValue<'input> {
     /// Unit `()` value.
     Unit,
     /// A boolean literal.
@@ -30,7 +36,7 @@ pub enum ComptimeValue {
     /// A type value (returned by type factories).
     Type(TypeId),
     /// A structured type info value (returned by `@typeInfo!`).
-    TypeInfo(Box<TypeInfo>),
+    TypeInfo(Box<TypeInfo<'input>>),
     /// A layout descriptor (returned by `layout_of!`).
     LayoutDescriptor(Box<LayoutDescriptor>),
     /// A comptime pointer value (created by `&x` / `&mut x`).
@@ -41,11 +47,11 @@ pub enum ComptimeValue {
     /// A comptime aggregate value: struct, tuple, or array.
     /// Fields are named for structs, positional for tuples/arrays.
     Aggregate {
-        fields: Vec<(Symbol, ComptimeValue)>,
+        fields: Vec<(Symbol, ComptimeValue<'input>)>,
     },
 }
 
-impl ComptimeValue {
+impl<'input> ComptimeValue<'input> {
     /// Estimate the "own size" of this value in bytes — the memory that would
     /// be freed if this specific reference were dropped.
     ///

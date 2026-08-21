@@ -41,6 +41,10 @@ pub struct QueryJob {
     pub id: QueryJobId,
     /// The `DepNodeIndex` of the query being computed.
     pub dep_node: DepNodeIndex,
+    /// The thread computing this job.  Used as a double-safety guard for
+    /// same-thread cycle detection and as the anchor of the
+    /// cross-thread wait graph.
+    pub owner: std::thread::ThreadId,
     /// The latch that other threads can wait on.
     pub latch: QueryLatch,
 }
@@ -50,6 +54,7 @@ impl QueryJob {
         QueryJob {
             id: QueryJobId::fresh(),
             dep_node,
+            owner: std::thread::current().id(),
             latch: QueryLatch::new(),
         }
     }
@@ -71,6 +76,9 @@ pub struct QueryWaiter {
     pub parent: Option<QueryJobId>,
     pub condvar: Condvar,
     pub completed: Mutex<bool>,
+    /// Set by `QueryLatch::poison`: the computing thread panicked
+    /// and this waiter must return `Err` instead of `Ok`.
+    pub poisoned: Mutex<bool>,
 }
 
 impl QueryWaiter {
@@ -79,6 +87,7 @@ impl QueryWaiter {
             parent,
             condvar: Condvar::new(),
             completed: Mutex::new(false),
+            poisoned: Mutex::new(false),
         }
     }
 }
@@ -105,12 +114,16 @@ impl QueryWaiter {
 pub struct QueryLatch {
     /// `Some(..)` while the query is active, `None` once completed.
     waiters: Arc<Mutex<Option<Vec<Arc<QueryWaiter>>>>>,
+    /// Set once the computing thread panicked.  Read by the
+    /// already-complete fast path of `wait_on`.
+    poisoned: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl QueryLatch {
     pub fn new() -> Self {
         QueryLatch {
             waiters: Arc::new(Mutex::new(Some(Vec::new()))),
+            poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -125,8 +138,13 @@ impl QueryLatch {
         let waiter = {
             let mut waiters_guard = self.waiters.lock().unwrap();
             let Some(waiters) = &mut *waiters_guard else {
-                // Already complete — the result is in the cache.
-                return Ok(());
+                // Already complete — the result is in the cache, unless the
+                // latch was poisoned.
+                return if self.poisoned.load(std::sync::atomic::Ordering::Relaxed) {
+                    Err(())
+                } else {
+                    Ok(())
+                };
             };
 
             let waiter = Arc::new(QueryWaiter::new(None));
@@ -140,7 +158,11 @@ impl QueryLatch {
             completed = waiter.condvar.wait(completed).unwrap();
         }
 
-        Ok(())
+        if *waiter.poisoned.lock().unwrap() {
+            Err(())
+        } else {
+            Ok(())
+        }
     }
 
     /// Signal that the query is complete and resume all waiting threads.
@@ -149,6 +171,23 @@ impl QueryLatch {
         let waiters = waiters_guard.take(); // mark as complete
         if let Some(waiters) = waiters {
             for waiter in waiters {
+                *waiter.completed.lock().unwrap() = true;
+                waiter.condvar.notify_one();
+            }
+        }
+    }
+
+    /// Poison the latch: wake every blocked waiter and make `wait_on`
+    /// return `Err`.  Called when the computing thread panicked,
+    /// so blocked threads are woken with an error instead of hanging.
+    pub fn poison(&self) {
+        self.poisoned
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut waiters_guard = self.waiters.lock().unwrap();
+        let waiters = waiters_guard.take(); // mark as complete
+        if let Some(waiters) = waiters {
+            for waiter in waiters {
+                *waiter.poisoned.lock().unwrap() = true;
                 *waiter.completed.lock().unwrap() = true;
                 waiter.condvar.notify_one();
             }

@@ -1,20 +1,24 @@
 use super::*;
-use crate::ast::{BinOp, Literal, Span, VariableKind};
+use crate::ast::{self, BinOp, Literal, Span, VariableKind};
 use crate::hir::hir::{HirExpr, HirMatchArm, HirParam, HirPattern, HirStmt};
 use crate::hir::types::{TypeContext, TypeId};
 use crate::symbol::Symbol;
 
-fn make_int_val(n: i128, ty: TypeId) -> HirExpr {
-    HirExpr::Literal(Literal::Int(n), ty, Span::new(0, 0))
+fn make_int_val<'input>(n: i128, ty: TypeId) -> HirExpr<'input> {
+    HirExpr::Literal(Literal::Int(ast::IntLit::Small(n)), ty, Span::new(0, 0))
 }
 
-fn make_int(n: i128) -> HirExpr {
+fn make_int<'input>(n: i128) -> HirExpr<'input> {
     make_int_val(n, TypeId::NONE)
 }
 
 /// Insert a comptime variable into the evaluator with a unique slot.
 /// Used in tests that need to set up variable state before evaluation.
-fn insert_var(ec: &mut ComptimeEvalContext, name: &str, val: ComptimeValue) {
+fn insert_var<'a, 'input>(
+    ec: &mut ComptimeEvalContext<'a, 'input>,
+    name: &str,
+    val: ComptimeValue<'input>,
+) {
     let slot = ec.allocate_slot();
     ec.cur_slot.insert(Symbol::intern(name), slot);
     ec.variables.insert(slot, val);
@@ -22,17 +26,25 @@ fn insert_var(ec: &mut ComptimeEvalContext, name: &str, val: ComptimeValue) {
 
 /// Look up a comptime variable by name via the slot mapping.
 /// Returns `None` if the variable doesn't exist in the current scope.
-fn get_var<'a>(ec: &'a ComptimeEvalContext, name: &str) -> Option<&'a ComptimeValue> {
+fn get_var<'a, 'input>(
+    ec: &'a ComptimeEvalContext<'a, 'input>,
+    name: &str,
+) -> Option<&'a ComptimeValue<'input>> {
     ec.cur_slot
         .get(&Symbol::intern(name))
         .and_then(|slot| ec.variables.get(slot))
 }
 
-fn make_bool(b: bool) -> HirExpr {
+fn make_bool<'input>(b: bool) -> HirExpr<'input> {
     HirExpr::Literal(Literal::Bool(b), TypeId::NONE, Span::new(0, 0))
 }
 
-fn make_binop_ty(l: HirExpr, op: BinOp, r: HirExpr, ty: TypeId) -> HirExpr {
+fn make_binop_ty<'input>(
+    l: HirExpr<'input>,
+    op: BinOp,
+    r: HirExpr<'input>,
+    ty: TypeId,
+) -> HirExpr<'input> {
     HirExpr::BinaryOp {
         left: Box::new(l),
         op,
@@ -42,29 +54,38 @@ fn make_binop_ty(l: HirExpr, op: BinOp, r: HirExpr, ty: TypeId) -> HirExpr {
     }
 }
 
-fn make_binop(l: HirExpr, op: BinOp, r: HirExpr) -> HirExpr {
+fn make_binop<'input>(l: HirExpr<'input>, op: BinOp, r: HirExpr<'input>) -> HirExpr<'input> {
     make_binop_ty(l, op, r, TypeId::NONE)
 }
 
 /// Create an Int<32> type and wrap a value in a Literal with that type.
-fn make_int32(ctx: &mut TypeContext, n: i128) -> HirExpr {
+fn make_int32<'input>(ctx: &mut TypeContext<'input>, n: i128) -> HirExpr<'input> {
     let int32 = ctx.int(32, true);
     make_int_val(n, int32)
 }
 
 /// Create a BinaryOp with Int<32> as the result type.
-fn make_binop32(ctx: &mut TypeContext, l: HirExpr, op: BinOp, r: HirExpr) -> HirExpr {
+fn make_binop32<'input>(
+    ctx: &mut TypeContext<'input>,
+    l: HirExpr<'input>,
+    op: BinOp,
+    r: HirExpr<'input>,
+) -> HirExpr<'input> {
     let int32 = ctx.int(32, true);
     make_binop_ty(l, op, r, int32)
 }
 
-fn make_block(stmts: Vec<HirStmt>, last: HirExpr) -> HirExpr {
+fn make_block<'input>(stmts: Vec<HirStmt<'input>>, last: HirExpr<'input>) -> HirExpr<'input> {
     let mut all = stmts;
     all.push(HirStmt::Expression(Box::new(last)));
     HirExpr::Block(all, TypeId::NONE, Span::new(0, 0))
 }
 
-fn make_if(cond: HirExpr, then: HirExpr, els: Option<HirExpr>) -> HirExpr {
+fn make_if<'input>(
+    cond: HirExpr<'input>,
+    then: HirExpr<'input>,
+    els: Option<HirExpr<'input>>,
+) -> HirExpr<'input> {
     let then_block = vec![HirStmt::Expression(Box::new(then))];
     let else_block = els.map(|e| vec![HirStmt::Expression(Box::new(e))]);
     HirExpr::If {
@@ -77,7 +98,10 @@ fn make_if(cond: HirExpr, then: HirExpr, els: Option<HirExpr>) -> HirExpr {
     }
 }
 
-fn eval(ctx: &mut TypeContext, expr: &HirExpr) -> Result<ComptimeValue, ComptimeError> {
+fn eval<'input>(
+    ctx: &mut TypeContext<'input>,
+    expr: &HirExpr<'input>,
+) -> Result<ComptimeValue<'input>, ComptimeError> {
     use crate::diagnostics::DiagCtxt;
     use crate::hir::symbol::SymbolTable;
     use crate::hir::types::{CrateId, DefId};
@@ -413,6 +437,7 @@ fn test_eval_while_loop() {
     }];
 
     let while_stmt = HirStmt::While {
+        label: None,
         cond: Box::new(cond),
         body,
         invariant: None,
@@ -467,6 +492,7 @@ fn test_eval_while_scope_isolation() {
     ];
 
     let while_stmt = HirStmt::While {
+        label: None,
         cond: Box::new(cond),
         body,
         invariant: None,
@@ -542,6 +568,7 @@ fn test_eval_while_shadowing_same_name() {
         },
     ];
     let while_stmt = HirStmt::While {
+        label: None,
         cond: Box::new(cond),
         body,
         invariant: None,
@@ -613,6 +640,7 @@ fn test_assign_while_internal_var_after_loop() {
         },
     ];
     let while_stmt = HirStmt::While {
+        label: None,
         cond: Box::new(cond),
         body,
         invariant: None,
@@ -664,6 +692,7 @@ fn test_eval_while_step_limit() {
     }];
 
     let while_stmt = HirStmt::While {
+        label: None,
         cond: Box::new(cond),
         body,
         invariant: None,
@@ -1253,6 +1282,7 @@ fn test_eval_pointer_shadowing_while() {
     let body = vec![shadow_x, inc_i];
     let cond = make_binop_ty(i(), BinOp::Lt, make_int_val(3, int32), int32);
     let while_stmt = HirStmt::While {
+        label: None,
         cond: Box::new(cond),
         body,
         invariant: None,
@@ -1485,7 +1515,7 @@ fn test_eval_aggregate_index() {
     let index = HirExpr::Index {
         base: Box::new(arr_expr),
         index: Box::new(HirExpr::Literal(
-            Literal::Int(1),
+            Literal::Int(ast::IntLit::Small(1)),
             TypeId::NONE,
             Span::new(0, 0),
         )),
@@ -1638,17 +1668,20 @@ fn test_eval_layout_of() {
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
     // Use the correct AST type structure: Type::Generic(Int, [32])
+    let path_ty: &'static crate::ast::Type<'static> = Box::leak(Box::new(crate::ast::Type::Path(
+        smallvec::smallvec!["Int".into()],
+        Span::new(0, 0),
+    )));
+    let lit_expr: &'static crate::ast::Expr<'static> =
+        Box::leak(Box::new(crate::ast::Expr::Literal(
+            crate::ast::Literal::Int(ast::IntLit::Small(32)),
+            Span::new(0, 0),
+        )));
     let expr = HirExpr::LayoutOf(
         Box::new(crate::ast::Type::Generic(
-            Box::new(crate::ast::Type::Path(vec!["Int".into()], Span::new(0, 0))),
+            path_ty,
             vec![crate::ast::GenericArg::Positional(
-                crate::ast::Type::Literal(
-                    Box::new(crate::ast::Expr::Literal(
-                        crate::ast::Literal::Int(32),
-                        Span::new(0, 0),
-                    )),
-                    Span::new(0, 0),
-                ),
+                crate::ast::Type::Literal(lit_expr, Span::new(0, 0)),
             )],
             Span::new(0, 0),
         )),
@@ -1887,7 +1920,7 @@ fn test_eval_pointer_index() {
     let index = HirExpr::Index {
         base: Box::new(HirExpr::Ident("ptr".into(), TypeId::NONE, Span::new(0, 0))),
         index: Box::new(HirExpr::Literal(
-            Literal::Int(1),
+            Literal::Int(ast::IntLit::Small(1)),
             TypeId::NONE,
             Span::new(0, 0),
         )),
@@ -2068,7 +2101,7 @@ fn test_eval_int_min_neg() {
     let expr = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Neg,
         expr: Box::new(HirExpr::Literal(
-            Literal::Int(i128::MIN),
+            Literal::Int(ast::IntLit::Small(i128::MIN)),
             TypeId::NONE,
             Span::new(0, 0),
         )),
@@ -2286,6 +2319,7 @@ fn test_eval_while_neested() {
         span: Span::new(0, 0),
     }];
     let inner_while = HirStmt::While {
+        label: None,
         cond: Box::new(inner_cond),
         body: inner_body,
         invariant: None,
@@ -2307,6 +2341,7 @@ fn test_eval_while_neested() {
         },
     ];
     let outer_while = HirStmt::While {
+        label: None,
         cond: Box::new(outer_cond),
         body: outer_body,
         invariant: None,

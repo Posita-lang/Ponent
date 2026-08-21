@@ -23,6 +23,7 @@
 
 use crate::ast::Span;
 use crate::diagnostics::Diagnostic;
+use crate::diagnostics::byte_to_linecol;
 use crate::diagnostics::label::{AnnotationKind, Label, SourcePos};
 use crate::diagnostics::level::DiagnosticLevel;
 use std::fmt::Write;
@@ -849,20 +850,6 @@ impl GlyphRenderer {
             reset = self.s.reset,
             msg = msg,
         );
-    }
-}
-
-// ── Helper: byte offset → line:col ──────────────────────────────
-
-pub(crate) fn byte_to_linecol(source: &str, byte_offset: usize) -> SourcePos {
-    let len = source.len();
-    let clamped = std::cmp::min(byte_offset, len);
-    let prefix = &source[..clamped];
-    let line = prefix.matches('\n').count();
-    let start_of_line = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    SourcePos {
-        line,
-        col: clamped - start_of_line,
     }
 }
 

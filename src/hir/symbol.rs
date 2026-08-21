@@ -9,10 +9,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 #[derive(Debug, Clone)]
-pub struct FieldBinding {
+pub struct FieldBinding<'input> {
     pub name: Symbol,
     pub ty: TypeId,
-    pub default: Option<Expr>,
+    pub default: Option<Expr<'input>>,
     pub span: Span,
 }
 
@@ -36,46 +36,46 @@ pub struct VariableBinding {
 }
 
 #[derive(Debug, Clone)]
-pub struct Parameter {
+pub struct Parameter<'input> {
     pub name: Symbol,
     pub ty: TypeId,
     pub span: Span,
-    pub default: Option<Expr>,
+    pub default: Option<Expr<'input>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct FunctionSignature {
-    pub params: Vec<Parameter>,
+pub struct FunctionSignature<'input> {
+    pub params: Vec<Parameter<'input>>,
     pub return_type: Rc<Cell<TypeId>>,
-    pub type_params: Vec<TypeParam>,
-    pub where_clause: Option<WhereClause>,
+    pub type_params: Vec<TypeParam<'input>>,
+    pub where_clause: Option<WhereClause<'input>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct FunctionBinding {
+pub struct FunctionBinding<'input> {
     pub def_id: DefId,
-    pub signature: FunctionSignature,
+    pub signature: FunctionSignature<'input>,
     pub is_comptime: bool,
     pub is_async: bool,
     pub is_pure: bool,
     pub is_ieee_contracts: bool,
-    pub contracts: Vec<Contract>,
-    pub hints: Vec<Expr>,
-    pub attributes: Vec<Attribute>,
+    pub contracts: Vec<Contract<'input>>,
+    pub hints: Vec<Expr<'input>>,
+    pub attributes: Vec<Attribute<'input>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct TypeBinding {
+pub struct TypeBinding<'input> {
     pub def_id: DefId,
-    pub params: Vec<TypeParam>,
+    pub params: Vec<TypeParam<'input>>,
     pub kind: TypeKind,
     pub span: Span,
-    pub alias_ast: Option<Type>,
-    pub attributes: Vec<Attribute>,
-    pub fields: Vec<FieldBinding>,
-    pub variants: Vec<EnumVariant>,
-    pub invariant: Option<Expr>,
-    pub default_value: Option<Expr>,
+    pub alias_ast: Option<Type<'input>>,
+    pub attributes: Vec<Attribute<'input>>,
+    pub fields: Vec<FieldBinding<'input>>,
+    pub variants: Vec<EnumVariant<'input>>,
+    pub invariant: Option<Expr<'input>>,
+    pub default_value: Option<Expr<'input>>,
     pub no_default: bool,
     pub crate_id: CrateId,
     /// Custom error message for non-exhaustive match on this type.
@@ -93,7 +93,7 @@ pub struct TypeBinding {
     /// Expanded layout attributes from `@layout(AliasName)` resolution.
     /// Contains the full set of built-in attributes (packed, endian, etc.)
     /// after alias expansion, for use by codegen / layout_of!.
-    pub expanded_layout_attrs: Vec<crate::ast::Attribute>,
+    pub expanded_layout_attrs: Vec<crate::ast::Attribute<'input>>,
     /// Whether `@packed` is set on this type (remove padding between fields).
     pub packed: bool,
     /// Endianness from `@endian(little)` or `@endian(big)`.
@@ -107,22 +107,22 @@ pub struct TypeBinding {
 }
 
 #[derive(Debug, Clone)]
-pub struct TraitBinding {
+pub struct TraitBinding<'input> {
     pub def_id: DefId,
-    pub methods: Vec<(Symbol, FunctionSignature)>,
-    pub associated_types: Vec<(Symbol, Option<Type>)>,
+    pub methods: Vec<(Symbol, FunctionSignature<'input>)>,
+    pub associated_types: Vec<(Symbol, Option<Type<'input>>)>,
     /// Direct supertraits this trait extends, e.g. `trait Copy: Clone { }`
     /// stores `Clone`'s DefId here.
     pub super_traits: Vec<DefId>,
     pub span: Span,
-    pub attributes: Vec<Attribute>,
+    pub attributes: Vec<Attribute<'input>>,
     pub crate_id: CrateId,
 }
 
 #[derive(Debug, Clone)]
-pub struct ImplBinding {
+pub struct ImplBinding<'input> {
     pub def_id: DefId,
-    pub methods: Vec<ImplMethod>,
+    pub methods: Vec<ImplMethod<'input>>,
     pub span: Span,
 }
 
@@ -133,31 +133,32 @@ pub struct ConstraintPredicate {
 }
 
 #[derive(Debug, Clone)]
-pub struct ConstraintBinding {
+pub struct ConstraintBinding<'input> {
     /// Each predicate is a subject type with its trait bounds,
     /// matching the syntax `Subject: Bound1 + Bound2`.
     pub predicates: Vec<ConstraintPredicate>,
     /// The type parameters declared on the constraint (e.g. `<T>` in
     /// `constraint Foo<T> { T: Display }`).  Stored so the checker can build
     /// a substitution map when the constraint is instantiated at a use site.
-    pub params: Vec<crate::ast::TypeParam>,
+    pub params: Vec<crate::ast::TypeParam<'input>>,
     pub span: Span,
 }
 
-pub struct Scope {
+#[derive(Debug, Clone)]
+pub struct Scope<'input> {
     pub parent: Option<usize>,
     pub variables: IndexMap<Symbol, VariableBinding, FxBuildHasher>,
-    pub functions: HashMap<Symbol, FunctionBinding>,
-    pub types: HashMap<Symbol, TypeBinding>,
-    pub traits: HashMap<Symbol, TraitBinding>,
-    pub impls: Vec<ImplBinding>,
-    pub constraints: HashMap<Symbol, ConstraintBinding>,
+    pub functions: HashMap<Symbol, FunctionBinding<'input>>,
+    pub types: HashMap<Symbol, TypeBinding<'input>>,
+    pub traits: HashMap<Symbol, TraitBinding<'input>>,
+    pub impls: Vec<ImplBinding<'input>>,
+    pub constraints: HashMap<Symbol, ConstraintBinding<'input>>,
     /// If true, duplicate names in this scope are allowed (shadowing).
     /// Block scopes are ordered; module/function scopes are not.
     pub ordered: bool,
 }
 
-impl Scope {
+impl<'input> Scope<'input> {
     pub fn new(parent: Option<usize>, ordered: bool) -> Self {
         Scope {
             parent,
@@ -172,11 +173,12 @@ impl Scope {
     }
 }
 
-pub struct SymbolTable {
-    scopes: Vec<Scope>,
+#[derive(Clone)]
+pub struct SymbolTable<'input> {
+    scopes: Vec<Scope<'input>>,
     current_scope: usize,
-    type_defs: HashMap<DefId, TypeBinding>,
-    trait_defs: HashMap<DefId, TraitBinding>,
+    type_defs: HashMap<DefId, TypeBinding<'input>>,
+    trait_defs: HashMap<DefId, TraitBinding<'input>>,
     next_def_id: usize,
     pub local_crate_id: CrateId,
     /// Maps fully-qualified type path (e.g. "std::collections::HashMap") to DefId.
@@ -189,9 +191,15 @@ pub struct SymbolTable {
     /// Populated by `register_full_path` alongside `full_path_to_def_id`.
     /// Avoids O(n) scans of `full_path_to_def_id` for name lookups.
     def_id_to_full_path: HashMap<DefId, Symbol>,
+    /// Method identity map: (receiver type DefId, method name) → the
+    /// method's OWN DefId (the "assoc item" identity, mirroring rustc's
+    /// `AssocItem.def_id`).  Allocated ONCE in the resolver so that the
+    /// AST pre-scan (`collect_function_effects`) and the checker agree on
+    /// a method's identity — `MethodInfo.def_id` is filled from this map.
+    method_def_ids: HashMap<(DefId, Symbol), DefId>,
 }
 
-impl SymbolTable {
+impl<'input> SymbolTable<'input> {
     pub fn new(local_crate_id: CrateId) -> Self {
         let root = Scope::new(None, false);
         SymbolTable {
@@ -204,6 +212,7 @@ impl SymbolTable {
             full_path_to_def_id: HashMap::default(),
             def_id_to_name: HashMap::default(),
             def_id_to_full_path: HashMap::default(),
+            method_def_ids: HashMap::default(),
         }
     }
 
@@ -245,7 +254,7 @@ impl SymbolTable {
     pub fn insert_function(
         &mut self,
         name: Symbol,
-        binding: FunctionBinding,
+        binding: FunctionBinding<'input>,
         span: Span,
     ) -> Result<(), Diagnostic> {
         let scope = &mut self.scopes[self.current_scope];
@@ -266,7 +275,7 @@ impl SymbolTable {
     pub fn insert_function_at_root(
         &mut self,
         name: Symbol,
-        binding: FunctionBinding,
+        binding: FunctionBinding<'input>,
         span: Span,
     ) -> Result<(), Diagnostic> {
         let scope = &mut self.scopes[0];
@@ -318,7 +327,7 @@ impl SymbolTable {
     pub fn insert_type(
         &mut self,
         name: Symbol,
-        binding: TypeBinding,
+        binding: TypeBinding<'input>,
         span: Span,
     ) -> Result<(), Diagnostic> {
         let scope = &mut self.scopes[self.current_scope];
@@ -351,7 +360,7 @@ impl SymbolTable {
     pub fn insert_trait(
         &mut self,
         name: Symbol,
-        binding: TraitBinding,
+        binding: TraitBinding<'input>,
         span: Span,
     ) -> Result<(), Diagnostic> {
         let scope = &mut self.scopes[self.current_scope];
@@ -367,7 +376,7 @@ impl SymbolTable {
         Ok(())
     }
 
-    pub fn insert_impl(&mut self, binding: ImplBinding, span: Span) {
+    pub fn insert_impl(&mut self, binding: ImplBinding<'input>, span: Span) {
         let scope = &mut self.scopes[self.current_scope];
         scope.impls.push(binding);
     }
@@ -375,7 +384,7 @@ impl SymbolTable {
     pub fn insert_constraint(
         &mut self,
         name: Symbol,
-        binding: ConstraintBinding,
+        binding: ConstraintBinding<'input>,
         span: Span,
     ) -> Result<(), Diagnostic> {
         let scope = &mut self.scopes[self.current_scope];
@@ -405,7 +414,7 @@ impl SymbolTable {
         None
     }
 
-    pub fn lookup_function(&self, name: Symbol) -> Option<&FunctionBinding> {
+    pub fn lookup_function(&self, name: Symbol) -> Option<&FunctionBinding<'input>> {
         let mut idx = self.current_scope;
         while let Some(scope) = self.scopes.get(idx) {
             if let Some(binding) = scope.functions.get(&name) {
@@ -420,7 +429,7 @@ impl SymbolTable {
         None
     }
 
-    pub fn lookup_type(&self, name: Symbol) -> Option<&TypeBinding> {
+    pub fn lookup_type(&self, name: Symbol) -> Option<&TypeBinding<'input>> {
         let mut idx = self.current_scope;
         while let Some(scope) = self.scopes.get(idx) {
             if let Some(binding) = scope.types.get(&name) {
@@ -435,7 +444,7 @@ impl SymbolTable {
         None
     }
 
-    pub fn lookup_type_by_def_id(&self, def_id: DefId) -> Option<&TypeBinding> {
+    pub fn lookup_type_by_def_id(&self, def_id: DefId) -> Option<&TypeBinding<'input>> {
         self.type_defs.get(&def_id)
     }
 
@@ -459,7 +468,7 @@ impl SymbolTable {
         None
     }
 
-    pub fn lookup_trait(&self, name: Symbol) -> Option<&TraitBinding> {
+    pub fn lookup_trait(&self, name: Symbol) -> Option<&TraitBinding<'input>> {
         let mut idx = self.current_scope;
         while let Some(scope) = self.scopes.get(idx) {
             if let Some(binding) = scope.traits.get(&name) {
@@ -474,7 +483,7 @@ impl SymbolTable {
         None
     }
 
-    pub fn lookup_trait_by_def_id(&self, def_id: DefId) -> Option<&TraitBinding> {
+    pub fn lookup_trait_by_def_id(&self, def_id: DefId) -> Option<&TraitBinding<'input>> {
         self.trait_defs.get(&def_id)
     }
 
@@ -498,7 +507,7 @@ impl SymbolTable {
         &self.full_path_to_def_id
     }
 
-    pub fn lookup_constraint(&self, name: Symbol) -> Option<&ConstraintBinding> {
+    pub fn lookup_constraint(&self, name: Symbol) -> Option<&ConstraintBinding<'input>> {
         let mut idx = self.current_scope;
         while let Some(scope) = self.scopes.get(idx) {
             if let Some(binding) = scope.constraints.get(&name) {
@@ -579,12 +588,23 @@ impl SymbolTable {
         crate::hir::types::alloc_def_id()
     }
 
+    /// Register a method's OWN DefId under (receiver type DefId, name).
+    /// Called once per method by the resolver; the checker and the AST
+    /// pre-scan read it back so a method has a single stable identity.
+    pub fn insert_method_def_id(&mut self, receiver: DefId, name: Symbol, method: DefId) {
+        self.method_def_ids.insert((receiver, name), method);
+    }
+
+    pub fn lookup_method_def_id(&self, receiver: DefId, name: Symbol) -> Option<DefId> {
+        self.method_def_ids.get(&(receiver, name)).copied()
+    }
+
     pub fn allocate_crate_id(&mut self) -> CrateId {
         CrateId(self.allocate_def_id())
     }
 
     /// Look up a method by name on a trait bound at a given DefId.
-    pub fn lookup_method(&self, def_id: DefId, name: Symbol) -> Option<&FunctionSignature> {
+    pub fn lookup_method(&self, def_id: DefId, name: Symbol) -> Option<&FunctionSignature<'input>> {
         if let Some(trait_binding) = self.trait_defs.get(&def_id) {
             trait_binding
                 .methods

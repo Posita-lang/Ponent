@@ -1,4 +1,5 @@
 use crate::symbol::Symbol;
+use bitflags::bitflags;
 use logos::Logos;
 
 fn parse_char_literal(s: &str) -> Result<u8, String> {
@@ -33,7 +34,8 @@ fn parse_char_literal(s: &str) -> Result<u8, String> {
                 if chars.next() != Some('{') {
                     return Err("expected '{' after \\u in char literal".to_string());
                 }
-                let mut scalar = String::new();
+                let mut buf = [0u8; 6];
+                let mut len = 0;
                 let mut closed = false;
                 for c in chars.by_ref().take(6) {
                     if c == '}' {
@@ -43,7 +45,8 @@ fn parse_char_literal(s: &str) -> Result<u8, String> {
                     if !c.is_ascii_hexdigit() {
                         return Err("invalid hex digit in \\u{...} in char literal".to_string());
                     }
-                    scalar.push(c);
+                    buf[len] = c as u8;
+                    len += 1;
                 }
                 if !closed {
                     if let Some(c) = chars.next() {
@@ -54,7 +57,7 @@ fn parse_char_literal(s: &str) -> Result<u8, String> {
                         return Err("unclosed \\u{...} in char literal".to_string());
                     }
                 }
-                let code = u32::from_str_radix(&scalar, 16)
+                let code = u32::from_str_radix(std::str::from_utf8(&buf[..len]).unwrap(), 16)
                     .map_err(|_| "invalid hex in \\u{...} in char literal".to_string())?;
                 if code > 0xFF || (0xD800..=0xDFFF).contains(&code) || code > 0x10FFFF {
                     return Err("unicode scalar in char literal must be 0x00..0xFF, not a surrogate, and valid Unicode".to_string());
@@ -77,9 +80,60 @@ fn parse_char_literal(s: &str) -> Result<u8, String> {
     }
 }
 
+/// Parse a float literal: the fast path parses the ORIGINAL slice
+/// directly (zero allocation) when it contains no `_` separator — which
+/// is the overwhelming majority of literals; only literals WITH `_` fall
+/// back to a cleaned String (the integer-side zero-allocation
+/// optimization previously was not applied to floats).
+/// Parse a float literal.  The error messages are STATIC strings — the
+/// `&'static str` error type avoids allocating on every error branch
+/// (the callers map to `String` only if they must — the happy path
+/// performs no allocation).
+fn parse_float_literal(s: &str) -> Result<f64, &'static str> {
+    let parse = |t: &str| match t.parse::<f64>() {
+        Ok(val) => match val.classify() {
+            std::num::FpCategory::Zero
+            | std::num::FpCategory::Normal
+            | std::num::FpCategory::Subnormal => Ok(val),
+            // The committee ruling (float default `trap`): report the SPECIFIC
+            // anomaly — overflow (→ ±inf) vs NaN — for the compile error.
+            std::num::FpCategory::Infinite => Err("float literal overflow"),
+            std::num::FpCategory::Nan => Err("float literal NaN"),
+        },
+        Err(_) => Err("invalid float literal"),
+    };
+    if !s.contains('_') {
+        parse(s)
+    } else {
+        let cleaned: String = s.chars().filter(|c| *c != '_').collect();
+        parse(&cleaned)
+    }
+}
+
+/// Parse an integer literal with `_` separators in a single pass — zero
+/// allocation (the previous `replace('_', "")` + `parse` allocated a new
+/// String and scanned twice).  Overflow is reported with checked
+/// arithmetic.
+fn parse_int_literal(s: &str, radix: u32, overflow_msg: &str) -> Result<i128, String> {
+    let mut acc: i128 = 0;
+    for c in s.chars() {
+        if c == '_' {
+            continue;
+        }
+        let d = c
+            .to_digit(radix)
+            .ok_or_else(|| "invalid digit in literal".to_string())? as i128;
+        acc = acc
+            .checked_mul(radix as i128)
+            .and_then(|v| v.checked_add(d))
+            .ok_or_else(|| overflow_msg.to_string())?;
+    }
+    Ok(acc)
+}
+
 fn parse_string_literal(s: &str) -> Result<String, String> {
     let inner = &s[1..s.len() - 1];
-    let mut result = String::new();
+    let mut result = String::with_capacity(inner.len());
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
@@ -115,7 +169,8 @@ fn parse_string_literal(s: &str) -> Result<String, String> {
                     if chars.next() != Some('{') {
                         return Err("expected '{' after \\u in string literal".to_string());
                     }
-                    let mut scalar = String::new();
+                    let mut buf = [0u8; 6];
+                    let mut len = 0;
                     let mut closed = false;
                     for c in chars.by_ref().take(6) {
                         if c == '}' {
@@ -127,7 +182,8 @@ fn parse_string_literal(s: &str) -> Result<String, String> {
                                 "invalid hex digit in \\u{...} in string literal".to_string()
                             );
                         }
-                        scalar.push(c);
+                        buf[len] = c as u8;
+                        len += 1;
                     }
                     if !closed {
                         if let Some(c) = chars.next() {
@@ -138,8 +194,9 @@ fn parse_string_literal(s: &str) -> Result<String, String> {
                             return Err("unclosed \\u{...} in string literal".to_string());
                         }
                     }
-                    let code = u32::from_str_radix(&scalar, 16)
-                        .map_err(|_| "invalid hex in \\u{...} in string literal".to_string())?;
+                    let code =
+                        u32::from_str_radix(std::str::from_utf8(&buf[..len]).unwrap(), 16)
+                            .map_err(|_| "invalid hex in \\u{...} in string literal".to_string())?;
                     let c = std::char::from_u32(code).ok_or_else(|| {
                         format!("invalid unicode scalar {:#x} in string literal", code)
                     })?;
@@ -161,7 +218,9 @@ fn parse_string_literal(s: &str) -> Result<String, String> {
 
 fn parse_byte_string_literal(s: &str) -> Result<Vec<u8>, String> {
     let inner = &s[2..s.len() - 1];
-    let mut result = Vec::new();
+    // Escape sequences only shorten or keep the length — a safe capacity
+    // bound that avoids reallocations during growth.
+    let mut result = Vec::with_capacity(inner.len());
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
@@ -202,10 +261,63 @@ fn parse_byte_string_literal(s: &str) -> Result<Vec<u8>, String> {
                 }
             }
         } else {
+            if !c.is_ascii() {
+                return Err(
+                    "non-ASCII character not allowed in byte string literal (use \\x or \\u{...})"
+                        .to_string(),
+                );
+            }
             result.push(c as u8);
         }
     }
     Ok(result)
+}
+
+bitflags! {
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct TokenClass: u16 {
+        /// Tokens that can begin an expression.
+        const EXPR_START      = 1 << 0;
+        /// Comparison operators (>, >=, <, <=, ==, !=).
+        const COMPARISON      = 1 << 1;
+        /// Binary operators (arithmetic, shifts, bitwise).
+        const BINARY_OPERATOR = 1 << 2;
+    }
+}
+
+/// The coarse token class used for "may this token appear here" checks.
+pub fn token_class(tok: &Token) -> TokenClass {
+    use Token::*;
+    let mut c = TokenClass::empty();
+    if matches!(
+        tok,
+        IntLiteral(_)
+            | FloatLiteral(_)
+            | True
+            | False
+            | CharLiteral(_)
+            | StringLiteral(_)
+            | ByteStringLiteral(_)
+            | Ident(_)
+            | LParen
+            | LBracket
+            | Minus
+            | Plus
+            | Bang
+            | Tilde
+    ) {
+        c |= TokenClass::EXPR_START;
+    }
+    if matches!(tok, Gt | Ge | Lt | Le | EqEq | Neq) {
+        c |= TokenClass::COMPARISON;
+    }
+    if matches!(
+        tok,
+        Plus | Minus | Star | Slash | Percent | Shl | Ampersand | Pipe | Caret
+    ) {
+        c |= TokenClass::BINARY_OPERATOR;
+    }
+    c
 }
 
 #[derive(Logos, Debug, PartialEq, Clone)]
@@ -317,6 +429,8 @@ pub enum Token {
     Saturate,
     #[token("trap")]
     Trap,
+    #[token("ieee")]
+    Ieee,
     #[token("Self")]
     SelfKw,
     #[token("no_default")]
@@ -459,40 +573,27 @@ pub enum Token {
     BinUIntSuffix(String),
 
     #[regex("[0-9][0-9_]*\\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?", |lex| {
-        let s = lex.slice().replace('_', "");
-        match s.parse::<f64>() {
-            Ok(val) if val.is_finite() => Ok(val),
-            Ok(_) => Err("float literal must be finite (no NaN or Inf)".to_string()),
-            Err(_) => Err("invalid float literal".to_string()),
-        }
+        parse_float_literal(lex.slice()).map_err(|e| e.to_string())
     })]
     #[regex("[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*", |lex| {
-        let s = lex.slice().replace('_', "");
-        match s.parse::<f64>() {
-            Ok(val) if val.is_finite() => Ok(val),
-            Ok(_) => Err("float literal must be finite (no NaN or Inf)".to_string()),
-            Err(_) => Err("invalid float literal".to_string()),
-        }
+        parse_float_literal(lex.slice()).map_err(|e| e.to_string())
     })]
     FloatLiteral(Result<f64, String>),
 
     #[regex("[0-9][0-9_]*", |lex| {
-        let s = lex.slice().replace('_', "");
-        s.parse::<i128>().map(Ok).unwrap_or_else(|_| Err("integer literal overflow".to_string()))
+        parse_int_literal(lex.slice(), 10, "integer literal overflow")
     })]
     IntLiteral(Result<i128, String>),
     #[regex("0x[0-9a-fA-F][0-9a-fA-F_]*", |lex| {
-        let s = lex.slice()[2..].replace('_', "");
-        i128::from_str_radix(&s, 16).map(Ok).unwrap_or_else(|_| Err("hex literal overflow".to_string()))
+        parse_int_literal(&lex.slice()[2..], 16, "hex literal overflow")
     })]
     HexLiteral(Result<i128, String>),
     #[regex("0b[01][01_]*", |lex| {
-        let s = lex.slice()[2..].replace('_', "");
-        i128::from_str_radix(&s, 2).map(Ok).unwrap_or_else(|_| Err("binary literal overflow".to_string()))
+        parse_int_literal(&lex.slice()[2..], 2, "binary literal overflow")
     })]
     BinLiteral(Result<i128, String>),
 
-    #[regex("'(?:[^'\\\\]|\\\\[^']*|\\\\')'", |lex| parse_char_literal(lex.slice()))]
+    #[regex("'(?:[^'\\\\]|\\\\(?:[nrt\\\\\"'0]|x[0-9a-fA-F]{2}|u\\{[0-9a-fA-F]{1,6}\\}))'", |lex| parse_char_literal(lex.slice()))]
     CharLiteral(Result<u8, String>),
     #[regex("b\"(\\\\.|[^\"\\\\])*\"", |lex| parse_byte_string_literal(lex.slice()))]
     ByteStringLiteral(Result<Vec<u8>, String>),
@@ -522,6 +623,9 @@ pub enum Token {
     PlusSaturate,
     #[token("-?")]
     MinusSaturate,
+    /// `*?` — saturating multiply. STILL UNDER RESEARCH: the BII template
+    /// domain is linear, multiplication is outside the subset, and
+    /// lowering fails closed on it. `/?` has no token yet.
     #[token("*?")]
     StarSaturate,
     #[token("+!")]
@@ -719,19 +823,13 @@ impl Token {
             Token::Shl => "`<<`".to_string(),
             Token::Shr => "`>>`".to_string(),
             Token::At => "`@`".to_string(),
-            // Keywords
+            // Keywords (continued — first batch at lines ~735–776)
             Token::Default => "`default`".to_string(),
-            Token::Let => "`let`".to_string(),
-            Token::Mut => "`mut`".to_string(),
-            Token::Ref => "`ref`".to_string(),
             Token::Copy => "`copy`".to_string(),
-            Token::Move => "`move`".to_string(),
-            Token::Dyn => "`dyn`".to_string(),
             Token::By => "`by`".to_string(),
             Token::In => "`in`".to_string(),
             Token::Auto => "`auto`".to_string(),
             Token::With => "`with`".to_string(),
-            Token::Where => "`where`".to_string(),
             Token::When => "`when`".to_string(),
             Token::Const => "`const`".to_string(),
             Token::Finally => "`finally`".to_string(),
@@ -743,12 +841,12 @@ impl Token {
             Token::Wrap => "`wrap`".to_string(),
             Token::Saturate => "`saturate`".to_string(),
             Token::Trap => "`trap`".to_string(),
+            Token::Ieee => "`ieee`".to_string(),
             Token::Old => "`old`".to_string(),
             Token::Ghost => "`ghost`".to_string(),
             Token::ScopeCleanup => "`scope_cleanup`".to_string(),
             Token::Trigger => "`trigger`".to_string(),
             Token::Validate => "`validate`".to_string(),
-            Token::Isolate => "`isolate`".to_string(),
             Token::Layout => "`layout`".to_string(),
             Token::Alignof => "`alignof`".to_string(),
             Token::Sizeof => "`sizeof`".to_string(),
@@ -908,6 +1006,68 @@ impl Token {
             Token::Trunc => Some(Symbol::intern("trunc")),
             Token::Ceil => Some(Symbol::intern("ceil")),
             Token::Floor => Some(Symbol::intern("floor")),
+            Token::Ieee => Some(Symbol::intern("ieee")),
+            // The remaining SYNTAX.md keywords were missing
+            // from the path-position table — any keyword is valid
+            // after `::` (`T::default()`, `T::move()`),
+            // so every keyword with a dedicated token must resolve to its
+            // surface name in path position (e.g. `T::requires`).
+            Token::Def => Some(Symbol::intern("def")),
+            Token::Set => Some(Symbol::intern("set")),
+            Token::With => Some(Symbol::intern("with")),
+            Token::Return => Some(Symbol::intern("return")),
+            Token::If => Some(Symbol::intern("if")),
+            Token::Else => Some(Symbol::intern("else")),
+            Token::For => Some(Symbol::intern("for")),
+            Token::While => Some(Symbol::intern("while")),
+            Token::Loop => Some(Symbol::intern("loop")),
+            Token::Leave => Some(Symbol::intern("leave")),
+            Token::Continue => Some(Symbol::intern("continue")),
+            Token::Comptime => Some(Symbol::intern("comptime")),
+            Token::Generate => Some(Symbol::intern("generate")),
+            Token::Import => Some(Symbol::intern("import")),
+            Token::From => Some(Symbol::intern("from")),
+            Token::True => Some(Symbol::intern("true")),
+            Token::False => Some(Symbol::intern("false")),
+            Token::Auto => Some(Symbol::intern("auto")),
+            Token::Sizeof => Some(Symbol::intern("sizeof")),
+            Token::Alignof => Some(Symbol::intern("alignof")),
+            Token::Requires => Some(Symbol::intern("requires")),
+            Token::Ensures => Some(Symbol::intern("ensures")),
+            Token::Invariant => Some(Symbol::intern("invariant")),
+            Token::Constraint => Some(Symbol::intern("constraint")),
+            Token::NoDefault => Some(Symbol::intern("no_default")),
+            Token::Edition => Some(Symbol::intern("edition")),
+            Token::Deprecated => Some(Symbol::intern("deprecated")),
+            Token::Experimental => Some(Symbol::intern("experimental")),
+            Token::Endian => Some(Symbol::intern("endian")),
+            Token::BitOrder => Some(Symbol::intern("bit_order")),
+            Token::Align => Some(Symbol::intern("align")),
+            Token::Pad => Some(Symbol::intern("pad")),
+            Token::Packed => Some(Symbol::intern("packed")),
+            Token::Task => Some(Symbol::intern("task")),
+            Token::Channel => Some(Symbol::intern("channel")),
+            Token::Linear => Some(Symbol::intern("linear")),
+            Token::Consume => Some(Symbol::intern("consume")),
+            Token::ScopeCleanup => Some(Symbol::intern("scope_cleanup")),
+            Token::Trigger => Some(Symbol::intern("trigger")),
+            Token::MissingMatch => Some(Symbol::intern("missing_match")),
+            Token::ApplyLemma => Some(Symbol::intern("apply_lemma")),
+            Token::Decreases => Some(Symbol::intern("decreases")),
+            Token::Terminates => Some(Symbol::intern("terminates")),
+            Token::MustUse => Some(Symbol::intern("must_use")),
+            Token::MustHandle => Some(Symbol::intern("must_handle")),
+            Token::LinkProof => Some(Symbol::intern("link_proof")),
+            Token::Exhaustive => Some(Symbol::intern("exhaustive")),
+            Token::NoAllocError => Some(Symbol::intern("no_alloc_error")),
+            Token::NoPanic => Some(Symbol::intern("no_panic")),
+            Token::DebugInfo => Some(Symbol::intern("debug_info")),
+            Token::IeeeContracts => Some(Symbol::intern("ieee_contracts")),
+            Token::AuditLog => Some(Symbol::intern("audit_log")),
+            Token::Interrupt => Some(Symbol::intern("interrupt")),
+            Token::Match => Some(Symbol::intern("match")),
+            Token::OnTimeout => Some(Symbol::intern("on_timeout")),
+            Token::OnCancel => Some(Symbol::intern("on_cancel")),
             _ => None,
         }
     }
@@ -1460,9 +1620,7 @@ mod tests {
             .collect();
         assert_eq!(
             tokens,
-            vec![Token::FloatLiteral(Err(
-                "float literal must be finite (no NaN or Inf)".into()
-            ))]
+            vec![Token::FloatLiteral(Err("float literal overflow".into()))]
         );
     }
 
@@ -1737,15 +1895,13 @@ mod tests {
     fn float_special_values_are_rejected() {
         check_tokens(
             "1e9999",
-            vec![Token::FloatLiteral(Err(
-                "float literal must be finite (no NaN or Inf)".into(),
-            ))],
+            vec![Token::FloatLiteral(Err("float literal overflow".into()))],
         );
         check_tokens(
             "-1e9999",
             vec![
                 Token::Minus,
-                Token::FloatLiteral(Err("float literal must be finite (no NaN or Inf)".into())),
+                Token::FloatLiteral(Err("float literal overflow".into())),
             ],
         );
     }
@@ -1829,6 +1985,9 @@ mod tests {
 
     #[test]
     fn invalid_char_escape_reports_error() {
+        // With the tightened char-literal regex, '\q' is not recognized
+        // as a CharLiteral token at all — the invalid escape means the
+        // regex doesn't match.  The lexer produces separate tokens.
         let source = r"'\q'";
         let tokens: Vec<_> = Token::lexer(source)
             .filter_map(|r| r.ok())
@@ -1836,9 +1995,11 @@ mod tests {
             .collect();
         assert_eq!(
             tokens,
-            vec![Token::CharLiteral(Err(
-                "unknown escape sequence in char literal".into()
-            ))]
+            vec![
+                Token::Apostrophe,
+                Token::Ident(Symbol::intern("q")),
+                Token::Apostrophe
+            ]
         );
     }
 
@@ -1910,6 +2071,30 @@ mod tests {
                 Token::Semicolon,
                 Token::RBrace,
                 Token::RBrace,
+            ],
+        );
+    }
+
+    /// LEXER-LEVEL coverage for the `ieee` keyword token (the parser's
+    /// `Token::Ieee` arm is dead code — the keyword flows through
+    /// `as_ident_symbol`, so a lexer regression would silently turn
+    /// `with overflow = ieee` into a bare identifier error at the
+    /// parser; this test pins the tokenization itself).
+    #[test]
+    fn test_ieee_keyword_token() {
+        check_tokens("ieee", vec![Token::Ieee]);
+        // The keyword-in-path-position property: keywords are NOT
+        // reserved after `::` (`Mod::ieee` is a valid path segment).
+        // The LEXER still emits the keyword token `Ieee` — the
+        // identifier recovery happens in the PARSER via
+        // `as_ident_symbol` (which maps `Token::Ieee` back to the
+        // symbol `ieee`).  This pins the lexer-level tokenization.
+        check_tokens(
+            "Mod::ieee",
+            vec![
+                Token::Ident(Symbol::intern("Mod")),
+                Token::ColonColon,
+                Token::Ieee,
             ],
         );
     }

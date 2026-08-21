@@ -18,7 +18,7 @@ use crate::symbol::Symbol;
 /// 3. Confirmation (verifying the selected candidate and producing sub-obligations)
 ///
 /// Uses `TraitEnv` as a read-only data source for registered impls.
-/// Does NOT modify `TraitEnv` — all state mutations go through `TypeContext` transactions.
+/// Does NOT modify `TraitEnv` — all state mutations go through `TypeContext<'input>` transactions.
 ///
 /// ## Refactoring Note
 /// Candidate assembly (impls, caller_bounds, builtins, object_ty, poly) has been
@@ -27,10 +27,10 @@ use crate::symbol::Symbol;
 /// The old private assembly methods (`assemble_candidates_from_*`, `try_match_impl`,
 /// `winnow`, `specificity`, `confirm_candidate`) have been removed from this file.
 /// See `src/hir/traits/solver/assembly/mod.rs` for the new implementation.
-pub struct SelectionContext<'a> {
-    pub ctx: &'a mut TypeContext,
-    pub trait_env: &'a TraitEnv,
-    pub symbols: &'a SymbolTable,
+pub struct SelectionContext<'a, 'input> {
+    pub ctx: &'a mut TypeContext<'input>,
+    pub trait_env: &'a TraitEnv<'input>,
+    pub symbols: &'a SymbolTable<'input>,
     pub builtin_registry: &'a BuiltinTraitRegistry,
     /// Caller bounds (from where-clauses in scope).
     pub caller_bounds: &'a [Predicate],
@@ -98,7 +98,12 @@ pub enum Candidate {
 /// A resolved obligation — self_ty has been followed through bindings.
 #[derive(Clone, Debug)]
 pub struct ResolvedObligation {
-    pub trait_id: DefId,
+    /// `Some` for trait goals (or the built-in `Sized` marker);
+    /// `None` for non-trait goals (`Eq` / `Sub` / `Match` / ...).  An
+    /// `Option` instead of the old `DefId(0)` / `DefId(usize::MAX)`
+    /// sentinels — a real trait's `DefId` can start at 0, which would
+    /// collide with the `DefId(0)` "no trait" marker.
+    pub trait_id: Option<DefId>,
     pub self_ty: TypeId,
     pub args: Vec<TypeId>,
     /// Whether the self_ty is still an inference variable, meaning the
@@ -112,11 +117,11 @@ pub struct ResolvedObligation {
     pub span: crate::ast::Span,
 }
 
-impl<'a> SelectionContext<'a> {
+impl<'a, 'input> SelectionContext<'a, 'input> {
     pub fn new(
-        ctx: &'a mut TypeContext,
-        trait_env: &'a TraitEnv,
-        symbols: &'a SymbolTable,
+        ctx: &'a mut TypeContext<'input>,
+        trait_env: &'a TraitEnv<'input>,
+        symbols: &'a SymbolTable<'input>,
         builtin_registry: &'a BuiltinTraitRegistry,
         proj_cache: &'a ProjectionCache,
         caller_bounds: &'a [Predicate],
@@ -163,7 +168,7 @@ impl<'a> SelectionContext<'a> {
                     args.iter().map(|a| self.ctx.resolve_binding(*a)).collect();
                 let ambiguous = self.ctx.is_infer_var(resolved_self);
                 ResolvedObligation {
-                    trait_id: *trait_id,
+                    trait_id: Some(*trait_id),
                     self_ty: resolved_self,
                     args: resolved_args,
                     ambiguous,
@@ -175,7 +180,7 @@ impl<'a> SelectionContext<'a> {
                 let resolved_self = self.ctx.resolve_binding(*self_ty);
                 let ambiguous = self.ctx.is_infer_var(resolved_self);
                 ResolvedObligation {
-                    trait_id: *trait_id,
+                    trait_id: Some(*trait_id),
                     self_ty: resolved_self,
                     args: vec![],
                     ambiguous,
@@ -187,7 +192,7 @@ impl<'a> SelectionContext<'a> {
                 let resolved_ty = self.ctx.resolve_binding(*ty);
                 let ambiguous = self.ctx.is_infer_var(resolved_ty);
                 ResolvedObligation {
-                    trait_id: DefId(usize::MAX), // sentinel
+                    trait_id: Some(DefId(usize::MAX)), // built-in Sized
                     self_ty: resolved_ty,
                     args: vec![],
                     ambiguous,
@@ -198,7 +203,7 @@ impl<'a> SelectionContext<'a> {
             _ => {
                 // Fallback for other predicate types (ProjectionEq, etc.)
                 ResolvedObligation {
-                    trait_id: DefId(0),
+                    trait_id: None,
                     self_ty: self.ctx.error(),
                     args: vec![],
                     ambiguous: false,
@@ -239,18 +244,21 @@ impl<'a> SelectionContext<'a> {
             project::ProjectionResult::Normalized(concrete_ty) => {
                 self.ctx
                     .unify(value, concrete_ty)
-                    .map_err(|_| SolveError::Mismatch {
+                    .map_err(|e| SolveError::Mismatch {
                         expected: value,
                         found: concrete_ty,
                         span: cause.span,
+                        note: format!("unify failed: {e:?}"),
                     })?;
                 Ok(ImplSource::Param(vec![]))
             }
             project::ProjectionResult::Deferred(stalled_on) => Ok(ImplSource::Deferred {
                 stalled_on: vec![stalled_on],
             }),
-            _ => Err(SolveError::NotFound {
-                trait_id,
+            // Explicit arm — a newly added ProjectionResult variant is a
+            // compile error here instead of being silently swallowed by `_`.
+            project::ProjectionResult::Error => Err(SolveError::NotFound {
+                trait_id: Some(trait_id),
                 self_ty: resolved_self,
                 span: cause.span,
             }),
@@ -284,10 +292,11 @@ impl<'a> SelectionContext<'a> {
             project::ProjectionResult::Normalized(concrete_ty) => {
                 self.ctx
                     .unify(target, concrete_ty)
-                    .map_err(|_| SolveError::Mismatch {
+                    .map_err(|e| SolveError::Mismatch {
                         expected: target,
                         found: concrete_ty,
                         span: cause.span,
+                        note: format!("unify failed: {e:?}"),
                     })?;
                 Ok(ImplSource::Param(vec![]))
             }
@@ -295,7 +304,7 @@ impl<'a> SelectionContext<'a> {
                 stalled_on: vec![stalled_on],
             }),
             _ => Err(SolveError::NotFound {
-                trait_id: projection.trait_id,
+                trait_id: Some(projection.trait_id),
                 self_ty: resolved_self,
                 span: cause.span,
             }),
@@ -307,16 +316,16 @@ impl<'a> SelectionContext<'a> {
 
 // ── SolverDelegate implementation ───────────────────────────────────
 
-impl SolverDelegate for SelectionContext<'_> {
-    fn ctx(&mut self) -> &mut TypeContext {
+impl<'a, 'input> SolverDelegate<'input> for SelectionContext<'a, 'input> {
+    fn ctx(&mut self) -> &mut TypeContext<'input> {
         self.ctx
     }
 
-    fn trait_env(&self) -> &TraitEnv {
+    fn trait_env(&self) -> &TraitEnv<'input> {
         self.trait_env
     }
 
-    fn symbols(&self) -> &SymbolTable {
+    fn symbols(&self) -> &SymbolTable<'input> {
         self.symbols
     }
 
@@ -337,9 +346,16 @@ impl SolverDelegate for SelectionContext<'_> {
     }
 
     fn trait_is_coinductive(&self, def_id: DefId) -> bool {
+        // Built-in auto-traits (Sized, Copy, Clone, ...) OR user traits
+        // declared `@coinductive` — mirrors rustc's `TraitDef::is_coinductive`
+        // (auto traits or `#[rustc_coinductive]`).
         self.builtin_registry
             .lookup(def_id)
             .is_some_and(|bt| bt.is_coinductive())
+            || self
+                .symbols
+                .lookup_trait_by_def_id(def_id)
+                .is_some_and(|b| b.attributes.iter().any(|a| a.name.eq_str("coinductive")))
     }
 
     fn is_builtin_trait(&self, def_id: DefId) -> Option<BuiltinTrait> {
@@ -483,7 +499,7 @@ mod tests {
 
         // Create an inference variable as the self_ty — this guarantees
         // select() returns Deferred { stalled_on }.
-        let infer_var = ctx.alloc_infer_var(999);
+        let infer_var = ctx.alloc_infer_var(999, 0);
 
         let mut selcx = SelectionContext::new(
             &mut ctx,
@@ -531,7 +547,7 @@ mod tests {
         let mut ctx = TypeContext::new();
         let mut forest = crate::hir::traits::solver::forest::ObligationForest::new();
 
-        let infer_var = ctx.alloc_infer_var(1001);
+        let infer_var = ctx.alloc_infer_var(1001, 0);
         let obligation = Obligation {
             cause: ObligationCause {
                 span: crate::ast::Span::new(0, 0),
@@ -559,7 +575,7 @@ mod tests {
         let mut ctx = TypeContext::new();
         let mut forest = crate::hir::traits::solver::forest::ObligationForest::new();
 
-        let infer_var = ctx.alloc_infer_var(1002);
+        let infer_var = ctx.alloc_infer_var(1002, 0);
         let int_ty = ctx.int(32, true);
         let obligation = Obligation {
             cause: ObligationCause {
@@ -593,7 +609,7 @@ mod tests {
         let mut ctx = TypeContext::new();
         let mut forest = crate::hir::traits::solver::forest::ObligationForest::new();
 
-        let infer_var = ctx.alloc_infer_var(1003);
+        let infer_var = ctx.alloc_infer_var(1003, 0);
         let obligation = Obligation {
             cause: ObligationCause {
                 span: crate::ast::Span::new(0, 0),

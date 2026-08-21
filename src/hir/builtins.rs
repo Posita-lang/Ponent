@@ -5,7 +5,7 @@ use crate::hir::types::{DefId, TypeContext};
 use crate::symbol::Symbol;
 
 /// Insert a trait with no associated types into the symbol table.
-fn insert_trait(symbols: &mut SymbolTable, name: &str, def_id: &mut DefId) {
+fn insert_trait<'input>(symbols: &mut SymbolTable<'input>, name: &str, def_id: &mut DefId) {
     *def_id = symbols.allocate_def_id();
     let binding = TraitBinding {
         def_id: *def_id,
@@ -16,17 +16,18 @@ fn insert_trait(symbols: &mut SymbolTable, name: &str, def_id: &mut DefId) {
         attributes: vec![],
         crate_id: symbols.local_crate_id,
     };
-    symbols
-        .insert_trait(Symbol::intern(name), binding, Span::new(0, 0))
-        .ok();
+    if let Err(e) = symbols.insert_trait(Symbol::intern(name), binding, Span::new(0, 0)) {
+        panic!("duplicate builtin registration: {:?}", e);
+    }
 }
 
 /// Insert a trait with associated types into the symbol table.
-fn insert_trait_with_assoc_types(
-    symbols: &mut SymbolTable,
+fn insert_trait_with_assoc_types<'input>(
+    symbols: &mut SymbolTable<'input>,
     name: &str,
     def_id: &mut DefId,
-    associated_types: Vec<(Symbol, Option<Type>)>,
+    associated_types: Vec<(Symbol, Option<Type<'input>>)>,
+    span: Span,
 ) {
     *def_id = symbols.allocate_def_id();
     let binding = TraitBinding {
@@ -34,19 +35,23 @@ fn insert_trait_with_assoc_types(
         methods: vec![],
         associated_types,
         super_traits: vec![],
-        span: Span::new(0, 0),
+        span,
         attributes: vec![],
         crate_id: symbols.local_crate_id,
     };
-    symbols
-        .insert_trait(Symbol::intern(name), binding, Span::new(0, 0))
-        .ok();
+    // A duplicate registration is a pre-registration bug — surface it
+    // explicitly instead of silently swallowing the conflict (the
+    // returned Diagnostic carries the message; the `span` argument lets
+    // a caller with a real source location report precisely).
+    if let Err(e) = symbols.insert_trait(Symbol::intern(name), binding, span) {
+        panic!("duplicate builtin trait registration: {:?}", e);
+    }
 }
 
-pub fn register_builtins(
-    symbols: &mut SymbolTable,
-    trait_env: &mut TraitEnv,
-    ctx: &mut TypeContext,
+pub fn register_builtins<'input>(
+    symbols: &mut SymbolTable<'input>,
+    trait_env: &mut TraitEnv<'input>,
+    ctx: &mut TypeContext<'input>,
 ) {
     let mut add_id = DefId(0);
     let mut sub_id = DefId(0);
@@ -96,23 +101,89 @@ pub fn register_builtins(
         add_id, sub_id, mul_id, div_id, rem_id, bitand_id, bitor_id, bitxor_id, shl_id, shr_id,
         eq_id, ord_id, not_id,
     ];
-    // Register arithmetic/bitwise trait impls for all common integer types.
-    // Signed: Int<8>, Int<16>, Int<32>, Int<64>
-    // Unsigned: UInt<8>, UInt<16>, UInt<32>, UInt<64>
-    for &(bits, signed) in &[
-        (8, true),
-        (16, true),
-        (32, true),
-        (64, true),
-        (8, false),
-        (16, false),
-        (32, false),
-        (64, false),
-    ] {
+    // Register arithmetic/bitwise trait impls for ALL legal integer widths.
+    // `TypeContext::int()` accepts bits 1..=64 (SYNTAX.md — the type system
+    // admits e.g. `Int<17>` / `Int<23>`), so a hardcoded {8,16,32,64} set
+    // left those legal types WITHOUT any Add/Sub/... impl — arithmetic on
+    // them failed with E030 "no trait implementation found for `Add`".
+    // Signed: Int<N>; Unsigned: UInt<N> for every N in 1..=64.
+    let all_widths: Vec<(u32, bool)> = (1..=64)
+        .flat_map(|bits| [(bits, true), (bits, false)])
+        .collect();
+    for &(bits, signed) in &all_widths {
         let int_ty = ctx.int(bits, signed);
         for &trait_id in &int_arith_traits {
-            trait_env
-                .add_impl(
+            if let Err(e) = trait_env.add_impl(
+                ImplCandidate {
+                    trait_id,
+                    for_type: int_ty,
+                    methods: vec![],
+                    resolved_methods: vec![],
+                    assoc_tys: vec![],
+                    has_auto_deref: false,
+                    context: vec![],
+                    arity: 0,
+                    trait_args: vec![],
+                    where_clause_bounds: vec![],
+                    span: Span::new(0, 0),
+                },
+                symbols,
+                ctx,
+                false,
+            ) {
+                // Orphan (CoverageViolation) is EXPECTED for the compiler's
+                // own built-in impls — the orphan rule does not apply to
+                // pre-registered standard-library impls.  Ignore knowingly
+                // (this is not a duplicate-definition conflict).
+                let _ = e;
+            }
+        }
+        // Neg (unary `-`) only applies to signed integers.
+        if signed {
+            if let Err(e) = trait_env.add_impl(
+                ImplCandidate {
+                    trait_id: neg_id,
+                    for_type: int_ty,
+                    methods: vec![],
+                    resolved_methods: vec![],
+                    assoc_tys: vec![],
+                    has_auto_deref: false,
+                    context: vec![],
+                    arity: 0,
+                    trait_args: vec![],
+                    where_clause_bounds: vec![],
+                    span: Span::new(0, 0),
+                },
+                symbols,
+                ctx,
+                false,
+            ) {
+                // Orphan (CoverageViolation) is EXPECTED for the compiler's
+                // own built-in impls — the orphan rule does not apply to
+                // pre-registered standard-library impls.  Ignore knowingly
+                // (this is not a duplicate-definition conflict).
+                let _ = e;
+            }
+        }
+    }
+    // Types declared with a non-default overflow policy (`Int<8> with
+    // overflow = saturate` / `wrap`) are DIFFERENT TypeIds and need
+    // their own arithmetic surface.  Trap is the
+    // default policy registered above via `ctx.int`/`ctx.uint`.
+    for &(bits, signed) in &all_widths {
+        for policy in [
+            crate::ast::OverflowPolicy::Wrap,
+            crate::ast::OverflowPolicy::Saturate,
+        ] {
+            // `UInt<N>` resolves to `Int { bits, signed: false, policy }`
+            // internally (not a distinct `UInt` TypeData) — register the
+            // SAME representation so the trait solver matches.  `ctx.uint`
+            // / `uint_with_overflow` build the `UInt` variant, which is a
+            // different TypeId and would leave `with overflow = saturate`
+            // types without Add/Ord impls.
+            let int_ty = ctx.int_with_overflow(bits, signed, policy);
+            for &trait_id in &int_arith_traits {
+                if let Err(e) = trait_env.add_impl(
                     ImplCandidate {
                         trait_id,
                         for_type: int_ty,
@@ -129,13 +200,16 @@ pub fn register_builtins(
                     symbols,
                     ctx,
                     false,
-                )
-                .ok();
-        }
-        // Neg (unary `-`) only applies to signed integers.
-        if signed {
-            trait_env
-                .add_impl(
+                ) {
+                    // Orphan (CoverageViolation) is EXPECTED for the
+                    // compiler's own built-in impls — the orphan rule
+                    // does not apply to pre-registered stdlib impls.
+                    let _ = e;
+                }
+            }
+            // Neg (unary `-`) only applies to signed integers.
+            if signed {
+                if let Err(e) = trait_env.add_impl(
                     ImplCandidate {
                         trait_id: neg_id,
                         for_type: int_ty,
@@ -152,8 +226,44 @@ pub fn register_builtins(
                     symbols,
                     ctx,
                     false,
-                )
-                .ok();
+                ) {
+                    let _ = e;
+                }
+            }
+        }
+    }
+
+    // USize (the machine-word unsigned integer) gets the same arithmetic/
+    // bitwise/equality/ordering surface as the fixed-width unsigned types
+    // (but no `Neg` — it is unsigned).  The no-op fulfillment loop previously
+    // masked this gap: `usize + 1` type-checked but the `Add` obligation was
+    // never enforced.  With the loop fixed, arithmetic on USize must resolve
+    // against these impls or every `+`/`==`/`<` on USize would be rejected.
+    let usize_ty = ctx.usize();
+    for &trait_id in &int_arith_traits {
+        if let Err(e) = trait_env.add_impl(
+            ImplCandidate {
+                trait_id,
+                for_type: usize_ty,
+                methods: vec![],
+                resolved_methods: vec![],
+                assoc_tys: vec![],
+                has_auto_deref: false,
+                context: vec![],
+                arity: 0,
+                trait_args: vec![],
+                where_clause_bounds: vec![],
+                span: Span::new(0, 0),
+            },
+            symbols,
+            ctx,
+            false,
+        ) {
+            // Orphan (CoverageViolation) is EXPECTED for the compiler's
+            // own built-in impls — the orphan rule does not apply to
+            // pre-registered standard-library impls.  Ignore knowingly
+            // (this is not a duplicate-definition conflict).
+            let _ = e;
         }
     }
 
@@ -161,52 +271,60 @@ pub fn register_builtins(
     // type checker and do not route through traits.
     let bool_ty = ctx.bool();
     for &trait_id in &[not_id] {
-        trait_env
-            .add_impl(
-                ImplCandidate {
-                    trait_id,
-                    for_type: bool_ty,
-                    methods: vec![],
-                    resolved_methods: vec![],
-                    assoc_tys: vec![],
-                    has_auto_deref: false,
-                    context: vec![],
-                    arity: 0,
-                    trait_args: vec![],
-                    where_clause_bounds: vec![],
-                    span: Span::new(0, 0),
-                },
-                symbols,
-                ctx,
-                false,
-            )
-            .ok();
+        if let Err(e) = trait_env.add_impl(
+            ImplCandidate {
+                trait_id,
+                for_type: bool_ty,
+                methods: vec![],
+                resolved_methods: vec![],
+                assoc_tys: vec![],
+                has_auto_deref: false,
+                context: vec![],
+                arity: 0,
+                trait_args: vec![],
+                where_clause_bounds: vec![],
+                span: Span::new(0, 0),
+            },
+            symbols,
+            ctx,
+            false,
+        ) {
+            // Orphan (CoverageViolation) is EXPECTED for the compiler's
+            // own built-in impls — the orphan rule does not apply to
+            // pre-registered standard-library impls.  Ignore knowingly
+            // (this is not a duplicate-definition conflict).
+            let _ = e;
+        }
     }
 
     let float64 = ctx.float(64);
     for &trait_id in &[
         add_id, sub_id, mul_id, div_id, rem_id, eq_id, ord_id, neg_id,
     ] {
-        trait_env
-            .add_impl(
-                ImplCandidate {
-                    trait_id,
-                    for_type: float64,
-                    methods: vec![],
-                    resolved_methods: vec![],
-                    assoc_tys: vec![],
-                    has_auto_deref: false,
-                    context: vec![],
-                    arity: 0,
-                    trait_args: vec![],
-                    where_clause_bounds: vec![],
-                    span: Span::new(0, 0),
-                },
-                symbols,
-                ctx,
-                false,
-            )
-            .ok();
+        if let Err(e) = trait_env.add_impl(
+            ImplCandidate {
+                trait_id,
+                for_type: float64,
+                methods: vec![],
+                resolved_methods: vec![],
+                assoc_tys: vec![],
+                has_auto_deref: false,
+                context: vec![],
+                arity: 0,
+                trait_args: vec![],
+                where_clause_bounds: vec![],
+                span: Span::new(0, 0),
+            },
+            symbols,
+            ctx,
+            false,
+        ) {
+            // Orphan (CoverageViolation) is EXPECTED for the compiler's
+            // own built-in impls — the orphan rule does not apply to
+            // pre-registered standard-library impls.  Ignore knowingly
+            // (this is not a duplicate-definition conflict).
+            let _ = e;
+        }
     }
 
     // Register built-in Rational<p,q> types with arithmetic trait impls.
@@ -216,26 +334,30 @@ pub fn register_builtins(
     for &(p, q) in &[(8, 8), (16, 16), (32, 16), (32, 32)] {
         let rty = ctx.rational(p, q);
         for &trait_id in &rational_arith_traits {
-            trait_env
-                .add_impl(
-                    ImplCandidate {
-                        trait_id,
-                        for_type: rty,
-                        methods: vec![],
-                        resolved_methods: vec![],
-                        assoc_tys: vec![],
-                        has_auto_deref: false,
-                        context: vec![],
-                        arity: 0,
-                        trait_args: vec![],
-                        where_clause_bounds: vec![],
-                        span: Span::new(0, 0),
-                    },
-                    symbols,
-                    ctx,
-                    false,
-                )
-                .ok();
+            if let Err(e) = trait_env.add_impl(
+                ImplCandidate {
+                    trait_id,
+                    for_type: rty,
+                    methods: vec![],
+                    resolved_methods: vec![],
+                    assoc_tys: vec![],
+                    has_auto_deref: false,
+                    context: vec![],
+                    arity: 0,
+                    trait_args: vec![],
+                    where_clause_bounds: vec![],
+                    span: Span::new(0, 0),
+                },
+                symbols,
+                ctx,
+                false,
+            ) {
+                // Orphan (CoverageViolation) is EXPECTED for the compiler's
+                // own built-in impls — the orphan rule does not apply to
+                // pre-registered standard-library impls.  Ignore knowingly
+                // (this is not a duplicate-definition conflict).
+                let _ = e;
+            }
         }
     }
 
@@ -258,14 +380,20 @@ pub fn register_builtins(
         };
         let ok_variant = EnumVariant {
             name: Symbol::intern("Ok"),
-            payload: Some(Type::Path(vec![Symbol::intern("T")], Span::new(0, 0))),
+            payload: Some(Type::Path(
+                smallvec::smallvec![Symbol::intern("T")],
+                Span::new(0, 0),
+            )),
             eq_spec: Vec::new(),
             exists_params: Vec::new(),
             span: Span::new(0, 0),
         };
         let err_variant = EnumVariant {
             name: Symbol::intern("Err"),
-            payload: Some(Type::Path(vec![Symbol::intern("E")], Span::new(0, 0))),
+            payload: Some(Type::Path(
+                smallvec::smallvec![Symbol::intern("E")],
+                Span::new(0, 0),
+            )),
             eq_spec: Vec::new(),
             exists_params: Vec::new(),
             span: Span::new(0, 0),
@@ -294,9 +422,9 @@ pub fn register_builtins(
             align: None,
             pad: None,
         };
-        symbols
-            .insert_type(Symbol::intern("Result"), binding, Span::new(0, 0))
-            .ok();
+        if let Err(e) = symbols.insert_type(Symbol::intern("Result"), binding, Span::new(0, 0)) {
+            panic!("duplicate builtin registration: {:?}", e);
+        }
     }
 
     // Option<T>
@@ -317,7 +445,10 @@ pub fn register_builtins(
         };
         let some_variant = EnumVariant {
             name: Symbol::intern("Some"),
-            payload: Some(Type::Path(vec![Symbol::intern("T")], Span::new(0, 0))),
+            payload: Some(Type::Path(
+                smallvec::smallvec![Symbol::intern("T")],
+                Span::new(0, 0),
+            )),
             eq_spec: Vec::new(),
             exists_params: Vec::new(),
             span: Span::new(0, 0),
@@ -346,9 +477,9 @@ pub fn register_builtins(
             align: None,
             pad: None,
         };
-        symbols
-            .insert_type(Symbol::intern("Option"), binding, Span::new(0, 0))
-            .ok();
+        if let Err(e) = symbols.insert_type(Symbol::intern("Option"), binding, Span::new(0, 0)) {
+            panic!("duplicate builtin registration: {:?}", e);
+        }
     }
 
     // ── Future trait ──────────────────────────────────────────────────
@@ -377,7 +508,10 @@ pub fn register_builtins(
         };
         let output_variant = EnumVariant {
             name: Symbol::intern("Output"),
-            payload: Some(Type::Path(vec![Symbol::intern("T")], Span::new(0, 0))),
+            payload: Some(Type::Path(
+                smallvec::smallvec![Symbol::intern("T")],
+                Span::new(0, 0),
+            )),
             eq_spec: Vec::new(),
             exists_params: Vec::new(),
             span: Span::new(0, 0),
@@ -406,18 +540,22 @@ pub fn register_builtins(
             align: None,
             pad: None,
         };
-        symbols
-            .insert_type(Symbol::intern("Future"), binding, Span::new(0, 0))
-            .ok();
+        if let Err(e) = symbols.insert_type(Symbol::intern("Future"), binding, Span::new(0, 0)) {
+            panic!("duplicate builtin registration: {:?}", e);
+        }
     }
 
-    // 2) Register the Future trait with associated type `Output`
+    // 2) Register the Future trait with associated type `Output`.
+    //    Builtin pre-registration has no source location, so the
+    //    placeholder span is passed explicitly (a caller with a real
+    //    source span would pass it here for precise error reports).
     let mut future_trait_id = DefId(0);
     insert_trait_with_assoc_types(
         symbols,
         "Future",
         &mut future_trait_id,
         vec![(Symbol::intern("Output"), None)],
+        Span::new(0, 0),
     );
 
     // 3) Register `impl Future for Future<T>` where `Output = T`.
@@ -427,33 +565,42 @@ pub fn register_builtins(
     //    We register a generic impl using a generic param index 0.
     let future_output_ty = ctx.generic_param(0, Symbol::intern("T"));
     let future_for_ty = ctx.enum_ty(future_enum_def_id, vec![future_output_ty]);
-    trait_env
-        .add_impl(
-            ImplCandidate {
-                trait_id: future_trait_id,
-                for_type: future_for_ty,
-                methods: vec![],
-                resolved_methods: vec![],
-                assoc_tys: vec![(Symbol::intern("Output"), future_output_ty)],
-                has_auto_deref: false,
-                context: vec![],
-                arity: 1, // Future<T> has one generic param T
-                trait_args: vec![],
-                where_clause_bounds: vec![],
-                span: Span::new(0, 0),
-            },
-            symbols,
-            ctx,
-            true, // trusted — built-in impl
-        )
-        .ok();
+    if let Err(e) = trait_env.add_impl(
+        ImplCandidate {
+            trait_id: future_trait_id,
+            for_type: future_for_ty,
+            methods: vec![],
+            resolved_methods: vec![],
+            assoc_tys: vec![(Symbol::intern("Output"), future_output_ty)],
+            has_auto_deref: false,
+            context: vec![],
+            arity: 1, // Future<T> has one generic param T
+            trait_args: vec![],
+            where_clause_bounds: vec![],
+            span: Span::new(0, 0),
+        },
+        symbols,
+        ctx,
+        true, // trusted — built-in impl
+    ) {
+        // Orphan (CoverageViolation) is EXPECTED for the compiler's
+        // own built-in impls — the orphan rule does not apply to
+        // pre-registered standard-library impls.  Ignore knowingly
+        // (this is not a duplicate-definition conflict).
+        let _ = e;
+    }
 
     // Register standard traits for error suggestions and future use
     insert_trait(symbols, "From", &mut DefId(0));
     insert_trait(symbols, "Into", &mut DefId(0));
     insert_trait(symbols, "Sized", &mut DefId(0));
-    insert_trait(symbols, "Deref", &mut DefId(0));
-    insert_trait(symbols, "DerefMut", &mut DefId(0));
+    // NOTE: `Deref` / `DerefMut` are NOT placeholder-registered — they
+    // are USER-DEFINABLE traits (SYNTAX.md §Method-Call Auto-
+    // Dereferencing: `@auto_deref impl Deref for Rc<T>`).  A placeholder
+    // registration made the names undeclarable ("trait 'Deref' already
+    // defined") and the auto-deref machinery dead.  The autoderef chain
+    // (`try_deref_trait_step`) resolves `Deref` through the user's
+    // definition via `lookup_trait`.
 
     // ── Channel<T> type ──────────────────────────────────────────
     // `Channel<T>` is a built-in type constructor for typed channels.
@@ -492,8 +639,8 @@ pub fn register_builtins(
             align: None,
             pad: None,
         };
-        symbols
-            .insert_type(Symbol::intern("Channel"), binding, Span::new(0, 0))
-            .ok();
+        if let Err(e) = symbols.insert_type(Symbol::intern("Channel"), binding, Span::new(0, 0)) {
+            panic!("duplicate builtin registration: {:?}", e);
+        }
     }
 }

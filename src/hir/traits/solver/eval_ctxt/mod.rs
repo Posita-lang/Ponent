@@ -31,7 +31,7 @@ static INSTANCE_FRESH_VAR_ID: AtomicUsize = AtomicUsize::new(4_000_000);
 
 /// Describes the instantiation target of a polymorphic scheme,
 /// collected from a TypeData node without holding a borrow on the
-/// TypeContext. Used by the Instance constraint handler to separate
+/// TypeContext<'input>. Used by the Instance constraint handler to separate
 /// the immutable scan phase from the mutable variable-creation phase.
 enum InstantiationTarget {
     /// `∀α₁.∀α₂. ... αₙ. body_ty` — Forall binders.
@@ -124,7 +124,7 @@ pub enum GoalStalledOn {
 ///
 /// Wraps a `SolverDelegate` and mirrors the core fields of Rust's `EvalCtxt`.
 /// See the table in the module doc for the field mapping.
-pub struct EvalCtxt<'a, D: SolverDelegate> {
+pub struct EvalCtxt<'a, 'input, D: SolverDelegate<'input>> {
     pub delegate: &'a mut D,
     pub var_kinds: Vec<TypeVariableKind>,
     pub current_goal_kind: CurrentGoalKind,
@@ -145,7 +145,7 @@ pub struct EvalCtxt<'a, D: SolverDelegate> {
     // These are stored as raw pointers so that `ctx()` and `trait_env()` /
     // `caller_bounds()` / `builtin_registry()` can be called simultaneously
     // without borrow conflicts.  Initialized once in `new()`.
-    pub(crate) trait_env: *const TraitEnv,
+    pub(crate) trait_env: *const TraitEnv<'input>,
     pub(crate) caller_bounds: *const [Predicate],
     pub(crate) builtin_registry: *const BuiltinTraitRegistry,
 }
@@ -164,7 +164,7 @@ struct EvalCtxtSnapshot {
     // because search_graph mutations are idempotent (push/pop on try_entry/exit).
 }
 
-impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
+impl<'a, 'input, D: SolverDelegate<'input>> EvalCtxt<'a, 'input, D> {
     fn snapshot(&self) -> EvalCtxtSnapshot {
         EvalCtxtSnapshot {
             var_kinds: self.var_kinds.clone(),
@@ -215,12 +215,12 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
     }
 
     /// Access the type context through the delegate.
-    pub fn ctx(&mut self) -> &mut TypeContext {
+    pub fn ctx(&mut self) -> &mut TypeContext<'input> {
         self.delegate.ctx()
     }
 
     /// Access the trait environment (read-only, no borrow conflict with ctx()).
-    pub fn trait_env(&self) -> &TraitEnv {
+    pub fn trait_env(&self) -> &TraitEnv<'input> {
         // SAFETY: The raw pointer was initialized in `new()` from the delegate's
         // `trait_env()` method, and the delegate is alive for the lifetime of
         // this EvalCtxt.  The delegate is not dropped or invalidated while we
@@ -262,10 +262,11 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
             let stalled_on = vec![if ctx.is_infer_var(ra) { ra } else { rb }];
             return Ok(ImplSource::Deferred { stalled_on });
         }
-        ctx.unify(a, b).map_err(|_| SolveError::Mismatch {
+        ctx.unify(a, b).map_err(|e| SolveError::Mismatch {
             expected: a,
             found: b,
             span,
+            note: format!("unify failed: {e:?}"),
         })?;
         Ok(ImplSource::Param(vec![]))
     }
@@ -293,6 +294,7 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
                 expected: sup,
                 found: sub,
                 span,
+                note: String::new(),
             });
         }
         Ok(ImplSource::Param(vec![]))
@@ -330,7 +332,7 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
             Err(()) => {
                 // No branch matched and no else_ fallback.
                 Err(SolveError::NotFound {
-                    trait_id: DefId(0),
+                    trait_id: None,
                     self_ty: scrutinee,
                     span,
                 })
@@ -445,7 +447,7 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
                         let mut instantiated = body_ty;
                         for &idx in binder_indices.iter().rev() {
                             let fresh_id = INSTANCE_FRESH_VAR_ID.fetch_add(1, Ordering::Relaxed);
-                            let fv = ctx.alloc_infer_var(fresh_id);
+                            let fv = ctx.alloc_infer_var(fresh_id, 0);
                             instantiated = ctx.replace_generic(instantiated, idx, fv);
                         }
                         (instantiation_ty, instantiated)
@@ -457,7 +459,7 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
                         let mut instantiated = body_ty;
                         for &idx in binder_indices.iter() {
                             let fresh_id = INSTANCE_FRESH_VAR_ID.fetch_add(1, Ordering::Relaxed);
-                            let fv = ctx.alloc_infer_var(fresh_id);
+                            let fv = ctx.alloc_infer_var(fresh_id, 0);
                             instantiated = ctx.replace_generic(instantiated, idx, fv);
                         }
                         (instantiation_ty, instantiated)
@@ -474,10 +476,11 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
                 // Concrete type — unify directly.
                 let ctx = self.ctx();
                 ctx.unify(instantiation_ty, resolved_scheme)
-                    .map_err(|_| SolveError::Mismatch {
+                    .map_err(|e| SolveError::Mismatch {
                         expected: instantiation_ty,
                         found: resolved_scheme,
                         span: cause.span,
+                        note: format!("unify failed: {e:?}"),
                     })?;
                 Ok(ImplSource::Param(vec![]))
             }
@@ -522,7 +525,7 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
     pub fn probe<T>(
         &mut self,
         probe_kind: crate::hir::traits::solver::eval_ctxt::ProbeKind,
-    ) -> probe::ProbeCtxt<'_, 'a, D, T> {
+    ) -> probe::ProbeCtxt<'_, 'a, 'input, D, T> {
         probe::ProbeCtxt {
             ecx: self,
             probe_kind,
@@ -541,7 +544,7 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
     pub fn probe_trait_candidate(
         &mut self,
         source: probe::CandidateSource,
-    ) -> probe::TraitProbeCtxt<'_, 'a, D> {
+    ) -> probe::TraitProbeCtxt<'_, 'a, 'input, D> {
         probe::TraitProbeCtxt {
             cx: probe::ProbeCtxt {
                 ecx: self,
@@ -556,8 +559,8 @@ impl<'a, D: SolverDelegate> EvalCtxt<'a, D> {
     /// Convenience wrapper around `probe_trait_candidate`.
     pub fn probe_builtin_candidate(
         &mut self,
-        source: probe::BuiltinImplSource,
-    ) -> probe::TraitProbeCtxt<'_, 'a, D> {
+        source: crate::hir::traits::solver::obligation::BuiltinImplSource,
+    ) -> probe::TraitProbeCtxt<'_, 'a, 'input, D> {
         self.probe_trait_candidate(probe::CandidateSource::Builtin(source))
     }
 

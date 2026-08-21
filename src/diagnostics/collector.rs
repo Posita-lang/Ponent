@@ -91,6 +91,17 @@ impl DiagCtxt {
     }
 
     /// Clear all diagnostics.
+    pub fn unreported_len(&self) -> usize {
+        self.unreported.len()
+    }
+
+    /// Remove the fresh diagnostics pushed since `len` — used to tolerate
+    /// expected failures during recursive type resolution (an ADT payload
+    /// referencing the ADT itself, which is not yet registered).
+    pub fn truncate_unreported(&mut self, len: usize) {
+        self.unreported.truncate(len);
+    }
+
     pub fn clear(&mut self) {
         self.reported.clear();
         self.unreported.clear();

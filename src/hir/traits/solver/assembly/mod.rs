@@ -19,7 +19,7 @@
 //!
 //! ## Borrow Discipline
 //!
-//! `GoalKind` methods take `&mut TypeContext` (not `&mut EvalCtxt`) to avoid
+//! `GoalKind` methods take `&mut TypeContext<'input>` (not `&mut EvalCtxt`) to avoid
 //! borrow conflicts with the assembly functions that concurrently hold
 //! references to `TraitEnv` / `BuiltinTraitRegistry` through `ecx.delegate`.
 //! The `EvalCtxt` is only used in the top-level `assemble_and_evaluate_candidates`.
@@ -45,6 +45,75 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Counter for fresh inference variables used during generic impl matching.
 static ASSEMBLY_FRESH_VAR_ID: AtomicUsize = AtomicUsize::new(3_000_000);
 
+/// Unify with rustc-style rigid-param semantics: when one side is a
+/// `GenericParam` and the other a fresh `InferVar`, bind the VAR to the
+/// param regardless of argument order.
+///
+/// `TypeContext::unify` binds the PARAM for `(param, var)` pairs — a
+/// direction the checker's call-instantiation and GADT refinement paths
+/// deliberately depend on (a call-site var must stay a var so defaulting
+/// can fill it).  The solver needs the opposite: a goal self_ty that is
+/// the impl's rigid param must not absorb the goal's variable — the
+/// dangling var makes `SgGoalKey::from_obligation` return `None`, so a
+/// recursive blanket `impl<T: Foo> Foo for T` on a generic-param goal
+/// skips cycle detection and defers instead of reporting overflow.
+fn solver_unify<'input>(
+    ctx: &mut TypeContext<'input>,
+    a: TypeId,
+    b: TypeId,
+) -> Result<TypeId, crate::hir::types::TypeError> {
+    // Resolve bindings FIRST (OmniML union-find discipline: unification
+    // operates on the ROOT of each variable — `Term.structure t =
+    // (Union_find.get t).structure` in the reference `unifier.ml` — never
+    // on a stale bound node).  `get_raw` bypasses binding resolution, so
+    // without this an InferVar bound earlier in inference (e.g. a goal
+    // self_ty resolved during candidate evaluation) would still classify
+    // as an unbound var and `set_binding` would silently overwrite its
+    // existing binding with the impl's GenericParam.
+    let a = ctx.resolve_binding(a);
+    let b = ctx.resolve_binding(b);
+    let a_is_param = matches!(ctx.get_raw(a), TypeData::GenericParam { .. });
+    let b_is_param = matches!(ctx.get_raw(b), TypeData::GenericParam { .. });
+    let a_is_var = matches!(ctx.get_raw(a), TypeData::InferVar { .. });
+    let b_is_var = matches!(ctx.get_raw(b), TypeData::InferVar { .. });
+    let (var, param) = if a_is_var && b_is_param {
+        (a, b)
+    } else if a_is_param && b_is_var {
+        (b, a)
+    } else {
+        return ctx.unify(a, b);
+    };
+    ctx.begin_transaction();
+    // Mirror the (InferVar, GenericParam) arm of `unify_internal_impl`:
+    // a GADT skolem must not be bound into the var, and the var must not
+    // occur inside the param.
+    let result = if ctx.contains_gadt_skolem(param) || ctx.occurs_check(var, param) {
+        Err(crate::hir::types::TypeError::Mismatch {
+            expected: param,
+            found: var,
+            span: crate::ast::Span::new(0, 0),
+        })
+    } else if ctx.set_binding(var, param) {
+        Ok(param)
+    } else {
+        Err(crate::hir::types::TypeError::Mismatch {
+            expected: param,
+            found: var,
+            span: crate::ast::Span::new(0, 0),
+        })
+    };
+    match result {
+        Ok(ty) => {
+            ctx.commit_transaction();
+            Ok(ty)
+        }
+        Err(e) => {
+            ctx.rollback_transaction();
+            Err(e)
+        }
+    }
+}
+
 // ── GoalKind trait ────────────────────────────────────────────────
 
 /// Trait that encapsulates candidate assembly for a specific goal type.
@@ -57,10 +126,10 @@ static ASSEMBLY_FRESH_VAR_ID: AtomicUsize = AtomicUsize::new(3_000_000);
 /// in a generic pipeline, and the `EvalCtxt` dispatches to the correct
 /// `GoalKind` implementation based on the predicate kind.
 ///
-/// Note: `consider_*` methods take `&mut EvalCtxt` (not `&mut TypeContext`)
+/// Note: `consider_*` methods take `&mut EvalCtxt` (not `&mut TypeContext<'input>`)
 /// to enable probe integration at the candidate level.  Each candidate
 /// can be wrapped in `ecx.probe_trait_candidate(source).enter(...)`.
-pub(super) trait GoalKind<D: SolverDelegate> {
+pub(super) trait GoalKind<'input, D: SolverDelegate<'input>> {
     /// The self type of the goal (after resolving through bindings if needed).
     fn self_ty(&self) -> TypeId;
 
@@ -69,7 +138,7 @@ pub(super) trait GoalKind<D: SolverDelegate> {
     fn trait_def_id(&self) -> Option<DefId>;
 
     /// Resolve the goal through bindings, returning a `ResolvedObligation`.
-    fn resolve(&self, ctx: &TypeContext) -> ResolvedObligation;
+    fn resolve(&self, ctx: &TypeContext<'input>) -> ResolvedObligation;
 
     /// Consider a user-defined impl as a candidate.
     ///
@@ -78,7 +147,7 @@ pub(super) trait GoalKind<D: SolverDelegate> {
     /// The transaction is rolled back — confirmation will re-apply it.
     fn consider_impl_candidate(
         &self,
-        ecx: &mut EvalCtxt<'_, D>,
+        ecx: &mut EvalCtxt<'_, 'input, D>,
         idx: usize,
         impl_cand: &ImplCandidate,
         obligation: &ResolvedObligation,
@@ -88,7 +157,7 @@ pub(super) trait GoalKind<D: SolverDelegate> {
     /// Consider a caller-bound (where-clause) as a candidate.
     fn consider_caller_bound_candidate(
         &self,
-        ecx: &mut EvalCtxt<'_, D>,
+        ecx: &mut EvalCtxt<'_, 'input, D>,
         self_ty: TypeId,
         args: &[TypeId],
         obligation: &ResolvedObligation,
@@ -98,7 +167,7 @@ pub(super) trait GoalKind<D: SolverDelegate> {
     /// Consider a builtin trait impl as a candidate.
     fn consider_builtin_candidate(
         &self,
-        ecx: &mut EvalCtxt<'_, D>,
+        ecx: &mut EvalCtxt<'_, 'input, D>,
         builtin: BuiltinImplSource,
         candidates: &mut Vec<Candidate>,
     );
@@ -106,7 +175,7 @@ pub(super) trait GoalKind<D: SolverDelegate> {
     /// Consider an object type bound as a candidate.
     fn consider_object_candidate(
         &self,
-        ecx: &mut EvalCtxt<'_, D>,
+        ecx: &mut EvalCtxt<'_, 'input, D>,
         object_trait_id: DefId,
         nested: Vec<Obligation>,
         candidates: &mut Vec<Candidate>,
@@ -115,7 +184,7 @@ pub(super) trait GoalKind<D: SolverDelegate> {
     /// Consider a poly/unbox type (Posita-specific) as a candidate.
     fn consider_poly_candidate(
         &self,
-        ecx: &mut EvalCtxt<'_, D>,
+        ecx: &mut EvalCtxt<'_, 'input, D>,
         quantifier_count: usize,
         candidates: &mut Vec<Candidate>,
     );
@@ -123,7 +192,7 @@ pub(super) trait GoalKind<D: SolverDelegate> {
 
 // ── GoalKind implementation for Predicate ─────────────────────────
 
-impl<D: SolverDelegate> GoalKind<D> for Predicate {
+impl<'input, D: SolverDelegate<'input>> GoalKind<'input, D> for Predicate {
     fn self_ty(&self) -> TypeId {
         match self {
             Predicate::Trait { self_ty, .. } => *self_ty,
@@ -153,7 +222,7 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
         }
     }
 
-    fn resolve(&self, ctx: &TypeContext) -> ResolvedObligation {
+    fn resolve(&self, ctx: &TypeContext<'input>) -> ResolvedObligation {
         match self {
             Predicate::Trait {
                 trait_id,
@@ -165,7 +234,7 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
                     args.iter().map(|a| ctx.resolve_binding(*a)).collect();
                 let ambiguous = ctx.is_infer_var(resolved_self);
                 ResolvedObligation {
-                    trait_id: *trait_id,
+                    trait_id: Some(*trait_id),
                     self_ty: resolved_self,
                     args: resolved_args,
                     ambiguous,
@@ -177,7 +246,7 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
                 let resolved_self = ctx.resolve_binding(*self_ty);
                 let ambiguous = ctx.is_infer_var(resolved_self);
                 ResolvedObligation {
-                    trait_id: *trait_id,
+                    trait_id: Some(*trait_id),
                     self_ty: resolved_self,
                     args: vec![],
                     ambiguous,
@@ -189,7 +258,7 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
                 let resolved_ty = ctx.resolve_binding(*ty);
                 let ambiguous = ctx.is_infer_var(resolved_ty);
                 ResolvedObligation {
-                    trait_id: DefId(usize::MAX), // sentinel
+                    trait_id: Some(DefId(usize::MAX)), // built-in Sized
                     self_ty: resolved_ty,
                     args: vec![],
                     ambiguous,
@@ -202,7 +271,7 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
                 let rb = ctx.resolve_binding(*b);
                 let ambiguous = ctx.is_infer_var(ra) || ctx.is_infer_var(rb);
                 ResolvedObligation {
-                    trait_id: DefId(0),
+                    trait_id: None,
                     self_ty: ra,
                     args: vec![rb],
                     ambiguous,
@@ -215,7 +284,7 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
                 let rsup = ctx.resolve_binding(*sup);
                 let ambiguous = ctx.is_infer_var(rsub) || ctx.is_infer_var(rsup);
                 ResolvedObligation {
-                    trait_id: DefId(0),
+                    trait_id: None,
                     self_ty: rsub,
                     args: vec![rsup],
                     ambiguous,
@@ -227,7 +296,7 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
                 let resolved = ctx.resolve_binding(*scrutinee);
                 let ambiguous = ctx.is_infer_var(resolved);
                 ResolvedObligation {
-                    trait_id: DefId(0),
+                    trait_id: None,
                     self_ty: resolved,
                     args: vec![],
                     ambiguous,
@@ -238,7 +307,7 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
             _ => {
                 // Fallback for other predicate types (ProjectionEq, CopyLike, etc.)
                 ResolvedObligation {
-                    trait_id: DefId(0),
+                    trait_id: None,
                     self_ty: ctx.error(),
                     args: vec![],
                     ambiguous: false,
@@ -251,7 +320,7 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
 
     fn consider_impl_candidate(
         &self,
-        ecx: &mut EvalCtxt<'_, D>,
+        ecx: &mut EvalCtxt<'_, 'input, D>,
         idx: usize,
         impl_cand: &ImplCandidate,
         obligation: &ResolvedObligation,
@@ -269,7 +338,7 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
 
     fn consider_caller_bound_candidate(
         &self,
-        ecx: &mut EvalCtxt<'_, D>,
+        ecx: &mut EvalCtxt<'_, 'input, D>,
         self_ty: TypeId,
         args: &[TypeId],
         obligation: &ResolvedObligation,
@@ -278,13 +347,13 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
         let ctx = ecx.ctx();
         ctx.begin_transaction();
 
-        let ok = ctx.unify(obligation.self_ty, self_ty).is_ok();
+        let ok = solver_unify(ctx, obligation.self_ty, self_ty).is_ok();
 
         let args_ok = if ok {
             if args.len() == obligation.args.len() {
                 args.iter()
                     .zip(obligation.args.iter())
-                    .all(|(ba, oa)| ctx.unify(*ba, *oa).is_ok())
+                    .all(|(ba, oa)| solver_unify(ctx, *ba, *oa).is_ok())
             } else {
                 false
             }
@@ -305,7 +374,7 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
 
     fn consider_builtin_candidate(
         &self,
-        _ecx: &mut EvalCtxt<'_, D>,
+        _ecx: &mut EvalCtxt<'_, 'input, D>,
         builtin: BuiltinImplSource,
         candidates: &mut Vec<Candidate>,
     ) {
@@ -314,7 +383,7 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
 
     fn consider_object_candidate(
         &self,
-        _ecx: &mut EvalCtxt<'_, D>,
+        _ecx: &mut EvalCtxt<'_, 'input, D>,
         object_trait_id: DefId,
         nested: Vec<Obligation>,
         candidates: &mut Vec<Candidate>,
@@ -327,7 +396,7 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
 
     fn consider_poly_candidate(
         &self,
-        _ecx: &mut EvalCtxt<'_, D>,
+        _ecx: &mut EvalCtxt<'_, 'input, D>,
         quantifier_count: usize,
         candidates: &mut Vec<Candidate>,
     ) {
@@ -351,8 +420,8 @@ impl<D: SolverDelegate> GoalKind<D> for Predicate {
 /// Unlike the old `SelectionContext::select`, this function uses the
 /// `GoalKind` trait to dispatch candidate assembly logic, making it
 /// extensible to new predicate types without modifying the core engine.
-pub(super) fn assemble_and_evaluate_candidates<D: SolverDelegate>(
-    ecx: &mut EvalCtxt<'_, D>,
+pub(super) fn assemble_and_evaluate_candidates<'input, D: SolverDelegate<'input>>(
+    ecx: &mut EvalCtxt<'_, 'input, D>,
     obligation: &Obligation,
 ) -> Result<ImplSource, SolveError> {
     // ── Depth check ──
@@ -429,7 +498,7 @@ pub(super) fn assemble_and_evaluate_candidates<D: SolverDelegate>(
     }
 
     // ── Resolve self_ty ──
-    // We need &mut TypeContext for resolve, so we must get it before
+    // We need &mut TypeContext<'input> for resolve, so we must get it before
     // borrowing any other data from ecx.delegate.
     let resolved = obligation.predicate.resolve(ecx.ctx());
 
@@ -520,8 +589,8 @@ pub(super) fn assemble_and_evaluate_candidates<D: SolverDelegate>(
 
 // ── Candidate assembly helpers ────────────────────────────────────
 
-fn assemble_impl_candidates<D: SolverDelegate>(
-    ecx: &mut EvalCtxt<'_, D>,
+fn assemble_impl_candidates<'input, D: SolverDelegate<'input>>(
+    ecx: &mut EvalCtxt<'_, 'input, D>,
     predicate: &Predicate,
     resolved: &ResolvedObligation,
     candidates: &mut Vec<Candidate>,
@@ -542,7 +611,7 @@ fn assemble_impl_candidates<D: SolverDelegate>(
     // not immutably borrowed here, and `trait_env` is only read below.
     let trait_env = unsafe { &*trait_env_ptr };
     for (idx, impl_cand) in trait_env.all_impls().iter().enumerate() {
-        if impl_cand.trait_id != trait_id {
+        if Some(impl_cand.trait_id) != trait_id {
             continue;
         }
         // Evaluate each candidate inside a probe so that CandidateHeadUsages
@@ -574,8 +643,8 @@ fn assemble_impl_candidates<D: SolverDelegate>(
     }
 }
 
-fn assemble_caller_bound_candidates<D: SolverDelegate>(
-    ecx: &mut EvalCtxt<'_, D>,
+fn assemble_caller_bound_candidates<'input, D: SolverDelegate<'input>>(
+    ecx: &mut EvalCtxt<'_, 'input, D>,
     predicate: &Predicate,
     resolved: &ResolvedObligation,
     candidates: &mut Vec<Candidate>,
@@ -600,7 +669,7 @@ fn assemble_caller_bound_candidates<D: SolverDelegate>(
             Predicate::AutoTrait { trait_id, self_ty } => (trait_id, self_ty, None),
             _ => continue,
         };
-        if *bound_trait_id == trait_id {
+        if Some(*bound_trait_id) == trait_id {
             let args_vec = args.cloned().unwrap_or_default();
             predicate
                 .consider_caller_bound_candidate(ecx, *self_ty, &args_vec, resolved, candidates);
@@ -608,8 +677,8 @@ fn assemble_caller_bound_candidates<D: SolverDelegate>(
     }
 }
 
-fn assemble_builtin_candidates<D: SolverDelegate>(
-    ecx: &mut EvalCtxt<'_, D>,
+fn assemble_builtin_candidates<'input, D: SolverDelegate<'input>>(
+    ecx: &mut EvalCtxt<'_, 'input, D>,
     predicate: &Predicate,
     resolved: &ResolvedObligation,
     candidates: &mut Vec<Candidate>,
@@ -622,7 +691,11 @@ fn assemble_builtin_candidates<D: SolverDelegate>(
         unsafe { &*ecx.builtin_registry }
     };
     let ctx = ecx.ctx();
-    let builtin_kind = builtin_registry.lookup(resolved.trait_id);
+    let builtin_kind = builtin_registry.lookup(
+        resolved
+            .trait_id
+            .unwrap_or(crate::hir::types::DefId(usize::MAX)),
+    );
 
     match builtin_kind {
         Some(crate::hir::traits::solver::builtins::BuiltinTrait::Sized) => {
@@ -651,8 +724,8 @@ fn assemble_builtin_candidates<D: SolverDelegate>(
     }
 }
 
-fn assemble_object_candidates<D: SolverDelegate>(
-    ecx: &mut EvalCtxt<'_, D>,
+fn assemble_object_candidates<'input, D: SolverDelegate<'input>>(
+    ecx: &mut EvalCtxt<'_, 'input, D>,
     predicate: &Predicate,
     resolved: &ResolvedObligation,
     candidates: &mut Vec<Candidate>,
@@ -664,7 +737,7 @@ fn assemble_object_candidates<D: SolverDelegate>(
         if let TypeData::DynTrait { traits, .. } = ctx.get(resolved.self_ty) {
             traits
                 .iter()
-                .filter(|&&t| t == resolved.trait_id)
+                .filter(|&&t| Some(t) == resolved.trait_id)
                 .copied()
                 .collect()
         } else {
@@ -676,8 +749,8 @@ fn assemble_object_candidates<D: SolverDelegate>(
     }
 }
 
-fn assemble_poly_candidates<D: SolverDelegate>(
-    ecx: &mut EvalCtxt<'_, D>,
+fn assemble_poly_candidates<'input, D: SolverDelegate<'input>>(
+    ecx: &mut EvalCtxt<'_, 'input, D>,
     predicate: &Predicate,
     resolved: &ResolvedObligation,
     candidates: &mut Vec<Candidate>,
@@ -697,8 +770,8 @@ fn assemble_poly_candidates<D: SolverDelegate>(
 
 // ── Winnowing ─────────────────────────────────────────────────────
 
-fn winnow(
-    ctx: &mut TypeContext,
+fn winnow<'input>(
+    ctx: &mut TypeContext<'input>,
     trait_env: &TraitEnv,
     candidates: &mut Candidates,
     _resolved: &ResolvedObligation,
@@ -730,14 +803,14 @@ fn winnow(
 }
 
 /// Order candidates by specificity (most specific first).
-fn specificity(
-    ctx: &mut TypeContext,
+fn specificity<'input>(
+    ctx: &mut TypeContext<'input>,
     trait_env: &TraitEnv,
     a: &Candidate,
     b: &Candidate,
 ) -> std::cmp::Ordering {
     match (a, b) {
-        // Param candidates are most specific (caller knows best)
+        // Param<'input> candidates are most specific (caller knows best)
         (Candidate::Param { .. }, _) => std::cmp::Ordering::Less,
         (_, Candidate::Param { .. }) => std::cmp::Ordering::Greater,
         // Impl candidates are more specific than builtins
@@ -782,8 +855,8 @@ fn candidate_should_be_dropped(victim: &Candidate, other: &Candidate) -> bool {
 
 // ── Confirmation ──────────────────────────────────────────────────
 
-fn confirm_candidate(
-    ctx: &mut TypeContext,
+fn confirm_candidate<'input>(
+    ctx: &mut TypeContext<'input>,
     trait_env: &TraitEnv,
     resolved: &ResolvedObligation,
     candidate: &Candidate,
@@ -808,12 +881,12 @@ fn confirm_candidate(
         Candidate::Param { self_ty, args } => {
             // Re-apply the unification for the matched caller bound.
             ctx.begin_transaction();
-            let ok = ctx.unify(resolved.self_ty, *self_ty).is_ok()
+            let ok = solver_unify(ctx, resolved.self_ty, *self_ty).is_ok()
                 && args.len() == resolved.args.len()
                 && args
                     .iter()
                     .zip(resolved.args.iter())
-                    .all(|(a, b)| ctx.unify(*a, *b).is_ok());
+                    .all(|(a, b)| solver_unify(ctx, *a, *b).is_ok());
             if ok {
                 ctx.commit_transaction();
                 Ok(ImplSource::Param(vec![]))
@@ -849,7 +922,7 @@ fn confirm_candidate(
             ctx.begin_transaction();
             for i in 0..*quantifier_count {
                 let id = ASSEMBLY_FRESH_VAR_ID.fetch_add(1, Ordering::Relaxed);
-                let fresh = ctx.alloc_infer_var(id);
+                let fresh = ctx.alloc_infer_var(id, 0);
                 fresh_subst.insert(i, fresh);
             }
             let unboxed_body = ctx.subst(body, &fresh_subst);
@@ -861,7 +934,9 @@ fn confirm_candidate(
                     },
                 },
                 predicate: Predicate::Trait {
-                    trait_id: resolved.trait_id,
+                    trait_id: resolved
+                        .trait_id
+                        .unwrap_or(crate::hir::types::DefId(usize::MAX)),
                     self_ty: unboxed_body,
                     args: resolved.args.clone(),
                 },
@@ -887,8 +962,8 @@ fn confirm_candidate(
 ///
 /// This is called inside a transaction — the caller is responsible for
 /// committing or rolling back.
-fn try_match_impl(
-    ctx: &mut TypeContext,
+fn try_match_impl<'input>(
+    ctx: &mut TypeContext<'input>,
     cand_idx: usize,
     impl_cand: &ImplCandidate,
     obligation: &ResolvedObligation,
@@ -899,7 +974,7 @@ fn try_match_impl(
     let mut subst = Subst::new();
     for i in 0..arity {
         let id = ASSEMBLY_FRESH_VAR_ID.fetch_add(1, Ordering::Relaxed);
-        let fresh = ctx.alloc_infer_var(id);
+        let fresh = ctx.alloc_infer_var(id, 0);
         subst.insert(i, fresh);
     }
 
@@ -907,12 +982,13 @@ fn try_match_impl(
     let substituted_for_type = ctx.subst(impl_cand.for_type, &subst);
 
     // Unify substituted for_type with obligation's self_ty
-    ctx.unify(obligation.self_ty, substituted_for_type)
-        .map_err(|_| SolveError::NotFound {
+    solver_unify(ctx, obligation.self_ty, substituted_for_type).map_err(|_| {
+        SolveError::NotFound {
             trait_id: obligation.trait_id,
             self_ty: obligation.self_ty,
             span: crate::ast::Span::new(0, 0),
-        })?;
+        }
+    })?;
 
     // Unify trait generic args
     let substituted_trait_args: Vec<TypeId> = impl_cand
@@ -930,12 +1006,12 @@ fn try_match_impl(
     }
 
     for (impl_arg, ob_arg) in substituted_trait_args.iter().zip(obligation.args.iter()) {
-        ctx.unify(*impl_arg, *ob_arg)
-            .map_err(|_| SolveError::Mismatch {
-                expected: *ob_arg,
-                found: *impl_arg,
-                span: crate::ast::Span::new(0, 0),
-            })?;
+        solver_unify(ctx, *impl_arg, *ob_arg).map_err(|e| SolveError::Mismatch {
+            expected: *ob_arg,
+            found: *impl_arg,
+            span: crate::ast::Span::new(0, 0),
+            note: format!("unify failed: {e:?}"),
+        })?;
     }
 
     // Generate sub-obligations from impl's where-clause
@@ -967,4 +1043,47 @@ fn try_match_impl(
         subst,
         nested,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for the `solver_unify` binding discipline: an `InferVar`
+    /// that is ALREADY BOUND must never be re-bound.  `solver_unify`
+    /// inspects the RAW type nodes, and `ctx.get_raw` bypasses binding
+    /// resolution — a var bound to a concrete type earlier in inference
+    /// was classified as unbound and its existing binding silently
+    /// overwritten with the impl's GenericParam.  The OmniML union-find
+    /// discipline is find-before-inspect (`Term.structure t =
+    /// (Union_find.get t).structure` in the reference `unifier.ml`):
+    /// unification operates on the ROOT of each variable, never on a
+    /// stale bound node.
+    #[test]
+    fn test_solver_unify_preserves_existing_var_binding() {
+        let mut ctx = TypeContext::new();
+        let var = ctx.alloc_infer_var(7, 0);
+        let concrete = ctx.struct_ty(DefId(100), vec![]);
+        let param = ctx.generic_param(0, crate::symbol::Symbol::intern("T"));
+        // The var was already resolved earlier in inference: ?v ↦ S.
+        assert!(ctx.set_binding(var, concrete), "fixture: pre-bind the var");
+        let result = solver_unify(&mut ctx, var, param);
+        assert!(
+            result.is_ok(),
+            "unifying a pre-bound var with a param must succeed: {:?}",
+            result
+        );
+        // The existing binding must survive; the param absorbs the
+        // RESOLVED type instead (find-first unification).
+        assert_eq!(
+            ctx.resolve_binding(var),
+            concrete,
+            "the var's existing binding must not be overwritten by the param"
+        );
+        assert_eq!(
+            ctx.resolve_binding(param),
+            concrete,
+            "the param must be bound to the var's resolved type"
+        );
+    }
 }

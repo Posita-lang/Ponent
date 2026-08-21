@@ -9,16 +9,22 @@ use rustc_hash::FxHashMap as HashMap;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+// Base offset (1_000_000) for fresh generic-match variables: keeps them
+// out of the main inference context's low ID space (regular inference
+// variables are allocated from 0 upward), so the two ID families never
+// collide in any table that indexes by both.  The exact value only needs
+// to exceed the largest plausible count of ordinary inference variables
+// in a single program — an order of magnitude above any real compile.
 static GENERIC_MATCH_VAR_ID: AtomicUsize = AtomicUsize::new(1_000_000);
 
 #[derive(Debug, Clone)]
-pub struct ImplCandidate {
+pub struct ImplCandidate<'input> {
     pub trait_id: DefId,
     pub for_type: TypeId,
-    pub methods: Vec<crate::ast::ImplMethod>,
+    pub methods: Vec<crate::ast::ImplMethod<'input>>,
     /// Pre-resolved method signatures (resolved during resolution using impl's
     /// type param mapping, so generic params like `T` are properly handled).
-    pub resolved_methods: Vec<MethodInfo>,
+    pub resolved_methods: Vec<MethodInfo<'input>>,
     pub assoc_tys: Vec<(Symbol, TypeId)>,
     pub span: Span,
     /// Whether this impl's method calls can be auto-deref'd through.
@@ -46,22 +52,28 @@ pub struct ImplCandidate {
 
 /// Describes a single method with resolved type IDs, ready for method lookup.
 #[derive(Debug, Clone)]
-pub struct MethodInfo {
+pub struct MethodInfo<'input> {
+    /// The method's OWN DefId — allocated once in the resolver (the
+    /// "assoc item" identity, mirroring rustc's `AssocItem.def_id`), so a
+    /// method is addressable independently of its impl across the whole
+    /// pipeline (lookup, effect labels, diagnostics).
+    pub def_id: DefId,
     pub name: Symbol,
     pub param_tys: Vec<TypeId>,
     pub ret_ty: TypeId,
     pub span: Span,
-    pub attributes: Vec<crate::ast::Attribute>,
+    pub attributes: Vec<crate::ast::Attribute<'input>>,
     /// Whether this method's `Deref` impl is marked `@auto_deref`.
     /// Without this flag, even if a type implements `Deref`, the compiler
     /// will NOT automatically dereference through it — the user must write `*x`.
     pub has_auto_deref: bool,
 }
 
-pub struct TraitEnv {
-    impls: Vec<ImplCandidate>,
+#[derive(Clone)]
+pub struct TraitEnv<'input> {
+    impls: Vec<ImplCandidate<'input>>,
     /// Inherent (non-trait) methods indexed by the DefId of the type they're implemented on.
-    inherent_methods: HashMap<DefId, Vec<MethodInfo>>,
+    inherent_methods: HashMap<DefId, Vec<MethodInfo<'input>>>,
     /// Cache for `lookup_impl_generic`: (trait_id, target_ty) → Some(cand_idx, subst)
     /// on match, None on miss (negative cache).  Stores the candidate index alongside
     /// the substitution so that a cache hit returns the exact same candidate that
@@ -72,13 +84,13 @@ pub struct TraitEnv {
     impl_generic_cache: RefCell<HashMap<(DefId, TypeId), Option<(usize, Subst)>>>,
 }
 
-impl Default for TraitEnv {
+impl<'input> Default for TraitEnv<'input> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl TraitEnv {
+impl<'input> TraitEnv<'input> {
     pub fn new() -> Self {
         TraitEnv {
             impls: Vec::new(),
@@ -88,17 +100,17 @@ impl TraitEnv {
     }
 
     /// Return all registered impl candidates.
-    pub fn all_impls(&self) -> &[ImplCandidate] {
+    pub fn all_impls(&self) -> &[ImplCandidate<'input>] {
         &self.impls
     }
 
     pub fn add_impl(
         &mut self,
-        candidate: ImplCandidate,
-        symbols: &SymbolTable,
-        ctx: &mut TypeContext,
+        candidate: ImplCandidate<'input>,
+        symbols: &SymbolTable<'input>,
+        ctx: &mut TypeContext<'input>,
         is_trusted: bool,
-    ) -> Result<(), TraitError> {
+    ) -> Result<(), TraitError<'_>> {
         // Check termination conditions BEFORE the orphan rule, so that
         // generic impls get clear errors about Paterson/Coverage violations
         // rather than a misleading "orphan rule" error.
@@ -213,15 +225,18 @@ impl TraitEnv {
 }
 
 /// Collect all GenericParam indices appearing in a type.
-fn collect_generic_params(ty: TypeId, ctx: &TypeContext) -> std::collections::HashSet<usize> {
+fn collect_generic_params<'input>(
+    ty: TypeId,
+    ctx: &TypeContext<'input>,
+) -> std::collections::HashSet<usize> {
     let mut set = std::collections::HashSet::new();
     collect_generic_params_rec(ty, ctx, &mut set);
     set
 }
 
-fn collect_generic_params_rec(
+fn collect_generic_params_rec<'input>(
     ty: TypeId,
-    ctx: &TypeContext,
+    ctx: &TypeContext<'input>,
     set: &mut std::collections::HashSet<usize>,
 ) {
     match ctx.get(ty) {
@@ -259,7 +274,10 @@ fn collect_generic_params_rec(
 
 /// Collect only *bare* GenericParam indices — those appearing directly as a
 /// top-level constructor argument (e.g. `T` in `(T,)` but not `T` in `Option<T>`).
-fn collect_bare_generic_params(ty: TypeId, ctx: &TypeContext) -> std::collections::HashSet<usize> {
+fn collect_bare_generic_params<'input>(
+    ty: TypeId,
+    ctx: &TypeContext<'input>,
+) -> std::collections::HashSet<usize> {
     let mut set = std::collections::HashSet::new();
     match ctx.get(ty) {
         TypeData::GenericParam { index, .. } => {
@@ -337,8 +355,8 @@ fn collect_bare_generic_params(ty: TypeId, ctx: &TypeContext) -> std::collection
     set
 }
 
-impl TraitEnv {
-    pub fn lookup_impl(&self, trait_id: DefId, type_id: TypeId) -> Option<&ImplCandidate> {
+impl<'input> TraitEnv<'input> {
+    pub fn lookup_impl(&self, trait_id: DefId, type_id: TypeId) -> Option<&ImplCandidate<'input>> {
         self.impls
             .iter()
             .find(|cand| cand.trait_id == trait_id && cand.for_type == type_id)
@@ -354,9 +372,9 @@ impl TraitEnv {
         &'b self,
         trait_id: DefId,
         target_ty: TypeId,
-        ctx: &mut TypeContext,
-        symbols: &SymbolTable,
-    ) -> Option<(&'b ImplCandidate, Subst)> {
+        ctx: &mut TypeContext<'input>,
+        symbols: &SymbolTable<'input>,
+    ) -> Option<(&'b ImplCandidate<'input>, Subst)> {
         let resolved = ctx.resolve_binding(target_ty);
         let cache_key = (trait_id, resolved);
         // Negative cache check.
@@ -398,7 +416,7 @@ impl TraitEnv {
             let mut fresh_args = Vec::with_capacity(binding.params.len());
             for i in 0..binding.params.len() {
                 let id = GENERIC_MATCH_VAR_ID.fetch_add(1, Ordering::Relaxed);
-                let fresh = ctx.alloc_infer_var(id);
+                let fresh = ctx.alloc_infer_var(id, 0);
                 subst.insert(i, fresh);
                 fresh_args.push(fresh);
             }
@@ -430,7 +448,7 @@ impl TraitEnv {
 
     /// Find all impl candidates whose `for_type` matches the given type exactly.
     /// This is used for inherent method lookup (methods on a type without a trait).
-    pub fn lookup_impls_for_type(&self, type_id: TypeId) -> Vec<&ImplCandidate> {
+    pub fn lookup_impls_for_type(&self, type_id: TypeId) -> Vec<&ImplCandidate<'input>> {
         self.impls
             .iter()
             .filter(|cand| cand.for_type == type_id)
@@ -448,8 +466,8 @@ impl TraitEnv {
         trait_id: DefId,
         self_ty: TypeId,
         assoc_name: &str,
-        ctx: &mut TypeContext,
-        symbols: &SymbolTable,
+        ctx: &mut TypeContext<'input>,
+        symbols: &SymbolTable<'input>,
     ) -> Option<TypeId> {
         // Try exact match first
         if let Some(cand) = self.lookup_impl(trait_id, self_ty) {
@@ -472,7 +490,7 @@ impl TraitEnv {
     }
 
     /// Register resolved inherent methods for a type.
-    pub fn add_inherent_methods(&mut self, for_type: DefId, methods: Vec<MethodInfo>) {
+    pub fn add_inherent_methods(&mut self, for_type: DefId, methods: Vec<MethodInfo<'input>>) {
         self.inherent_methods
             .entry(for_type)
             .or_default()
@@ -480,7 +498,11 @@ impl TraitEnv {
     }
 
     /// Look up inherent methods registered for a type.
-    pub fn lookup_inherent_methods(&self, ty: TypeId, ctx: &TypeContext) -> &[MethodInfo] {
+    pub fn lookup_inherent_methods(
+        &self,
+        ty: TypeId,
+        ctx: &TypeContext<'input>,
+    ) -> &[MethodInfo<'input>] {
         match ctx.get(ty) {
             TypeData::Adt { def_id, .. } => self
                 .inherent_methods
@@ -493,7 +515,7 @@ impl TraitEnv {
 }
 
 #[derive(Debug, Clone)]
-pub enum TraitError {
+pub enum TraitError<'input> {
     /// Paterson condition / Coverage condition / orphan rule violation
     /// during impl registration.
     Orphan {
@@ -510,7 +532,7 @@ pub enum TraitError {
     },
     /// Multiple impl candidates matched (incoherent overlap).
     Ambiguous {
-        candidates: Vec<ImplCandidate>,
+        candidates: Vec<ImplCandidate<'input>>,
         span: Span,
     },
 }
@@ -530,7 +552,7 @@ pub enum OrphanKind {
     OverlapViolation { existing_span: Span },
 }
 
-impl std::fmt::Display for TraitError {
+impl<'input> std::fmt::Display for TraitError<'input> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TraitError::Orphan {
@@ -650,6 +672,7 @@ mod tests {
             "add_impl should succeed: {:?}",
             result.err()
         );
+        drop(result);
         assert_eq!(env.all_impls().len(), 1);
     }
 
@@ -661,6 +684,7 @@ mod tests {
 
         let def_id = DefId(42);
         let method = MethodInfo {
+            def_id: DefId(43),
             name: "foo".into(),
             param_tys: vec![],
             ret_ty: ctx.int(32, true),

@@ -192,9 +192,9 @@ pub(crate) const CODE_TABLE: &[CodeEntry] = &[
     },
     CodeEntry {
         code: "E008",
-        title: "integer overflow",
+        title: "return Err is not valid; use leave with",
         category: ErrorCategory::Parse,
-        explain: "Integer literal overflow.",
+        explain: "`return Err(...)` is not a valid error exit in Posita.\n\n`leave with` is the only valid error exit (SYNTAX.md §Error Handling); it\nis recorded as an `ErrorExit` in the control-flow graph for audit.\n\nFix: replace `return Err(x)` with `leave with x`.",
     },
     CodeEntry {
         code: "E009",
@@ -408,9 +408,9 @@ pub(crate) const CODE_TABLE: &[CodeEntry] = &[
     },
     CodeEntry {
         code: "E060",
-        title: "internal compiler error",
-        category: ErrorCategory::Internal,
-        explain: "An internal compiler error occurred. This is a bug in the compiler.\n\nPlease report this error at https://github.com/posita-lang/ponent/issues.",
+        title: "GADT variant constraint violation",
+        category: ErrorCategory::Type,
+        explain: "A GADT variant's `when` constraint is not satisfied after solving\nand defaulting, or cannot be verified because a type argument is\nstill unresolved (fail-closed).\n\nFix: make the type arguments satisfy the variant's `when` constraint,\nor provide concrete type arguments at the construction site.",
     },
     CodeEntry {
         code: "E061",
@@ -447,6 +447,18 @@ pub(crate) const CODE_TABLE: &[CodeEntry] = &[
         title: "conflicting GADT refinements in or-pattern",
         category: ErrorCategory::Resolution,
         explain: "An or-pattern (`pattern1 | pattern2`) refines the same enum type parameter to DIFFERENT types in different alternatives.\n\nFor example, the following is invalid because `Add` refines `T == Int<32>` while `Eq` refines `T == Bool`:\n  type Expr<T> = enum { Add(...) when T == Int<32>, Eq(...) when T == Bool }\n  match e { Add(_, _) | Eq(_, _) => ... }\n\nA branch guarded by a disjunction may only assume facts true in ALL alternatives. Conflicting refinements are a contradiction.\n\nFix: split the or-pattern into separate match arms, or make the alternatives refine the type parameter consistently.",
+    },
+    CodeEntry {
+        code: "E070",
+        title: "unknown edition",
+        category: ErrorCategory::Resolution,
+        explain: "The `--edition` / `@edition` value is not one of the supported editions (e.g. `\"2024\"` or `\"2026\"`).  The edition selects the language defaults (reserved keywords, overflow policy, …) for the compilation unit.\n\nFix: use a valid edition string.",
+    },
+    CodeEntry {
+        code: "E100",
+        title: "trait not found",
+        category: ErrorCategory::Trait,
+        explain: "A trait referenced in an `impl` or a bound could not be resolved.\n\nFix: check the trait name and ensure it is defined or imported in scope.",
     },
     CodeEntry {
         code: "E101",
@@ -497,6 +509,60 @@ pub(crate) const CODE_TABLE: &[CodeEntry] = &[
         explain: "In strict mode, a call to an `@must_handle` function must handle every marked error variant locally (via `catch`) before propagating.  Propagating a must_handle'd result via `?`, or leaving a marked variant uncaught, is an error in strict mode (a warning otherwise).\n\nFix: add explicit `catch` branches for each `@must_handle` variant, or add `@delegates_must_handle` to this function.",
     },
     CodeEntry {
+        code: "E109",
+        title: "read of a variable frozen by an active `&mut` borrow",
+        category: ErrorCategory::Type,
+        explain: "SYNTAX.md §References: an exclusive borrow (`&mut T`) freezes the original variable — neither readable nor writable — while it is live (committee ruling, 2026-08-05).  Reading the source place while the exclusive borrow is live is rejected.\n\nFix: read through the borrow itself (`*r`), or end the borrow's scope before reading the source.",
+    },
+    CodeEntry {
+        code: "E110",
+        title: "mutation of a variable frozen by an active borrow",
+        category: ErrorCategory::Type,
+        explain: "SYNTAX.md §References / §Reference Coercion: the source of an active borrow (`&mut` exclusive, `&ro` / `.freeze!()` read-only) is frozen against mutation while the borrow is live.\n\nFix: mutate through the borrow (for `&mut`), end the borrow's scope first, or use the explicit `&ro`/`.freeze!()` forms deliberately.",
+    },
+    CodeEntry {
+        code: "E111",
+        title: "read-only borrow requires a reference operand",
+        category: ErrorCategory::Type,
+        explain: "The `&ro` operator (and `.freeze!()`) freezes a `&mut T` reference into a `&T` view.  The operand must itself be a reference; borrowing a non-reference value with `&ro` is not meaningful.\n\nFix: apply `&ro` to a reference-typed operand (`&ro r`, `&ro r.f` where the field is a reference).",
+    },
+    CodeEntry {
+        code: "E112",
+        title: "overlapping exclusive borrows",
+        category: ErrorCategory::Type,
+        explain: "SYNTAX.md §References: `&mut T` is exclusive — while it is live, no other borrow (read-only or exclusive) of an overlapping place may exist.\n\nFix: end the first borrow's scope (its borrow variable's last use) before creating the second, or restructure the code to avoid the overlapping exclusive borrows.",
+    },
+    CodeEntry {
+        code: "E113",
+        title: "the function's CFG exceeds the point-encoding capacity",
+        category: ErrorCategory::Type,
+        explain: "The Polonius fact extraction encodes each CFG point as an integer (block << 36 | stmt << 16 | expr).  A function with more than 1,048,575 CFG blocks, more than 1,048,575 statements in a single block, or more than 65,535 expressions in a single statement exceeds this internal encoding capacity — an internal compiler limitation, not a program error.\n\nFix: split the function into smaller functions, or report the issue if the function is not unusually large.",
+    },
+    CodeEntry {
+        code: "E114",
+        title: "use of moved value",
+        category: ErrorCategory::Type,
+        explain: "SYNTAX.md §Move Semantics: after a move, the source is invalidated — a subsequent use is a compile-time error (affine: a non-Copy value is used at most once).\n\nFix: use the value before moving it, or re-initialize the source (assign a new value) before the later use.",
+    },
+    CodeEntry {
+        code: "E115",
+        title: "region subset not declared in signature",
+        category: ErrorCategory::Type,
+        explain: "The Polonius R9 (placeholder-subset rejection) rule: a subset relation between two placeholder (signature-region) origins derived inside the function body must be declared in the signature (`known_placeholder_subset`) — the caller needs the declared relationship to reason about the returned borrows.  An undeclared region subset is rejected.\n\nFix: declare the region relationship in the signature (e.g. `def f<'a, 'b>(...) -> ...` with the regions ordered so the subset holds), or restructure the function so the derived relationship is not required.",
+    },
+    CodeEntry {
+        code: "E116",
+        title: "cannot drop a value while its borrow is still live",
+        category: ErrorCategory::Type,
+        explain: "The Polonius drop rule (`evaluate_drop_errors`): a dropped value whose loan is still live at the drop point — the borrow outlives the value (rustc E0505).  The drop destroys the value while a borrow of it is still live, so the borrow would dangle.\n\nFix: end the borrow's scope (its borrow variable's last use) before the value is dropped, or reorder the code so the drop happens after the borrow is no longer needed.",
+    },
+    CodeEntry {
+        code: "E117",
+        title: "side effect in a @pure function",
+        category: ErrorCategory::Resolution,
+        explain: "A `@pure` function must have no side effects — transitively: it may only call functions/methods whose own `effect_of` labels are empty (no write, no allocation, no panic, no unsafe, no comptime, no mutable-global read, no input/output).  A forbidden effect anywhere in the call chain violates the annotation.\n\nFix: remove the offending call or read, or drop `@pure` from the function.",
+    },
+    CodeEntry {
         code: "W004",
         title: "must_handle error propagated via `?`",
         category: ErrorCategory::Generic,
@@ -515,10 +581,34 @@ pub(crate) const CODE_TABLE: &[CodeEntry] = &[
         explain: "A bare `@must_handle` (no specific variants listed) is used with a `catch` that only has a wildcard arm.  A wildcard catch does not make the handled variants explicit.\n\nFix: use specific catch arms like `|Variant| { ... }` instead of `|_| { ... }`.",
     },
     CodeEntry {
+        code: "W090",
+        title: "use of deprecated function",
+        category: ErrorCategory::Generic,
+        explain: "A function annotated `@deprecated(\"reason\")` is called.  The annotation marks it for removal; new code should not rely on it.\n\nFix: migrate to the replacement function named in the deprecation reason.",
+    },
+    CodeEntry {
+        code: "W091",
+        title: "@cfg condition too complex for precise satisfiability checking",
+        category: ErrorCategory::Generic,
+        explain: "The SAT-based @cfg reachability checker skipped some constraints because the condition exceeded the complexity budget — the result may be a false positive (the code may be kept even when unsatisfiable).\n\nFix: simplify the condition so every constraint can be checked.",
+    },
+    CodeEntry {
+        code: "W092",
+        title: "conservative reachability treatment",
+        category: ErrorCategory::Generic,
+        explain: "A @cfg condition (or attribute-resolution check) could not be fully verified, so the code is conservatively treated as reachable rather than silently eliminated.\n\nFix: simplify the condition or resolve the incomplete check to suppress the warning.",
+    },
+    CodeEntry {
         code: "W113",
         title: "variable shadowing",
         category: ErrorCategory::Generic,
         explain: "A variable in the current scope has the same name as a variable in an\nouter scope, which shadows (hides) the outer one.\n\nThis is allowed in Posita, but may indicate a bug if the outer variable was\nstill needed.  Consider renaming one of the variables to avoid confusion.\n\nExample:\n  def f() {\n    set x = 1;\n    if true {\n      set x = 2;  // warning: shadows the outer `x`\n    }\n  }\n\nFix: use a different name for the inner variable, or remove the outer one.",
+    },
+    CodeEntry {
+        code: "W114",
+        title: "redundant &ro on immutable reference",
+        category: ErrorCategory::Generic,
+        explain: "`&ro`'s core purpose is the `&mut T` → `&T` coercion.  Applying it to an\nalready-immutable reference is harmless but redundant — the operand is\nalready `&T`.\n\nThis is allowed in Posita (a warning, not an error), but may indicate that\nthe `&ro` is unnecessary.  Consider removing it and using the plain `&T`\nreference directly.",
     },
     CodeEntry {
         code: "E091",
@@ -527,16 +617,58 @@ pub(crate) const CODE_TABLE: &[CodeEntry] = &[
         explain: "In strict mode, @trusted functions must have @link_proof or\n@comptime_test evidence linking them to a formal proof.\n\nWithout such evidence, the compiler cannot verify that the function\nmeets its safety guarantees.  Add @link_proof or use @comptime_test\nto provide the required proof linkage.",
     },
     CodeEntry {
+        code: "E080",
+        title: "comptime evaluation error",
+        category: ErrorCategory::Generic,
+        explain: "A comptime block or comptime function failed during evaluation.\n\nThe evaluator's error message is attached and is the specific cause.\nCommon causes include:\n- A comptime block containing an item declaration (`type`, `def`, `impl`,\n  `trait`, ...) — comptime blocks only allow expressions, variable\n  definitions, and assignments.  Use a `generate` block for\n  declaration-level code generation.\n- A comptime function or block referencing a value that is not computable\n  at compile time.\nFix the comptime code so it evaluates successfully.",
+    },
+    CodeEntry {
         code: "E081",
         title: "comptime sandbox violation",
         category: ErrorCategory::Generic,
         explain: "A comptime block attempted to call a @trusted or @io function, which\nis prohibited because comptime code is sandboxed.\n\nComptime blocks can only call comptime functions (declared with\n`comptime def`) or safe built-in operations.  To call a @trusted\nfunction at compile time, use `comptime @trusted { ... }` instead.",
     },
     CodeEntry {
+        code: "E082",
+        title: "comptime block accesses mutable or unknown state",
+        category: ErrorCategory::Generic,
+        explain: "A comptime block cannot touch mutable state: assigning to a mutable global, capturing a mutable variable, or naming an unknown variable in the capture list are all rejected — comptime evaluation is sandboxed to compile-time-known values.\n\nFix: only capture comptime-known values, or read the state outside the comptime block.",
+    },
+    CodeEntry {
+        code: "E090",
+        title: "invalid @comptime_test function",
+        category: ErrorCategory::Resolution,
+        explain: "A `@comptime_test` function must have no parameters, must have a body, and must evaluate successfully — it is executed at compile time with no arguments to demonstrate the property.\n\nFix: remove the parameters, provide a body, or fix the failing assertion.",
+    },
+    CodeEntry {
         code: "E092",
         title: "cfg condition unreachable in strict mode",
         category: ErrorCategory::Generic,
         explain: "In strict mode, the SAT-based cfg reachability checker determined that\na `@cfg(condition)` is unsatisfiable under any target configuration.\n\nThis likely indicates contradictory conditions (e.g.\n`all(target_os == \"linux\", target_os == \"windows\")`).\n\nFix the @cfg condition to be satisfiable under at least one target.",
+    },
+    CodeEntry {
+        code: "E093",
+        title: "isolate block accesses external mutable state",
+        category: ErrorCategory::Generic,
+        explain: "An isolate block must not access or mutate external mutable state\n(SYNTAX.md §Task Isolation — \"does not access any external mutable\nstate\").  Reading or writing a mutable global, or assigning to a\ncaptured outer mutable variable, inside an isolate block is rejected.\n\nDeclare the variable inside the block if it is meant to be internal\nstate, or restructure the code so the isolate block only touches its\nown state.",
+    },
+    CodeEntry {
+        code: "E094",
+        title: "use of experimental trait",
+        category: ErrorCategory::Trait,
+        explain: "The trait is marked experimental — it is not part of the stable language surface and requires the experimental feature flag.\n\nFix: enable experimental features (`--enable-experimental`), or avoid the trait.",
+    },
+    CodeEntry {
+        code: "E099",
+        title: "`@compile_error` triggered",
+        category: ErrorCategory::Generic,
+        explain: "A `@compile_error(\"message\")` expression was evaluated during compilation — it halts compilation unconditionally with the attached message.  This is the intended mechanism for `#error`-style compile-time diagnostics.\n\nFix: remove or guard the `@compile_error` invocation.",
+    },
+    CodeEntry {
+        code: "E601",
+        title: "invalid safe cast",
+        category: ErrorCategory::Type,
+        explain: "A `as` (safe cast) between incompatible types: a reference type requires an explicit dereference or an unsafe `as!` bitcast; safe casts are only allowed between numeric and boolean types; casting a reference to an integer is not yet supported; an unsafe cast requires compatible types (numeric↔numeric, ref↔ptr, ptr↔ptr).\n\nFix: dereference the value first (`*expr as TargetType`), use `as!` for an explicit bitcast, or cast between compatible types.",
     },
 ];
 

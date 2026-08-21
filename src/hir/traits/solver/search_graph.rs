@@ -104,7 +104,10 @@ pub enum GoalKind {
 }
 
 impl GoalKey {
-    pub fn from_obligation(obligation: &Obligation, ctx: &TypeContext) -> Option<Self> {
+    pub fn from_obligation<'input>(
+        obligation: &Obligation,
+        ctx: &TypeContext<'input>,
+    ) -> Option<Self> {
         let (kind, trait_id, self_ty, args) = match &obligation.predicate {
             Predicate::Trait {
                 trait_id,
@@ -254,14 +257,14 @@ pub enum CanonicalTy {
         index: usize,
     },
     Int {
-        bits: u8,
+        bits: u32,
         signed: bool,
     },
     UInt {
-        bits: u8,
+        bits: u32,
     },
     Float {
-        bits: u8,
+        bits: u32,
     },
     Bool,
     Char,
@@ -359,7 +362,11 @@ pub enum CanonicalTy {
 /// analogue of `hash_type_canonical` but produces a full tree instead of a
 /// hash, enabling sound structural equality for cache keys.
 /// See rustc's `Canonicalizer::canonicalize_ty` (rustc_type_ir/src/canonicalizer.rs).
-pub fn ty_to_canonical(ty: TypeId, ctx: &TypeContext) -> CanonicalTy {
+pub fn ty_to_canonical<'input>(
+    ty: TypeId,
+    ctx: &TypeContext<'input>,
+    bound: &[(usize, usize)],
+) -> CanonicalTy {
     let resolved = ctx.resolve_binding(ty);
     match ctx.get(resolved) {
         TypeData::InferVar { .. } => CanonicalTy::InferSentinel,
@@ -378,7 +385,23 @@ pub fn ty_to_canonical(ty: TypeId, ctx: &TypeContext) -> CanonicalTy {
         TypeData::Unit => CanonicalTy::Unit,
         TypeData::Error => CanonicalTy::Error,
         TypeData::Type => CanonicalTy::Type,
-        TypeData::GenericParam { index, .. } => CanonicalTy::GenericParam { index: *index },
+        TypeData::GenericParam { index, .. } => CanonicalTy::GenericParam {
+            // De Bruijn: a binder-bound variable maps to its nesting depth
+            // (alpha-equivalent quantified types — e.g. `∀X0. X0` vs
+            // `∀X1. X1` — then produce the same canonical key).  A FREE
+            // parameter (not bound by any enclosing quantifier) keeps its
+            // original index.
+            //
+            // The binder stack is searched in REVERSE so that a shadowing
+            // inner binder (`∀X. ∀X. X` — the inner `X` shadows the outer)
+            // resolves to the NEAREST enclosing binder's depth, matching
+            // De Bruijn semantics.
+            index: bound
+                .iter()
+                .rev()
+                .find(|(p, _)| *p == *index)
+                .map_or(*index, |&(_, d)| d),
+        },
         TypeData::Rational {
             int_bits,
             frac_bits,
@@ -395,32 +418,41 @@ pub fn ty_to_canonical(ty: TypeId, ctx: &TypeContext) -> CanonicalTy {
             args,
         } => CanonicalTy::Adt {
             def_id: *def_id,
-            args: args.iter().map(|a| ty_to_canonical(*a, ctx)).collect(),
+            args: args
+                .iter()
+                .map(|a| ty_to_canonical(*a, ctx, bound))
+                .collect(),
         },
         TypeData::Tuple { elems } => CanonicalTy::Tuple {
-            elems: elems.iter().map(|e| ty_to_canonical(*e, ctx)).collect(),
+            elems: elems
+                .iter()
+                .map(|e| ty_to_canonical(*e, ctx, bound))
+                .collect(),
         },
         TypeData::Array { elem, size } => CanonicalTy::Array {
-            elem: Box::new(ty_to_canonical(*elem, ctx)),
+            elem: Box::new(ty_to_canonical(*elem, ctx, bound)),
             size: *size,
         },
         TypeData::Slice { elem } => CanonicalTy::Slice {
-            elem: Box::new(ty_to_canonical(*elem, ctx)),
+            elem: Box::new(ty_to_canonical(*elem, ctx, bound)),
         },
-        TypeData::Ref { ty, mutable } => CanonicalTy::Ref {
-            ty: Box::new(ty_to_canonical(*ty, ctx)),
+        TypeData::Ref { ty, mutable, .. } => CanonicalTy::Ref {
+            ty: Box::new(ty_to_canonical(*ty, ctx, bound)),
             mutable: *mutable,
         },
         TypeData::Pointer { ty } => CanonicalTy::Pointer {
-            ty: Box::new(ty_to_canonical(*ty, ctx)),
+            ty: Box::new(ty_to_canonical(*ty, ctx, bound)),
         },
         TypeData::Ptr { size, pointee } => CanonicalTy::Ptr {
-            size: Box::new(ty_to_canonical(*size, ctx)),
-            pointee: Box::new(ty_to_canonical(*pointee, ctx)),
+            size: Box::new(ty_to_canonical(*size, ctx, bound)),
+            pointee: Box::new(ty_to_canonical(*pointee, ctx, bound)),
         },
         TypeData::Fn { params, ret, .. } => CanonicalTy::Fn {
-            params: params.iter().map(|p| ty_to_canonical(*p, ctx)).collect(),
-            ret: Box::new(ty_to_canonical(*ret, ctx)),
+            params: params
+                .iter()
+                .map(|p| ty_to_canonical(*p, ctx, bound))
+                .collect(),
+            ret: Box::new(ty_to_canonical(*ret, ctx, bound)),
         },
         TypeData::DynTrait { traits } => CanonicalTy::DynTrait {
             traits: traits.clone(),
@@ -432,46 +464,77 @@ pub fn ty_to_canonical(ty: TypeId, ctx: &TypeContext) -> CanonicalTy {
         } => CanonicalTy::AssociatedType {
             trait_id: *trait_id,
             name: *name,
-            self_ty: Box::new(ty_to_canonical(*self_ty, ctx)),
+            self_ty: Box::new(ty_to_canonical(*self_ty, ctx, bound)),
         },
         TypeData::Opaque { def_id, hidden } => CanonicalTy::Opaque {
             def_id: *def_id,
-            hidden: hidden.map(|h| Box::new(ty_to_canonical(h, ctx))),
+            hidden: hidden.map(|h| Box::new(ty_to_canonical(h, ctx, bound))),
         },
         TypeData::Coproduct { alternatives } => CanonicalTy::Coproduct {
             alternatives: alternatives
                 .iter()
-                .map(|a| ty_to_canonical(*a, ctx))
+                .map(|a| ty_to_canonical(*a, ctx, bound))
                 .collect(),
         },
         TypeData::Forall {
             param_index, body, ..
-        } => CanonicalTy::Forall {
-            param_index: *param_index,
-            body: Box::new(ty_to_canonical(*body, ctx)),
-        },
+        } => {
+            let mut b = bound.to_vec();
+            b.push((*param_index, bound.len()));
+            CanonicalTy::Forall {
+                // De Bruijn: the binder's nesting depth (alpha-equivalent
+                // quantifiers — `∀X0. ...` vs `∀X1. ...` — agree).
+                param_index: bound.len(),
+                body: Box::new(ty_to_canonical(*body, ctx, &b)),
+            }
+        }
         TypeData::Exists {
             param_index, base, ..
-        } => CanonicalTy::Exists {
-            param_index: *param_index,
-            base: Box::new(ty_to_canonical(*base, ctx)),
-        },
+        } => {
+            let mut b = bound.to_vec();
+            b.push((*param_index, bound.len()));
+            CanonicalTy::Exists {
+                param_index: bound.len(),
+                base: Box::new(ty_to_canonical(*base, ctx, &b)),
+            }
+        }
         TypeData::Mu {
             param_index, body, ..
-        } => CanonicalTy::Mu {
-            param_index: *param_index,
-            body: Box::new(ty_to_canonical(*body, ctx)),
-        },
+        } => {
+            let mut b = bound.to_vec();
+            b.push((*param_index, bound.len()));
+            CanonicalTy::Mu {
+                param_index: bound.len(),
+                body: Box::new(ty_to_canonical(*body, ctx, &b)),
+            }
+        }
         TypeData::Nu {
             param_index, body, ..
-        } => CanonicalTy::Nu {
-            param_index: *param_index,
-            body: Box::new(ty_to_canonical(*body, ctx)),
-        },
-        TypeData::Poly { quantifiers, body } => CanonicalTy::Poly {
-            quantifiers: quantifiers.iter().map(|(i, _)| *i).collect(),
-            body: Box::new(ty_to_canonical(*body, ctx)),
-        },
+        } => {
+            let mut b = bound.to_vec();
+            b.push((*param_index, bound.len()));
+            CanonicalTy::Nu {
+                param_index: bound.len(),
+                body: Box::new(ty_to_canonical(*body, ctx, &b)),
+            }
+        }
+        TypeData::Poly { quantifiers, body } => {
+            let mut b = bound.to_vec();
+            let mut depth = bound.len();
+            for (i, _) in quantifiers {
+                b.push((*i, depth));
+                depth += 1; // Sequential De Bruijn depths — each quantifier
+                // gets its own depth so body references distinguish the
+                // binders (`∀A B. A → B` ≠ `∀A B. A → A` in the cache).
+            }
+            CanonicalTy::Poly {
+                // The De Bruijn depth RANGE, not the original param
+                // indices — alpha-equivalent Poly types (`∀A B. ...` vs
+                // `∀C D. ...`) canonicalize identically.
+                quantifiers: (bound.len()..depth).collect(),
+                body: Box::new(ty_to_canonical(*body, ctx, &b)),
+            }
+        }
     }
 }
 
@@ -506,7 +569,7 @@ pub struct CanonicalResponse {
     /// Original InferVar IDs for each canonical variable, parallel to
     /// `var_values`.  Stored so that `instantiate_canonical` can build
     /// a solution map keyed by original InferVar ID (required by
-    /// `replace_infer`), which looks up by `TypeData::InferVar { id }`.
+    /// `replace_infer`), which looks up by `TypeData::InferVar { id, .. }`.
     pub infer_var_ids: Vec<usize>,
     /// Universe index for each canonical variable, parallel to `var_values`.
     /// Used when creating fresh inference variables during instantiation
@@ -519,7 +582,7 @@ pub struct CanonicalResponse {
 }
 
 /// Hash a TypeId canonically: resolve bindings + opaque types, strip infer var identity.
-fn hash_type_canonical(ty: TypeId, ctx: &TypeContext, state: &mut DefaultHasher) {
+fn hash_type_canonical<'input>(ty: TypeId, ctx: &TypeContext<'input>, state: &mut DefaultHasher) {
     // Use resolve_binding (not resolve) to preserve opaque type identity.
     // ctx.resolve() chains resolve_opaque which strips the Opaque wrapper,
     // causing distinct opaque types with the same hidden type to collide.
@@ -579,7 +642,7 @@ fn hash_type_canonical(ty: TypeId, ctx: &TypeContext, state: &mut DefaultHasher)
             16u64.hash(state);
             hash_type_canonical(*elem, ctx, state);
         }
-        TypeData::Ref { ty, mutable } => {
+        TypeData::Ref { ty, mutable, .. } => {
             17u64.hash(state);
             hash_type_canonical(*ty, ctx, state);
             mutable.hash(state);
@@ -682,7 +745,7 @@ fn hash_type_canonical(ty: TypeId, ctx: &TypeContext, state: &mut DefaultHasher)
 /// Extracted as a standalone function so it can be used by both
 /// `predicate_has_unresolved_vars` and `canonicalize_response` (for
 /// checking subst values before caching).
-pub fn ty_has_unresolved_vars(ty: TypeId, ctx: &TypeContext) -> bool {
+pub fn ty_has_unresolved_vars<'input>(ty: TypeId, ctx: &TypeContext<'input>) -> bool {
     // Use ctx.resolve() instead of resolve_binding() so that opaque
     // side-table state (opaque_hidden map) is also followed.
     let resolved = ctx.resolve(ty);
@@ -698,7 +761,7 @@ pub fn ty_has_unresolved_vars(ty: TypeId, ctx: &TypeContext) -> bool {
         // benefits without needing its own match arms.
         _ => {
             let mut found = false;
-            visit_type_children(ty, ctx, &mut |child| {
+            crate::hir::types::visit_type_children(ty, ctx, &mut |child| {
                 if ty_has_unresolved_vars(child, ctx) {
                     found = true;
                 }
@@ -714,7 +777,7 @@ pub fn ty_has_unresolved_vars(ty: TypeId, ctx: &TypeContext) -> bool {
 /// goal with free inference variables enters the canonical cache.
 /// Crucially, it also recurses INTO composite types (Adt, Tuple, Ref, Fn, etc.)
 /// so that `Trait<Vec<?x>>` is correctly identified as containing an infer var.
-fn predicate_has_unresolved_vars(predicate: &Predicate, ctx: &TypeContext) -> bool {
+fn predicate_has_unresolved_vars<'input>(predicate: &Predicate, ctx: &TypeContext<'input>) -> bool {
     match predicate {
         Predicate::Trait { self_ty, args, .. } => {
             ty_has_unresolved_vars(*self_ty, ctx)
@@ -757,12 +820,15 @@ fn predicate_has_unresolved_vars(predicate: &Predicate, ctx: &TypeContext) -> bo
 /// Collect free inference variable kinds from a Predicate by walking
 /// all TypeId fields.  Records the `TypeVariableKind` of each distinct
 /// infer var in order of first appearance.
-fn collect_predicate_var_kinds(predicate: &Predicate, ctx: &TypeContext) -> Vec<TypeVariableKind> {
+fn collect_predicate_var_kinds<'input>(
+    predicate: &Predicate,
+    ctx: &TypeContext<'input>,
+) -> Vec<TypeVariableKind> {
     let mut var_kinds: Vec<TypeVariableKind> = Vec::new();
     let mut seen: HashMap<usize, usize> = HashMap::default();
     let self_ty = predicate.self_ty();
     let resolved = ctx.resolve_binding(self_ty);
-    if let TypeData::InferVar { id } = ctx.get(resolved) {
+    if let TypeData::InferVar { id, .. } = ctx.get(resolved) {
         let canon_idx = seen.len();
         let idx = *seen.entry(*id).or_insert(canon_idx);
         if idx == canon_idx {
@@ -780,9 +846,9 @@ fn collect_predicate_var_kinds(predicate: &Predicate, ctx: &TypeContext) -> Vec<
 ///
 /// When `Some(...)` is returned, the key is a structural hash that is identical
 /// for structurally identical goals (same type structure, same trait, same args).
-pub fn canonicalize_goal_key(
+pub fn canonicalize_goal_key<'input>(
     obligation: &Obligation,
-    ctx: &TypeContext,
+    ctx: &TypeContext<'input>,
     max_universe: usize,
 ) -> Option<CanonicalPredicate> {
     // SAFETY: Goals with unresolved inference variables must NOT be cached.
@@ -806,26 +872,26 @@ pub fn canonicalize_goal_key(
         } => {
             h(CanonicalTy::PredicateDiscriminant(0));
             h(CanonicalTy::TraitRef(*trait_id));
-            h(ty_to_canonical(*self_ty, ctx));
+            h(ty_to_canonical(*self_ty, ctx, &[]));
             for a in args {
-                h(ty_to_canonical(*a, ctx));
+                h(ty_to_canonical(*a, ctx, &[]));
             }
         }
         Predicate::AutoTrait { trait_id, self_ty } => {
             h(CanonicalTy::PredicateDiscriminant(1));
             h(CanonicalTy::TraitRef(*trait_id));
-            h(ty_to_canonical(*self_ty, ctx));
+            h(ty_to_canonical(*self_ty, ctx, &[]));
         }
         Predicate::Sized { ty } => {
             h(CanonicalTy::PredicateDiscriminant(2));
-            h(ty_to_canonical(*ty, ctx));
+            h(ty_to_canonical(*ty, ctx, &[]));
         }
         Predicate::CopyLike { kind, ty } => {
             h(CanonicalTy::PredicateDiscriminant(3));
             h(CanonicalTy::GenericParam {
                 index: *kind as usize,
             });
-            h(ty_to_canonical(*ty, ctx));
+            h(ty_to_canonical(*ty, ctx, &[]));
         }
         Predicate::ProjectionEq {
             trait_id,
@@ -836,32 +902,32 @@ pub fn canonicalize_goal_key(
             h(CanonicalTy::PredicateDiscriminant(4));
             h(CanonicalTy::TraitRef(*trait_id));
             h(CanonicalTy::AssocName(*assoc_name));
-            h(ty_to_canonical(*self_ty, ctx));
-            h(ty_to_canonical(*value, ctx));
+            h(ty_to_canonical(*self_ty, ctx, &[]));
+            h(ty_to_canonical(*value, ctx, &[]));
         }
         Predicate::ProjectionNormalize { projection, target } => {
             h(CanonicalTy::PredicateDiscriminant(5));
             h(CanonicalTy::TraitRef(projection.trait_id));
             h(CanonicalTy::AssocName(projection.assoc_name));
-            h(ty_to_canonical(projection.self_ty, ctx));
-            h(ty_to_canonical(*target, ctx));
+            h(ty_to_canonical(projection.self_ty, ctx, &[]));
+            h(ty_to_canonical(*target, ctx, &[]));
             for a in &projection.args {
-                h(ty_to_canonical(*a, ctx));
+                h(ty_to_canonical(*a, ctx, &[]));
             }
         }
         Predicate::Eq { a, b } => {
             h(CanonicalTy::PredicateDiscriminant(6));
-            h(ty_to_canonical(*a, ctx));
-            h(ty_to_canonical(*b, ctx));
+            h(ty_to_canonical(*a, ctx, &[]));
+            h(ty_to_canonical(*b, ctx, &[]));
         }
         Predicate::Sub { sub, sup } => {
             h(CanonicalTy::PredicateDiscriminant(7));
-            h(ty_to_canonical(*sub, ctx));
-            h(ty_to_canonical(*sup, ctx));
+            h(ty_to_canonical(*sub, ctx, &[]));
+            h(ty_to_canonical(*sup, ctx, &[]));
         }
         Predicate::Match { scrutinee, .. } => {
             h(CanonicalTy::PredicateDiscriminant(8));
-            h(ty_to_canonical(*scrutinee, ctx));
+            h(ty_to_canonical(*scrutinee, ctx, &[]));
         }
         Predicate::Forall { body, .. } => {
             return None;
@@ -881,81 +947,31 @@ pub fn canonicalize_goal_key(
     })
 }
 
-/// Visit every TypeId child of a resolved type by calling `f` on each one.
-/// This is the SINGLE source of truth for which TypeData variants contain
-/// TypeId children.  When a new TypeData variant with TypeId fields is added,
-/// update this function — all downstream walkers (ty_has_unresolved_vars,
-/// collect_from_ty, type_is_volatile, etc.) automatically benefit.
-/// See rustc's `TypeSuperFoldable` for the analogous pattern.
-pub fn visit_type_children<F: FnMut(TypeId)>(ty: TypeId, ctx: &TypeContext, f: &mut F) {
-    let resolved = ctx.resolve_binding(ty);
-    match ctx.get(resolved) {
-        TypeData::Adt { args, .. } => {
-            for a in args {
-                f(*a);
-            }
-        }
-        TypeData::Tuple { elems } => {
-            for e in elems {
-                f(*e);
-            }
-        }
-        TypeData::Ref { ty, .. } => f(*ty),
-        TypeData::Fn { params, ret, .. } => {
-            for p in params {
-                f(*p);
-            }
-            f(*ret);
-        }
-        TypeData::Array { elem, .. } => f(*elem),
-        TypeData::Slice { elem } => f(*elem),
-        TypeData::Pointer { ty } => f(*ty),
-        TypeData::Ptr { size, pointee } => {
-            f(*size);
-            f(*pointee);
-        }
-        TypeData::AssociatedType { self_ty, .. } => f(*self_ty),
-        TypeData::Opaque {
-            hidden: Some(h), ..
-        } => f(*h),
-        TypeData::Coproduct { alternatives } => {
-            for a in alternatives {
-                f(*a);
-            }
-        }
-        TypeData::Forall { body, .. } | TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => {
-            f(*body)
-        }
-        TypeData::Exists { base, .. } => f(*base),
-        TypeData::Poly { body, .. } => f(*body),
-        // Leaf types have no TypeId children.
-        _ => {}
-    }
-}
-
 /// Recursively walk a TypeId and collect all InferVar IDs into `var_values`
 /// via the `seen` dedup map.  Uses `visit_type_children` for recursive
 /// traversal, so it automatically covers all composite type variants.
 /// Extracted as a standalone function so that `canonicalize_response` can
 /// use it for both nested obligations and subst mapping values.
-pub fn collect_from_ty(
+pub fn collect_from_ty<'input>(
     ty: TypeId,
-    ctx: &TypeContext,
+    ctx: &TypeContext<'input>,
     seen: &mut HashMap<usize, usize>,
     var_values: &mut Vec<Option<TypeId>>,
+    var_universes: &mut Vec<Option<usize>>,
 ) {
     let resolved = ctx.resolve_binding(ty);
-    if let TypeData::InferVar { id } = ctx.get(resolved) {
+    if let TypeData::InferVar { id, universe, .. } = ctx.get(resolved) {
         let canon_idx = seen.len();
         let idx = *seen.entry(*id).or_insert(canon_idx);
         if idx == canon_idx {
             var_values.push(None);
+            var_universes.push(Some(*universe));
         }
         return;
     }
     // Recurse into composite types via the shared walker.
-    visit_type_children(ty, ctx, &mut |child_ty| {
-        collect_from_ty(child_ty, ctx, seen, var_values);
+    crate::hir::types::visit_type_children(ty, ctx, &mut |child_ty| {
+        collect_from_ty(child_ty, ctx, seen, var_values, var_universes);
     });
 }
 
@@ -963,64 +979,71 @@ pub fn collect_from_ty(
 /// `var_values` via the `seen` dedup map.  This is the collection analogue
 /// of `predicate_has_unresolved_vars` — it finds the same InferVars but
 /// records them for canonical instantiation instead of returning a bool.
-fn collect_infer_ids_from_predicate(
+fn collect_infer_ids_from_predicate<'input>(
     predicate: &Predicate,
-    ctx: &TypeContext,
+    ctx: &TypeContext<'input>,
     seen: &mut HashMap<usize, usize>,
     var_values: &mut Vec<Option<TypeId>>,
+    var_universes: &mut Vec<Option<usize>>,
 ) {
     // Uses module-level `collect_from_ty` (defined above) — no local shadow.
     match predicate {
         Predicate::Trait { self_ty, args, .. } => {
-            collect_from_ty(*self_ty, ctx, seen, var_values);
+            collect_from_ty(*self_ty, ctx, seen, var_values, var_universes);
             for a in args {
-                collect_from_ty(*a, ctx, seen, var_values);
+                collect_from_ty(*a, ctx, seen, var_values, var_universes);
             }
         }
-        Predicate::AutoTrait { self_ty, .. } => collect_from_ty(*self_ty, ctx, seen, var_values),
-        Predicate::Sized { ty } => collect_from_ty(*ty, ctx, seen, var_values),
-        Predicate::CopyLike { ty, .. } => collect_from_ty(*ty, ctx, seen, var_values),
+        Predicate::AutoTrait { self_ty, .. } => {
+            collect_from_ty(*self_ty, ctx, seen, var_values, var_universes)
+        }
+        Predicate::Sized { ty } => collect_from_ty(*ty, ctx, seen, var_values, var_universes),
+        Predicate::CopyLike { ty, .. } => {
+            collect_from_ty(*ty, ctx, seen, var_values, var_universes)
+        }
         Predicate::ProjectionEq { self_ty, value, .. } => {
-            collect_from_ty(*self_ty, ctx, seen, var_values);
-            collect_from_ty(*value, ctx, seen, var_values);
+            collect_from_ty(*self_ty, ctx, seen, var_values, var_universes);
+            collect_from_ty(*value, ctx, seen, var_values, var_universes);
         }
         Predicate::ProjectionNormalize { projection, target } => {
-            collect_from_ty(projection.self_ty, ctx, seen, var_values);
-            collect_from_ty(*target, ctx, seen, var_values);
+            collect_from_ty(projection.self_ty, ctx, seen, var_values, var_universes);
+            collect_from_ty(*target, ctx, seen, var_values, var_universes);
             for a in &projection.args {
-                collect_from_ty(*a, ctx, seen, var_values);
+                collect_from_ty(*a, ctx, seen, var_values, var_universes);
             }
         }
         Predicate::NormalizesTo { projection, target } => {
-            collect_from_ty(projection.self_ty, ctx, seen, var_values);
-            collect_from_ty(*target, ctx, seen, var_values);
+            collect_from_ty(projection.self_ty, ctx, seen, var_values, var_universes);
+            collect_from_ty(*target, ctx, seen, var_values, var_universes);
             for a in &projection.args {
-                collect_from_ty(*a, ctx, seen, var_values);
+                collect_from_ty(*a, ctx, seen, var_values, var_universes);
             }
         }
         Predicate::Eq { a, b } => {
-            collect_from_ty(*a, ctx, seen, var_values);
-            collect_from_ty(*b, ctx, seen, var_values);
+            collect_from_ty(*a, ctx, seen, var_values, var_universes);
+            collect_from_ty(*b, ctx, seen, var_values, var_universes);
         }
         Predicate::Sub { sub, sup } => {
-            collect_from_ty(*sub, ctx, seen, var_values);
-            collect_from_ty(*sup, ctx, seen, var_values);
+            collect_from_ty(*sub, ctx, seen, var_values, var_universes);
+            collect_from_ty(*sup, ctx, seen, var_values, var_universes);
         }
-        Predicate::Match { scrutinee, .. } => collect_from_ty(*scrutinee, ctx, seen, var_values),
+        Predicate::Match { scrutinee, .. } => {
+            collect_from_ty(*scrutinee, ctx, seen, var_values, var_universes)
+        }
         Predicate::Forall { body, .. } | Predicate::Exists { body, .. } => {
-            collect_infer_ids_from_predicate(body, ctx, seen, var_values);
+            collect_infer_ids_from_predicate(body, ctx, seen, var_values, var_universes);
         }
         Predicate::Instance {
             scheme_ty,
             instantiation_ty,
             ..
         } => {
-            collect_from_ty(*scheme_ty, ctx, seen, var_values);
-            collect_from_ty(*instantiation_ty, ctx, seen, var_values);
+            collect_from_ty(*scheme_ty, ctx, seen, var_values, var_universes);
+            collect_from_ty(*instantiation_ty, ctx, seen, var_values, var_universes);
         }
         Predicate::Let { def, body } => {
-            collect_infer_ids_from_predicate(def, ctx, seen, var_values);
-            collect_infer_ids_from_predicate(body, ctx, seen, var_values);
+            collect_infer_ids_from_predicate(def, ctx, seen, var_values, var_universes);
+            collect_infer_ids_from_predicate(body, ctx, seen, var_values, var_universes);
         }
     }
 }
@@ -1033,9 +1056,9 @@ fn collect_infer_ids_from_predicate(
 /// Currently only `ImplSource::Builtin` is cached (it has no TypeIds,
 /// so this is a no-op).  Other variants walk nested obligations to
 /// collect infer vars for future cache expansion.
-pub fn canonicalize_response(
+pub fn canonicalize_response<'input>(
     result: &Result<ImplSource, SolveError>,
-    ctx: &TypeContext,
+    ctx: &TypeContext<'input>,
     max_universe: usize,
     required_depth: usize,
     encountered_overflow: bool,
@@ -1043,6 +1066,7 @@ pub fn canonicalize_response(
 ) -> Option<CanonicalResponse> {
     let mut var_values: Vec<Option<TypeId>> = Vec::new();
     let mut seen: HashMap<usize, usize> = HashMap::default();
+    let mut var_universes: Vec<Option<usize>> = Vec::new();
 
     match result {
         Ok(ImplSource::Builtin(_)) => {
@@ -1078,12 +1102,13 @@ pub fn canonicalize_response(
                     ctx,
                     &mut seen,
                     &mut var_values,
+                    &mut var_universes,
                 );
             }
             // Also collect InferVars from the subst mapping (recursively
             // through composite types via collect_from_ty / visit_type_children).
             subst.for_each_value(|ty| {
-                collect_from_ty(ty, ctx, &mut seen, &mut var_values);
+                collect_from_ty(ty, ctx, &mut seen, &mut var_values, &mut var_universes);
             });
         }
         Ok(ImplSource::Param(nested))
@@ -1100,6 +1125,7 @@ pub fn canonicalize_response(
                     ctx,
                     &mut seen,
                     &mut var_values,
+                    &mut var_universes,
                 );
             }
         }
@@ -1122,7 +1148,10 @@ pub fn canonicalize_response(
     // `max_universe`.  When `collect_infer_ids_from_predicate` records
     // per-variable universes during canonicalization, this vec will contain
     // distinct values for each canonical variable.
-    let var_universes = vec![max_universe; var_values.len()];
+    let var_universes: Vec<usize> = var_universes
+        .iter()
+        .map(|u| u.unwrap_or(max_universe))
+        .collect();
 
     Some(CanonicalResponse {
         impl_source: match result {
@@ -1169,10 +1198,10 @@ pub fn instantiate_solution_map(
 /// where the callback receives already-created vars so that each new variable
 /// can reference previously-created ones (for subtyping chains).
 /// See rustc's `instantiate_and_apply_query_response`.
-pub fn instantiate_canonical(
+pub fn instantiate_canonical<'input>(
     response: &CanonicalResponse,
     mut infer: Option<&mut crate::hir::infer::InferenceContext>,
-    ctx: &mut TypeContext,
+    ctx: &mut TypeContext<'input>,
 ) -> ImplSource {
     // Defensive check: if no InferenceContext is available and any canonical
     // variable needs a fresh type, abort and return the cached source as-is.
@@ -1201,7 +1230,11 @@ pub fn instantiate_canonical(
     }
     // Apply substitution via replace_infer through all TypeId fields.
     use crate::hir::infer::replace_infer;
-    fn subst_pred(pred: &Predicate, sol: &HashMap<usize, TypeId>, ctx: &TypeContext) -> Predicate {
+    fn subst_pred<'input>(
+        pred: &Predicate,
+        sol: &HashMap<usize, TypeId>,
+        ctx: &TypeContext<'input>,
+    ) -> Predicate {
         match pred {
             Predicate::Trait {
                 trait_id,
@@ -1296,10 +1329,10 @@ pub fn instantiate_canonical(
             },
         }
     }
-    fn subst_nested(
+    fn subst_nested<'input>(
         nested: &[Obligation],
         sol: &HashMap<usize, TypeId>,
-        ctx: &TypeContext,
+        ctx: &TypeContext<'input>,
     ) -> Vec<Obligation> {
         nested
             .iter()
@@ -1613,7 +1646,7 @@ impl SearchGraph {
     }
 
     /// Classify a cycle based on the goal's trait kind.
-    fn classify_cycle_kind(key: &GoalKey, delegate: &dyn SolverDelegate) -> PathKind {
+    fn classify_cycle_kind(key: &GoalKey, delegate: &dyn SolverDelegate<'_>) -> PathKind {
         if let Some(trait_id) = key.trait_id
             && delegate.trait_is_coinductive(trait_id)
         {
@@ -1676,7 +1709,7 @@ impl SearchGraph {
     pub fn try_entry(
         &mut self,
         key: &GoalKey,
-        delegate: &dyn SolverDelegate,
+        delegate: &dyn SolverDelegate<'_>,
     ) -> Result<(), PathKind> {
         // Check if the goal is on the stack (cycle).
         // We search for the key in a separate pass to avoid borrow conflicts.
@@ -1731,14 +1764,21 @@ impl SearchGraph {
         result: &Result<ImplSource, SolveError>,
         path_kind: PathKind,
     ) -> bool {
+        use crate::hir::traits::solver::obligation::BuiltinImplSource;
         match (result, path_kind) {
-            // Coinductive: initial result is Ok(Builtin) — any Ok result
-            // different from Err means the cycle is not at fixpoint.
-            (Ok(ImplSource::Builtin(_)), PathKind::Coinductive) => true,
+            // Coinductive: initial result is Ok(Builtin(Sized)) — any Ok
+            // result different from Err means the cycle is not at fixpoint.
+            // The BuiltinImplSource payload is checked: `initial_provisional_result`
+            // only ever produces `Sized` here, so a non-Sized Builtin would be a
+            // mismatch (fail-closed).
+            (Ok(ImplSource::Builtin(BuiltinImplSource::Sized)), PathKind::Coinductive) => true,
             // Inductive: initial result is Err — if we got Err, fixpoint reached.
             (Err(_), PathKind::Inductive) => true,
             // Unknown/ForcedAmbiguity: similar to coinductive.
-            (Ok(ImplSource::Builtin(_)), PathKind::Unknown | PathKind::ForcedAmbiguity) => true,
+            (
+                Ok(ImplSource::Builtin(BuiltinImplSource::Sized)),
+                PathKind::Unknown | PathKind::ForcedAmbiguity,
+            ) => true,
             _ => false,
         }
     }
@@ -1882,16 +1922,6 @@ impl SearchGraph {
         self.changed = HasChanged::No;
     }
 
-    /// Try to advance the fixpoint iteration.  Returns `true` if the
-    /// iteration limit has not been reached.
-    pub fn try_fixpoint_step(&mut self) -> bool {
-        // We track fixpoint iterations implicitly through the stack and
-        // provisional cache.  The caller is responsible for calling
-        // `begin_fixpoint` before the loop and checking `has_changed`
-        // to detect convergence.
-        true
-    }
-
     /// Returns `true` if any goal was entered since the last `begin_fixpoint`.
     pub fn has_changed(&self) -> bool {
         self.changed == HasChanged::Yes
@@ -1992,14 +2022,14 @@ mod tests {
     use crate::hir::types::TypeContext;
 
     struct TestDelegate;
-    impl SolverDelegate for TestDelegate {
-        fn ctx(&mut self) -> &mut TypeContext {
+    impl<'input> SolverDelegate<'input> for TestDelegate {
+        fn ctx(&mut self) -> &mut TypeContext<'input> {
             unimplemented!()
         }
-        fn trait_env(&self) -> &crate::hir::traits::TraitEnv {
+        fn trait_env(&self) -> &crate::hir::traits::TraitEnv<'input> {
             unimplemented!()
         }
-        fn symbols(&self) -> &crate::hir::symbol::SymbolTable {
+        fn symbols(&self) -> &crate::hir::symbol::SymbolTable<'input> {
             unimplemented!()
         }
         fn builtin_registry(&self) -> &crate::hir::traits::solver::builtins::BuiltinTraitRegistry {
@@ -2041,6 +2071,55 @@ mod tests {
         ) -> Result<ImplSource, SolveError> {
             unimplemented!()
         }
+    }
+
+    /// Regression: `ty_to_canonical`'s Poly arm used a CONSTANT
+    /// `bound.len()` for every quantifier's De Bruijn depth, so all
+    /// binders collapsed to one depth — `∀A B. A → B` and `∀A B. A → A`
+    /// canonicalized identically (trait-solver cache collision).  Now each
+    /// quantifier gets a sequential depth and the stored range is the depth
+    /// range (alpha-equivalent Polys agree).
+    #[test]
+    fn test_ty_to_canonical_poly_no_collision() {
+        let mut ctx = TypeContext::new();
+        let a = Symbol::intern("A");
+        let b = Symbol::intern("B");
+        let gp0 = ctx.generic_param(0, "A".into());
+        let gp1 = ctx.generic_param(1, "B".into());
+        // ∀A B. A → B
+        let body_ab = ctx.function(vec![gp0, gp1], gp1);
+        let poly_ab = ctx.alloc(TypeData::Poly {
+            quantifiers: vec![(0, a), (1, b)],
+            body: body_ab,
+        });
+        // ∀A B. A → A
+        let body_aa = ctx.function(vec![gp0, gp1], gp0);
+        let poly_aa = ctx.alloc(TypeData::Poly {
+            quantifiers: vec![(0, a), (1, b)],
+            body: body_aa,
+        });
+        let c1 = ty_to_canonical(poly_ab, &ctx, &[]);
+        let c2 = ty_to_canonical(poly_aa, &ctx, &[]);
+        assert_ne!(
+            c1, c2,
+            "∀A B. A → B must NOT canonicalize identically to ∀A B. A → A"
+        );
+        // Alpha-equivalence: ∀A B (indices 0,1) vs ∀C D (indices 2,3) with
+        // the same body shape must canonicalize IDENTICALLY.
+        let c = Symbol::intern("C");
+        let d = Symbol::intern("D");
+        let gp2 = ctx.generic_param(2, "C".into());
+        let gp3 = ctx.generic_param(3, "D".into());
+        let body_cd = ctx.function(vec![gp2, gp3], gp3);
+        let poly_cd = ctx.alloc(TypeData::Poly {
+            quantifiers: vec![(2, c), (3, d)],
+            body: body_cd,
+        });
+        let c3 = ty_to_canonical(poly_cd, &ctx, &[]);
+        assert_eq!(
+            c1, c3,
+            "alpha-equivalent Polys (∀A B. A → B vs ∀C D. C → D) must canonicalize identically"
+        );
     }
 
     #[test]

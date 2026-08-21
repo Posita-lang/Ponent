@@ -174,7 +174,24 @@ impl ImplSource {
         match self {
             ImplSource::UserDefined { nested, .. } => nested.clone(),
             ImplSource::Param(nested) => nested.clone(),
-            ImplSource::Builtin(_) => vec![],
+            ImplSource::Builtin(src) => {
+                // The builtin-impl source is consumed here (Sized/Copy/
+                // Clone/DiscriminantKind/FnPtr): a builtin trait has no
+                // nested obligations, but the source kind is sanity-checked
+                // in debug builds (only known builtin sources are legal).
+                debug_assert!(
+                    matches!(
+                        *src,
+                        BuiltinImplSource::Sized
+                            | BuiltinImplSource::Copy
+                            | BuiltinImplSource::Clone
+                            | BuiltinImplSource::DiscriminantKind
+                            | BuiltinImplSource::FnPtr
+                    ),
+                    "unknown builtin impl source"
+                );
+                vec![]
+            }
             ImplSource::Object { nested, .. } => nested.clone(),
             ImplSource::Auto { nested } => nested.clone(),
             ImplSource::Poly { nested, .. } => nested.clone(),
@@ -259,12 +276,12 @@ pub enum BuiltinImplSource {
 #[derive(Clone, Debug)]
 pub enum SolveError {
     NotFound {
-        trait_id: DefId,
+        trait_id: Option<DefId>,
         self_ty: TypeId,
         span: Span,
     },
     Ambiguous {
-        trait_id: DefId,
+        trait_id: Option<DefId>,
         self_ty: TypeId,
         span: Span,
         num_candidates: usize,
@@ -282,6 +299,9 @@ pub enum SolveError {
         expected: TypeId,
         found: TypeId,
         span: Span,
+        /// The underlying unification error, when available — carried for
+        /// more precise diagnostics.
+        note: String,
     },
 }
 
@@ -294,7 +314,7 @@ impl std::fmt::Display for SolveError {
                 write!(
                     f,
                     "trait impl not found for trait={} on type={}",
-                    trait_id.0,
+                    trait_id.unwrap_or(crate::hir::types::DefId(usize::MAX)).0,
                     self_ty.raw()
                 )
             }
@@ -308,7 +328,7 @@ impl std::fmt::Display for SolveError {
                     write!(
                         f,
                         "no trait implementation found for trait={} on type={}",
-                        trait_id.0,
+                        trait_id.unwrap_or(crate::hir::types::DefId(usize::MAX)).0,
                         self_ty.raw()
                     )
                 } else {
@@ -376,7 +396,7 @@ impl Predicate {
     /// Resolve the goal through bindings, returning a `ResolvedObligation`.
     /// This is an inherent method to avoid `E0283` inference issues with
     /// `GoalKind<D>::resolve` (where `D` cannot be inferred from arguments).
-    pub fn resolve(&self, ctx: &TypeContext) -> super::select::ResolvedObligation {
+    pub fn resolve<'input>(&self, ctx: &TypeContext<'input>) -> super::select::ResolvedObligation {
         match self {
             Predicate::Trait {
                 trait_id,
@@ -387,98 +407,161 @@ impl Predicate {
                 let resolved_args: Vec<TypeId> =
                     args.iter().map(|a| ctx.resolve_binding(*a)).collect();
                 let ambiguous = ctx.is_infer_var(resolved_self);
-                super::select::ResolvedObligation {
-                    trait_id: *trait_id,
-                    self_ty: resolved_self,
-                    args: resolved_args,
+                Self::make_obligation(
+                    Some(*trait_id),
+                    resolved_self,
+                    resolved_args,
                     ambiguous,
-                    parent_depth: 0,
-                    span: crate::ast::Span::new(0, 0),
-                }
+                    crate::ast::Span::new(0, 0),
+                )
             }
             Predicate::AutoTrait { trait_id, self_ty } => {
                 let resolved_self = ctx.resolve_binding(*self_ty);
                 let ambiguous = ctx.is_infer_var(resolved_self);
-                super::select::ResolvedObligation {
-                    trait_id: *trait_id,
-                    self_ty: resolved_self,
-                    args: vec![],
+                Self::make_obligation(
+                    Some(*trait_id),
+                    resolved_self,
+                    vec![],
                     ambiguous,
-                    parent_depth: 0,
-                    span: crate::ast::Span::new(0, 0),
-                }
+                    crate::ast::Span::new(0, 0),
+                )
             }
             Predicate::Sized { ty } => {
                 let resolved_ty = ctx.resolve_binding(*ty);
                 let ambiguous = ctx.is_infer_var(resolved_ty);
-                super::select::ResolvedObligation {
-                    trait_id: DefId(usize::MAX),
-                    self_ty: resolved_ty,
-                    args: vec![],
+                Self::make_obligation(
+                    Some(DefId(usize::MAX)),
+                    resolved_ty,
+                    vec![],
                     ambiguous,
-                    parent_depth: 0,
-                    span: crate::ast::Span::new(0, 0),
-                }
+                    crate::ast::Span::new(0, 0),
+                )
             }
             Predicate::Eq { a, b } => {
                 let ra = ctx.resolve_binding(*a);
                 let rb = ctx.resolve_binding(*b);
                 let ambiguous = ctx.is_infer_var(ra) || ctx.is_infer_var(rb);
-                super::select::ResolvedObligation {
-                    trait_id: DefId(0),
-                    self_ty: ra,
-                    args: vec![rb],
-                    ambiguous,
-                    parent_depth: 0,
-                    span: crate::ast::Span::new(0, 0),
-                }
+                Self::make_obligation(None, ra, vec![rb], ambiguous, crate::ast::Span::new(0, 0))
             }
             Predicate::Sub { sub, sup } => {
                 let rsub = ctx.resolve_binding(*sub);
                 let rsup = ctx.resolve_binding(*sup);
                 let ambiguous = ctx.is_infer_var(rsub) || ctx.is_infer_var(rsup);
-                super::select::ResolvedObligation {
-                    trait_id: DefId(0),
-                    self_ty: rsub,
-                    args: vec![rsup],
+                Self::make_obligation(
+                    None,
+                    rsub,
+                    vec![rsup],
                     ambiguous,
-                    parent_depth: 0,
-                    span: crate::ast::Span::new(0, 0),
-                }
+                    crate::ast::Span::new(0, 0),
+                )
             }
             Predicate::Match { scrutinee, .. } => {
                 let resolved = ctx.resolve_binding(*scrutinee);
                 let ambiguous = ctx.is_infer_var(resolved);
-                super::select::ResolvedObligation {
-                    trait_id: DefId(0),
-                    self_ty: resolved,
-                    args: vec![],
+                Self::make_obligation(
+                    None,
+                    resolved,
+                    vec![],
                     ambiguous,
-                    parent_depth: 0,
-                    span: crate::ast::Span::new(0, 0),
-                }
+                    crate::ast::Span::new(0, 0),
+                )
             }
             Predicate::Forall { body } | Predicate::Exists { body } => body.resolve(ctx),
             Predicate::Instance { scheme_ty, .. } => {
                 let resolved = ctx.resolve_binding(*scheme_ty);
-                super::select::ResolvedObligation {
-                    trait_id: DefId(0),
-                    self_ty: resolved,
-                    args: vec![],
-                    ambiguous: false,
-                    parent_depth: 0,
-                    span: crate::ast::Span::new(0, 0),
+                Self::make_obligation(None, resolved, vec![], false, crate::ast::Span::new(0, 0))
+            }
+            // Quantifier/let wrappers recurse into their inner predicate
+            // (unified through `inner_predicate`).
+            Predicate::Forall { .. } | Predicate::Exists { .. } | Predicate::Let { .. } => {
+                match self.inner_predicate() {
+                    Some(inner) => inner.resolve(ctx),
+                    None => Self::make_obligation(
+                        None,
+                        ctx.error(),
+                        vec![],
+                        false,
+                        crate::ast::Span::new(0, 0),
+                    ),
                 }
             }
-            Predicate::Let { def, .. } => def.resolve(ctx),
-            _ => super::select::ResolvedObligation {
-                trait_id: DefId(0),
-                self_ty: ctx.error(),
-                args: vec![],
-                ambiguous: false,
-                parent_depth: 0,
-                span: crate::ast::Span::new(0, 0),
-            },
+            // Explicit arms for the remaining variants — a newly added
+            // Predicate variant is a compile error here instead of being
+            // silently swallowed by `_`.
+            Predicate::CopyLike { ty, .. } => {
+                let resolved = ctx.resolve_binding(*ty);
+                let ambiguous = ctx.is_infer_var(resolved);
+                Self::make_obligation(
+                    None,
+                    resolved,
+                    vec![],
+                    ambiguous,
+                    crate::ast::Span::new(0, 0),
+                )
+            }
+            Predicate::ProjectionEq { self_ty, .. } => {
+                let resolved = ctx.resolve_binding(*self_ty);
+                let ambiguous = ctx.is_infer_var(resolved);
+                Self::make_obligation(
+                    None,
+                    resolved,
+                    vec![],
+                    ambiguous,
+                    crate::ast::Span::new(0, 0),
+                )
+            }
+            Predicate::ProjectionNormalize { projection, .. } => {
+                let resolved = ctx.resolve_binding(projection.self_ty);
+                let ambiguous = ctx.is_infer_var(resolved);
+                Self::make_obligation(
+                    None,
+                    resolved,
+                    vec![],
+                    ambiguous,
+                    crate::ast::Span::new(0, 0),
+                )
+            }
+            Predicate::NormalizesTo { projection, .. } => {
+                let resolved = ctx.resolve_binding(projection.self_ty);
+                let ambiguous = ctx.is_infer_var(resolved);
+                Self::make_obligation(
+                    None,
+                    resolved,
+                    vec![],
+                    ambiguous,
+                    crate::ast::Span::new(0, 0),
+                )
+            }
+        }
+    }
+
+    /// Shared `ResolvedObligation` construction — every arm only fills in
+    /// the fields that differ.  `trait_id` is `Option<DefId>`: `None` for
+    /// non-trait goals, `Some` for trait goals / the built-in `Sized`.
+    fn make_obligation(
+        trait_id: Option<DefId>,
+        self_ty: TypeId,
+        args: Vec<TypeId>,
+        ambiguous: bool,
+        span: crate::ast::Span,
+    ) -> super::select::ResolvedObligation {
+        super::select::ResolvedObligation {
+            trait_id,
+            self_ty,
+            args,
+            ambiguous,
+            parent_depth: 0,
+            span,
+        }
+    }
+
+    /// The inner predicate for quantifier/let wrappers (`Forall` /
+    /// `Exists` / `Let`) — unified recursion for `resolve`.
+    fn inner_predicate(&self) -> Option<&Predicate> {
+        match self {
+            Predicate::Forall { body } | Predicate::Exists { body } => Some(body),
+            Predicate::Let { def, .. } => Some(def),
+            _ => None,
         }
     }
 }
@@ -493,5 +576,135 @@ impl SolveError {
             SolveError::CycleDetected { .. } => None,
             SolveError::Mismatch { span, .. } => Some(*span),
         }
+    }
+
+    /// The self type of the goal this error is about, when the error kind
+    /// carries one.  `None` for error kinds without a self type (e.g.
+    /// `Mismatch`).  Used by recovery-artifact detection.
+    pub fn self_ty(&self) -> Option<TypeId> {
+        match self {
+            SolveError::NotFound { self_ty, .. } | SolveError::Ambiguous { self_ty, .. } => {
+                Some(*self_ty)
+            }
+            SolveError::Overflow { obligation, .. } => Some(obligation.predicate.self_ty()),
+            SolveError::CycleDetected { predicate } => Some(predicate.self_ty()),
+            SolveError::Mismatch { .. } => None,
+        }
+    }
+
+    /// Whether this error is a recovery artifact: an obligation whose self
+    /// type has since RESOLVED to the error sentinel.  The expression it
+    /// came from already failed to type-check elsewhere (e.g. a silently
+    /// recovered deref); enforcing traits on the recovery type surfaces
+    /// cascading `... on type Error` errors, and the recovery path owns the
+    /// diagnostics.  `contains_error` (not the shallow `is_error`) also
+    /// catches composite recoveries like `Vec<Error>`, and
+    /// `CycleDetected`/`Overflow` goals at the sentinel are recovery
+    /// artifacts too (e.g. a cyclic generic impl instantiated at the
+    /// recovery type).
+    pub fn is_recovery_artifact<'input>(&self, ctx: &TypeContext<'input>) -> bool {
+        self.self_ty()
+            .is_some_and(|ty| ctx.contains_error(ctx.resolve_binding(ty)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins `SolveError::self_ty` / `is_recovery_artifact`: every error
+    /// kind that carries a self type reports it (routed through
+    /// `Predicate::self_ty` for `Overflow` / `CycleDetected`), errors on
+    /// the error sentinel are recovery artifacts, errors on real types are
+    /// not, and kinds without a self type (`Mismatch`) are never artifacts.
+    #[test]
+    fn test_solve_error_self_ty_and_recovery_artifact() {
+        let mut ctx = TypeContext::new();
+        let err_ty = ctx.error();
+        let int_ty = ctx.int(32, true);
+        let span = crate::ast::DUMMY_SPAN;
+
+        // NotFound / Ambiguous carry their self_ty directly.
+        let not_found = SolveError::NotFound {
+            trait_id: None,
+            self_ty: int_ty,
+            span,
+        };
+        assert_eq!(not_found.self_ty(), Some(int_ty));
+        assert!(!not_found.is_recovery_artifact(&ctx));
+
+        let not_found_err = SolveError::NotFound {
+            trait_id: None,
+            self_ty: err_ty,
+            span,
+        };
+        assert!(not_found_err.is_recovery_artifact(&ctx));
+
+        let ambiguous = SolveError::Ambiguous {
+            trait_id: None,
+            self_ty: int_ty,
+            span,
+            num_candidates: 0,
+        };
+        assert_eq!(ambiguous.self_ty(), Some(int_ty));
+        assert!(!ambiguous.is_recovery_artifact(&ctx));
+
+        // Overflow / CycleDetected route through the predicate's self_ty.
+        let sized_ob = |ty: TypeId| Obligation {
+            cause: ObligationCause {
+                span,
+                code: ObligationCauseCode::Misc,
+            },
+            predicate: Predicate::Sized { ty },
+            recursion_depth: 0,
+        };
+        let overflow_err = SolveError::Overflow {
+            obligation: Box::new(sized_ob(err_ty)),
+            depth: 0,
+        };
+        assert_eq!(overflow_err.self_ty(), Some(err_ty));
+        assert!(overflow_err.is_recovery_artifact(&ctx));
+
+        let overflow_int = SolveError::Overflow {
+            obligation: Box::new(sized_ob(int_ty)),
+            depth: 0,
+        };
+        assert!(!overflow_int.is_recovery_artifact(&ctx));
+
+        let cycle_err = SolveError::CycleDetected {
+            predicate: Predicate::Sized { ty: err_ty },
+        };
+        assert_eq!(cycle_err.self_ty(), Some(err_ty));
+        assert!(cycle_err.is_recovery_artifact(&ctx));
+
+        // Mismatch has no self type — never a recovery artifact.
+        let mismatch = SolveError::Mismatch {
+            expected: int_ty,
+            found: err_ty,
+            span,
+            note: String::new(),
+        };
+        assert_eq!(mismatch.self_ty(), None);
+        assert!(!mismatch.is_recovery_artifact(&ctx));
+    }
+
+    /// A composite recovery type (`Vec<Error>`) is still an artifact —
+    /// `contains_error` is checked, not the shallow `is_error`.
+    #[test]
+    fn test_recovery_artifact_catches_composite_recovery() {
+        let mut ctx = TypeContext::new();
+        let err_ty = ctx.error();
+        let vec_err = ctx.struct_ty(DefId(100), vec![err_ty]);
+        let span = crate::ast::DUMMY_SPAN;
+
+        let not_found = SolveError::NotFound {
+            trait_id: None,
+            self_ty: vec_err,
+            span,
+        };
+        assert!(
+            not_found.is_recovery_artifact(&ctx),
+            "an obligation on Vec<Error> is a recovery artifact"
+        );
     }
 }

@@ -20,7 +20,7 @@ use std::sync::{
 
 // ── Helpers ──
 
-fn new_ctx() -> TypeContext {
+fn new_ctx() -> TypeContext<'static> {
     TypeContext::new()
 }
 
@@ -28,9 +28,9 @@ fn new_infer() -> InferenceContext {
     InferenceContext::new()
 }
 
-fn infer_var_id(ctx: &TypeContext, ty: TypeId) -> usize {
+fn infer_var_id<'input>(ctx: &TypeContext<'input>, ty: TypeId) -> usize {
     match ctx.get(ty) {
-        TypeData::InferVar { id } => *id,
+        TypeData::InferVar { id, .. } => *id,
         _ => panic!("not an infer var"),
     }
 }
@@ -39,7 +39,7 @@ fn span() -> Span {
     Span::new(0, 0)
 }
 
-fn default_env() -> (SymbolTable, TraitEnv) {
+fn default_env<'input>() -> (SymbolTable<'input>, TraitEnv<'input>) {
     let symbols = SymbolTable::new(CrateId(DefId(0)));
     let trait_env = TraitEnv::new();
     (symbols, trait_env)
@@ -325,6 +325,51 @@ fn test_guard_snapshot_rollback() {
     assert!(!infer.is_guarded(id), "guard should be rolled back");
 }
 
+#[test]
+fn test_guard_double_add_rollback_restores_status() {
+    let mut ctx = new_ctx();
+    let mut infer = new_infer();
+    let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let id = infer_var_id(&ctx, var);
+
+    let snap = infer.start_snapshot();
+    infer.add_guard(id);
+    infer.add_guard(id);
+    assert_eq!(
+        infer.get_gen_status(id),
+        Some(GenStatus::PartiallyGeneralizable),
+        "should be PG with 2 guards"
+    );
+
+    // Rolling back must undo BOTH guards and restore the pre-snapshot
+    // status — the second add (on an already-PG var) must not leave a
+    // stale `SetGenStatus` undo behind.
+    infer.rollback_to(snap);
+    assert!(!infer.is_guarded(id), "both guards should be rolled back");
+    assert_eq!(
+        infer.get_gen_status(id),
+        Some(GenStatus::Ungeneralized),
+        "status should be restored to the pre-snapshot value"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "add_guard: direct-guard refcount overflow")]
+fn test_guard_add_refcount_overflow_panics() {
+    let mut gs = GuardSet::empty();
+    gs.direct_guards = usize::MAX;
+    gs.add_guard();
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "remove_guard: count == 0")]
+fn test_guard_remove_underflow_panics() {
+    let mut gs = GuardSet::empty();
+    gs.remove_guard();
+}
+
 // ── Suspend / Wake Tests ──
 
 #[test]
@@ -415,6 +460,81 @@ fn test_force_generalize_pg_with_guard_not_generalized() {
     assert_eq!(
         infer.get_gen_status(id),
         Some(GenStatus::PartiallyGeneralizable)
+    );
+}
+
+/// PG lowering must route through the registered pool API so `var_to_region`
+/// and the pool undo log stay consistent.  A direct
+/// `retain`+`push` on `pool.var_ids` leaves `var_to_region` stale (the TcLevel
+/// escape check reads it) and the move un-rollbackable (no undo entries).
+#[test]
+fn test_pg_lowering_maintains_var_to_region_and_undo_log() {
+    let mut ctx = new_ctx();
+    let mut infer = new_infer();
+    let root = infer.region_tree.root;
+    let prev = infer.enter_level();
+    let child = infer.region_tree.current;
+    let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let id = infer_var_id(&ctx, var);
+    infer.add_guard(id); // PG
+
+    // Sanity: the var is registered in the child region and mapped there.
+    assert!(
+        infer.region_tree.nodes[child.0].pool.var_ids.contains(&id),
+        "var should be in the child pool"
+    );
+    assert_eq!(
+        infer.region_tree.region_of_var(id),
+        child,
+        "var_to_region should map the var to the child region"
+    );
+
+    // Generalize — the PG var must be LOWERED to the parent (root), never
+    // generalized.
+    let generalized = infer.force_root_generalization(&mut ctx);
+    assert!(
+        !generalized.iter().any(|&(gid, _)| gid == id),
+        "PG var must NOT be generalized"
+    );
+
+    // var_to_region is consistent: the var now lives in the parent region.
+    assert_eq!(
+        infer.region_tree.region_of_var(id),
+        root,
+        "PG var must be lowered to the parent region in var_to_region"
+    );
+    // Pools agree: gone from child, present in parent (root).
+    assert!(
+        !infer.region_tree.nodes[child.0].pool.var_ids.contains(&id),
+        "child pool must not contain the lowered var"
+    );
+    assert!(
+        infer.region_tree.nodes[root.0].pool.var_ids.contains(&id),
+        "parent (root) pool must contain the lowered var"
+    );
+    // The undo log records the move: Unregister(child) + Register(root).
+    let has_unregister = infer.region_tree.pool_undo_log.iter().any(|e| {
+        matches!(
+            e,
+            PoolUndoEntry::Unregister {
+                region_idx,
+                var_id,
+            } if *region_idx == child.0 && *var_id == id
+        )
+    });
+    let has_register = infer.region_tree.pool_undo_log.iter().any(|e| {
+        matches!(
+            e,
+            PoolUndoEntry::Register {
+                region_idx,
+                var_id,
+                ..
+            } if *region_idx == root.0 && *var_id == id
+        )
+    });
+    assert!(
+        has_unregister && has_register,
+        "the PG-lowering move must be recorded in the pool undo log"
     );
 }
 
@@ -651,7 +771,7 @@ fn test_s_exists_lower_concrete() {
     // Exit the level so current_level drops below the var's level
     infer.exit_level(prev);
 
-    let result = infer.s_exists_lower(&ctx, id);
+    let result = infer.s_exists_lower(&ctx, id, &SkolemEnv::default(), &[]);
     assert!(result, "S-Exists-Lower should succeed");
     assert_eq!(
         infer.get_gen_status(id),
@@ -679,7 +799,7 @@ fn test_s_exists_lower_forall() {
     infer.add_guard(id);
     infer.exit_level(prev);
 
-    let result = infer.s_exists_lower(&ctx, id);
+    let result = infer.s_exists_lower(&ctx, id, &SkolemEnv::default(), &[]);
     assert!(
         result,
         "s_exists_lower should succeed for variable with Forall shape"
@@ -1550,8 +1670,8 @@ fn test_forall_match_unicity_does_not_treat_skolem_as_free_var() {
 #[test]
 fn test_infer_var_occurs_check() {
     let mut ctx = new_ctx();
-    let a = ctx.alloc_infer_var(100);
-    let b = ctx.alloc_infer_var(101);
+    let a = ctx.alloc_infer_var(100, 0);
+    let b = ctx.alloc_infer_var(101, 0);
 
     // occurs_check(a, b) — a does not occur in b
     assert!(!ctx.occurs_check(a, b), "a should not occur in b");
@@ -1733,7 +1853,7 @@ fn test_unify_resolution_undo() {
         "resolution for b should remain None after rollback",
     );
 
-    // Verify binding is also rolled back at the TypeContext level.
+    // Verify binding is also rolled back at the TypeContext<'input> level.
     assert_eq!(
         ctx.resolve_binding(a),
         a,
@@ -1764,8 +1884,8 @@ fn test_unify_and_track_resolution_undo() {
 
     let resolved = ctx.resolve_binding(result.unwrap());
     // The resolution points to the InferVar itself (since it stays an InferVar
-    // but is now bound to Int<32> via the TypeContext).
-    if let TypeData::InferVar { id: rid } = ctx.get(resolved) {
+    // but is now bound to Int<32> via the TypeContext<'input>).
+    if let TypeData::InferVar { id: rid, .. } = ctx.get(resolved) {
         if *rid < infer.resolutions().len() {
             assert!(
                 infer.resolutions()[*rid].is_some(),
@@ -1781,7 +1901,7 @@ fn test_unify_and_track_resolution_undo() {
         "resolution should be None after rollback",
     );
     // Note: we do NOT check ctx.resolve_binding(var) here — the
-    // TypeContext binding is managed by ctx.unify()'s own transaction
+    // TypeContext<'input> binding is managed by ctx.unify()'s own transaction
     // system (TypeContext::transaction_depth / rollback_transaction),
     // not by InferenceContext's undo_log.  The two rollback systems
     // are independent: InferenceContext::rollback_to reverses the
@@ -1829,5 +1949,510 @@ fn test_pool_undo_nested_snapshots() {
         infer.region_tree.nodes[root.0].pool.var_ids.len(),
         root_pool_before,
         "pool should be back to pre-snapshot state after outer rollback",
+    );
+}
+
+/// The O(1) DFS-order ancestor test: after building a region tree via
+/// enter_region/exit_region, `is_ancestor` must agree with the tree
+/// structure — including the root covering everything and the tin/tout
+/// intervals excluding non-ancestors.
+#[test]
+fn test_region_tree_is_ancestor_dfs_order() {
+    let mut tree = InferRegionTree::new();
+    let root = tree.root;
+    // Note: `enter_region` RETURNS the previous `current` (the design —
+    // the entered region becomes `tree.current`), so read `tree.current`
+    // to name the new region.
+    // root ─ a ── a1
+    //       └ b
+    tree.enter_region();
+    let a = tree.current;
+    tree.enter_region();
+    let a1 = tree.current;
+    tree.exit_region();
+    tree.exit_region();
+    tree.enter_region();
+    let b = tree.current;
+    tree.exit_region();
+
+    assert!(tree.is_ancestor(root, a));
+    assert!(tree.is_ancestor(root, b));
+    assert!(tree.is_ancestor(a, a1));
+    assert!(tree.is_ancestor(root, a1));
+    assert!(!tree.is_ancestor(a, b), "siblings must not be ancestors");
+    assert!(
+        !tree.is_ancestor(b, a1),
+        "an unrelated region must not be an ancestor"
+    );
+    assert!(tree.is_ancestor(a1, a1), "a node is its own ancestor");
+}
+
+/// Regression: the interval test must be sound while a region is still
+/// OPEN.  `enter_region` pushes a `tout = 0` placeholder that is
+/// finalized only by `exit_region`; a naive interval test reading the
+/// placeholder as `0` would make the second conjunct (`0 <= tout[anc]`)
+/// a tautology and report ANY earlier-entered node — siblings included —
+/// as an ancestor.  `is_ancestor` reads the placeholder as `usize::MAX`
+/// (conceptual infinity), so a closed sibling's finite `tout`
+/// correctly fails `MAX <= tout[anc]`; the debug build cross-checks the
+/// O(1) fast path against the binary-lifting NCA anchor.
+#[test]
+fn test_region_tree_is_ancestor_open_sibling() {
+    let mut tree = InferRegionTree::new();
+    let root = tree.root;
+    // root ─ a ── a1   (a, a1 closed)
+    //       └ b        (b still OPEN when queried)
+    tree.enter_region();
+    let a = tree.current;
+    tree.enter_region();
+    let a1 = tree.current;
+    tree.exit_region();
+    tree.exit_region();
+    tree.enter_region();
+    let b = tree.current;
+    // Do NOT exit b — the query happens with b open.
+
+    assert!(
+        !tree.is_ancestor(a, b),
+        "open sibling b must NOT report closed sibling a as an ancestor"
+    );
+    assert!(
+        !tree.is_ancestor(a1, b),
+        "an unrelated closed region must NOT be an ancestor of open b"
+    );
+    assert!(
+        tree.is_ancestor(root, b),
+        "the root is an ancestor of open b"
+    );
+    assert!(
+        tree.is_ancestor(a, a1),
+        "closed-ancestor/closed-descendant intervals still hold"
+    );
+    assert!(
+        tree.is_ancestor(b, b),
+        "a node is its own ancestor even while open"
+    );
+
+    tree.exit_region();
+    assert!(
+        !tree.is_ancestor(a, b),
+        "siblings stay non-ancestors after b closes"
+    );
+}
+
+/// The open-ancestor direction of the interval trick: an OPEN region
+/// is still the ancestor of everything entered after it (the stack
+/// discipline — every new region is a child of `current`), including
+/// nodes that were entered and already closed inside its subtree.  The
+/// open interval `[tin, ∞)` must accept these while the naive
+/// `tout == 0` reading would reject them.
+#[test]
+fn test_region_tree_is_ancestor_open_ancestor() {
+    let mut tree = InferRegionTree::new();
+    let root = tree.root;
+    // root ─ a ── a1   (a still OPEN, a1 entered+exited inside a)
+    tree.enter_region();
+    let a = tree.current;
+    tree.enter_region();
+    let a1 = tree.current;
+    tree.exit_region(); // close a1 — a stays open
+
+    assert!(
+        tree.is_ancestor(a, a1),
+        "open a must be the ancestor of its already-closed child a1"
+    );
+    assert!(
+        tree.is_ancestor(a, a),
+        "a node is its own ancestor while open"
+    );
+    assert!(
+        tree.is_ancestor(root, a),
+        "the root is an ancestor of the open a"
+    );
+    assert!(
+        !tree.is_ancestor(a1, a),
+        "the closed child a1 must NOT be an ancestor of its open parent a"
+    );
+
+    tree.exit_region(); // close a
+    assert!(tree.is_ancestor(a, a1), "a stays an ancestor after closing");
+}
+
+/// The stack-discipline contract is machine-checked: `exit_level` requires
+/// `prev_region` to be an ancestor of the current region (as guaranteed by
+/// the `enter_level` → `exit_level` pairing).  Rewinding to a non-ancestor
+/// is a caller bug and must trip the `debug_assert!` in the debug build —
+/// it would break the tin/tout bookkeeping the interval test relies on.
+/// DEBUG-ONLY, mirroring the `debug_assert!` it exercises: in a release
+/// build the assertion is compiled out, so the `should_panic` expectation
+/// would not hold (the release-mode `cargo test -r` run must not report
+/// this as a failure).
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "exit_level: prev_region must be an ancestor")]
+fn test_exit_level_rejects_non_ancestor_rewind() {
+    let mut infer = new_infer();
+    let root = infer.region_tree.root;
+    let _p1 = infer.enter_level();
+    let child = infer.region_tree.current;
+    infer.exit_level(root); // ok — root is an ancestor of child
+    // Now child has been exited; `child` is NOT an ancestor of root.
+    infer.exit_level(child); // caller bug — must trip the debug_assert
+}
+
+/// Regression: the PRODUCTION API (`enter_level`/`exit_level`) must
+/// finalize the `tout` stamps.  `exit_level` previously only rewound
+/// `current` and never called `exit_region` (the sole `tout` writer),
+/// so every non-root `tout` stayed at the placeholder 0 and the O(1)
+/// ancestor interval test degenerated to a pre-order comparison —
+/// siblings appeared as ancestors, silently weakening OmniML §6
+/// PR-UVARPR region promotion.  The direct `enter_region`/`exit_region`
+/// test masked this because it exercised the mechanism in isolation.
+#[test]
+fn test_region_tree_is_ancestor_production_api() {
+    let mut infer = InferenceContext::new();
+    let root = infer.region_tree.root;
+    // root ─ a ── a1
+    //       └ b
+    let prev_a = infer.enter_level();
+    let a = infer.region_tree.current;
+    let prev_a1 = infer.enter_level();
+    let a1 = infer.region_tree.current;
+    infer.exit_level(prev_a1);
+    infer.exit_level(prev_a);
+    let prev_b = infer.enter_level();
+    let b = infer.region_tree.current;
+    infer.exit_level(prev_b);
+
+    assert!(infer.region_tree.is_ancestor(root, a));
+    assert!(infer.region_tree.is_ancestor(root, b));
+    assert!(infer.region_tree.is_ancestor(a, a1));
+    assert!(infer.region_tree.is_ancestor(root, a1));
+    assert!(
+        !infer.region_tree.is_ancestor(a, b),
+        "siblings must not be ancestors (tout must be finalized)"
+    );
+    assert!(
+        !infer.region_tree.is_ancestor(b, a1),
+        "an unrelated region must not be an ancestor"
+    );
+}
+
+/// The Binary-Lifting NCA (O(log n)): on the built region tree the NCA
+/// must agree with the structure — direct ancestor, cross-branch (root),
+/// sibling (root), and self.
+#[test]
+fn test_region_tree_nca_binary_lifting() {
+    let mut tree = InferRegionTree::new();
+    let root = tree.root;
+    // root ─ a ── a1
+    //       └ b
+    tree.enter_region();
+    let a = tree.current;
+    tree.enter_region();
+    let a1 = tree.current;
+    tree.exit_region();
+    tree.exit_region();
+    tree.enter_region();
+    let b = tree.current;
+    tree.exit_region();
+
+    assert_eq!(tree.nearest_common_ancestor(a, a1), a);
+    assert_eq!(tree.nearest_common_ancestor(a1, a), a);
+    assert_eq!(tree.nearest_common_ancestor(a1, b), root);
+    assert_eq!(tree.nearest_common_ancestor(a, b), root);
+    assert_eq!(tree.nearest_common_ancestor(a1, a1), a1);
+    assert_eq!(tree.nearest_common_ancestor(root, a1), root);
+    // Deep-chain NCA: build root ─ c ─ c1 ─ c2, NCA(c1, c2) == c1.
+    tree.enter_region();
+    let c = tree.current;
+    tree.enter_region();
+    let c1 = tree.current;
+    tree.enter_region();
+    let c2 = tree.current;
+    tree.exit_region();
+    tree.exit_region();
+    tree.exit_region();
+    assert_eq!(tree.nearest_common_ancestor(c1, c2), c1);
+    assert_eq!(tree.nearest_common_ancestor(c, c2), c);
+}
+
+/// The O(1) var → region map: `region_of_var` must reflect
+/// register / unregister / rollback — a registered var lives in its
+/// region, an unregistered var falls back to the root, and a rolled-back
+/// registration is forgotten.
+#[test]
+fn test_var_to_region_map() {
+    let mut tree = InferRegionTree::new();
+    let root = tree.root;
+    tree.enter_region();
+    let a = tree.current;
+
+    // Register in region `a` — region_of_var is O(1) and correct.
+    tree.register_var(42);
+    assert_eq!(tree.region_of_var(42), a);
+
+    // Unregister — falls back to the root.
+    tree.unregister_var(42, a);
+    assert_eq!(tree.region_of_var(42), root);
+
+    // Re-register, then roll back — the rollback log reverses the map.
+    tree.register_var(42);
+    assert_eq!(tree.region_of_var(42), a);
+    tree.rollback_pool();
+    assert_eq!(tree.region_of_var(42), root);
+}
+
+/// The dirty-tracking sets (HashSet for O(1) contains):
+/// marking a region dirty twice must NOT duplicate it (set semantics),
+/// and drain_dirty_roots still processes it once.
+#[test]
+fn test_dirty_roots_dedup() {
+    let mut tree = InferRegionTree::new();
+    tree.enter_region();
+    let a = tree.current;
+    tree.mark_dirty(a);
+    tree.mark_dirty(a);
+    assert_eq!(
+        tree.dirty_roots.len(),
+        1,
+        "marking the same region dirty twice must not duplicate it"
+    );
+    let mut processed = Vec::new();
+    tree.drain_dirty_roots(&mut |id, _| processed.push(id));
+    assert!(
+        processed.contains(&a),
+        "the dirty region must still be processed by drain_dirty_roots"
+    );
+}
+
+/// Per-variable universe tracking (rustc mode): unifying two InferVars
+/// from DIFFERENT universes is rejected (a higher-universe variable would
+/// escape into a lower universe).  Universe 0 vars unify fine.
+#[test]
+fn test_universe_mismatch_rejected() {
+    let mut ctx = TypeContext::new();
+    let mut infer = InferenceContext::new();
+    let a0 = infer.new_type_var_with_universe(
+        &mut ctx,
+        TypeVariableKind::Unconstrained,
+        VarOrigin::Synthetic,
+        0,
+    );
+    let b0 = infer.new_type_var_with_universe(
+        &mut ctx,
+        TypeVariableKind::Unconstrained,
+        VarOrigin::Synthetic,
+        0,
+    );
+    let b1 = infer.new_type_var_with_universe(
+        &mut ctx,
+        TypeVariableKind::Unconstrained,
+        VarOrigin::Synthetic,
+        1,
+    );
+    // Same universe → unifies.
+    assert!(infer.unify(a0, b0, &mut ctx).is_ok());
+    // Different universes (0 vs 1) → rejected.
+    assert!(infer.unify(a0, b1, &mut ctx).is_err());
+}
+
+/// The wake-up phase (end of each solver iteration) must wake constraints
+/// suspended on a variable that was resolved during the iteration.
+/// Guards the incremental wake-up path: the per-variable scan is gated on
+/// non-empty wait lists, so a resolved var whose wait list is non-empty
+/// MUST still be woken even though the scan skips resolve_binding for
+/// vars without suspended constraints.
+#[test]
+fn test_solve_wakeup_wakes_suspended_constraint() {
+    let mut ctx = new_ctx();
+    let mut infer = new_infer();
+    let (symbols, trait_env) = default_env();
+
+    let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let id = infer_var_id(&ctx, var);
+
+    // Suspend a trivial Eq constraint on the var — it must be woken and
+    // processed once the var is resolved.
+    infer.suspend_on_var(
+        Constraint::Eq(ctx.bool(), ctx.bool(), span(), EqOrigin::Normal),
+        id,
+    );
+
+    // Resolve the var BEFORE solve(): the wake-up phase must still see it
+    // through its non-empty wait list.
+    let res = infer.unify_and_track(var, ctx.int(32, true), &mut ctx);
+    assert!(res.is_ok(), "unify_and_track should succeed");
+
+    let result = infer.solve(&mut ctx, &trait_env, &symbols);
+    assert!(result.is_ok(), "solve should succeed, got {:?}", result);
+    assert!(
+        infer.wait_lists()[id].is_empty(),
+        "the suspended constraint must have been woken and processed"
+    );
+}
+
+/// get_var_kind / get_var_level are O(1) index lookups (type_vars is
+/// indexed by var id): every id in 0..n must be found, and out-of-range
+/// ids must return None.
+#[test]
+fn test_var_kind_level_indexing() {
+    let mut ctx = new_ctx();
+    let mut infer = new_infer();
+    for _ in 0..5 {
+        infer.new_type_var(&mut ctx, TypeVariableKind::Numeric, VarOrigin::Synthetic);
+    }
+    for id in 0..5 {
+        assert_eq!(
+            infer.get_var_kind(id),
+            Some(TypeVariableKind::Numeric),
+            "get_var_kind({id}) must resolve by index"
+        );
+        assert!(
+            infer.get_var_level(id).is_some(),
+            "get_var_level({id}) must resolve by index"
+        );
+    }
+    assert_eq!(infer.get_var_kind(9999), None, "OOB kind must be None");
+    assert_eq!(infer.get_var_level(9999), None, "OOB level must be None");
+}
+
+/// s_exists_lower must run the cheap syntactic unicity check first: a PG
+/// variable with an Eq constraint to a concrete type in the active set is
+/// lowered via UNI-VAR without needing the (subprocess-spawning) SMT query.
+#[test]
+fn test_s_exists_lower_syntactic_unicity_first() {
+    let mut ctx = new_ctx();
+    let mut infer = new_infer();
+
+    let prev = infer.enter_level();
+    let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let id = infer_var_id(&ctx, var);
+    infer.add_guard(id);
+    infer.exit_level(prev);
+
+    // Active Eq constraint: Eq(α, Int<32>) — UNI-VAR determines the shape.
+    let active = vec![PrioritizedConstraint {
+        priority: 1,
+        constraint: Constraint::Eq(var, ctx.int(32, true), span(), EqOrigin::Normal),
+        env: SkolemEnv::default(),
+    }];
+
+    let result = infer.s_exists_lower(&ctx, id, &SkolemEnv::default(), &active);
+    assert!(result, "syntactic unicity must lower the PG var");
+    assert_eq!(
+        infer.get_gen_status(id),
+        Some(GenStatus::Ungeneralized),
+        "PG var must become Ungeneralized after syntactic S-Exists-Lower"
+    );
+}
+
+/// An ELIGIBLE current var (PG, resolved, no guards, nothing waiting, no
+/// rigid escape) must be transitioned PG → Generalized with S-Inst-Copy
+/// deterministically — regardless of whether an earlier transition in the
+/// same iteration already triggered a sweep.  Before batching, this case
+/// was order-dependent: with a single Eq, no sweep ran, S-Exists-Lower
+/// lowered the var instead, and S-Inst-Copy never fired (instances stayed
+/// unresolved InferVars).
+#[test]
+fn test_solve_generalizes_eligible_current_var_with_copy() {
+    let mut ctx = new_ctx();
+    let mut infer = new_infer();
+    let (symbols, trait_env) = default_env();
+
+    let pg_var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let pg_id = infer_var_id(&ctx, pg_var);
+    let instance = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let inst_id = infer_var_id(&ctx, instance);
+
+    // PG with NO guards, NO wait list, and a registered instance — the
+    // state left behind when transitive guards are removed (eligible).
+    infer.set_gen_status(pg_id, GenStatus::PartiallyGeneralizable);
+    infer.register_instance(pg_id, inst_id);
+
+    let int32 = ctx.int(32, true);
+    infer.add_constraint(Constraint::Eq(pg_var, int32, span(), EqOrigin::Normal));
+
+    let result = infer.solve(&mut ctx, &trait_env, &symbols);
+    assert!(result.is_ok(), "solve should succeed, got {:?}", result);
+    assert_eq!(
+        infer.get_gen_status(pg_id),
+        Some(GenStatus::Generalized),
+        "eligible current var must be generalized, not lowered"
+    );
+    assert!(
+        ctx.is_integer(ctx.resolve_binding(instance)),
+        "S-Inst-Copy must propagate the resolved type to instances"
+    );
+}
+
+/// The batched end-of-iteration sweep (replacing the per-transition sweep)
+/// must replicate S-Inst-Copy for every var it transitions PG → G: the
+/// sweep itself only sets the status, so without the replication the
+/// forward-referenced instances of a sweep-transitioned var would keep
+/// unresolved InferVars.
+#[test]
+fn test_batched_sweep_copies_for_transitioned_vars() {
+    let mut ctx = new_ctx();
+    let mut infer = new_infer();
+    let (symbols, trait_env) = default_env();
+
+    // V2: non-current eligible PG var — pre-resolved and pre-marked dirty,
+    // exactly what the end-of-iteration sweep must generalize (and copy).
+    let v2 = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let v2_id = infer_var_id(&ctx, v2);
+    let instance = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let inst_id = infer_var_id(&ctx, instance);
+    let int32 = ctx.int(32, true);
+    infer.set_gen_status(v2_id, GenStatus::PartiallyGeneralizable);
+    infer.register_instance(v2_id, inst_id);
+    ctx.set_binding(v2, int32);
+    infer.mark_dirty(v2_id);
+
+    // V1: current var of the driver Eq — PG via a suspended constraint so
+    // it transitions through the wake path.
+    let v1 = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let v1_id = infer_var_id(&ctx, v1);
+    infer.suspend_on_var(
+        Constraint::Eq(ctx.bool(), ctx.bool(), span(), EqOrigin::Normal),
+        v1_id,
+    );
+    infer.add_constraint(Constraint::Eq(v1, int32, span(), EqOrigin::Normal));
+
+    let result = infer.solve(&mut ctx, &trait_env, &symbols);
+    assert!(result.is_ok(), "solve should succeed, got {:?}", result);
+    assert_eq!(
+        infer.get_gen_status(v2_id),
+        Some(GenStatus::Generalized),
+        "batched sweep must generalize the eligible dirty var"
+    );
+    assert!(
+        ctx.is_integer(ctx.resolve_binding(instance)),
+        "sweep-transitioned vars must get S-Inst-Copy (replication)"
+    );
+}
+
+/// S-Exists-Lower must remain reachable for INELIGIBLE current vars: a PG
+/// var that still carries a guard is not swept, and the re-ordered per-var
+/// block must still lower it (never generalize a guarded var).
+#[test]
+fn test_s_exists_lower_still_lowers_guarded_current_var() {
+    let mut ctx = new_ctx();
+    let mut infer = new_infer();
+    let (symbols, trait_env) = default_env();
+
+    let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+    let id = infer_var_id(&ctx, var);
+    infer.add_guard(id); // PG + direct guard → ineligible
+
+    let int32 = ctx.int(32, true);
+    infer.add_constraint(Constraint::Eq(var, int32, span(), EqOrigin::Normal));
+
+    let result = infer.solve(&mut ctx, &trait_env, &symbols);
+    assert!(result.is_ok(), "solve should succeed, got {:?}", result);
+    assert_eq!(
+        infer.get_gen_status(id),
+        Some(GenStatus::Ungeneralized),
+        "guarded current var must be lowered by S-Exists-Lower, not generalized"
     );
 }

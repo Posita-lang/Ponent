@@ -5,14 +5,14 @@ use crate::hir::types::{TypeContext, TypeData, TypeId};
 
 /// Compute the ABI size (in bytes) of a type on the given target.
 ///
-/// For ADT types (structs/enums), requires a `SymbolTable` to resolve
+/// For ADT types (structs/enums), requires a `SymbolTable<'input>` to resolve
 /// type bindings.  When `symbols` is `None`, falls back to a pointer-sized
 /// estimate for ADT types.
-pub fn abi_size(
-    ctx: &mut TypeContext,
+pub fn abi_size<'input>(
+    ctx: &mut TypeContext<'input>,
     target: &Target,
     ty: TypeId,
-    symbols: Option<&SymbolTable>,
+    symbols: Option<&SymbolTable<'input>>,
     diag: &mut DiagCtxt,
 ) -> Option<u64> {
     let resolved = ctx.resolve_binding(ty);
@@ -45,13 +45,13 @@ pub fn abi_size(
             Some(total)
         }
         TypeData::Adt { .. } => {
-            // Delegate to the layout engine when the SymbolTable is available.
+            // Delegate to the layout engine when the SymbolTable<'input> is available.
             if let Some(s) = symbols {
                 let layout =
                     crate::hir::target::layout::compute_adt_layout(ctx, Some(s), target, ty, diag)?;
                 Some(layout.size)
             } else {
-                // Without a SymbolTable we cannot resolve TypeBindings, and
+                // Without a SymbolTable<'input> we cannot resolve TypeBindings, and
                 // a pointer-sized fallback would be wildly wrong for large
                 // structs/enums.  Returning None forces callers to handle
                 // the un-resolved-ADT case explicitly.
@@ -68,11 +68,11 @@ pub fn abi_size(
 }
 
 /// Compute the ABI alignment (in bytes) of a type on the given target.
-pub fn abi_alignment(
-    ctx: &mut TypeContext,
+pub fn abi_alignment<'input>(
+    ctx: &mut TypeContext<'input>,
     target: &Target,
     ty: TypeId,
-    symbols: Option<&SymbolTable>,
+    symbols: Option<&SymbolTable<'input>>,
     diag: &mut DiagCtxt,
 ) -> Option<u64> {
     let resolved = ctx.resolve_binding(ty);

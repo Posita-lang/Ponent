@@ -94,9 +94,12 @@ struct Checkpoint {
     cursor: usize,
     peeked: Option<Result<Token, ()>>,
     pending: Vec<Token>,
+    progress: u64,
+    sync_stall: Option<u64>,
 }
 
-pub struct Parser {
+pub struct Parser<'input> {
+    arena: &'input bumpalo::Bump,
     tokens: Vec<SpannedToken>,
     cursor: usize,
     peeked: Option<Result<Token, ()>>,
@@ -116,12 +119,26 @@ pub struct Parser {
     last_unexpected_token_span: Option<Span>,
     /// Stack of expected token types for better error messages.
     expected_token_types: Vec<ExpectedToken>,
+    /// Monotonic count of tokens consumed by `advance` — detects
+    /// zero-progress error-recovery loops (the stall detector).
+    progress: u64,
+    /// Progress value when `synchronize` last stopped before a protected
+    /// statement-start keyword; if reached again at the same progress,
+    /// recovery force-consumes a token (no net progress was made).
+    sync_stall: Option<u64>,
 }
 
 // Local Diagnostic removed — using crate::diagnostics::Diagnostic
 
-impl Parser {
-    pub fn new(source: &str) -> Self {
+impl<'input> Parser<'input> {
+    /// Allocate an AST node in the parser's arena, returning a SHARED
+    /// `&'input` reference (bumpalo::Bump::alloc returns `&mut T`; the
+    /// AST fields expect shared references).
+    fn alloc_shared<T>(arena: &'input bumpalo::Bump, val: T) -> &'input T {
+        arena.alloc(val)
+    }
+
+    pub fn new(source: &str, arena: &'input bumpalo::Bump) -> Self {
         // Lex all tokens upfront into a buffer.
         let mut tokens = Vec::new();
         let mut lexer = Token::lexer(source);
@@ -151,6 +168,7 @@ impl Parser {
             });
         }
         Parser {
+            arena,
             tokens,
             cursor: 0,
             peeked: None,
@@ -163,6 +181,8 @@ impl Parser {
             recovery: Recovery::Allowed,
             last_unexpected_token_span: None,
             expected_token_types: Vec::new(),
+            progress: 0,
+            sync_stall: None,
         }
     }
 
@@ -188,10 +208,14 @@ impl Parser {
     }
 
     fn advance(&mut self) -> Result<Token, ()> {
-        match self.peeked.take() {
+        let tok = match self.peeked.take() {
             Some(tok) => tok,
             None => self.next_token(),
+        };
+        if tok.is_ok() {
+            self.progress += 1;
         }
+        tok
     }
 
     /// Set recovery mode for a scope (rustc-style).
@@ -320,11 +344,11 @@ impl Parser {
     }
 
     /// Parse a const generic argument (value side), e.g. `<{ 2 + 2 }>`, `<N>`, or `{ 42 }`.
-    /// Returns an `AnonConst` wrapping the expression.
+    /// Returns an `AnonConst<'input>` wrapping the expression.
     /// Per the Posita syntax spec: complex expressions MUST be wrapped in `{ }`;
     /// only simple literals and identifier paths may appear unbraced.
     /// Analogous to rustc's `parse_const_arg` (rustc_parse/src/parser/path.rs).
-    fn parse_const_arg(&mut self) -> Result<AnonConst, Diagnostic> {
+    fn parse_const_arg(&mut self) -> Result<AnonConst<'input>, Diagnostic> {
         let start = self.span().start;
         let value = if matches!(self.peek(), Ok(Token::LBrace)) {
             // Brace-delimited const arg: `{ expr }`
@@ -363,7 +387,7 @@ impl Parser {
         };
         let end = self.span().end;
         Ok(AnonConst {
-            value: Box::new(value),
+            value: Self::alloc_shared(self.arena, value),
             span: Span::new(start, end),
         })
     }
@@ -372,7 +396,7 @@ impl Parser {
     /// enough to be unambiguous — a literal, a single-segment identifier path,
     /// or a unary `-`/`+` applied to one of those.  Complex expressions like
     /// `N + 1` must be wrapped in `{ }`.
-    fn is_simple_const_expr(expr: &Expr) -> bool {
+    fn is_simple_const_expr(expr: &Expr<'input>) -> bool {
         match expr {
             Expr::Literal(..) => true,
             Expr::Ident(..) => true,
@@ -432,29 +456,77 @@ impl Parser {
         }
     }
 
+    /// Constant-time sync-token check: the old `sync_tokens`
+    /// array was linearly scanned per skipped token during error recovery —
+    /// O(skipped × count).  A `matches!` compiles to a kind switch with no
+    /// payload comparison.
+    fn is_sync_token(tok: &Token) -> bool {
+        matches!(
+            tok,
+            Token::Semicolon
+                | Token::RBrace
+                | Token::Def
+                | Token::Set
+                | Token::Let
+                | Token::Type
+                | Token::Import
+                | Token::From
+                | Token::Extern
+                | Token::Edition
+                | Token::At
+                | Token::Comptime
+                | Token::Generate
+                | Token::Async
+        )
+    }
+
+    /// Whether `tok` can begin a valid statement via `parse_stmt`
+    /// (block context).  Error recovery stops BEFORE these tokens so the
+    /// caller's statement loop parses the next statement fresh; sync
+    /// tokens that cannot begin a statement are consumed instead, to
+    /// guarantee forward progress (no infinite error-recovery loop).
+    fn is_stmt_start_keyword(tok: &Token) -> bool {
+        matches!(
+            tok,
+            Token::Set
+                | Token::Let
+                | Token::If
+                | Token::While
+                | Token::For
+                | Token::Loop
+                | Token::Leave
+                | Token::Continue
+                | Token::Return
+                | Token::Def
+                | Token::Type
+                | Token::Trait
+                | Token::Impl
+                | Token::Constraint
+                | Token::Comptime
+                | Token::Generate
+                | Token::ScopeCleanup
+                | Token::Trigger
+                | Token::Unsafe
+                | Token::Ghost
+                | Token::Isolate
+                | Token::Match
+                | Token::LBrace
+                | Token::At
+        )
+    }
+
     fn synchronize(&mut self) {
-        let sync_tokens = [
-            Token::Semicolon,
-            Token::RBrace,
-            Token::Def,
-            Token::Set,
-            Token::Let,
-            Token::Type,
-            Token::Import,
-            Token::From,
-            Token::Extern,
-            Token::Edition,
-            Token::At,
-            Token::Comptime,
-            Token::Generate,
-            Token::Async,
-            Token::Trait,
-            Token::Impl,
-            Token::Constraint,
-        ];
-        // Consume semicolon if present (it's a statement terminator).
+        // NOTE: every call site invokes this AFTER a parse error has been
+        // reported (`Err(diag) => { push(diag); synchronize(); }`), so the
+        // "consume only after an error" discipline is guaranteed by the
+        // callers — no extra error-state tracking is needed here.
+        //
+        // Consume semicolon if present (it's a statement TERMINATOR — not
+        // a statement start — so consuming it cannot skip the next valid
+        // statement's first token; the next statement starts fresh).
         if matches!(self.peek(), Ok(Token::Semicolon)) {
             self.advance().ok();
+            self.sync_stall = None;
             return;
         }
         // Skip tokens silently until we hit a sync token or EOF.
@@ -465,9 +537,46 @@ impl Parser {
         loop {
             match self.peek() {
                 Err(()) => return,
-                Ok(tok) if sync_tokens.contains(tok) => return,
+                // A block's closing brace belongs to the enclosing block —
+                // stop before it so `parse_block_inner`'s `RBrace => break`
+                // guard ends the block cleanly (consuming it would let the
+                // loop keep parsing tokens after the block's close).
+                Ok(Token::RBrace) => return,
+                // A statement-start keyword begins the NEXT statement —
+                // stop before it instead of swallowing it, otherwise the
+                // next statement's first token is lost and the follow-up
+                // diagnostics are distorted (e.g. `set x = 1 + <err>; set y
+                // = 5` must keep its `set y = 5` as a variable def).
+                //
+                // Stall detector: the protected stop TRUSTS the statement
+                // loop to consume the token next.  If recovery previously
+                // stopped before a protected token at the SAME progress
+                // value, the statement loop made no net consumption — force
+                // consume one token so forward progress is guaranteed even
+                // when a statement arm cannot consume its keyword.
+                Ok(tok) if Self::is_stmt_start_keyword(tok) => {
+                    let current = self.progress;
+                    if self.sync_stall == Some(current) {
+                        self.advance().ok();
+                        self.sync_stall = None;
+                        return;
+                    }
+                    self.sync_stall = Some(current);
+                    return;
+                }
+                // Sync tokens that cannot start a statement in this
+                // position — consume them so error recovery makes progress
+                // instead of spinning forever on the same token (the
+                // stuck-test regression: `def main() { type R = Int<32>; }`
+                // looped on `Token::Type`).
+                Ok(tok) if Self::is_sync_token(tok) => {
+                    self.advance().ok();
+                    self.sync_stall = None;
+                    return;
+                }
                 _ => {
                     self.advance().ok();
+                    self.sync_stall = None;
                 }
             }
         }
@@ -544,6 +653,8 @@ impl Parser {
             cursor: self.cursor,
             peeked: self.peeked.clone(),
             pending: self.pending.clone(),
+            progress: self.progress,
+            sync_stall: self.sync_stall,
         }
     }
 
@@ -554,6 +665,8 @@ impl Parser {
         self.cursor = cp.cursor;
         self.peeked = cp.peeked.clone();
         self.pending = cp.pending.clone();
+        self.progress = cp.progress;
+        self.sync_stall = cp.sync_stall;
     }
 
     /// Try parsing with `f`.  If `f` succeeds, keep the result and the
@@ -597,115 +710,10 @@ impl Parser {
     }
 
     fn keyword_to_ident(&self, tok: &Token) -> Option<Symbol> {
-        match tok {
-            Token::Def => Some(Symbol::intern("def")),
-            Token::Set => Some(Symbol::intern("set")),
-            Token::Type => Some(Symbol::intern("type")),
-            Token::With => Some(Symbol::intern("with")),
-            Token::Default => Some(Symbol::intern("default")),
-            Token::Return => Some(Symbol::intern("return")),
-            Token::If => Some(Symbol::intern("if")),
-            Token::Else => Some(Symbol::intern("else")),
-            Token::For => Some(Symbol::intern("for")),
-            Token::In => Some(Symbol::intern("in")),
-            Token::While => Some(Symbol::intern("while")),
-            Token::Loop => Some(Symbol::intern("loop")),
-            Token::Leave => Some(Symbol::intern("leave")),
-            Token::Continue => Some(Symbol::intern("continue")),
-            Token::Comptime => Some(Symbol::intern("comptime")),
-            Token::Generate => Some(Symbol::intern("generate")),
-            Token::Import => Some(Symbol::intern("import")),
-            Token::From => Some(Symbol::intern("from")),
-            Token::As => Some(Symbol::intern("as")),
-            Token::True => Some(Symbol::intern("true")),
-            Token::False => Some(Symbol::intern("false")),
-            Token::Auto => Some(Symbol::intern("auto")),
-            Token::And => Some(Symbol::intern("and")),
-            Token::Or => Some(Symbol::intern("or")),
-            Token::Not => Some(Symbol::intern("not")),
-            Token::Sizeof => Some(Symbol::intern("sizeof")),
-            Token::Alignof => Some(Symbol::intern("alignof")),
-            Token::Catch => Some(Symbol::intern("catch")),
-            Token::Panic => Some(Symbol::intern("panic")),
-            Token::Unsafe => Some(Symbol::intern("unsafe")),
-            Token::Let => Some(Symbol::intern("let")),
-            Token::Finally => Some(Symbol::intern("finally")),
-            Token::Where => Some(Symbol::intern("where")),
-            Token::Requires => Some(Symbol::intern("requires")),
-            Token::Ensures => Some(Symbol::intern("ensures")),
-            Token::Invariant => Some(Symbol::intern("invariant")),
-            Token::Constraint => Some(Symbol::intern("constraint")),
-            Token::Move => Some(Symbol::intern("move")),
-            Token::Dyn => Some(Symbol::intern("dyn")),
-            Token::By => Some(Symbol::intern("by")),
-            Token::Copy => Some(Symbol::intern("copy")),
-            Token::Ref => Some(Symbol::intern("ref")),
-            Token::Mut => Some(Symbol::intern("mut")),
-            Token::Wrap => Some(Symbol::intern("wrap")),
-            Token::Saturate => Some(Symbol::intern("saturate")),
-            Token::Trap => Some(Symbol::intern("trap")),
-            Token::SelfKw => Some(Symbol::intern("Self")),
-            Token::NoDefault => Some(Symbol::intern("no_default")),
-            Token::Extern => Some(Symbol::intern("extern")),
-            Token::Pub => Some(Symbol::intern("pub")),
-            Token::Edition => Some(Symbol::intern("edition")),
-            Token::Deprecated => Some(Symbol::intern("deprecated")),
-            Token::Experimental => Some(Symbol::intern("experimental")),
-            Token::Endian => Some(Symbol::intern("endian")),
-            Token::BitOrder => Some(Symbol::intern("bit_order")),
-            Token::Align => Some(Symbol::intern("align")),
-            Token::Pad => Some(Symbol::intern("pad")),
-            Token::Packed => Some(Symbol::intern("packed")),
-            Token::Async => Some(Symbol::intern("async")),
-            Token::Await => Some(Symbol::intern("await")),
-            Token::Task => Some(Symbol::intern("task")),
-            Token::Channel => Some(Symbol::intern("channel")),
-            Token::Linear => Some(Symbol::intern("linear")),
-            Token::Consume => Some(Symbol::intern("consume")),
-            Token::Pure => Some(Symbol::intern("pure")),
-            Token::Io => Some(Symbol::intern("io")),
-            Token::Trusted => Some(Symbol::intern("trusted")),
-            Token::Ghost => Some(Symbol::intern("ghost")),
-            Token::ScopeCleanup => Some(Symbol::intern("scope_cleanup")),
-            Token::Trigger => Some(Symbol::intern("trigger")),
-            Token::Validate => Some(Symbol::intern("validate")),
-            Token::MissingMatch => Some(Symbol::intern("missing_match")),
-            Token::ApplyLemma => Some(Symbol::intern("apply_lemma")),
-            Token::Layout => Some(Symbol::intern("layout")),
-            Token::Exists => Some(Symbol::intern("exists")),
-            Token::Forall => Some(Symbol::intern("forall")),
-            Token::On => Some(Symbol::intern("on")),
-            Token::OnTimeout => Some(Symbol::intern("on_timeout")),
-            Token::OnCancel => Some(Symbol::intern("on_cancel")),
-            Token::Trait => Some(Symbol::intern("trait")),
-            Token::Impl => Some(Symbol::intern("impl")),
-            Token::Decreases => Some(Symbol::intern("decreases")),
-            Token::Terminates => Some(Symbol::intern("terminates")),
-            Token::Cfg => Some(Symbol::intern("cfg")),
-            Token::Isolate => Some(Symbol::intern("isolate")),
-            Token::Hint => Some(Symbol::intern("hint")),
-            Token::MustUse => Some(Symbol::intern("must_use")),
-            Token::MustHandle => Some(Symbol::intern("must_handle")),
-            Token::LinkProof => Some(Symbol::intern("link_proof")),
-            Token::Exhaustive => Some(Symbol::intern("exhaustive")),
-            Token::NoAllocError => Some(Symbol::intern("no_alloc_error")),
-            Token::NoPanic => Some(Symbol::intern("no_panic")),
-            Token::DebugInfo => Some(Symbol::intern("debug_info")),
-            Token::IeeeContracts => Some(Symbol::intern("ieee_contracts")),
-            Token::Old => Some(Symbol::intern("old")),
-            Token::AuditLog => Some(Symbol::intern("audit_log")),
-            Token::Interrupt => Some(Symbol::intern("interrupt")),
-            Token::Match => Some(Symbol::intern("match")),
-            Token::Round => Some(Symbol::intern("round")),
-            Token::Trunc => Some(Symbol::intern("trunc")),
-            Token::Ceil => Some(Symbol::intern("ceil")),
-            Token::Floor => Some(Symbol::intern("floor")),
-            Token::Poly => Some(Symbol::intern("poly")),
-            Token::Unbox => Some(Symbol::intern("unbox")),
-            Token::Propagates => Some(Symbol::intern("propagates")),
-            Token::Overrides => Some(Symbol::intern("overrides")),
-            _ => None,
-        }
+        // Delegate entirely to the lexer's path-position keyword map.
+        // `as_ident_symbol()` covers every keyword token; no separate
+        // hand-maintained copy is needed.
+        tok.as_ident_symbol()
     }
 
     /// Parse the full program source into an AST.
@@ -716,7 +724,7 @@ impl Parser {
     /// source contains syntax errors.  The parser attempts to recover and
     /// continue after each error, so multiple diagnostics may be returned.
     #[must_use]
-    pub fn parse_program(&mut self) -> Result<Program, Vec<Diagnostic>> {
+    pub fn parse_program(&mut self) -> Result<Program<'input>, Vec<Diagnostic>> {
         let start = self.span().start;
         let mut items = Vec::new();
         loop {
@@ -731,7 +739,13 @@ impl Parser {
                     }
                     Err(diag) => {
                         self.diagnostics.push(diag);
-                        self.synchronize();
+                        // Top-level recovery: skip to the next genuine
+                        // top-level keyword (def/type/trait/impl/import/…)
+                        // WITHOUT swallowing it — those are legal item
+                        // starts, so the outer loop parses them fresh.
+                        // (`synchronize` would consume them; it is only
+                        // correct for the block-level statement loop.)
+                        self.skip_to_next_top_level();
                     }
                 },
             }
@@ -745,7 +759,7 @@ impl Parser {
         }
     }
 
-    fn parse_item(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_item(&mut self) -> Result<Stmt<'input>, Diagnostic> {
         let mut attributes = Vec::new();
         let mut doc = None;
         loop {
@@ -785,6 +799,20 @@ impl Parser {
                 };
                 match self.peek() {
                     Ok(Token::Def) => {
+                        // `comptime @trusted def` is not valid — for
+                        // functions, `@trusted` should appear before
+                        // `comptime`: `@trusted comptime def f() { ... }`.
+                        // The `comptime @trusted { ... }` form is for
+                        // anonymous blocks only.
+                        if trusted {
+                            return Err(Diagnostic::error(
+                                "`comptime @trusted def` is not valid",
+                            )
+                            .with_code_str("E004")
+                            .with_help("for functions, use `@trusted comptime def f(...) { ... }` — `@trusted` should appear before `comptime`")
+                            .with_suggestion("move `@trusted` before `comptime`: `@trusted comptime def f(...) { ... }`")
+                            .with_span(self.span()));
+                        }
                         self.advance().ok();
                         self.with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
                             this.parse_function_def(attributes, doc, true, false)
@@ -944,7 +972,7 @@ impl Parser {
                         .with_span(self.span()));
                     }
                 }
-                let for_type = Box::new(self.parse_type()?);
+                let for_type = Self::alloc_shared(self.arena, self.parse_type()?);
                 self.expect(Token::LBrace)?;
                 let body = self.parse_block()?;
                 self.expect(Token::RBrace)?;
@@ -986,7 +1014,7 @@ impl Parser {
         }
     }
 
-    fn parse_attribute(&mut self) -> Result<Attribute, Diagnostic> {
+    fn parse_attribute(&mut self) -> Result<Attribute<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         let name = match self.advance() {
@@ -1046,11 +1074,11 @@ impl Parser {
 
     fn parse_function_def(
         &mut self,
-        attributes: Vec<Attribute>,
+        attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
         is_comptime: bool,
         is_async: bool,
-    ) -> Result<Stmt, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         let name = match self.advance() {
             Ok(Token::Ident(name)) => {
@@ -1171,9 +1199,9 @@ impl Parser {
 
     fn parse_trait_def(
         &mut self,
-        attributes: Vec<Attribute>,
+        attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
-    ) -> Result<Stmt, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         let name = match self.advance() {
@@ -1188,6 +1216,20 @@ impl Parser {
                     .with_span(self.span()));
             }
         };
+        // Generic traits are not yet supported.  Parse the params to
+        // give a clean error instead of letting `<` cascade to the
+        // top level.
+        if matches!(self.peek(), Ok(Token::Lt)) {
+            let lt_span = self.span();
+            let _type_params = self.parse_type_params()?;
+            return Err(Diagnostic::error("generic traits are not yet supported")
+                .with_code_str("E004")
+                .with_help("trait definitions cannot have type parameters yet")
+                .with_suggestion(
+                    "remove the type parameters, or express constraints in the trait body",
+                )
+                .with_span(Span::new(lt_span.start, self.span().end)));
+        }
         let mut methods = Vec::new();
         let mut associated_types = Vec::new();
         if matches!(self.peek(), Ok(Token::LBrace)) {
@@ -1210,6 +1252,11 @@ impl Parser {
                                     .with_span(self.span(),));
                             }
                         };
+                        // GAT lifetime parameters: `type Item<'a, 'b>` —
+                        // the `<'a>` list after the name (SYNTAX.md §GAT
+                        // Declaration; a GAT takes lifetime or const
+                        // params, never new TYPE params).
+                        let lifetime_params = self.parse_associated_type_lifetime_params()?;
                         let default = if matches!(self.peek(), Ok(Token::Assign)) {
                             self.advance().ok();
                             Some(self.parse_type()?)
@@ -1219,6 +1266,7 @@ impl Parser {
                         self.expect(Token::Semicolon)?;
                         associated_types.push(AssociatedType {
                             name: assoc_name,
+                            lifetime_params,
                             default,
                             span: Span::new(start, self.span().end),
                         });
@@ -1247,7 +1295,11 @@ impl Parser {
                                     let param = self.parse_self_param()?;
                                     params.push(param);
                                 }
-                                Ok(Token::Ident(s)) if s.eq_str("self") || s.eq_str("Self") => {
+                                Ok(Token::Ident(s)) if s.eq_str("self") => {
+                                    let param = self.parse_self_param()?;
+                                    params.push(param);
+                                }
+                                Ok(Token::SelfKw) => {
                                     let param = self.parse_self_param()?;
                                     params.push(param);
                                 }
@@ -1298,7 +1350,7 @@ impl Parser {
         })
     }
 
-    fn parse_constraint(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_constraint(&mut self) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         let name = match self.advance() {
@@ -1357,12 +1409,46 @@ impl Parser {
         Ok(Stmt::Constraint {
             name,
             params,
-            predicates,
+            predicates: smallvec::SmallVec::from(predicates),
             span: Span::new(start, end),
         })
     }
 
-    fn parse_type_params(&mut self) -> Result<Vec<TypeParam>, Diagnostic> {
+    /// GAT lifetime parameters: `type Item<'a, 'b> = ...;` — parses the
+    /// optional `<'a, 'b>` list after an associated type name (SYNTAX.md
+    /// §GAT Declaration).  Returns an empty vec for a plain associated
+    /// type (`type Output;`).
+    fn parse_associated_type_lifetime_params(&mut self) -> Result<Vec<Symbol>, Diagnostic> {
+        if !matches!(self.peek(), Ok(Token::Lt)) {
+            return Ok(Vec::new());
+        }
+        self.advance().ok(); // consume <
+        let mut params = Vec::new();
+        loop {
+            self.expect(Token::Apostrophe)?;
+            let name = match self.advance() {
+                Ok(Token::Ident(n)) => n,
+                _ => {
+                    return Err(Diagnostic::error(
+                        "expected a lifetime name after `'` in GAT parameters",
+                    )
+                    .with_code_str("E004")
+                    .with_help("GAT lifetime parameters look like `type Item<'a>;`")
+                    .with_span(self.span()));
+                }
+            };
+            params.push(name);
+            if matches!(self.peek(), Ok(Token::Comma)) {
+                self.advance().ok();
+                continue;
+            }
+            break;
+        }
+        self.expect_gt()?;
+        Ok(params)
+    }
+
+    fn parse_type_params(&mut self) -> Result<Vec<TypeParam<'input>>, Diagnostic> {
         self.advance().ok(); // consume <
         let mut p = Vec::new();
         loop {
@@ -1447,7 +1533,7 @@ impl Parser {
     /// Parse a const generic parameter: `const N: Type = default_expr`.
     /// Called when `const` is encountered in a generic parameter list.
     /// Analogous to rustc's `parse_const_param` (rustc_parse/src/parser/generics.rs).
-    fn parse_const_param(&mut self) -> Result<TypeParam, Diagnostic> {
+    fn parse_const_param(&mut self) -> Result<TypeParam<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok(); // consume `const`
         let name = match self.advance() {
@@ -1474,7 +1560,7 @@ impl Parser {
         let ty = self.parse_type()?;
         let default = if matches!(self.peek(), Ok(Token::Assign)) {
             self.advance().ok();
-            Some(Box::new(self.parse_expr()?))
+            Some(Self::alloc_shared(self.arena, self.parse_expr()?))
         } else {
             None
         };
@@ -1487,38 +1573,85 @@ impl Parser {
         })
     }
 
-    fn parse_where_clause(&mut self) -> Result<WhereClause, Diagnostic> {
+    fn parse_where_clause(&mut self) -> Result<WhereClause<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok(); // consume 'where'
         let mut predicates = Vec::new();
         let mut equalities = Vec::new();
+        let mut lifetime_outlives = Vec::new();
         loop {
-            let ty = self.parse_type()?;
-            if matches!(self.peek(), Ok(Token::EqEq)) {
-                // Equality constraint: `where T == Int<32>`.
-                self.advance().ok(); // consume '=='
-                let right = self.parse_type()?;
-                equalities.push(WhereEquality {
-                    left: ty,
-                    right,
-                    span: Span::new(start, self.span().end),
-                });
-            } else {
+            // LIFETIME outlives predicate: `where 'a: 'b + 'c` (rustc's
+            // `WherePredicateKind::RegionPredicate`).  An apostrophe starts
+            // a lifetime name — parse it BEFORE the generic `parse_type`
+            // path (which would mis-handle the leading `'`).
+            if matches!(self.peek(), Ok(Token::Apostrophe)) {
+                self.advance().ok(); // consume `'`
+                let lt = match self.advance() {
+                    Ok(Token::Ident(name)) => name,
+                    _ => {
+                        return Err(Diagnostic::error(
+                            "expected a lifetime name after `'` in where clause",
+                        )
+                        .with_code_str("E004")
+                        .with_span(self.span()));
+                    }
+                };
                 self.expect(Token::Colon)?;
-                let mut bounds = Vec::new();
+                let mut outlives = Vec::new();
                 loop {
-                    bounds.push(self.parse_type()?);
+                    if !matches!(self.peek(), Ok(Token::Apostrophe)) {
+                        return Err(Diagnostic::error(
+                            "expected a lifetime (`'a`) after `:` in a lifetime outlives predicate",
+                        )
+                        .with_code_str("E004")
+                        .with_span(self.span()));
+                    }
+                    self.advance().ok(); // consume `'`
+                    let bound = match self.advance() {
+                        Ok(Token::Ident(name)) => name,
+                        _ => {
+                            return Err(Diagnostic::error(
+                                "expected a lifetime name after `'` in where clause",
+                            )
+                            .with_code_str("E004")
+                            .with_span(self.span()));
+                        }
+                    };
+                    outlives.push(bound);
                     if !matches!(self.peek(), Ok(Token::Plus)) {
                         break;
                     }
                     self.advance().ok();
                 }
-                let end = self.span().end;
-                predicates.push(WherePredicate {
-                    ty,
-                    bounds,
-                    span: Span::new(start, end),
-                });
+                lifetime_outlives.push((lt, outlives));
+            } else {
+                let ty = self.parse_type()?;
+                if matches!(self.peek(), Ok(Token::EqEq)) {
+                    // Equality constraint: `where T == Int<32>`.
+                    self.advance().ok(); // consume '=='
+                    let right = self.parse_type()?;
+                    equalities.push(WhereEquality {
+                        left: ty,
+                        right,
+                        span: Span::new(start, self.span().end),
+                    });
+                } else {
+                    self.expect(Token::Colon)?;
+                    let mut bounds = Vec::new();
+                    loop {
+                        bounds.push(self.parse_type()?);
+                        if !matches!(self.peek(), Ok(Token::Plus)) {
+                            break;
+                        }
+                        self.advance().ok();
+                    }
+                    let end = self.span().end;
+                    predicates.push(WherePredicate {
+                        ty,
+                        bounds,
+                        span: Span::new(start, end),
+                    });
+                }
             }
             if !matches!(self.peek(), Ok(Token::Comma)) {
                 break;
@@ -1526,12 +1659,13 @@ impl Parser {
             self.advance().ok();
         }
         Ok(WhereClause {
-            predicates,
+            predicates: smallvec::SmallVec::from(predicates),
             equalities,
+            lifetime_outlives,
         })
     }
 
-    fn parse_param(&mut self) -> Result<Param, Diagnostic> {
+    fn parse_param(&mut self) -> Result<Param<'input>, Diagnostic> {
         let start = self.span().start;
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
@@ -1582,7 +1716,7 @@ impl Parser {
     /// Parse GADT `when` constraints: `Ident == Type [and Ident == Type]*`.
     /// This is a dedicated syntax, NOT a general expression parser, to avoid
     /// the `<` ambiguity where `Int<32>` would be parsed as `Int < 32`.
-    fn parse_gadt_constraints(&mut self) -> Result<Vec<(Symbol, Type)>, Diagnostic> {
+    fn parse_gadt_constraints(&mut self) -> Result<Vec<(Symbol, Type<'input>)>, Diagnostic> {
         let mut constraints = Vec::new();
         loop {
             let param_name = match self.advance() {
@@ -1620,7 +1754,7 @@ impl Parser {
         Ok(constraints)
     }
 
-    fn parse_contract(&mut self) -> Result<Contract, Diagnostic> {
+    fn parse_contract(&mut self) -> Result<Contract<'input>, Diagnostic> {
         let start = self.span().start;
         match self.advance().map_err(|_| Diagnostic::error("unexpected token")
             .with_code_str("E003")
@@ -1750,7 +1884,7 @@ impl Parser {
         }
     }
 
-    fn parse_type(&mut self) -> Result<Type, Diagnostic> {
+    fn parse_type(&mut self) -> Result<Type<'input>, Diagnostic> {
         self.recursion_depth += 1;
         if self.recursion_depth > self.max_recursion_depth {
             self.recursion_depth -= 1;
@@ -1768,15 +1902,44 @@ impl Parser {
         result
     }
 
-    fn parse_type_inner(&mut self) -> Result<Type, Diagnostic> {
+    fn parse_type_inner(&mut self) -> Result<Type<'input>, Diagnostic> {
         let start = self.span().start;
         match self.peek() {
+            Ok(Token::For) => {
+                // Higher-ranked type: `for<'a> T` (SYNTAX.md
+                // §Higher-Ranked Trait Bounds — "for<'a> introduces one or
+                // more lifetime parameters scoped over the subsequent
+                // trait bound").  The lifetime is universally quantified
+                // over the body; the checker skolemizes it at the call
+                // site.
+                self.advance().ok(); // consume 'for'
+                self.expect(Token::Lt)?;
+                self.expect(Token::Apostrophe)?;
+                let lifetime = match self.advance() {
+                    Ok(Token::Ident(name)) => name,
+                    _ => {
+                        return Err(Diagnostic::error(
+                            "expected a lifetime name after `for<'`",
+                        )
+                        .with_code_str("E004")
+                        .with_span(self.span()));
+                    }
+                };
+                self.expect_gt()?;
+                let body = Self::alloc_shared(self.arena, self.parse_type()?);
+                let end = self.span().end;
+                Ok(Type::Forall {
+                    lifetime,
+                    body,
+                    span: Span::new(start, end),
+                })
+            }
             Ok(Token::Lt) => {
                 // Qualified path / projection: `<ImplType as TraitPath>::AssocName`
                 self.advance().ok();
-                let impl_type = Box::new(self.parse_type()?);
+                let impl_type = Self::alloc_shared(self.arena, self.parse_type()?);
                 self.expect(Token::As)?;
-                let trait_path = Box::new(self.parse_type()?);
+                let trait_path = Self::alloc_shared(self.arena, self.parse_type()?);
                 self.expect_gt()?;
                 self.expect(Token::ColonColon)?;
                 let assoc_name = match self.advance() {
@@ -1802,9 +1965,9 @@ impl Parser {
                 // The lexer merged `<<` into Shl; push one `Lt` back and treat as `<`.
                 self.advance().ok();
                 self.pending.push(Token::Lt);
-                let impl_type = Box::new(self.parse_type()?);
+                let impl_type = Self::alloc_shared(self.arena, self.parse_type()?);
                 self.expect(Token::As)?;
-                let trait_path = Box::new(self.parse_type()?);
+                let trait_path = Self::alloc_shared(self.arena, self.parse_type()?);
                 self.expect_gt()?;
                 self.expect(Token::ColonColon)?;
                 let assoc_name = match self.advance() {
@@ -1849,7 +2012,7 @@ impl Parser {
                 let ty = self.parse_type()?;
                 let end = self.span().end;
                 Ok(Type::Reference {
-                    inner: Box::new(ty),
+                    inner: Self::alloc_shared(self.arena, ty),
                     mutable,
                     lifetime,
                     span: Span::new(start, end),
@@ -1859,7 +2022,7 @@ impl Parser {
                 self.advance().ok();
                 let ty = self.parse_type()?;
                 let end = self.span().end;
-                Ok(Type::Pointer(Box::new(ty), Span::new(start, end)))
+                Ok(Type::Pointer(Self::alloc_shared(self.arena, ty), Span::new(start, end)))
             }
             Ok(Token::LBracket) => {
                 self.advance().ok();
@@ -1870,14 +2033,14 @@ impl Parser {
                     self.expect(Token::RBracket)?;
                     let end = self.span().end;
                     Ok(Type::Array(
-                        Box::new(ty),
-                        Box::new(size),
+                        Self::alloc_shared(self.arena, ty),
+                        Self::alloc_shared(self.arena, size),
                         Span::new(start, end),
                     ))
                 } else {
                     self.expect(Token::RBracket)?;
                     let end = self.span().end;
-                    Ok(Type::Slice(Box::new(ty), Span::new(start, end)))
+                    Ok(Type::Slice(Self::alloc_shared(self.arena, ty), Span::new(start, end)))
                 }
             }
             Ok(Token::Dyn) => {
@@ -1909,11 +2072,11 @@ impl Parser {
                 self.expect(Token::Colon)?;
                 let base = self.parse_type()?;
                 self.expect(Token::Invariant)?;
-                let invariant = Box::new(self.parse_expr()?);
+                let invariant = Self::alloc_shared(self.arena, self.parse_expr()?);
                 let end = self.span().end;
                 Ok(Type::Exists {
                     name,
-                    base: Box::new(base),
+                    base: Self::alloc_shared(self.arena, base),
                     invariant,
                     span: Span::new(start, end),
                 })
@@ -1921,12 +2084,12 @@ impl Parser {
             Ok(Token::IntLiteral(_)) | Ok(Token::HexLiteral(_)) | Ok(Token::BinLiteral(_)) => {
                 let expr = self.parse_literal()?;
                 let end = self.span().end;
-                Ok(Type::Literal(Box::new(expr), Span::new(start, end)))
+                Ok(Type::Literal(Self::alloc_shared(self.arena, expr), Span::new(start, end)))
             }
             Ok(Token::Type) => {
                 self.advance().ok();
                 let end = self.span().end;
-                Ok(Type::Path(vec![Symbol::intern("type")], Span::new(start, end)))
+                Ok(Type::Path(smallvec::smallvec![Symbol::intern("type")], Span::new(start, end)))
             }
             _ => match self.advance() {
                 Ok(Token::Ident(name)) => {
@@ -1970,6 +2133,46 @@ impl Parser {
                         return Ok(Type::Regex(pattern, Span::new(start, end)));
                     }
 
+                    // Named function type: `Fn(T1, T2) -> R` (SYNTAX.md
+                    // §Higher-Ranked Trait Bounds — `where F: for<'a> Fn(&'a
+                    // T) -> &'a T`).  Parses like the `(A, B) -> C`
+                    // function type below.
+                    if name.eq_str("Fn") && matches!(self.peek(), Ok(Token::LParen)) {
+                        self.advance().ok(); // consume (
+                        let mut params = Vec::new();
+                        if !matches!(self.peek(), Ok(Token::RParen)) {
+                            loop {
+                                params.push(self.parse_type()?);
+                                match self.peek() {
+                                    Ok(Token::Comma) => {
+                                        self.advance().ok();
+                                    }
+                                    Ok(Token::RParen) => {
+                                        self.advance().ok();
+                                        break;
+                                    }
+                                    _ => {
+                                        return Err(Diagnostic::error(
+                                            "expected ',' or ')' in Fn parameter list",
+                                        )
+                                        .with_code_str("E004")
+                                        .with_span(self.span(),));
+                                    }
+                                }
+                            }
+                        } else {
+                            self.advance().ok(); // consume ()
+                        }
+                        self.expect(Token::Arrow)?;
+                        let ret = Self::alloc_shared(self.arena, self.parse_type()?);
+                        let end = self.span().end;
+                        return Ok(Type::Function {
+                            params,
+                            ret,
+                            span: Span::new(start, end),
+                        });
+                    }
+
                     let mut path = vec![name];
                     while matches!(self.peek(), Ok(Token::ColonColon)) {
                         self.advance().ok();
@@ -2005,7 +2208,7 @@ impl Parser {
                                         |this| this.parse_expr(),
                                     )?;
                                     let span = expr.span();
-                                    Type::Expr(Box::new(expr), span)
+                                    Type::Expr(Self::alloc_shared(self.arena, expr), span)
                                 } else {
                                     // Type value: `name = UInt<16>`
                                     self.parse_type()?
@@ -2052,7 +2255,8 @@ impl Parser {
                                                 | Ok(Token::Shl) | Ok(Token::Ampersand)
                                                 | Ok(Token::Pipe) | Ok(Token::Caret)
                                                 | Ok(Token::LParen) | Ok(Token::LBracket)
-                                                | Ok(Token::Dot) | Ok(Token::Apostrophe))
+                                                | Ok(Token::Dot) | Ok(Token::Apostrophe)
+                                                | Ok(Token::Bang))
                                         {
                                             // The next token is an expression-only operator,
                                             // so the preceding token must be an expression.
@@ -2073,7 +2277,7 @@ impl Parser {
                                             }
                                             let span = expr.span();
                                             GenericArg::Const(AnonConst {
-                                                value: Box::new(expr),
+                                                value: Self::alloc_shared(self.arena, expr),
                                                 span,
                                             })
                                         } else {
@@ -2098,7 +2302,7 @@ impl Parser {
                                         }
                                         let span = expr.span();
                                         GenericArg::Const(AnonConst {
-                                            value: Box::new(expr),
+                                            value: Self::alloc_shared(self.arena, expr),
                                             span,
                                         })
                                     }
@@ -2113,6 +2317,25 @@ impl Parser {
                                     self.expect_gt()?;
                                     break;
                                 }
+                                Ok(Token::Assign) => {
+                                    // GAT equality bound:
+                                    // `StreamingIterator<Item<'a> =
+                                    // &'a Int<32>>` (SYNTAX.md
+                                    // §Interaction with HRTB).
+                                    //
+                                    // The AST has no representation for
+                                    // GAT equality bounds yet.  Parse
+                                    // and consume the RHS type so the
+                                    // token stream stays consistent.
+                                    // The constraint is accepted but not
+                                    // enforced by the type checker.
+                                    self.advance().ok(); // consume =
+                                    let _eq_ty = self.parse_type()?;
+                                    // Close the generic list and break —
+                                    // the equality bound was the last arg.
+                                    self.expect_gt()?;
+                                    break;
+                                }
                                 _ => {
                                     return Err(Diagnostic::error("expected ',' or '>' in type parameters")
                                         .with_code_str("E004")
@@ -2124,13 +2347,13 @@ impl Parser {
                         }
                         let end = self.span().end;
                         Ok(Type::Generic(
-                            Box::new(Type::Path(path, Span::new(start, end))),
+                            Self::alloc_shared(self.arena, Type::Path(smallvec::SmallVec::from(path), Span::new(start, end))),
                             args,
                             Span::new(start, end),
                         ))
                     } else {
                         let end = self.span().end;
-                        Ok(Type::Path(path, Span::new(start, end)))
+                        Ok(Type::Path(smallvec::SmallVec::from(path), Span::new(start, end)))
                     }
                 }
                 Ok(Token::LParen) => {
@@ -2164,7 +2387,7 @@ impl Parser {
                     // `(A, B) -> C` is a function type; `(A, B)` alone is a tuple.
                     if matches!(self.peek(), Ok(Token::Arrow)) {
                         self.advance().ok();
-                        let ret = Box::new(self.parse_type()?);
+                        let ret = Self::alloc_shared(self.arena, self.parse_type()?);
                         let end = self.span().end;
                         Ok(Type::Function {
                             params,
@@ -2184,25 +2407,24 @@ impl Parser {
                     // Lifetime argument in generic context: `Foo<'a>`
                     // Parse `'name` as a placeholder path; the type checker
                     // will resolve or reject it.
-                    self.advance().ok();
+                    //
+                    // NOTE: this arm lives inside the catch-all
+                    // `_ => match self.advance()`, whose `advance()` has
+                    // ALREADY consumed the leading `'` — the following
+                    // `match self.advance()` consumes the lifetime NAME
+                    // (`a` in `'a`) and nothing more (a previous extra
+                    // `self.advance().ok()` here ate the closing `>`,
+                    // breaking `Foo<'a>` in nested generic args).
                     match self.advance() {
                         Ok(Token::Ident(name)) => {
                             let end = self.span().end;
-                            Ok(Type::Path(vec![Symbol::intern(&format!("'{}", name))], Span::new(start, end)))
+                            Ok(Type::Path(smallvec::smallvec![Symbol::intern(&format!("'{}", name))], Span::new(start, end)))
                         }
                         _ => Err(Diagnostic::error("expected lifetime name after `'`")
                             .with_code_str("E004")
                             .with_span(self.span())),
                     }
                 }
-                Ok(Token::Ident(name)) => Err(Diagnostic::error(format!("expected type, found `{}`", name))
-                    .with_code_str("E004")
-                    .with_help("expected a valid type expression — try `Int<32>`, `&T`, `[T]`, `(A, B)`, etc.")
-                    .with_suggestion(
-                        did_you_mean_keyword(&name.as_str(), KeywordContext::Type)
-                            .unwrap_or_else(|| "use a type name like `Int<32>`, `Bool`, or `String`".into())
-                    )
-                    .with_span(self.span(),)),
                 Ok(tok) => Err(Diagnostic::error(format!("expected type, found {:?}", tok))
                     .with_code_str("E004")
                     .with_help("expected a valid type expression — try `Int<32>`, `&T`, `[T]`, `(A, B)`, etc.")
@@ -2216,7 +2438,7 @@ impl Parser {
         }
     }
 
-    fn parse_block(&mut self) -> Result<Vec<Stmt>, Diagnostic> {
+    fn parse_block(&mut self) -> Result<Vec<Stmt<'input>>, Diagnostic> {
         self.recursion_depth += 1;
         if self.recursion_depth > self.max_recursion_depth {
             self.recursion_depth -= 1;
@@ -2234,7 +2456,7 @@ impl Parser {
         result
     }
 
-    fn parse_block_inner(&mut self) -> Result<Vec<Stmt>, Diagnostic> {
+    fn parse_block_inner(&mut self) -> Result<Vec<Stmt<'input>>, Diagnostic> {
         self.without_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
             let mut stmts = Vec::new();
             loop {
@@ -2255,7 +2477,7 @@ impl Parser {
         })
     }
 
-    fn parse_stmt(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic> {
         self.recursion_depth += 1;
         if self.recursion_depth > self.max_recursion_depth {
             self.recursion_depth -= 1;
@@ -2273,7 +2495,7 @@ impl Parser {
         result
     }
 
-    fn parse_stmt_inner(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_stmt_inner(&mut self) -> Result<Stmt<'input>, Diagnostic> {
         // Collect leading @attributes — only valid before comptime inside
         // function bodies (e.g. @deprecated("use bar") comptime { ... }).
         // Use checkpoint/restore to avoid consuming `@` in expression-level
@@ -2296,12 +2518,39 @@ impl Parser {
                 attributes = Vec::new();
             }
         }
+        // A loop label prefix: `'label: while ...` / `'label: for ...` /
+        // `'label: loop ...`.  `continue 'label;` and `leave 'label;`
+        // (SYNTAX.md §Loops) target the enclosing loop with that label.
+        // Use checkpoint/restore so a stray apostrophe (e.g. in a lifetime
+        // position) falls through to the normal statement dispatch.
+        let label = if matches!(self.peek(), Ok(Token::Apostrophe)) {
+            let cp = self.checkpoint();
+            self.advance().ok();
+            match self.advance() {
+                Ok(Token::Ident(name)) if matches!(self.peek(), Ok(Token::Colon)) => {
+                    self.advance().ok();
+                    match self.peek() {
+                        Ok(Token::While) | Ok(Token::For) | Ok(Token::Loop) => Some(name),
+                        _ => {
+                            self.restore(&cp);
+                            None
+                        }
+                    }
+                }
+                _ => {
+                    self.restore(&cp);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         match self.peek() {
             Ok(Token::Set) | Ok(Token::Let) => self.parse_variable_def(Vec::new()),
             Ok(Token::If) => self.parse_if_stmt(),
-            Ok(Token::While) => self.parse_while_stmt(),
-            Ok(Token::For) => self.parse_for_stmt(),
-            Ok(Token::Loop) => self.parse_loop_stmt(),
+            Ok(Token::While) => self.parse_while_stmt(label),
+            Ok(Token::For) => self.parse_for_stmt(label),
+            Ok(Token::Loop) => self.parse_loop_stmt(label),
             Ok(Token::Leave) => self.parse_leave_stmt(),
             Ok(Token::Continue) => self.parse_continue_stmt(),
             Ok(Token::Return) => self.parse_return_stmt(),
@@ -2422,7 +2671,7 @@ impl Parser {
                             .with_span(self.span()));
                     }
                 }
-                let for_type = Box::new(self.parse_type()?);
+                let for_type = Self::alloc_shared(self.arena, self.parse_type()?);
                 self.expect(Token::LBrace)?;
                 let body = self.parse_block()?;
                 self.expect(Token::RBrace)?;
@@ -2455,6 +2704,38 @@ impl Parser {
                     this.parse_function_def(Vec::new(), None, false, false)
                 })
             }
+            Ok(Token::Trait) => self.parse_trait_def(attributes, None),
+            Ok(Token::Impl) => self
+                .with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
+                    this.parse_impl_block(attributes)
+                }),
+            Ok(Token::Constraint) => self.parse_constraint(),
+            Ok(Token::Type) => {
+                // Nested type definitions — blocks may contain items
+                // (rustc-style).  Before this arm existed, `type` fell
+                // through to the expression fallback and produced a
+                // misleading "expected expression" (E007) false negative;
+                // the synchronize fix only prevented the infinite
+                // recovery loop, not the error itself.
+                //
+                // NOTE: do NOT pre-consume `type` here — unlike
+                // parse_function_def (which expects `def` already
+                // consumed), parse_type_def consumes the `type` keyword
+                // itself.
+                let stmt = self
+                    .with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
+                        this.parse_type_def(Vec::new(), None)
+                    })?;
+                // The Alias / Opaque branches of parse_type_def consume an
+                // optional trailing `;`, but the Struct / Enum branches do
+                // not.  In statement position users habitually terminate
+                // with `;` — swallow it here so the leftover semicolon
+                // does not trigger a spurious error.
+                if matches!(self.peek(), Ok(Token::Semicolon)) {
+                    self.advance().ok();
+                }
+                Ok(stmt)
+            }
             _ => {
                 let _start = self.span().start;
                 let lhs = self.parse_expr()?;
@@ -2486,7 +2767,7 @@ impl Parser {
                     self.expect(Token::Semicolon)?;
                     let _end = self.span().end;
                     Ok(Stmt::Assign {
-                        target: Box::new(lhs),
+                        target: Self::alloc_shared(self.arena, lhs),
                         op,
                         value,
                         span: Span::new(_start, _end),
@@ -2506,7 +2787,7 @@ impl Parser {
         }
     }
 
-    fn parse_unsafe_block(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_unsafe_block(&mut self) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         self.expect(Token::LBrace)?;
@@ -2519,14 +2800,14 @@ impl Parser {
         })
     }
 
-    fn parse_ghost_variable(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_ghost_variable(&mut self) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         let mut stmt = self.parse_variable_def(Vec::new())?;
         if let Stmt::VariableDef { .. } = &mut stmt {
             let end = self.span().end;
             return Ok(Stmt::GhostVariableDef {
-                inner: Box::new(stmt),
+                inner: Self::alloc_shared(self.arena, stmt),
                 span: Span::new(start, end),
             });
         }
@@ -2541,7 +2822,7 @@ impl Parser {
         )
     }
 
-    fn parse_isolate_block(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_isolate_block(&mut self) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         self.expect(Token::LBrace)?;
@@ -2556,7 +2837,10 @@ impl Parser {
     }
 
     /// Parse a layout alias definition: `layout Name { packed, little_endian; }`
-    fn parse_layout_def(&mut self, mut attributes: Vec<Attribute>) -> Result<Stmt, Diagnostic> {
+    fn parse_layout_def(
+        &mut self,
+        mut attributes: Vec<Attribute<'input>>,
+    ) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
@@ -2621,7 +2905,10 @@ impl Parser {
         })
     }
 
-    fn parse_variable_def(&mut self, attributes: Vec<Attribute>) -> Result<Stmt, Diagnostic> {
+    fn parse_variable_def(
+        &mut self,
+        attributes: Vec<Attribute<'input>>,
+    ) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         let kind = match self.advance().map_err(|_| {
             Diagnostic::error("unexpected token")
@@ -2699,6 +2986,14 @@ impl Parser {
         } else {
             None
         };
+        // Type-level overflow policy: `set mut i:
+        // UInt<8> with overflow = saturate` — the `with` modifiers are
+        // parsed here and applied by the checker when the type resolves.
+        let type_modifiers = if matches!(self.peek(), Ok(Token::With)) {
+            self.parse_type_modifiers()?
+        } else {
+            Vec::new()
+        };
 
         // `set auto<T, N> = expr` — type/const capture syntax.
         // Parse `<T>` BEFORE the `= expr` part so the value expression parser
@@ -2743,13 +3038,14 @@ impl Parser {
             attributes,
             doc: None,
             type_captures,
+            type_modifiers,
         })
     }
 
     /// Parse `<T, N, L>` capture parameter list after `set auto`.
     /// Unlike `parse_type_params`, capture params may include plain
     /// identifiers (type captures) and compile-time constant captures.
-    fn parse_type_capture_params(&mut self) -> Result<Vec<TypeParam>, Diagnostic> {
+    fn parse_type_capture_params(&mut self) -> Result<Vec<TypeParam<'input>>, Diagnostic> {
         self.advance().ok(); // consume <
         let mut params = Vec::new();
         loop {
@@ -2792,7 +3088,7 @@ impl Parser {
         Ok(params)
     }
 
-    fn parse_if_stmt(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_if_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         if matches!(self.peek(), Ok(Token::Let)) {
@@ -2856,7 +3152,7 @@ impl Parser {
         })
     }
 
-    fn parse_while_stmt(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_while_stmt(&mut self, label: Option<Symbol>) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         if matches!(self.peek(), Ok(Token::Let)) {
@@ -2867,8 +3163,8 @@ impl Parser {
                 .with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
                     this.parse_expr()
                 })?;
-            let mut invariant: Option<Expr> = None;
-            let mut decreases: Option<Expr> = None;
+            let mut invariant: Option<Expr<'input>> = None;
+            let mut decreases: Option<Expr<'input>> = None;
             while matches!(self.peek(), Ok(Token::Invariant) | Ok(Token::Decreases)) {
                 match self.peek() {
                     Ok(Token::Invariant) => {
@@ -2895,6 +3191,7 @@ impl Parser {
             self.expect(Token::RBrace)?;
             let end = self.span().end;
             return Ok(Stmt::WhileLet {
+                label,
                 pattern,
                 scrutinee,
                 body,
@@ -2906,8 +3203,8 @@ impl Parser {
         let cond = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
             this.parse_expr()
         })?;
-        let mut invariant: Option<Expr> = None;
-        let mut decreases: Option<Expr> = None;
+        let mut invariant: Option<Expr<'input>> = None;
+        let mut decreases: Option<Expr<'input>> = None;
         while matches!(self.peek(), Ok(Token::Invariant) | Ok(Token::Decreases)) {
             match self.peek() {
                 Ok(Token::Invariant) => {
@@ -2934,6 +3231,7 @@ impl Parser {
         self.expect(Token::RBrace)?;
         let end = self.span().end;
         Ok(Stmt::While {
+            label,
             cond,
             body,
             invariant,
@@ -2942,7 +3240,7 @@ impl Parser {
         })
     }
 
-    fn parse_for_stmt(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_for_stmt(&mut self, label: Option<Symbol>) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         let pattern = self.parse_pattern()?;
@@ -2950,8 +3248,8 @@ impl Parser {
         let iterable = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
             this.parse_expr()
         })?;
-        let mut invariant: Option<Expr> = None;
-        let mut decreases: Option<Expr> = None;
+        let mut invariant: Option<Expr<'input>> = None;
+        let mut decreases: Option<Expr<'input>> = None;
         while matches!(self.peek(), Ok(Token::Invariant) | Ok(Token::Decreases)) {
             match self.peek() {
                 Ok(Token::Invariant) => {
@@ -2978,6 +3276,7 @@ impl Parser {
         self.expect(Token::RBrace)?;
         let end = self.span().end;
         Ok(Stmt::For {
+            label,
             pattern,
             iterable,
             body,
@@ -2987,7 +3286,7 @@ impl Parser {
         })
     }
 
-    fn parse_loop_stmt(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_loop_stmt(&mut self, label: Option<Symbol>) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         self.expect(Token::LBrace)?;
@@ -2995,12 +3294,13 @@ impl Parser {
         self.expect(Token::RBrace)?;
         let end = self.span().end;
         Ok(Stmt::Loop {
+            label,
             body,
             span: Span::new(start, end),
         })
     }
 
-    fn parse_leave_stmt(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_leave_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         if matches!(self.peek(), Ok(Token::With)) {
@@ -3009,16 +3309,29 @@ impl Parser {
             self.expect(Token::Semicolon)?;
             let end = self.span().end;
             Ok(Stmt::Expression(Expr::LeaveWith {
-                expr: Box::new(expr),
+                expr: Self::alloc_shared(self.arena, expr),
                 is_return: false,
                 span: Span::new(start, end),
             }))
         } else {
-            let label = if let Ok(Token::Ident(l)) = self.peek().clone() {
-                self.advance().ok();
-                Some(l)
-            } else {
-                None
+            // Optional label: `leave 'label;` (SYNTAX.md §Loops) or the
+            // plain `leave;`.  The label must match a labeled block/loop.
+            // Only the apostrophe form is accepted — SYNTAX.md specifies
+            // `leave 'label;`; a bare identifier is NOT a label (a typo
+            // like `leave label;` must not silently parse).
+            let label = match self.peek().clone() {
+                Ok(Token::Apostrophe) => {
+                    self.advance().ok();
+                    match self.advance() {
+                        Ok(Token::Ident(l)) => Some(l),
+                        _ => {
+                            return Err(Diagnostic::error("expected a label after `'` in leave")
+                                .with_code_str("E004")
+                                .with_span(self.span()));
+                        }
+                    }
+                }
+                _ => None,
             };
             self.expect(Token::Semicolon)?;
             let end = self.span().end;
@@ -3029,14 +3342,25 @@ impl Parser {
         }
     }
 
-    fn parse_continue_stmt(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_continue_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
-        let label = if let Ok(Token::Ident(l)) = self.peek().clone() {
-            self.advance().ok();
-            Some(l)
-        } else {
-            None
+        // Optional label: `continue 'label;` (SYNTAX.md §Loops — continue
+        // to outer labels) or the plain `continue;`.  Only the apostrophe
+        // form is accepted — a bare identifier is not a label.
+        let label = match self.peek().clone() {
+            Ok(Token::Apostrophe) => {
+                self.advance().ok();
+                match self.advance() {
+                    Ok(Token::Ident(l)) => Some(l),
+                    _ => {
+                        return Err(Diagnostic::error("expected a label after `'` in continue")
+                            .with_code_str("E004")
+                            .with_span(self.span()));
+                    }
+                }
+            }
+            _ => None,
         };
         self.expect(Token::Semicolon)?;
         let end = self.span().end;
@@ -3046,7 +3370,7 @@ impl Parser {
         })
     }
 
-    fn parse_return_stmt(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_return_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok(); // consume 'return'
 
@@ -3092,7 +3416,7 @@ impl Parser {
         })
     }
 
-    fn parse_scope_cleanup(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_scope_cleanup(&mut self) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         self.expect(Token::At)?;
@@ -3112,7 +3436,7 @@ impl Parser {
             let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
                 this.parse_expr()
             })?;
-            Some(Box::new(expr))
+            Some(Self::alloc_shared(self.arena, expr))
         } else {
             None
         };
@@ -3147,7 +3471,7 @@ impl Parser {
         })
     }
 
-    fn parse_trigger(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_trigger(&mut self) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         self.expect(Token::At)?;
@@ -3169,7 +3493,7 @@ impl Parser {
         })
     }
 
-    fn parse_edition(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_edition(&mut self) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         self.expect(Token::Assign)?;
@@ -3195,7 +3519,7 @@ impl Parser {
         Ok(Stmt::Edition(edition, Span::new(start, end)))
     }
 
-    fn parse_import(&mut self) -> Result<Stmt, Diagnostic> {
+    fn parse_import(&mut self) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         let is_from = matches!(self.peek(), Ok(Token::From));
         if is_from {
@@ -3221,6 +3545,11 @@ impl Parser {
         }
         while matches!(self.peek(), Ok(Token::ColonColon)) {
             self.advance().ok();
+            // If `{` follows `::`, break to the items parser — this
+            // enables `import std::{HashMap, HashSet}` syntax.
+            if matches!(self.peek(), Ok(Token::LBrace)) {
+                break;
+            }
             match self.advance() {
                 Ok(Token::Star) => {
                     return Err(Diagnostic::error("wildcard import is prohibited: `import *` is illegal")
@@ -3367,7 +3696,10 @@ impl Parser {
         })
     }
 
-    fn parse_extern_function(&mut self, attributes: Vec<Attribute>) -> Result<Stmt, Diagnostic> {
+    fn parse_extern_function(
+        &mut self,
+        attributes: Vec<Attribute<'input>>,
+    ) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         let abi = match self.advance() {
@@ -3433,9 +3765,9 @@ impl Parser {
 
     fn parse_type_def(
         &mut self,
-        attributes: Vec<Attribute>,
+        attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
-    ) -> Result<Stmt, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         let name = match self.advance() {
@@ -3593,6 +3925,20 @@ impl Parser {
                             }
                         }
                         let ty = self.parse_type()?;
+                        // A dedicated diagnostic for the common mistake
+                        // `exists X: T, exists Y: T` — multiple `exists`
+                        // variables share ONE type (`exists X, Y: Type`).
+                        if !variant_exists_params.is_empty()
+                            && matches!(self.peek(), Ok(Token::Comma))
+                        {
+                            return Err(Diagnostic::error(
+                                "expected `)` after the `exists` variable type",
+                            )
+                            .with_help(
+                                "multiple `exists` variables share ONE type — use                                  `exists X, Y: Type` (comma-separated names, then a                                  single `:` and one type), not `exists X: T, exists Y: T`",
+                            )
+                            .with_span(self.span()));
+                        }
                         self.expect(Token::RParen)?;
                         Some(ty)
                     } else {
@@ -3674,8 +4020,8 @@ impl Parser {
             // The parser preserves `value` as-is; desugaring happens in the
             // resolver / checker phase.
             ty = Type::WhereShorthand {
-                base: Box::new(ty),
-                invariant: Box::new(invariant),
+                base: Self::alloc_shared(self.arena, ty),
+                invariant: Self::alloc_shared(self.arena, invariant),
                 span: Span::new(start, self.span().end),
             };
         }
@@ -3705,7 +4051,7 @@ impl Parser {
         })
     }
 
-    fn parse_type_modifiers(&mut self) -> Result<Vec<TypeModifier>, Diagnostic> {
+    fn parse_type_modifiers(&mut self) -> Result<Vec<TypeModifier<'input>>, Diagnostic> {
         let mut modifiers = Vec::new();
         while matches!(self.peek(), Ok(Token::With)) {
             self.advance().ok();
@@ -3722,11 +4068,12 @@ impl Parser {
                                 Ok(Token::Wrap) => OverflowPolicy::Wrap,
                                 Ok(Token::Saturate) => OverflowPolicy::Saturate,
                                 Ok(Token::Trap) => OverflowPolicy::Trap,
+                                Ok(Token::Ieee) => OverflowPolicy::Ieee,
                                 _ => {
-                                    return Err(Diagnostic::error("expected overflow policy (wrap, saturate, trap)")
+                                    return Err(Diagnostic::error("expected overflow policy (wrap, saturate, trap, ieee)")
                                         .with_code_str("E007")
-                                        .with_help("`overflow` policy must be one of: `wrap`, `saturate`, or `trap`")
-                                        .with_suggestion("use one of: `wrap`, `saturate`, or `trap`")
+                                        .with_help("`overflow` policy must be one of: `wrap`, `saturate`, `trap`, or `ieee` (floats only)")
+                                        .with_suggestion("use one of: `wrap`, `saturate`, `trap`, or `ieee`")
                                         .with_span(self.span(),));
                                 }
                             };
@@ -3786,7 +4133,10 @@ impl Parser {
         Ok(modifiers)
     }
 
-    fn parse_impl_block(&mut self, attributes: Vec<Attribute>) -> Result<Stmt, Diagnostic> {
+    fn parse_impl_block(
+        &mut self,
+        attributes: Vec<Attribute<'input>>,
+    ) -> Result<Stmt<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         // Inherent impl: `impl TypeName { ... }` or `impl<T> TypeName { ... }`
@@ -3809,7 +4159,7 @@ impl Parser {
             if matches!(self.peek(), Ok(Token::For)) {
                 self.advance().ok(); // consume `for`
                 let for_ty = self.parse_type()?;
-                (Some(Box::new(first_type)), for_ty)
+                (Some(Self::alloc_shared(self.arena, first_type)), for_ty)
             } else {
                 (None, first_type)
             }
@@ -3837,11 +4187,15 @@ impl Parser {
                             .with_span(self.span(),));
                     }
                 };
+                // GAT lifetime parameters (`type Item<'a> = ...;`) —
+                // same optional `<'a>` list as the trait arm.
+                let lifetime_params = self.parse_associated_type_lifetime_params()?;
                 self.expect(Token::Assign)?;
                 let assoc_ty = self.parse_type()?;
                 self.expect(Token::Semicolon)?;
                 associated_types.push(AssociatedType {
                     name: assoc_name,
+                    lifetime_params,
                     default: Some(assoc_ty),
                     span: Span::new(start, self.span().end),
                 });
@@ -3863,7 +4217,7 @@ impl Parser {
         })
     }
 
-    fn parse_impl_method(&mut self) -> Result<ImplMethod, Diagnostic> {
+    fn parse_impl_method(&mut self) -> Result<ImplMethod<'input>, Diagnostic> {
         // Parse leading attributes: @trusted, @io, etc.
         let mut attributes = Vec::new();
         while matches!(self.peek(), Ok(Token::At)) {
@@ -3910,7 +4264,11 @@ impl Parser {
                     let param = self.parse_self_param()?;
                     params.push(param);
                 }
-                Ok(Token::Ident(s)) if s.eq_str("self") || s.eq_str("Self") => {
+                Ok(Token::Ident(s)) if s.eq_str("self") => {
+                    let param = self.parse_self_param()?;
+                    params.push(param);
+                }
+                Ok(Token::SelfKw) => {
                     let param = self.parse_self_param()?;
                     params.push(param);
                 }
@@ -3951,7 +4309,7 @@ impl Parser {
         })
     }
 
-    fn parse_self_param(&mut self) -> Result<Param, Diagnostic> {
+    fn parse_self_param(&mut self) -> Result<Param<'input>, Diagnostic> {
         let start = self.span().start;
         let has_ampersand = matches!(self.peek(), Ok(Token::Ampersand));
         let mutable = if has_ampersand {
@@ -3967,15 +4325,18 @@ impl Parser {
         match self.advance() {
             Ok(Token::Ident(s)) if s.eq_str("self") => {
                 let end = self.span().end;
-                let ty: Type = if has_ampersand {
+                let ty: Type<'input> = if has_ampersand {
                     Type::Reference {
-                        inner: Box::new(Type::Path(vec!["Self".into()], Span::new(start, end))),
+                        inner: Self::alloc_shared(
+                            self.arena,
+                            Type::Path(smallvec::smallvec!["Self".into()], Span::new(start, end)),
+                        ),
                         mutable,
                         lifetime: None,
                         span: Span::new(start, end),
                     }
                 } else {
-                    Type::Path(vec!["Self".into()], Span::new(start, end))
+                    Type::Path(smallvec::smallvec!["Self".into()], Span::new(start, end))
                 };
                 Ok(Param {
                     name: "self".into(),
@@ -3987,15 +4348,18 @@ impl Parser {
             // Also handle `Self` (capital S) as the SelfKw token.
             Ok(Token::SelfKw) => {
                 let end = self.span().end;
-                let ty: Type = if has_ampersand {
+                let ty: Type<'input> = if has_ampersand {
                     Type::Reference {
-                        inner: Box::new(Type::Path(vec!["Self".into()], Span::new(start, end))),
+                        inner: Self::alloc_shared(
+                            self.arena,
+                            Type::Path(smallvec::smallvec!["Self".into()], Span::new(start, end)),
+                        ),
                         mutable,
                         lifetime: None,
                         span: Span::new(start, end),
                     }
                 } else {
-                    Type::Path(vec!["Self".into()], Span::new(start, end))
+                    Type::Path(smallvec::smallvec!["Self".into()], Span::new(start, end))
                 };
                 Ok(Param {
                     name: "self".into(),
@@ -4012,7 +4376,7 @@ impl Parser {
         }
     }
 
-    fn parse_pattern(&mut self) -> Result<Pattern, Diagnostic> {
+    fn parse_pattern(&mut self) -> Result<Pattern<'input>, Diagnostic> {
         self.recursion_depth += 1;
         if self.recursion_depth > self.max_recursion_depth {
             self.recursion_depth -= 1;
@@ -4035,7 +4399,7 @@ impl Parser {
     /// generic pattern contexts — `catch { |NetworkError| ... }` uses a
     /// pipe-wrapped pattern whose `|` must not be consumed as an or
     /// separator.
-    fn parse_or_pattern(&mut self) -> Result<Pattern, Diagnostic> {
+    fn parse_or_pattern(&mut self) -> Result<Pattern<'input>, Diagnostic> {
         let start = self.span().start;
         let first = self.parse_pattern()?;
         if matches!(self.peek(), Ok(Token::Pipe)) {
@@ -4051,7 +4415,7 @@ impl Parser {
         }
     }
 
-    fn parse_pattern_inner(&mut self) -> Result<Pattern, Diagnostic> {
+    fn parse_pattern_inner(&mut self) -> Result<Pattern<'input>, Diagnostic> {
         let start = self.span().start;
         let tok = match self.peek() {
             Ok(t) => t.clone(),
@@ -4073,7 +4437,7 @@ impl Parser {
             | Token::False => {
                 let lit = self.parse_literal()?;
                 Ok(Pattern::Literal(
-                    Box::new(lit),
+                    Self::alloc_shared(self.arena, lit),
                     Span::new(start, self.span().end),
                 ))
             }
@@ -4103,7 +4467,7 @@ impl Parser {
                     Ok(Pattern::Enum {
                         path: vec![],
                         variant: name,
-                        inner: Some(Box::new(inner)),
+                        inner: Some(Self::alloc_shared(self.arena, inner)),
                         span: Span::new(start, end),
                     })
                 } else if matches!(self.peek(), Ok(Token::ColonColon)) {
@@ -4139,7 +4503,7 @@ impl Parser {
                         Ok(Pattern::Enum {
                             path,
                             variant: variant_sym,
-                            inner: Some(Box::new(p)),
+                            inner: Some(Self::alloc_shared(self.arena, p)),
                             span: Span::new(start, end),
                         })
                     } else {
@@ -4174,14 +4538,6 @@ impl Parser {
                 }
                 Ok(Pattern::Tuple(patterns, Span::new(start, self.span().end)))
             }
-            Token::Ident(name) => Err(Diagnostic::error(format!("expected pattern, found `{}`", name))
-                .with_code_str("E004")
-                .with_help("expected a valid pattern — try a literal, variable name, `_`, struct pattern, or tuple pattern")
-                .with_suggestion(
-                    did_you_mean_keyword(&name.as_str(), KeywordContext::Expression)
-                        .unwrap_or_else(|| "try `x`, `_`, `42`, `true`, `Point { x, y }`, or `Some(val)`".into())
-                )
-                .with_span(self.span(),)),
             _ => Err(Diagnostic::error("expected pattern")
                 .with_code_str("E004")
                 .with_help("expected a valid pattern — try a literal, variable name, `_`, struct pattern, or tuple pattern")
@@ -4190,7 +4546,55 @@ impl Parser {
         }
     }
 
-    fn parse_expr(&mut self) -> Result<Expr, Diagnostic> {
+    /// Hot path (the industrial-engineering pass): the overwhelming
+    /// majority of expressions are plain literals — build them directly
+    /// without the full Pratt machinery.  A following `:` (type
+    /// annotation) or anything else falls back to the general parser.
+    #[inline(always)]
+    fn parse_expr_fast(&mut self) -> Result<Option<Expr<'input>>, Diagnostic> {
+        // Check the token AFTER the literal FIRST (without consuming):
+        // only a terminator (or a type-annotation colon) lets the literal
+        // stand alone — otherwise (e.g. `1 + 2`) we must fall back WITHOUT
+        // having consumed anything, or the general parser would start
+        // mid-expression.
+        // NOTE: Colon is deliberately NOT a terminator here — `1: T` is a
+        // literal with a type annotation, which the general parser must
+        // handle (fall back without consuming).
+        if !matches!(
+            self.peek_next(),
+            Some(Token::Semicolon)
+                | Some(Token::RParen)
+                | Some(Token::Comma)
+                | Some(Token::RBracket)
+                | Some(Token::RBrace)
+                | None
+        ) {
+            return Ok(None);
+        }
+        match self.peek() {
+            Ok(Token::IntLiteral(_))
+            | Ok(Token::HexLiteral(_))
+            | Ok(Token::BinLiteral(_))
+            | Ok(Token::FloatLiteral(_))
+            | Ok(Token::StringLiteral(_))
+            | Ok(Token::ByteStringLiteral(_))
+            | Ok(Token::CharLiteral(_))
+            | Ok(Token::True)
+            | Ok(Token::False) => {
+                // A literal PARSE ERROR (e.g. `1e999` overflow) must be
+                // propagated — swallowing it here would leave the token
+                // consumed and the general parser starting mid-expression.
+                let expr = self.parse_literal()?;
+                Ok(Some(expr))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn parse_expr(&mut self) -> Result<Expr<'input>, Diagnostic> {
+        if let Some(e) = self.parse_expr_fast()? {
+            return Ok(e);
+        }
         self.parse_expr_bp(0)
     }
 
@@ -4199,7 +4603,7 @@ impl Parser {
     /// appeared as the last element.
     fn parse_struct_pattern_fields(
         &mut self,
-    ) -> Result<(Vec<(Symbol, Pattern)>, bool, Span), Diagnostic> {
+    ) -> Result<(Vec<(Symbol, Pattern<'input>)>, bool, Span), Diagnostic> {
         let start = self.span().start;
         self.expect(Token::LBrace)?;
         let mut fields = Vec::new();
@@ -4250,7 +4654,7 @@ impl Parser {
         Ok((fields, rest, Span::new(start, end)))
     }
 
-    fn parse_expr_bp(&mut self, min_bp: u8) -> Result<Expr, Diagnostic> {
+    fn parse_expr_bp(&mut self, min_bp: u8) -> Result<Expr<'input>, Diagnostic> {
         self.recursion_depth += 1;
         if self.recursion_depth > self.max_recursion_depth {
             self.recursion_depth -= 1;
@@ -4268,7 +4672,7 @@ impl Parser {
         result
     }
 
-    fn parse_expr_bp_inner(&mut self, min_bp: u8) -> Result<Expr, Diagnostic> {
+    fn parse_expr_bp_inner(&mut self, min_bp: u8) -> Result<Expr<'input>, Diagnostic> {
         let mut lhs = self.parse_prefix()?;
         loop {
             let token_opt = self.peek().as_ref().ok().cloned();
@@ -4293,15 +4697,9 @@ impl Parser {
                 // (>, >=, <, <=, ==, !=) so they don't consume the closing
                 // `>` of a generic in const expressions like `Val >> 2>`.
                 if self.restrictions.contains(ParseRestrictions::NO_COMPARISON) {
-                    let is_compare = matches!(
-                        token_opt,
-                        Some(Token::Gt)
-                            | Some(Token::Ge)
-                            | Some(Token::Lt)
-                            | Some(Token::Le)
-                            | Some(Token::EqEq)
-                            | Some(Token::Neq)
-                    );
+                    let is_compare = token_opt.is_some_and(|t| {
+                        crate::lexer::token_class(&t).contains(crate::lexer::TokenClass::COMPARISON)
+                    });
                     if is_compare {
                         break;
                     }
@@ -4366,7 +4764,7 @@ impl Parser {
         }
     }
 
-    fn parse_prefix(&mut self) -> Result<Expr, Diagnostic> {
+    fn parse_prefix(&mut self) -> Result<Expr<'input>, Diagnostic> {
         let start = self.span().start;
         match self.peek() {
             Ok(Token::IntLiteral(_))
@@ -4384,8 +4782,8 @@ impl Parser {
                     let ty = self.parse_type()?;
                     let end = self.span().end;
                     Ok(Expr::TypeAnnotated {
-                        expr: Box::new(expr),
-                        ty: Box::new(ty),
+                        expr: Self::alloc_shared(self.arena, expr),
+                        ty: Self::alloc_shared(self.arena, ty),
                         span: Span::new(start, end),
                     })
                 } else {
@@ -4445,10 +4843,12 @@ impl Parser {
                         | Some(Token::RBrace)
                 );
                 if is_operator_arg {
-                    let op_tok = self.advance().map_err(|_| Diagnostic::error("unexpected token")
-                        .with_code_str("E003")
-                        .with_help("expected an expression after the operator position")
-                        .with_span(Span::new(0, 0)))?;
+                    let op_tok = self.advance().map_err(|_| {
+                        Diagnostic::error("unexpected token")
+                            .with_code_str("E003")
+                            .with_help("expected an expression after the operator position")
+                            .with_span(Span::new(0, 0))
+                    })?;
                     let op_name = match op_tok {
                         Token::Plus => Symbol::intern("+"),
                         Token::Minus => Symbol::intern("-"),
@@ -4469,7 +4869,7 @@ impl Parser {
                             let end = self.span().end;
                             Ok(Expr::UnaryOp {
                                 op: UnaryOp::Neg,
-                                expr: Box::new(expr),
+                                expr: Self::alloc_shared(self.arena, expr),
                                 span: Span::new(start, end),
                             })
                         }
@@ -4478,7 +4878,7 @@ impl Parser {
                             let end = self.span().end;
                             Ok(Expr::UnaryOp {
                                 op: UnaryOp::Deref,
-                                expr: Box::new(expr),
+                                expr: Self::alloc_shared(self.arena, expr),
                                 span: Span::new(start, end),
                             })
                         }
@@ -4497,7 +4897,10 @@ impl Parser {
                 let body = self.parse_block()?;
                 self.expect(Token::RBrace)?;
                 let end = self.span().end;
-                Ok(Expr::Task { body, span: Span::new(start, end) })
+                Ok(Expr::Task {
+                    body,
+                    span: Span::new(start, end),
+                })
             }
             Ok(Token::Match) => self.parse_match_expr(),
             Ok(Token::Leave) => {
@@ -4506,20 +4909,32 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 let end = self.span().end;
                 Ok(Expr::LeaveWith {
-                    expr: Box::new(expr),
+                    expr: Self::alloc_shared(self.arena, expr),
                     is_return: false,
                     span: Span::new(start, end),
                 })
             }
             Ok(Token::Return) => {
+                // Consume the `return` keyword FIRST — the value
+                // expression below is parsed from the NEXT token;
+                // otherwise `parse_expr` on the value re-enters this
+                // branch with the unconsumed `return` (an infinite
+                // recursion — stack overflow — exposed by expression-
+                // position returns such as a match arm's `return 0`).
+                self.advance().ok();
                 let value = if !matches!(self.peek(), Ok(Token::Semicolon) | Ok(Token::RBrace)) {
-                    Some(Box::new(self.parse_expr()?))
+                    Some(Self::alloc_shared(self.arena, self.parse_expr()?))
                 } else {
                     None
                 };
                 let end = self.span().end;
                 Ok(Expr::LeaveWith {
-                    expr: value.unwrap_or_else(|| Box::new(Expr::Tuple(Vec::new(), Span::new(start, end)))),
+                    expr: value.unwrap_or_else(|| {
+                        Self::alloc_shared(
+                            self.arena,
+                            Expr::Tuple(Vec::new(), Span::new(start, end)),
+                        )
+                    }),
                     is_return: true,
                     span: Span::new(start, end),
                 })
@@ -4529,7 +4944,7 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 let end = self.span().end;
                 Ok(Expr::Await {
-                    expr: Box::new(expr),
+                    expr: Self::alloc_shared(self.arena, expr),
                     span: Span::new(start, end),
                 })
             }
@@ -4540,7 +4955,7 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 let end = self.span().end;
                 Ok(Expr::PolyBox {
-                    expr: Box::new(expr),
+                    expr: Self::alloc_shared(self.arena, expr),
                     scheme: None,
                     span: Span::new(start, end),
                 })
@@ -4552,7 +4967,7 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 let end = self.span().end;
                 Ok(Expr::PolyUnbox {
-                    expr: Box::new(expr),
+                    expr: Self::alloc_shared(self.arena, expr),
                     scheme: None,
                     span: Span::new(start, end),
                 })
@@ -4564,7 +4979,10 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 self.expect(Token::RParen)?;
                 let end = self.span().end;
-                Ok(Expr::Old(Box::new(expr), Span::new(start, end)))
+                Ok(Expr::Old(
+                    Self::alloc_shared(self.arena, expr),
+                    Span::new(start, end),
+                ))
             }
             Ok(Token::Not) => {
                 self.advance().ok();
@@ -4573,7 +4991,7 @@ impl Parser {
                 let end = self.span().end;
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Not,
-                    expr: Box::new(expr),
+                    expr: Self::alloc_shared(self.arena, expr),
                     span: Span::new(start, end),
                 })
             }
@@ -4583,7 +5001,7 @@ impl Parser {
                 let end = self.span().end;
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::BitNot,
-                    expr: Box::new(expr),
+                    expr: Self::alloc_shared(self.arena, expr),
                     span: Span::new(start, end),
                 })
             }
@@ -4600,7 +5018,13 @@ impl Parser {
                 if mutable {
                     self.advance().ok();
                 }
-                let expr = self.parse_prefix()?;
+                // The borrow's operand must include the POSTFIX chain
+                // (`&mut arr[0]` = `&mut (arr[0])`, NOT `(&mut arr)[0]`):
+                // parse at binding power 18 (= the postfix operators'
+                // binding power, above every binary operator) so the
+                // borrow wraps the whole index/field/call — mirroring
+                // rustc's `parse_expr_borrow` → `parse_expr_prefix`.
+                let expr = self.parse_expr_bp(18)?;
                 let end = self.span().end;
                 Ok(Expr::UnaryOp {
                     op: if read_only {
@@ -4610,7 +5034,7 @@ impl Parser {
                     } else {
                         UnaryOp::Ref
                     },
-                    expr: Box::new(expr),
+                    expr: Self::alloc_shared(self.arena, expr),
                     span: Span::new(start, end),
                 })
             }
@@ -4618,7 +5042,10 @@ impl Parser {
                 self.advance().ok();
                 let expr = self.parse_prefix()?;
                 let end = self.span().end;
-                Ok(Expr::Move(Box::new(expr), Span::new(start, end)))
+                Ok(Expr::Move(
+                    Self::alloc_shared(self.arena, expr),
+                    Span::new(start, end),
+                ))
             }
             Ok(Token::Unsafe) => {
                 self.advance().ok();
@@ -4685,14 +5112,17 @@ impl Parser {
                         Err(_) => return Ok(Expr::Error(Span::new(start, end))),
                     }
                 };
-                let expr = Expr::Literal(Literal::Int(value), Span::new(start, end));
+                let expr = Expr::Literal(
+                    Literal::Int(crate::ast::IntLit::Small(value)),
+                    Span::new(start, end),
+                );
                 if matches!(self.peek(), Ok(Token::Colon)) {
                     self.advance().ok();
                     let ty = self.parse_type()?;
                     let end = self.span().end;
                     Ok(Expr::TypeAnnotated {
-                        expr: Box::new(expr),
-                        ty: Box::new(ty),
+                        expr: Self::alloc_shared(self.arena, expr),
+                        ty: Self::alloc_shared(self.arena, ty),
                         span: Span::new(start, end),
                     })
                 } else {
@@ -4718,7 +5148,7 @@ impl Parser {
                             quantifier
                         ))
                         .with_suggestion("try `forall i in 0..n: arr[i] > 0`")
-                        .with_span(self.span(),));
+                        .with_span(self.span()));
                     }
                     Err(()) => {
                         return Err(Diagnostic::error(format!(
@@ -4727,7 +5157,7 @@ impl Parser {
                         ))
                         .with_code_str("E002")
                         .with_help("quantified expression is incomplete")
-                        .with_span(self.span(),));
+                        .with_span(self.span()));
                     }
                 };
                 self.expect(Token::In)?;
@@ -4738,8 +5168,8 @@ impl Parser {
                 Ok(Expr::Quantified {
                     quantifier,
                     binder,
-                    range: Box::new(range),
-                    body: Box::new(body),
+                    range: Self::alloc_shared(self.arena, range),
+                    body: Self::alloc_shared(self.arena, body),
                     span: Span::new(start, end),
                 })
             }
@@ -4748,11 +5178,17 @@ impl Parser {
                 self.advance().ok();
                 let name = match self.advance() {
                     Ok(Token::Ident(n)) => n,
-                    Ok(tok) => return Err(Diagnostic::error(format!(
-                        "expected built-in name after `@`, found {:?}", tok
-                    )).with_span(self.span())),
-                    Err(()) => return Err(Diagnostic::error("unexpected end of input after `@`")
-                        .with_span(self.span())),
+                    Ok(tok) => {
+                        return Err(Diagnostic::error(format!(
+                            "expected built-in name after `@`, found {:?}",
+                            tok
+                        ))
+                        .with_span(self.span()));
+                    }
+                    Err(()) => {
+                        return Err(Diagnostic::error("unexpected end of input after `@`")
+                            .with_span(self.span()));
+                    }
                 };
                 if name.eq_str("typeInfo") {
                     self.expect(Token::Bang)?;
@@ -4760,7 +5196,10 @@ impl Parser {
                     let ty = self.parse_type()?;
                     self.expect(Token::RParen)?;
                     let end = self.span().end;
-                    Ok(Expr::TypeInfo(Box::new(ty), Span::new(start, end)))
+                    Ok(Expr::TypeInfo(
+                        Self::alloc_shared(self.arena, ty),
+                        Span::new(start, end),
+                    ))
                 } else if name.eq_str("compile_error") {
                     // `@compile_error("msg")` — `!` is optional (the spec description
                     // omits it, but the spec example uses it).  Accept both forms.
@@ -4783,17 +5222,12 @@ impl Parser {
                     // label placeholders from regular variables.  The checker
                     // validates that the label is attached to a `return`.
                     let end = self.span().end;
-                    Ok(Expr::Ident(Symbol::intern(&format!("@{}", name.as_str())), Span::new(start, end)))
+                    Ok(Expr::Ident(
+                        Symbol::intern(&format!("@{}", name.as_str())),
+                        Span::new(start, end),
+                    ))
                 }
             }
-            Ok(Token::Ident(name)) => Err(Diagnostic::error(format!("expected expression, found `{}`", name))
-                .with_code_str("E007")
-                .with_help("expected a valid expression — try a literal, variable, `if`, `match`, `|...| { }` closure, or prefix operator")
-                .with_suggestion(
-                    did_you_mean_keyword(&name.as_str(), KeywordContext::Expression)
-                        .unwrap_or_else(|| "try `42`, `true`, `x`, `if cond { a } else { b }`, or `|x| { x + 1 }`".into())
-                )
-                .with_span(self.span(),)),
             _ => {
                 let mut diag = Diagnostic::error("expected expression")
                     .with_code_str("E007")
@@ -4813,7 +5247,7 @@ impl Parser {
         }
     }
 
-    fn parse_closure(&mut self, start: usize) -> Result<Expr, Diagnostic> {
+    fn parse_closure(&mut self, start: usize) -> Result<Expr<'input>, Diagnostic> {
         self.advance().ok();
         let mut params = Vec::new();
         loop {
@@ -4884,7 +5318,7 @@ impl Parser {
         })
     }
 
-    fn parse_path_or_literal(&mut self, start: usize) -> Result<Expr, Diagnostic> {
+    fn parse_path_or_literal(&mut self, start: usize) -> Result<Expr<'input>, Diagnostic> {
         let mut path = Vec::new();
         let name = match self.advance() {
             Ok(Token::Ident(n)) => n,
@@ -4941,7 +5375,10 @@ impl Parser {
             let ty = self.parse_type()?;
             self.expect(Token::RParen)?;
             let end = self.span().end;
-            return Ok(Expr::LayoutOf(Box::new(ty), Span::new(start, end)));
+            return Ok(Expr::LayoutOf(
+                Self::alloc_shared(self.arena, ty),
+                Span::new(start, end),
+            ));
         }
 
         match self.peek() {
@@ -4955,7 +5392,7 @@ impl Parser {
                 } else if path.len() >= 2 {
                     // Longer path + ( → associated function call: `module::Type::method(args)`
                     let span = Span::new(start, self.span().end);
-                    let callee = Expr::Path(path, span);
+                    let callee = Expr::Path(smallvec::SmallVec::from(path), span);
                     self.parse_call(callee, start)
                 } else {
                     self.parse_call(
@@ -4991,7 +5428,11 @@ impl Parser {
         }
     }
 
-    fn parse_struct_lit(&mut self, path: Vec<Symbol>, start: usize) -> Result<Expr, Diagnostic> {
+    fn parse_struct_lit(
+        &mut self,
+        path: Vec<Symbol>,
+        start: usize,
+    ) -> Result<Expr<'input>, Diagnostic> {
         self.expect(Token::LBrace)?;
         let mut fields = Vec::new();
         loop {
@@ -5043,7 +5484,7 @@ impl Parser {
         path: Vec<Symbol>,
         variant: Symbol,
         start: usize,
-    ) -> Result<Expr, Diagnostic> {
+    ) -> Result<Expr<'input>, Diagnostic> {
         self.expect(Token::LParen)?;
         // If the next token is `)`, it's an empty payload (no args).
         if matches!(self.peek(), Ok(Token::RParen)) {
@@ -5069,9 +5510,9 @@ impl Parser {
             self.expect(Token::RParen)?;
             let end = self.span().end;
             // Build a call expression: Type::method(arg1, arg2, ...)
-            let callee = Expr::Path(path, Span::new(start, end));
+            let callee = Expr::Path(smallvec::SmallVec::from(path), Span::new(start, end));
             return Ok(Expr::Call {
-                callee: Box::new(callee),
+                callee: Self::alloc_shared(self.arena, callee),
                 args,
                 comptime: false,
                 span: Span::new(start, end),
@@ -5082,12 +5523,16 @@ impl Parser {
         Ok(Expr::EnumLit {
             path,
             variant,
-            payload: Some(Box::new(payload)),
+            payload: Some(Self::alloc_shared(self.arena, payload)),
             span: Span::new(start, end),
         })
     }
 
-    fn parse_call(&mut self, callee: Expr, start: usize) -> Result<Expr, Diagnostic> {
+    fn parse_call(
+        &mut self,
+        callee: Expr<'input>,
+        start: usize,
+    ) -> Result<Expr<'input>, Diagnostic> {
         self.expect(Token::LParen)?;
         let mut args = Vec::new();
         if !matches!(self.peek(), Ok(Token::RParen)) {
@@ -5103,14 +5548,14 @@ impl Parser {
         self.expect(Token::RParen)?;
         let end = self.span().end;
         Ok(Expr::Call {
-            callee: Box::new(callee),
+            callee: Self::alloc_shared(self.arena, callee),
             args,
             comptime: false,
             span: Span::new(start, end),
         })
     }
 
-    fn parse_literal(&mut self) -> Result<Expr, Diagnostic> {
+    fn parse_literal(&mut self) -> Result<Expr<'input>, Diagnostic> {
         let start = self.span().start;
         let token = self.advance().map_err(|_| {
             Diagnostic::error("unexpected token")
@@ -5122,32 +5567,65 @@ impl Parser {
         let span = Span::new(start, end);
         match token {
             Token::IntLiteral(res) => match res {
-                Ok(v) => Ok(Expr::Literal(Literal::Int(v), span)),
-                Err(_) => Ok(Expr::Error(span)),
+                Ok(v) => Ok(Expr::Literal(
+                    Literal::Int(crate::ast::IntLit::Small(v)),
+                    span,
+                )),
+                Err(e) => {
+                    self.diagnostics.push(Diagnostic::error(e).with_span(span));
+                    Ok(Expr::Error(span))
+                }
             },
             Token::HexLiteral(res) => match res {
-                Ok(v) => Ok(Expr::Literal(Literal::Int(v), span)),
-                Err(_) => Ok(Expr::Error(span)),
+                Ok(v) => Ok(Expr::Literal(
+                    Literal::Int(crate::ast::IntLit::Small(v)),
+                    span,
+                )),
+                Err(e) => {
+                    self.diagnostics.push(Diagnostic::error(e).with_span(span));
+                    Ok(Expr::Error(span))
+                }
             },
             Token::BinLiteral(res) => match res {
-                Ok(v) => Ok(Expr::Literal(Literal::Int(v), span)),
-                Err(_) => Ok(Expr::Error(span)),
+                Ok(v) => Ok(Expr::Literal(
+                    Literal::Int(crate::ast::IntLit::Small(v)),
+                    span,
+                )),
+                Err(e) => {
+                    self.diagnostics.push(Diagnostic::error(e).with_span(span));
+                    Ok(Expr::Error(span))
+                }
             },
             Token::FloatLiteral(res) => match res {
                 Ok(v) => Ok(Expr::Literal(Literal::Float(v), span)),
-                Err(_) => Ok(Expr::Error(span)),
+                // The committee ruling (float default `trap` — aligned
+                // with integers): a compile-time float-literal anomaly
+                // (overflow/NaN/inf) is a COMPILE ERROR — the error must
+                // not be swallowed into Expr::Error.
+                Err(e) => {
+                    return Err(Diagnostic::error(e).with_span(span));
+                }
             },
             Token::CharLiteral(res) => match res {
                 Ok(v) => Ok(Expr::Literal(Literal::Char(v), span)),
-                Err(_) => Ok(Expr::Error(span)),
+                Err(e) => {
+                    self.diagnostics.push(Diagnostic::error(e).with_span(span));
+                    Ok(Expr::Error(span))
+                }
             },
             Token::StringLiteral(res) => match res {
                 Ok(s) => Ok(Expr::Literal(Literal::String(s), span)),
-                Err(_) => Ok(Expr::Error(span)),
+                Err(e) => {
+                    self.diagnostics.push(Diagnostic::error(e).with_span(span));
+                    Ok(Expr::Error(span))
+                }
             },
             Token::ByteStringLiteral(res) => match res {
                 Ok(b) => Ok(Expr::Literal(Literal::ByteString(b), span)),
-                Err(_) => Ok(Expr::Error(span)),
+                Err(e) => {
+                    self.diagnostics.push(Diagnostic::error(e).with_span(span));
+                    Ok(Expr::Error(span))
+                }
             },
             Token::True => Ok(Expr::Literal(Literal::Bool(true), span)),
             Token::False => Ok(Expr::Literal(Literal::Bool(false), span)),
@@ -5155,7 +5633,7 @@ impl Parser {
         }
     }
 
-    fn parse_infix(&mut self, lhs: Expr, bp: u8) -> Result<Expr, Diagnostic> {
+    fn parse_infix(&mut self, lhs: Expr<'input>, bp: u8) -> Result<Expr<'input>, Diagnostic> {
         let start = self.span().start;
         match self.peek() {
             Ok(Token::Bang) => {
@@ -5177,7 +5655,7 @@ impl Parser {
                     }
                     self.expect(Token::RParen)?;
                     Ok(Expr::Call {
-                        callee: Box::new(lhs),
+                        callee: Self::alloc_shared(self.arena, lhs),
                         args,
                         comptime: true,
                         span: Span::new(start, self.span().end),
@@ -5194,7 +5672,7 @@ impl Parser {
                 self.advance().ok();
                 let end = self.span().end;
                 Ok(Expr::Try {
-                    expr: Box::new(lhs),
+                    expr: Self::alloc_shared(self.arena, lhs),
                     span: Span::new(start, end),
                 })
             }
@@ -5226,8 +5704,8 @@ impl Parser {
                 };
                 let end = self.span().end;
                 Ok(Expr::Cast {
-                    expr: Box::new(lhs),
-                    ty: Box::new(ty),
+                    expr: Self::alloc_shared(self.arena, lhs),
+                    ty: Self::alloc_shared(self.arena, ty),
                     safe,
                     rounding,
                     span: Span::new(start, end),
@@ -5235,111 +5713,111 @@ impl Parser {
             }
             Ok(Token::Plus) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::Add, bp, start)
+                self.binary(lhs, BinOp::Add, bp + 1, start)
             }
             Ok(Token::Minus) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::Sub, bp, start)
+                self.binary(lhs, BinOp::Sub, bp + 1, start)
             }
             Ok(Token::Star) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::Mul, bp, start)
+                self.binary(lhs, BinOp::Mul, bp + 1, start)
             }
             Ok(Token::Slash) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::Div, bp, start)
+                self.binary(lhs, BinOp::Div, bp + 1, start)
             }
             Ok(Token::Percent) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::Rem, bp, start)
+                self.binary(lhs, BinOp::Rem, bp + 1, start)
             }
             Ok(Token::PlusWrap) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::AddWrap, bp, start)
+                self.binary(lhs, BinOp::AddWrap, bp + 1, start)
             }
             Ok(Token::MinusWrap) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::SubWrap, bp, start)
+                self.binary(lhs, BinOp::SubWrap, bp + 1, start)
             }
             Ok(Token::StarWrap) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::MulWrap, bp, start)
+                self.binary(lhs, BinOp::MulWrap, bp + 1, start)
             }
             Ok(Token::PlusSaturate) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::AddSaturate, bp, start)
+                self.binary(lhs, BinOp::AddSaturate, bp + 1, start)
             }
             Ok(Token::MinusSaturate) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::SubSaturate, bp, start)
+                self.binary(lhs, BinOp::SubSaturate, bp + 1, start)
             }
             Ok(Token::StarSaturate) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::MulSaturate, bp, start)
+                self.binary(lhs, BinOp::MulSaturate, bp + 1, start)
             }
             Ok(Token::PlusTrap) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::AddTrap, bp, start)
+                self.binary(lhs, BinOp::AddTrap, bp + 1, start)
             }
             Ok(Token::MinusTrap) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::SubTrap, bp, start)
+                self.binary(lhs, BinOp::SubTrap, bp + 1, start)
             }
             Ok(Token::StarTrap) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::MulTrap, bp, start)
+                self.binary(lhs, BinOp::MulTrap, bp + 1, start)
             }
             Ok(Token::Ampersand) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::BitAnd, bp, start)
+                self.binary(lhs, BinOp::BitAnd, bp + 1, start)
             }
             Ok(Token::Pipe) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::BitOr, bp, start)
+                self.binary(lhs, BinOp::BitOr, bp + 1, start)
             }
             Ok(Token::Caret) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::BitXor, bp, start)
+                self.binary(lhs, BinOp::BitXor, bp + 1, start)
             }
             Ok(Token::Shl) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::Shl, bp, start)
+                self.binary(lhs, BinOp::Shl, bp + 1, start)
             }
             Ok(Token::Shr) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::Shr, bp, start)
+                self.binary(lhs, BinOp::Shr, bp + 1, start)
             }
             Ok(Token::EqEq) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::Eq, bp, start)
+                self.binary(lhs, BinOp::Eq, bp + 1, start)
             }
             Ok(Token::Neq) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::Neq, bp, start)
+                self.binary(lhs, BinOp::Neq, bp + 1, start)
             }
             Ok(Token::Lt) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::Lt, bp, start)
+                self.binary(lhs, BinOp::Lt, bp + 1, start)
             }
             Ok(Token::Gt) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::Gt, bp, start)
+                self.binary(lhs, BinOp::Gt, bp + 1, start)
             }
             Ok(Token::Le) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::Le, bp, start)
+                self.binary(lhs, BinOp::Le, bp + 1, start)
             }
             Ok(Token::Ge) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::Ge, bp, start)
+                self.binary(lhs, BinOp::Ge, bp + 1, start)
             }
             Ok(Token::And) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::And, bp, start)
+                self.binary(lhs, BinOp::And, bp + 1, start)
             }
             Ok(Token::Or) => {
                 self.advance().ok();
-                self.binary(lhs, BinOp::Or, bp, start)
+                self.binary(lhs, BinOp::Or, bp + 1, start)
             }
             Ok(Token::DotDot) => {
                 self.advance().ok();
@@ -5347,12 +5825,12 @@ impl Parser {
                     self.peek(),
                     Ok(Token::Semicolon) | Ok(Token::RBrace) | Ok(Token::Comma) | Ok(Token::RParen)
                 ) {
-                    Some(Box::new(self.parse_expr_bp(0)?))
+                    Some(Self::alloc_shared(self.arena, self.parse_expr_bp(0)?))
                 } else {
                     None
                 };
                 Ok(Expr::Range {
-                    start: Some(Box::new(lhs)),
+                    start: Some(Self::alloc_shared(self.arena, lhs)),
                     end,
                     inclusive: false,
                     span: Span::new(start, self.span().end),
@@ -5362,8 +5840,8 @@ impl Parser {
                 self.advance().ok();
                 let end = self.parse_expr_bp(0)?;
                 Ok(Expr::Range {
-                    start: Some(Box::new(lhs)),
-                    end: Some(Box::new(end)),
+                    start: Some(Self::alloc_shared(self.arena, lhs)),
+                    end: Some(Self::alloc_shared(self.arena, end)),
                     inclusive: true,
                     span: Span::new(start, self.span().end),
                 })
@@ -5383,7 +5861,7 @@ impl Parser {
                 }
                 self.expect(Token::RParen)?;
                 Ok(Expr::Call {
-                    callee: Box::new(lhs),
+                    callee: Self::alloc_shared(self.arena, lhs),
                     args,
                     comptime: false,
                     span: Span::new(start, self.span().end),
@@ -5394,8 +5872,8 @@ impl Parser {
                 let index = self.parse_expr()?;
                 self.expect(Token::RBracket)?;
                 Ok(Expr::Index {
-                    base: Box::new(lhs),
-                    index: Box::new(index),
+                    base: Self::alloc_shared(self.arena, lhs),
+                    index: Self::alloc_shared(self.arena, index),
                     span: Span::new(start, self.span().end),
                 })
             }
@@ -5411,12 +5889,12 @@ impl Parser {
                         self.expect(Token::RParen)?;
                         Ok(Expr::UnaryOp {
                             op: crate::ast::UnaryOp::Ro,
-                            expr: Box::new(lhs),
+                            expr: Self::alloc_shared(self.arena, lhs),
                             span: Span::new(start, self.span().end),
                         })
                     } else {
                         Ok(Expr::FieldAccess {
-                            base: Box::new(lhs),
+                            base: Self::alloc_shared(self.arena, lhs),
                             field,
                             span: Span::new(start, self.span().end),
                         })
@@ -5433,7 +5911,7 @@ impl Parser {
                 self.advance().ok();
                 if let Ok(Token::Ident(attr)) = self.advance() {
                     Ok(Expr::AttrAccess {
-                        base: Box::new(lhs),
+                        base: Self::alloc_shared(self.arena, lhs),
                         attr,
                         span: Span::new(start, self.span().end),
                     })
@@ -5494,7 +5972,7 @@ impl Parser {
                     });
                 }
                 Ok(Expr::Catch {
-                    expr: Box::new(lhs),
+                    expr: Self::alloc_shared(self.arena, lhs),
                     branches,
                     span: Span::new(start, self.span().end),
                 })
@@ -5503,28 +5981,62 @@ impl Parser {
         }
     }
 
-    fn binary(&mut self, lhs: Expr, op: BinOp, bp: u8, start: usize) -> Result<Expr, Diagnostic> {
+    fn binary(
+        &mut self,
+        lhs: Expr<'input>,
+        op: BinOp,
+        bp: u8,
+        start: usize,
+    ) -> Result<Expr<'input>, Diagnostic> {
         let rhs = self.parse_expr_bp(bp)?;
         Ok(Expr::BinaryOp {
-            left: Box::new(lhs),
+            left: Self::alloc_shared(self.arena, lhs),
             op,
-            right: Box::new(rhs),
+            right: Self::alloc_shared(self.arena, rhs),
             span: Span::new(start, self.span().end),
         })
     }
 
+    /// Return the token AFTER the one `peek()` would return
+    /// (lookahead-2), without consuming anything.
+    ///
+    /// `peek()` consumes pending tokens FIRST (`next_token` pops the
+    /// pending stack), so when `pending` is non-empty the "next" token
+    /// is the NEW stack top after the pop — or the token-stream position
+    /// when the stack empties (the pop does not advance `cursor`).
+    /// `peeked` caches the token `peek()` already consumed; once it is
+    /// populated the pending stack is necessarily empty (a prior
+    /// `next_token` drained it), so the two branches never overlap.
     fn peek_next(&mut self) -> Option<Token> {
-        // Check pending stack first (e.g. Shr-split Gt pushed by generic parsing).
+        // Invariant: `pending` holds at most ONE token at any time — every
+        // `pending.push` (`>>` split in `expect_gt`, `<<` split in the
+        // nested-projection path) is immediately followed by consuming it
+        // via `expect_gt`.  Therefore a populated `peeked` (which would
+        // have popped the stack) and a non-empty `pending` cannot
+        // co-occur.  The assert guards this invariant: if a future
+        // extension ever pushes ≥2 tokens, the pending branch below
+        // (which assumes `peeked` is empty) must be revisited.
+        debug_assert!(
+            !(self.peeked.is_some() && !self.pending.is_empty()),
+            "peek_next: peeked cache and pending stack cannot both be non-empty"
+        );
         if let Some(tok) = self.pending.last() {
-            return Some(tok.clone());
+            // peek() will pop this token off the stack (cursor stays put).
+            // The token after it is the new stack top, or the stream
+            // position once the stack is empty.
+            if self.pending.len() > 1 {
+                return Some(self.pending[self.pending.len() - 2].clone());
+            }
+            let _ = tok;
+            return self.tokens.get(self.cursor).map(|st| st.token.clone());
         }
-        // peek() ensures cursor is at the current token; the next
-        // unconsumed token is always at cursor (peeked advances cursor by 1).
+        // No pending tokens: peek() advances cursor by one, so the next
+        // unconsumed token sits at the new cursor position.
         self.peek();
         self.tokens.get(self.cursor).map(|st| st.token.clone())
     }
 
-    fn parse_if_expr(&mut self) -> Result<Expr, Diagnostic> {
+    fn parse_if_expr(&mut self) -> Result<Expr<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         if matches!(self.peek(), Ok(Token::Let)) {
@@ -5557,7 +6069,7 @@ impl Parser {
             let end = self.span().end;
             return Ok(Expr::IfLet {
                 pattern,
-                scrutinee: Box::new(scrutinee),
+                scrutinee: Self::alloc_shared(self.arena, scrutinee),
                 then_branch,
                 else_branch,
                 is_expression: true,
@@ -5587,7 +6099,7 @@ impl Parser {
         };
         let end = self.span().end;
         Ok(Expr::If {
-            cond: Box::new(cond),
+            cond: Self::alloc_shared(self.arena, cond),
             then_branch,
             else_branch,
             is_expression: true,
@@ -5595,7 +6107,7 @@ impl Parser {
         })
     }
 
-    fn parse_match_expr(&mut self) -> Result<Expr, Diagnostic> {
+    fn parse_match_expr(&mut self) -> Result<Expr<'input>, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
         let scrutinee = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
@@ -5614,7 +6126,7 @@ impl Parser {
             let pattern = self.parse_or_pattern()?;
             let guard = if matches!(self.peek(), Ok(Token::If)) {
                 self.advance().ok();
-                Some(Box::new(self.parse_expr()?))
+                Some(Self::alloc_shared(self.arena, self.parse_expr()?))
             } else {
                 None
             };
@@ -5640,7 +6152,7 @@ impl Parser {
         }
         let end = self.span().end;
         Ok(Expr::Match {
-            scrutinee: Box::new(scrutinee),
+            scrutinee: Self::alloc_shared(self.arena, scrutinee),
             arms,
             span: Span::new(start, end),
         })
@@ -5648,27 +6160,83 @@ impl Parser {
 }
 
 /// Compute Levenshtein distance between two strings.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let a_len = a.len();
-    let b_len = b.len();
+/// The limited edit distance with reusable buffers: returns the
+/// Levenshtein distance between `a` and `b`, or `limit + 1` if it
+/// exceeds `limit` (the caller only cares whether it is within the
+/// limit, so the computation can stop early).  The row buffers are
+/// provided by the caller — the per-keyword allocation is avoided.
+fn edit_distance_limited_into(
+    prev: &mut Vec<usize>,
+    curr: &mut Vec<usize>,
+    a_buf: &mut Vec<char>,
+    b_buf: &mut Vec<char>,
+    a: &str,
+    b: &str,
+    limit: usize,
+) -> usize {
+    // Reuse the caller-provided buffers (clear + extend) instead of
+    // allocating two `Vec<char>` on every call — `did_you_mean_keyword`
+    // calls this once per candidate keyword.
+    a_buf.clear();
+    a_buf.extend(a.chars());
+    b_buf.clear();
+    b_buf.extend(b.chars());
+    let a_len = a_buf.len();
+    let b_len = b_buf.len();
+    // Length-difference pruning: a distance can never be smaller than
+    // the character-length difference.
+    if a_len.abs_diff(b_len) > limit {
+        return limit + 1;
+    }
     if a_len == 0 {
         return b_len;
     }
     if b_len == 0 {
         return a_len;
     }
-    let mut prev: Vec<usize> = (0..=b_len).collect();
-    let mut curr = vec![0usize; b_len + 1];
-    for (i, ca) in a.chars().enumerate() {
+    prev.clear();
+    prev.extend(0..=b_len);
+    curr.resize(b_len + 1, 0);
+    let overflow = limit + 1;
+    for (i, &ca) in a_buf.iter().enumerate() {
         curr[0] = i + 1;
-        for (j, cb) in b.chars().enumerate() {
-            let cost = if ca == cb { 0 } else { 1 };
-            curr[j + 1] =
-                std::cmp::min(std::cmp::min(curr[j] + 1, prev[j + 1] + 1), prev[j] + cost);
+        // The band: only the columns within `limit` of the diagonal can
+        // influence a result within the limit — the out-of-band columns
+        // are skipped (they stay at the overflow sentinel, which never
+        // wins a min()).
+        // The in-band columns: |(i+1) - j| <= limit — the out-of-band
+        // columns would be at a distance > limit (d[i][j] >= |i-j|), so
+        // they cannot influence a result within the limit.
+        let lo = (i + 1).saturating_sub(limit).max(1);
+        let hi = ((i + 1) + limit).min(b_len);
+        if lo > hi {
+            continue;
         }
-        std::mem::swap(&mut prev, &mut curr);
+        for j in lo..=hi {
+            let cb = b_buf[j - 1];
+            let cost = if ca == cb { 0 } else { 1 };
+            curr[j] = std::cmp::min(
+                std::cmp::min(curr[j - 1] + 1, prev[j] + 1),
+                prev[j - 1] + cost,
+            );
+        }
+        // Early termination: if every in-band entry of this row exceeds
+        // the limit, the final distance will too.
+        if (lo..=hi).all(|j| curr[j] > limit) {
+            return overflow;
+        }
+        // Reset the out-of-band entries to the sentinel — they may be
+        // read as `prev` next row but must never win a min().  Column 0
+        // is EXCLUDED: `curr[0] = i + 1` is the legitimate first-column
+        // distance (overwriting it broke the invariant
+        // when `i + 1 <= limit`).
+        for j in (1..lo).chain(hi + 1..=b_len) {
+            curr[j] = overflow;
+        }
+        std::mem::swap(prev, curr);
     }
-    prev[b_len]
+    let result = prev[b_len];
+    if result > limit { limit + 1 } else { result }
 }
 
 /// The syntactic context in which keyword suggestions are made.
@@ -5693,6 +6261,10 @@ pub enum KeywordContext {
 /// `context` restricts the candidate keyword set to the current syntactic
 /// position, so that e.g. `fn` at top level suggests `def` rather than `for`.
 fn did_you_mean_keyword(input: &str, context: KeywordContext) -> Option<String> {
+    // Reusable character buffers for the edit-distance computation — one
+    // allocation per call instead of one per candidate keyword.
+    let mut a_buf: Vec<char> = Vec::new();
+    let mut b_buf: Vec<char> = Vec::new();
     let keywords: &[&str] = match context {
         KeywordContext::TopLevel => &[
             "def",
@@ -5714,7 +6286,7 @@ fn did_you_mean_keyword(input: &str, context: KeywordContext) -> Option<String> 
         KeywordContext::Expression => &[
             "true", "false", "if", "else", "match", "for", "while", "return", "leave", "continue",
             "move", "not", "and", "or", "sizeof", "alignof", "catch", "panic", "unsafe", "old",
-            "exists", "forall", "poly", "unbox", "await", "task",
+            "exists", "forall", "poly", "unbox", "await", "task", "ieee",
         ],
         KeywordContext::Statement => &[
             "set",
@@ -5734,7 +6306,7 @@ fn did_you_mean_keyword(input: &str, context: KeywordContext) -> Option<String> 
         ],
         KeywordContext::Type => &[
             "Int", "UInt", "Float", "Bool", "Char", "Byte", "USize", "Never", "Rational", "dyn",
-            "ref", "mut",
+            "ref", "mut", "ieee",
         ],
         KeywordContext::Generic => &[
             "def",
@@ -5765,15 +6337,39 @@ fn did_you_mean_keyword(input: &str, context: KeywordContext) -> Option<String> 
             "scope_cleanup",
             "true",
             "false",
+            "ieee",
         ],
     };
-    let input_lower = input.to_lowercase();
+    // ASCII fast path: byte-based case folding avoids the allocation of
+    // `to_lowercase()`; non-ASCII falls back to the Unicode fold.
+    let input_lower: String = if input.is_ascii() {
+        input.to_ascii_lowercase()
+    } else {
+        input.to_lowercase()
+    };
     let first = input_lower.chars().next();
     let mut best = None;
+    // The reusable row buffers (avoided the per-keyword allocation).
+    let max_kw_len = keywords.iter().map(|k| k.len()).max().unwrap_or(0);
+    let mut prev = Vec::with_capacity(max_kw_len + 1);
+    let mut curr = vec![0usize; max_kw_len + 1];
     // Strict pass: first-char match + distance <= 2
     for &kw in keywords {
-        let d = edit_distance(&input_lower, kw);
-        if d <= 2 && first == kw.chars().next() {
+        // First-char check first (cheap), then the length-difference
+        // pruning, before any distance computation.
+        if first != kw.chars().next() {
+            continue;
+        }
+        let d = edit_distance_limited_into(
+            &mut prev,
+            &mut curr,
+            &mut a_buf,
+            &mut b_buf,
+            &input_lower,
+            kw,
+            2,
+        );
+        if d <= 2 {
             match best {
                 None => best = Some((kw, d)),
                 Some((_, db)) if d < db => best = Some((kw, d)),
@@ -5783,11 +6379,26 @@ fn did_you_mean_keyword(input: &str, context: KeywordContext) -> Option<String> 
     }
     // Lenient pass: if no candidate found, allow wider distance for short inputs.
     // This catches cases like `fn` → `def` (distance 3, but the only sensible match).
+    // For LONGER inputs the distance must be small RELATIVE to the length
+    // (rustc's MaxEditDistance style) — a distance equal to the input length
+    // (e.g. `xyzabc` → `leave`) is an unrelated input and must NOT be
+    // suggested (an input whose distance equals its length is unrelated —
+    //    the previous wide threshold produced false suggestions).
     if best.is_none() {
         for &kw in keywords {
-            let d = edit_distance(&input_lower, kw);
             let threshold = input.len().max(3);
-            if d <= threshold {
+            let d = edit_distance_limited_into(
+                &mut prev,
+                &mut curr,
+                &mut a_buf,
+                &mut b_buf,
+                &input_lower,
+                kw,
+                threshold,
+            );
+            // Relative-distance gate: reject suggestions whose distance
+            // exceeds half the input length for inputs of length >= 4.
+            if d <= threshold && (input.len() < 4 || d * 2 <= input.len()) {
                 match best {
                     None => best = Some((kw, d)),
                     Some((_, db)) if d < db => best = Some((kw, d)),
@@ -5803,8 +6414,9 @@ fn did_you_mean_keyword(input: &str, context: KeywordContext) -> Option<String> 
 mod tests {
     use super::*;
 
-    fn check_parse(source: &str) -> Program {
-        let mut parser = Parser::new(source);
+    fn check_parse(source: &str) -> Program<'static> {
+        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let mut parser = Parser::new(source, arena);
         match parser.parse_program() {
             Ok(prog) => {
                 assert!(
@@ -5819,13 +6431,99 @@ mod tests {
     }
 
     fn check_parse_err(source: &str) -> Vec<Diagnostic> {
-        let mut parser = Parser::new(source);
+        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let mut parser = Parser::new(source, arena);
         parser.parse_program().err().unwrap_or_else(|| {
             panic!(
                 "expected parse error, but parsing succeeded: {:?}",
                 parser.diagnostics
             )
         })
+    }
+
+    /// Construct a parser over `source` backed by a leaked `'static` arena,
+    /// for tests that need direct access to the parser (tokens, pending
+    /// stack, etc.) rather than just its result.
+    fn new_parser(source: &str) -> Parser<'static> {
+        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        Parser::new(source, arena)
+    }
+
+    /// Parse `source` and assert that it fails (error result or diagnostics).
+    fn check_parse_fails(source: &str) {
+        let mut parser = new_parser(source);
+        let result = parser.parse_program();
+        assert!(
+            result.is_err() || !parser.diagnostics.is_empty(),
+            "expected parse failure for: {:?}",
+            source
+        );
+    }
+
+    /// The banded edit distance correctness: the transposition-like pair
+    /// `"retrun"`/`"return"` is distance 2 (within the limit), and the
+    /// unrelated pair is clamped to the limit+1 sentinel when it exceeds
+    /// the limit.
+    #[test]
+    fn test_edit_distance_limited_banded() {
+        let mut prev = Vec::new();
+        let mut curr = Vec::new();
+        assert_eq!(
+            edit_distance_limited_into(
+                &mut prev,
+                &mut curr,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                "retrun",
+                "return",
+                2
+            ),
+            2
+        );
+        // Within the lenient threshold.
+        assert_eq!(
+            edit_distance_limited_into(
+                &mut prev,
+                &mut curr,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                "retrun",
+                "leave",
+                6
+            ),
+            5
+        );
+        // Exceeds the limit → clamped to limit + 1.
+        assert_eq!(
+            edit_distance_limited_into(
+                &mut prev,
+                &mut curr,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                "retrun",
+                "leave",
+                2
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn test_did_you_mean_keyword_suggestion() {
+        // The optimized did_you_mean_keyword must still suggest:
+        // "retrun" → "return" (distance 2, first-char match).
+        let suggestion = did_you_mean_keyword("retrun", KeywordContext::Statement);
+        assert_eq!(suggestion.as_deref(), Some("did you mean `return`?"));
+        // The ASCII fast path (upper-case input → case-insensitive match).
+        let suggestion2 = did_you_mean_keyword("Retrun", KeywordContext::Statement);
+        assert_eq!(suggestion2.as_deref(), Some("did you mean `return`?"));
+        // An unrelated input (distance == length — no real similarity)
+        // gets NO suggestion (the wide threshold used to
+        // suggest `leave` for `xyzabc` — a false suggestion).
+        assert_eq!(
+            did_you_mean_keyword("xyzabc", KeywordContext::Statement).as_deref(),
+            None
+        );
     }
 
     #[test]
@@ -5853,6 +6551,110 @@ mod tests {
                 _ => panic!("expected VariableDef"),
             },
             _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    /// `a..b` must parse the upper bound: `Range { end: Some(b) }`.
+    /// A regression test for the infix range branch (the `..` arm must
+    /// parse the end when a non-terminator follows).
+    #[test]
+    fn test_range_expr_with_upper_bound() {
+        let program = check_parse("def main() { set r = 0..10; }");
+        let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+            panic!("expected FunctionDef");
+        };
+        let Stmt::VariableDef { value, .. } = &body.as_ref().unwrap()[0] else {
+            panic!("expected VariableDef");
+        };
+        let expr = value.as_ref().expect("initializer present");
+        match expr {
+            Expr::Range { end, inclusive, .. } => {
+                assert!(!inclusive);
+                assert!(end.is_some(), "`0..10` must have an upper bound");
+            }
+            other => panic!("expected Range, got {:?}", other),
+        }
+    }
+
+    /// `a..;` is an open-ended range: `Range { end: None }`, and must
+    /// NOT error (the `..` arm must leave the end unset when a
+    /// terminator follows).
+    #[test]
+    fn test_range_expr_open_ended() {
+        let program = check_parse("def main() { set r = 0..; }");
+        let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+            panic!("expected FunctionDef");
+        };
+        let Stmt::VariableDef { value, .. } = &body.as_ref().unwrap()[0] else {
+            panic!("expected VariableDef");
+        };
+        let expr = value.as_ref().expect("initializer present");
+        match expr {
+            Expr::Range { end, inclusive, .. } => {
+                assert!(!inclusive);
+                assert!(end.is_none(), "`0..` must be an open-ended range");
+            }
+            other => panic!("expected Range, got {:?}", other),
+        }
+    }
+
+    /// Same-precedence binary operators are LEFT-associative:
+    /// `a - b - c` parses as `(a - b) - c`.  A regression test for the
+    /// `bp + 1` right-operand binding-power change in `parse_infix`.
+    #[test]
+    fn test_binary_sub_left_associative() {
+        let program = check_parse("def main() -> Int<32> { set r = a - b - c; return 0; }");
+        let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+            panic!("expected FunctionDef");
+        };
+        let Stmt::VariableDef { value, .. } = &body.as_ref().unwrap()[0] else {
+            panic!("expected VariableDef");
+        };
+        let expr = value.as_ref().expect("initializer present");
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinOp::Sub,
+                right,
+                ..
+            } => {
+                assert!(matches!(*right, Expr::Ident(..)));
+                match *left {
+                    Expr::BinaryOp { op: BinOp::Sub, .. } => {}
+                    other => panic!("expected nested `a - b` on the left, got {:?}", other),
+                }
+            }
+            other => panic!("expected BinaryOp(Sub), got {:?}", other),
+        }
+    }
+
+    /// Division is left-associative too (SYNTAX.md §Operators:
+    /// `*`/`/`/`%` are left-to-right): `a / b / c` parses as
+    /// `(a / b) / c`.  A companion to `test_binary_sub_left_associative`.
+    #[test]
+    fn test_binary_div_left_associative() {
+        let program = check_parse("def main() -> Int<32> { set r = a / b / c; return 0; }");
+        let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+            panic!("expected FunctionDef");
+        };
+        let Stmt::VariableDef { value, .. } = &body.as_ref().unwrap()[0] else {
+            panic!("expected VariableDef");
+        };
+        let expr = value.as_ref().expect("initializer present");
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinOp::Div,
+                right,
+                ..
+            } => {
+                assert!(matches!(*right, Expr::Ident(..)));
+                match *left {
+                    Expr::BinaryOp { op: BinOp::Div, .. } => {}
+                    other => panic!("expected nested `a / b` on the left, got {:?}", other),
+                }
+            }
+            other => panic!("expected BinaryOp(Div), got {:?}", other),
         }
     }
 
@@ -5927,10 +6729,7 @@ mod tests {
 
     #[test]
     fn test_ellipsis_is_invalid() {
-        let src = "def main() { ...; }";
-        let mut parser = Parser::new(src);
-        let result = parser.parse_program();
-        assert!(result.is_err() || !parser.diagnostics.is_empty());
+        check_parse_fails("def main() { ...; }");
     }
 
     #[test]
@@ -6052,6 +6851,92 @@ mod tests {
             "expected a suggestion for bad pattern token, got: {:?}",
             diags
         );
+    }
+
+    /// Error recovery must NOT swallow a statement-start keyword:
+    /// after the `1 +` operand gap, the next `set` starts a fresh
+    /// statement (`set y = 5`), so the parser reports exactly ONE error
+    /// (the missing operand).  If `synchronize` consumed the `set`, the
+    /// leftover `y = 5` would be misparsed and add a cascade error.
+    #[test]
+    fn test_synchronize_does_not_swallow_statement_start() {
+        let diags = check_parse_err("def main() { set a = 1 + set y = 5; }");
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected only the `1 +` operand-gap error, got: {:?}",
+            diags
+        );
+    }
+
+    /// A block-level `trait` is a valid statement (committee-approved
+    /// rustc-style nested items): `parse_stmt` dispatches it to
+    /// `parse_trait_def`, which consumes the keyword first — so error
+    /// recovery always makes progress and the block loop terminates at
+    /// the closing brace.  The test completing at all is the assertion
+    /// (a spin would hang it).
+    #[test]
+    fn test_synchronize_block_level_trait_no_spin() {
+        // Block-level `trait` is now a valid statement (committee-approved
+        // rustc-style nested items): parsing succeeds — a spin would hang
+        // the test instead.
+        let program = check_parse("def main() { trait X {} return 0; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    /// Regression: error recovery must not swallow a block-level item
+    /// definition — `trait` is a protected statement starter, so after
+    /// the `1 +` operand-gap error the `trait X {}` definition is parsed
+    /// normally (only the original error is reported).
+    #[test]
+    fn test_recovery_keeps_block_level_trait() {
+        let diags = check_parse_err("def main() { set a = 1 + trait X {} return 0; }");
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected only the `1 +` operand-gap error, got: {:?}",
+            diags
+        );
+    }
+
+    // ── peek_next lookahead-2 contract ────────────────────────────
+    // `peek_next` must return the token AFTER the one `peek()` would
+    // return, both with an empty pending stack and with pending tokens
+    // queued (the `>>`/`<<` split paths).  For `"a + b"` the stream is
+    // [Ident(a), Plus, Ident(b)].
+
+    /// Empty pending stack: `peek()` returns `Ident(a)`, so `peek_next`
+    /// is the following stream token `Plus`.
+    #[test]
+    fn test_peek_next_pending_empty() {
+        let mut p = new_parser("a + b");
+        assert_eq!(p.peek_next(), Some(Token::Plus));
+        // peek() must still return the FIRST token (peek_next is a pure
+        // lookahead — it must not have consumed `Ident(a)`).
+        assert!(matches!(p.peek(), Ok(Token::Ident(_))));
+    }
+
+    /// One pending token (`Gt`, as after a `>>` split): `peek()` will pop
+    /// it, so `peek_next` is the stream position `Ident(a)`.
+    #[test]
+    fn test_peek_next_pending_one() {
+        let mut p = new_parser("a + b");
+        p.pending.push(Token::Gt);
+        assert_eq!(p.peek_next(), Some(Token::Ident(Symbol::intern("a"))));
+        // peek() returns the pending token, not the stream head.
+        assert!(matches!(p.peek(), Ok(Token::Gt)));
+    }
+
+    /// Two pending tokens (`[Gt, Lt]`, stack top `Lt`): `peek()` will pop
+    /// `Lt`, so `peek_next` is the new stack top `Gt`.
+    #[test]
+    fn test_peek_next_pending_two() {
+        let mut p = new_parser("a + b");
+        p.pending.push(Token::Gt);
+        p.pending.push(Token::Lt);
+        assert_eq!(p.peek_next(), Some(Token::Gt));
+        // peek() returns the pending stack top `Lt`.
+        assert!(matches!(p.peek(), Ok(Token::Lt)));
     }
 
     #[test]
@@ -6213,12 +7098,34 @@ mod tests {
             "def f() { let x = Mod::move; }",
             "def f() { let x = Mod::copy; }",
             "def f() { let x = Mod::type; }",
+            "def f() { let x = Mod::ieee; }",
             // With empty parens (→ enum construction with empty payload).
             "def f() { let x = Mod::none(); }",
         ];
         for src in cases {
             let program = check_parse(src);
             assert_eq!(program.items.len(), 1, "failed to parse: {src}");
+        }
+    }
+
+    #[test]
+    fn test_ieee_keyword_attribute_name() {
+        // `ieee` is a keyword, but as an ATTRIBUTE NAME it must
+        // round-trip to the symbol "ieee" — NOT the debug-formatted "Ieee"
+        // fallback (which silently renamed `@ieee` and broke consumers
+        // comparing `attr.name.eq_str("ieee")`).
+        let src = "@ieee\ndef f() { }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { attributes, .. } => {
+                assert_eq!(attributes.len(), 1);
+                assert!(
+                    attributes[0].name.eq_str("ieee"),
+                    "attribute name must be `ieee`, got `{}`",
+                    attributes[0].name.as_str()
+                );
+            }
+            _ => panic!("expected function definition"),
         }
     }
 
@@ -6444,10 +7351,7 @@ mod tests {
 
     #[test]
     fn test_scope_cleanup_overrides_without_propagates_fails() {
-        let src = "def main() { scope_cleanup @close_file overrides { } }";
-        let mut parser = Parser::new(src);
-        let result = parser.parse_program();
-        assert!(result.is_err() || !parser.diagnostics.is_empty());
+        check_parse_fails("def main() { scope_cleanup @close_file overrides { } }");
     }
 
     #[test]
@@ -6672,7 +7576,10 @@ mod tests {
                     value: Some(Expr::TypeAnnotated { expr, ty, .. }),
                     ..
                 } => {
-                    assert!(matches!(**expr, Expr::Literal(Literal::Int(1), _)));
+                    assert!(matches!(
+                        **expr,
+                        Expr::Literal(Literal::Int(crate::ast::IntLit::Small(1)), _)
+                    ));
                     assert!(
                         matches!(**ty, Type::Path(ref path, _) if path.len() == 1 && path[0].eq_str("PositiveInt"))
                     );
@@ -6704,6 +7611,63 @@ mod tests {
             }
             _ => panic!("expected TypeDef with where clause"),
         }
+    }
+
+    /// The `where value > 0` desugar renames `value` to the fresh binder
+    /// inside the invariant expression — the rename must propagate into
+    /// NESTED statements (an if-branch block inside the invariant), not
+    /// just the top-level expression.
+    #[test]
+    fn test_replace_ident_renames_into_nested_stmt() {
+        let src = "def main() -> Int<32> { if value > 0 { value } else { -value } return 0; }";
+        let program = check_parse(src);
+        let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+            panic!("expected a function def");
+        };
+        let if_stmt = &body.as_ref().unwrap()[0];
+        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let renamed = crate::ast::visit::replace_ident_in_stmt(
+            arena,
+            if_stmt,
+            Symbol::intern("value"),
+            Symbol::intern("_where_9"),
+        );
+        let Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } = renamed
+        else {
+            panic!("expected an if statement");
+        };
+        let collect_names = |stmts: &[Stmt<'static>]| -> Vec<Symbol> {
+            let mut names = Vec::new();
+            for s in stmts {
+                if let Stmt::Expression(e) = s {
+                    // `-value` is a UnaryOp wrapping the Ident.
+                    let inner: &Expr<'static> = match e {
+                        Expr::UnaryOp { expr, .. } => *expr,
+                        other => other,
+                    };
+                    if let Expr::Ident(n, _) = inner {
+                        names.push(*n);
+                    }
+                }
+            }
+            names
+        };
+        let then_names = collect_names(&then_branch);
+        assert_eq!(
+            then_names,
+            vec![Symbol::intern("_where_9")],
+            "then-branch `value` must be renamed to the binder"
+        );
+        let else_names = collect_names(else_branch.as_deref().unwrap_or(&[]));
+        assert_eq!(
+            else_names,
+            vec![Symbol::intern("_where_9")],
+            "else-branch `value` must be renamed to the binder"
+        );
     }
 
     // ── Nested generics and >> disambiguation ─────────────────────
@@ -6763,17 +7727,14 @@ mod tests {
 
     #[test]
     fn test_generic_right_shift_expr() {
-        // Combined: Vec<Vec<Int<32>>> (>> split by expect_gt) and
-        // a separate type with a right-shift expression arg.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let src =
-                "def main() { set x: Vec<Vec<Int<32>>> = 0; set y: Array<Int, Count >> 4> = 0; }";
-            let mut parser = Parser::new(src);
-            parser.parse_program()
-        }));
+        // `Array<Int, Count >> 4>` — the `Count >> 4` is a binary
+        // expression that must be wrapped in `{ }` per the braced-const
+        // rule.  The parser should reject it, not panic.
+        let mut parser = new_parser("def main() { set x: Array<Int, Count >> 4> = 0; }");
+        let result = parser.parse_program();
         assert!(
-            result.is_ok(),
-            "nested generics + const expr with >> should parse"
+            result.is_err() || !parser.diagnostics.is_empty(),
+            "expected parse error for unbraced `Count >> 4` in const-generic position"
         );
     }
 
@@ -7158,7 +8119,7 @@ mod tests {
                         match expr {
                             Expr::BinaryOp { left, op, .. } => {
                                 assert_eq!(*op, BinOp::Gt);
-                                match left.as_ref() {
+                                match left {
                                     Expr::Ident(name, _) => {
                                         assert_eq!(name.as_str(), "@even");
                                     }
@@ -7193,7 +8154,7 @@ mod tests {
                         match expr {
                             Expr::BinaryOp { left, op, .. } => {
                                 assert_eq!(*op, BinOp::Lt);
-                                match left.as_ref() {
+                                match left {
                                     Expr::Ident(name, _) => {
                                         assert_eq!(name.as_str(), "@fast");
                                     }

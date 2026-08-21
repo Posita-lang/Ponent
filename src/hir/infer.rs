@@ -39,9 +39,25 @@ impl GuardSet {
         self.direct_guards == 0 && self.transitive_guards.is_empty()
     }
     pub fn add_guard(&mut self) {
-        self.direct_guards = self.direct_guards.wrapping_add(1);
+        debug_assert!(
+            self.direct_guards != usize::MAX,
+            "add_guard: direct-guard refcount overflow (usize::MAX) — \
+             add/remove imbalance or runaway guard growth"
+        );
+        // Saturating, never wrapping: a corrupted refcount must keep the
+        // variable GUARDED (fail-safe — premature generalization is
+        // unsound); a wrap to 0 would make `is_empty()` report unguarded
+        // and the variable could be generalized while a constraint still
+        // blocks it.
+        self.direct_guards = self.direct_guards.saturating_add(1);
     }
     pub fn remove_guard(&mut self) {
+        debug_assert!(
+            self.direct_guards > 0,
+            "remove_guard: count == 0 — removal without matching addition; \
+             this is an invariant violation that indicates a guard-set \
+             lifecycle bug",
+        );
         if self.direct_guards > 0 {
             self.direct_guards -= 1;
         }
@@ -138,7 +154,7 @@ pub struct InferRegionNode {
     pub children: Vec<InferRegionId>,
     pub pool: InferPool,
     pub dirty: bool,
-    pub dirty_children: Vec<InferRegionId>,
+    pub dirty_children: FxHashSet<InferRegionId>,
     /// Shape variable region node ID (optional — created lazily).
     /// Corresponds to OmniML's `Pool.shape_var_region`.
     pub shape_var_region: Option<usize>,
@@ -156,11 +172,24 @@ pub struct InferRegionTree {
     /// design.  When a region is marked dirty and no dirty ancestor is found, it is
     /// added here so that `drain_dirty_roots` can reach it — otherwise orphaned
     /// dirty regions would be silently skipped.
-    pub dirty_roots: Vec<InferRegionId>,
+    pub dirty_roots: FxHashSet<InferRegionId>,
     /// Undo log for pool mutations.
     /// When a transaction is rolled back, pools are restored to their
     /// previous states to prevent zombie entries from abandoned variables.
     pub pool_undo_log: Vec<PoolUndoEntry>,
+    /// DFS pre-order timestamps (`tin`) and post-order timestamps
+    /// (`tout`), parallel to `nodes` — enable the O(1) ancestor test
+    /// `tin[anc] <= tin[node] && tout[node] <= tout[anc]`.
+    tin: Vec<usize>,
+    tout: Vec<usize>,
+    next_dfs: usize,
+    /// Binary Lifting ancestor table, parallel to `nodes`:
+    /// `ancestor_table[i][k]` = the 2^k-th ancestor of node i.
+    ancestor_table: Vec<[InferRegionId; MAX_LOG]>,
+    /// O(1) var → region lookup: maintained by
+    /// register_var / register_var_in_region / unregister_var and the
+    /// rollback log — replaces the linear scan over every region's pool.
+    var_to_region: HashMap<usize, InferRegionId>,
 }
 
 /// Which pool list a Register entry modified.
@@ -195,14 +224,20 @@ impl InferRegionTree {
                 children: Vec::new(),
                 pool: InferPool::new(),
                 dirty: false,
-                dirty_children: Vec::new(),
+                dirty_children: FxHashSet::default(),
                 shape_var_region: None,
                 parent_shape_var_region: 0,
             }],
             root: InferRegionId(0),
             current: InferRegionId(0),
-            dirty_roots: Vec::new(),
+            dirty_roots: FxHashSet::default(),
             pool_undo_log: Vec::new(),
+            tin: vec![0],
+            // The root's interval covers the whole tree.
+            tout: vec![usize::MAX],
+            next_dfs: 1,
+            ancestor_table: vec![[NO_ANCESTOR; MAX_LOG]],
+            var_to_region: HashMap::default(),
         }
     }
     pub fn enter_region(&mut self) -> InferRegionId {
@@ -218,42 +253,153 @@ impl InferRegionTree {
             children: Vec::new(),
             pool: InferPool::new(),
             dirty: false,
-            dirty_children: Vec::new(),
+            dirty_children: FxHashSet::default(),
             shape_var_region: None,
             parent_shape_var_region: parent_shape_var,
         });
         self.nodes[self.current.0].children.push(new_id);
+        self.tin.push(self.next_dfs);
+        // Placeholder `tout` parallel to `nodes` — exit assigns by id
+        // (the post-order exit order differs from the pre-order id order).
+        self.tout.push(0);
+        self.next_dfs += 1;
+        // ── Incremental Binary Lifting table build ──
+        // f(u, k) = f(f(u, k-1), k-1); break at the root (NO_ANCESTOR).
+        let mut ancestors = [NO_ANCESTOR; MAX_LOG];
+        ancestors[0] = self.current;
+        for k in 1..MAX_LOG {
+            let mid = ancestors[k - 1];
+            if mid == NO_ANCESTOR {
+                break;
+            }
+            ancestors[k] = self.ancestor_table[mid.0][k - 1];
+        }
+        self.ancestor_table.push(ancestors);
         let old = self.current;
         self.current = new_id;
         old
     }
     pub fn exit_region(&mut self) {
         if let Some(parent) = self.nodes[self.current.0].parent {
+            // Assign by id — the post-order exit order differs from the
+            // pre-order id order, so `push` would misalign `tout` with
+            // `nodes`.
+            self.tout[self.current.0] = self.next_dfs;
+            self.next_dfs += 1;
             self.current = parent;
         }
     }
     pub fn get_level(&self, region_id: InferRegionId) -> usize {
         self.nodes[region_id.0].level
     }
+    /// Lift `node` up `steps` levels.  Clamps to the root when `steps`
+    /// exceeds the node's depth.
+    #[inline]
+    fn lift(&self, mut node: InferRegionId, mut steps: usize) -> InferRegionId {
+        debug_assert!(steps < (1 << MAX_LOG), "lift steps exceed MAX_LOG capacity");
+        let mut k = 0;
+        while steps > 0 {
+            if steps & 1 != 0 {
+                let anc = self.ancestor_table[node.0][k];
+                if anc == NO_ANCESTOR {
+                    return self.root;
+                }
+                node = anc;
+            }
+            steps >>= 1;
+            k += 1;
+        }
+        node
+    }
+
+    /// Binary Lifting NCA: O(log n) queries.
+    ///
+    /// 1. Align the depths (lift the deeper one).
+    /// 2. If equal after alignment → NCA.
+    /// 3. Jump from high to low bits simultaneously (2^k ancestors differ
+    ///    and are both valid).
+    /// 4. The direct parent is the NCA.
     pub fn nearest_common_ancestor(&self, a: InferRegionId, b: InferRegionId) -> InferRegionId {
         if a == b {
             return a;
         }
-        let a_node = &self.nodes[a.0];
-        let b_node = &self.nodes[b.0];
-        if a_node.level < b_node.level {
-            self.nearest_common_ancestor(a, self.nodes[b.0].parent.expect("parent"))
-        } else if a_node.level > b_node.level {
-            self.nearest_common_ancestor(self.nodes[a.0].parent.expect("parent"), b)
-        } else {
-            self.nearest_common_ancestor(
-                self.nodes[a.0].parent.expect("parent"),
-                self.nodes[b.0].parent.expect("parent"),
-            )
+        let level_a = self.nodes[a.0].level;
+        let level_b = self.nodes[b.0].level;
+
+        // Step 1: align depths.
+        let (mut lo, mut hi) = if level_a >= level_b { (b, a) } else { (a, b) };
+        let depth_diff = level_a.abs_diff(level_b);
+        hi = self.lift(hi, depth_diff);
+
+        // Step 2: aligned equal → NCA.
+        if lo == hi {
+            return lo;
         }
+
+        // Step 3: simultaneous lifting from the high bit down.  The safety
+        // fix over the bare `anc_lo != anc_hi` form: only lift when BOTH
+        // ancestors are valid (not NO_ANCESTOR) and differ — otherwise a
+        // node could be lifted onto the NO_ANCESTOR sentinel and index out
+        // of bounds on the next access.
+        for k in (0..MAX_LOG).rev() {
+            let anc_lo = self.ancestor_table[lo.0][k];
+            let anc_hi = self.ancestor_table[hi.0][k];
+            if anc_lo != NO_ANCESTOR && anc_hi != NO_ANCESTOR && anc_lo != anc_hi {
+                lo = anc_lo;
+                hi = anc_hi;
+            }
+        }
+
+        // Step 4: the direct parent is the NCA.
+        let parent = self.ancestor_table[lo.0][0];
+        debug_assert_eq!(
+            parent, self.ancestor_table[hi.0][0],
+            "NCA invariant: both nodes must share the same parent after lifting"
+        );
+        parent
     }
+    /// O(1) ancestor test via the DFS pre/post-order intervals:
+    /// `ancestor` is an ancestor of `node` iff
+    /// `tin[ancestor] <= tin[node] && tout[node] <= tout[ancestor]`.
+    ///
+    /// While a region is still OPEN its `tout` is the `0` placeholder
+    /// (assigned only by `exit_region`).  The interval test treats the
+    /// placeholder as `usize::MAX` (conceptual infinity): under the stack
+    /// discipline — every new region is entered as a CHILD of `current`,
+    /// and `current` moves only via `enter_region`/`exit_region` (with
+    /// `exit_level`'s rewind being the caller-bug guarded exception) —
+    /// everything entered after an open region is its descendant, so the
+    /// open interval `[tin, ∞)` correctly rejects closed siblings while
+    /// accepting real open ancestors.  The NCA anchor in the debug build
+    /// cross-checks this O(1) fast path against the lifting table, which is
+    /// correct on every tree state — making the stack-discipline contract
+    /// machine-checkable.
     pub fn is_ancestor(&self, ancestor: InferRegionId, node: InferRegionId) -> bool {
-        self.nearest_common_ancestor(ancestor, node) == ancestor
+        debug_assert!(ancestor.0 < self.nodes.len());
+        debug_assert!(node.0 < self.nodes.len());
+        // Open-region `tout` placeholders read as infinity: a closed
+        // sibling of an open node has a finite `tout`, so `MAX <= tout[anc]`
+        // fails; the open ancestor's interval covers everything after it.
+        let t_anc = if self.tout[ancestor.0] == 0 {
+            usize::MAX
+        } else {
+            self.tout[ancestor.0]
+        };
+        let t_node = if self.tout[node.0] == 0 {
+            usize::MAX
+        } else {
+            self.tout[node.0]
+        };
+        let result = self.tin[ancestor.0] <= self.tin[node.0] && t_node <= t_anc;
+        // Debug anchor: NCA is correct for open AND closed regions; the O(1)
+        // interval fast path must agree with it on every reachable tree
+        // state (this is the machine-checked stack-discipline contract).
+        debug_assert_eq!(
+            result,
+            self.nearest_common_ancestor(ancestor, node) == ancestor,
+            "interval fast path must agree with the NCA anchor"
+        );
+        result
     }
     pub fn mark_dirty(&mut self, region_id: InferRegionId) {
         let node = &mut self.nodes[region_id.0];
@@ -269,7 +415,7 @@ impl InferRegionTree {
             let parent = &mut self.nodes[pid.0];
             if parent.dirty {
                 if !parent.dirty_children.contains(&region_id) {
-                    parent.dirty_children.push(region_id);
+                    parent.dirty_children.insert(region_id);
                 }
                 return;
             }
@@ -278,7 +424,7 @@ impl InferRegionTree {
         // No dirty ancestor found — add to dirty_roots so that
         // drain_dirty_roots can reach this region.
         if !self.dirty_roots.contains(&region_id) {
-            self.dirty_roots.push(region_id);
+            self.dirty_roots.insert(region_id);
         }
     }
     pub fn mark_current_dirty(&mut self) {
@@ -303,6 +449,7 @@ impl InferRegionTree {
             kind: RegisterKind::Var,
         });
         self.nodes[idx].pool.register_var(var_id);
+        self.var_to_region.insert(var_id, self.current);
     }
     pub fn register_rigid_var(&mut self, var_id: usize) {
         let idx = self.current.0;
@@ -315,6 +462,7 @@ impl InferRegionTree {
     }
     pub fn register_var_in_region(&mut self, var_id: usize, region_id: InferRegionId) {
         let idx = region_id.0;
+        self.var_to_region.insert(var_id, region_id);
         self.pool_undo_log.push(PoolUndoEntry::Register {
             region_idx: idx,
             var_id,
@@ -338,6 +486,7 @@ impl InferRegionTree {
             .pool
             .var_ids
             .retain(|&v| v != var_id);
+        self.var_to_region.remove(&var_id);
     }
     pub fn collect_dirty_ids(&self) -> Vec<InferRegionId> {
         self.nodes
@@ -358,12 +507,12 @@ impl InferRegionTree {
     /// region pools.  Returns the root region if not found.
     /// Used by TcLevel escape checking in try_unify.
     pub fn region_of_var(&self, var_id: usize) -> InferRegionId {
-        for node in &self.nodes {
-            if node.pool.var_ids.contains(&var_id) {
-                return node.id;
-            }
-        }
-        InferRegionId(0) // root
+        // O(1) via the var → region map — previously a linear
+        // scan over every region's pool, O(total vars).
+        self.var_to_region
+            .get(&var_id)
+            .copied()
+            .unwrap_or(InferRegionId(0)) // root
     }
 
     pub fn drain_dirty<F>(&mut self, node_id: InferRegionId, f: &mut F)
@@ -373,7 +522,11 @@ impl InferRegionTree {
         if !self.nodes[node_id.0].dirty {
             return;
         }
-        let children: Vec<InferRegionId> = self.nodes[node_id.0].dirty_children.clone();
+        let children: Vec<InferRegionId> = self.nodes[node_id.0]
+            .dirty_children
+            .iter()
+            .copied()
+            .collect();
         for child_id in children {
             self.drain_dirty(child_id, f);
         }
@@ -393,7 +546,7 @@ impl InferRegionTree {
     {
         // Drain from dirty_roots first, then fall back to the root for
         // backward compatibility with regions that are reachable from root.
-        let roots: Vec<InferRegionId> = self.dirty_roots.drain(..).collect();
+        let roots: Vec<InferRegionId> = self.dirty_roots.drain().collect();
         for root_id in roots {
             self.drain_dirty(root_id, f);
         }
@@ -491,6 +644,7 @@ impl InferRegionTree {
                                     .pool
                                     .var_ids
                                     .retain(|&v| v != *var_id);
+                                self.var_to_region.remove(var_id);
                             }
                             RegisterKind::RigidVar => {
                                 self.nodes[*region_idx]
@@ -504,6 +658,8 @@ impl InferRegionTree {
                 PoolUndoEntry::Unregister { region_idx, var_id } => {
                     if *region_idx < self.nodes.len() {
                         self.nodes[*region_idx].pool.var_ids.push(*var_id);
+                        self.var_to_region
+                            .insert(*var_id, InferRegionId(*region_idx));
                     }
                 }
             }
@@ -517,7 +673,7 @@ impl InferRegionTree {
 // is open; popped and `reverse()`'d on rollback.
 
 /// A single reversible operation on `InferenceContext` state.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum InferUndoLog {
     PushConstraint,
     PushTypeVar,
@@ -530,6 +686,10 @@ pub(crate) enum InferUndoLog {
     PushForwardRef,
     /// An instance was pushed into an existing forward_refs[pg].  Reverse: pop.
     ForwardRefPush(usize),
+    /// Undo for `s_inst_copy`'s `forward_refs[pg].clear()`: stores the
+    /// cleared entries so a rollback restores the instance registrations
+    /// (the plain `ForwardRefPush` entry cannot — it only pops).
+    ClearForwardRefs(usize, Vec<usize>),
     PushReverseRef,
     SetReverseRef(usize, Option<usize>),
     PushLowerBound,
@@ -579,6 +739,11 @@ impl InferenceContext {
             InferUndoLog::ForwardRefPush(pg) => {
                 if pg < self.forward_refs.len() {
                     self.forward_refs[pg].pop();
+                }
+            }
+            InferUndoLog::ClearForwardRefs(pg, entries) => {
+                if pg < self.forward_refs.len() {
+                    self.forward_refs[pg] = entries;
                 }
             }
             InferUndoLog::PushReverseRef => {
@@ -651,6 +816,12 @@ impl InferenceContext {
 //
 // Named constants for the priority levels above, so the solver's
 // determinism ordering is not buried as magic numbers.
+/// Binary Lifting max levels: 2^20 ≈ 10^6, far beyond any real nesting depth.
+const MAX_LOG: usize = 20;
+
+/// Sentinel value: "no ancestor" (the root's parent).
+const NO_ANCESTOR: InferRegionId = InferRegionId(usize::MAX);
+
 const PRIORITY_EQ_CONCRETE: u8 = 0;
 const PRIORITY_EQ_MIXED: u8 = 1;
 const PRIORITY_EQ_INFER: u8 = 2;
@@ -662,9 +833,9 @@ const PRIORITY_FORALL: u8 = 6;
 const PRIORITY_DEFER: u8 = 6;
 const PRIORITY_BODY_FLOOR: u8 = 4;
 /// Default bit width for inferred `Int` / `UInt` types.
-const DEFAULT_INT_WIDTH: u8 = 32;
+const DEFAULT_INT_WIDTH: u32 = 32;
 /// Default bit width for inferred `Float` types.
-const DEFAULT_FLOAT_WIDTH: u8 = 64;
+const DEFAULT_FLOAT_WIDTH: u32 = 64;
 /// A scoped environment carried with each delayed constraint, mapping
 /// inference variable IDs to Skolem TypeIds introduced by enclosing
 /// Forall binders.  The solver consults this environment before falling
@@ -673,14 +844,14 @@ const DEFAULT_FLOAT_WIDTH: u8 = 64;
 pub(crate) type SkolemEnv = HashMap<usize, TypeId>;
 
 #[derive(Clone)]
-struct PrioritizedConstraint {
-    priority: u8,
-    constraint: Constraint,
+pub(crate) struct PrioritizedConstraint {
+    pub(crate) priority: u8,
+    pub(crate) constraint: Constraint,
     /// Scoped skolem environment: maps var_id → Skolem TypeId for
     /// Forall-bound rigid variables that apply to this constraint.
     /// Inherited from the parent constraint and extended by new Forall
     /// binders.  Empty unless the constraint is inside a Forall body.
-    env: SkolemEnv,
+    pub(crate) env: SkolemEnv,
 }
 
 impl PartialEq for PrioritizedConstraint {
@@ -844,7 +1015,7 @@ pub enum Constraint {
 
 /// Describes the instantiation target of a polymorphic scheme,
 /// collected from a TypeData node without holding a borrow on the
-/// TypeContext. Used by the Instance constraint handler to separate
+/// TypeContext<'input>. Used by the Instance constraint handler to separate
 /// the immutable scan phase from the mutable variable-creation phase.
 enum InstantiationTarget {
     /// `∀α₁.∀α₂. ... αₙ. body_ty` — Forall binders.
@@ -865,7 +1036,7 @@ impl Constraint {
     /// Compute priority: lower = more deterministic, processed first.
     /// This enables BinaryHeap-based scheduling where concrete-concrete
     /// constraints are resolved before those involving inference variables.
-    pub fn priority(&self, ctx: &TypeContext) -> u8 {
+    pub fn priority<'input>(&self, ctx: &TypeContext<'input>) -> u8 {
         match self {
             Constraint::Eq(a, b, _, _) => {
                 let a_is_infer =
@@ -1032,7 +1203,11 @@ impl InferenceContext {
     /// Test helper: wake suspended constraints into a local heap and return
     /// the number of woken constraints.  Does not expose the internal
     /// PrioritizedConstraint type to tests.
-    pub(crate) fn wake_var_for_test(&mut self, var_id: usize, ctx: &TypeContext) -> usize {
+    pub(crate) fn wake_var_for_test<'input>(
+        &mut self,
+        var_id: usize,
+        ctx: &TypeContext<'input>,
+    ) -> usize {
         let mut heap = std::collections::BinaryHeap::new();
         self.wake_var_incremental(var_id, &mut heap, ctx);
         heap.len()
@@ -1061,9 +1236,14 @@ impl InferenceContext {
     /// ctx.resolve_binding() for ordinary bindings.  Env-mapped (skolemized)
     /// variables are replaced with their Skolem TypeId so that all constraint
     /// forms (Eq, Sub, etc.) operate on the rigid type, not the raw InferVar.
-    fn resolve_with_env(&self, ty: TypeId, ctx: &TypeContext, env: &SkolemEnv) -> TypeId {
+    fn resolve_with_env<'input>(
+        &self,
+        ty: TypeId,
+        ctx: &TypeContext<'input>,
+        env: &SkolemEnv,
+    ) -> TypeId {
         let r = ctx.resolve_binding(ty);
-        if let TypeData::InferVar { id } = ctx.get(r)
+        if let TypeData::InferVar { id, .. } = ctx.get(r)
             && let Some(skolem) = env.get(id)
         {
             return *skolem;
@@ -1080,10 +1260,15 @@ impl InferenceContext {
     /// If the given type is an InferVar that is NOT bound in the scoped
     /// environment, return its var_id.  Returns None for concrete types,
     /// Skolem-bound variables, or variables bound in ctx.bindings.
-    fn free_infer_var_id(&self, ty: TypeId, ctx: &TypeContext, env: &SkolemEnv) -> Option<usize> {
+    fn free_infer_var_id<'input>(
+        &self,
+        ty: TypeId,
+        ctx: &TypeContext<'input>,
+        env: &SkolemEnv,
+    ) -> Option<usize> {
         let r = ctx.resolve_binding(ty);
         match ctx.get(r) {
-            TypeData::InferVar { id } if !env.contains_key(id) => Some(*id),
+            TypeData::InferVar { id, .. } if !env.contains_key(id) => Some(*id),
             _ => None,
         }
     }
@@ -1116,9 +1301,9 @@ impl InferenceContext {
         }
     }
 
-    pub fn new_type_var(
+    pub fn new_type_var<'input>(
         &mut self,
-        ctx: &mut TypeContext,
+        ctx: &mut TypeContext<'input>,
         kind: TypeVariableKind,
         origin: VarOrigin,
     ) -> TypeId {
@@ -1128,19 +1313,20 @@ impl InferenceContext {
     /// Create a new type variable with a specific universe index.
     /// Currently, the universe is accepted but not stored — the body is
     /// identical to `new_type_var`.  When per-variable universe tracking
-    /// is implemented, this function will store `_universe` in the
+    /// is implemented, this function will store `universe` in the
     /// InferVar's metadata for correct HRTB scoping during canonical
     /// instantiation.
-    pub fn new_type_var_with_universe(
+    pub fn new_type_var_with_universe<'input>(
         &mut self,
-        ctx: &mut TypeContext,
+        ctx: &mut TypeContext<'input>,
         kind: TypeVariableKind,
         origin: VarOrigin,
-        _universe: usize,
+        universe: usize,
     ) -> TypeId {
         let id = self.next_var_id;
         self.next_var_id += 1;
-        let ty_id = ctx.alloc_infer_var(id);
+        // Store the per-variable universe (rustc's CanonicalVarKind::Ty { ui }).
+        let ty_id = ctx.alloc_infer_var(id, universe);
         if id >= self.resolutions.len() {
             self.resolutions.resize(id + 1, None);
         }
@@ -1188,44 +1374,39 @@ impl InferenceContext {
 
     /// Resolve a TypeId through inference variable bindings (TypeOrVar pattern).
     /// Follows the chain of resolutions until a concrete type is found.
-    pub fn resolve(&self, ty: TypeId, ctx: &TypeContext) -> TypeId {
+    pub fn resolve<'input>(&self, ty: TypeId, ctx: &TypeContext<'input>) -> TypeId {
         let mut current = ty;
         loop {
-            match ctx.get(current) {
-                TypeData::InferVar { id } => {
-                    if *id < self.resolutions.len() {
-                        if let Some(resolved) = self.resolutions[*id] {
-                            if resolved == current {
-                                return current;
-                            }
-                            current = resolved;
-                            continue;
-                        }
-                    }
-                    return current;
-                }
-                _ => return current,
+            let TypeData::InferVar { id, .. } = ctx.get(current) else {
+                return current;
+            };
+            let Some(&Some(resolved)) = self.resolutions.get(*id) else {
+                return current;
+            };
+            if resolved == current {
+                return current;
             }
+            current = resolved;
         }
     }
 
-    /// Unify two types via the global `TypeContext` AND record the resolution
+    /// Unify two types via the global `TypeContext<'input>` AND record the resolution
     /// in `self.resolutions` so that `self.resolve()` stays consistent with
     /// global bindings.
     ///
     /// This must be used instead of bare `ctx.unify()` inside the solver loop
     /// whenever one of the sides is an InferVar owned by this context.
-    pub(crate) fn unify_and_track(
+    pub(crate) fn unify_and_track<'input>(
         &mut self,
         a: TypeId,
         b: TypeId,
-        ctx: &mut TypeContext,
+        ctx: &mut TypeContext<'input>,
     ) -> Result<TypeId, TypeError> {
         let result = ctx.unify(a, b)?;
         // After unification, record any new bindings in self.resolutions
         // so that self.resolve() follows the same chain as ctx.resolve_binding().
         let resolved = ctx.resolve_binding(result);
-        if let TypeData::InferVar { id } = ctx.get(resolved)
+        if let TypeData::InferVar { id, .. } = ctx.get(resolved)
             && *id < self.resolutions.len()
             && self.resolutions[*id].is_none()
         {
@@ -1237,11 +1418,11 @@ impl InferenceContext {
 
     /// Unify with local InferVar resolution (TypeOrVar pattern).
     /// Records resolutions in `self.resolutions` instead of global bindings.
-    pub fn unify(
+    pub fn unify<'input>(
         &mut self,
         a: TypeId,
         b: TypeId,
-        ctx: &mut TypeContext,
+        ctx: &mut TypeContext<'input>,
     ) -> Result<TypeId, TypeError> {
         let ra = self.resolve(a, ctx);
         let rb = self.resolve(b, ctx);
@@ -1249,12 +1430,71 @@ impl InferenceContext {
             return Ok(ra);
         }
         match (ctx.get(ra), ctx.get(rb)) {
-            (TypeData::InferVar { id }, _) if *id < self.resolutions.len() => {
+            (TypeData::InferVar { id, universe, .. }, _) if *id < self.resolutions.len() => {
+                // Per-variable universe tracking: binding a HIGHER-universe
+                // variable into a LOWER universe lets it escape — reject.
+                // (rustc `can_define`: binding is legal iff
+                // `max_universe(binding_ty) <= var.universe`; only a
+                // strictly-higher binding universe escapes — a lower one
+                // is legal.)
+                if let TypeData::InferVar { universe: bu, .. } = ctx.get(rb)
+                    && *bu > *universe
+                {
+                    return Err(TypeError::Mismatch {
+                        expected: ra,
+                        found: rb,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
+                if ty_contains_foreign_universe(ctx, rb, *universe) {
+                    return Err(TypeError::Mismatch {
+                        expected: ra,
+                        found: rb,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
+                // Occurs-check: `a := rb` where `rb`
+                // contains `a` would create a cyclic binding.
+                if ctx.occurs_check(a, rb) {
+                    return Err(TypeError::Mismatch {
+                        expected: ra,
+                        found: rb,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 self.push_undo(InferUndoLog::SetResolution(*id, self.resolutions[*id]));
                 self.resolutions[*id] = Some(rb);
                 Ok(rb)
             }
-            (_, TypeData::InferVar { id }) if *id < self.resolutions.len() => {
+            (_, TypeData::InferVar { id, universe, .. }) if *id < self.resolutions.len() => {
+                if let TypeData::InferVar { universe: au, .. } = ctx.get(ra)
+                    && *au > *universe
+                {
+                    return Err(TypeError::Mismatch {
+                        expected: ra,
+                        found: rb,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
+                // Symmetric recursive universe check:
+                // the first arm checks `rb`; `ra` may be a composite type
+                // containing a foreign-universe InferVar).
+                if ty_contains_foreign_universe(ctx, ra, *universe) {
+                    return Err(TypeError::Mismatch {
+                        expected: ra,
+                        found: rb,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
+                // Occurs-check: binding `b := ra` where `ra` contains `b`
+                // would create a cyclic binding (resolve would loop).
+                if ctx.occurs_check(rb, ra) {
+                    return Err(TypeError::Mismatch {
+                        expected: ra,
+                        found: rb,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                }
                 self.push_undo(InferUndoLog::SetResolution(*id, self.resolutions[*id]));
                 self.resolutions[*id] = Some(ra);
                 Ok(ra)
@@ -1264,19 +1504,23 @@ impl InferenceContext {
     }
 
     /// Look up the kind of a type variable by its id.
+    /// `type_vars` is indexed by var id (sequential allocation in
+    /// `new_type_var`, only appended/popped on rollback), so this is an
+    /// O(1) index lookup — not a linear scan.
     pub fn get_var_kind(&self, id: usize) -> Option<TypeVariableKind> {
-        self.type_vars
-            .iter()
-            .find(|tv| tv.id == id)
-            .map(|tv| tv.kind)
+        self.type_vars.get(id).map(|tv| {
+            debug_assert_eq!(tv.id, id, "type_vars must be indexed by var id");
+            tv.kind
+        })
     }
 
     /// Get the region level of a type variable by its id.
+    /// O(1) index lookup (see `get_var_kind`).
     pub fn get_var_level(&self, id: usize) -> Option<usize> {
-        self.type_vars
-            .iter()
-            .find(|tv| tv.id == id)
-            .map(|tv| self.region_tree.get_level(tv.region_id))
+        self.type_vars.get(id).map(|tv| {
+            debug_assert_eq!(tv.id, id, "type_vars must be indexed by var id");
+            self.region_tree.get_level(tv.region_id)
+        })
     }
 
     /// Enter a deeper typing scope (let/forall/region).
@@ -1287,16 +1531,43 @@ impl InferenceContext {
     }
 
     /// Exit the current typing scope, restoring the previous region.
+    /// Finalizes the post-order `tout` stamps for every region exited on
+    /// the way back to `prev_region` — `exit_region` is the ONLY writer
+    /// of `tout`, and production previously used only `exit_level`, which
+    /// just rewound `current` without assigning stamps.  Every non-root
+    /// `tout` stayed at the placeholder 0, degenerating the O(1)
+    /// ancestor interval test to a pre-order comparison (any region
+    /// entered earlier — including siblings — passed as "ancestor").
     pub fn exit_level(&mut self, prev_region: InferRegionId) {
+        // Contract: `prev_region` must be an ancestor of (or equal to) the
+        // current region — `enter_level` returns the PRE-entry region, which
+        // the caller passes back here.  Machine-checked so the
+        // stack-discipline invariant (which the O(1) interval ancestor test
+        // relies on) cannot silently degrade; a caller-bug rewind to a
+        // non-ancestor would break the tin/tout bookkeeping.
+        debug_assert!(
+            self.region_tree
+                .is_ancestor(prev_region, self.region_tree.current),
+            "exit_level: prev_region must be an ancestor of the current region (caller bug)"
+        );
+        while self.region_tree.current != prev_region {
+            let cur = self.region_tree.current;
+            if self.region_tree.nodes[cur.0].parent.is_none() {
+                // `prev_region` is not an ancestor of the current region
+                // (caller bug) — stop at the root instead of looping.
+                break;
+            }
+            self.region_tree.exit_region();
+        }
         self.region_tree.current = prev_region;
     }
 
     /// Try to promote a variable to the target region's scope
     /// by creating a new variable at the target region and unifying.
     /// Uses the region tree's ancestor check (OmniML §6 PR-UVARPR).
-    pub fn try_promote_var(
+    pub fn try_promote_var<'input>(
         &mut self,
-        ctx: &mut TypeContext,
+        ctx: &mut TypeContext<'input>,
         var_id: usize,
         target_region: InferRegionId,
     ) -> Option<TypeId> {
@@ -1343,7 +1614,9 @@ impl InferenceContext {
         if var_id < self.gen_statuses.len() && new_id < self.gen_statuses.len() {
             let old_status = self.gen_statuses[var_id];
             if old_status != GenStatus::Ungeneralized {
+                let old_new = self.gen_statuses[new_id];
                 self.gen_statuses[new_id] = old_status;
+                self.push_undo(InferUndoLog::SetGenStatus(new_id, old_new));
             }
         }
         if var_id < self.lower_bounds.len() && new_id < self.lower_bounds.len() {
@@ -1413,14 +1686,11 @@ impl InferenceContext {
     fn suspend_on_var_with_env(&mut self, c: Constraint, env: SkolemEnv, var_id: usize) {
         if var_id < self.wait_lists.len() {
             self.wait_lists[var_id].push((c, env));
-            if var_id < self.gen_statuses.len() {
-                let old = self.gen_statuses[var_id];
-                self.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
-                self.push_undo(InferUndoLog::SetGenStatus(var_id, old));
-            }
             // Add a guard: the variable is now blocked until this constraint
             // is woken and processed.  This is essential for the PG→G lifecycle
-            // (OmniML §6).  Uses the reference-counted GuardSet.
+            // (OmniML §6).  Uses the reference-counted GuardSet — it also
+            // marks the variable PartiallyGeneralizable (PG), so no separate
+            // status update is needed here.
             self.add_guard(var_id);
         } else {
             self.constraints.push(c);
@@ -1430,15 +1700,19 @@ impl InferenceContext {
 
     /// Extract the InferVar id from a constraint (if any side is an unresolved InferVar).
     /// Returns None if both sides are concrete.
-    fn infer_var_from_constraint(&self, c: &Constraint, ctx: &TypeContext) -> Option<usize> {
+    fn infer_var_from_constraint<'input>(
+        &self,
+        c: &Constraint,
+        ctx: &TypeContext<'input>,
+    ) -> Option<usize> {
         match c {
             Constraint::Eq(a, b, _, _) => {
                 let ra = ctx.resolve_binding(*a);
                 let rb = ctx.resolve_binding(*b);
-                if let TypeData::InferVar { id } = ctx.get(ra) {
+                if let TypeData::InferVar { id, .. } = ctx.get(ra) {
                     return Some(*id);
                 }
-                if let TypeData::InferVar { id } = ctx.get(rb) {
+                if let TypeData::InferVar { id, .. } = ctx.get(rb) {
                     return Some(*id);
                 }
                 None
@@ -1446,17 +1720,17 @@ impl InferenceContext {
             Constraint::Sub(sub, sup, _) => {
                 let rs = ctx.resolve_binding(*sub);
                 let rsup = ctx.resolve_binding(*sup);
-                if let TypeData::InferVar { id } = ctx.get(rs) {
+                if let TypeData::InferVar { id, .. } = ctx.get(rs) {
                     return Some(*id);
                 }
-                if let TypeData::InferVar { id } = ctx.get(rsup) {
+                if let TypeData::InferVar { id, .. } = ctx.get(rsup) {
                     return Some(*id);
                 }
                 None
             }
             Constraint::Match { scrutinee, .. } => {
                 let r = ctx.resolve_binding(*scrutinee);
-                if let TypeData::InferVar { id } = ctx.get(r) {
+                if let TypeData::InferVar { id, .. } = ctx.get(r) {
                     Some(*id)
                 } else {
                     None
@@ -1468,7 +1742,7 @@ impl InferenceContext {
                 instantiation_ty, ..
             } => {
                 let r = ctx.resolve_binding(*instantiation_ty);
-                if let TypeData::InferVar { id } = ctx.get(r) {
+                if let TypeData::InferVar { id, .. } = ctx.get(r) {
                     Some(*id)
                 } else {
                     None
@@ -1478,29 +1752,8 @@ impl InferenceContext {
         }
     }
 
-    /// Wake all constraints suspended on the given var_id, moving them
-    /// back into the active constraint list for reprocessing.
-    fn wake_var(
-        &mut self,
-        var_id: usize,
-        ctx: &TypeContext,
-        heap: &mut BinaryHeap<PrioritizedConstraint>,
-    ) {
-        if var_id < self.wait_lists.len() {
-            let suspended = std::mem::take(&mut self.wait_lists[var_id]);
-            for (c, env) in suspended {
-                let p = c.priority(ctx);
-                heap.push(PrioritizedConstraint {
-                    priority: p,
-                    constraint: c,
-                    env,
-                });
-            }
-        }
-    }
-
     /// Determine the principal shape of a resolved type.
-    pub fn shape_of_type(ctx: &TypeContext, ty: TypeId) -> PrincipalShape {
+    pub fn shape_of_type<'input>(ctx: &TypeContext<'input>, ty: TypeId) -> PrincipalShape {
         let resolved = ctx.resolve_binding(ty);
         match ctx.get(resolved) {
             TypeData::Fn { params, .. } => PrincipalShape::Arrow,
@@ -1525,7 +1778,7 @@ impl InferenceContext {
 
     /// Try to set the shape of a variable from its resolved type.
     /// Returns true if the shape was updated.
-    fn try_set_shape(&mut self, var_id: usize, ctx: &TypeContext) -> bool {
+    fn try_set_shape<'input>(&mut self, var_id: usize, ctx: &TypeContext<'input>) -> bool {
         if var_id < self.type_vars.len() && var_id < self.var_type_ids.len() {
             let ty = ctx.resolve_binding(self.var_type_ids[var_id]);
             if !matches!(ctx.get(ty), TypeData::InferVar { .. }) {
@@ -1543,11 +1796,11 @@ impl InferenceContext {
     /// Woken constraints are enqueued directly onto the heap.
     /// After waking, if the wait list is empty AND no guards remain,
     /// the variable can be re-generalised (G) — OmniML §6.
-    fn wake_var_incremental(
+    fn wake_var_incremental<'input>(
         &mut self,
         var_id: usize,
         heap: &mut BinaryHeap<PrioritizedConstraint>,
-        ctx: &TypeContext,
+        ctx: &TypeContext<'input>,
     ) {
         if var_id < self.wait_lists.len() && !self.wait_lists[var_id].is_empty() {
             let suspended = std::mem::take(&mut self.wait_lists[var_id]);
@@ -1576,7 +1829,9 @@ impl InferenceContext {
                 let guards_empty =
                     var_id < self.guard_sets.len() && self.guard_sets[var_id].is_empty();
                 if guards_empty {
+                    let old = self.gen_statuses[var_id];
                     self.gen_statuses[var_id] = GenStatus::Generalized;
+                    self.push_undo(InferUndoLog::SetGenStatus(var_id, old));
                 }
             }
         }
@@ -1604,9 +1859,9 @@ impl InferenceContext {
     /// so the match fires when the shape becomes known.
     /// Returns `true` if the match was handled (either discharged or
     /// registered for later).
-    pub fn try_match_via_shape_var(
+    pub fn try_match_via_shape_var<'input>(
         &mut self,
-        ctx: &mut TypeContext,
+        ctx: &mut TypeContext<'input>,
         scrutinee: TypeId,
         branches_id: (usize, usize),
         heap: &mut BinaryHeap<PrioritizedConstraint>,
@@ -1617,7 +1872,7 @@ impl InferenceContext {
         // treated as free inference variables.
         let resolved = self.resolve_with_env(scrutinee, ctx, env);
         match ctx.get(resolved) {
-            TypeData::InferVar { id } => {
+            TypeData::InferVar { id, .. } => {
                 // Always suspend the Match constraint, regardless of whether
                 // this variable already has guards.  A non-empty guard set
                 // from a *previous* Match cannot repel a *new* Match with a
@@ -1660,9 +1915,9 @@ impl InferenceContext {
     /// Implements the ⊆-closed erasure semantics:
     ///   C[τ!ζ] iff ∀φ, φ ⊢ [C[τ = g]] ⇒ shape(g) = ζ
     /// where [C] erases all SuspendedMatch constraints to true.
-    pub fn unicity_check(
+    pub fn unicity_check<'input>(
         &self,
-        ctx: &TypeContext,
+        ctx: &TypeContext<'input>,
         ty: TypeId,
         env: &SkolemEnv,
         active_constraints: &[PrioritizedConstraint],
@@ -1678,7 +1933,7 @@ impl InferenceContext {
 
         // τ is an InferVar — extract its id.
         let var_id = match data {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => return None,
         };
 
@@ -1782,7 +2037,11 @@ impl InferenceContext {
     ///
     /// This implements the full ⊆-closed erasure semantics:
     ///   C[τ!ζ] iff ∀φ, φ ⊢ [C[τ = g]] ⇒ shape(g) = ζ
-    pub fn unicity_check_smt(&self, ctx: &TypeContext, ty: TypeId) -> Option<PrincipalShape> {
+    pub fn unicity_check_smt<'input>(
+        &self,
+        ctx: &TypeContext<'input>,
+        ty: TypeId,
+    ) -> Option<PrincipalShape> {
         let solver = SmtSolver::new("z3");
 
         // ── 1. Collect all resolved bindings ─────────────────────
@@ -1801,7 +2060,7 @@ impl InferenceContext {
             if let Constraint::Eq(a, b, _, _) = c {
                 let ra = ctx.resolve_binding(*a);
                 let rb = ctx.resolve_binding(*b);
-                if let (TypeData::InferVar { id: aid }, TypeData::InferVar { id: bid }) =
+                if let (TypeData::InferVar { id: aid, .. }, TypeData::InferVar { id: bid, .. }) =
                     (ctx.get(ra), ctx.get(rb))
                 {
                     eq_pairs.push((*aid, *bid));
@@ -1863,9 +2122,9 @@ impl InferenceContext {
     /// same abstraction), fresh instances of those are created and bound.
     ///
     /// Returns the number of instances that were updated.
-    pub fn s_inst_copy(
+    pub fn s_inst_copy<'input>(
         &mut self,
-        ctx: &mut TypeContext,
+        ctx: &mut TypeContext<'input>,
         pg_var_id: usize,
         resolve_ty: TypeId,
     ) -> usize {
@@ -1891,14 +2150,19 @@ impl InferenceContext {
                 updated += 1;
             }
         }
-        // Clear forward refs (all propagated)
+        // Clear forward refs (all propagated).  Log a ClearForwardRefs entry
+        // carrying the entries so a rollback restores the registrations.
+        if !self.forward_refs[pg_var_id].is_empty() {
+            let entries = self.forward_refs[pg_var_id].clone();
+            self.push_undo(InferUndoLog::ClearForwardRefs(pg_var_id, entries));
+        }
         self.forward_refs[pg_var_id].clear();
         updated
     }
 
     /// Walk a type and recursively apply S-Inst-Copy to any region variables
     /// found inside it that have their own instances.
-    fn s_inst_copy_deepen(&mut self, ctx: &mut TypeContext, ty: TypeId) {
+    fn s_inst_copy_deepen<'input>(&mut self, ctx: &mut TypeContext<'input>, ty: TypeId) {
         let resolved = ctx.resolve_binding(ty);
         match ctx.get(resolved).clone() {
             TypeData::Fn { params, ret } => {
@@ -1920,7 +2184,7 @@ impl InferenceContext {
                     self.s_inst_copy_deepen(ctx, a);
                 }
             }
-            TypeData::InferVar { id } => {
+            TypeData::InferVar { id, .. } => {
                 // If this region variable has instances, propagate to them too
                 if id < self.forward_refs.len() && !self.forward_refs[id].is_empty() {
                     let resolved_inner = ctx.resolve_binding(ty);
@@ -1934,10 +2198,15 @@ impl InferenceContext {
     }
 
     /// Copy one solved equation to one instance variable (S-Inst-Copy detail).
-    fn s_inst_copy_walk(&mut self, ctx: &mut TypeContext, instance_ty: TypeId, source_ty: TypeId) {
+    fn s_inst_copy_walk<'input>(
+        &mut self,
+        ctx: &mut TypeContext<'input>,
+        instance_ty: TypeId,
+        source_ty: TypeId,
+    ) {
         let resolved_source = ctx.resolve_binding(source_ty);
         match ctx.get(resolved_source) {
-            TypeData::InferVar { id } => {
+            TypeData::InferVar { id, .. } => {
                 // This instance refers to another region variable.
                 // If the source has its own forward refs (instances),
                 // recursively copy them to the new instance's peer.
@@ -1970,8 +2239,19 @@ impl InferenceContext {
     /// uniquely determined by the constraint context, it can be safely lowered
     /// from PG to monomorphic (Ungeneralized).
     ///
+    /// The cheap syntactic unicity rules (UNI-TYPE / UNI-VAR / UNI-BACKPROP /
+    /// bounds) are tried FIRST — they are a decidable subset of the Z3 check,
+    /// so a positive syntactic answer is a proof that Z3 would also accept,
+    /// and the (subprocess-spawning) SMT query is only run when they fail.
+    ///
     /// Falls back to the level-based heuristic when Z3 is unavailable.
-    pub fn s_exists_lower(&mut self, ctx: &TypeContext, var_id: usize) -> bool {
+    pub fn s_exists_lower<'input>(
+        &mut self,
+        ctx: &TypeContext<'input>,
+        var_id: usize,
+        env: &SkolemEnv,
+        active: &[PrioritizedConstraint],
+    ) -> bool {
         if var_id >= self.type_vars.len() || var_id >= self.gen_statuses.len() {
             return false;
         }
@@ -1979,11 +2259,24 @@ impl InferenceContext {
             return false;
         }
 
+        // ── Syntactic unicity check (cheap, no subprocess) ────────────
+        // Any of the decidable syntactic rules proving a unique shape is a
+        // valid proof of S-Exists-Lower — Z3 would derive the same answer
+        // from the (superset) constraint context.
+        if let Some(_shape) = self.unicity_check(ctx, self.var_type_ids[var_id], env, active) {
+            let old = self.gen_statuses[var_id];
+            self.gen_statuses[var_id] = GenStatus::Ungeneralized;
+            self.push_undo(InferUndoLog::SetGenStatus(var_id, old));
+            return true;
+        }
+
         // ── Z3-backed semantic check ──────────────────────────────
         // Query whether this variable's shape is uniquely determined.
         if let Some(_shape) = self.unicity_check_smt(ctx, self.var_type_ids[var_id]) {
             // Shape is uniquely determined → safe to lower.
+            let old = self.gen_statuses[var_id];
             self.gen_statuses[var_id] = GenStatus::Ungeneralized;
+            self.push_undo(InferUndoLog::SetGenStatus(var_id, old));
             return true;
         }
 
@@ -2002,7 +2295,9 @@ impl InferenceContext {
             self.region_tree.unregister_var(var_id, old_region);
             self.type_vars[var_id].region_id = root_id;
             self.region_tree.register_var_in_region(var_id, root_id);
+            let old = self.gen_statuses[var_id];
             self.gen_statuses[var_id] = GenStatus::Ungeneralized;
+            self.push_undo(InferUndoLog::SetGenStatus(var_id, old));
             return true;
         }
 
@@ -2016,16 +2311,16 @@ impl InferenceContext {
     ///
     /// The optional `target_var_id` restricts processing to just the region
     /// containing that variable (for targeted generalization before instantiation).
-    pub fn force_generalize(&mut self, ctx: &mut TypeContext) {
+    pub fn force_generalize<'input>(&mut self, ctx: &mut TypeContext<'input>) {
         self.force_generalize_for_regions(ctx, &[], None)
     }
 
     /// Full generation-based generalization.  `dirty_levels` lists region
     /// levels that have been marked dirty.  `target_var_id` (if set) limits
     /// processing to the region containing that specific variable.
-    pub fn force_generalize_for_regions(
+    pub fn force_generalize_for_regions<'input>(
         &mut self,
-        ctx: &mut TypeContext,
+        ctx: &mut TypeContext<'input>,
         dirty_levels: &[usize],
         target_var: Option<usize>,
     ) {
@@ -2135,8 +2430,15 @@ impl InferenceContext {
             .collect();
         vars_by_level.sort_by(|a, b| b.1.cmp(&a.1));
 
-        // Rigid scope check per generation.
+        // Rigid scope check per generation: a PG variable whose resolved
+        // type contains an escaped rigid (skolem / GenericParam) must NOT
+        // be generalized — generalizing would copy the skolem into the
+        // type scheme (`s_inst_copy`), leaking a Forall-bound variable
+        // into an outer scope (the check result was
+        // previously DISCARDED — the loop `continue`d with no record, and
+        // the generalization loop below never consulted it).
         let cur_level = self.region_tree.get_level(self.region_tree.current);
+        let mut rigid_escaped: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for &(i, level) in &vars_by_level {
             if i >= self.var_type_ids.len() {
                 continue;
@@ -2146,7 +2448,7 @@ impl InferenceContext {
                 continue;
             }
             if level < cur_level && Self::check_rigid_escape(ctx, resolved, level) {
-                continue;
+                rigid_escaped.insert(i);
             }
         }
 
@@ -2163,8 +2465,13 @@ impl InferenceContext {
                 let ty = ctx.resolve_binding(self.var_type_ids[i]);
                 !matches!(ctx.get(ty), TypeData::InferVar { .. })
             };
-            if is_resolved && !is_trans_guarded && !has_waiting {
+            // The rigid-escape check result is CONSUMED here: a variable
+            // whose resolved type escapes a rigid may not be generalized
+            // (it stays PartiallyGeneralizable / handled elsewhere).
+            if is_resolved && !is_trans_guarded && !has_waiting && !rigid_escaped.contains(&i) {
+                let old = self.gen_statuses[i];
                 self.gen_statuses[i] = GenStatus::Generalized;
+                self.push_undo(InferUndoLog::SetGenStatus(i, old));
             }
         }
 
@@ -2176,13 +2483,69 @@ impl InferenceContext {
         }
     }
 
+    /// Whether `var_id` meets the sweep's per-var generalization criterion
+    /// (the same checks `force_generalize_for_regions` applies, for a single
+    /// variable): resolved, no direct guards, nothing waiting, no rigid
+    /// escape from its region level, and not transitively guarded via
+    /// binding-root sharing with another dirty guarded var.  Used by the
+    /// Eq handler to transition eligible current vars PG → Generalized
+    /// deterministically (before S-Exists-Lower), since the sweep itself
+    /// now runs once per iteration instead of per transition.
+    fn is_sweep_eligible<'input>(&self, ctx: &TypeContext<'input>, var_id: usize) -> bool {
+        if var_id >= self.gen_statuses.len()
+            || self.gen_statuses[var_id] != GenStatus::PartiallyGeneralizable
+        {
+            return false;
+        }
+        if var_id < self.wait_lists.len() && !self.wait_lists[var_id].is_empty() {
+            return false;
+        }
+        let Some(ty_id) = self.var_type_ids.get(var_id) else {
+            return false;
+        };
+        let resolved = ctx.resolve_binding(*ty_id);
+        if matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
+            return false;
+        }
+        if var_id < self.guard_sets.len() && !self.guard_sets[var_id].is_empty() {
+            return false;
+        }
+        let level = self
+            .type_vars
+            .get(var_id)
+            .map(|v| self.region_tree.get_level(v.region_id))
+            .unwrap_or(0);
+        let cur_level = self.region_tree.get_level(self.region_tree.current);
+        if level < cur_level && Self::check_rigid_escape(ctx, resolved, level) {
+            return false;
+        }
+        // Transitive guard: a dirty var with direct guards sharing our
+        // binding root (mirrors `trans_guarded` in the sweep).
+        let root = ctx.resolve_binding(*ty_id);
+        for &j in &self.dirty_set {
+            if j != var_id
+                && j < self.guard_sets.len()
+                && !self.guard_sets[j].is_empty()
+                && j < self.var_type_ids.len()
+                && ctx.resolve_binding(self.var_type_ids[j]) == root
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Check whether a resolved type contains escaped rigid (skolem) variables.
     /// Recursively walks the type tree looking for `GenericParam` or `SkolemVar`
     /// references that would indicate a Forall-bound variable has escaped into
     /// an outer scope.  SkolemVar is the runtime representation of a universally
     /// quantified variable bound by a `Constraint::Forall` — detecting it here
     /// prevents skolem constants from leaking into generalized type schemes.
-    pub(crate) fn check_rigid_escape(ctx: &TypeContext, ty: TypeId, max_level: usize) -> bool {
+    pub(crate) fn check_rigid_escape<'input>(
+        ctx: &TypeContext<'input>,
+        ty: TypeId,
+        max_level: usize,
+    ) -> bool {
         let resolved = ctx.resolve_binding(ty);
         match ctx.get(resolved) {
             TypeData::GenericParam { .. } | TypeData::SkolemVar { .. } => true, // escape detected
@@ -2244,6 +2607,15 @@ impl InferenceContext {
     }
 
     /// Roll back to a snapshot: pop entries and call `reverse()`.
+    ///
+    /// All `gen_statuses` mutations (guards, lowering, generalization,
+    /// wake transitions, instance promotion) are undo-logged, so a rolled
+    /// back status always matches the rolled-back `guard_sets` /
+    /// `forward_refs` / `resolutions`.  Residual non-reversible state from
+    /// the solve loop: `wait_lists` takes (wake paths) and `type_vars[i].
+    /// region_id` (S-Exists-Lower level fallback) — a leaked-but-empty
+    /// wait list is conservative (a var stays PG until its next wake),
+    /// never unsound.
     pub fn rollback_to(&mut self, snapshot_len: usize) {
         while self.undo_log.len() > snapshot_len {
             let undo = self.undo_log.pop().unwrap();
@@ -2265,26 +2637,17 @@ impl InferenceContext {
                         var_id,
                         kind,
                     } => {
-                        if region_idx < self.region_tree.nodes.len() {
-                            match kind {
-                                RegisterKind::Var => {
-                                    self.region_tree.nodes[region_idx]
-                                        .pool
-                                        .var_ids
-                                        .retain(|&v| v != var_id);
-                                }
-                                RegisterKind::RigidVar => {
-                                    self.region_tree.nodes[region_idx]
-                                        .pool
-                                        .rigid_var_ids
-                                        .retain(|&v| v != var_id);
-                                }
-                            }
+                        if let Some(node) = self.region_tree.nodes.get_mut(region_idx) {
+                            let vec = match kind {
+                                RegisterKind::Var => &mut node.pool.var_ids,
+                                RegisterKind::RigidVar => &mut node.pool.rigid_var_ids,
+                            };
+                            vec.retain(|&v| v != var_id);
                         }
                     }
                     PoolUndoEntry::Unregister { region_idx, var_id } => {
-                        if region_idx < self.region_tree.nodes.len() {
-                            self.region_tree.nodes[region_idx].pool.var_ids.push(var_id);
+                        if let Some(node) = self.region_tree.nodes.get_mut(region_idx) {
+                            node.pool.var_ids.push(var_id);
                         }
                     }
                 }
@@ -2327,9 +2690,9 @@ impl InferenceContext {
     /// Discharge a suspended Match constraint: when the scrutinee's shape
     /// is known (unicity holds), add the matched branch's continuation
     /// constraints and remove the guard on the scrutinee variable.
-    pub fn discharge_match(
+    pub fn discharge_match<'input>(
         &mut self,
-        ctx: &mut TypeContext,
+        ctx: &mut TypeContext<'input>,
         scrutinee_ty: TypeId,
         branches_id: (usize, usize),
         heap: &mut BinaryHeap<PrioritizedConstraint>,
@@ -2386,18 +2749,46 @@ impl InferenceContext {
         self.gen_statuses.get(var_id).copied()
     }
 
+    /// Test-support setter for the generation status.  Mirrors the direct
+    /// field access the in-module unit tests use; guarded by a bounds check
+    /// (vars created via `new_type_var` always have an entry).  Undo-logged
+    /// like every other gen_statuses mutation, so snapshots stay consistent.
+    pub(crate) fn set_gen_status(&mut self, var_id: usize, status: GenStatus) {
+        if var_id < self.gen_statuses.len() {
+            let old = self.gen_statuses[var_id];
+            self.gen_statuses[var_id] = status;
+            self.push_undo(InferUndoLog::SetGenStatus(var_id, old));
+        }
+    }
+
     /// Mark a variable as guarded by a suspended constraint.
     /// Increments the reference-counted guard on the variable.
     pub fn add_guard(&mut self, var_id: usize) {
-        while self.guard_sets.len() <= var_id {
-            self.guard_sets.push(GuardSet::empty());
+        // Grow `guard_sets` to cover var_id.  This extension is deliberately
+        // NOT undo-logged: on rollback the vec keeps trailing empty entries,
+        // which are identity (`is_empty()` on GuardSet::empty()) and every
+        // consumer bounds-checks before reading, so the extra capacity is
+        // harmless.  `new_type_var` grows guard_sets and gen_statuses in
+        // lockstep, so var_id < gen_statuses.len() holds for tracked vars.
+        if self.guard_sets.len() <= var_id {
+            self.guard_sets.resize_with(var_id + 1, GuardSet::empty);
         }
         self.push_undo(InferUndoLog::AddGuard(var_id));
         self.guard_sets[var_id].add_guard();
+        debug_assert!(
+            self.is_guarded(var_id),
+            "add_guard: variable {var_id} must be guarded after add_guard"
+        );
+        // A guarded variable cannot be generalized (OmniML §6): reflect the
+        // guard in the gen status, and undo-log the status only when it
+        // ACTUALLY changes — an unconditional `SetGenStatus` undo would log
+        // no-op entries on the second add of an already-PG variable.
         if var_id < self.gen_statuses.len() {
             let old = self.gen_statuses[var_id];
-            self.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
-            self.push_undo(InferUndoLog::SetGenStatus(var_id, old));
+            if old != GenStatus::PartiallyGeneralizable {
+                self.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
+                self.push_undo(InferUndoLog::SetGenStatus(var_id, old));
+            }
         }
     }
 
@@ -2426,11 +2817,11 @@ impl InferenceContext {
         }
     }
 
-    pub fn solve(
+    pub fn solve<'input>(
         &mut self,
-        ctx: &mut TypeContext,
+        ctx: &mut TypeContext<'input>,
         trait_env: &TraitEnv,
-        symbols: &SymbolTable,
+        symbols: &SymbolTable<'input>,
     ) -> Result<(), TypeError> {
         // ── Build priority queue ────────────────────────────────────
         let mut heap: BinaryHeap<PrioritizedConstraint> = BinaryHeap::new();
@@ -2467,13 +2858,13 @@ impl InferenceContext {
                         // Compute var_ids unconditionally from the raw TypeData
                         // so they are available for Skolem env lookups even when
                         // the variable is treated as rigid (not a free InferVar).
-                        let a_var_id = match ctx.get(ra) {
-                            TypeData::InferVar { id } => Some(*id),
-                            _ => None,
+                        let (a_var_id, auniverse) = match ctx.get(ra) {
+                            TypeData::InferVar { id, universe, .. } => (Some(*id), Some(*universe)),
+                            _ => (None, None),
                         };
-                        let b_var_id = match ctx.get(rb) {
-                            TypeData::InferVar { id } => Some(*id),
-                            _ => None,
+                        let (b_var_id, buniverse) = match ctx.get(rb) {
+                            TypeData::InferVar { id, universe, .. } => (Some(*id), Some(*universe)),
+                            _ => (None, None),
                         };
                         let mut a_is_infer = a_var_id.is_some();
                         let mut b_is_infer = b_var_id.is_some();
@@ -2493,6 +2884,18 @@ impl InferenceContext {
                             && pc.env.contains_key(&id)
                         {
                             b_is_infer = false;
+                        }
+
+                        // Per-variable universe tracking (rustc): unifying two
+                        // InferVars from DIFFERENT universes — binding a
+                        // HIGHER-universe variable into a LOWER universe would
+                        // let a forall-introduced variable ESCAPE; reject.
+                        if a_is_infer && b_is_infer && auniverse != buniverse {
+                            return Err(TypeError::Mismatch {
+                                expected: ra,
+                                found: rb,
+                                span: crate::ast::Span::new(0, 0),
+                            });
                         }
 
                         // Level-based promotion (Fan, Xu & Xie 2025 §6.2):
@@ -2652,19 +3055,45 @@ impl InferenceContext {
                             {
                                 let resolved_ty = ctx.resolve_binding(self.var_type_ids[*var_id]);
                                 if !matches!(ctx.get(resolved_ty), TypeData::InferVar { .. }) {
-                                    // ── S-Generalize (OmniML §5.3) ──
-                                    self.force_generalize(ctx);
                                     self.s_inst_copy(ctx, *var_id, resolved_ty);
                                 }
                             }
-                            // ── S-Exists-Lower (OmniML §5.3) ──
-                            // For vars that remain PG (still have guards/waiting),
-                            // try Z3-backed semantic lowering if uniquely determined.
+                            // ── S-Generalize for eligible current vars ──
+                            // The sweep runs once per outer iteration (batched),
+                            // so a current var that is eligible for generalization
+                            // (resolved, unguarded, nothing waiting, no rigid
+                            // escape) is transitioned HERE — before
+                            // S-Exists-Lower — keeping the PG→G transition and
+                            // S-Inst-Copy deterministic instead of dependent on
+                            // whether an earlier transition in this iteration
+                            // already triggered a sweep.
                             if *var_id < self.gen_statuses.len()
                                 && self.gen_statuses[*var_id] == GenStatus::PartiallyGeneralizable
-                                && self.s_exists_lower(ctx, *var_id)
+                                && self.is_sweep_eligible(ctx, *var_id)
                             {
-                                // lowering succeeded
+                                let old = self.gen_statuses[*var_id];
+                                self.gen_statuses[*var_id] = GenStatus::Generalized;
+                                self.push_undo(InferUndoLog::SetGenStatus(*var_id, old));
+                                let resolved_ty = ctx.resolve_binding(self.var_type_ids[*var_id]);
+                                self.s_inst_copy(ctx, *var_id, resolved_ty);
+                            }
+                            // ── S-Exists-Lower (OmniML §5.3) ──
+                            // For vars that remain PG (still have guards/waiting),
+                            // try lowering if uniquely determined.  The syntactic
+                            // unicity check runs on the Eq constraints currently
+                            // in the heap (collected lazily — only for PG vars);
+                            // if that fails, the Z3-backed check runs internally.
+                            if *var_id < self.gen_statuses.len()
+                                && self.gen_statuses[*var_id] == GenStatus::PartiallyGeneralizable
+                            {
+                                let active: Vec<PrioritizedConstraint> = heap
+                                    .iter()
+                                    .filter(|pc| matches!(pc.constraint, Constraint::Eq(..)))
+                                    .cloned()
+                                    .collect();
+                                if self.s_exists_lower(ctx, *var_id, &pc.env, &active) {
+                                    // lowering succeeded
+                                }
                             }
                         }
                     }
@@ -2814,7 +3243,7 @@ impl InferenceContext {
                         //
                         // The SkolemVar uses `enter_universe` so that its
                         // `universe_num` can be checked by `check_skolem_escape`
-                        // on TypeContext, preventing the skolem from leaking
+                        // on TypeContext<'input>, preventing the skolem from leaking
                         // into outer scopes via generalization.
                         //
                         // The Skolem mapping is recorded in the constraint's
@@ -2829,7 +3258,7 @@ impl InferenceContext {
                             self.var_type_ids.len(),
                         );
                         if *var_id < self.var_type_ids.len() {
-                            let (_universe, skolem_ty) = ctx.enter_universe();
+                            let (universe, skolem_ty) = ctx.enter_universe();
                             let mut child_env = pc.env.clone();
                             child_env.insert(*var_id, skolem_ty);
                             let inner = constraint.as_ref().clone();
@@ -2993,49 +3422,85 @@ impl InferenceContext {
             // A Match constraint can be discharged when the scrutinee's shape
             // is uniquely determined by the context (unicity check).
             // This implements O'Brien, Rémy & Scherer §4.1, MATCH-CTX rule.
-            for pc in &heap.clone().into_sorted_vec() {
-                if let Constraint::Match {
-                    scrutinee,
-                    branches_id,
-                    span: _,
-                } = &pc.constraint
-                {
-                    let resolved = ctx.resolve_binding(*scrutinee);
-                    // Collect active constraints for UNI-VAR check
-                    let active: Vec<PrioritizedConstraint> = heap.iter().cloned().collect();
-                    // Only attempt discharge if scrutinee is resolved (not an InferVar)
-                    if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
-                        if let Some(shape) =
-                            Self::unicity_check(self, ctx, *scrutinee, &pc.env, &active)
-                        {
-                            let discharged = self.discharge_match(
-                                ctx,
-                                *scrutinee,
-                                *branches_id,
-                                &mut heap,
-                                &pc.env,
-                            );
-                            // If discharge succeeded, the Match constraint is still in the
-                            // original heap (we cloned above).  It will be re-processed in
-                            // the next iteration, but discharge_match is idempotent — the
-                            // continuation constraints are enqueued once and the second call
-                            // is a no-op.  If discharge failed, the constraint remains in the
-                            // heap and the convergence path below handles it.
-                            let _ = discharged;
+            // Cheap guard: skip the (allocation-heavy) clone/sort below when
+            // the heap contains no Match constraints at all.
+            if heap
+                .iter()
+                .any(|pc| matches!(pc.constraint, Constraint::Match { .. }))
+            {
+                for pc in &heap.clone().into_sorted_vec() {
+                    if let Constraint::Match {
+                        scrutinee,
+                        branches_id,
+                        span: _,
+                    } = &pc.constraint
+                    {
+                        let resolved = ctx.resolve_binding(*scrutinee);
+                        // Collect active constraints for UNI-VAR check
+                        let active: Vec<PrioritizedConstraint> = heap.iter().cloned().collect();
+                        // Only attempt discharge if scrutinee is resolved (not an InferVar)
+                        if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
+                            if let Some(shape) =
+                                Self::unicity_check(self, ctx, *scrutinee, &pc.env, &active)
+                            {
+                                let discharged = self.discharge_match(
+                                    ctx,
+                                    *scrutinee,
+                                    *branches_id,
+                                    &mut heap,
+                                    &pc.env,
+                                );
+                                // If discharge succeeded, the Match constraint is still in the
+                                // original heap (we cloned above).  It will be re-processed in
+                                // the next iteration, but discharge_match is idempotent — the
+                                // continuation constraints are enqueued once and the second call
+                                // is a no-op.  If discharge failed, the constraint remains in the
+                                // heap and the convergence path below handles it.
+                                let _ = discharged;
+                            }
+                        } else {
+                            // Scrutinee is still an InferVar — check unicity via bounds
+                            if let Some(_shape) =
+                                Self::unicity_check(self, ctx, *scrutinee, &pc.env, &active)
+                            {
+                                let discharged = self.discharge_match(
+                                    ctx,
+                                    *scrutinee,
+                                    *branches_id,
+                                    &mut heap,
+                                    &pc.env,
+                                );
+                                let _ = discharged;
+                            }
                         }
-                    } else {
-                        // Scrutinee is still an InferVar — check unicity via bounds
-                        if let Some(_shape) =
-                            Self::unicity_check(self, ctx, *scrutinee, &pc.env, &active)
-                        {
-                            let discharged = self.discharge_match(
-                                ctx,
-                                *scrutinee,
-                                *branches_id,
-                                &mut heap,
-                                &pc.env,
-                            );
-                            let _ = discharged;
+                    }
+                }
+            }
+
+            // ── Batch force_generalize (OmniML §5.3) ──────────────────
+            // One sweep per outer iteration (after the heap drains and the
+            // Match phase has removed guards), replacing the per-transition
+            // sweep in the Eq handler.  The sweep only sets the status, so
+            // for every var it transitions PG → Generalized we replicate
+            // S-Inst-Copy — otherwise forward-referenced instances of a
+            // sweep-transitioned var would keep unresolved InferVars.
+            if !self.dirty_set.is_empty() {
+                let swept: Vec<usize> = self
+                    .dirty_set
+                    .iter()
+                    .copied()
+                    .filter(|i| {
+                        self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable)
+                    })
+                    .collect();
+                self.force_generalize_for_regions(ctx, &[], None);
+                for var_id in swept {
+                    if self.gen_statuses.get(var_id) == Some(&GenStatus::Generalized)
+                        && let Some(ty_id) = self.var_type_ids.get(var_id)
+                    {
+                        let resolved_ty = ctx.resolve_binding(*ty_id);
+                        if !matches!(ctx.get(resolved_ty), TypeData::InferVar { .. }) {
+                            self.s_inst_copy(ctx, var_id, resolved_ty);
                         }
                     }
                 }
@@ -3045,12 +3510,16 @@ impl InferenceContext {
             // After processing all active constraints, check if any variables
             // were resolved. If so, wake their wait-listed constraints and
             // continue solving (OmniML bidirectional flow §3.2).
+            // Only vars with non-empty wait lists can be woken, so the
+            // (potentially chain-walking) resolve_binding is gated on the
+            // cheap wait-list check first — the wake behavior is unchanged.
             let mut woken = 0usize;
-            for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
-                let resolved = ctx.resolve_binding(ty_id);
-                if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
-                    // This variable was resolved — wake its suspended constraints
-                    if i < self.wait_lists.len() && !self.wait_lists[i].is_empty() {
+            for i in 0..self.var_type_ids.len() {
+                let ty_id = self.var_type_ids[i];
+                if i < self.wait_lists.len() && !self.wait_lists[i].is_empty() {
+                    let resolved = ctx.resolve_binding(ty_id);
+                    if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
+                        // This variable was resolved — wake its suspended constraints
                         let suspended = std::mem::take(&mut self.wait_lists[i]);
                         let count = suspended.len();
                         for (c, env) in suspended {
@@ -3077,7 +3546,9 @@ impl InferenceContext {
                             let guards_empty =
                                 i < self.guard_sets.len() && self.guard_sets[i].is_empty();
                             if guards_empty {
+                                let old = self.gen_statuses[i];
                                 self.gen_statuses[i] = GenStatus::Generalized;
+                                self.push_undo(InferUndoLog::SetGenStatus(i, old));
                             }
                         }
                         woken += count;
@@ -3152,7 +3623,14 @@ impl InferenceContext {
 
         // Kind checking: ensure that solved types respect the variable's kind
         for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
-            let resolved = ctx.resolve_binding(ty_id);
+            let mut resolved = ctx.resolve_binding(ty_id);
+            // A refined type (`exists n: T invariant P(n)`) has the CARRIER's
+            // kind — `exists n: Int<32> invariant n != 0` IS an integer type
+            // (SYNTAX.md: the binder "is erased at runtime"; the invariant is
+            // verified at construction points, not by the kind check).
+            if let TypeData::Exists { base, .. } = ctx.get(resolved) {
+                resolved = *base;
+            }
             let data = ctx.get(resolved);
             if let TypeData::InferVar { .. } = data {
                 continue; // will be defaulted below
@@ -3258,13 +3736,13 @@ impl InferenceContext {
         &self.var_origins
     }
 
-    pub fn finalize(&self, ctx: &mut TypeContext) -> HashMap<usize, TypeId> {
+    pub fn finalize<'input>(&self, ctx: &mut TypeContext<'input>) -> HashMap<usize, TypeId> {
         let mut solution = HashMap::default();
         for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
             let resolved = ctx.resolve_binding(ty_id);
             let data = ctx.get(resolved);
             match data {
-                TypeData::InferVar { id } => {
+                TypeData::InferVar { id, .. } => {
                     // Variable is still unbound — try to infer from bounds
                     let var_id = *id;
                     let lbs: &[TypeId] = if var_id < self.lower_bounds.len() {
@@ -3322,7 +3800,10 @@ impl InferenceContext {
     ///
     /// Returns a list of (region_id, var_id) pairs for variables that
     /// were successfully generalized.
-    pub fn force_root_generalization(&mut self, ctx: &mut TypeContext) -> Vec<(usize, usize)> {
+    pub fn force_root_generalization<'input>(
+        &mut self,
+        ctx: &mut TypeContext<'input>,
+    ) -> Vec<(usize, usize)> {
         let mut generalized = Vec::new();
         // Collect all region IDs that have alive pools or are dirty.
         let mut region_ids: Vec<InferRegionId> = {
@@ -3351,10 +3832,10 @@ impl InferenceContext {
     /// Generalize a single region: iterate over its pool's type variables,
     /// check if each is guarded, and if not, mark as Generic and remove
     /// from the pool.
-    fn generalize_region(
+    fn generalize_region<'input>(
         &mut self,
         region_id: InferRegionId,
-        ctx: &mut TypeContext,
+        ctx: &mut TypeContext<'input>,
         out: &mut Vec<(usize, usize)>,
     ) {
         let var_ids: Vec<usize> = self.region_tree.nodes[region_id.0].pool.var_ids.clone();
@@ -3386,12 +3867,13 @@ impl InferenceContext {
                 // region is exited (or when guards are discharged).
                 if let Some(parent_id) = self.region_tree.nodes[region_id.0].parent {
                     let parent = parent_id;
-                    // Unregister from current region, register in parent.
-                    self.region_tree.nodes[region_id.0]
-                        .pool
-                        .var_ids
-                        .retain(|&v| v != var_id);
-                    self.region_tree.nodes[parent.0].pool.var_ids.push(var_id);
+                    // Route through the registered pool API so `var_to_region`
+                    // and the pool undo log stay consistent — never mutate
+                    // `pool.var_ids` directly (a direct retain+push would
+                    // leave `var_to_region` stale and the PG move
+                    // un-rollbackable).
+                    self.region_tree.unregister_var(var_id, region_id);
+                    self.region_tree.register_var_in_region(var_id, parent);
                     self.type_vars[var_id].region_id = parent;
                 }
                 // If there is no parent (root region), the variable stays
@@ -3403,14 +3885,19 @@ impl InferenceContext {
                 // Not guarded — can be generalized.
                 // Update the gen_status if it exists.
                 if var_id < self.gen_statuses.len() {
+                    let old = self.gen_statuses[var_id];
                     self.gen_statuses[var_id] = GenStatus::Generalized;
+                    self.push_undo(InferUndoLog::SetGenStatus(var_id, old));
                 }
                 // When a variable is generalized, update its instances.
                 // BUT: only mark an instance as Generalized if it is NOT
                 // itself still guarded (OmniML §6: a variable can become
                 // Generic only when all its constraints are resolved).
                 if var_id < self.forward_refs.len() {
-                    for &inst_id in &self.forward_refs[var_id] {
+                    // Copy the instance list so the (mutable) push_undo
+                    // below does not conflict with the iteration borrow.
+                    let instance_ids: Vec<usize> = self.forward_refs[var_id].clone();
+                    for inst_id in instance_ids {
                         // Check if the instance is still guarded.
                         let inst_guarded = if inst_id < self.guard_sets.len() {
                             !self.guard_sets[inst_id].is_empty()
@@ -3425,7 +3912,9 @@ impl InferenceContext {
                         // Only promote if the instance is not guarded and not PG.
                         if !inst_guarded && !inst_pg {
                             if inst_id < self.gen_statuses.len() {
+                                let old = self.gen_statuses[inst_id];
                                 self.gen_statuses[inst_id] = GenStatus::Generalized;
+                                self.push_undo(InferUndoLog::SetGenStatus(inst_id, old));
                             }
                             // Remove the instance from its region's pool.
                             // Generalized variables must not belong to any pool
@@ -3433,11 +3922,13 @@ impl InferenceContext {
                             // removed from its pool").
                             if inst_id < self.type_vars.len() {
                                 let inst_region = self.type_vars[inst_id].region_id;
-                                if inst_region.0 < self.region_tree.nodes.len() {
-                                    self.region_tree.nodes[inst_region.0]
+                                if inst_region.0 < self.region_tree.nodes.len()
+                                    && self.region_tree.nodes[inst_region.0]
                                         .pool
                                         .var_ids
-                                        .retain(|&v| v != inst_id);
+                                        .contains(&inst_id)
+                                {
+                                    self.region_tree.unregister_var(inst_id, inst_region);
                                 }
                             }
                         }
@@ -3446,19 +3937,26 @@ impl InferenceContext {
                 out.push((region_id.0, var_id));
             }
         }
-        // Remove generalized variables from the pool.
-        self.region_tree.nodes[region_id.0]
-            .pool
-            .var_ids
-            .retain(|v| !out.iter().any(|(_, vid)| vid == v));
+        // Remove generalized variables from the pool — through the
+        // registered API so `var_to_region` and the undo log stay
+        // consistent.
+        for (_, vid) in out.iter() {
+            if self.region_tree.nodes[region_id.0]
+                .pool
+                .var_ids
+                .contains(vid)
+            {
+                self.region_tree.unregister_var(*vid, region_id);
+            }
+        }
         // Mark the region as processed.
         self.region_tree.nodes[region_id.0].dirty = false;
     }
 
-    pub fn apply_solution(
+    pub fn apply_solution<'input>(
         ty: TypeId,
         solution: &HashMap<usize, TypeId>,
-        ctx: &TypeContext,
+        ctx: &TypeContext<'input>,
     ) -> TypeId {
         replace_infer(ty, solution, ctx)
     }
@@ -3466,7 +3964,7 @@ impl InferenceContext {
     /// Check for inference variables that remain unresolved and were
     /// defaulted to `error` (unconstrained/any kind). Returns a list of
     /// diagnostic messages describing the ambiguous variables.
-    pub fn check_unresolved(&self, ctx: &TypeContext) -> Vec<String> {
+    pub fn check_unresolved<'input>(&self, ctx: &TypeContext<'input>) -> Vec<String> {
         let mut results = Vec::new();
         for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
             let resolved = ctx.resolve_binding(ty_id);
@@ -3489,15 +3987,15 @@ impl Default for InferenceContext {
     }
 }
 
-pub(crate) fn replace_infer(
+pub(crate) fn replace_infer<'input>(
     ty: TypeId,
     solution: &HashMap<usize, TypeId>,
-    ctx: &TypeContext,
+    ctx: &TypeContext<'input>,
 ) -> TypeId {
     let resolved = ctx.resolve_binding(ty);
     let data = ctx.get(resolved).clone();
     match data {
-        TypeData::InferVar { id } => solution.get(&id).copied().unwrap_or(ty),
+        TypeData::InferVar { id, .. } => solution.get(&id).copied().unwrap_or(ty),
         TypeData::SkolemVar { .. } => ty,
         TypeData::Int { .. }
         | TypeData::UInt { .. }
@@ -3580,11 +4078,12 @@ pub(crate) fn replace_infer(
             ctx.find_type(&TypeData::Slice { elem: new_elem })
                 .unwrap_or(ctx.error())
         }
-        TypeData::Ref { ty, mutable } => {
+        TypeData::Ref { ty, mutable, .. } => {
             let new_ty = replace_infer(ty, solution, ctx);
             ctx.find_type(&TypeData::Ref {
                 ty: new_ty,
                 mutable,
+                lifetime: None,
             })
             .unwrap_or(ctx.error())
         }
@@ -3708,7 +4207,7 @@ pub(crate) fn replace_infer(
 mod tests {
     use super::*;
 
-    fn new_ctx() -> TypeContext {
+    fn new_ctx() -> TypeContext<'static> {
         TypeContext::new()
     }
 
@@ -3753,7 +4252,7 @@ mod tests {
         );
         // Extract the var ID from the InferVar type
         let var_id = match ctx.get(var) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         infer.suspend_on_var(
@@ -3781,7 +4280,7 @@ mod tests {
             VarOrigin::Synthetic,
         );
         let var_id = match ctx.get(var) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         infer.suspend_on_var(
@@ -3821,7 +4320,7 @@ mod tests {
             VarOrigin::Synthetic,
         );
         let var_id = match ctx.get(var) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         assert!(infer.get_var_level(var_id).unwrap_or(0) > 0);
@@ -3876,7 +4375,7 @@ mod tests {
     fn test_match_constraint_priority() {
         let mut ctx = TypeContext::new();
         let infer = InferenceContext::new();
-        let var = ctx.alloc_infer_var(0);
+        let var = ctx.alloc_infer_var(0, 0);
         // Match constraint on an InferVar → low priority (6)
         let match_c = Constraint::Match {
             scrutinee: var,
@@ -3934,7 +4433,7 @@ mod tests {
             VarOrigin::Synthetic,
         );
         let pg_id = match ctx.get(pg_var) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         let inst1 = infer.new_type_var(
@@ -3943,7 +4442,7 @@ mod tests {
             VarOrigin::Synthetic,
         );
         let inst1_id = match ctx.get(inst1) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         // Register the instance
@@ -4416,7 +4915,7 @@ mod tests {
         // Create a variable at the current deep level
         let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         let deep_level = infer.get_var_level(var_id).unwrap();
@@ -4428,7 +4927,7 @@ mod tests {
         // The old var should now be bound to the promoted var (via infer.resolve)
         let resolved = infer.resolve(var, &ctx);
         assert!(
-            matches!(ctx.get(resolved), TypeData::InferVar { id } if *id != var_id),
+            matches!(ctx.get(resolved), TypeData::InferVar { id, .. } if *id != var_id),
             "original var should be bound to a new InferVar"
         );
     }
@@ -4440,7 +4939,7 @@ mod tests {
         // Variable at level 0 (default)
         let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         // Try to promote to level 0 — no-op since already at level 0
@@ -4448,7 +4947,7 @@ mod tests {
         assert!(promoted.is_some(), "should return the existing var");
         let resolved = ctx.resolve_binding(var);
         assert!(
-            matches!(ctx.get(resolved), TypeData::InferVar { id } if *id == var_id),
+            matches!(ctx.get(resolved), TypeData::InferVar { id, .. } if *id == var_id),
             "should be unchanged"
         );
     }
@@ -4467,7 +4966,7 @@ mod tests {
         // Create a variable at a deep level
         let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         let deep_level = infer.get_var_level(var_id).unwrap();
@@ -4512,7 +5011,7 @@ mod tests {
         // Also set up a forward reference (simulating instance tracking)
         let inst = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let inst_id = match ctx.get(inst) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         infer.register_instance(var_id, inst_id);
@@ -4529,7 +5028,7 @@ mod tests {
 
         // The promoted TypeId corresponds to the new variable
         let new_id = match ctx.get(promoted.unwrap()) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         assert_ne!(new_id, var_id, "new var must be different from old");
@@ -4609,7 +5108,7 @@ mod tests {
         let mut infer = InferenceContext::new();
         let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         // Set PG status and add a suspended constraint (wait list not empty)
@@ -4641,7 +5140,7 @@ mod tests {
         let mut infer = InferenceContext::new();
         let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         infer.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
@@ -4665,7 +5164,7 @@ mod tests {
         let prev = infer.enter_level();
         let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         infer.exit_level(prev);
@@ -4718,13 +5217,13 @@ mod tests {
         let mut infer = InferenceContext::new();
         let pg = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let pg_id = match ctx.get(pg) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         // Create an instance
         let inst = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let inst_id = match ctx.get(inst) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         infer.register_instance(pg_id, inst_id);
@@ -4761,12 +5260,12 @@ mod tests {
         let mut infer = InferenceContext::new();
         let pg = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let pg_id = match ctx.get(pg) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         let inst = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let inst_id = match ctx.get(inst) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         infer.register_instance(pg_id, inst_id);
@@ -4792,14 +5291,14 @@ mod tests {
         let prev = infer.enter_level();
         let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         // S-Exists-Lower requires PG status and level > current_level
         infer.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
         // exit_level so current_level drops below the var's level
         infer.exit_level(prev);
-        let lowered = infer.s_exists_lower(&mut ctx, var_id);
+        let lowered = infer.s_exists_lower(&mut ctx, var_id, &SkolemEnv::default(), &[]);
         assert!(lowered, "S-Exists-Lower should succeed");
         assert_eq!(
             infer.gen_statuses[var_id],
@@ -4893,7 +5392,7 @@ mod tests {
         // Create an infer var and try_match via shape var (should suspend)
         let infer_var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(infer_var) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         let mut heap = std::collections::BinaryHeap::new();
@@ -4950,7 +5449,7 @@ mod tests {
         let _prev = infer.enter_level();
         let x = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let x_id = match ctx.get(x) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         assert!(
@@ -4989,7 +5488,7 @@ mod tests {
         let _r1 = infer.enter_level(); // → leaf_A1
         let a_deep = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let a_deep_id = match ctx.get(a_deep) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         infer.exit_level(_r1); // back to branch_A
@@ -5000,7 +5499,7 @@ mod tests {
         let _r3 = infer.enter_level(); // → leaf_B1
         let b_deep = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let b_deep_id = match ctx.get(b_deep) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         infer.exit_level(_r3); // back to branch_B
@@ -5106,7 +5605,7 @@ mod tests {
         let child_region = infer.region_tree.current;
         let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
         let var_id = match ctx.get(var) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
         // The variable should be in the child region's pool
@@ -5123,7 +5622,7 @@ mod tests {
         let promoted = infer.try_promote_var(&mut ctx, var_id, root);
         assert!(promoted.is_some(), "try_promote_var should succeed");
         let promoted_id = match ctx.get(promoted.unwrap()) {
-            TypeData::InferVar { id } => *id,
+            TypeData::InferVar { id, .. } => *id,
             _ => unreachable!(),
         };
 
@@ -5469,6 +5968,135 @@ mod tests {
             vec![1, 2],
             "rollback: pool should be restored to [1, 2], got {:?}",
             tree.nodes[root.0].pool.var_ids,
+        );
+    }
+
+    // ── gen_statuses undo discipline ──────────────────────────────
+    // Every gen_statuses mutation must be undo-logged: a rollback after
+    // a sweep / lowering / solve mutation must restore the status to its
+    // pre-snapshot value, keeping it consistent with the rolled-back
+    // guard_sets / forward_refs.
+
+    #[test]
+    fn test_rollback_restores_gen_status_after_force_generalize() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let var_id = match ctx.get(var) {
+            TypeData::InferVar { id, .. } => *id,
+            _ => unreachable!(),
+        };
+        // PG without guards (the state after transitive guard removal) —
+        // a guarded var is skipped by the sweep.
+        infer.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
+        let int32 = ctx.int(32, true);
+        ctx.set_binding(var, int32);
+
+        let snap = infer.start_snapshot();
+        infer.force_generalize(&mut ctx);
+        assert_eq!(
+            infer.gen_statuses[var_id],
+            GenStatus::Generalized,
+            "sweep must generalize the eligible var"
+        );
+        infer.rollback_to(snap);
+        assert_eq!(
+            infer.gen_statuses[var_id],
+            GenStatus::PartiallyGeneralizable,
+            "rollback must restore the PG status, not leave a stale Generalized"
+        );
+    }
+
+    #[test]
+    fn test_rollback_restores_gen_status_after_s_exists_lower() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let var_id = match ctx.get(var) {
+            TypeData::InferVar { id, .. } => *id,
+            _ => unreachable!(),
+        };
+        infer.add_guard(var_id); // PG + guard
+        let int32 = ctx.int(32, true);
+        ctx.set_binding(var, int32);
+
+        let snap = infer.start_snapshot();
+        let lowered = infer.s_exists_lower(&ctx, var_id, &SkolemEnv::default(), &[]);
+        assert!(lowered, "resolved PG var must be lowered via UNI-TYPE");
+        assert_eq!(
+            infer.gen_statuses[var_id],
+            GenStatus::Ungeneralized,
+            "lowering must set Ungeneralized"
+        );
+        infer.rollback_to(snap);
+        assert_eq!(
+            infer.gen_statuses[var_id],
+            GenStatus::PartiallyGeneralizable,
+            "rollback must restore the PG status after a lowering"
+        );
+    }
+
+    /// The user-visible scenario: a snapshot open across a solve() that
+    /// generalizes a current var (step 3.5) and copies it to instances.
+    /// Rollback must revert the status AND the forward_refs/instance
+    /// statuses together — no stale Generalized with restored instances.
+    #[test]
+    fn test_rollback_after_solve_restores_gen_statuses() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let symbols = SymbolTable::new(crate::hir::types::CrateId(DefId(0)));
+        let trait_env = TraitEnv::new();
+
+        let pg_var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let pg_id = match ctx.get(pg_var) {
+            TypeData::InferVar { id, .. } => *id,
+            _ => unreachable!(),
+        };
+        let instance = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let inst_id = match ctx.get(instance) {
+            TypeData::InferVar { id, .. } => *id,
+            _ => unreachable!(),
+        };
+        // PG without guards (the state after transitive guard removal),
+        // with a registered instance.  Set BEFORE the snapshot so the
+        // rollback has to undo only the solve-loop mutations.
+        infer.gen_statuses[pg_id] = GenStatus::PartiallyGeneralizable;
+        infer.register_instance(pg_id, inst_id);
+        let int32 = ctx.int(32, true);
+        infer.add_constraint(Constraint::Eq(
+            pg_var,
+            int32,
+            crate::ast::Span::new(0, 0),
+            EqOrigin::Normal,
+        ));
+
+        let snap = infer.start_snapshot();
+        let result = infer.solve(&mut ctx, &trait_env, &symbols);
+        assert!(result.is_ok(), "solve should succeed, got {:?}", result);
+        assert_eq!(
+            infer.gen_statuses[pg_id],
+            GenStatus::Generalized,
+            "eligible current var must be generalized during solve"
+        );
+        assert!(
+            infer.forward_refs[pg_id].is_empty(),
+            "s_inst_copy clears forward_refs after propagating"
+        );
+
+        infer.rollback_to(snap);
+        assert_eq!(
+            infer.gen_statuses[pg_id],
+            GenStatus::PartiallyGeneralizable,
+            "rollback must restore PG — a stale Generalized would desync with the restored forward_refs"
+        );
+        assert!(
+            infer.forward_refs[pg_id].contains(&inst_id),
+            "rollback must restore the instance registration"
+        );
+        assert_eq!(
+            infer.gen_statuses[inst_id],
+            GenStatus::PartialInstance,
+            "rollback must restore the instance's PartialInstance status"
         );
     }
 }

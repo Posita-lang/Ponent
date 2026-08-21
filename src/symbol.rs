@@ -24,12 +24,18 @@ use std::fmt;
 /// references consolidated into this module.  The implementation
 /// here includes `resolve_ref` which the fork lacked.
 /// ──────────────────────────────────────────────────────────────
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Symbol(u32);
 
 impl Symbol {
     /// The invalid / sentinel symbol (used for errors, uninitialised slots).
     pub const INVALID: Symbol = Symbol(u32::MAX);
+
+    /// The underlying interner index (used by the Polonius fact extractor
+    /// to encode variables as plain integers).
+    pub fn to_u32(self) -> u32 {
+        self.0
+    }
 
     /// Create a new interned symbol from a string slice.
     /// If the string has already been interned, returns the existing symbol.

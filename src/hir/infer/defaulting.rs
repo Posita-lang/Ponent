@@ -34,8 +34,8 @@ use crate::hir::types::{TypeContext, TypeData, TypeError, TypeId};
 /// * `Ok(())` — All variables were successfully defaulted or skipped.
 /// * `Err(TypeError::CannotInfer { span })` — An `Any`/`Unconstrained` variable
 ///   with `Expression(Some(span))` origin could not be resolved.
-pub fn default_variables(
-    ctx: &mut TypeContext,
+pub fn default_variables<'input>(
+    ctx: &mut TypeContext<'input>,
     var_type_ids: &[TypeId],
     type_vars: &[(TypeVariableKind, VarOrigin)],
     gen_statuses: &[GenStatus],

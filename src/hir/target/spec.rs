@@ -18,6 +18,10 @@ pub enum OverflowPolicy {
     Wrap,
     #[serde(rename = "saturate")]
     Saturate,
+    /// IEEE 754 semantics for floats (`with overflow = ieee` — explicit
+    /// opt-in; the default is `trap` per the committee ruling).
+    #[serde(rename = "ieee")]
+    Ieee,
 }
 
 /// A complete target specification, serializable to/from JSON.

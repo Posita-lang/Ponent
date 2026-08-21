@@ -16,8 +16,10 @@ mod ast;
 mod cli;
 mod diagnostics;
 mod hir {
+    pub mod bii;
     pub mod builtins;
     pub mod cfg;
+    pub mod cfg_graph;
     pub mod checker;
     pub mod comptime;
     pub mod generate;
@@ -25,6 +27,11 @@ mod hir {
     pub mod infer;
     #[cfg(test)]
     mod infer_tests;
+    pub mod loop_infer;
+    pub(crate) mod loop_ir;
+    pub(crate) mod octagon;
+    pub mod place;
+    pub mod polonius;
     pub mod query;
     pub mod resolver;
     pub mod shape_var;
@@ -77,6 +84,56 @@ fn make_emitter(json: bool) -> Box<dyn DiagnosticEmitter> {
     } else {
         Box::new(ColoredEmitter::new())
     }
+}
+
+/// Phase 1 (generate expansion) → name resolution → Phase 2 (generate
+/// expansion with resolution) → incremental resolution — all inside one
+/// function so each phase's `&mut ctx` borrow is scoped sequentially.
+fn resolve_and_expand<'input>(
+    ctx: &mut TypeContext<'input>,
+    program: ast::Program<'input>,
+    local_crate_id: CrateId,
+    source: &str,
+    file_name: &str,
+) -> (
+    ast::Program<'input>,
+    hir::symbol::SymbolTable<'input>,
+    hir::traits::TraitEnv<'input>,
+    Vec<Diagnostic>,
+    hir::resolver::ResolutionMap<'input>,
+) {
+    // Phase 1: expand `generate` blocks before name resolution.
+    let mut expander = hir::generate::GenerateExpander::new_phase1(ctx);
+    let (expanded_items, _) = expander.expand_program(program.items);
+    let program = ast::Program {
+        items: expanded_items,
+        span: program.span,
+    };
+    // Name resolution (the resolver's `&mut ctx` borrow ends here).
+    let (symbols, trait_env, resolver_diags, resolution_map) = {
+        let mut resolver = NameResolver::new(ctx, local_crate_id);
+        resolver.resolve_program(&program)
+    };
+    let mut all_diags = resolver_diags.into_inner();
+    attach_source_to_diags(&mut all_diags, source, file_name);
+    // Phase 2: expand with name resolution complete.
+    let mut expander = hir::generate::GenerateExpander::new_phase2(ctx, &symbols);
+    let (expanded_items, new_items) = expander.expand_program(program.items);
+    let program = ast::Program {
+        items: expanded_items,
+        span: program.span,
+    };
+    // Incremental resolution for newly expanded items.
+    let (symbols, trait_env, resolver_diags, resolution_map) = if !new_items.is_empty() {
+        let mut resolver = NameResolver::new(ctx, local_crate_id);
+        resolver.resolve_incremental(&new_items, symbols, trait_env, resolution_map)
+    } else {
+        (symbols, trait_env, DiagCtxt::new(), resolution_map)
+    };
+    let mut phase2_diags = resolver_diags.into_inner();
+    attach_source_to_diags(&mut phase2_diags, source, file_name);
+    all_diags.extend(phase2_diags);
+    (program, symbols, trait_env, all_diags, resolution_map)
 }
 
 /// Resolve a target from CLI argument: load a JSON file, look up a builtin,
@@ -168,7 +225,8 @@ fn main() {
                     process::exit(1);
                 }
             };
-            let mut parser = parser::Parser::new(&source);
+            let arena = bumpalo::Bump::new();
+            let mut parser = parser::Parser::new(&source, &arena);
             match parser.parse_program() {
                 Ok(program) => {
                     if ast {
@@ -185,55 +243,17 @@ fn main() {
                             }
                         };
                         let mut ctx = TypeContext::new_with_target(target);
+                        ctx.arena = Some(&arena);
                         let local_crate_id = CrateId(DefId(0));
 
-                        // Expand `generate` blocks before name resolution,
-                        // so the resolver sees only concrete declarations.
-                        let mut expander = hir::generate::GenerateExpander::new_phase1(&mut ctx);
-                        let (expanded_items, _) = expander.expand_program(program.items);
-                        let program = ast::Program {
-                            items: expanded_items,
-                            span: program.span,
-                        };
-
-                        let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
-                        let (symbols, mut trait_env, resolver_diags, resolution_map) =
-                            resolver.resolve_program(&program);
-                        let mut all_diags = resolver_diags.into_inner();
+                        // Phase 1 → resolve → Phase 2 → incremental resolve,
+                        // all inside a helper so each phase's `&mut ctx`
+                        // borrow is scoped (the helper takes `ctx` once and
+                        // the phases reborrow it sequentially).
+                        let (program, symbols, mut trait_env, all_diags, resolution_map) =
+                            resolve_and_expand(&mut ctx, program, local_crate_id, &source, &file);
+                        let mut all_diags = all_diags;
                         attach_source_to_diags(&mut all_diags, &source, &file);
-
-                        // Phase 2: expand `generate` blocks with name resolution
-                        // complete — `@typeInfo!` can now return real type data.
-                        let mut expander =
-                            hir::generate::GenerateExpander::new_phase2(&mut ctx, &symbols);
-                        let (expanded_items, new_items) = expander.expand_program(program.items);
-                        let program = ast::Program {
-                            items: expanded_items,
-                            span: program.span,
-                        };
-
-                        // Phase 2 expansion may have introduced new AST nodes
-                        // (e.g. from conditional branches).  Re-run the resolver
-                        // so that any new type/function references are resolved
-                        // before type checking.
-                        let (symbols, mut trait_env, resolver_diags, resolution_map) =
-                            if !new_items.is_empty() {
-                                // Incremental resolution: only process the newly expanded
-                                // items, reusing the existing symbol table from Phase 1.
-                                let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
-                                resolver.resolve_incremental(
-                                    &new_items,
-                                    symbols,
-                                    trait_env,
-                                    resolution_map,
-                                )
-                            } else {
-                                // No new items — keep the Phase 1 results unchanged.
-                                (symbols, trait_env, DiagCtxt::new(), resolution_map)
-                            };
-                        let mut phase2_diags = resolver_diags.into_inner();
-                        attach_source_to_diags(&mut phase2_diags, &source, &file);
-                        all_diags.extend(phase2_diags);
 
                         let has_main = resolution_map.has_main;
                         let mut checker = TypeChecker::new_with_source(
@@ -320,7 +340,8 @@ fn main() {
                     process::exit(1);
                 }
             };
-            let mut parser = parser::Parser::new(&source);
+            let arena = bumpalo::Bump::new();
+            let mut parser = parser::Parser::new(&source, &arena);
             let program = match parser.parse_program() {
                 Ok(p) => p,
                 Err(mut diagnostics) => {
@@ -341,6 +362,7 @@ fn main() {
                 }
             };
             let mut ctx = TypeContext::new_with_target(target);
+            ctx.arena = Some(&arena);
             let local_crate_id = CrateId(DefId(0));
             let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
             let (symbols, mut trait_env, resolver_diags, resolution_map) =

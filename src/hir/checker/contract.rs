@@ -1,4 +1,4 @@
-use super::*;
+use crate::hir::types::TypeId;
 
 /// A predicate over machine state in SCAP (Feng & Shao 2006 §4.1).
 ///
@@ -50,7 +50,7 @@ impl Predicate {
 /// If a function has multiple return points, g covers all traces from
 /// the current point to any return point.
 #[derive(Debug, Clone)]
-pub struct Guarantee {
+pub struct Guarantee<'input> {
     /// Precondition: predicate over the pre-call machine state.
     pub pre: Predicate,
     /// Postcondition: predicate over the post-return machine state.
@@ -60,10 +60,10 @@ pub struct Guarantee {
     /// Original AST expression of the ensures clause, used for the
     /// semantic-equivalence fast path.  `None` if the fast path is not
     /// applicable (e.g. non-trivial ensures).
-    pub ast_expr: Option<Box<crate::ast::Expr>>,
+    pub ast_expr: Option<Box<crate::ast::Expr<'input>>>,
 }
 
-impl Guarantee {
+impl<'input> Guarantee<'input> {
     /// Construct a guarantee from explicit pre/post predicates and an
     /// optional frame type.
     pub fn new(pre: Predicate, post: Predicate, frame: Option<TypeId>) -> Self {
@@ -81,7 +81,7 @@ impl Guarantee {
         pre: Predicate,
         post: Predicate,
         frame: Option<TypeId>,
-        ast_expr: Option<Box<crate::ast::Expr>>,
+        ast_expr: Option<Box<crate::ast::Expr<'input>>>,
     ) -> Self {
         Guarantee {
             pre,
@@ -142,27 +142,27 @@ impl Guarantee {
 ///     S′.R($ra) ∈ dom(Ψ) ∧ p′ S′ ∧ WFST(n−1, g′, S′, Ψ)
 ///     where (p′, g′) = Ψ(S′.R($ra))
 #[derive(Debug, Clone)]
-pub struct GuaranteeChain {
-    pub stack: Vec<Guarantee>,
+pub struct GuaranteeChain<'input> {
+    pub stack: Vec<Guarantee<'input>>,
 }
 
-impl GuaranteeChain {
+impl<'input> GuaranteeChain<'input> {
     pub fn new() -> Self {
         GuaranteeChain { stack: Vec::new() }
     }
 
     /// Push a callee's guarantee onto the chain (SCAP CALL rule).
-    pub fn push(&mut self, g: Guarantee) {
+    pub fn push(&mut self, g: Guarantee<'input>) {
         self.stack.push(g);
     }
 
     /// Pop the innermost guarantee on return (SCAP RET rule).
-    pub fn pop(&mut self) -> Option<Guarantee> {
+    pub fn pop(&mut self) -> Option<Guarantee<'input>> {
         self.stack.pop()
     }
 
     /// The current (innermost) guarantee, if any.
-    pub fn current(&self) -> Option<&Guarantee> {
+    pub fn current(&self) -> Option<&Guarantee<'input>> {
         self.stack.last()
     }
 

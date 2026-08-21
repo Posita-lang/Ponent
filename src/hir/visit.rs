@@ -10,16 +10,16 @@ use crate::hir::types::TypeId;
 pub trait HirVisitor {
     type Result;
 
-    fn visit_hir_expr(&mut self, expr: &HirExpr) -> Self::Result {
+    fn visit_hir_expr<'input>(&mut self, expr: &HirExpr<'input>) -> Self::Result {
         walk_hir_expr(self, expr)
     }
-    fn visit_hir_stmt(&mut self, stmt: &HirStmt) -> Self::Result {
+    fn visit_hir_stmt<'input>(&mut self, stmt: &HirStmt<'input>) -> Self::Result {
         walk_hir_stmt(self, stmt)
     }
-    fn visit_hir_pattern(&mut self, pat: &HirPattern) -> Self::Result {
+    fn visit_hir_pattern(&mut self, pat: &HirPattern<'input>) -> Self::Result {
         walk_hir_pattern(self, pat)
     }
-    fn visit_hir_param(&mut self, param: &HirParam) -> Self::Result {
+    fn visit_hir_param<'input>(&mut self, param: &HirParam<'input>) -> Self::Result {
         walk_hir_param(self, param)
     }
     fn visit_type_id(&mut self, _ty: TypeId) -> Self::Result {
@@ -35,7 +35,7 @@ pub trait HirVisitor {
 
 // ── Walk functions ───────────────────────────────────────────────
 
-pub fn walk_hir_expr<V: HirVisitor>(visitor: &mut V, expr: &HirExpr) -> V::Result {
+pub fn walk_hir_expr<V: HirVisitor, 'input>(visitor: &mut V, expr: &HirExpr<'input>) -> V::Result {
     match expr {
         HirExpr::Literal(lit, ty, _) => {
             visitor.visit_type_id(*ty)?;
@@ -192,7 +192,7 @@ pub fn walk_hir_expr<V: HirVisitor>(visitor: &mut V, expr: &HirExpr) -> V::Resul
     }
 }
 
-pub fn walk_hir_stmt<V: HirVisitor>(visitor: &mut V, stmt: &HirStmt) -> V::Result {
+pub fn walk_hir_stmt<V: HirVisitor, 'input>(visitor: &mut V, stmt: &HirStmt<'input>) -> V::Result {
     match stmt {
         HirStmt::VariableDef { name, value, pattern, else_branch, ty, .. } => {
             if let Some(ref n) = name { visitor.visit_ident(n)?; }
@@ -277,7 +277,7 @@ pub fn walk_hir_stmt<V: HirVisitor>(visitor: &mut V, stmt: &HirStmt) -> V::Resul
     }
 }
 
-pub fn walk_hir_pattern<V: HirVisitor>(visitor: &mut V, pat: &HirPattern) -> V::Result {
+pub fn walk_hir_pattern<V: HirVisitor>(visitor: &mut V, pat: &HirPattern<'input>) -> V::Result {
     match pat {
         HirPattern::Wildcard(_) | HirPattern::Error(_) => V::Result::output(),
         HirPattern::Ident(name, ty, _) => {
@@ -318,7 +318,7 @@ pub fn walk_hir_pattern<V: HirVisitor>(visitor: &mut V, pat: &HirPattern) -> V::
     }
 }
 
-pub fn walk_hir_param<V: HirVisitor>(visitor: &mut V, param: &HirParam) -> V::Result {
+pub fn walk_hir_param<V: HirVisitor, 'input>(visitor: &mut V, param: &HirParam<'input>) -> V::Result {
     visitor.visit_ident(&param.name)?;
     visitor.visit_type_id(param.ty)
 }

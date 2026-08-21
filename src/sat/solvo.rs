@@ -232,6 +232,18 @@ impl Solver {
     ///   (`set_max_decisions`) without reaching a definite conclusion.
     pub fn solve(&mut self) -> SolveResult {
         self.decisions_made = 0;
+        // Reset the ENTIRE DPLL state before each solve.  A previous
+        // call's model (or a partial assignment left by a `LimitExceeded`
+        // exit) must not leak into the next solve: with stale decisions
+        // the propagator treats them as fixed assumptions, which can
+        // prune the search and yield a FALSE UNSAT on incremental reuse
+        // (e.g. `(a∨b)` then `(¬a∨¬b)` is satisfiable, but the leaked
+        // `a=true` from the first solve makes the second appear unsat).
+        self.assignment.iter_mut().for_each(|a| *a = None);
+        self.decision_level.iter_mut().for_each(|l| *l = 0);
+        self.current_level = 0;
+        self.trail.clear();
+        self.trail_limits.clear();
         match self.dpll() {
             DpllOutcome::Sat => {
                 let result: Vec<bool> = self.assignment[1..]
@@ -1988,6 +2000,27 @@ mod tests {
             assert!(!model[0], "a should be false (¬a)");
             assert!(!model[3], "d should be false (¬d)");
         }
+    }
+
+    /// Regression: incremental reuse of a `Solver` must not leak
+    /// state between `solve()` calls.  `(a∨b) ∧ (¬a∨¬b)` is satisfiable
+    /// (a=true, b=false), but with the first solve's model (`a=true`,
+    /// `b=true` via pure-literal elimination) left in `assignment`, the
+    /// second solve treats them as fixed and reports a FALSE UNSAT.
+    #[test]
+    fn test_incremental_solve_no_state_leak() {
+        let mut solver = Solver::new();
+        let a = solver.new_var();
+        let b = solver.new_var();
+        solver.add_clause(&[a as i32, b as i32]);
+        assert!(solver.solve().is_sat(), "(a ∨ b) is satisfiable");
+        // Add `¬a ∨ ¬b` and re-solve on the SAME solver — still SAT.
+        solver.add_clause(&[-(a as i32), -(b as i32)]);
+        assert!(
+            solver.solve().is_sat(),
+            "(a ∨ b) ∧ (¬a ∨ ¬b) is satisfiable — a leaked model must not \
+             produce a false UNSAT"
+        );
     }
 
     #[test]
