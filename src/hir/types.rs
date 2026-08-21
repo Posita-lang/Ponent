@@ -5042,13 +5042,25 @@ impl<'input> TypeContext<'input> {
         }
     }
 
-    pub(crate) fn find_type(&self, _data: &TypeData) -> Option<TypeId> {
-        // Previously delegated to ctx.type_map, then to factory.type_map.
-        // Both paths are now superseded — TypeFactory handles dedup internally
-        // in factory.alloc().  Callers should rely on that path instead.
-        // This stub is retained for the transition; remove once all callers
-        // are updated to not use this method.
-        None
+    /// Look up an EXISTING interned `TypeId` for `data`, without
+    /// allocating.  `None` when the type has never been interned or is
+    /// volatile.
+    ///
+    /// The dedup table (`factory.type_map`) is safe to consult directly:
+    /// `TypeFactory::alloc` interns bottom-up — every caller allocates the
+    /// child `TypeId`s first, then the parent — so identical logical types
+    /// always build the same `TypeData` key and hit the same entry.
+    ///
+    /// Volatile types (`InferVar` / `SkolemVar` and any composite that
+    /// embeds them) are scope-sensitive and NEVER interned: `alloc` skips
+    /// caching them (`can_cache`), so they have no table entry — checked
+    /// here with the same semantics (`type_is_volatile` mirrors
+    /// `is_type_volatile_inner`, reading through `self.types`).
+    pub(crate) fn find_type(&self, data: &TypeData) -> Option<TypeId> {
+        if self.type_is_volatile(data) {
+            return None;
+        }
+        self.factory.type_map.borrow().get(data).copied()
     }
 
     pub fn subst(&mut self, ty: TypeId, subst: &Subst) -> TypeId {
@@ -6634,6 +6646,46 @@ mod tests {
 
     fn new_ctx() -> TypeContext<'static> {
         TypeContext::new()
+    }
+
+    /// `find_type` looks up an ALREADY-INTERNED logical type in the
+    /// factory's dedup table: the same `TypeData` built from the same
+    /// children must return the `TypeId` that `alloc` originally
+    /// produced.  (The bottom-up intern invariant — children allocated
+    /// before the parent — is what makes identical keys hit.)
+    #[test]
+    fn test_find_type_hit_and_dedup() {
+        let mut ctx = TypeContext::new();
+        let a = ctx.int(32, true);
+        let b = ctx.bool();
+        let t1 = ctx.tuple(vec![a, b]);
+        // Same logical type, rebuilt from the same interned children:
+        // find_type must hit and agree with the allocated TypeId.
+        let found = ctx.find_type(&TypeData::Tuple { elems: vec![a, b] });
+        assert_eq!(found, Some(t1));
+    }
+
+    /// Volatile types (`InferVar` / `SkolemVar` and any composite that
+    /// embeds them) are scope-sensitive and NEVER interned — `alloc`
+    /// skips caching them, so `find_type` must return `None` rather than
+    /// fabricating a stale intern for a one-shot variable.
+    #[test]
+    fn test_find_type_skips_volatile() {
+        let mut ctx = TypeContext::new();
+        let var = ctx.alloc(TypeData::InferVar { id: 0, universe: 0 });
+        assert_eq!(
+            ctx.find_type(&TypeData::InferVar { id: 0, universe: 0 }),
+            None,
+            "a raw InferVar is never interned"
+        );
+        // A composite embedding the InferVar is volatile too — no table
+        // entry, so find_type declines.
+        let tup = TypeData::Tuple { elems: vec![var] };
+        assert_eq!(
+            ctx.find_type(&tup),
+            None,
+            "a composite with an InferVar is volatile"
+        );
     }
 
     /// Review-fix pin: `place_is_prefix_of` implements "target is a PREFIX

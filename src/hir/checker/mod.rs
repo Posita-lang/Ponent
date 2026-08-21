@@ -1543,15 +1543,12 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
         // unknown defaults to 64 bits.
         let bit_widths: Vec<u8> = vars
             .iter()
-            .map(|sym| match self.local_variable_types.get(*sym) {
-                Some(ty) => match self.ctx.get(ty) {
-                    crate::hir::types::TypeData::Int { bits, .. }
-                    | crate::hir::types::TypeData::UInt { bits, .. } => {
-                        u8::try_from(*bits).unwrap_or(u8::MAX)
-                    }
-                    _ => 64,
-                },
-                None => 64,
+            .map(|sym| {
+                self.local_variable_types
+                    .get(*sym)
+                    .and_then(|ty| self.ctx.bits_of_int(ty))
+                    .map(|b| u8::try_from(b).unwrap_or(u8::MAX))
+                    .unwrap_or(64)
             })
             .collect();
         // Per-variable signedness for the template queries: `Int<N>` rows
@@ -1562,15 +1559,10 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
         let signed: Vec<bool> = vars
             .iter()
             .map(|sym| {
-                matches!(
-                    self.local_variable_types
-                        .get(*sym)
-                        .map(|ty| self.ctx.get(ty)),
-                    // `Int<N>` is signed only when its `signed` flag is
-                    // true; `Int{signed: false}` (the internal unsigned
-                    // representation) and the `UInt` variant are unsigned.
-                    Some(crate::hir::types::TypeData::Int { signed: true, .. })
-                )
+                self.local_variable_types
+                    .get(*sym)
+                    .map(|ty| self.ctx.is_signed(ty))
+                    .unwrap_or(false)
             })
             .collect();
         // Pre-fill the DBM with compile-time-known type
@@ -1650,7 +1642,28 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
             sep_vars, sep_init, sep_body, sep_bws, sep_signed, sep_params, !use_bv,
         )
         .and_then(|problem| {
-            let tpl = crate::hir::bii::synthesize_problem_bii(smt, &problem, 512, use_bv)?;
+            // Budget floor applied HERE (production caller), not inside
+            // the drivers: the paper's raw count ≈ 2×4W (Theorem 5.5),
+            // so 8W + 64 covers wide templates without inflating a
+            // test's explicit budget.
+            let bws_all: Vec<u8> = sep_bws
+                .iter()
+                .copied()
+                .chain(sep_params.iter().map(|p| p.bw))
+                .collect();
+            let signed_all: Vec<bool> = sep_signed
+                .iter()
+                .copied()
+                .chain(sep_params.iter().map(|p| p.signed))
+                .collect();
+            let budget = crate::hir::bii::query_budget_floor(
+                bws_all.len(),
+                &bws_all,
+                &signed_all,
+                &problem.saturates,
+            )
+            .max(512);
+            let tpl = crate::hir::bii::synthesize_problem_bii(smt, &problem, budget, use_bv)?;
             smt.set_timeout(crate::hir::smt::VERIFY_TIMEOUT_MS);
             let outcome =
                 crate::hir::bii::verify_template_against_problem(smt, &problem, &tpl, use_bv);
@@ -1704,7 +1717,7 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
                 &instrs,
                 &bit_widths,
                 &signed,
-                512,
+                crate::hir::bii::query_budget_floor(vars.len(), &bit_widths, &signed, &[]).max(512),
                 use_bv,
             ) {
                 Some(tpl) => {
@@ -1928,13 +1941,9 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
                 .iter()
                 .filter_map(|sym| {
                     let ty = self.local_variable_types.get(*sym)?;
-                    match self.ctx.get(ty) {
-                        crate::hir::types::TypeData::Int { bits, .. }
-                        | crate::hir::types::TypeData::UInt { bits, .. } => {
-                            Some((*sym, u8::try_from(*bits).unwrap_or(u8::MAX)))
-                        }
-                        _ => None,
-                    }
+                    self.ctx
+                        .bits_of_int(ty)
+                        .map(|b| (*sym, u8::try_from(b).unwrap_or(u8::MAX)))
                 })
                 .collect();
             // Per-variable signedness for the BV query: `Int<N>` variables
@@ -2049,15 +2058,12 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
             // truncate mixed-width loops and misjudge their guards.
             let widths: Vec<u8> = vars
                 .iter()
-                .map(|sym| match self.local_variable_types.get(*sym) {
-                    Some(ty) => match self.ctx.get(ty) {
-                        crate::hir::types::TypeData::Int { bits, .. }
-                        | crate::hir::types::TypeData::UInt { bits, .. } => {
-                            u8::try_from(*bits).unwrap_or(u8::MAX)
-                        }
-                        _ => 64,
-                    },
-                    None => 64,
+                .map(|sym| {
+                    self.local_variable_types
+                        .get(*sym)
+                        .and_then(|ty| self.ctx.bits_of_int(ty))
+                        .map(|b| u8::try_from(b).unwrap_or(u8::MAX))
+                        .unwrap_or(64)
                 })
                 .collect();
             // `widths_map` carries BOTH `i` and its primed copy `i_p`:

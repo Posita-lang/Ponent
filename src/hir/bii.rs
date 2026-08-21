@@ -726,6 +726,10 @@ impl BoundaryLimits {
                 .rows
                 .iter()
                 .map(|r| match r.kind {
+                    RowKind::Interval(_) | RowKind::Clamp(..) if r.signed => {
+                        // True signed top: [−2^(bw−1), 2^(bw−1)−1].
+                        (BigInt::one() << (r.bw as usize - 1)) - BigInt::one()
+                    }
                     RowKind::Sum(..) if r.signed => {
                         (BigInt::one() << r.bw as usize) - BigInt::from(2)
                     }
@@ -745,6 +749,14 @@ impl BoundaryLimits {
                 .rows
                 .iter()
                 .map(|r| match r.kind {
+                    RowKind::Interval(_) | RowKind::Clamp(..) if r.signed => {
+                        // True signed bottom: [−2^(bw−1), 2^(bw−1)−1].
+                        // The generic `_` below would seed 0, which
+                        // asserts "u* ≥ 0" — FALSE when the BII's upper
+                        // bound is negative, permanently corrupting the
+                        // B ⊑ A* invariant Theorem 5.5 relies on.
+                        -(BigInt::one() << (r.bw as usize - 1))
+                    }
                     RowKind::Sum(..) if r.signed => -(BigInt::one() << r.bw as usize),
                     RowKind::Support3(_, _, _, sj, sk) if r.signed => {
                         let (lo, _hi) = BiiRow::signed_s3_range(r.bw, sj, sk);
@@ -1091,15 +1103,42 @@ fn clamp_expr(x: &str, c: i128, bv: bool, bw: u8, signed: bool) -> String {
         (BigInt::zero(), (BigInt::one() << bw as usize) - 1)
     };
     if bv {
-        let add = format!("(bvadd {x} {})", bv_const(&BigInt::from(c), bw as u32));
+        // The clamp bounds compare the ADDITION-PRE operand, never the
+        // `bvadd` result: `bvadd` wraps mod 2^bw, so `clamp(x + c)` must
+        // decide on x alone (`x > MAX−c` ⟹ saturate up, `x < MIN−c` ⟹
+        // saturate down).  Comparing the WRAPPED sum misjudges the
+        // boundary (UInt8 x=255, c=1: bvadd = 0, neither comparison
+        // fires, successor 0 instead of 255; Int8 x=127, c=1: bvadd =
+        // −128, successor −128 instead of 127).  `c` is a compile-time
+        // constant, so the per-sign comparison constant is representable:
+        // for c > 0 only the upper bound can be crossed (MAX−c stays in
+        // range), for c < 0 only the lower (MIN−c stays in range).
+        let c_big = BigInt::from(c);
+        let abs_c = c_big.abs();
+        let span = &max - &min; // 2^bw - 1
+        let c_bv = bv_const(&BigInt::from(c), bw as u32);
         let min_c = bv_const(&min, bw as u32);
         let max_c = bv_const(&max, bw as u32);
+
+        if abs_c > span {
+            return if c > 0 { max_c } else { min_c };
+        }
+
         let (gt, lt) = if signed {
             ("bvsgt", "bvslt")
         } else {
             ("bvugt", "bvult")
         };
-        format!("(ite ({gt} {add} {max_c}) {max_c} (ite ({lt} {add} {min_c}) {min_c} {add}))")
+        let add = format!("(bvadd {x} {c_bv})");
+        if c > 0 {
+            let limit = bv_const(&(&max - BigInt::from(c)), bw as u32);
+            format!("(ite ({gt} {x} {limit}) {max_c} {add})")
+        } else if c < 0 {
+            let limit = bv_const(&(&min - BigInt::from(c)), bw as u32);
+            format!("(ite ({lt} {x} {limit}) {min_c} {add})")
+        } else {
+            x.to_string() // c == 0: clamp(x + 0) = x — no boundary crossed.
+        }
     } else {
         let add = format!("(+ {x} {c})");
         format!("(ite (> {add} {max}) {max} (ite (< {add} {min}) {min} {add}))")
@@ -1687,7 +1726,17 @@ fn expr_to_smt_bw(
             },
             ctx_bw,
         )),
-        E::Add(l, r, _) => {
+        E::Add(l, r, sem) => {
+            // Saturating arithmetic is not expressible as a plain `+`
+            // (the clamp is piecewise — it lives in the Clamp rows and
+            // the transfer's dedicated `clamp_expr` path in
+            // `encode_edge_inductiveness`).  Any OTHER Saturate shape
+            // reaching the generic encoder (nested expressions, guards,
+            // init scalars) fails closed — same defense as
+            // `lin_of_scalar`.
+            if *sem == crate::hir::loop_ir::ArithSem::Saturate {
+                return None;
+            }
             let (ls, lbw) = expr_to_smt_bw(l, bv, bws, vars_len, ctx_bw)?;
             let (rs, rbw) = expr_to_smt_bw(r, bv, bws, vars_len, ctx_bw)?;
             if bv {
@@ -1707,7 +1756,10 @@ fn expr_to_smt_bw(
                 Some((format!("(+ {ls} {rs})"), ctx_bw))
             }
         }
-        E::Sub(l, r, _) => {
+        E::Sub(l, r, sem) => {
+            if *sem == crate::hir::loop_ir::ArithSem::Saturate {
+                return None; // saturating arithmetic — fail closed (see Add).
+            }
             let (ls, lbw) = expr_to_smt_bw(l, bv, bws, vars_len, ctx_bw)?;
             let (rs, rbw) = expr_to_smt_bw(r, bv, bws, vars_len, ctx_bw)?;
             if bv {
@@ -1920,10 +1972,33 @@ fn encode_edge_inductiveness(
     let mut next_parts = Vec::new();
     for (i, next_e) in edge.next_values.iter().enumerate() {
         let ctx_bw = bws.get(i).copied().unwrap_or(64) as u32;
-        next_parts.push(format!(
-            "(= xp_{i} {})",
-            expr_to_smt(next_e, bv, bws, n, ctx_bw)?
-        ));
+        // A saturating transfer (`x_i := x_i +? c`) encodes the successor
+        // as `clamp(x_i + c)` — the same piecewise semantics the Clamp
+        // rows carry (`template_formula`'s primed Interval branch).  A
+        // raw `+` would silently drop the clamp, mixing two different
+        // transfer semantics inside one query (the antecedent's Clamp
+        // rows say `clamp(x + c) ≤ u'`, the transition says
+        // `xp = x + c` — inconsistent whenever the addition saturates).
+        let next_s = match next_e {
+            crate::hir::loop_ir::ScalarExpr::Add(l, r, sem)
+                if *sem == crate::hir::loop_ir::ArithSem::Saturate =>
+            {
+                let c = match r.as_ref() {
+                    crate::hir::loop_ir::ScalarExpr::Const(c) => c,
+                    _ => return None, // non-constant saturate step — fail closed.
+                };
+                let x = expr_to_smt(l, bv, bws, n, ctx_bw)?;
+                // next_values are indexed by the loop variables — an
+                // out-of-range index is an IR inconsistency, NOT a
+                // recoverable default: fail closed rather than clamp with
+                // a guessed (8, false) width/signedness (LIA would then
+                // reason over the WRONG [0,255] range silently).
+                let (bw, signed) = problem.vars.get(i).map(|v| (v.bw, v.signed))?;
+                clamp_expr(&x, c.to_i128()?, bv, bw, signed)
+            }
+            _ => expr_to_smt(next_e, bv, bws, n, ctx_bw)?,
+        };
+        next_parts.push(format!("(= xp_{i} {next_s})"));
     }
     let next_cond = if next_parts.is_empty() {
         "true".to_string()
@@ -2179,6 +2254,25 @@ fn build_bounded_leap_query_problem(
         smt.push_str("(get-model)\n");
     }
     Some(smt)
+}
+
+/// The query-budget floor for a template: the paper's raw query count
+/// is ~2× the 4W high-level bound (Theorem 5.5), so 8W raw is the
+/// correct ceiling; a fixed budget under-budgets wide/multi-variable
+/// templates (2 vars @ 64b: W = 258, 8W ≈ 2064) and silently drops the
+/// hint (fail-closed).  The checker applies this floor when sizing its
+/// synthesis budget; the drivers themselves take the caller's budget
+/// verbatim so tests can assert tight logarithmic bounds (the floor
+/// must not inflate a test's explicit budget).
+pub(crate) fn query_budget_floor(
+    n_vars: usize,
+    bit_widths: &[u8],
+    signed: &[bool],
+    saturates: &[(usize, i128)],
+) -> usize {
+    let tpl = BiiTemplate::with_saturates(n_vars, bit_widths, signed, saturates);
+    let w: usize = tpl.rows.iter().map(|r| r.enc_bw() as usize).sum();
+    w * 8 + 64
 }
 
 /// BiiLoopProblem BII synthesis (Algorithm 4 + 5 driver unchanged; the
@@ -5201,6 +5295,82 @@ mod tests {
                 "Diff lb (use_bv={use_bv}) — the sign-extension fix"
             );
             assert_eq!(diff.ub, BigInt::zero(), "Diff ub (use_bv={use_bv})");
+        }
+    }
+
+    /// Regression: the BV clamp compares the ADDITION-PRE operand, never
+    /// the WRAPPED `bvadd` result.  UInt8 x=250, c=10: `bvadd` wraps to
+    /// 260 mod 256 = 4, which passes both bounds and yields successor 4
+    /// instead of the saturated 255 — the old encoding silently
+    /// mis-saturated at the boundary (x=255,c=1 → 0; Int8 x=127,c=1 →
+    /// −128).  The comparison constants (MAX−c / MIN−c, per sign) are
+    /// representable because `c` is a compile-time constant.
+    #[test]
+    fn test_clamp_expr_bv_compares_pre_add() {
+        // UInt8, c=10 > 0: only the upper bound can cross —
+        // `(ite (bvugt x 245) 255 (bvadd x 10))`.
+        assert_eq!(
+            clamp_expr("x", 10, true, 8, false),
+            "(ite (bvugt x (_ bv245 8)) (_ bv255 8) (bvadd x (_ bv10 8)))"
+        );
+        // Int8, c=1 > 0: `x > 126 → 127` — the old code compared the
+        // wrapped sum (127+1 = −128) and let it through.
+        assert_eq!(
+            clamp_expr("x", 1, true, 8, true),
+            "(ite (bvsgt x (_ bv126 8)) (_ bv127 8) (bvadd x (_ bv1 8)))"
+        );
+        // Int8, c=−1 < 0: only the lower bound can cross —
+        // `x < −127 → −128` (MIN−c = −127; only x = −128 saturates).
+        assert_eq!(
+            clamp_expr("x", -1, true, 8, true),
+            "(ite (bvslt x (_ bv129 8)) (_ bv128 8) (bvadd x (_ bv255 8)))"
+        );
+        // c == 0: identity — no boundary can be crossed.
+        assert_eq!(clamp_expr("x", 0, true, 8, false), "x");
+    }
+
+    /// Regression (z3-gated): a signed Interval row whose BII UPPER bound
+    /// is NEGATIVE — `y := −2; while y > −9 { y := y − 1 }` on Int<8>,
+    /// BII = [−9, −2].  `BoundaryLimits` must seed the signed Interval
+    /// row's ub at −2^(bw−1) (not 0): a 0 seed asserts "u* ≥ 0", which
+    /// is false here and would empty the bounded-leap search region
+    /// (leap UNSAT → premature termination on a sound-but-not-best
+    /// invariant).
+    #[test]
+    fn test_g3_signed_interval_negative_bii_ub() {
+        let solver = SmtSolver::new("z3");
+        if !solver.check_version() {
+            eprintln!("z3 unavailable — skipping test_g3_signed_interval_negative_bii_ub");
+            return;
+        }
+        let vars = vec![Symbol::intern("y")];
+        let init = vec![LoopInstr::ConstVar(0, -2)];
+        let body = vec![LoopInstr::TestGe(0, -8), LoopInstr::AddVar(0, -1)];
+        for use_bv in [false, true] {
+            let problem = crate::hir::loop_ir::loop_instrs_to_loop_problem(
+                &vars,
+                &init,
+                &body,
+                &[8],
+                &[true],
+                &[],
+                !use_bv,
+            )
+            .expect("must lower");
+            let tpl = synthesize_problem_bii(&solver, &problem, 512, use_bv)
+                .expect("signed negative-ub BII synthesis must converge");
+            let row = &tpl.rows[0];
+            assert_eq!(row.kind, RowKind::Interval(0));
+            assert_eq!(
+                row.lb,
+                BigInt::from(-9),
+                "lb = −9 (use_bv={use_bv}) — the exit successor"
+            );
+            assert_eq!(
+                row.ub,
+                BigInt::from(-2),
+                "ub = −2 (use_bv={use_bv}) — negative BII upper bound"
+            );
         }
     }
 }

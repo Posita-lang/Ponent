@@ -3956,7 +3956,7 @@ impl InferenceContext {
     pub fn apply_solution<'input>(
         ty: TypeId,
         solution: &HashMap<usize, TypeId>,
-        ctx: &TypeContext<'input>,
+        ctx: &mut TypeContext<'input>,
     ) -> TypeId {
         replace_infer(ty, solution, ctx)
     }
@@ -3990,7 +3990,7 @@ impl Default for InferenceContext {
 pub(crate) fn replace_infer<'input>(
     ty: TypeId,
     solution: &HashMap<usize, TypeId>,
-    ctx: &TypeContext<'input>,
+    ctx: &mut TypeContext<'input>,
 ) -> TypeId {
     let resolved = ctx.resolve_binding(ty);
     let data = ctx.get(resolved).clone();
@@ -4050,56 +4050,49 @@ pub(crate) fn replace_infer<'input>(
                 .iter()
                 .map(|&a| replace_infer(a, solution, ctx))
                 .collect();
-            ctx.find_type(&TypeData::Adt {
+            ctx.alloc(TypeData::Adt {
                 kind,
                 def_id,
                 args: new_args,
             })
-            .unwrap_or(ctx.error())
         }
         TypeData::Tuple { elems } => {
             let new_elems: Vec<TypeId> = elems
                 .iter()
                 .map(|&e| replace_infer(e, solution, ctx))
                 .collect();
-            ctx.find_type(&TypeData::Tuple { elems: new_elems })
-                .unwrap_or(ctx.error())
+            ctx.alloc(TypeData::Tuple { elems: new_elems })
         }
         TypeData::Array { elem, size } => {
             let new_elem = replace_infer(elem, solution, ctx);
-            ctx.find_type(&TypeData::Array {
+            ctx.alloc(TypeData::Array {
                 elem: new_elem,
                 size,
             })
-            .unwrap_or(ctx.error())
         }
         TypeData::Slice { elem } => {
             let new_elem = replace_infer(elem, solution, ctx);
-            ctx.find_type(&TypeData::Slice { elem: new_elem })
-                .unwrap_or(ctx.error())
+            ctx.alloc(TypeData::Slice { elem: new_elem })
         }
         TypeData::Ref { ty, mutable, .. } => {
             let new_ty = replace_infer(ty, solution, ctx);
-            ctx.find_type(&TypeData::Ref {
+            ctx.alloc(TypeData::Ref {
                 ty: new_ty,
                 mutable,
                 lifetime: None,
             })
-            .unwrap_or(ctx.error())
         }
         TypeData::Pointer { ty } => {
             let new_ty = replace_infer(ty, solution, ctx);
-            ctx.find_type(&TypeData::Pointer { ty: new_ty })
-                .unwrap_or(ctx.error())
+            ctx.alloc(TypeData::Pointer { ty: new_ty })
         }
         TypeData::Ptr { size, pointee } => {
             let new_size = replace_infer(size, solution, ctx);
             let new_pointee = replace_infer(pointee, solution, ctx);
-            ctx.find_type(&TypeData::Ptr {
+            ctx.alloc(TypeData::Ptr {
                 size: new_size,
                 pointee: new_pointee,
             })
-            .unwrap_or(ctx.error())
         }
         TypeData::Fn { params, ret } => {
             let new_params: Vec<TypeId> = params
@@ -4107,11 +4100,10 @@ pub(crate) fn replace_infer<'input>(
                 .map(|&p| replace_infer(p, solution, ctx))
                 .collect();
             let new_ret = replace_infer(ret, solution, ctx);
-            ctx.find_type(&TypeData::Fn {
+            ctx.alloc(TypeData::Fn {
                 params: new_params,
                 ret: new_ret,
             })
-            .unwrap_or(ctx.error())
         }
         TypeData::DynTrait { .. } => ty,
         TypeData::Exists {
@@ -4120,12 +4112,11 @@ pub(crate) fn replace_infer<'input>(
             base,
         } => {
             let new_base = replace_infer(base, solution, ctx);
-            ctx.find_type(&TypeData::Exists {
+            ctx.alloc(TypeData::Exists {
                 param_index,
                 name,
                 base: new_base,
             })
-            .unwrap_or(ctx.error())
         }
         TypeData::AssociatedType {
             trait_id,
@@ -4133,12 +4124,11 @@ pub(crate) fn replace_infer<'input>(
             self_ty,
         } => {
             let new_self = replace_infer(self_ty, solution, ctx);
-            ctx.find_type(&TypeData::AssociatedType {
+            ctx.alloc(TypeData::AssociatedType {
                 trait_id,
                 name,
                 self_ty: new_self,
             })
-            .unwrap_or(ctx.error())
         }
         TypeData::Forall {
             param_index,
@@ -4146,12 +4136,11 @@ pub(crate) fn replace_infer<'input>(
             body,
         } => {
             let new_body = replace_infer(body, solution, ctx);
-            ctx.find_type(&TypeData::Forall {
+            ctx.alloc(TypeData::Forall {
                 param_index,
                 param_name,
                 body: new_body,
             })
-            .unwrap_or(ctx.error())
         }
         TypeData::Mu {
             param_index,
@@ -4159,12 +4148,11 @@ pub(crate) fn replace_infer<'input>(
             body,
         } => {
             let new_body = replace_infer(body, solution, ctx);
-            ctx.find_type(&TypeData::Mu {
+            ctx.alloc(TypeData::Mu {
                 param_index,
                 param_name,
                 body: new_body,
             })
-            .unwrap_or(ctx.error())
         }
         TypeData::Nu {
             param_index,
@@ -4172,21 +4160,19 @@ pub(crate) fn replace_infer<'input>(
             body,
         } => {
             let new_body = replace_infer(body, solution, ctx);
-            ctx.find_type(&TypeData::Nu {
+            ctx.alloc(TypeData::Nu {
                 param_index,
                 param_name,
                 body: new_body,
             })
-            .unwrap_or(ctx.error())
         }
         TypeData::Opaque { def_id, hidden } => match hidden {
             Some(hidden_ty) => {
                 let new_hidden = replace_infer(hidden_ty, solution, ctx);
-                ctx.find_type(&TypeData::Opaque {
+                ctx.alloc(TypeData::Opaque {
                     def_id,
                     hidden: Some(new_hidden),
                 })
-                .unwrap_or(ctx.error())
             }
             None => ty,
         },
@@ -4195,10 +4181,9 @@ pub(crate) fn replace_infer<'input>(
                 .iter()
                 .map(|&a| replace_infer(a, solution, ctx))
                 .collect();
-            ctx.find_type(&TypeData::Coproduct {
+            ctx.alloc(TypeData::Coproduct {
                 alternatives: new_alts,
             })
-            .unwrap_or(ctx.error())
         }
     }
 }

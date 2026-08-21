@@ -1233,7 +1233,7 @@ pub fn instantiate_canonical<'input>(
     fn subst_pred<'input>(
         pred: &Predicate,
         sol: &HashMap<usize, TypeId>,
-        ctx: &TypeContext<'input>,
+        ctx: &mut TypeContext<'input>,
     ) -> Predicate {
         match pred {
             Predicate::Trait {
@@ -1332,7 +1332,7 @@ pub fn instantiate_canonical<'input>(
     fn subst_nested<'input>(
         nested: &[Obligation],
         sol: &HashMap<usize, TypeId>,
-        ctx: &TypeContext<'input>,
+        ctx: &mut TypeContext<'input>,
     ) -> Vec<Obligation> {
         nested
             .iter()
