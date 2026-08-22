@@ -62,7 +62,7 @@ pub(crate) fn sat_neg(a: i128) -> i128 {
 /// - Otherwise returns `2*c`
 pub(crate) fn sat_mul2(c: i128) -> i128 {
     if c == DBM_INF {
-        return DBM_INF;
+        return DBM_INF; // i128::MAX / 4
     }
     match c.checked_mul(2) {
         Some(v) => {

@@ -294,7 +294,7 @@ impl InferRegionTree {
     }
     /// Lift `node` up `steps` levels.  Clamps to the root when `steps`
     /// exceeds the node's depth.
-    #[inline]
+    #[inline(always)]
     fn lift(&self, mut node: InferRegionId, mut steps: usize) -> InferRegionId {
         debug_assert!(steps < (1 << MAX_LOG), "lift steps exceed MAX_LOG capacity");
         let mut k = 0;
@@ -498,8 +498,8 @@ impl InferRegionTree {
     pub fn collect_alive_ids(&self) -> Vec<InferRegionId> {
         self.nodes
             .iter()
-            .filter(|n| n.pool.is_alive())
-            .map(|n| n.id)
+            .filter(|n: &&InferRegionNode| n.pool.is_alive())
+            .map(|n: &InferRegionNode| n.id)
             .collect()
     }
 
