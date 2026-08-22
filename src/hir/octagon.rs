@@ -88,7 +88,9 @@ const fn mirror_index(i: usize) -> usize {
 
 /// A difference-bound matrix over `2n` nodes: `Xᵢ⁺ = Xᵢ` and
 /// `Xᵢ⁻ = -Xᵢ`. `m[i][j]` encodes `node_i - node_j ≤ c` **in doubled
-/// space** (`m[i][j] = 2*c`). Single-variable bounds hang on the
+/// space** (`m[i][j] = 2*c`). (The paper's convention is the transpose —
+/// `m⁺ᵢⱼ` bounds `vⱼ − vᵢ`; Figure 8's operators are unchanged
+/// under transposition.) Single-variable bounds hang on the
 /// self-dual edges: `m[2i][2i+1]` carries `2Xᵢ ≤ 2c` (stored `4c`),
 /// `m[2i+1][2i]` carries `-2Xᵢ ≤ -2c` (stored `-4c`).
 #[derive(Clone, PartialEq, Debug)]
@@ -244,20 +246,28 @@ impl Dbm {
     /// so `IntegerExact` can re-run it between Harvey–Stuckey
     /// tightening rounds without duplicating the loop body.
     fn strong_closure_pass(m: &mut [i128], size: usize) {
+        // The paper's loop applies C⁺ only at even pivots (Figure 8:
+        // S⁺(C⁺_{2k}(·))); C⁺_{k̄} has the same five terms as C⁺_k, so
+        // iterating over all 2n nodes applies each pivot twice —
+        // redundant work, same result.
         // k iterates over ALL 2n nodes. The mirror of every node is
         // `i ⊕ 1`; with no implicit zero node the single-variable bounds
         // hang on the self-dual edges m[2i][2i+1] / m[2i+1][2i], and the
         // five C⁺ terms below stay mirror-symmetric under `i ↦ i⊕1`.
         for k in 0..size {
             let k_bar = mirror_index(k);
-            // ---- C⁺_k (paper Figure 8): all five terms are real graph
-            // paths — i→k→j, i→k̄→j, i→k→k̄→j, i→k̄→k→j.
-            // Fixed regressions: term3/5 read m[ī][k] (the path needs
-            // m[i][k̄]), and term4's middle edge was m[k̄][k] (should be
-            // m[k][k̄]) — the three constraints constrained
-            // −node_i − node_j − 2·node_k (not a path at all), fabricating
-            // negative cycles / spurious tightenings out of satisfiable
-            // systems (`X := 5` closing alone into ⊥ was one such case).
+            // ---- C⁺_k (paper Figure 8). Each term is a path
+            // i → … → j in the potential graph, so every arm of
+            // the min is a sound bound on node_i − node_j:
+            //   1. m[i][j]                         (direct)
+            //   2. m[i][k]  + m[k][j]              (i→k→j)
+            //   3. m[i][k̄] + m[k̄][j]              (i→k̄→j)
+            //   4. m[i][k]  + m[k][k̄] + m[k̄][j]   (i→k→k̄→j)
+            //   5. m[i][k̄] + m[k̄][k] + m[k][j]    (i→k̄→k→j)
+            // The mirror of every term is again one of the five
+            // terms of the mirrored entry (j̄, ī), so C⁺_k maps
+            // coherent matrices to coherent matrices — the
+            // property Figure 8's C⁺ is designed around (§V.C).
             for i in 0..size {
                 for j in 0..size {
                     let mut best = m[i * size + j];
@@ -300,10 +310,9 @@ impl Dbm {
                 }
             }
             // ---- S⁺ (paper Figure 8): m[i][j] ≤ (m[i][ī] + m[j̄][j]) / 2.
-            // In doubled storage the derived value is (t1+t2)/2 — the old
-            // code stored t1+t2, making every S⁺ derivation loose by 2×
-            // (Figure 9 case: 2v₀≤1 ∧ 2v₁≤2 should derive v₀+v₁ ≤ 1.5,
-            // stored 3, not 6). Odd sums (two half-integer bounds compose
+            // In doubled storage the derived value is (t1+t2)/2 — e.g.
+            // 2v₀ ≤ 1 ∧ 2v₁ ≤ 2 derives v₀+v₁ ≤ 1.5, stored 3. Odd sums
+            // (two half-integer bounds compose
             // into a quarter) round UP — the sound direction for ≤. DBM_INF
             // is never halved (DBM_INF/2 is a finite value and would invent
             // a tightening); sum < DBM_INF guarantees sum+1 cannot overflow.
@@ -653,9 +662,7 @@ impl Dbm {
     }
 
     /// The finite bound on `Xᵢ - Xⱼ` (actual value) or `None`.
-    /// Delegates to `node_bound` (the single halving point) — this also
-    /// fixes the old trunc-vs-floor drift: `stored / 2` truncated toward
-    /// zero, while every other reader uses floor.
+    /// Delegates to `node_bound` (the single halving point).
     #[allow(dead_code)]
     pub(crate) fn diff_bound(&self, i: usize, j: usize) -> Option<i128> {
         self.node_bound(2 * i, 2 * j) // X−Y ≤ c
@@ -712,15 +719,14 @@ mod tests {
     #[test]
     fn test_strong_closure_deduces_sum() {
         // 2v₀ ≤ 1 (stored 2), 2v₁ ≤ 2 (stored 4) ⟹ S⁺: v₀+v₁ ≤ (1+2)/2 = 1.5
-        // ⟹ stored 3. The old expectation 6 came from a missing halving in
-        // the S⁺ step (it stored t1+t2 rather than (t1+t2)/2).
+        // ⟹ stored 3.
         let mut d = Dbm::new(2);
         d.set_mirrored(0, 1, 1); // v₀⁺ - v₀⁻ ≤ 1 (self-dual: 2v₀ ≤ 1)
         d.set_mirrored(2, 3, 2); // v₁⁺ - v₁⁻ ≤ 2 (self-dual: 2v₁ ≤ 2)
         assert!(d.close());
         // v₀⁺ = node 0, v₁⁻ = node 3: v₀⁺ - v₁⁻ ≤ ceil((1+2)/2) = 1.5.
         let stored = d.m[0 * d.size + 3];
-        assert_eq!(stored, 3); // stored = 2*1.5 = 3, NOT 6
+        assert_eq!(stored, 3); // stored = 2 × 1.5 = 3
     }
 
     #[test]
@@ -732,9 +738,7 @@ mod tests {
         assert!(d.bottom);
         // ⊥ is the identity of ⊔ (paper §VII.A): join(⊥, ⊤) = ⊤.
         // dbm_fixpoint relies on this semantics to handle infeasible
-        // bodies (join(cur, ⊥) = cur). The old assertion treated ⊥ as
-        // an absorbing element, contradicting the lattice and the
-        // fixpoint behavior.
+        // bodies (join(cur, ⊥) = cur).
         let j = d.join(&Dbm::new(1));
         assert!(!j.bottom);
         let m = d.meet(&Dbm::new(1));
@@ -769,12 +773,8 @@ mod tests {
 
     /// Golden-facts bridge: three hand-computed facts, each pinning
     /// one derivation channel — FW transitivity, the interval→sum routing
-    /// through the self-dual edges, and S⁺ self-dual composition. After
-    /// the 2N representation migration these facts must hold bit-for-bit
-    /// (the migration keeps no legacy implementation, so this test is the
-    /// mechanical evidence of semantic equivalence, replacing a
-    /// new-vs-old parallel comparison). It reads ONLY through the semantic
-    /// projections — representation-independent.
+    /// through the self-dual edges, and S⁺ self-dual composition. Reads
+    /// ONLY through the semantic projections — representation-independent.
     #[test]
     fn test_golden_projections_bridge() {
         // A. Transitivity: X−Y ≤ 4 ∧ Y−Z ≤ 2 ⟹ X−Z ≤ 6.
