@@ -5639,6 +5639,43 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
             return Err(body_err);
         }
 
+        // ── Return-body equality: eager check + constraint-queue dispatch ──
+        // (moved BEFORE guard.commit so the queued Constraint::Eq is solved
+        // by THIS function's inference scope — dispatching after commit
+        // would leak the constraint into the outer inference context).
+        //
+        // Reachability dependency: the `saved_body_err` short-circuit above
+        // returns BEFORE this block, so a body-scope error and a return
+        // mismatch never surface in the same check — the eager `?` below
+        // also returns before the queued Eq is dispatched, so the same
+        // equality is never double-reported.  If `saved_body_err` handling
+        // ever becomes non-short-circuiting (e.g. for better error
+        // recovery), the double-error precedence question reopens with no
+        // test pinning it — revisit the ordering here if that changes.
+        if let Some(ref body_stmts) = body_hir
+            && return_type.is_some()
+        {
+            // User wrote an explicit return type — check body against it.
+            let body_ty = guard.checker.block_type_impl(body_stmts, false);
+            // Eager unification remains the diagnostic authority (DCE S4):
+            // a mismatch reports the rich E030 immediately.  On success the
+            // SAME equality is ALSO dispatched to the constraint queue so the
+            // old solver's solve() (inside guard.commit below) processes a
+            // real Constraint::Eq — the recovered OmniML production dispatch.
+            guard
+                .checker
+                .unify_with(return_ty, body_ty, *span, TypingContext::ReturnValue)?;
+            guard.checker.add_constraint(Constraint::Eq(
+                return_ty,
+                body_ty,
+                *span,
+                crate::hir::infer::EqOrigin::Normal,
+            ));
+        }
+        // When return_type is None, the infer var was already unified
+        // with return values during body checking (via current_return_type),
+        // or defaulted to Never before the solver ran (see above).
+
         let exit_res = guard.commit();
 
         if let Err(diags) = exit_res {
@@ -5648,17 +5685,6 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
                     .with_span(*span),
             );
         }
-
-        if let Some(ref body_stmts) = body_hir
-            && return_type.is_some()
-        {
-            // User wrote an explicit return type — check body against it.
-            let body_ty = self.block_type_impl(body_stmts, false);
-            self.unify_with(return_ty, body_ty, *span, TypingContext::ReturnValue)?;
-        }
-        // When return_type is None, the infer var was already unified
-        // with return values during body checking (via current_return_type),
-        // or defaulted to Never before the solver ran (see above).
 
         // Contract<'input> verification skeleton: check that requires/ensures are bool,
         // and decreases/terminates are integer types.

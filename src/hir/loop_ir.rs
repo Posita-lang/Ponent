@@ -1,4 +1,4 @@
-//! Edge-based loop transition IR (docs/loop-transition-ir.md).
+//! Edge-based loop transition IR .
 //!
 //! IR types (this file); the `LoopInstr → BiiLoopProblem`
 //! lowering and the independent template verifier live here.

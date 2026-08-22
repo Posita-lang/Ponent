@@ -678,9 +678,17 @@ pub(crate) enum InferUndoLog {
     PushConstraint,
     PushTypeVar,
     PushVarTypeId,
-    PushMatchBranch,
+    /// Batch registration of match branches: carries the pre-extend
+    /// length so a rollback truncates ALL of them (a single per-element
+    /// entry cannot invert a variable-size `extend`).
+    PushMatchBranches(usize),
     PushResolution,
     PushWaitList,
+    /// A constraint was pushed onto `wait_lists[var_id]`: reverse pops the
+    /// last element (the log is strict reverse-chronological, every push
+    /// appends).  Pairs with the logged `AddGuard` so a rollback restores
+    /// both the guard AND the suspension.
+    PushWaitListEntry(usize),
     PushGuardSet,
     PushGenStatus,
     PushForwardRef,
@@ -718,14 +726,19 @@ impl InferenceContext {
             InferUndoLog::PushVarTypeId => {
                 self.var_type_ids.pop();
             }
-            InferUndoLog::PushMatchBranch => {
-                self.match_branches.pop();
+            InferUndoLog::PushMatchBranches(prev_len) => {
+                self.match_branches.truncate(prev_len);
             }
             InferUndoLog::PushResolution => {
                 self.resolutions.pop();
             }
             InferUndoLog::PushWaitList => {
                 self.wait_lists.pop();
+            }
+            InferUndoLog::PushWaitListEntry(var_id) => {
+                if var_id < self.wait_lists.len() {
+                    self.wait_lists[var_id].pop();
+                }
             }
             InferUndoLog::PushGuardSet => {
                 self.guard_sets.pop();
@@ -1200,6 +1213,9 @@ impl InferenceContext {
     pub(crate) fn wait_lists(&self) -> &[Vec<(Constraint, SkolemEnv)>] {
         &self.wait_lists
     }
+    pub(crate) fn match_branches_len_for_test(&self) -> usize {
+        self.match_branches.len()
+    }
     /// Test helper: wake suspended constraints into a local heap and return
     /// the number of woken constraints.  Does not expose the internal
     /// PrioritizedConstraint type to tests.
@@ -1669,6 +1685,9 @@ impl InferenceContext {
 
     pub fn add_constraint(&mut self, c: Constraint) {
         self.constraints.push(c);
+        // Logged for rollback symmetry with the internal fallback path in
+        // `suspend_on_var_with_env` (which pushes its own PushConstraint).
+        self.push_undo(InferUndoLog::PushConstraint);
     }
 
     /// OmniML-inspired: suspend a constraint on the target InferVar id.
@@ -1686,6 +1705,10 @@ impl InferenceContext {
     fn suspend_on_var_with_env(&mut self, c: Constraint, env: SkolemEnv, var_id: usize) {
         if var_id < self.wait_lists.len() {
             self.wait_lists[var_id].push((c, env));
+            // Pair the suspension with its undo entry BEFORE the guard is
+            // logged: reverse restores the guard first, then pops the
+            // suspension — a rolled-back var is neither guarded nor armed.
+            self.push_undo(InferUndoLog::PushWaitListEntry(var_id));
             // Add a guard: the variable is now blocked until this constraint
             // is woken and processed.  This is essential for the PG→G lifecycle
             // (OmniML §6).  Uses the reference-counted GuardSet — it also
@@ -1846,10 +1869,14 @@ impl InferenceContext {
     pub fn register_match_branches(&mut self, branches: Vec<MatchBranchSet>) -> (usize, usize) {
         let start = self.match_branches.len();
         let count = branches.len();
-        for b in branches {
-            self.match_branches.push(b);
-        }
-        self.push_undo(InferUndoLog::PushMatchBranch);
+        self.match_branches.reserve(count);
+        self.match_branches.extend(branches);
+
+        // Batch mutation, batch undo: the payload is the pre-extend
+        // length so a rollback restores the table exactly (a single
+        // per-element pop would leave count − 1 stale branch sets that
+        // the next registration would alias — cross-contamination).
+        self.push_undo(InferUndoLog::PushMatchBranches(start));
         (start, count)
     }
 
@@ -4465,6 +4492,41 @@ mod tests {
         }];
         let id = infer.register_match_branches(branches);
         assert!(id.0 < infer.match_branches.len());
+    }
+
+    #[test]
+    fn test_rollback_register_match_branches_batch() {
+        let mut ctx = TypeContext::new();
+        let mut infer = InferenceContext::new();
+        let mut mk_branch = |shape: PrincipalShape| MatchBranchSet {
+            shape_pattern: shape,
+            continuation: vec![Constraint::Eq(
+                ctx.int(DEFAULT_INT_WIDTH, true),
+                ctx.int(DEFAULT_INT_WIDTH, true),
+                crate::ast::Span::new(0, 0),
+                EqOrigin::Normal,
+            )],
+            else_continuation: Vec::new(),
+        };
+        let pre_len = infer.match_branches_len_for_test();
+        let snap = infer.start_snapshot();
+        let (start, count) = infer.register_match_branches(vec![
+            mk_branch(PrincipalShape::Arrow),
+            mk_branch(PrincipalShape::Tuple(2)),
+        ]);
+        assert_eq!(count, 2);
+        assert_eq!(start, pre_len);
+        assert_eq!(
+            infer.match_branches_len_for_test(),
+            pre_len + 2,
+            "both branches registered inside the snapshot"
+        );
+        infer.rollback_to(snap);
+        assert_eq!(
+            infer.match_branches_len_for_test(),
+            pre_len,
+            "rollback must remove ALL branches of the batch, not count−1"
+        );
     }
 
     #[test]

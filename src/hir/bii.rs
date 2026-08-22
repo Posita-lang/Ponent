@@ -1651,7 +1651,7 @@ fn build_refine_query(
     Some(smt)
 }
 
-// ── BiiLoopProblem synthesis entry (docs/loop-transition-ir.md) ──
+// ── BiiLoopProblem synthesis entry  ──
 
 /// Emit the candidate disjunction `(assert (or ⋁_c ⋀_r A'⊑c))` — A' is at
 /// least as tight as some candidate c in every row, and never empty
@@ -2166,8 +2166,8 @@ fn build_refine_query_problem(
     Some(smt)
 }
 
-/// BiiLoopProblem bounded-leap query (Algorithm 5): B⊑A'⊑A + strict as in
-/// the original; the transition part is Init plus one implication per back
+/// BiiLoopProblem bounded-leap query (Algorithm 5): `B ⊑ A′ ⊏ A` as in
+/// the paper; the transition part is Init plus one implication per back
 /// edge (single ∀).
 fn build_bounded_leap_query_problem(
     problem: &crate::hir::loop_ir::BiiLoopProblem,
@@ -2217,7 +2217,7 @@ fn build_bounded_leap_query_problem(
             sort(ebw)
         ));
     }
-    // B ⊑ A' ⊑ A (same as the original).
+    // B ⊑ A′ ⊏ A (Algorithm 5).
     smt.push_str("(assert (and ");
     for (r, row) in rows.iter().enumerate() {
         let ebw = row.enc_bw();
@@ -2237,7 +2237,8 @@ fn build_bounded_leap_query_problem(
         smt.push_str(&format!(" ({} l_{r} u_{r})", rle));
     }
     smt.push_str("))\n");
-    // STRICT tightening (same as the original).
+    // The paper's `A′ ⊏ A` conjunct (Algorithm 5) — the strict-bound
+    // disjunction excludes the trivial witness A' = A (Theorem 5.5).
     smt.push_str("(assert (or");
     for (r, row) in rows.iter().enumerate() {
         let ebw = row.enc_bw();
@@ -3327,13 +3328,14 @@ pub(crate) fn verify_template_against_problem(
 }
 
 /// Algorithm 5's bounded leap query:
-/// `∃A'.∀X,X'.P(A',X,X') ∧ (B ⊑ A' ⊑ A)` — the witness must lie inside
-/// the under-approximation `B = ⋀ [lb, ub]` and at-or-tighter-than `A`.
+///  `∃A'.∀X,X'.P(A',X,X') ∧ (B ⊑ A' ⊏ A)`  — the witness must lie inside
+/// the under-approximation `B`, at-or-tighter-than `A`, and STRICTLY
+/// tighter in at least one row (the paper's `⊏`).
 ///
-/// STRICT tightening: the witness must differ from `A` in at least one
-/// bound (at least one `l_r > A.l_r` or `u_r < A.u_r`). Without this
-/// constraint the query is trivially satisfied by `A' = A` and the UNSAT
-/// branch (which proves `A` is the BII) is unreachable.
+/// SMT has no lattice-order primitive, so `⊏` is expanded to the
+/// row-wise disjunction `∃r. l'_r > A.l_r ∨ u'_r < A.u_r`; it is what
+/// excludes the trivial witness A' = A and makes the Theorem-5.5 UNSAT
+/// termination (`A = A*`) reachable.
 ///
 /// Returns `None` if the transition encoding fails (fail-closed).
 fn build_bounded_leap_query(
@@ -3387,7 +3389,7 @@ fn build_bounded_leap_query(
         ));
     }
 
-    // B ⊑ A' ⊑ A in bound terms (ENCODED domain, Diff rows offset):
+    // B ⊑ A′ ⊏ A in bound terms (ENCODED domain, Diff rows offset):
     // A.l_i ≤ l'_i ≤ B.lb_i and B.ub_i ≤ u'_i ≤ A.u_i
     smt.push_str("(assert (and ");
     for (r, row) in rows.iter().enumerate() {
@@ -3409,10 +3411,9 @@ fn build_bounded_leap_query(
     }
     smt.push_str("))\n");
 
-    // STRICT tightening: at least one bound must differ from A.
-    // This is the fix that makes UNSAT correctly prove A is the BII
-    // (Theorem 5.5). Without it, A' = A trivially satisfies the
-    // query and the UNSAT branch is unreachable.
+    // The paper's `A′ ⊏ A` conjunct (Algorithm 5), expanded into the
+    // row-wise strict-bound disjunction: `⊏` excludes the trivial witness
+    // A' = A, exactly as the Theorem-5.5 UNSAT termination requires.
     smt.push_str("(assert (or");
     for (r, row) in rows.iter().enumerate() {
         let ebw = row.enc_bw();
@@ -4336,10 +4337,10 @@ mod tests {
         );
     }
 
-    /// The bounded-leap query must contain the STRICT tightening
-    /// constraint — without it the query is trivially satisfied by
-    /// A' = A and the UNSAT branch (which proves A is the BII) is
-    /// unreachable.
+    /// The bounded-leap query must emit the paper's `A′ ⊏ A` conjunct (as
+    /// the strict-bound disjunction): dropping it admits the trivial
+    /// witness A' = A and disables the Theorem-5.5 UNSAT termination.
+    /// Regression pin for the `⊏` expansion.
     #[test]
     fn test_build_bounded_leap_query_has_strict_tightening() {
         let tpl = BiiTemplate::new(1, &[8], &[false]);

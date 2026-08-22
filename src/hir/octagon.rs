@@ -462,20 +462,120 @@ impl Dbm {
         if r.bottom { Dbm::bottom() } else { r }
     }
 
-    /// join (⊔): abstract disjunction – looser of each bound (diagonal tighter),
-    /// then close. If one operand is bottom, return the other.
+    /// Check the strong-closure invariants (paper Figure 8), read-only —
+    /// never repairs.  Four properties:
+    ///
+    /// 1. **Coherence**: `m[i][j] == m[j̄][ī]` (the mirrored entry).
+    /// 2. **Triangle inequality** (C⁺): `m[i][j] ≤ m[i][k] + m[k][j]` for
+    ///    every pivot k — the two-edge-path arm.  The longer C⁺ arms
+    ///    (i→k̄→j, i→k→k̄→j, i→k̄→k→j) are implied: e.g. the triangle
+    ///    gives `m[i][k̄] ≤ m[i][k] + m[k][k̄]`, so any 3- or 4-edge path
+    ///    through k̄ is bounded by the 1-edge arm through k̄ already
+    ///    checked here.
+    /// 3. **S⁺ half-sum**: `m[i][j] ≤ ceil((m[i][ī] + m[j̄][j]) / 2)` —
+    ///    the same ceil-rounding as the closure pass (INF entries skip).
+    /// 4. **Zero diagonal**: `m[i][i] == 0`.
+    ///
+    /// ⊥ is vacuously closed (no constraints to violate).  O(N³) — used
+    /// only in debug assertions (the preservation-lemma tripwire) and
+    /// tests, never on a hot path.
+    pub(crate) fn is_strongly_closed(&self) -> bool {
+        if self.bottom {
+            return true; // ⊥ is vacuously strongly closed.
+        }
+        let size = self.size;
+        let m = &self.m;
+        // 4. Zero diagonal.
+        for i in 0..size {
+            if m[i * size + i] != 0 {
+                return false;
+            }
+        }
+        for i in 0..size {
+            let i_bar = mirror_index(i);
+            for j in 0..size {
+                // 1. Coherence: m[i][j] == m[j̄][ī].
+                let j_bar = mirror_index(j);
+                if m[i * size + j] != m[j_bar * size + i_bar] {
+                    return false;
+                }
+                // 3. S⁺ half-sum (INF skips — no derived bound).
+                let t1 = m[i * size + i_bar];
+                let t2 = m[j_bar * size + j];
+                if t1 != DBM_INF && t2 != DBM_INF {
+                    let sum = sat_add(t1, t2);
+                    if sum != DBM_INF {
+                        let halved = (sum + 1) >> 1; // ceil(sum / 2)
+                        if halved < m[i * size + j] {
+                            return false;
+                        }
+                    }
+                }
+                // 2. Triangle inequality over every pivot k.
+                for k in 0..size {
+                    let t_ik = m[i * size + k];
+                    let t_kj = m[k * size + j];
+                    if t_ik != DBM_INF && t_kj != DBM_INF {
+                        let s = sat_add(t_ik, t_kj);
+                        if s != DBM_INF && s < m[i * size + j] {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// join (⊔): abstract disjunction — point-wise max off the diagonal
+    /// (min on the diagonal). O(N²); no closure pass.
+    ///
+    /// # Why the output is strongly closed (no close() needed)
+    ///
+    /// Let F be strong closure. F is monotone and contracting
+    /// (F(M) ≤ M: closure only tightens entries). On strongly closed
+    /// operands A = F(A), B = F(B), and the join M satisfies A ≤ M and
+    /// B ≤ M point-wise. Monotonicity gives A ≤ F(M) and B ≤ F(M), hence
+    /// M = max(A, B) ≤ F(M); contraction gives F(M) ≤ M. Therefore
+    /// F(M) = M.
+    ///
+    /// Equivalently, point-wise: every closedness condition upper-bounds
+    /// M_ij by an expression of other entries, and each branch of an
+    /// outer max inherits its operand's own inequality —
+    ///   - triangle: A_ij ≤ A_ik + A_kj implies
+    ///     max(A_ij,B_ij) ≤ max(A_ik,B_ik) + max(A_kj,B_kj), since each
+    ///     right-hand term only grows under the max;
+    ///   - S⁺ saturation: same transport of A_ij ≤ (A_iī + A_j̄j)/2;
+    ///   - coherence: the mirror of a point-wise max is the point-wise
+    ///     max of the mirrors (M_j̄ī = max(A_j̄ī, B_j̄ī) = M_ij);
+    ///   - diagonal: min(0, 0) = 0.
+    /// (Miné 2001, Thm 7.3 remark: "if the two arguments of ∨ are
+    /// strongly closed, then the result is also strongly closed.")
+    ///
+    /// # Bottom is unreachable (non-bottom operands)
+    ///
+    /// F(M) = M with a zero diagonal admits no strictly negative cycle,
+    /// so negative-diagonal detection could never fire here; the operand
+    /// shortcuts below are the only bottom paths.
+    ///
+    /// # IntegerExact note
+    ///
+    /// The max of two multiples of 4 is a multiple of 4, so this join
+    /// also preserves the Harvey–Stuckey rounded normal form (§V.D)
+    /// whenever both operands carry it — this operation never exits it.
+    ///
+    /// # Precondition
+    ///
+    /// Strongly closed, non-bottom operands. The debug_assert is the
+    /// tripwire for the preservation argument above — a failure means a
+    /// lemma inside this module is wrong, and the fix belongs here, not
+    /// in the caller.
     pub(crate) fn join(&self, other: &Dbm) -> Dbm {
         debug_assert!(
-            {
-                let mut s = self.clone();
-                let mut o = other.clone();
-                s.close();
-                o.close();
-                s == *self && o == *other
-            },
-            "join operands must be strongly closed"
+            self.is_strongly_closed() && other.is_strongly_closed(),
+            "join requires strongly closed operands — a violation is a bug in a \
+             closure-preservation lemma of this module, not in the caller"
         );
-
         if self.bottom {
             return other.clone();
         }
@@ -483,7 +583,7 @@ impl Dbm {
             return self.clone();
         }
         debug_assert_eq!(self.size, other.size);
-        let size: usize = self.size;
+        let size = self.size;
         let m: Vec<i128> = self
             .m
             .iter()
@@ -495,13 +595,13 @@ impl Dbm {
                 if i == j { (*a).min(*b) } else { (*a).max(*b) }
             })
             .collect();
-        let mut r = Dbm {
+        // Strongly closed ∨ strongly closed = strongly closed (see doc):
+        // no closure pass, bottom unreachable.
+        Dbm {
             size,
             m,
             bottom: false,
-        };
-        r.close();
-        if r.bottom { Dbm::bottom() } else { r }
+        }
     }
 
     /// widen (∇): termination-guaranteeing upper approximation.
@@ -534,7 +634,50 @@ impl Dbm {
 
     // ---- Transfer functions (coherent) ----
 
-    /// `X := X + c`
+    /// `X := X + c`. O(N²); no closure pass.
+    ///
+    /// # Why this transfer is closure-preserving (no close() needed)
+    ///
+    /// The four update lines reweight the potential graph by a node
+    /// potential: with σ = +1 on X⁺ (node 2i), −1 on X⁻ (node 2i+1), 0
+    /// elsewhere, and δ = 2c (stored/doubled shift),
+    ///     m'[u][v] = m[u][v] + δ·(σ_u − σ_v).
+    /// Every path u → … → v telescopes: its weight shifts by exactly
+    /// δ·(σ_u − σ_v), independent of intermediate routing (the classical
+    /// argument behind Johnson's potential reweighting for APSP). Strong
+    /// closure is shortest-path completeness on the potential graph, and
+    /// reweighting by potentials commutes with it. Condition by
+    /// condition:
+    /// - triangle: the left side m'[u][v] shifts by δ(σ_u − σ_v); the
+    ///   right side m'[u][k] + m'[k][v] shifts by
+    ///   δ(σ_u − σ_k) + δ(σ_k − σ_v) = δ(σ_u − σ_v) — the same amount,
+    ///   so the inequality is transported unchanged;
+    /// - S⁺ saturation: σ_ī = −σ_i, so the right side of
+    ///   m[i][j] ≤ (m[i][ī] + m[j̄][j])/2 shifts by
+    ///   (δ(σ_i + σ_i) + δ(−σ_j − σ_j))/2 = δ(σ_i − σ_j), identical to
+    ///   the left side's shift;
+    /// - coherence: the mirror edge (j̄, ī) shifts by
+    ///   δ(σ_j̄ − σ_ī) = δ(σ_i − σ_j), the same as (i, j) itself;
+    /// - diagonal: σ_u − σ_u = 0, untouched — a zero diagonal cannot
+    ///   become negative, so bottom is unreachable (non-bottom input).
+    ///   (Saturation corners: at δ = DBM_INF the early returns break the
+    ///   add-then-sub cancellation on BOTH self-loops; at δ = i128::MIN
+    ///   the sub-first diagonal m[q][q] overflows positive and lands on
+    ///   `_ => DBM_INF` — the code below restores the diagonal
+    ///   unconditionally, the Miné Fig. 7 `[C_k(n)]_ii ≜ 0` discipline.)
+    ///
+    /// Every stored shift is even (δ = 2c), so the ceil-halving inside
+    /// S⁺'s encoded form sees unchanged input parity.
+    ///
+    /// # IntegerExact note
+    ///
+    /// A self-dual edge shifts by ±2δ = ±4c, a multiple of 4: this
+    /// transfer PRESERVES the Harvey–Stuckey rounded normal form (§V.D),
+    /// so a follow-up `close_with(ClosureMode::IntegerExact)` is a no-op
+    /// (the tightening step finds nothing to round).  The sole exception
+    /// is the saturation regime above (δ = DBM_INF or δ = i128::MIN),
+    /// where self-dual edges land on INF/saturated values and the mod-4
+    /// arithmetic is vacuous.
     pub(crate) fn assign_add_var(&self, i: usize, c: i128) -> Dbm {
         if self.bottom {
             return Dbm::bottom();
@@ -549,13 +692,24 @@ impl Dbm {
             m[q * self.size + j] = sat_sub(m[q * self.size + j], delta);
             m[j * self.size + q] = sat_add(m[j * self.size + q], delta);
         }
-        let mut r = Dbm {
+        // The true self-loop is always exactly 0; both saturation
+        // corners (δ = DBM_INF: both diagonals via early returns;
+        // δ = i128::MIN: the sub-first diagonal m[q][q] — checked_sub(0,
+        // MIN) overflows POSITIVE at a = 0, misses the `a < 0 && b > 0`
+        // arm, lands on _ => DBM_INF, then nothing can cancel) are
+        // repaired by unconditional normalization — the same discipline
+        // as Miné Fig. 7's `[C_k(n)]_ii ≜ 0` — rather than by
+        // corner-matched guards.  No-op on the finite-δ path (the two
+        // writes cancel exactly in checked arithmetic), so it cannot
+        // over-trigger.
+        m[p * self.size + p] = 0;
+        m[q * self.size + q] = 0;
+        // Potential shift preserves strong closure (see doc): no close().
+        Dbm {
             size: self.size,
             m,
             bottom: false,
-        };
-        r.close();
-        if r.bottom { Dbm::bottom() } else { r }
+        }
     }
 
     /// `X := c`
@@ -916,5 +1070,163 @@ mod tests {
         assert!(b.close_with(ClosureMode::IntegerExact));
         assert_eq!(b.m[0 * 2 + 1], 8, "IntegerExact: 2x even ⟹ x ≤ 2");
         assert_eq!(b.var_ub(0), Some(2));
+    }
+
+    // ------------------------------------------------------------------
+    // Differential regression pins for the closure-free fast paths.
+    // The reference path re-does the same point-wise operation and then
+    // pays the full strong closure; by the preservation lemmas in the
+    // docs of `join` / `assign_add_var`, that closure is a no-op there,
+    // so both paths must agree bit-for-bit. Any mismatch means a
+    // preservation lemma is wrong — do NOT "fix" by re-adding close().
+    // ------------------------------------------------------------------
+    fn reference_join(a: &Dbm, b: &Dbm) -> Dbm {
+        let size = a.size;
+        let mut m = Vec::with_capacity(size * size);
+        for idx in 0..size * size {
+            let i = idx / size;
+            let j = idx % size;
+            let (x, y) = (a.m[idx], b.m[idx]);
+            m.push(if i == j { x.min(y) } else { x.max(y) });
+        }
+        let mut r = Dbm {
+            size,
+            m,
+            bottom: false,
+        };
+        r.close();
+        r
+    }
+    #[test]
+    fn test_join_differential_no_close() {
+        // Case 1: interval + difference constraints (2 vars).
+        let mut a = Dbm::new(2);
+        a.set_mirrored(0, 1, 4); // X ≤ 4
+        a.set_mirrored(1, 0, -2); // X ≥ 1
+        a.set_mirrored(0, 2, 3); // X − Y ≤ 3
+        assert!(a.close());
+        let mut b = Dbm::new(2);
+        b.set_mirrored(2, 3, 2); // Y ≤ 2
+        b.set_mirrored(0, 2, 1); // X − Y ≤ 1
+        assert!(b.close());
+        // Case 2: half-integer derived bounds (S⁺ composition).
+        let mut c1 = Dbm::new(2);
+        c1.set_mirrored(0, 1, 1); // 2X ≤ 1
+        c1.set_mirrored(2, 3, 2); // 2Y ≤ 2
+        assert!(c1.close());
+        // Case 3: 3-var transitive chains.
+        let mut d3a = Dbm::new(3);
+        d3a.set_mirrored(0, 2, 4); // X − Y ≤ 4
+        d3a.set_mirrored(2, 4, 2); // Y − Z ≤ 2
+        d3a.set_mirrored(0, 1, 3); // X ≤ 3
+        assert!(d3a.close());
+        let mut d3b = Dbm::new(3);
+        d3b.set_mirrored(4, 0, -2); // Z − X ≤ −2
+        assert!(d3b.close());
+        let top2 = Dbm::new(2); // top is trivially strongly closed
+        for (x, y) in [(&a, &b), (&c1, &b), (&d3a, &d3b), (&top2, &a)] {
+            let j1 = x.join(y);
+            let j2 = y.join(x);
+            let slow = reference_join(x, y);
+            assert_eq!(j1, slow, "differential mismatch");
+            assert_eq!(j1, j2, "join must be symmetric");
+            assert!(!j1.bottom);
+            assert!(j1.is_strongly_closed());
+        }
+    }
+    fn reference_assign_add(a: &Dbm, i: usize, c: i128) -> Dbm {
+        // The with-close() reference path (the pre-change implementation).
+        let p = 2 * i;
+        let q = 2 * i + 1;
+        let mut m = a.m.clone();
+        let delta = sat_mul2(c);
+        for j in 0..a.size {
+            m[p * a.size + j] = sat_add(m[p * a.size + j], delta);
+            m[j * a.size + p] = sat_sub(m[j * a.size + p], delta);
+            m[q * a.size + j] = sat_sub(m[q * a.size + j], delta);
+            m[j * a.size + q] = sat_add(m[j * a.size + q], delta);
+        }
+        let mut r = Dbm {
+            size: a.size,
+            m,
+            bottom: false,
+        };
+        r.close();
+        r
+    }
+    #[test]
+    fn test_assign_add_differential_no_close() {
+        let mut a = Dbm::new(3);
+        a.set_mirrored(0, 1, 4); // X ≤ 4
+        a.set_mirrored(1, 0, -2); // X ≥ 1
+        a.set_mirrored(0, 2, 3); // X − Y ≤ 3
+        a.set_mirrored(2, 4, 2); // Y − Z ≤ 2
+        assert!(a.close());
+        for &(i, c) in &[(0usize, -3i128), (0, 5), (1, 1), (2, -1)] {
+            let fast = a.assign_add_var(i, c);
+            let slow = reference_assign_add(&a, i, c);
+            assert_eq!(fast, slow, "differential mismatch at (i={}, c={})", i, c);
+            assert!(!fast.bottom);
+            assert!(fast.is_strongly_closed());
+        }
+        // Saturation corners: c = i128::MAX/4 drives δ to DBM_INF
+        // (positive saturation — breaks both diagonals); c = −2^126
+        // drives δ to i128::MIN through the `Some` arm (negative
+        // saturation — breaks only the sub-first diagonal m[q][q]).
+        // reference_assign_add closes, which normalizes the diagonal, so
+        // bit-equality plus is_strongly_closed catches either corner.
+        for &(i, c) in &[(0usize, i128::MAX / 4), (0, -(1i128 << 126))] {
+            let fast = a.assign_add_var(i, c);
+            let slow = reference_assign_add(&a, i, c);
+            assert_eq!(fast, slow, "saturation corner (i={}, c={})", i, c);
+            assert!(!fast.bottom);
+            assert!(fast.is_strongly_closed());
+        }
+        // Half-integer derived bounds shift through unchanged parity.
+        let mut h = Dbm::new(2);
+        h.set_mirrored(0, 1, 1); // 2X ≤ 1
+        h.set_mirrored(2, 3, 2); // 2Y ≤ 2
+        assert!(h.close());
+        assert_eq!(h.assign_add_var(0, 1), reference_assign_add(&h, 0, 1));
+        assert!(h.assign_add_var(0, 1).is_strongly_closed());
+    }
+    #[test]
+    fn test_is_strongly_closed_tripwire() {
+        assert!(Dbm::new(2).is_strongly_closed()); // top: vacuous
+        assert!(Dbm::bottom().is_strongly_closed()); // ⊥: vacuous
+        let mut d = Dbm::new(2);
+        d.set_mirrored(0, 1, 4);
+        d.set_mirrored(0, 2, 3);
+        assert!(d.close());
+        assert!(d.is_strongly_closed());
+        // One-sided tighten WITHOUT closure is caught (coherence break:
+        // `set` writes one direction only).
+        d.set(0, 2, 1);
+        assert!(!d.is_strongly_closed());
+    }
+    #[test]
+    fn test_join_preserves_rounded_normal_form() {
+        // Both operands closed under IntegerExact: every finite
+        // self-dual stored bound is a multiple of 4; the point-wise max
+        // of two multiples of 4 is a multiple of 4 — join never exits
+        // the Harvey–Stuckey rounded normal form (§V.D).
+        let mut a = Dbm::new(2);
+        a.set_mirrored(0, 1, 5); // 2x ≤ 5 → rounds to 2x ≤ 4
+        a.set_mirrored(1, 0, -2); // 2x ≥ 2 (stored −4, clean)
+        assert!(a.close_with(ClosureMode::IntegerExact));
+        let mut b = Dbm::new(2);
+        b.set_mirrored(0, 1, 3); // 2x ≤ 3 → rounds to 2x ≤ 2
+        b.set_mirrored(2, 3, 4); // 2y ≤ 4 (stored 8, clean)
+        assert!(b.close_with(ClosureMode::IntegerExact));
+        let j = a.join(&b);
+        assert!(!j.bottom);
+        for v in 0..j.size / 2 {
+            for e in [2 * v, 2 * v + 1] {
+                let s = j.m[e * j.size + (e ^ 1)];
+                if s != DBM_INF {
+                    assert_eq!(s & 3, 0, "self-dual bound must stay ≡ 0 (mod 4)");
+                }
+            }
+        }
     }
 }

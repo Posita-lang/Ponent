@@ -1516,6 +1516,65 @@ fn test_error_type_mismatch() {
     assert!(!all.is_empty(), "should have at least one error message");
 }
 
+// ── Constraint-queue dispatch (return-body unification) ───────────
+//
+// Defensive regression tests for routing the return-body unification
+// (checker/mod.rs `check_stmt(FunctionDef)`) through the inference
+// constraint queue (`Constraint::Eq`) instead of an inline
+// `ctx.unify_tracked` call.  These pin behaviors that MUST NOT change:
+// mismatches still error, matches still pass, and infer-var returns
+// resolve identically whether unified inline or at solve time.
+
+#[test]
+fn test_constraint_dispatch_return_mismatch_still_errors() {
+    // Baseline: inline unify_with(return_ty, body_ty) → immediate E030.
+    // After dispatch: the queued Constraint::Eq must surface the same
+    // mismatch when solved at the scope exit.
+    let result = check_source("def f() -> Int<32> { return true; }");
+    let err = result.expect_err("return type mismatch must error");
+    let all = err.join(" ");
+    assert!(
+        all.contains("expected") && all.contains("Int") && all.contains("Bool"),
+        "error should mention both the expected and found types: {}",
+        all
+    );
+}
+
+#[test]
+fn test_constraint_dispatch_return_match_still_passes() {
+    let result = check_source("def f() -> Int<32> { return 42; }");
+    assert!(
+        result.is_ok(),
+        "matching return must pass: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_constraint_dispatch_return_infer_var_resolves() {
+    // The return type is an InferVar; the body binds it to Int<32>.
+    // Whether unified inline or dispatched to the queue, the result
+    // must resolve identically.
+    let result = check_source("def f() -> Int<32> { set x = 42; return x; }");
+    assert!(
+        result.is_ok(),
+        "infer-var return must pass: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_constraint_dispatch_return_mismatch_in_conditional() {
+    // An `if` whose branches return different types is still rejected
+    // after dispatch (no over-acceptance through the queue).
+    let result = check_source(
+        "def f(x: Int<32>) -> Int<32> {
+             if true { return x; } else { return true; }
+         }",
+    );
+    assert!(result.is_err(), "branch type mismatch should error");
+}
+
 #[test]
 fn test_error_undefined_variable() {
     let result = check_source("def main() -> Int<32> { return x; }");

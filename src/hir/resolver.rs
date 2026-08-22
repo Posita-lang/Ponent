@@ -2283,15 +2283,8 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
 
     fn extract_int_from_type(&self, ty: &Type<'input>) -> Option<u32> {
         match ty {
-            Type::Literal(expr, _) => {
-                if let Expr::Literal(Literal::Int(val), _) = expr {
-                    if *val > 64 {
-                        return None;
-                    }
-                    val.to_u64().and_then(|n| u32::try_from(n).ok())
-                } else {
-                    None
-                }
+            Type::Literal(Expr::Literal(Literal::Int(val), _), _) if *val <= 64 => {
+                val.to_u64().map(|n: u64| n as u32)
             }
             _ => None,
         }
@@ -2409,6 +2402,7 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
         }
     }
 
+    #[must_use]
     pub fn into_symbols(self) -> SymbolTable<'input> {
         self.symbols
     }
