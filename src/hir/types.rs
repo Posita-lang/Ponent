@@ -2840,93 +2840,87 @@ impl<'input> TypeContext<'input> {
                 if total_matches == 0 || total_matches != normalized_params.len() {
                     return ty;
                 }
-                if !branch_replacements.is_empty() || !coyoneda_replacements.is_empty() {
-                    let sigma = if is_coyoneda {
-                        // ≡_X: no Σₖ — multiple branches combine via product (tuple),
-                        // not coproduct.  (Pistone & Tranchini 2022 §2, ≡_X formula)
-                        if coyoneda_replacements.len() == 1 {
-                            coyoneda_replacements[0]
-                        } else {
-                            self.tuple(coyoneda_replacements.clone())
-                        }
-                    } else {
-                        // Σₖ is the categorical coproduct (sum type), NOT a product.
-                        // For ∀X.(A₁⇒X)⇒(A₂⇒X)⇒X  →  A₁ + A₂
-                        self.coproduct(branch_replacements)
-                    };
-                    // Wrap with μX/νX only when the branch product(s) depend on X
-                    // (Pistone & Tranchini 2022 §2, eq.3 & eq.4):
-                    //   Yoneda (A⟨X⟩⇒X):    B⟨X⟩ → B⟨X↦μX.A⟨X⟩⟩
-                    //   co-Yoneda (X⇒A⟨X⟩): B⟨X⟩ → B⟨X↦νX.A⟨X⟩⟩
-                    // When A⟨X⟩ = Int (no X), no fixpoint needed:
-                    //   ∀X.(Int⇒X)⇒B⟨X⟩  →  B⟨X↦Int⟩
-                    let needs_fix = self.type_contains_param(pi, sigma);
-                    let replacement = if needs_fix {
-                        if is_coyoneda {
-                            self.alloc(TypeData::Nu {
-                                param_index: pi,
-                                param_name: "X".into(),
-                                body: sigma,
-                            })
-                        } else {
-                            self.alloc(TypeData::Mu {
-                                param_index: pi,
-                                param_name: "X".into(),
-                                body: sigma,
-                            })
-                        }
-                    } else {
-                        sigma
-                    };
-                    let mut result = self.replace_generic(ret, pi, replacement);
-                    // Re-wrap preserved outer quantifiers ∀Y⃗ (paper Fig.3).
-                    for (oi, on) in outer_quantifiers.into_iter().rev() {
-                        result = self.forall(oi, on, result);
+
+                // ── Variance preconditions (Pistone & Tranchini 2022 §2) ──
+                // Yoneda (≡_X) requires B⟨X⟩ to be entirely positive, and each
+                // replacement Σₖ ∃Z⃗ₖ. Πⱼ Aⱼₖ⟨X⟩ to be positive for μ legality.
+                // co-Yoneda (≡^X) requires B⟨X⟩ to be entirely negative, and each
+                // replacement Πⱼ Aⱼ⟨X⟩ to be positive for ν legality.
+                if !branch_replacements.is_empty() {
+                    // Yoneda case
+                    if !self.check_positive_only(pi, ret)
+                        || branch_replacements
+                            .iter()
+                            .any(|&r| !self.check_positive_only(pi, r))
+                    {
+                        return ty;
                     }
-                    return result;
+                } else if !coyoneda_replacements.is_empty() {
+                    // co-Yoneda case
+                    if !self.check_negative_only(pi, ret)
+                        || coyoneda_replacements
+                            .iter()
+                            .any(|&r| !self.check_positive_only(pi, r))
+                    {
+                        return ty;
+                    }
                 }
+
+                let sigma = if is_coyoneda {
+                    // ≡_X: no Σₖ — multiple branches combine via product (tuple),
+                    // not coproduct.  (Pistone & Tranchini 2022 §2, ≡_X formula)
+                    if coyoneda_replacements.len() == 1 {
+                        coyoneda_replacements[0]
+                    } else {
+                        self.tuple(coyoneda_replacements.clone())
+                    }
+                } else {
+                    // Σₖ is the categorical coproduct (sum type), NOT a product.
+                    // For ∀X.(A₁⇒X)⇒(A₂⇒X)⇒X  →  A₁ + A₂
+                    self.coproduct(branch_replacements)
+                };
+                // Wrap with μX/νX only when the branch product(s) depend on X
+                // (Pistone & Tranchini 2022 §2, eq.3 & eq.4):
+                //   Yoneda (A⟨X⟩⇒X):    B⟨X⟩ → B⟨X↦μX.A⟨X⟩⟩
+                //   co-Yoneda (X⇒A⟨X⟩): B⟨X⟩ → B⟨X↦νX.A⟨X⟩⟩
+                // When A⟨X⟩ = Int (no X), no fixpoint needed:
+                //   ∀X.(Int⇒X)⇒B⟨X⟩  →  B⟨X↦Int⟩
+                let needs_fix = self.type_contains_param(pi, sigma);
+                let replacement = if needs_fix {
+                    if is_coyoneda {
+                        self.alloc(TypeData::Nu {
+                            param_index: pi,
+                            param_name: "X".into(),
+                            body: sigma,
+                        })
+                    } else {
+                        self.alloc(TypeData::Mu {
+                            param_index: pi,
+                            param_name: "X".into(),
+                            body: sigma,
+                        })
+                    }
+                } else {
+                    sigma
+                };
+                let mut result = self.replace_generic(ret, pi, replacement);
+                // Re-wrap preserved outer quantifiers ∀Y⃗ (paper Fig.3).
+                for (oi, on) in outer_quantifiers.into_iter().rev() {
+                    result = self.forall(oi, on, result);
+                }
+                return result;
             }
             return ty;
         }
 
-        // ── Case B: implicit Fn-encoded pattern (backward compatible) ──
-        let (inner, ret) = match self.get(ty) {
-            TypeData::Fn { params, ret } if params.len() == 1 => (params[0], *ret),
-            _ => return ty,
-        };
-        let inner_data = self.get_arc(inner);
-        if let TypeData::Fn {
-            params: inner_params,
-            ret: inner_ret,
-        } = &*inner_data
-        {
-            // ≡_X (Yoneda): inner_ret is GenericParam X
-            let yoneda_idx = match self.get(*inner_ret) {
-                TypeData::GenericParam { index, .. } => Some(*index),
-                _ => None,
-            };
-            if let Some(idx) = yoneda_idx {
-                let replacement = if inner_params.len() == 1 {
-                    inner_params[0]
-                } else {
-                    self.tuple(inner_params.clone())
-                };
-                return self.replace_generic(ret, idx, replacement);
-            }
-            // ≡_X (co-Yoneda): first inner param is GenericParam X
-            if !inner_params.is_empty() {
-                let coyoneda_idx = match self.get(inner_params[0]) {
-                    TypeData::GenericParam { index, .. } => Some(*index),
-                    _ => None,
-                };
-                if let Some(idx) = coyoneda_idx {
-                    return self.replace_generic(ret, idx, *inner_ret);
-                }
-            }
-        }
+        // No explicit Forall → no reduction (Case B was removed, as all legal
+        // Yoneda/co-Yoneda patterns are captured by the explicit Forall case).
         ty
     }
-    /// the type tree (Pistone & Tranchini 2022 §2).
+
+    /// Check whether all occurrences of `param` in `ty` appear only in
+    /// **positive** (covariant) positions throughout the type tree
+    /// (Pistone & Tranchini 2022 §2).
     fn check_positive_only(&self, param: usize, ty: TypeId) -> bool {
         self.check_variance(param, ty, 1)
     }
@@ -7214,49 +7208,97 @@ mod tests {
         );
     }
 
+    /// PIN: the implicit Fn-encoded pattern (the removed "Case B") must
+    /// NOT reduce — `(Int⇒Bool⇒X)⇒X` with NO enclosing ∀X binder stays
+    /// unchanged. (Replaces the old `test_yoneda_distributed_case_b`,
+    /// which asserted the reduction.)
+    ///
+    /// Without the ∀X, X is a FREE type variable, and reducing would
+    /// assert an isomorphism
+    ///     ∀X. ((Int⇒Bool⇒X) ⇒ X)  ≅  (Int, Bool)
+    /// holding for EVERY instantiation of X with a single X-independent
+    /// pair. Hand counterexample at X := 1 (unit):
+    ///     LHS = (Int⇒Bool⇒1)⇒1 ≅ 1⇒1 ≅ 1
+    ///     RHS = (Int, Bool)     = 2^33
+    /// — not isomorphic. The continuation type (A⇒X)⇒X is the DOUBLE
+    /// DUAL of A; the Yoneda lemma collapses it to A only under the ∀X
+    /// (Nat(Hom(A,−), K) ≅ K(A) needs the whole natural transformation —
+    /// Mac Lane §III.2; cf. Pistone & Tranchini §2, where every schema is
+    /// ∀X-headed). The legal form of this reduction is the ∀-bound one,
+    /// covered by test_yoneda_multi_param_inner_fn
+    /// (∀X.(Int⇒Bool⇒X)⇒X → (Int,Bool)).
     #[test]
-    fn test_yoneda_distributed_case_b() {
-        // Implicit Fn-encoded: (Int⇒Bool⇒X)⇒X  →  (Int, Bool)
-        // (no Forall wrapper — pure Fn-encoded pattern)
+    fn test_yoneda_fn_encoded_no_reduction() {
         let mut ctx = TypeContext::new();
         let p0 = ctx.generic_param(0, "X".into());
         let int_ty = ctx.int(32, true);
         let bool_ty = ctx.bool();
+
+        // (Int ⇒ Bool ⇒ X) ⇒ X   — X free, no Forall binder anywhere.
         let inner_fn = ctx.function(vec![int_ty, bool_ty], p0);
         let ty = ctx.function(vec![inner_fn], p0);
-        let reduced = ctx.try_yoneda_reduce(ty);
-        let expected = ctx.tuple(vec![int_ty, bool_ty]);
+
         assert_eq!(
-            reduced, expected,
-            "(Int⇒Bool⇒X)⇒X should reduce to (Int,Bool)"
+            ctx.try_yoneda_reduce(ty),
+            ty,
+            "no ∀X binder ⇒ X is free ⇒ fail-closed: no reduction"
         );
     }
 
+    /// co-Yoneda, multi-param branch tail: `∀X.(X⇒Int⇒Float)⇒(X⇒Bool)` →
+    /// `(Int⇒Float)⇒Bool`.
+    ///
+    /// Isomorphism (⋆)II / (2) of Pistone & Tranchini (2022) §1–2:
+    ///   ∀X.(X⇒A₀)⇒B⟨X⟩  ≡  B⟨X ↦ A₀⟩
+    /// The branch is curried as `X ⇒ (Int⇒Float)` (Fig. 4(a):
+    /// A⇒(B⇒C) ≡ B⇒(A⇒C) — the tail after X IS A₀), so A₀ = Int⇒Float,
+    /// and B⟨X⟩ = X⇒Bool with X in a NEGATIVE position — exactly the
+    /// contravariant reading ≡^X requires (Notation 2.1: the
+    /// co-representable functor X ↦ (X⇒A₀) is contravariant, so B must
+    /// match). Instantiating: B[X ↦ A₀] = (Int⇒Float)⇒Bool.
+    ///
+    /// Hand computation of the isomorphism (semantic sanity check):
+    ///   → : t ↦ t[Int⇒Float](id)
+    ///       t[A₀] : (A₀⇒A₀)⇒(A₀⇒Bool) — applying the identity yields
+    ///       A₀⇒Bool directly.
+    ///   ← : f ↦ ΛX. λ(g:X⇒Int⇒Float). λ(x:X). f (g x)
+    ///       (g x : Int⇒Float = A₀, f applied : Bool).
+    ///
+    /// WHY THE OLD SHAPE WAS WRONG: the previous test used
+    /// `∀X.(X⇒Int⇒Float)⇒X`, i.e. B⟨X⟩ = X — an all-POSITIVE B under the
+    /// co-Yoneda (contravariant) schema. The source is EMPTY: at X := 0,
+    ///   t[0] : (0⇒Int⇒Float)⇒0 ≅ 1⇒0 ≅ 0,
+    /// while the claimed reduct Int⇒Float is inhabited (λi. 0.0). The old
+    /// assertion therefore pinned a FALSE isomorphism (∅ ≅ |Int⇒Float|);
+    /// the variance gate now rejects it. This rewrite moves the test
+    /// inside the schema's domain (B negative) while preserving the
+    /// original regression intent: the multi-parameter tail (Int⇒Float,
+    /// NOT just Int) must survive the reduction.
     #[test]
     fn test_coyoneda_multi_param_preserves_return() {
-        // co-Yoneda: ∀X.(X ⇒ Int ⇒ Float) ⇒ X
-        //   ips = [X(pi), Int], ir = Float
-        //   Correct: replacement = Int → Float = Fn(Int, Float)
-        //   Bug:     replacement = Int (drops Float!)
         let mut ctx = TypeContext::new();
         let p0 = ctx.generic_param(0, "X".into());
         let int_ty = ctx.int(32, true);
         let float_ty = ctx.float(64);
-        // branch: X ⇒ Int → Float
-        let branch = ctx.function(vec![int_ty], float_ty);
-        // outer: X ⇒ branch  →  but co-Yoneda needs X as FIRST param
-        let outer_fn = ctx.function(vec![p0, branch], p0); // p0 is ret, but it doesn't matter
-        // Actually build the right shape: ∀X.(X ⇒ Int → Float) ⇒ X
-        // The branch param list is [X, Int] with ret=Float
+        let bool_ty = ctx.bool();
+
+        // Branch: X ⇒ Int ⇒ Float   (the single k-branch of the ≡^X schema)
         let inner_fn = ctx.function(vec![p0, int_ty], float_ty);
-        let outer = ctx.function(vec![inner_fn], p0);
+        // B⟨X⟩ = X ⇒ Bool   (X negative: function-parameter position)
+        let b_ty = ctx.function(vec![p0], bool_ty);
+        // ∀X.(X⇒Int⇒Float)⇒(X⇒Bool)
+        let outer = ctx.function(vec![inner_fn], b_ty);
         let forall = ctx.forall(0, "X".into(), outer);
-        let reduced = ctx.try_yoneda_reduce(forall);
-        // Expected: Int → Float
-        let expected = ctx.function(vec![int_ty], float_ty);
+
+        // Expected: B⟨X ↦ Int⇒Float⟩ = (Int⇒Float)⇒Bool
+        let int_to_float = ctx.function(vec![int_ty], float_ty);
+        let expected = ctx.function(vec![int_to_float], bool_ty);
+
         assert_eq!(
-            reduced, expected,
-            "∀X.(X⇒Int⇒Float)⇒X should reduce to Int→Float, not lose Float"
+            ctx.try_yoneda_reduce(forall),
+            expected,
+            "∀X.(X⇒Int⇒Float)⇒(X⇒Bool) should reduce to (Int⇒Float)⇒Bool, \
+             preserving the full multi-param tail"
         );
     }
 
@@ -7372,65 +7414,123 @@ mod tests {
         );
     }
 
+    /// co-Yoneda with an inner quantifier, B in negative position:
+    /// `∀X.(∀Z.X⇒Z)⇒(X⇒Int)` → `(∀Z.Z)⇒Int`.
+    ///
+    /// Fig. 3, second schema (≡^X), k = 1 branch:
+    ///   ∀X.⟨∀Z⃗. X ⇒ A⟨X⟩⟩ ⇒ C⟨X⟩  ≡  C⟨X ↦ {νX.}∀Z⃗. A⟨X⟩⟩
+    /// The branch is `∀Z.X⇒Z`: A = Z with X NOT occurring in A, so the
+    /// {νX.} wrapper is elided — the paper derives isomorphism (2) from
+    /// (4) exactly this way ("μX.A ≡ νX.A ≡ A when X does not occur in
+    /// A"), leaving the substitution X ↦ ∀Z.Z. C⟨X⟩ = X⇒Int (negative
+    /// B ✓), so the reduct is C[X ↦ ∀Z.Z] = (∀Z.Z)⇒Int.
+    ///
+    /// Hand computation of the extraction (→ direction):
+    ///   t : ∀X.(∀Z.X⇒Z)⇒(X⇒Int)  ↦  λ(h:∀Z.Z). t[∀Z.Z](ΛZ.λ_. h[Z])
+    /// Instantiate X := ∀Z.Z:
+    ///   t[∀Z.Z] : (∀Z.(∀Z.Z)⇒Z) ⇒ ((∀Z.Z)⇒Int).
+    /// From h : ∀Z.Z build g' = ΛZ.λ_. h[Z] : ∀Z.(∀Z.Z)⇒Z (ignore the
+    /// argument, return h[Z] : Z), so t[∀Z.Z](g') : (∀Z.Z)⇒Int. Note
+    /// ∀Z.Z is EMPTY (instantiate Z := 0), so the reduct has exactly ONE
+    /// inhabitant — the vacuous function from an empty domain (κ = 1).
+    ///
+    /// The old shape `∀X.(∀Z.X⇒Z)⇒X` only "worked" because BOTH sides
+    /// were empty (0 ≅ 0 — source: at X := 0, t[0] : (∀Z.1)⇒0 ≅ 0), an
+    /// accidental isomorphism outside the schema's domain; the variance
+    /// gate now rejects it.
+    ///
+    /// The branch's ∀Z⃗ is PRESERVED as ∀ — the dual of the Yoneda side's
+    /// ∃Z⃗ (Fig. 3 keeps ∀Z⃗ₖ under the ν/∀ combination). NB: the expected
+    /// TypeId equality relies on the fresh binder index landing on 1 —
+    /// deterministic here because fresh_param_index() first yields 0
+    /// (which collides with pi = 0 and is skipped), then 1, matching the
+    /// peeled index before any other fresh allocation in this reduction.
     #[test]
     fn test_coyoneda_inner_quantifier_one() {
-        // ∀X. (∀Z. X ⇒ Z) ⇒ X  →  ∀Z. Z
         let mut ctx = TypeContext::new();
         let p0 = ctx.generic_param(0, "X".into());
         let gp_z = ctx.generic_param(1, "Z".into());
+        let int_ty = ctx.int(32, true);
 
-        // Expected: ∀Z. Z
-        let expected = ctx.alloc(TypeData::Forall {
-            param_index: 1,
-            param_name: "Z".into(),
-            body: gp_z,
-        });
+        // Expected: (∀Z.Z) ⇒ Int
+        let forall_z = ctx.forall(1, "Z".into(), gp_z);
+        let expected = ctx.function(vec![forall_z], int_ty);
 
+        // Branch: ∀Z. X ⇒ Z
         let inner_fn = ctx.function(vec![p0], gp_z);
-        let inner_forall = ctx.alloc(TypeData::Forall {
-            param_index: 1,
-            param_name: "Z".into(),
-            body: inner_fn,
-        });
-        let outer_fn = ctx.function(vec![inner_forall], p0);
+        let inner_forall = ctx.forall(1, "Z".into(), inner_fn);
+        // B⟨X⟩ = X ⇒ Int   (X negative)
+        let b_ty = ctx.function(vec![p0], int_ty);
+        // ∀X.(∀Z.X⇒Z)⇒(X⇒Int)
+        let outer_fn = ctx.function(vec![inner_forall], b_ty);
         let forall_id = ctx.forall(0, "X".into(), outer_fn);
-        let result = ctx.try_yoneda_reduce(forall_id);
-        assert_eq!(result, expected, "∀X.(∀Z.X⇒Z)⇒X should reduce to ∀Z.Z");
+
+        assert_eq!(
+            ctx.try_yoneda_reduce(forall_id),
+            expected,
+            "∀X.(∀Z.X⇒Z)⇒(X⇒Int) should reduce to (∀Z.Z)⇒Int, keeping the \
+             inner ∀ as ∀ (the co-Yoneda dual of the Yoneda ∃)"
+        );
     }
 
+    /// co-Yoneda with X occurring in the branch body — schema (4), the ν
+    /// case: `∀X.(∀Z.X⇒(Z,X))⇒(X⇒Int)` → `(νX.∀Z.(Z,X))⇒Int`.
+    ///
+    /// Isomorphism (4) of Pistone & Tranchini (2022) §2:
+    ///   ∀X.(X⇒A⟨X⟩)⇒C⟨X⟩  ≡  C⟨X ↦ νX.A⟨X⟩⟩
+    /// with the branch's inner ∀Z⃗ folded into the ν body (Fig. 3, ≡^X).
+    /// Preconditions, both satisfied here:
+    ///   - C⟨X⟩ = X⇒Int: every X occurrence NEGATIVE (the contravariant
+    ///     reading ≡^X requires — Notation 2.1);
+    ///   - A⟨X⟩ = (Z,X): every X occurrence POSITIVE (Forall body and
+    ///     Tuple are both covariant positions) — the schemas only form
+    ///     μ/ν over strictly positive bodies.
+    /// Since X DOES occur in A, the {νX.} wrapper is NOT elided (contrast
+    /// test_coyoneda_inner_quantifier_one), and the reduct is
+    /// C[X ↦ νX.∀Z.(Z,X)] = (νX.∀Z.(Z,X))⇒Int — νX.∀Z.(Z,X) being the
+    /// final coalgebra of F(Y) = ∀Z.(Z,Y).
+    ///
+    /// Hand computation (why the old shape was outside the schema): the
+    /// old test used B⟨X⟩ = X — positive. Its source is again EMPTY: at
+    /// X := 0, g : ∀Z.0⇒(Z,0) ≅ ∀Z.1 is inhabited, so
+    ///   t[0] : (∀Z.1)⇒0 ≅ 0,
+    /// while the claimed reduct νX.∀Z.(Z,X) IS inhabited — the canonical
+    /// final-coalgebra element h = ΛZ.λz.(z, h) (unfolding
+    /// νX.F(X) ≅ F(νX.F(X))) is well-typed. The old assertion therefore
+    /// pinned ∅ ≅ |νX.∀Z.(Z,X)| > 0 — a false isomorphism the variance
+    /// gate now rejects.
     #[test]
     fn test_coyoneda_inner_quantifier_x_in_body() {
-        // ∀X. (∀Z. X ⇒ (Z, X)) ⇒ X  →  νX. ∀Z. (Z, X)
         let mut ctx = TypeContext::new();
         let p0 = ctx.generic_param(0, "X".into());
         let gp_z = ctx.generic_param(1, "Z".into());
+        let int_ty = ctx.int(32, true);
 
-        // Expected: νX. ∀Z. (Z, X)
+        // Expected: (νX.∀Z.(Z,X)) ⇒ Int
         let tup = ctx.tuple(vec![gp_z, p0]);
-        let inner_forall = ctx.alloc(TypeData::Forall {
-            param_index: 1,
-            param_name: "Z".into(),
-            body: tup,
-        });
-        let expected = ctx.alloc(TypeData::Nu {
+        let inner_forall = ctx.forall(1, "Z".into(), tup);
+        let nu = ctx.alloc(TypeData::Nu {
             param_index: 0,
             param_name: "X".into(),
             body: inner_forall,
         });
+        let expected = ctx.function(vec![nu], int_ty);
 
+        // Branch: ∀Z. X ⇒ (Z, X)
         let i_tup = ctx.tuple(vec![gp_z, p0]);
         let inner_fn = ctx.function(vec![p0], i_tup);
-        let inner_forall_wrap = ctx.alloc(TypeData::Forall {
-            param_index: 1,
-            param_name: "Z".into(),
-            body: inner_fn,
-        });
-        let outer_fn = ctx.function(vec![inner_forall_wrap], p0);
+        let inner_forall_wrap = ctx.forall(1, "Z".into(), inner_fn);
+        // B⟨X⟩ = X ⇒ Int   (X negative)
+        let b_ty = ctx.function(vec![p0], int_ty);
+        // ∀X.(∀Z.X⇒(Z,X))⇒(X⇒Int)
+        let outer_fn = ctx.function(vec![inner_forall_wrap], b_ty);
         let forall_id = ctx.forall(0, "X".into(), outer_fn);
-        let result = ctx.try_yoneda_reduce(forall_id);
+
         assert_eq!(
-            result, expected,
-            "∀X.(∀Z.X⇒(Z,X))⇒X should reduce to νX.∀Z.(Z,X)"
+            ctx.try_yoneda_reduce(forall_id),
+            expected,
+            "∀X.(∀Z.X⇒(Z,X))⇒(X⇒Int) should reduce to (νX.∀Z.(Z,X))⇒Int — \
+             X occurs in the branch body, so the νX wrapper is kept"
         );
     }
 
