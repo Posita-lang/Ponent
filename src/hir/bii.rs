@@ -9,6 +9,26 @@
 //! strategy (Algorithm 3) and the bitwise greedy strategy (Algorithm 4)
 //! augmented by boundary-limit bounded leap (Algorithm 5).
 //!
+//! # Semantics operating point
+//!
+//! The paper fixes ONE semantics (unsigned bit-vectors, §3.3). This
+//! pipeline serves a language with THREE overflow policies, each
+//! mapped to its exact encoding:
+//!   trap (language default) → LIA + definedness antecedents
+//!       (mathematical integers are EXACT for partial arithmetic:
+//!        the inductive step is conditioned on non-trapping states)
+//!   wrap (`+%`)             → BV (the paper's setting), opt-in
+//!   saturate (`+?`)         → Clamp rows (beyond the paper)
+//! The LIA default is the exact encoding of the default semantics,
+//! not a divergence; the paper's setting is the opt-in for loops
+//! that have it. Signed support (sign-extended operands, shifted-
+//! domain bit-walk, signed boundary seeds) lies OUTSIDE the paper's
+//! validated unsigned scope (Lemma 5.2 / Theorem 5.3) and carries
+//! its own in-line soundness arguments. The template family is the
+//! sparse template-polyhedra hierarchy of the paper's Section 4
+//! (Interval ⊂ Octagon ⊂ SparsePoly — "additionally include"),
+//! exercised at the full SparsePoly level.
+//!
 //! All bound arithmetic uses `num_bigint::BigInt` to support bit-widths
 //! up to 128 and beyond without overflow. The SMT encoding supports both
 //! LIA (linear integer arithmetic) and BV (fixed-width bit-vectors with
@@ -37,25 +57,26 @@
 //! `RowKind`/template abstraction without touching the propose-and-refine
 //! driver.
 //!
-//! # Correctness fixes over the initial implementation
+//! # Deviations from the paper (rationale)
 //!
-//! - **Bounded leap strict-tightening** (Algorithm 5 Theorem 5.5): the
-//!   leap query now requires the witness to be *strictly* tighter than
-//!   the current template in at least one row, so UNSAT correctly proves
-//!   the current template is the BII.
+//! - **Bounded leap strict-tightening** (Algorithm 5, Theorem 5.5).  The
+//!   leap query conjoins a STRICT-tightening obligation:
+//!   `A′ ⊏ A ≜ ∃r. l′_r > A.l_r ∨ u′_r < A.u_r` — the witness must
+//!   tighten at least one row.  UNSAT then proves `A = A*`: any
+//!   `A* ∈ [B, A]` with `A* ⊏ A` would satisfy the query, so
+//!   unsatisfiability contradicts the existence of a strictly tighter
+//!   inductive template in the bounded region.  The strict conjunct
+//!   adds no query — the 4W bound (Theorem 5.5) is unchanged.
 //!
-//! - **Position-pointer advancement** (Algorithm 4 Lemma 5.2): pointers
+//! - **Position-pointer advancement** (Algorithm 4, Lemma 5.2): pointers
 //!   advance only after UNSAT (the template is unchanged), never after
-//!   SAT (the witness changed the template). The previous implementation
-//!   advanced all rows after SAT, potentially skipping undecided bits
-//!   for rows the witness did not touch. This is now implemented via a
-//!   `prev_unsat` flag instead of the error-prone `a_last` comparison.
+//!   SAT (the witness changed the template).  This is Algorithm 4's
+//!   `A = A_last` test, realized as an explicit `prev_unsat` flag.
 //!
 //! - **Negative-bound bitwise encoding** (§5.1): Diff rows with negative
 //!   lower bounds use an offset encoding that maps the signed range
 //!   `[-m, m]` to the unsigned range `[0, 2m]` before bit manipulation,
-//!   preserving the O(Σ bw) query bound. The previous implementation
-//!   fell back to linear ±1 stepping for negative bounds.
+//!   preserving the O(Σ bw) query bound.
 //!
 //! - **Sequential transition fail-closed**: `encode_sequential_transition`
 //!   returns `Option`, and any unsupported `LoopInstr` causes the entire
@@ -76,13 +97,11 @@
 //! - **Signed relational rows**: Sum and Support3 rows are
 //!   generated over uniform-signedness operand sets with TRUE signed
 //!   tops (signed Sum: [−2^bw, 2^bw−2]; signed Support3:
-//!   signed_s3_range); mixed-signature pairs are skipped (the old
-//!   mixed Diff tops [−m, m] EXCLUDED reachable states — Int<8> −
-//!   UInt<8> reaches −383 < −255). Under BV, relational-row operands
+//!   signed_s3_range); mixed-signature pairs are skipped (symmetric
+//!   mixed tops would EXCLUDE reachable states — Int<8> − UInt<8>
+//!   reaches −383 < −255). Under BV, relational-row operands
 //!   SIGN-extend (a two's-complement negative value zero-extended
-//!   inflates by 2^bw and corrupts the offset-domain comparison — the
-//!   latent signed-Diff bug, never exercised because signed tests had
-//!   ≤ 1 variable).
+//!   inflates by 2^bw and corrupts the offset-domain comparison).
 
 use crate::ast::{self, IntLit};
 use crate::hir::loop_infer::LoopInstr;
@@ -317,12 +336,10 @@ impl BiiTemplate {
         // and both-unsigned keep the exact symmetric tops [−m, m] (the
         // difference of two same-signedness b-bit values spans exactly
         // that, mixed widths included: |x−y| ≤ 2^bw−1). MIXED pairs are
-        // SKIPPED: the mixed range [min_x − max_y, max_x − min_y]
-        // escapes [−m, m] (Int<8> − UInt<8> reaches −383 < −255), so the
-        // old tops EXCLUDED reachable states — the verifier's check 1
-        // would report a counterexample and the checker would flag a
-        // domain-construction gap as a synthesis bug. Mixed-signature
-        // relational rows are future work.
+        // SKIPPED: symmetric tops would EXCLUDE reachable states — the
+        // mixed range [min_x − max_y, max_x − min_y]
+        // escapes [−m, m] (Int<8> − UInt<8> reaches −383 < −255).
+        // Mixed-signature relational rows are future work.
         for i in 0..n_vars {
             for j in (i + 1)..n_vars {
                 if signed_of(i) != signed_of(j) {
@@ -820,13 +837,24 @@ impl BoundaryLimits {
 /// Synthesize the BII with the bitwise greedy strategy (Algorithm 4) and
 /// the boundary-limit bounded leap (Algorithm 5). Solver-call count is
 /// bounded by `2·Σ bwᵢ + 1` queries (Theorem 5.3) instead of the linear
-/// search's `O(Σ 2^bwᵢ)`. Fail-closed (`None`) on solver unavailability,
-/// `unknown`, an unparsable witness, or an exhausted query budget.
+/// search's `O(Σ 2^bwᵢ)`.
 ///
-/// The `prev_unsat` flag replaces the old `a_last` comparison: pointers
-/// advance ONLY when the previous refine left `cur` unchanged (UNSAT).
-/// After SAT the witness changed `cur`, so the pointers must NOT advance
-/// (the new bits may still need examination).
+/// Return contract:
+/// - `Some(tpl)` — the BII (every bit position decided, or a bounded-leap
+///   UNSAT proving no tighter inductive template exists), OR a PARTIAL
+///   inductive invariant: on budget exhaustion, solver `unknown`/error,
+///   or a witness-parse failure after at least one refinement was
+///   adopted, the last adopted template is returned — the paper's
+///   any-time property (§4, remark after Algorithm 2). Only best-ness
+///   is forfeited: every adopted witness passed the ∃∀ query carrying
+///   both the Init and the Inductiveness obligation.
+/// - `None` — nothing was adopted before the failure (the result would
+///   be the uninformative ⊤), or a query encoding failed.
+///
+/// Pointers advance ONLY when the previous refine left `cur` unchanged
+/// (UNSAT) — Algorithm 4's `A = A_last` test, realized as the
+/// `prev_unsat` flag. After SAT the witness changed `cur`, so the new
+/// bits may still need examination.
 pub(crate) fn synthesize_bitwise_bii(
     solver: &SmtSolver,
     vars: &[Symbol],
@@ -844,10 +872,19 @@ pub(crate) fn synthesize_bitwise_bii(
     // Whether the previous refine step left `cur` unchanged (= UNSAT).
     // Only then do position pointers advance (Algorithm 4 line 7-8).
     let mut prev_unsat = false;
+    // Any-time partial invariant: whether at least one refinement was
+    // adopted (see the budget-exhaustion return below).
+    let mut adopted = false;
 
     loop {
         if calls >= max_queries {
-            return None; // budget exhausted — fail closed.
+            // Budget exhausted: `cur` is inductive by construction — every
+            // adopted witness passed the ∃∀ query carrying BOTH the Init and
+            // the Inductiveness obligation. Return the PARTIAL invariant (the
+            // paper's any-time property, §4 remark after Algorithm 2); `None`
+            // only when nothing was adopted (the result would be the
+            // uninformative ⊤).
+            return if adopted { Some(cur) } else { None };
         }
 
         if prev_unsat {
@@ -858,17 +895,15 @@ pub(crate) fn synthesize_bitwise_bii(
         let candidates = propose_bitwise(&cur, &pos);
         if candidates.is_empty() {
             // EXHAUSTED pointers (every bit passed — the true
-            // termination) vs WINDOW-INVALID proposals (bits remain but
-            // every candidate was filtered by the l ≤ u pre-check). The
-            // paper's Propose emits ALL bit hypotheses and lets the
-            // SOLVER reject impossible ones (the l ≤ u conjunct makes
-            // the disjunct trivially false → UNSAT → pointers advance,
-            // Lemma 5.2); the Rust pre-filter short-circuits that path,
-            // and returning here froze a non-BII inductive witness
-            // (first exposed by a signed-pair test's BV half:
-            // converged [0,16] where the BII is [0,5] — sound, not
-            // best). Advance while any pointer is live; return only
-            // when every position is exhausted.
+            // termination) vs WINDOW-INVALID proposals: an empty
+            // candidate set can mean bits remain whose hypotheses are
+            // window-invalid (every candidate was filtered by the l ≤ u
+            // pre-check). The paper's Propose emits ALL bit hypotheses
+            // and lets the SOLVER reject impossible ones (the l ≤ u
+            // conjunct makes the disjunct trivially false → UNSAT →
+            // pointers advance, Lemma 5.2); the Rust pre-filter
+            // short-circuits that path, so advance while any pointer is
+            // live, return only when every position is exhausted.
             if pos.lpos.iter().chain(pos.upos.iter()).all(|&p| p < 0) {
                 return Some(cur); // every bit position passed — BII reached.
             }
@@ -893,7 +928,7 @@ pub(crate) fn synthesize_bitwise_bii(
                 // region — SAT adopts the witness, UNSAT proves A is the BII.
                 if limits.is_active() {
                     if calls >= max_queries {
-                        return None;
+                        return if adopted { Some(cur) } else { None };
                     }
                     let leap = build_bounded_leap_query(
                         &cur, &limits, init, body, false, use_bv, bit_widths, signed,
@@ -903,7 +938,7 @@ pub(crate) fn synthesize_bitwise_bii(
                         RawQueryOutcome::Unsat => return Some(cur),
                         RawQueryOutcome::Sat(_) => {
                             if calls >= max_queries {
-                                return None;
+                                return if adopted { Some(cur) } else { None };
                             }
                             let leap_m = build_bounded_leap_query(
                                 &cur, &limits, init, body, true, use_bv, bit_widths, signed,
@@ -915,27 +950,37 @@ pub(crate) fn synthesize_bitwise_bii(
                                         Some(bounds) => {
                                             apply_bounds(&mut cur, &bounds);
                                             limits.tighten_sat(&bounds);
+                                            adopted = true;
                                             // After a successful leap the pointers
                                             // should advance past the rejected
                                             // directions (Algorithm 5 line 12).
                                             prev_unsat = true;
                                         }
-                                        None => return None,
+                                        None => {
+                                            eprintln!(
+                                                "witness parse failure in leap — synthesis bug"
+                                            );
+                                            return if adopted { Some(cur) } else { None };
+                                        }
                                     }
                                 }
                                 RawQueryOutcome::Unknown
                                 | RawQueryOutcome::Error(_)
-                                | RawQueryOutcome::Unsat => return None,
+                                | RawQueryOutcome::Unsat => {
+                                    return if adopted { Some(cur) } else { None };
+                                }
                             }
                         }
-                        RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => return None,
+                        RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => {
+                            return if adopted { Some(cur) } else { None };
+                        }
                     }
                 }
             }
             RawQueryOutcome::Sat(_) => {
                 // Refine step 2: get model.
                 if calls >= max_queries {
-                    return None;
+                    return if adopted { Some(cur) } else { None };
                 }
                 let query_model =
                     build_refine_query(&candidates, init, body, true, use_bv, bit_widths, signed)?;
@@ -946,20 +991,26 @@ pub(crate) fn synthesize_bitwise_bii(
                             Some(bounds) => {
                                 apply_bounds(&mut cur, &bounds);
                                 limits.tighten_sat(&bounds);
+                                adopted = true;
                                 // SAT changed cur — do NOT advance pointers.
                                 // prev_unsat stays false.
                             }
-                            None => return None,
+                            None => {
+                                eprintln!("witness parse failure in refine — synthesis bug");
+                                return if adopted { Some(cur) } else { None };
+                            }
                         }
                     }
                     RawQueryOutcome::Unknown
                     | RawQueryOutcome::Error(_)
                     | RawQueryOutcome::Unsat => {
-                        return None;
+                        return if adopted { Some(cur) } else { None };
                     }
                 }
             }
-            RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => return None,
+            RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => {
+                return if adopted { Some(cur) } else { None };
+            }
         }
     }
 }
@@ -1820,11 +1871,10 @@ fn sext_term(s: String, from: u32, to: u32) -> String {
 /// row's encoded width (`to`), SIGN-extending for signed rows and
 /// zero-extending otherwise. Row uniformity: relational rows
 /// exist only over same-signedness operand sets, so `row.signed`
-/// implies EVERY operand of the row is signed. Sign-extension is the
-/// fix for the latent signed-BV bug: a two's-complement negative value
-/// zero-extended inflates by 2^bw (x = −1 @ 8 bits → 255, not −1) and
-/// corrupts the offset-domain comparison (the Diff encoding computed
-/// 510 where the truth was 254); sign-extension represents the TRUE
+/// implies EVERY operand of the row is signed. A two's-complement
+/// negative value zero-extended inflates by 2^bw (x = −1 @ 8 bits →
+/// 255, not −1) and corrupts the offset-domain comparison;
+/// sign-extension represents the TRUE
 /// value mod 2^enc_bw, and the subsequent +offset `bvadd` lands
 /// exactly in [0, 2^enc_bw).
 fn ext_operand(var_str: &str, from: u32, to: u32, signed: bool) -> String {
@@ -1869,14 +1919,12 @@ fn cond_to_smt(
             let (ls, lbw) = expr_to_smt_bw(lhs, bv, bws, vars_len, 64)?;
             let (rs, rbw) = expr_to_smt_bw(rhs, bv, bws, vars_len, 64)?;
             // Common width inferred from both operands (fallback 64 when
-            // neither side names a variable). Fix: a SIGNED comparison
+            // neither side names a variable). A SIGNED comparison
             // sign-extends the narrower operand to the common width — a
             // two's-complement negative pattern zero-extended inflates by
             // 2^w (x = −1 @ 8 bits → 255 at 64), and bvsle then misjudges
-            // the guard (x < y at (−1, 0) read as false; the vacuous
-            // inductive step let an unsound singleton BII pass BOTH
-            // synthesis and the shared verifier — first triggered by a
-            // signed Diff test). Mirrors `ext_operand`. Residual
+            // the guard (x < y at (−1, 0) reads false, making the
+            // inductive step vacuous). Mirrors `ext_operand`. Residual
             // limitation (consistent with the uniform-signedness
             // policy): a comparison marked signed over a genuinely
             // UNSIGNED operand sign-extends its pattern — mixed-
@@ -2276,8 +2324,10 @@ pub(crate) fn query_budget_floor(
 }
 
 /// BiiLoopProblem BII synthesis (Algorithm 4 + 5 driver unchanged; the
-/// transition encoding is edge-wise ∀). Returns None = fail-closed (same
-/// as `synthesize_bitwise_bii`).
+/// transition encoding is edge-wise ∀). Return contract identical to
+/// `synthesize_bitwise_bii`: `Some` = the BII or an any-time partial
+/// invariant (at least one refinement adopted); `None` = nothing was
+/// adopted, or an encoding failure.
 pub(crate) fn synthesize_problem_bii(
     solver: &SmtSolver,
     problem: &crate::hir::loop_ir::BiiLoopProblem,
@@ -2304,10 +2354,19 @@ pub(crate) fn synthesize_problem_bii(
     let mut limits = BoundaryLimits::new(&cur);
     let mut calls = 0usize;
     let mut prev_unsat = false;
+    // Any-time partial invariant: whether at least one refinement was
+    // adopted (see the budget-exhaustion return below).
+    let mut adopted = false;
 
     loop {
         if calls >= max_queries {
-            return None;
+            // Budget exhausted: `cur` is inductive by construction — every
+            // adopted witness passed the ∃∀ query carrying BOTH the Init and
+            // the Inductiveness obligation. Return the PARTIAL invariant (the
+            // paper's any-time property, §4 remark after Algorithm 2); `None`
+            // only when nothing was adopted (the result would be the
+            // uninformative ⊤).
+            return if adopted { Some(cur) } else { None };
         }
         if prev_unsat {
             pos.advance();
@@ -2317,17 +2376,15 @@ pub(crate) fn synthesize_problem_bii(
         let candidates = propose_bitwise(&cur, &pos);
         if candidates.is_empty() {
             // EXHAUSTED pointers (every bit passed — the true
-            // termination) vs WINDOW-INVALID proposals (bits remain but
-            // every candidate was filtered by the l ≤ u pre-check). The
-            // paper's Propose emits ALL bit hypotheses and lets the
-            // SOLVER reject impossible ones (the l ≤ u conjunct makes
-            // the disjunct trivially false → UNSAT → pointers advance,
-            // Lemma 5.2); the Rust pre-filter short-circuits that path,
-            // and returning here froze a non-BII inductive witness
-            // (first exposed by a signed-pair test's BV half:
-            // converged [0,16] where the BII is [0,5] — sound, not
-            // best). Advance while any pointer is live; return only
-            // when every position is exhausted.
+            // termination) vs WINDOW-INVALID proposals: an empty
+            // candidate set can mean bits remain whose hypotheses are
+            // window-invalid (every candidate was filtered by the l ≤ u
+            // pre-check). The paper's Propose emits ALL bit hypotheses
+            // and lets the SOLVER reject impossible ones (the l ≤ u
+            // conjunct makes the disjunct trivially false → UNSAT →
+            // pointers advance, Lemma 5.2); the Rust pre-filter
+            // short-circuits that path, so advance while any pointer is
+            // live, return only when every position is exhausted.
             if pos.lpos.iter().chain(pos.upos.iter()).all(|&p| p < 0) {
                 return Some(cur); // every bit position passed — BII reached.
             }
@@ -2343,7 +2400,7 @@ pub(crate) fn synthesize_problem_bii(
                 limits.prune_unsat(&cur, &candidates);
                 if limits.is_active() {
                     if calls >= max_queries {
-                        return None;
+                        return if adopted { Some(cur) } else { None };
                     }
                     let leap = build_bounded_leap_query_problem(
                         problem, &cur, &limits, false, use_bv, &bws_all,
@@ -2353,7 +2410,7 @@ pub(crate) fn synthesize_problem_bii(
                         RawQueryOutcome::Unsat => return Some(cur),
                         RawQueryOutcome::Sat(_) => {
                             if calls >= max_queries {
-                                return None;
+                                return if adopted { Some(cur) } else { None };
                             }
                             let leap_m = build_bounded_leap_query_problem(
                                 problem, &cur, &limits, true, use_bv, &bws_all,
@@ -2365,23 +2422,33 @@ pub(crate) fn synthesize_problem_bii(
                                         Some(bounds) => {
                                             apply_bounds(&mut cur, &bounds);
                                             limits.tighten_sat(&bounds);
+                                            adopted = true;
                                             prev_unsat = true;
                                         }
-                                        None => return None,
+                                        None => {
+                                            eprintln!(
+                                                "witness parse failure in leap — synthesis bug"
+                                            );
+                                            return if adopted { Some(cur) } else { None };
+                                        }
                                     }
                                 }
                                 RawQueryOutcome::Unknown
                                 | RawQueryOutcome::Error(_)
-                                | RawQueryOutcome::Unsat => return None,
+                                | RawQueryOutcome::Unsat => {
+                                    return if adopted { Some(cur) } else { None };
+                                }
                             }
                         }
-                        RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => return None,
+                        RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => {
+                            return if adopted { Some(cur) } else { None };
+                        }
                     }
                 }
             }
             RawQueryOutcome::Sat(_) => {
                 if calls >= max_queries {
-                    return None;
+                    return if adopted { Some(cur) } else { None };
                 }
                 let query_model =
                     build_refine_query_problem(problem, &candidates, true, use_bv, &bws_all)?;
@@ -2391,17 +2458,23 @@ pub(crate) fn synthesize_problem_bii(
                         Some(bounds) => {
                             apply_bounds(&mut cur, &bounds);
                             limits.tighten_sat(&bounds);
+                            adopted = true;
                         }
-                        None => return None,
+                        None => {
+                            eprintln!("witness parse failure in refine — synthesis bug");
+                            return if adopted { Some(cur) } else { None };
+                        }
                     },
                     RawQueryOutcome::Unknown
                     | RawQueryOutcome::Error(_)
                     | RawQueryOutcome::Unsat => {
-                        return None;
+                        return if adopted { Some(cur) } else { None };
                     }
                 }
             }
-            RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => return None,
+            RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => {
+                return if adopted { Some(cur) } else { None };
+            }
         }
     }
 }
@@ -3880,6 +3953,87 @@ mod tests {
         );
     }
 
+    /// Any-time partial invariant (paper §4 remark after Algorithm 2):
+    /// a budget-exhausted driver returns the last INDUCTIVE template —
+    /// not None — once at least one witness was adopted.  `i := 0;
+    /// while i < 6 { i := i + 1 }` (BII [0,6]) with budget 3: the first
+    /// refine+model pair (2 calls) adopts a witness (the first candidate
+    /// set contains the inductive [0,127]), the budget check then fires.
+    /// Asserts: (a) Some, never None; (b) sound — the partial bounds
+    /// contain the BII row-wise (lb ≤ and ub ≥); (c) inductive — the
+    /// independent verifier still says Verified.
+    #[test]
+    fn test_bitwise_bii_budget_exhaustion_returns_partial() {
+        let solver = SmtSolver::new("z3");
+        if !solver.check_version() {
+            eprintln!(
+                "z3 unavailable — skipping test_bitwise_bii_budget_exhaustion_returns_partial"
+            );
+            return;
+        }
+        let vars = vec![Symbol::intern("i")];
+        let init = vec![LoopInstr::ConstVar(0, 0)];
+        let body = vec![LoopInstr::TestLe(0, 5), LoopInstr::AddVar(0, 1)];
+        let bw = vec![8u8];
+        let tpl = synthesize_bitwise_bii(&solver, &vars, &init, &body, &bw, &[false], 3, false)
+            .expect("budget exhaustion must return the partial invariant, never None");
+        // (b) sound: partial ⊇ BII row-wise ([0,6] ⊆ [lb, ub]).
+        assert!(tpl.rows[0].lb <= BigInt::zero(), "partial lb ≤ BII lb (0)");
+        assert!(tpl.rows[0].ub >= BigInt::from(6), "partial ub ≥ BII ub (6)");
+        // (c) inductive: the independent verifier confirms.
+        let problem = crate::hir::loop_ir::loop_instrs_to_loop_problem(
+            &vars,
+            &init,
+            &body,
+            &bw,
+            &[false],
+            &[],
+            true,
+        )
+        .expect("must lower");
+        assert!(matches!(
+            verify_template_against_problem(&solver, &problem, &tpl, false),
+            VerifyOutcome::Verified
+        ));
+    }
+
+    /// Same any-time property on the PRODUCTION path
+    /// (synthesize_problem_bii): budget 3 exhausts after the first
+    /// adopted witness — the partial invariant comes back instead of
+    /// None, stays sound and verifies.
+    #[test]
+    fn test_problem_bii_budget_exhaustion_returns_partial() {
+        let solver = SmtSolver::new("z3");
+        if !solver.check_version() {
+            eprintln!(
+                "z3 unavailable — skipping test_problem_bii_budget_exhaustion_returns_partial"
+            );
+            return;
+        }
+        let vars = vec![Symbol::intern("i")];
+        let init = vec![LoopInstr::ConstVar(0, 0)];
+        let body = vec![LoopInstr::TestLe(0, 5), LoopInstr::AddVar(0, 1)];
+        let bw = vec![8u8];
+        let problem = crate::hir::loop_ir::loop_instrs_to_loop_problem(
+            &vars,
+            &init,
+            &body,
+            &bw,
+            &[false],
+            &[],
+            true,
+        )
+        .expect("must lower");
+        let tpl = synthesize_problem_bii(&solver, &problem, 3, false)
+            .expect("budget exhaustion must return the partial invariant, never None");
+        assert!(tpl.rows[0].lb <= BigInt::zero(), "partial lb ≤ BII lb (0)");
+        assert!(tpl.rows[0].ub >= BigInt::from(6), "partial ub ≥ BII ub (6)");
+        assert!(matches!(
+            verify_template_against_problem(&solver, &problem, &tpl, false),
+            VerifyOutcome::Verified
+        ));
+    }
+
     /// With an 8-bit width, the bitwise strategy must not burn the
     /// full linear-search budget (2^8 = 256 tightenings) — it converges
     /// within a handful of queries. The assertion is deliberately loose
@@ -3932,9 +4086,9 @@ mod tests {
 
     /// The transition relation must model SEQUENTIAL semantics —
     /// `x = x + 1; y = x;` gives `y` the NEW `x`, so the CopyVar must read
-    /// an intermediate variable, not the pre-state `x_0`. Regression: the
-    /// old encoding conjoined `(= xp_1 x_0)` (parallel), which is unsound
-    /// for read-after-write dependencies.
+    /// an intermediate variable, not the pre-state `x_0`. A PARALLEL
+    /// encoding (`(= xp_1 x_0)`) is unsound for read-after-write
+    /// dependencies.
     #[test]
     fn test_encode_sequential_transition_reads_after_write() {
         // body: x := x + 1; y := x  (vars: [x, y] → indices 0, 1)
@@ -5253,9 +5407,9 @@ mod tests {
     }
 
     /// Regression (z3-gated): the signed Diff row under BV — the
-    /// latent zero-extension bug. `x,y := −1, 0; while x < y { x := x+1 }`
+    /// zero-extension hazard. `x,y := −1, 0; while x < y { x := x+1 }`
     /// on Int<8>: reachable x = −1 plus the exit successor 0, so
-    /// Diff(x,y) = x − 0 ∈ [−1, 0]. Under the OLD zero-extension the
+    /// Diff(x,y) = x − 0 ∈ [−1, 0]. Under ZERO-extension the
     /// encoding computed zx(−1) = 255 (9-bit) instead of the true −1
     /// (sign-extended 511 ≡ −1 mod 512): the Diff value encoded as
     /// 255 − 0 + 255 = 510 instead of −1 + 255 = 254, misjudging the
@@ -5301,8 +5455,8 @@ mod tests {
     /// Regression: the BV clamp compares the ADDITION-PRE operand, never
     /// the WRAPPED `bvadd` result.  UInt8 x=250, c=10: `bvadd` wraps to
     /// 260 mod 256 = 4, which passes both bounds and yields successor 4
-    /// instead of the saturated 255 — the old encoding silently
-    /// mis-saturated at the boundary (x=255,c=1 → 0; Int8 x=127,c=1 →
+    /// instead of the saturated 255 — a wrapped-sum comparison silently
+    /// mis-saturates at the boundary (x=255,c=1 → 0; Int8 x=127,c=1 →
     /// −128).  The comparison constants (MAX−c / MIN−c, per sign) are
     /// representable because `c` is a compile-time constant.
     #[test]
@@ -5313,8 +5467,8 @@ mod tests {
             clamp_expr("x", 10, true, 8, false),
             "(ite (bvugt x (_ bv245 8)) (_ bv255 8) (bvadd x (_ bv10 8)))"
         );
-        // Int8, c=1 > 0: `x > 126 → 127` — the old code compared the
-        // wrapped sum (127+1 = −128) and let it through.
+        // Int8, c=1 > 0: `x > 126 → 127` — a wrapped-sum comparison lets
+        // 127+1 = −128 through both bounds.
         assert_eq!(
             clamp_expr("x", 1, true, 8, true),
             "(ite (bvsgt x (_ bv126 8)) (_ bv127 8) (bvadd x (_ bv1 8)))"
