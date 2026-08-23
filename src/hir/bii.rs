@@ -97,9 +97,17 @@
 //! - **Signed relational rows**: Sum and Support3 rows are
 //!   generated over uniform-signedness operand sets with TRUE signed
 //!   tops (signed Sum: [−2^bw, 2^bw−2]; signed Support3:
-//!   signed_s3_range); mixed-signature pairs are skipped (symmetric
+//!   signed_s3_range); mixed-signature pairs were once skipped (symmetric
 //!   mixed tops would EXCLUDE reachable states — Int<8> − UInt<8>
-//!   reaches −383 < −255). Under BV, relational-row operands
+//!   reaches −383 < −255). Mixed-signedness relational rows carry exact
+//!   asymmetric tops in BOTH modes: LIA reasons over mathematical
+//!   integers; under BV each operand is extended by its OWN signedness
+//!   (per-operand ext_operand), and comparisons (guards / definedness)
+//!   use the value-preserving lift with SIGNED predicates
+//!   (lift_cmp_operand — its LEMMA and the W_c/W_d width rules are stated in situ); the
+//!   row-level signed flag no longer drives operand extension, and the
+//!   comparison-level flag no longer selects predicates. Under BV,
+//!   relational-row operands
 //!   SIGN-extend (a two's-complement negative value zero-extended
 //!   inflates by 2^bw and corrupts the offset-domain comparison).
 
@@ -128,8 +136,19 @@ pub(crate) struct BiiRow {
     pub(crate) ub: BigInt,
     /// true when the row's variables are signed (`Int<N>`): Interval rows
     /// then carry TRUE signed bounds and compare with `bvsle`/`bvsge`
-    /// under BV (the signed row tranche: Interval + Diff).
+    /// under BV (the signed row tranche: Interval + Diff). For MIXED
+    /// relational rows this flag is the OR of the operands' signedness —
+    /// only Interval/Clamp's domain selection consumes it; the exact
+    /// per-operand signedness lives in `full_lb`/`full_ub` (via
+    /// `full_range`).
     pub(crate) signed: bool,
+    /// The row's FULL value range (the construction tops): bounds can never
+    /// leave it. Cached from `full_range` at construction — `is_trivial` /
+    /// `offset` / `BoundaryLimits` read these instead of recomputing, because
+    /// MIXED-signedness rows need per-operand signedness, which the row's
+    /// single `signed` flag no longer encodes.
+    pub(crate) full_lb: BigInt,
+    pub(crate) full_ub: BigInt,
 }
 
 /// The linear form `f(X)` of a template row.
@@ -152,6 +171,52 @@ pub(crate) enum RowKind {
     Clamp(usize, i128),
 }
 
+/// A variable's full value range at width `bw`: signed `[−2^(bw−1), 2^(bw−1)−1]`,
+/// unsigned `[0, 2^bw − 1]`.
+fn var_bounds(bw: u8, signed: bool) -> (BigInt, BigInt) {
+    if signed {
+        let half = BigInt::one() << (bw as usize - 1);
+        (-half.clone(), half - 1)
+    } else {
+        (BigInt::zero(), BiiRow::max_ub(bw))
+    }
+}
+
+/// The EXACT full value range `[lo, hi]` of a row's linear form, computed from
+/// the per-variable signedness `var_signed` (each operand is treated as if it
+/// had the row's `bw` — exact when widths are equal, a sound superset when
+/// they differ, matching the existing uniform-row convention). This UNIFIES
+/// and REPLACES `s3_range` / `signed_s3_range` (their values are the
+/// uniform-signedness special cases) and extends to MIXED-signedness rows:
+/// Diff(i,j) → [min_i − max_j, max_i − min_j]; Sum(i,j) → [min_i + min_j,
+/// max_i + max_j]; Support3 → the sum of the per-term ranges (term `−x`
+/// spans `[−max, −min]`).
+fn full_range(kind: RowKind, bw: u8, var_signed: &[bool]) -> (BigInt, BigInt) {
+    let vb = |i: usize| var_bounds(bw, var_signed.get(i).copied().unwrap_or(false));
+    match kind {
+        RowKind::Interval(i) | RowKind::Clamp(i, _) => vb(i),
+        RowKind::Diff(i, j) => {
+            let (min_i, max_i) = vb(i);
+            let (min_j, max_j) = vb(j);
+            (min_i - max_j, max_i - min_j)
+        }
+        RowKind::Sum(i, j) => {
+            let (min_i, max_i) = vb(i);
+            let (min_j, max_j) = vb(j);
+            (min_i + min_j, max_i + max_j)
+        }
+        RowKind::Support3(i, j, k, sj, sk) => {
+            let term = |(lo, hi): (BigInt, BigInt), pos: bool| {
+                if pos { (lo, hi) } else { (-hi, -lo) }
+            };
+            let (a0, a1) = term(vb(i), true);
+            let (b0, b1) = term(vb(j), sj);
+            let (c0, c1) = term(vb(k), sk);
+            (a0 + b0 + c0, a1 + b1 + c1)
+        }
+    }
+}
+
 impl BiiRow {
     /// The largest unsigned value at `bw` bits: `2^bw − 1`.
     fn max_ub(bw: u8) -> BigInt {
@@ -159,75 +224,28 @@ impl BiiRow {
     }
 
     /// The smallest signed value for a Diff row: `−(2^bw − 1)`.
+    #[allow(dead_code)] // referenced by tests; production reads full_lb/full_ub.
     fn min_diff(bw: u8) -> BigInt {
         -Self::max_ub(bw)
     }
 
     /// The largest value for a Sum row: `2·(2^bw − 1)`.
     /// Two `bw`-bit unsigned values sum to at most twice the max.
+    #[allow(dead_code)] // referenced by tests; production reads full_lb/full_ub.
     fn max_sum_ub(bw: u8) -> BigInt {
         Self::max_ub(bw) * BigInt::from(2)
     }
 
-    /// The value range `[min, max]` of a support-three row
-    /// `x_i + s_j·x_j + s_k·x_k` over `bw`-bit unsigned variables.
-    /// Maximized by `x_i = m` and each `±x` term set to `m` (sign +) or
-    /// `0` (sign −); minimized symmetrically.
-    fn s3_range(bw: u8, sj: bool, sk: bool) -> (BigInt, BigInt) {
-        let m = Self::max_ub(bw);
-        match (sj, sk) {
-            (true, true) => (BigInt::zero(), m.clone() * BigInt::from(3)),
-            (true, false) => (-m.clone(), m.clone() * BigInt::from(2)),
-            (false, true) => (-m.clone(), m.clone() * BigInt::from(2)),
-            (false, false) => (-m.clone() * BigInt::from(2), m),
-        }
-    }
-
-    /// The value range `[min, max]` of a SIGNED support-three row
-    /// `x_i + s_j·x_j + s_k·x_k` over `bw`-bit signed variables.
-    /// With `h = 2^(bw−1)`: each `+x` term spans `[−h, h−1]`,
-    /// each `−x` term `[−(h−1), h]`, and `x_i` (coefficient +1)
-    /// `[−h, h−1]` — so the four sign combinations give
-    /// `(+,+) → [−3h, 3h−3]`, `(+,−)/(−,+) → [−3h+1, 3h−2]`,
-    /// `(−,−) → [−3h+2, 3h−1]` (the signed counterpart of
-    /// `s3_range`; tops are EXACT, not supersets).
-    fn signed_s3_range(bw: u8, sj: bool, sk: bool) -> (BigInt, BigInt) {
-        let h = BigInt::one() << (bw as usize - 1);
-        let h_m1 = h.clone() - BigInt::one();
-        let (min_j, max_j) = if sj {
-            (-h.clone(), h_m1.clone())
-        } else {
-            (-h_m1.clone(), h.clone())
-        };
-        let (min_k, max_k) = if sk {
-            (-h.clone(), h_m1.clone())
-        } else {
-            (-h_m1.clone(), h.clone())
-        };
-        (-h + min_j + min_k, h_m1 + max_j + max_k)
-    }
-
-    /// The offset that maps the row's full range to `[0, width]`.
-    /// Interval/Sum rows: offset = 0 (already non-negative).
-    /// Diff rows: offset = 2^bw − 1 (shifts `[-m, m]` to `[0, 2m]`).
-    /// Support3 rows: offset = −min (shifts the four sign-combination
-    /// ranges onto `[0, 3m]`).
+    /// The offset that maps the row's full range onto `[0, width]`:
+    /// `−full_lb` for relational rows (Diff/Sum/Support3 — including the
+    /// mixed-signedness rows, whose asymmetric tops this generalization
+    /// exists for); 0 for Interval/Clamp (unsigned rows are already
+    /// non-negative; signed rows compare in the TRUE signed domain, not the
+    /// offset domain).
     fn offset(&self) -> BigInt {
         match self.kind {
-            RowKind::Diff(..) => Self::max_ub(self.bw),
-            // Signed Sum tops are [−2^bw, 2^bw−2]; offset 2^bw
-            // maps them onto [0, 2^(bw+1)−2] — the Diff-style shift
-            // (the row compares in the offset domain under BV).
-            RowKind::Sum(..) if self.signed => BigInt::one() << self.bw as usize,
-            RowKind::Support3(_, _, _, sj, sk) if self.signed => {
-                let (lo, _) = Self::signed_s3_range(self.bw, sj, sk);
-                -lo
-            }
-            RowKind::Support3(_, _, _, sj, sk) => {
-                let (lo, _hi) = Self::s3_range(self.bw, sj, sk);
-                -lo
-            }
-            _ => BigInt::zero(),
+            RowKind::Interval(_) | RowKind::Clamp(..) => BigInt::zero(),
+            _ => -self.full_lb.clone(),
         }
     }
 
@@ -236,6 +254,8 @@ impl BiiRow {
     /// - Diff: `bw + 1` (offset range `[0, 2·(2^bw − 1)]`)
     /// - Sum: `bw + 1` (range `[0, 2·(2^bw − 1)]`)
     /// - Support3: `bw + 2` (offset range `[0, 3·(2^bw − 1)]`)
+    /// Mixed-signedness rows keep the same encoded widths: every operand
+    /// spreads ≤ 2^bw − 1 regardless of signedness.
     fn enc_bw(&self) -> u32 {
         match self.kind {
             RowKind::Diff(..) | RowKind::Sum(..) => self.bw as u32 + 1,
@@ -244,49 +264,10 @@ impl BiiRow {
         }
     }
 
-    /// A row still at its top bounds carries no information — skip it
+    /// A row still at its full-range tops carries no information — skip it
     /// when reporting candidates.
     fn is_trivial(&self) -> bool {
-        match self.kind {
-            RowKind::Interval(_) => {
-                if self.signed {
-                    let half = BigInt::one() << (self.bw as usize - 1);
-                    self.lb <= -half.clone() && self.ub >= half - 1
-                } else {
-                    self.lb <= BigInt::zero() && self.ub >= Self::max_ub(self.bw)
-                }
-            }
-            RowKind::Diff(..) => {
-                let m = Self::max_ub(self.bw);
-                self.lb <= -m.clone() && self.ub >= m
-            }
-            RowKind::Sum(..) => {
-                if self.signed {
-                    let top = BigInt::one() << self.bw as usize;
-                    self.lb <= -top.clone() && self.ub >= top - BigInt::from(2)
-                } else {
-                    self.lb <= BigInt::zero() && self.ub >= Self::max_sum_ub(self.bw)
-                }
-            }
-            RowKind::Support3(_, _, _, sj, sk) => {
-                let (lo, hi) = if self.signed {
-                    Self::signed_s3_range(self.bw, sj, sk)
-                } else {
-                    Self::s3_range(self.bw, sj, sk)
-                };
-                self.lb <= lo && self.ub >= hi
-            }
-            RowKind::Clamp(..) => {
-                // Trivial at the full type range (the clamped value never
-                // leaves [MIN, MAX]).
-                if self.signed {
-                    let half = BigInt::one() << (self.bw as usize - 1);
-                    self.lb <= -half.clone() && self.ub >= half - 1
-                } else {
-                    self.lb <= BigInt::zero() && self.ub >= Self::max_ub(self.bw)
-                }
-            }
-        }
+        self.lb <= self.full_lb && self.ub >= self.full_ub
     }
 }
 
@@ -300,159 +281,96 @@ pub(crate) struct BiiTemplate {
 
 impl BiiTemplate {
     /// Interval + octagon-diff + octagon-sum + sparse support-three rows
-    /// over `n_vars` variables with the given per-variable bit-widths
-    /// (default 64 for missing entries). The support-three rows cover all
-    /// canonical forms `x_i + s_j·x_j + s_k·x_k` with `i < j < k` and
-    /// `s_j, s_k ∈ {−1, 1}` (4·C(n,3) rows — the paper's fixed sparse
-    /// template-polyhedra domain).
+    /// over ALL operand sets: uniform pairs keep the exact symmetric
+    /// tops; MIXED pairs carry exact ASYMMETRIC tops from `full_range`
+    /// (e.g. `Int<8> − UInt<8>` → [−383, 127]). Sound in BOTH modes:
+    /// LIA is mathematical-integer arithmetic (no promotion needed);
+    /// under BV each operand is extended by its OWN signedness
+    /// (per-operand `ext_operand`), so the offset-domain comparison is
+    /// faithful for mixtures too.
     pub(crate) fn new(n_vars: usize, bit_widths: &[u8], signed: &[bool]) -> BiiTemplate {
+        Self::build(n_vars, bit_widths, signed)
+    }
+    fn build(n_vars: usize, bit_widths: &[u8], signed: &[bool]) -> BiiTemplate {
         let bw_of = |v: usize| bit_widths.get(v).copied().unwrap_or(64);
         let signed_of = |v: usize| signed.get(v).copied().unwrap_or(false);
+        let mk = |kind: RowKind, bw: u8, row_signed: bool| -> BiiRow {
+            let (lo, hi) = full_range(kind, bw, signed);
+            BiiRow {
+                kind,
+                bw,
+                lb: lo.clone(),
+                ub: hi.clone(),
+                signed: row_signed,
+                full_lb: lo,
+                full_ub: hi,
+            }
+        };
         let mut rows = Vec::new();
         for i in 0..n_vars {
-            let bw = bw_of(i);
-            let is_signed = signed_of(i);
-            rows.push(BiiRow {
-                kind: RowKind::Interval(i),
-                bw,
-                // Signed variables (`Int<N>`) get TRUE
-                // signed top bounds `[−2^(bw−1), 2^(bw−1)−1]`; unsigned
-                // stay `[0, 2^bw−1]`.
-                lb: if is_signed {
-                    -(BigInt::one() << (bw as usize - 1))
-                } else {
-                    BigInt::zero()
-                },
-                ub: if is_signed {
-                    (BigInt::one() << (bw as usize - 1)) - 1
-                } else {
-                    BiiRow::max_ub(bw)
-                },
-                signed: is_signed,
-            });
+            rows.push(mk(RowKind::Interval(i), bw_of(i), signed_of(i)));
         }
-        // Octagon difference rows `x_i - x_j` (i < j).
-        // Rows exist only over UNIFORM-SIGNEDNESS pairs — both-signed
-        // and both-unsigned keep the exact symmetric tops [−m, m] (the
-        // difference of two same-signedness b-bit values spans exactly
-        // that, mixed widths included: |x−y| ≤ 2^bw−1). MIXED pairs are
-        // SKIPPED: symmetric tops would EXCLUDE reachable states — the
-        // mixed range [min_x − max_y, max_x − min_y]
-        // escapes [−m, m] (Int<8> − UInt<8> reaches −383 < −255).
-        // Mixed-signature relational rows are future work.
+        // Octagon difference rows `x_i − x_j` (i < j): uniform pairs keep
+        // the exact symmetric tops `[−m, m]`; mixed pairs get their exact
+        // ASYMMETRIC tops from `full_range`.
         for i in 0..n_vars {
             for j in (i + 1)..n_vars {
-                if signed_of(i) != signed_of(j) {
-                    continue; // mixed signedness — skipped
-                }
                 let bw = bw_of(i).max(bw_of(j));
-                let m = BiiRow::max_ub(bw);
-                rows.push(BiiRow {
-                    kind: RowKind::Diff(i, j),
-                    bw,
-                    lb: -m.clone(),
-                    ub: m,
-                    signed: signed_of(i) || signed_of(j),
-                });
+                rows.push(mk(RowKind::Diff(i, j), bw, signed_of(i) || signed_of(j)));
             }
         }
-        // Octagon sum rows `x_i + x_j` (i < j).
-        // Pure-SIGNED pairs get SIGNED rows with TRUE signed tops
-        // [−2^bw, 2^bw−2] (offset 2^bw, `bvule` in the offset domain,
-        // sign-extended operands under BV); unsigned pairs keep
-        // [0, 2·(2^bw−1)]. MIXED signedness pairs stay skipped
-        // (uniform-signedness policy, mirroring Diff — the mixed range
-        // is asymmetric and deferred).
+        // Octagon sum rows `x_i + x_j` (i < j); uniform tops `[0, 2m]` /
+        // signed `[−2^bw, 2^bw−2]`; mixed tops from `full_range`.
         for i in 0..n_vars {
             for j in (i + 1)..n_vars {
-                if signed_of(i) != signed_of(j) {
-                    continue; // mixed signedness — deferred
-                }
                 let bw = bw_of(i).max(bw_of(j));
-                if signed_of(i) {
-                    let top = BigInt::one() << bw as usize;
-                    rows.push(BiiRow {
-                        kind: RowKind::Sum(i, j),
-                        bw,
-                        lb: -top.clone(),
-                        ub: top - BigInt::from(2),
-                        signed: true,
-                    });
-                } else {
-                    rows.push(BiiRow {
-                        kind: RowKind::Sum(i, j),
-                        bw,
-                        lb: BigInt::zero(),
-                        ub: BiiRow::max_sum_ub(bw),
-                        signed: false,
-                    });
-                }
+                rows.push(mk(RowKind::Sum(i, j), bw, signed_of(i) || signed_of(j)));
             }
         }
         // Sparse template-polyhedra rows `x_i + s_j·x_j + s_k·x_k`
         // (i < j < k), all four sign combinations.
-        // Uniform-signedness policy — all-three-signed gets SIGNED
-        // rows (signed_s3_range tops, exact); any mixed combination is
-        // skipped (asymmetric ranges, deferred — mirroring Diff/Sum).
         for i in 0..n_vars {
             for j in (i + 1)..n_vars {
                 for k in (j + 1)..n_vars {
                     let si = signed_of(i);
-                    if si != signed_of(j) || si != signed_of(k) {
-                        continue; // mixed signedness — skipped
-                    }
                     let bw = bw_of(i).max(bw_of(j)).max(bw_of(k));
                     for (sj, sk) in [(true, true), (true, false), (false, true), (false, false)] {
-                        let (lo, hi) = if si {
-                            BiiRow::signed_s3_range(bw, sj, sk)
-                        } else {
-                            BiiRow::s3_range(bw, sj, sk)
-                        };
-                        rows.push(BiiRow {
-                            kind: RowKind::Support3(i, j, k, sj, sk),
+                        rows.push(mk(
+                            RowKind::Support3(i, j, k, sj, sk),
                             bw,
-                            lb: lo,
-                            ub: hi,
-                            signed: si,
-                        });
+                            si || signed_of(j) || signed_of(k),
+                        ));
                     }
                 }
             }
         }
         BiiTemplate { n_vars, rows }
     }
-
     /// Template construction for a problem with saturating assignments:
-    /// the fixed rows plus one Clamp row per
-    /// `x_i := x_i +? c`. The Clamp row's top is the variable's full
-    /// type range (the clamped value never leaves it).
+    /// the fixed rows plus one Clamp row per `x_i := x_i +? c`, over ALL
+    /// operand sets.
     pub(crate) fn with_saturates(
         n_vars: usize,
         bit_widths: &[u8],
         signed: &[bool],
         saturates: &[(usize, i128)],
     ) -> BiiTemplate {
-        let mut tpl = BiiTemplate::new(n_vars, bit_widths, signed);
+        let mut tpl = Self::build(n_vars, bit_widths, signed);
         for &(i, c) in saturates {
             if i >= n_vars {
                 continue; // defensive: saturates reference loop variables.
             }
             let bw = bit_widths.get(i).copied().unwrap_or(64);
             let is_signed = signed.get(i).copied().unwrap_or(false);
+            let (lo, hi) = var_bounds(bw, is_signed);
             tpl.rows.push(BiiRow {
                 kind: RowKind::Clamp(i, c),
                 bw,
-                lb: if is_signed {
-                    -(BigInt::one() << (bw as usize - 1))
-                } else {
-                    BigInt::zero()
-                },
-                ub: if is_signed {
-                    (BigInt::one() << (bw as usize - 1)) - 1
-                } else {
-                    BiiRow::max_ub(bw)
-                },
+                lb: lo.clone(),
+                ub: hi.clone(),
                 signed: is_signed,
+                full_lb: lo,
+                full_ub: hi,
             });
         }
         tpl
@@ -736,57 +654,16 @@ struct BoundaryLimits {
 
 impl BoundaryLimits {
     fn new(tpl: &BiiTemplate) -> BoundaryLimits {
+        // lb[i] = the MAX possible optimal upper bound = the row's
+        // full-range top; ub[i] = the MIN possible optimal lower bound =
+        // the full-range bottom. Generalizes the former per-kind match:
+        // identical values for every uniform row kind (including the
+        // signed Interval seeding — full_lb of a signed Interval row IS
+        // −2^(bw−1), preserving the fix for the "u* ≥ 0" corruption),
+        // and correct for mixed-signedness rows by construction.
         BoundaryLimits {
-            // Initially unknown: the widest possible range.
-            // Sum/Support3 rows have a wider range than Interval/Diff.
-            lb: tpl
-                .rows
-                .iter()
-                .map(|r| match r.kind {
-                    RowKind::Interval(_) | RowKind::Clamp(..) if r.signed => {
-                        // True signed top: [−2^(bw−1), 2^(bw−1)−1].
-                        (BigInt::one() << (r.bw as usize - 1)) - BigInt::one()
-                    }
-                    RowKind::Sum(..) if r.signed => {
-                        (BigInt::one() << r.bw as usize) - BigInt::from(2)
-                    }
-                    RowKind::Support3(_, _, _, sj, sk) if r.signed => {
-                        let (_lo, hi) = BiiRow::signed_s3_range(r.bw, sj, sk);
-                        hi
-                    }
-                    RowKind::Sum(..) => BiiRow::max_sum_ub(r.bw),
-                    RowKind::Support3(_, _, _, sj, sk) => {
-                        let (_lo, hi) = BiiRow::s3_range(r.bw, sj, sk);
-                        hi
-                    }
-                    _ => BiiRow::max_ub(r.bw),
-                })
-                .collect(),
-            ub: tpl
-                .rows
-                .iter()
-                .map(|r| match r.kind {
-                    RowKind::Interval(_) | RowKind::Clamp(..) if r.signed => {
-                        // True signed bottom: [−2^(bw−1), 2^(bw−1)−1].
-                        // The generic `_` below would seed 0, which
-                        // asserts "u* ≥ 0" — FALSE when the BII's upper
-                        // bound is negative, permanently corrupting the
-                        // B ⊑ A* invariant Theorem 5.5 relies on.
-                        -(BigInt::one() << (r.bw as usize - 1))
-                    }
-                    RowKind::Sum(..) if r.signed => -(BigInt::one() << r.bw as usize),
-                    RowKind::Support3(_, _, _, sj, sk) if r.signed => {
-                        let (lo, _hi) = BiiRow::signed_s3_range(r.bw, sj, sk);
-                        lo
-                    }
-                    RowKind::Diff(..) => BiiRow::min_diff(r.bw),
-                    RowKind::Support3(_, _, _, sj, sk) => {
-                        let (lo, _hi) = BiiRow::s3_range(r.bw, sj, sk);
-                        lo
-                    }
-                    _ => BigInt::zero(),
-                })
-                .collect(),
+            lb: tpl.rows.iter().map(|r| r.full_ub.clone()).collect(),
+            ub: tpl.rows.iter().map(|r| r.full_lb.clone()).collect(),
         }
     }
 
@@ -912,7 +789,13 @@ pub(crate) fn synthesize_bitwise_bii(
         }
 
         // Refine step 1: ∃∀ query without get-model.
-        let query = build_refine_query(&candidates, init, body, false, use_bv, bit_widths, signed)?;
+        // Encoding failure: if witnesses were already adopted, return the
+        // partial invariant rather than discarding it (any-time property).
+        let Some(query) =
+            build_refine_query(&candidates, init, body, false, use_bv, bit_widths, signed)
+        else {
+            return if adopted { Some(cur) } else { None };
+        };
         calls += 1;
 
         match solver.run_raw_query(&query) {
@@ -930,9 +813,11 @@ pub(crate) fn synthesize_bitwise_bii(
                     if calls >= max_queries {
                         return if adopted { Some(cur) } else { None };
                     }
-                    let leap = build_bounded_leap_query(
+                    let Some(leap) = build_bounded_leap_query(
                         &cur, &limits, init, body, false, use_bv, bit_widths, signed,
-                    )?;
+                    ) else {
+                        return if adopted { Some(cur) } else { None };
+                    };
                     calls += 1;
                     match solver.run_raw_query(&leap) {
                         RawQueryOutcome::Unsat => return Some(cur),
@@ -940,9 +825,11 @@ pub(crate) fn synthesize_bitwise_bii(
                             if calls >= max_queries {
                                 return if adopted { Some(cur) } else { None };
                             }
-                            let leap_m = build_bounded_leap_query(
+                            let Some(leap_m) = build_bounded_leap_query(
                                 &cur, &limits, init, body, true, use_bv, bit_widths, signed,
-                            )?;
+                            ) else {
+                                return if adopted { Some(cur) } else { None };
+                            };
                             calls += 1;
                             match solver.run_raw_query(&leap_m) {
                                 RawQueryOutcome::Sat(model) => {
@@ -982,8 +869,11 @@ pub(crate) fn synthesize_bitwise_bii(
                 if calls >= max_queries {
                     return if adopted { Some(cur) } else { None };
                 }
-                let query_model =
-                    build_refine_query(&candidates, init, body, true, use_bv, bit_widths, signed)?;
+                let Some(query_model) =
+                    build_refine_query(&candidates, init, body, true, use_bv, bit_widths, signed)
+                else {
+                    return if adopted { Some(cur) } else { None };
+                };
                 calls += 1;
                 match solver.run_raw_query(&query_model) {
                     RawQueryOutcome::Sat(model) => {
@@ -1202,6 +1092,7 @@ fn template_formula(
     primed: bool,
     bv: bool,
     bws: &[u8],
+    signed: &[bool],
 ) -> String {
     let var = |i: usize| -> String {
         // The first `vars_len` indices are loop variables (x_i / xp_i
@@ -1217,6 +1108,12 @@ fn template_formula(
             format!("n_{}", i - vars_len)
         }
     };
+    // Per-operand signedness: the row-level `signed` flag is the OR
+    // of the operands and cannot drive extension for MIXED rows — a wrong
+    // choice misreads the operand by ±2^from and shifts the row value,
+    // misaligning the offset-domain window in BOTH directions (false
+    // violations block synthesis; false satisfactions are UNSOUND).
+    let signed_of = |v: usize| signed.get(v).copied().unwrap_or(false);
     // The clamped successor of a saturating variable —
     // `x_i := x_i +? c`, recovered from the Clamp rows.
     let clamp_of = |i: usize| -> Option<(i128, bool)> {
@@ -1254,8 +1151,8 @@ fn template_formula(
                     // Sign-extend the operands of a signed (uniform)
                     // row; zero-extend unsigned ones — byte-identical to
                     // the old emission for unsigned rows.
-                    let xi = ext_operand(&var(i), bws[i] as u32, ebw, row.signed);
-                    let xj = ext_operand(&var(j), bws[j] as u32, ebw, row.signed);
+                    let xi = ext_operand(&var(i), bws[i] as u32, ebw, signed_of(i));
+                    let xj = ext_operand(&var(j), bws[j] as u32, ebw, signed_of(j));
                     format!("(bvsub {xi} {xj})")
                 } else {
                     format!("(- {} {})", var(i), var(j))
@@ -1266,8 +1163,8 @@ fn template_formula(
                     // As Diff — sign-extend signed rows, zero-extend
                     // unsigned ones (byte-identical for unsigned).
                     let ebw = row.enc_bw();
-                    let xi = ext_operand(&var(i), bws[i] as u32, ebw, row.signed);
-                    let xj = ext_operand(&var(j), bws[j] as u32, ebw, row.signed);
+                    let xi = ext_operand(&var(i), bws[i] as u32, ebw, signed_of(i));
+                    let xj = ext_operand(&var(j), bws[j] as u32, ebw, signed_of(j));
                     format!("(bvadd {xi} {xj})")
                 } else {
                     format!("(+ {} {})", var(i), var(j))
@@ -1280,9 +1177,9 @@ fn template_formula(
                     // row's signs; the result is `bw + 2` bits, matching
                     // the bound constants.
                     let ebw = row.enc_bw();
-                    let xi = ext_operand(&var(i), bws[i] as u32, ebw, row.signed);
-                    let xj = ext_operand(&var(j), bws[j] as u32, ebw, row.signed);
-                    let xk = ext_operand(&var(k), bws[k] as u32, ebw, row.signed);
+                    let xi = ext_operand(&var(i), bws[i] as u32, ebw, signed_of(i));
+                    let xj = ext_operand(&var(j), bws[j] as u32, ebw, signed_of(j));
+                    let xk = ext_operand(&var(k), bws[k] as u32, ebw, signed_of(k));
                     let op_j = if sj { "bvadd" } else { "bvsub" };
                     let op_k = if sk { "bvadd" } else { "bvsub" };
                     format!("({op_k} ({op_j} {xi} {xj}) {xk})")
@@ -1339,6 +1236,7 @@ fn template_formula_concrete(
     primed: bool,
     bv: bool,
     bws: &[u8],
+    signed: &[bool],
 ) -> String {
     let var = |i: usize| -> String {
         if i < vars_len {
@@ -1351,6 +1249,10 @@ fn template_formula_concrete(
             format!("n_{}", i - vars_len)
         }
     };
+    // Per-operand signedness — see template_formula for the
+    // rationale: the row-level flag is the OR and cannot drive extension
+    // for mixed rows.
+    let signed_of = |v: usize| signed.get(v).copied().unwrap_or(false);
     // The clamped successor of a saturating variable
     // (see template_formula).
     let clamp_of = |i: usize| -> Option<(i128, bool)> {
@@ -1380,8 +1282,8 @@ fn template_formula_concrete(
                     // Sign-extend the operands of a signed (uniform)
                     // row; zero-extend unsigned ones — byte-identical to
                     // the old emission for unsigned rows.
-                    let xi = ext_operand(&var(i), bws[i] as u32, ebw, row.signed);
-                    let xj = ext_operand(&var(j), bws[j] as u32, ebw, row.signed);
+                    let xi = ext_operand(&var(i), bws[i] as u32, ebw, signed_of(i));
+                    let xj = ext_operand(&var(j), bws[j] as u32, ebw, signed_of(j));
                     format!("(bvsub {xi} {xj})")
                 } else {
                     format!("(- {} {})", var(i), var(j))
@@ -1392,8 +1294,8 @@ fn template_formula_concrete(
                     // As Diff — sign-extend signed rows, zero-extend
                     // unsigned ones (byte-identical for unsigned).
                     let ebw = row.enc_bw();
-                    let xi = ext_operand(&var(i), bws[i] as u32, ebw, row.signed);
-                    let xj = ext_operand(&var(j), bws[j] as u32, ebw, row.signed);
+                    let xi = ext_operand(&var(i), bws[i] as u32, ebw, signed_of(i));
+                    let xj = ext_operand(&var(j), bws[j] as u32, ebw, signed_of(j));
                     format!("(bvadd {xi} {xj})")
                 } else {
                     format!("(+ {} {})", var(i), var(j))
@@ -1406,9 +1308,9 @@ fn template_formula_concrete(
                     // row's signs; the result is `bw + 2` bits, matching
                     // the bound constants.
                     let ebw = row.enc_bw();
-                    let xi = ext_operand(&var(i), bws[i] as u32, ebw, row.signed);
-                    let xj = ext_operand(&var(j), bws[j] as u32, ebw, row.signed);
-                    let xk = ext_operand(&var(k), bws[k] as u32, ebw, row.signed);
+                    let xi = ext_operand(&var(i), bws[i] as u32, ebw, signed_of(i));
+                    let xj = ext_operand(&var(j), bws[j] as u32, ebw, signed_of(j));
+                    let xk = ext_operand(&var(k), bws[k] as u32, ebw, signed_of(k));
                     let op_j = if sj { "bvadd" } else { "bvsub" };
                     let op_k = if sk { "bvadd" } else { "bvsub" };
                     format!("({op_k} ({op_j} {xi} {xj}) {xk})")
@@ -1536,8 +1438,8 @@ fn build_refine_query(
     smt.push_str(")\n");
 
     // A'(X): the template rows over the current-state variables.
-    let a_x = template_formula(rows, n, false, bv, bws);
-    let a_xp = template_formula(rows, n, true, bv, bws);
+    let a_x = template_formula(rows, n, false, bv, bws, signed);
+    let a_xp = template_formula(rows, n, true, bv, bws, signed);
 
     // Pre(X): the seeded pre-state (`i = c`). Any non-constant init
     // instruction cannot be encoded as a plain seed — fail closed rather
@@ -1564,55 +1466,62 @@ fn build_refine_query(
         format!("(and {})", pre_parts.join(" "))
     };
 
-    // G(X): the guard — every TestLe/TestDiffLe in `body`. The guards
-    // encode at the variable's signedness — `Int<N>` variables compare
-    // SIGNED (`bvsle`), `UInt<N>` and unknowns UNSIGNED (`bvule`) —
-    // matching the verification side (`verify_loop_decreases` in the
-    // checker): the same guard must be read the same way in synthesis
-    // and verification.
+    // G(X): the guard — every TestLe/TestDiffLe in `body`. Under BV,
+    // guards encode via the value-preserving lift (`encode_cmp_bv` /
+    // `lift_cmp_operand`):
+    // each operand is lifted to a signed-faithful representation,
+    // sign-extended to a common width, and compared with SIGNED
+    // predicates — the same encoding used by the verification side
+    // (`verify_loop_decreases` in the checker, which delegates to
+    // `cond_to_smt`).
     let mut guard_parts = Vec::new();
     for instr in body {
         match instr {
             LoopInstr::TestLe(i, c) => {
                 if bv {
-                    let cmp = if signed[*i] { "bvsle" } else { "bvule" };
-                    let c_big = BigInt::from(*c);
-                    guard_parts.push(format!(
-                        "({} x_{i} {})",
-                        cmp,
-                        bv_const(&c_big, bws[*i] as u32)
-                    ));
+                    use crate::hir::loop_ir::ScalarExpr;
+                    guard_parts.push(encode_cmp_bv(
+                        crate::hir::loop_ir::CmpOp::Le,
+                        &ScalarExpr::Var(*i),
+                        &ScalarExpr::Const(BigInt::from(*c)),
+                        bws,
+                        signed,
+                        n,
+                    )?);
                 } else {
                     guard_parts.push(format!("(<= x_{i} {})", c));
                 }
             }
             LoopInstr::TestGe(i, c) => {
                 if bv {
-                    let cmp = if signed[*i] { "bvsge" } else { "bvuge" };
-                    let c_big = BigInt::from(*c);
-                    guard_parts.push(format!(
-                        "({} x_{i} {})",
-                        cmp,
-                        bv_const(&c_big, bws[*i] as u32)
-                    ));
+                    use crate::hir::loop_ir::ScalarExpr;
+                    guard_parts.push(encode_cmp_bv(
+                        crate::hir::loop_ir::CmpOp::Ge,
+                        &ScalarExpr::Var(*i),
+                        &ScalarExpr::Const(BigInt::from(*c)),
+                        bws,
+                        signed,
+                        n,
+                    )?);
                 } else {
                     guard_parts.push(format!("(>= x_{i} {})", c));
                 }
             }
             LoopInstr::TestDiffLe(i, j, c) => {
                 if bv {
-                    let cmp = if signed[*i] || signed[*j] {
-                        "bvsle"
-                    } else {
-                        "bvule"
-                    };
-                    let bw = bws[*i].max(bws[*j]);
-                    let c_big = BigInt::from(*c);
-                    guard_parts.push(format!(
-                        "({} (bvsub x_{i} x_{j}) {})",
-                        cmp,
-                        bv_const(&c_big, bw as u32)
-                    ));
+                    use crate::hir::loop_ir::{ArithSem, ScalarExpr};
+                    guard_parts.push(encode_cmp_bv(
+                        crate::hir::loop_ir::CmpOp::Le,
+                        &ScalarExpr::Sub(
+                            Box::new(ScalarExpr::Var(*i)),
+                            Box::new(ScalarExpr::Var(*j)),
+                            ArithSem::Wrap,
+                        ),
+                        &ScalarExpr::Const(BigInt::from(*c)),
+                        bws,
+                        signed,
+                        n,
+                    )?);
                 } else {
                     guard_parts.push(format!("(<= (- x_{i} x_{j}) {})", c));
                 }
@@ -1752,6 +1661,7 @@ fn expr_to_smt_bw(
     e: &crate::hir::loop_ir::ScalarExpr,
     bv: bool,
     bws: &[u8],
+    signed: &[bool],
     vars_len: usize,
     ctx_bw: u32,
 ) -> Option<(String, u32)> {
@@ -1788,9 +1698,15 @@ fn expr_to_smt_bw(
             if *sem == crate::hir::loop_ir::ArithSem::Saturate {
                 return None;
             }
-            let (ls, lbw) = expr_to_smt_bw(l, bv, bws, vars_len, ctx_bw)?;
-            let (rs, rbw) = expr_to_smt_bw(r, bv, bws, vars_len, ctx_bw)?;
+            let (ls, lbw) = expr_to_smt_bw(l, bv, bws, signed, vars_len, ctx_bw)?;
+            let (rs, rbw) = expr_to_smt_bw(r, bv, bws, signed, vars_len, ctx_bw)?;
             if bv {
+                // NB: the zext+bvadd/bvsub here encodes WRAP-semantics
+                // transition arithmetic — modular arithmetic is
+                // extension-agnostic at a FIXED width, so uniform zext is
+                // correct for the (wrapped) value. Comparison faithfulness
+                // is handled separately by lift_cmp_operand (the value-preserving lift); do
+                // NOT route transition arithmetic through the lift.
                 // Mixed-width operands must share a sort: zero-extend both
                 // to the common width (modular `bvadd` on the widened
                 // operands stays exact for the wrap-around semantics).
@@ -1811,8 +1727,8 @@ fn expr_to_smt_bw(
             if *sem == crate::hir::loop_ir::ArithSem::Saturate {
                 return None; // saturating arithmetic — fail closed (see Add).
             }
-            let (ls, lbw) = expr_to_smt_bw(l, bv, bws, vars_len, ctx_bw)?;
-            let (rs, rbw) = expr_to_smt_bw(r, bv, bws, vars_len, ctx_bw)?;
+            let (ls, lbw) = expr_to_smt_bw(l, bv, bws, signed, vars_len, ctx_bw)?;
+            let (rs, rbw) = expr_to_smt_bw(r, bv, bws, signed, vars_len, ctx_bw)?;
             if bv {
                 let bw = lbw.max(rbw);
                 Some((
@@ -1828,9 +1744,9 @@ fn expr_to_smt_bw(
             }
         }
         E::Ite(c, t, f) => {
-            let (ts, tbw) = expr_to_smt_bw(t, bv, bws, vars_len, ctx_bw)?;
-            let (fs, fbw) = expr_to_smt_bw(f, bv, bws, vars_len, ctx_bw)?;
-            let cond = cond_to_smt(c, bv, bws, vars_len)?;
+            let (ts, tbw) = expr_to_smt_bw(t, bv, bws, signed, vars_len, ctx_bw)?;
+            let (fs, fbw) = expr_to_smt_bw(f, bv, bws, signed, vars_len, ctx_bw)?;
+            let cond = cond_to_smt(c, bv, bws, signed, vars_len)?;
             if bv {
                 let bw = tbw.max(fbw);
                 Some((
@@ -1867,20 +1783,127 @@ fn sext_term(s: String, from: u32, to: u32) -> String {
     }
 }
 
-/// Extend operand `var_str` from its variable width (`from`) to the
-/// row's encoded width (`to`), SIGN-extending for signed rows and
-/// zero-extending otherwise. Row uniformity: relational rows
-/// exist only over same-signedness operand sets, so `row.signed`
-/// implies EVERY operand of the row is signed. A two's-complement
-/// negative value zero-extended inflates by 2^bw (x = −1 @ 8 bits →
-/// 255, not −1) and corrupts the offset-domain comparison;
-/// sign-extension represents the TRUE
-/// value mod 2^enc_bw, and the subsequent +offset `bvadd` lands
-/// exactly in [0, 2^enc_bw).
+/// Extend operand `var_str` from its variable width (`from`) to the row's
+/// encoded width (`to`), by the OPERAND'S OWN signedness (`signed` here is
+/// the PER-VARIABLE flag passed by the caller, NOT the row's OR):
+/// - (a) sign-extension preserves a two's-complement value;
+/// - (b) zero-extension preserves an unsigned value.
 fn ext_operand(var_str: &str, from: u32, to: u32, signed: bool) -> String {
     debug_assert!(from < to, "extension must widen (enc_bw > variable width)");
     let op = if signed { "sign_extend" } else { "zero_extend" };
     format!("((_ {op} {}) {var_str})", to - from)
+}
+
+/// Value-preserving lift (comparison layer). Returns `(term, W)`
+/// such that the W-bit TWO'S-COMPLEMENT reading of `term` equals the
+/// mathematical value of `e` (all variables within their type ranges) and
+/// |value| < 2^(W−1).
+///
+/// LEMMA (value-preserving lift):
+/// (a) a signed variable's pattern is its true value's two's complement —
+///     `sext` to any W ≥ bw preserves the reading;
+/// (b) an unsigned variable's value t ≤ 2^bw − 1 < 2^bw, so `zext` to
+///     bw + 1 yields a pattern with top bit 0 whose SIGNED reading is t.
+///
+/// WIDTH RULES:
+/// - W_d (addend/difference): Add/Sub nodes take W = max(W1, W2) + 1 —
+///   one extra bit absorbs carry/borrow: |v1 ± v2| < 2^(W−1) whenever
+///   |vi| < 2^(Wi−1). Without it the modular bvsub WRAPS (two same-width
+///   signed vars span a difference up to 2^bw − 1, overflowing bw-bit
+///   two's complement — the same reason Diff rows encode at bw + 1).
+/// - W_c (comparison, applied by `encode_cmp_bv`): W = max of the two
+///   lifted widths, both sides SIGN-extended to it, signed predicates.
+/// - Constants lift at W = bits(|c|) + 1 (smallest two's-complement fit).
+fn lift_cmp_operand(
+    e: &crate::hir::loop_ir::ScalarExpr,
+    bws: &[u8],
+    signed: &[bool],
+    vars_len: usize,
+) -> Option<(String, u32)> {
+    use crate::hir::loop_ir::{ArithSem, ScalarExpr as E};
+    match e {
+        E::Var(i) => {
+            let name = if *i < vars_len {
+                format!("x_{i}")
+            } else {
+                format!("n_{}", i - vars_len)
+            };
+            let bw = bws.get(*i).map(|b| *b as u32).unwrap_or(64);
+            let s = signed.get(*i).copied().unwrap_or(false);
+            if s {
+                Some((name, bw)) // two's-complement-faithful by definition
+            } else {
+                Some((zext_term(name, bw, bw + 1), bw + 1)) // LEMMA (b)
+            }
+        }
+        E::Const(c) => {
+            if c.abs().bits() > 126 {
+                return None; // absurdly wide guard constant — fail closed
+            }
+            let w = (c.abs().bits() + 1) as u32;
+            Some((bv_const(c, w), w))
+        }
+        E::Add(l, r, sem) => {
+            if *sem == ArithSem::Saturate {
+                return None; // clamp is piecewise — not a faithful lift
+            }
+            let (ls, lw) = lift_cmp_operand(l, bws, signed, vars_len)?;
+            let (rs, rw) = lift_cmp_operand(r, bws, signed, vars_len)?;
+            let w = lw.max(rw) + 1; // WIDTH RULE W_d
+            Some((
+                format!("(bvadd {} {})", sext_term(ls, lw, w), sext_term(rs, rw, w)),
+                w,
+            ))
+        }
+        E::Sub(l, r, sem) => {
+            if *sem == ArithSem::Saturate {
+                return None;
+            }
+            let (ls, lw) = lift_cmp_operand(l, bws, signed, vars_len)?;
+            let (rs, rw) = lift_cmp_operand(r, bws, signed, vars_len)?;
+            let w = lw.max(rw) + 1; // WIDTH RULE W_d
+            Some((
+                format!("(bvsub {} {})", sext_term(ls, lw, w), sext_term(rs, rw, w)),
+                w,
+            ))
+        }
+        // Comparisons over Ite were never produced by the lowering — fail
+        // closed rather than guess a semantics.
+        E::Ite(..) => None,
+    }
+}
+
+/// Shared BV comparison encoding (value-preserving lift): lift both sides, sign-extend
+/// to the common width, compare with SIGNED predicates. Used by BOTH
+/// `cond_to_smt` and the LoopInstr query builders' guard encoding — one
+/// source of truth, no drift. Fixes: (1) unsigned diff guards with a
+/// negative constant were VACUOUS under the old bvule encoding
+/// (`bv_const(−1)` becomes the all-ones pattern and `bvule(·, 2^w−1)` is
+/// always true — `i < n` guards were silently dropped); (2) same-width
+/// signed differences wrapped (`bvsub` at bw bits wraps −255 to 1);
+/// (3) mixed-signedness comparisons had no correct single-flag encoding.
+fn encode_cmp_bv(
+    op: crate::hir::loop_ir::CmpOp,
+    lhs: &crate::hir::loop_ir::ScalarExpr,
+    rhs: &crate::hir::loop_ir::ScalarExpr,
+    bws: &[u8],
+    signed: &[bool],
+    vars_len: usize,
+) -> Option<String> {
+    use crate::hir::loop_ir::CmpOp as O;
+    let (ls, lw) = lift_cmp_operand(lhs, bws, signed, vars_len)?;
+    let (rs, rw) = lift_cmp_operand(rhs, bws, signed, vars_len)?;
+    let w = lw.max(rw); // WIDTH RULE W_c
+    let l = sext_term(ls, lw, w);
+    let r = sext_term(rs, rw, w);
+    Some(match op {
+        O::Lt => format!("(bvslt {l} {r})"),
+        O::Le => format!("(bvsle {l} {r})"),
+        O::Gt => format!("(bvsgt {l} {r})"),
+        O::Ge => format!("(bvsge {l} {r})"),
+        O::Eq => format!("(= {l} {r})"),
+        O::Neq => format!("(not (= {l} {r}))"),
+    })
 }
 
 /// Encode a `ScalarExpr` as an SMT term (`ctx_bw` fallback width for
@@ -1889,57 +1912,41 @@ fn expr_to_smt(
     e: &crate::hir::loop_ir::ScalarExpr,
     bv: bool,
     bws: &[u8],
+    signed: &[bool],
     vars_len: usize,
     ctx_bw: u32,
 ) -> Option<String> {
-    expr_to_smt_bw(e, bv, bws, vars_len, ctx_bw).map(|(s, _)| s)
+    expr_to_smt_bw(e, bv, bws, signed, vars_len, ctx_bw).map(|(s, _)| s)
 }
 
-/// Encode a `Cond` as an SMT Boolean. Comparisons pick the signed
-/// comparators (`bvslt/bvsle/...`) per `Cond::Cmp.signed` or unsigned
-/// (`bvult/...`); LIA uses `< <= > >= =`. Under BV the operands are
-/// zero-extended to their common width (inferred from BOTH sides) before
-/// comparing, so mixed-width comparisons share a sort.
-fn cond_to_smt(
+/// Encode a `Cond` as an SMT Boolean. LIA uses the mathematical
+/// operators. Under BV, comparisons go through the value-preserving lift
+/// (`lift_cmp_operand`): each side is lifted so its
+/// W-bit two's-complement reading equals its mathematical value (LEMMA:
+/// sext preserves a signed pattern; zext to bw+1 makes an unsigned value
+/// a valid non-negative two's-complement pattern), both sides are
+/// sign-extended to the common width (W_c) and compared with SIGNED
+/// predicates — the mathematical order for EVERY signedness mixture.
+/// The `Cond::Cmp.signed` flag is therefore NO LONGER consumed here (it
+/// was the OR of the operands' signedness and had no correct value for
+/// mixtures); the field stays in the IR for compatibility.
+pub(crate) fn cond_to_smt(
     c: &crate::hir::loop_ir::Cond,
     bv: bool,
     bws: &[u8],
+    signed: &[bool],
     vars_len: usize,
 ) -> Option<String> {
     use crate::hir::loop_ir::{CmpOp as O, Cond as C};
     match c {
         C::True => Some("true".to_string()),
         C::False => Some("false".to_string()),
-        C::Cmp {
-            op,
-            lhs,
-            rhs,
-            signed,
-        } => {
-            let (ls, lbw) = expr_to_smt_bw(lhs, bv, bws, vars_len, 64)?;
-            let (rs, rbw) = expr_to_smt_bw(rhs, bv, bws, vars_len, 64)?;
-            // Common width inferred from both operands (fallback 64 when
-            // neither side names a variable). A SIGNED comparison
-            // sign-extends the narrower operand to the common width — a
-            // two's-complement negative pattern zero-extended inflates by
-            // 2^w (x = −1 @ 8 bits → 255 at 64), and bvsle then misjudges
-            // the guard (x < y at (−1, 0) reads false, making the
-            // inductive step vacuous). Mirrors `ext_operand`. Residual
-            // limitation (consistent with the uniform-signedness
-            // policy): a comparison marked signed over a genuinely
-            // UNSIGNED operand sign-extends its pattern — mixed-
-            // signedness comparisons are deferred together with mixed
-            // rows.
-            let (l, r) = if bv {
-                let bw = lbw.max(rbw);
-                if *signed {
-                    (sext_term(ls, lbw, bw), sext_term(rs, rbw, bw))
-                } else {
-                    (zext_term(ls, lbw, bw), zext_term(rs, rbw, bw))
-                }
-            } else {
-                (ls, rs)
-            };
+        C::Cmp { op, lhs, rhs, .. } => {
+            if bv {
+                return encode_cmp_bv(*op, lhs, rhs, bws, signed, vars_len);
+            }
+            let l = expr_to_smt_bw(lhs, false, bws, signed, vars_len, 64)?.0;
+            let r = expr_to_smt_bw(rhs, false, bws, signed, vars_len, 64)?.0;
             let pick = |lt: &str, le: &str, gt: &str, ge: &str| -> String {
                 match op {
                     O::Lt => format!("({lt} {l} {r})"),
@@ -1950,27 +1957,22 @@ fn cond_to_smt(
                     O::Neq => format!("(not (= {l} {r}))"),
                 }
             };
-            if bv {
-                if *signed {
-                    Some(pick("bvslt", "bvsle", "bvsgt", "bvsge"))
-                } else {
-                    Some(pick("bvult", "bvule", "bvugt", "bvuge"))
-                }
-            } else {
-                Some(pick("<", "<=", ">", ">="))
-            }
+            Some(pick("<", "<=", ">", ">="))
         }
         C::And(a, b) => Some(format!(
             "(and {} {})",
-            cond_to_smt(a, bv, bws, vars_len)?,
-            cond_to_smt(b, bv, bws, vars_len)?
+            cond_to_smt(a, bv, bws, signed, vars_len)?,
+            cond_to_smt(b, bv, bws, signed, vars_len)?
         )),
         C::Or(a, b) => Some(format!(
             "(or {} {})",
-            cond_to_smt(a, bv, bws, vars_len)?,
-            cond_to_smt(b, bv, bws, vars_len)?
+            cond_to_smt(a, bv, bws, signed, vars_len)?,
+            cond_to_smt(b, bv, bws, signed, vars_len)?
         )),
-        C::Not(a) => Some(format!("(not {})", cond_to_smt(a, bv, bws, vars_len)?)),
+        C::Not(a) => Some(format!(
+            "(not {})",
+            cond_to_smt(a, bv, bws, signed, vars_len)?
+        )),
     }
 }
 
@@ -1992,30 +1994,36 @@ fn encode_edge_inductiveness(
         return None; // only Back edges participate in inductiveness.
     }
     let n = problem.vars.len();
+    let signed_all: Vec<bool> = problem
+        .vars
+        .iter()
+        .chain(problem.params.iter())
+        .map(|v| v.signed)
+        .collect();
     let rows = &tpl.rows;
     // Synthesis uses the witness-constant version (l_r/u_r constrained by
     // the candidate disjunction); the verifier uses the concrete-bound
     // version (checks tpl's actual bound values directly).
     let a_x = if concrete {
-        template_formula_concrete(rows, n, false, bv, bws)
+        template_formula_concrete(rows, n, false, bv, bws, &signed_all)
     } else {
-        template_formula(rows, n, false, bv, bws)
+        template_formula(rows, n, false, bv, bws, &signed_all)
     };
     let a_xp = if concrete {
-        template_formula_concrete(rows, n, true, bv, bws)
+        template_formula_concrete(rows, n, true, bv, bws, &signed_all)
     } else {
-        template_formula(rows, n, true, bv, bws)
+        template_formula(rows, n, true, bv, bws, &signed_all)
     };
-    let g = cond_to_smt(&problem.loop_guard, bv, bws, n)?;
+    let g = cond_to_smt(&problem.loop_guard, bv, bws, &signed_all, n)?;
     let mut ante = vec![a_x, g];
     // Param type-range conditions are spliced into the
     // quantified antecedent — params are quantifier-scoped.
     ante.push(param_range_conds(&problem.params, bv));
     if let Some(guard) = &edge.guard {
-        ante.push(cond_to_smt(guard, bv, bws, n)?);
+        ante.push(cond_to_smt(guard, bv, bws, &signed_all, n)?);
     }
     if let Some(def) = &edge.definedness {
-        ante.push(cond_to_smt(def, bv, bws, n)?);
+        ante.push(cond_to_smt(def, bv, bws, &signed_all, n)?);
     }
     let mut next_parts = Vec::new();
     for (i, next_e) in edge.next_values.iter().enumerate() {
@@ -2035,7 +2043,7 @@ fn encode_edge_inductiveness(
                     crate::hir::loop_ir::ScalarExpr::Const(c) => c,
                     _ => return None, // non-constant saturate step — fail closed.
                 };
-                let x = expr_to_smt(l, bv, bws, n, ctx_bw)?;
+                let x = expr_to_smt(l, bv, bws, &signed_all, n, ctx_bw)?;
                 // next_values are indexed by the loop variables — an
                 // out-of-range index is an IR inconsistency, NOT a
                 // recoverable default: fail closed rather than clamp with
@@ -2044,7 +2052,7 @@ fn encode_edge_inductiveness(
                 let (bw, signed) = problem.vars.get(i).map(|v| (v.bw, v.signed))?;
                 clamp_expr(&x, c.to_i128()?, bv, bw, signed)
             }
-            _ => expr_to_smt(next_e, bv, bws, n, ctx_bw)?,
+            _ => expr_to_smt(next_e, bv, bws, &signed_all, n, ctx_bw)?,
         };
         next_parts.push(format!("(= xp_{i} {next_s})"));
     }
@@ -2077,6 +2085,12 @@ fn build_refine_query_problem(
         return None; // template var count must equal loop vars + params.
     }
     let rows = &candidates[0].rows;
+    let signed_all: Vec<bool> = problem
+        .vars
+        .iter()
+        .chain(problem.params.iter())
+        .map(|v| v.signed)
+        .collect();
 
     let sort = |bw: u32| -> String {
         if bv {
@@ -2120,7 +2134,7 @@ fn build_refine_query_problem(
         let ctx_bw = bws.get(i).copied().unwrap_or(64) as u32;
         init_parts.push(format!(
             "(= x_{i} {})",
-            expr_to_smt(init_e, bv, bws, vars_len, ctx_bw)?
+            expr_to_smt(init_e, bv, bws, &signed_all, vars_len, ctx_bw)?
         ));
     }
     let init_cond = if init_parts.is_empty() {
@@ -2128,7 +2142,7 @@ fn build_refine_query_problem(
     } else {
         format!("(and {})", init_parts.join(" "))
     };
-    let a_x_init = template_formula(rows, vars_len, false, bv, bws);
+    let a_x_init = template_formula(rows, vars_len, false, bv, bws, &signed_all);
     smt.push_str("(assert (forall (");
     for i in 0..vars_len {
         smt.push_str(&format!("(x_{i} {}) ", sort(bws[i] as u32)));
@@ -2183,6 +2197,12 @@ fn build_bounded_leap_query_problem(
         return None; // template var count must equal loop vars + params.
     }
     let rows = &cur.rows;
+    let signed_all: Vec<bool> = problem
+        .vars
+        .iter()
+        .chain(problem.params.iter())
+        .map(|v| v.signed)
+        .collect();
 
     let sort = |bw: u32| -> String {
         if bv {
@@ -2261,7 +2281,7 @@ fn build_bounded_leap_query_problem(
         let ctx_bw = bws.get(i).copied().unwrap_or(64) as u32;
         init_parts.push(format!(
             "(= x_{i} {})",
-            expr_to_smt(init_e, bv, bws, vars_len, ctx_bw)?
+            expr_to_smt(init_e, bv, bws, &signed_all, vars_len, ctx_bw)?
         ));
     }
     let init_cond = if init_parts.is_empty() {
@@ -2273,7 +2293,7 @@ fn build_bounded_leap_query_problem(
         "(=> (and {} {}) {})",
         init_cond,
         param_range_conds(&problem.params, bv),
-        template_formula(rows, vars_len, false, bv, bws)
+        template_formula(rows, vars_len, false, bv, bws, &signed_all)
     ));
     for edge in &problem.back_edges {
         parts.push(encode_edge_inductiveness(
@@ -2319,6 +2339,8 @@ pub(crate) fn query_budget_floor(
     signed: &[bool],
     saturates: &[(usize, i128)],
 ) -> usize {
+    // Both modes include mixed-signedness rows — the floor covers the
+    // full template.
     let tpl = BiiTemplate::with_saturates(n_vars, bit_widths, signed, saturates);
     let w: usize = tpl.rows.iter().map(|r| r.enc_bw() as usize).sum();
     w * 8 + 64
@@ -2393,7 +2415,10 @@ pub(crate) fn synthesize_problem_bii(
             continue;
         }
 
-        let query = build_refine_query_problem(problem, &candidates, false, use_bv, &bws_all)?;
+        let Some(query) = build_refine_query_problem(problem, &candidates, false, use_bv, &bws_all)
+        else {
+            return if adopted { Some(cur) } else { None };
+        };
         calls += 1;
         match solver.run_raw_query(&query) {
             RawQueryOutcome::Unsat => {
@@ -2403,9 +2428,11 @@ pub(crate) fn synthesize_problem_bii(
                     if calls >= max_queries {
                         return if adopted { Some(cur) } else { None };
                     }
-                    let leap = build_bounded_leap_query_problem(
+                    let Some(leap) = build_bounded_leap_query_problem(
                         problem, &cur, &limits, false, use_bv, &bws_all,
-                    )?;
+                    ) else {
+                        return if adopted { Some(cur) } else { None };
+                    };
                     calls += 1;
                     match solver.run_raw_query(&leap) {
                         RawQueryOutcome::Unsat => return Some(cur),
@@ -2413,9 +2440,11 @@ pub(crate) fn synthesize_problem_bii(
                             if calls >= max_queries {
                                 return if adopted { Some(cur) } else { None };
                             }
-                            let leap_m = build_bounded_leap_query_problem(
+                            let Some(leap_m) = build_bounded_leap_query_problem(
                                 problem, &cur, &limits, true, use_bv, &bws_all,
-                            )?;
+                            ) else {
+                                return if adopted { Some(cur) } else { None };
+                            };
                             calls += 1;
                             match solver.run_raw_query(&leap_m) {
                                 RawQueryOutcome::Sat(model) => {
@@ -2451,8 +2480,11 @@ pub(crate) fn synthesize_problem_bii(
                 if calls >= max_queries {
                     return if adopted { Some(cur) } else { None };
                 }
-                let query_model =
-                    build_refine_query_problem(problem, &candidates, true, use_bv, &bws_all)?;
+                let Some(query_model) =
+                    build_refine_query_problem(problem, &candidates, true, use_bv, &bws_all)
+                else {
+                    return if adopted { Some(cur) } else { None };
+                };
                 calls += 1;
                 match solver.run_raw_query(&query_model) {
                     RawQueryOutcome::Sat(model) => match parse_witness(&model, &cur.rows, use_bv) {
@@ -2803,6 +2835,51 @@ fn dbm_proves_inductiveness(
             }
         }
     }
+    // ── Check 4: A(X) ∧ ¬G(X) ⇒ Post(X) ──────────────────────
+    if let Some(post) = &problem.post {
+        let mut dbm = Dbm::new(n_total);
+        for &(a, b, c) in &param_edges {
+            dbm.set_mirrored(a, b, c);
+        }
+        for row in &tpl.rows {
+            for upper in [true, false] {
+                let (a, b, c) = row_half(row, upper, false)?;
+                dbm.set_mirrored(a, b, c);
+            }
+        }
+        // ¬G(X): encode the negated loop_guard.
+        // If loop_guard is an And-chain, ¬(A∧B) = ¬A∨¬B is disjunctive,
+        // outside the difference-constraint fragment → cond_to_edges
+        // returns false → fall back to SMT.
+        let mut neg_guard_edges = Vec::new();
+        if !cond_to_edges(&problem.loop_guard, true, &mut neg_guard_edges) {
+            return None; // ¬G outside the fragment → fall back to SMT
+        }
+        for (a, b, cc) in neg_guard_edges {
+            dbm.set_mirrored(a, b, cc);
+        }
+        if dbm.close_with(ClosureMode::IntegerExact) {
+            // Negate each Post conjunct and refute it separately.
+            let mut conjuncts = Vec::new();
+            if !split_and(post, &mut conjuncts) {
+                return None;
+            }
+            for c in &conjuncts {
+                let mut neg_edges = Vec::new();
+                if !cond_to_edges(c, true, &mut neg_edges) {
+                    return None;
+                }
+                let mut m = dbm.clone();
+                for (a, b, cc) in neg_edges {
+                    m.set_mirrored(a, b, cc);
+                }
+                if m.close_with(ClosureMode::IntegerExact) {
+                    return Some(false); // satisfiable → SMT decides
+                }
+            }
+        }
+        // ⊥ antecedent: vacuously true — Check 4 holds trivially.
+    }
     Some(true) // every counter-query refuted — inductiveness PROVEN
 }
 /// A linear form `Σ aᵥ·xᵥ + k` over the template-domain variables
@@ -3134,6 +3211,13 @@ pub(crate) enum VerifyOutcome {
     /// warning, strict vs non-strict) is an L3 decision —
     /// deliberately deferred, not silently dropped.
     TrapUnproven,
+    /// Checks 1–2 UNSAT (inductiveness holds), but Check 4 (ϕ₃ exit
+    /// sufficiency) is SAT: the BII within the template domain cannot
+    /// entail the postcondition. Either a domain expressiveness gap
+    /// (the BII is too weak), or the program genuinely fails Post.
+    /// The BII itself is verified inductive, so the hint channel stays
+    /// intact.
+    PostUnproven,
     /// Some check found a counterexample (sat) — the template is NOT
     /// inductive (a synthesis-layer bug; the checker reports it).
     Counterexample,
@@ -3185,6 +3269,12 @@ pub(crate) fn verify_template_against_problem(
         .chain(problem.params.iter())
         .map(|v| v.bw)
         .collect();
+    let signed_all: Vec<bool> = problem
+        .vars
+        .iter()
+        .chain(problem.params.iter())
+        .map(|v| v.signed)
+        .collect();
     if tpl.n_vars != vars_len + params_len {
         return VerifyOutcome::Inconclusive; // template var count must equal loop vars + params.
     }
@@ -3196,7 +3286,7 @@ pub(crate) fn verify_template_against_problem(
             "Int".to_string()
         }
     };
-    let a_x = template_formula_concrete(rows, vars_len, false, bv, &bws_all);
+    let a_x = template_formula_concrete(rows, vars_len, false, bv, &bws_all, &signed_all);
 
     let mut logic = String::new();
     if bv {
@@ -3209,7 +3299,7 @@ pub(crate) fn verify_template_against_problem(
     let mut init_parts = Vec::new();
     for (i, init_e) in problem.init.iter().enumerate() {
         let ctx_bw = bws_all.get(i).copied().unwrap_or(64) as u32;
-        match expr_to_smt(init_e, bv, &bws_all, vars_len, ctx_bw) {
+        match expr_to_smt(init_e, bv, &bws_all, &signed_all, vars_len, ctx_bw) {
             Some(s) => init_parts.push(format!("(= x_{i} {s})")),
             None => return VerifyOutcome::Inconclusive,
         }
@@ -3285,17 +3375,17 @@ pub(crate) fn verify_template_against_problem(
         let Some(def) = &edge.definedness else {
             continue;
         };
-        let Some(g) = cond_to_smt(&problem.loop_guard, bv, &bws_all, vars_len) else {
+        let Some(g) = cond_to_smt(&problem.loop_guard, bv, &bws_all, &signed_all, vars_len) else {
             return VerifyOutcome::Inconclusive;
         };
-        let Some(def_s) = cond_to_smt(def, bv, &bws_all, vars_len) else {
+        let Some(def_s) = cond_to_smt(def, bv, &bws_all, &signed_all, vars_len) else {
             return VerifyOutcome::Inconclusive;
         };
         let mut ante = vec![a_x.clone(), g];
         // Param type-range conditions, quantifier-scoped.
         ante.push(param_range_conds(&problem.params, bv));
         if let Some(guard) = &edge.guard {
-            match cond_to_smt(guard, bv, &bws_all, vars_len) {
+            match cond_to_smt(guard, bv, &bws_all, &signed_all, vars_len) {
                 Some(s) => ante.push(s),
                 None => return VerifyOutcome::Inconclusive,
             }
@@ -3318,6 +3408,43 @@ pub(crate) fn verify_template_against_problem(
         match solver.run_raw_query(&q) {
             RawQueryOutcome::Unsat => {}
             RawQueryOutcome::Sat(_) => return VerifyOutcome::TrapUnproven,
+            RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => {
+                return VerifyOutcome::Inconclusive;
+            }
+        }
+    }
+
+    // 4. Exit sufficiency: A(X) ∧ ¬G(X) ⇒ Post(X)
+    if let Some(post) = &problem.post {
+        let Some(post_s) = cond_to_smt(post, bv, &bws_all, &signed_all, vars_len) else {
+            return VerifyOutcome::Inconclusive;
+        };
+        let Some(g) = cond_to_smt(&problem.loop_guard, bv, &bws_all, &signed_all, vars_len) else {
+            return VerifyOutcome::Inconclusive;
+        };
+
+        let mut ante = vec![a_x.clone(), format!("(not {g})")];
+        ante.push(param_range_conds(&problem.params, bv));
+        let ante_cond = if ante.len() == 1 {
+            ante.into_iter().next().unwrap()
+        } else {
+            format!("(and {})", ante.join(" "))
+        };
+
+        let mut q = logic.clone();
+        q.push_str("(assert (not (forall (");
+        for i in 0..vars_len {
+            q.push_str(&format!("(x_{i} {}) ", sort(bws_all[i] as u32)));
+        }
+        for (j, p) in problem.params.iter().enumerate() {
+            q.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
+        }
+        q.push_str(&format!(") (=> {} {}))))\n", ante_cond, post_s));
+        q.push_str("(check-sat)\n");
+
+        match solver.run_raw_query(&q) {
+            RawQueryOutcome::Unsat => {}
+            RawQueryOutcome::Sat(_) => return VerifyOutcome::PostUnproven,
             RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => {
                 return VerifyOutcome::Inconclusive;
             }
@@ -3449,8 +3576,8 @@ fn build_bounded_leap_query(
     }
     smt.push_str(")\n");
 
-    let a_x = template_formula(rows, n, false, bv, bws);
-    let a_xp = template_formula(rows, n, true, bv, bws);
+    let a_x = template_formula(rows, n, false, bv, bws, signed);
+    let a_xp = template_formula(rows, n, true, bv, bws, signed);
 
     let mut pre_parts = Vec::new();
     for instr in init {
@@ -3479,44 +3606,49 @@ fn build_bounded_leap_query(
         match instr {
             LoopInstr::TestLe(i, c) => {
                 if bv {
-                    let cmp = if signed[*i] { "bvsle" } else { "bvule" };
-                    let c_big = BigInt::from(*c);
-                    guard_parts.push(format!(
-                        "({} x_{i} {})",
-                        cmp,
-                        bv_const(&c_big, bws[*i] as u32)
-                    ));
+                    use crate::hir::loop_ir::ScalarExpr;
+                    guard_parts.push(encode_cmp_bv(
+                        crate::hir::loop_ir::CmpOp::Le,
+                        &ScalarExpr::Var(*i),
+                        &ScalarExpr::Const(BigInt::from(*c)),
+                        bws,
+                        signed,
+                        n,
+                    )?);
                 } else {
                     guard_parts.push(format!("(<= x_{i} {})", c));
                 }
             }
             LoopInstr::TestGe(i, c) => {
                 if bv {
-                    let cmp = if signed[*i] { "bvsge" } else { "bvuge" };
-                    let c_big = BigInt::from(*c);
-                    guard_parts.push(format!(
-                        "({} x_{i} {})",
-                        cmp,
-                        bv_const(&c_big, bws[*i] as u32)
-                    ));
+                    use crate::hir::loop_ir::ScalarExpr;
+                    guard_parts.push(encode_cmp_bv(
+                        crate::hir::loop_ir::CmpOp::Ge,
+                        &ScalarExpr::Var(*i),
+                        &ScalarExpr::Const(BigInt::from(*c)),
+                        bws,
+                        signed,
+                        n,
+                    )?);
                 } else {
                     guard_parts.push(format!("(>= x_{i} {})", c));
                 }
             }
             LoopInstr::TestDiffLe(i, j, c) => {
                 if bv {
-                    let cmp = if signed[*i] || signed[*j] {
-                        "bvsle"
-                    } else {
-                        "bvule"
-                    };
-                    let bw = bws[*i].max(bws[*j]);
-                    let c_big = BigInt::from(*c);
-                    guard_parts.push(format!(
-                        "({} (bvsub x_{i} x_{j}) {})",
-                        cmp,
-                        bv_const(&c_big, bw as u32)
-                    ));
+                    use crate::hir::loop_ir::{ArithSem, ScalarExpr};
+                    guard_parts.push(encode_cmp_bv(
+                        crate::hir::loop_ir::CmpOp::Le,
+                        &ScalarExpr::Sub(
+                            Box::new(ScalarExpr::Var(*i)),
+                            Box::new(ScalarExpr::Var(*j)),
+                            ArithSem::Wrap,
+                        ),
+                        &ScalarExpr::Const(BigInt::from(*c)),
+                        bws,
+                        signed,
+                        n,
+                    )?);
                 } else {
                     guard_parts.push(format!("(<= (- x_{i} x_{j}) {})", c));
                 }
@@ -3840,6 +3972,7 @@ pub(crate) fn template_to_invariant_exprs<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hir::loop_ir::{CmpOp, Cond, ScalarExpr};
 
     /// `i := 0; while i < 6 { i := i + 1 }` — the BII interval is
     /// `[0, 6]`: the init pins the lower bound to 0, inductiveness forces
@@ -3885,6 +4018,8 @@ mod tests {
                     lb: BigInt::zero(),
                     ub: BigInt::from(6),
                     signed: false,
+                    full_lb: BigInt::zero(),
+                    full_ub: BiiRow::max_ub(4),
                 },
                 BiiRow {
                     kind: RowKind::Interval(0),
@@ -3892,6 +4027,8 @@ mod tests {
                     lb: BigInt::zero(),
                     ub: BiiRow::max_ub(4), // top — skipped.
                     signed: false,
+                    full_lb: BigInt::zero(),
+                    full_ub: BiiRow::max_ub(4),
                 },
             ],
         };
@@ -4386,6 +4523,8 @@ mod tests {
             lb: BigInt::zero(),
             ub: BiiRow::max_ub(8),
             signed: false,
+            full_lb: BigInt::zero(),
+            full_ub: BiiRow::max_ub(8),
         };
         assert_eq!(interval.enc_bw(), 8);
 
@@ -4395,6 +4534,8 @@ mod tests {
             lb: BiiRow::min_diff(8),
             ub: BiiRow::max_ub(8),
             signed: false,
+            full_lb: BiiRow::min_diff(8),
+            full_ub: BiiRow::max_ub(8),
         };
         assert_eq!(diff.enc_bw(), 9);
 
@@ -4404,6 +4545,8 @@ mod tests {
             lb: BigInt::zero(),
             ub: BiiRow::max_sum_ub(8),
             signed: false,
+            full_lb: BigInt::zero(),
+            full_ub: BiiRow::max_sum_ub(8),
         };
         assert_eq!(sum.enc_bw(), 9);
     }
@@ -4417,6 +4560,8 @@ mod tests {
             lb: BigInt::zero(),
             ub: BiiRow::max_sum_ub(8),
             signed: false,
+            full_lb: BigInt::zero(),
+            full_ub: BiiRow::max_sum_ub(8),
         };
         assert!(top_sum.is_trivial());
 
@@ -4426,6 +4571,8 @@ mod tests {
             lb: BigInt::from(10),
             ub: BigInt::from(100),
             signed: false,
+            full_lb: BigInt::zero(),
+            full_ub: BiiRow::max_sum_ub(8),
         };
         assert!(!tight_sum.is_trivial());
     }
@@ -4440,6 +4587,8 @@ mod tests {
             lb: BigInt::from(-15),
             ub: BigInt::from(15),
             signed: false,
+            full_lb: BiiRow::min_diff(4),
+            full_ub: BiiRow::max_ub(4),
         };
         let offset = diff.offset();
         assert_eq!(offset, BigInt::from(15));
@@ -4489,7 +4638,11 @@ mod tests {
             ),
         ];
         for (sj, sk, lo, hi, off) in cases {
-            let (rlo, rhi) = BiiRow::s3_range(4, sj, sk);
+            let (rlo, rhi) = full_range(
+                RowKind::Support3(0, 1, 2, sj, sk),
+                4,
+                &[false, false, false],
+            );
             assert_eq!(
                 (rlo, rhi),
                 (lo.clone(), hi.clone()),
@@ -4501,6 +4654,8 @@ mod tests {
                 lb: lo.clone(),
                 ub: hi.clone(),
                 signed: false,
+                full_lb: lo.clone(),
+                full_ub: hi.clone(),
             };
             assert_eq!(row.offset(), off, "offset for (sj={sj}, sk={sk})");
             assert_eq!(row.enc_bw(), 6, "enc_bw for (sj={sj}, sk={sk})");
@@ -4526,9 +4681,11 @@ mod tests {
             lb: BigInt::zero(),
             ub: BigInt::from(4),
             signed: false,
+            full_lb: BigInt::from(-15),
+            full_ub: BigInt::from(30),
         }];
         let bws = [4u8, 4, 4];
-        let f_lia = template_formula(&rows, 3, false, false, &bws);
+        let f_lia = template_formula(&rows, 3, false, false, &bws, &[false, false, false]);
         assert!(
             f_lia.contains("(<= l_0 (- (+ x_0 x_1) x_2))"),
             "LIA Support3 term: {f_lia}"
@@ -4539,7 +4696,7 @@ mod tests {
         );
         assert!(!f_lia.contains("bvadd"), "LIA must not use BV ops: {f_lia}");
 
-        let f_bv = template_formula(&rows, 3, false, true, &bws);
+        let f_bv = template_formula(&rows, 3, false, true, &bws, &[false, false, false]);
         // enc_bw = 6, each operand zero-extended by 2; (+,−) offset = m = 15.
         assert!(
             f_bv.contains(
@@ -4558,6 +4715,8 @@ mod tests {
             lb: -BiiRow::max_ub(8),
             ub: BiiRow::max_ub(8) * BigInt::from(2),
             signed: false,
+            full_lb: BigInt::from(-255),
+            full_ub: BigInt::from(510),
         };
         assert!(top.is_trivial(), "full-range Support3 row is trivial");
         let tight = BiiRow {
@@ -4566,6 +4725,8 @@ mod tests {
             lb: BigInt::from(0),
             ub: BigInt::from(4),
             signed: false,
+            full_lb: BigInt::from(-255),
+            full_ub: BigInt::from(510),
         };
         assert!(!tight.is_trivial(), "tightened Support3 row is not trivial");
     }
@@ -4578,7 +4739,7 @@ mod tests {
         let limits = BoundaryLimits::new(&tpl);
         for (idx, row) in tpl.rows.iter().enumerate() {
             if let RowKind::Support3(_, _, _, sj, sk) = row.kind {
-                let (lo, hi) = BiiRow::s3_range(row.bw, sj, sk);
+                let (lo, hi) = (row.full_lb.clone(), row.full_ub.clone());
                 assert_eq!(limits.lb[idx], hi, "lb limit for row {idx}");
                 assert_eq!(limits.ub[idx], lo, "ub limit for row {idx}");
             }
@@ -4608,6 +4769,8 @@ mod tests {
                 lb: BigInt::from(1),
                 ub: BiiRow::max_sum_ub(128), // > i128::MAX
                 signed: false,
+                full_lb: BigInt::zero(),
+                full_ub: BiiRow::max_sum_ub(128),
             }],
         };
         let exprs = template_to_invariant_exprs(arena, &tpl, &vars);
@@ -4909,6 +5072,7 @@ mod tests {
             }],
             exit_edges: vec![],
             saturates: vec![],
+            post: None,
         };
         let tpl = BiiTemplate::new(3, &[4, 4, 4], &[false, false, false]);
         assert_eq!(
@@ -5011,6 +5175,7 @@ mod tests {
             }],
             exit_edges: vec![],
             saturates: vec![],
+            post: None,
         };
         let mut tpl = BiiTemplate::new(2, &[8, 8], &[false, false]);
         tpl.rows[0].lb = BigInt::zero();
@@ -5151,9 +5316,8 @@ mod tests {
     /// Signed Sum/Support3 rows over uniform-signedness operand
     /// sets. Two Int<8> vars: the Sum row carries TRUE signed tops
     /// [−2^bw, 2^bw−2]; the Diff row keeps the symmetric [−255, 255].
-    /// Mixed pairs (Int, UInt) get NO Diff and NO Sum row — the old
-    /// mixed Diff tops [−m, m] excluded reachable states (Int<8> −
-    /// UInt<8> reaches −383 < −255), an unsound ⊤.
+    /// Mixed pairs get EXACT asymmetric tops — sound in both modes since
+    /// the per-operand extension.
     #[test]
     fn test_g3_signed_row_generation() {
         let tpl = BiiTemplate::new(2, &[8, 8], &[true, true]);
@@ -5177,20 +5341,32 @@ mod tests {
         // h = 128: (+,+) → [−384, 381]; (+,−)/(−,+) → [−383, 382];
         // (−,−) → [−382, 383].
         assert_eq!(
-            BiiRow::signed_s3_range(8, true, true),
+            full_range(
+                RowKind::Support3(0, 1, 2, true, true),
+                8,
+                &[true, true, true]
+            ),
             (BigInt::from(-384), BigInt::from(381))
         );
         assert_eq!(
-            BiiRow::signed_s3_range(8, true, false),
+            full_range(
+                RowKind::Support3(0, 1, 2, true, false),
+                8,
+                &[true, true, true]
+            ),
             (BigInt::from(-383), BigInt::from(382))
         );
         assert_eq!(
-            BiiRow::signed_s3_range(8, false, false),
+            full_range(
+                RowKind::Support3(0, 1, 2, false, false),
+                8,
+                &[true, true, true]
+            ),
             (BigInt::from(-382), BigInt::from(383))
         );
         for row in &tpl3.rows {
             if let RowKind::Support3(_, _, _, sj, sk) = row.kind {
-                let (lo, hi) = BiiRow::signed_s3_range(row.bw, sj, sk);
+                let (lo, hi) = (row.full_lb.clone(), row.full_ub.clone());
                 assert_eq!(row.lb, lo, "Support3 (sj={sj}, sk={sk}) tops");
                 assert_eq!(row.ub, hi);
                 assert!(row.signed);
@@ -5198,27 +5374,30 @@ mod tests {
         }
         // Mixed pair: no Diff, no Sum (uniform-signedness policy).
         let tpl_m = BiiTemplate::new(2, &[8, 8], &[true, false]);
-        assert!(
-            !tpl_m
-                .rows
-                .iter()
-                .any(|r| matches!(r.kind, RowKind::Diff(..))),
-            "mixed-signature Diff rows are skipped (unsound tops)"
-        );
-        assert!(
-            !tpl_m
-                .rows
-                .iter()
-                .any(|r| matches!(r.kind, RowKind::Sum(..))),
-            "mixed-signature Sum rows are skipped (deferred)"
-        );
-        // Mixed triple: no Support3; the (0,1) uniform pair keeps its rows.
+        let diff_m = tpl_m
+            .rows
+            .iter()
+            .find(|r| matches!(r.kind, RowKind::Diff(0, 1)))
+            .expect("mixed Diff row exists");
+        assert_eq!(diff_m.lb, BigInt::from(-383), "Int8 − UInt8 bottom");
+        assert_eq!(diff_m.ub, BigInt::from(127), "Int8 − UInt8 top");
+        let sum_m = tpl_m
+            .rows
+            .iter()
+            .find(|r| matches!(r.kind, RowKind::Sum(0, 1)))
+            .expect("mixed Sum row exists");
+        assert_eq!(sum_m.lb, BigInt::from(-128));
+        assert_eq!(sum_m.ub, BigInt::from(382));
+        // Mixed triple: the (0,1) uniform pair keeps its rows.
         let tpl_m3 = BiiTemplate::new(3, &[8, 8, 8], &[true, true, false]);
-        assert!(
-            !tpl_m3
+        assert_eq!(
+            tpl_m3
                 .rows
                 .iter()
-                .any(|r| matches!(r.kind, RowKind::Support3(..)))
+                .filter(|r| matches!(r.kind, RowKind::Support3(..)))
+                .count(),
+            4,
+            "the mixed triple now carries its 4 Support3 rows"
         );
         assert!(
             tpl_m3
@@ -5253,6 +5432,8 @@ mod tests {
             lb: BigInt::from(-256),
             ub: BigInt::from(254),
             signed: true,
+            full_lb: BigInt::from(-256),
+            full_ub: BigInt::from(254),
         };
         assert_eq!(sum.offset(), BigInt::from(256));
         assert_eq!(sum.enc_bw(), 9);
@@ -5267,6 +5448,8 @@ mod tests {
             lb: BigInt::from(-384),
             ub: BigInt::from(381),
             signed: true,
+            full_lb: BigInt::from(-384),
+            full_ub: BigInt::from(381),
         };
         assert_eq!(s3.offset(), BigInt::from(384));
         assert_eq!(s3.enc_bw(), 10);
@@ -5283,6 +5466,8 @@ mod tests {
             lb: BigInt::from(-256),
             ub: BigInt::from(254),
             signed: true,
+            full_lb: BigInt::from(-256),
+            full_ub: BigInt::from(254),
         };
         assert!(top_sum.is_trivial());
         let tight_sum = BiiRow {
@@ -5291,6 +5476,8 @@ mod tests {
             lb: BigInt::from(-10),
             ub: BigInt::from(10),
             signed: true,
+            full_lb: BigInt::from(-256),
+            full_ub: BigInt::from(254),
         };
         assert!(!tight_sum.is_trivial());
         let tpl = BiiTemplate::new(2, &[8, 8], &[true, true]);
@@ -5306,7 +5493,7 @@ mod tests {
         let limits3 = BoundaryLimits::new(&tpl3);
         for (idx, row) in tpl3.rows.iter().enumerate() {
             if let RowKind::Support3(_, _, _, sj, sk) = row.kind {
-                let (lo, hi) = BiiRow::signed_s3_range(row.bw, sj, sk);
+                let (lo, hi) = (row.full_lb.clone(), row.full_ub.clone());
                 assert_eq!(limits3.lb[idx], hi);
                 assert_eq!(limits3.ub[idx], lo);
             }
@@ -5527,5 +5714,484 @@ mod tests {
                 "ub = −2 (use_bv={use_bv}) — negative BII upper bound"
             );
         }
+    }
+
+    /// Mixed-signedness relational rows: Int<8>/UInt<8> gets a
+    /// Diff row with EXACT asymmetric tops [−383, 127] (min_x − max_y,
+    /// max_x − min_y) and a Sum row [−128, 382]; offsets map both onto
+    /// [0, 510] at enc_bw = 9.
+    #[test]
+    fn test_mixed_row_generation_tops() {
+        let tpl = BiiTemplate::new(2, &[8, 8], &[true, false]);
+        let diff = tpl
+            .rows
+            .iter()
+            .find(|r| matches!(r.kind, RowKind::Diff(0, 1)))
+            .expect("mixed Diff row must exist");
+        assert_eq!(
+            diff.full_lb,
+            BigInt::from(-383),
+            "Int8 − UInt8 bottom: −128 − 255"
+        );
+        assert_eq!(diff.full_ub, BigInt::from(127), "Int8 − UInt8 top: 127 − 0");
+        assert_eq!(diff.offset(), BigInt::from(383));
+        assert_eq!(diff.enc_bw(), 9);
+        let sum = tpl
+            .rows
+            .iter()
+            .find(|r| matches!(r.kind, RowKind::Sum(0, 1)))
+            .expect("mixed Sum row must exist");
+        assert_eq!(
+            (sum.full_lb.clone(), sum.full_ub.clone()),
+            (BigInt::from(-128), BigInt::from(382))
+        );
+        assert_eq!(sum.offset(), BigInt::from(128));
+        assert_eq!(sum.enc_bw(), 9);
+        assert_eq!(&sum.full_ub + &sum.offset(), BigInt::from(510));
+    }
+
+    /// Mixed Support3: vars (Int<8>, UInt<8>, Int<8>) — all four sign rows
+    /// over the triple with exact per-term tops; enc_bw = bw + 2 still fits
+    /// (each operand spreads ≤ 2^bw − 1 regardless of signedness).
+    #[test]
+    fn test_mixed_support3_tops() {
+        let tpl = BiiTemplate::new(3, &[8, 8, 8], &[true, false, true]);
+        let s3: Vec<&BiiRow> = tpl
+            .rows
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::Support3(..)))
+            .collect();
+        assert_eq!(s3.len(), 4, "one triple → 4 sign combinations");
+        for row in s3 {
+            let (sj, sk) = match row.kind {
+                RowKind::Support3(_, _, _, sj, sk) => (sj, sk),
+                _ => unreachable!(),
+            };
+            // terms: x0 ∈ [−128, 127]; ±x1 ∈ [0,255] / [−255,0]; ±x2 ∈ [−128,127] / [−127,128].
+            let (lo_j, hi_j) = if sj {
+                (BigInt::from(0), BigInt::from(255))
+            } else {
+                (BigInt::from(-255), BigInt::from(0))
+            };
+            let (lo_k, hi_k) = if sk {
+                (BigInt::from(-128), BigInt::from(127))
+            } else {
+                (BigInt::from(-127), BigInt::from(128))
+            };
+            assert_eq!(
+                row.full_lb,
+                BigInt::from(-128) + lo_j + lo_k,
+                "(sj={sj}, sk={sk}) bottom"
+            );
+            assert_eq!(
+                row.full_ub,
+                BigInt::from(127) + hi_j + hi_k,
+                "(sj={sj}, sk={sk}) top"
+            );
+            assert_eq!(row.enc_bw(), 10);
+            assert!(
+                &row.full_ub - &row.full_lb < BigInt::one() << 10,
+                "encoded width fits"
+            );
+        }
+    }
+
+    /// End-to-end (z3-gated, LIA only): lockstep mixed pair —
+    /// `x: Int<8>, y: UInt<8>; x,y := 0,0; while x ≤ 3 { x := x+1; y := y+1 }`
+    /// keeps x − y = 0, so the mixed Diff row's BII is the singleton [0, 0].
+    /// The template is synthesized under the mixed LIA domain and verified
+    /// by the independent verifier (its DBM fast path is mathematical and
+    /// handles mixed signedness natively).
+    #[test]
+    fn test_mixed_diff_bii_singleton_lia() {
+        let solver = SmtSolver::new("z3");
+        if !solver.check_version() {
+            eprintln!("z3 unavailable — skipping test_mixed_diff_bii_singleton_lia");
+            return;
+        }
+        let vars = vec![Symbol::intern("x"), Symbol::intern("y")];
+        let init = vec![LoopInstr::ConstVar(0, 0), LoopInstr::ConstVar(1, 0)];
+        let body = vec![
+            LoopInstr::TestLe(0, 3),
+            LoopInstr::AddVar(0, 1),
+            LoopInstr::AddVar(1, 1),
+        ];
+        let tpl = synthesize_bitwise_bii(
+            &solver,
+            &vars,
+            &init,
+            &body,
+            &[8, 8],
+            &[true, false],
+            512,
+            false,
+        )
+        .expect("mixed-pair LIA synthesis must converge");
+        let diff = tpl
+            .rows
+            .iter()
+            .find(|r| matches!(r.kind, RowKind::Diff(0, 1)))
+            .expect("mixed Diff row must be present in the LIA template");
+        assert_eq!(diff.lb, BigInt::zero(), "x − y is constantly 0 (lb)");
+        assert_eq!(diff.ub, BigInt::zero(), "x − y is constantly 0 (ub)");
+        let problem = crate::hir::loop_ir::loop_instrs_to_loop_problem(
+            &vars,
+            &init,
+            &body,
+            &[8, 8],
+            &[true, false],
+            &[],
+            true,
+        )
+        .expect("must lower");
+        assert!(matches!(
+            verify_template_against_problem(&solver, &problem, &tpl, false),
+            VerifyOutcome::Verified
+        ));
+    }
+
+    /// Per-operand extension, pinned at the formula level (no solver needed):
+    /// the mixed Diff row's BV emission
+    /// sign-extends the Int<8> side, zero-extends the UInt<8> side, and
+    /// compares in the offset domain at enc_bw 9 (offset = −full_lb = 383).
+    #[test]
+    fn test_mixed_diff_bv_formula_text() {
+        let rows = vec![BiiRow {
+            kind: RowKind::Diff(0, 1),
+            bw: 8,
+            lb: BigInt::from(-383),
+            ub: BigInt::from(127),
+            signed: true, // OR of operands — NOT consumed by extension
+            full_lb: BigInt::from(-383),
+            full_ub: BigInt::from(127),
+        }];
+        let f = template_formula(&rows, 2, false, true, &[8, 8], &[true, false]);
+        assert!(
+            f.contains("(bvule l_0 (bvadd (bvsub ((_ sign_extend 1) x_0) ((_ zero_extend 1) x_1)) (_ bv383 9)))"),
+            "per-operand extension text: {f}"
+        );
+    }
+
+    /// Semantic pins for the value-preserving lift (z3-gated) — each query fixes
+    /// both variables and asks z3 whether the encoded guard agrees with the
+    /// mathematical truth. Regression-pins the two defects the lift replaces:
+    /// the unsigned diff guard
+    /// `i < n` was VACUOUS under the old bvule encoding (c = −1 became the
+    /// all-ones pattern), and the same-width signed diff wrapped (−255 → 1).
+    #[test]
+    fn test_guard_bv_lift_semantic_pins() {
+        use crate::hir::loop_ir::{ArithSem, CmpOp, Cond, ScalarExpr};
+        let mk_cond = |signed: bool| Cond::Cmp {
+            op: CmpOp::Le,
+            lhs: Box::new(ScalarExpr::Sub(
+                Box::new(ScalarExpr::Var(0)),
+                Box::new(ScalarExpr::Var(1)),
+                ArithSem::Wrap,
+            )),
+            rhs: Box::new(ScalarExpr::Const(BigInt::from(-1))),
+            signed, // ignored by the new encoding — kept for the IR
+        };
+        let solver = SmtSolver::new("z3");
+        if !solver.check_version() {
+            eprintln!("z3 unavailable — skipping test_guard_bv_lift_semantic_pins");
+            return;
+        }
+        // (cond, x0_pattern, x1_pattern, guard_must_be_true)
+        let unsigned = ([false, false], mk_cond(false));
+        let signed = ([true, true], mk_cond(true));
+        for ((sgn, cond), (p0, p1, want_true)) in [
+            (&unsigned, ("(_ bv0 8)", "(_ bv255 8)", true)), // 0 < 255
+            (&unsigned, ("(_ bv255 8)", "(_ bv0 8)", false)), // ¬(255 < 0)
+            (&signed, ("(_ bv128 8)", "(_ bv127 8)", true)), // −128−127 = −255 ≤ −1 (old encoding wrapped to 1 → false)
+            (&signed, ("(_ bv127 8)", "(_ bv128 8)", false)), // 255 ≤ −1 false (old encoding judged true)
+        ] {
+            let g = cond_to_smt(cond, true, &[8, 8], sgn, 2).expect("must encode");
+            // Refutation-style construction: prove "g evaluates to want_true
+            // at this pinned point" — assert its negation is unsatisfiable
+            // (consistent with verify_template_against_problem's convention).
+            let assert_g = if want_true {
+                format!("(not {g})")
+            } else {
+                g.clone()
+            };
+            let q = format!(
+                "(set-logic BV)\n(declare-const x_0 (_ BitVec 8))\n(declare-const x_1 (_ BitVec 8))\n\
+                 (assert (and (= x_0 {p0}) (= x_1 {p1})))\n(assert {assert_g})\n(check-sat)\n"
+            );
+            assert!(
+                matches!(solver.run_raw_query(&q), RawQueryOutcome::Unsat),
+                "guard must evaluate {} at ({p0}, {p1}): encoded as {g}",
+                if want_true { "true" } else { "false" }
+            );
+        }
+    }
+
+    /// End-to-end BV (z3-gated): mixed lockstep pair
+    /// `x: Int<8>, y: UInt<8>; while x ≤ 3 { x := x+1; y := y+1 }`.
+    /// Row order [Interval(x), Interval(y), Diff, Sum]; the BII is
+    /// Ix [0,4], Iy [0,4], Diff [0,0], Sum [0,8]; the independent verifier
+    /// (SMT path — the DBM fast path is gated !bv) re-confirms Verified.
+    #[test]
+    fn test_mixed_diff_bii_singleton_bv() {
+        let solver = SmtSolver::new("z3");
+        if !solver.check_version() {
+            eprintln!("z3 unavailable — skipping test_mixed_diff_bii_singleton_bv");
+            return;
+        }
+        let vars = vec![Symbol::intern("x"), Symbol::intern("y")];
+        let init = vec![LoopInstr::ConstVar(0, 0), LoopInstr::ConstVar(1, 0)];
+        let body = vec![
+            LoopInstr::TestLe(0, 3),
+            LoopInstr::AddVar(0, 1),
+            LoopInstr::AddVar(1, 1),
+        ];
+        let tpl = synthesize_bitwise_bii(
+            &solver,
+            &vars,
+            &init,
+            &body,
+            &[8, 8],
+            &[true, false],
+            512,
+            true,
+        )
+        .expect("mixed-pair BV synthesis must converge");
+        assert_eq!(
+            (tpl.rows[0].lb.clone(), tpl.rows[0].ub.clone()),
+            (BigInt::from(0), BigInt::from(4))
+        );
+        assert_eq!(
+            (tpl.rows[1].lb.clone(), tpl.rows[1].ub.clone()),
+            (BigInt::from(0), BigInt::from(4))
+        );
+        assert_eq!(
+            (tpl.rows[2].lb.clone(), tpl.rows[2].ub.clone()),
+            (BigInt::from(0), BigInt::from(0)),
+            "Diff singleton"
+        );
+        assert_eq!(
+            (tpl.rows[3].lb.clone(), tpl.rows[3].ub.clone()),
+            (BigInt::from(0), BigInt::from(8)),
+            "Sum = 2x ∈ [0,8]"
+        );
+        let problem = crate::hir::loop_ir::loop_instrs_to_loop_problem(
+            &vars,
+            &init,
+            &body,
+            &[8, 8],
+            &[true, false],
+            &[],
+            false,
+        )
+        .expect("must lower");
+        assert!(matches!(
+            verify_template_against_problem(&solver, &problem, &tpl, true),
+            VerifyOutcome::Verified
+        ));
+    }
+
+    /// End-to-end BV with a negative mixed domain (z3-gated) —
+    /// `x: Int<8> := 0; y: UInt<8> := 0; while y ≤ 99 { x := x−1; y := y+1 }`.
+    /// Head states (−k, k), k ∈ [0, 100]: Ix [−100, 0], Iy [0, 100],
+    /// Diff = −2k ∈ [−200, 0], Sum ≡ 0 (singleton). Exercises the offset
+    /// domain around a negative window AND the unsigned single-var guard
+    /// lift under BV.
+    #[test]
+    fn test_mixed_sum_diff_negative_bv() {
+        let solver = SmtSolver::new("z3");
+        if !solver.check_version() {
+            eprintln!("z3 unavailable — skipping test_mixed_sum_diff_negative_bv");
+            return;
+        }
+        let vars = vec![Symbol::intern("x"), Symbol::intern("y")];
+        let init = vec![LoopInstr::ConstVar(0, 0), LoopInstr::ConstVar(1, 0)];
+        let body = vec![
+            LoopInstr::TestLe(1, 99),
+            LoopInstr::AddVar(0, -1),
+            LoopInstr::AddVar(1, 1),
+        ];
+        let tpl = synthesize_bitwise_bii(
+            &solver,
+            &vars,
+            &init,
+            &body,
+            &[8, 8],
+            &[true, false],
+            512,
+            true,
+        )
+        .expect("negative mixed-pair BV synthesis must converge");
+        assert_eq!(
+            (tpl.rows[0].lb.clone(), tpl.rows[0].ub.clone()),
+            (BigInt::from(-100), BigInt::from(0))
+        );
+        assert_eq!(
+            (tpl.rows[1].lb.clone(), tpl.rows[1].ub.clone()),
+            (BigInt::from(0), BigInt::from(100))
+        );
+        assert_eq!(
+            (tpl.rows[2].lb.clone(), tpl.rows[2].ub.clone()),
+            (BigInt::from(-200), BigInt::from(0)),
+            "Diff = −2k"
+        );
+        assert_eq!(
+            (tpl.rows[3].lb.clone(), tpl.rows[3].ub.clone()),
+            (BigInt::from(0), BigInt::from(0)),
+            "Sum ≡ 0"
+        );
+        let problem = crate::hir::loop_ir::loop_instrs_to_loop_problem(
+            &vars,
+            &init,
+            &body,
+            &[8, 8],
+            &[true, false],
+            &[],
+            false,
+        )
+        .expect("must lower");
+        assert!(matches!(
+            verify_template_against_problem(&solver, &problem, &tpl, true),
+            VerifyOutcome::Verified
+        ));
+    }
+
+    /// Check 4: postcondition entailed by the BII → Verified.
+    /// `i := 0; while i < 6 { i := i + 1 }`, BII = [0, 6].
+    /// Exit ¬(i < 6) ∧ 0 ≤ i ≤ 6 → i = 6. Post = i ≤ 10 → entailed.
+    #[test]
+    fn test_check4_post_implied() {
+        let solver = SmtSolver::new("z3");
+        if !solver.check_version() {
+            eprintln!("z3 unavailable — skipping test_check4_post_implied");
+            return;
+        }
+        let vars = vec![Symbol::intern("i")];
+        let init = vec![LoopInstr::ConstVar(0, 0)];
+        let body = vec![LoopInstr::TestLe(0, 5), LoopInstr::AddVar(0, 1)];
+        let mut problem = crate::hir::loop_ir::loop_instrs_to_loop_problem(
+            &vars,
+            &init,
+            &body,
+            &[8],
+            &[false],
+            &[],
+            true,
+        )
+        .expect("must lower");
+        // Post: i ≤ 10 (entailed by BII [0,6])
+        problem.post = Some(Cond::Cmp {
+            op: CmpOp::Le,
+            lhs: Box::new(ScalarExpr::Var(0)),
+            rhs: Box::new(ScalarExpr::Const(BigInt::from(10))),
+            signed: false,
+        });
+        let tpl = synthesize_problem_bii(&solver, &problem, 512, false).expect("must synthesize");
+        assert!(matches!(
+            verify_template_against_problem(&solver, &problem, &tpl, false),
+            VerifyOutcome::Verified
+        ));
+    }
+
+    /// Check 4: postcondition NOT entailed by the BII → PostUnproven.
+    /// Post = i == 100 (BII [0,6] does not entail it).
+    #[test]
+    fn test_check4_post_unproven() {
+        let solver = SmtSolver::new("z3");
+        if !solver.check_version() {
+            eprintln!("z3 unavailable — skipping test_check4_post_unproven");
+            return;
+        }
+        let vars = vec![Symbol::intern("i")];
+        let init = vec![LoopInstr::ConstVar(0, 0)];
+        let body = vec![LoopInstr::TestLe(0, 5), LoopInstr::AddVar(0, 1)];
+        let mut problem = crate::hir::loop_ir::loop_instrs_to_loop_problem(
+            &vars,
+            &init,
+            &body,
+            &[8],
+            &[false],
+            &[],
+            true,
+        )
+        .expect("must lower");
+        problem.post = Some(Cond::Cmp {
+            op: CmpOp::Eq,
+            lhs: Box::new(ScalarExpr::Var(0)),
+            rhs: Box::new(ScalarExpr::Const(BigInt::from(100))),
+            signed: false,
+        });
+        let tpl = synthesize_problem_bii(&solver, &problem, 512, false).expect("must synthesize");
+        assert!(matches!(
+            verify_template_against_problem(&solver, &problem, &tpl, false),
+            VerifyOutcome::PostUnproven
+        ));
+    }
+
+    /// Check 4: post = None → skipped, does not affect the result.
+    #[test]
+    fn test_check4_post_none_skipped() {
+        let solver = SmtSolver::new("z3");
+        if !solver.check_version() {
+            eprintln!("z3 unavailable — skipping test_check4_post_none_skipped");
+            return;
+        }
+        let vars = vec![Symbol::intern("i")];
+        let init = vec![LoopInstr::ConstVar(0, 0)];
+        let body = vec![LoopInstr::TestLe(0, 5), LoopInstr::AddVar(0, 1)];
+        let problem = crate::hir::loop_ir::loop_instrs_to_loop_problem(
+            &vars,
+            &init,
+            &body,
+            &[8],
+            &[false],
+            &[],
+            true,
+        )
+        .expect("must lower");
+        assert!(problem.post.is_none());
+        let tpl = synthesize_problem_bii(&solver, &problem, 512, false).expect("must synthesize");
+        assert!(matches!(
+            verify_template_against_problem(&solver, &problem, &tpl, false),
+            VerifyOutcome::Verified
+        ));
+    }
+
+    /// DBM fast path Check 4: single-comparison guard + simple postcondition.
+    /// `i := 0; while i < 6 { i := i + 1 }`, guard is a single `i ≤ 5`.
+    /// ¬(i ≤ 5) = i ≥ 6, Post = i ≤ 10.
+    /// DBM should handle it (the negation of a single-comparison guard
+    /// stays within the difference-constraint fragment).
+    #[test]
+    fn test_dbm_check4_single_guard() {
+        let vars = vec![Symbol::intern("i")];
+        let init = vec![LoopInstr::ConstVar(0, 0)];
+        let body = vec![LoopInstr::TestLe(0, 5), LoopInstr::AddVar(0, 1)];
+        let mut problem = crate::hir::loop_ir::loop_instrs_to_loop_problem(
+            &vars,
+            &init,
+            &body,
+            &[8],
+            &[false],
+            &[],
+            true,
+        )
+        .expect("must lower");
+        problem.post = Some(Cond::Cmp {
+            op: CmpOp::Le,
+            lhs: Box::new(ScalarExpr::Var(0)),
+            rhs: Box::new(ScalarExpr::Const(BigInt::from(10))),
+            signed: false,
+        });
+        let mut tpl = BiiTemplate::new(1, &[8], &[false]);
+        tpl.rows[0].lb = BigInt::zero();
+        tpl.rows[0].ub = BigInt::from(6);
+        // The DBM fast path should prove it (negated single-comparison
+        // guard stays within the fragment).
+        let result = dbm_proves_inductiveness(&problem, &tpl);
+        assert_eq!(
+            result,
+            Some(true),
+            "DBM must prove Check 4 for single-guard loop"
+        );
     }
 }

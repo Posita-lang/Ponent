@@ -126,6 +126,11 @@ pub struct BiiLoopProblem {
     /// Saturating assignments `x_i := x_i +? c` — the template domain
     /// adds Clamp rows for these.
     pub saturates: Vec<(usize, i128)>,
+    /// Postcondition (the `Post` of ϕ₃). `None` = no postcondition
+    /// (ϕ₃ is vacuously true). Filled by the checker after
+    /// `loop_instrs_to_loop_problem` and before
+    /// `synthesize_problem_bii`.
+    pub post: Option<Cond>,
 }
 
 /// Lowering: translate a whitelisted `LoopInstr` sequence
@@ -366,8 +371,14 @@ pub(crate) fn loop_instrs_to_loop_problem(
             definedness,
             next_values: values,
         }],
-        exit_edges: vec![],
+        exit_edges: vec![TransitionEdge {
+            kind: EdgeKind::Exit,
+            guard: None, // the exit condition is ¬loop_guard, handled by ϕ₃
+            definedness: None,
+            next_values: (0..vars.len()).map(ScalarExpr::Var).collect(), // identity transition
+        }],
         saturates,
+        post: None,
     })
 }
 
@@ -728,13 +739,21 @@ mod tests {
                     ArithSem::Wrap,
                 )],
             }],
-            exit_edges: vec![],
+            exit_edges: vec![TransitionEdge {
+                kind: EdgeKind::Exit,
+                guard: None,
+                definedness: None,
+                next_values: vec![ScalarExpr::Var(0)],
+            }],
             saturates: vec![],
+            post: None,
         };
         assert_eq!(problem.vars.len(), 1);
         assert_eq!(problem.back_edges.len(), 1);
         assert_eq!(problem.back_edges[0].kind, EdgeKind::Back);
-        assert!(problem.params.is_empty() && problem.exit_edges.is_empty());
+        assert!(problem.params.is_empty() && problem.post.is_none());
+        assert_eq!(problem.exit_edges.len(), 1);
+        assert_eq!(problem.exit_edges[0].kind, EdgeKind::Exit);
     }
 
     /// Cond combination and signedness annotation.
@@ -1555,5 +1574,19 @@ mod tests {
             enumerate_verify(&problem, &tpl),
             "descending-loop template must pass enumeration"
         );
+    }
+
+    /// `loop_instrs_to_loop_problem` sets `post: None`; `exit_edges` contains one Exit edge.
+    #[test]
+    fn test_problem_post_none_and_exit_edge() {
+        let vars = vec![Symbol::intern("i")];
+        let init = vec![LoopInstr::ConstVar(0, 0)];
+        let body = vec![LoopInstr::TestLe(0, 5), LoopInstr::AddVar(0, 1)];
+        let problem = loop_instrs_to_loop_problem(&vars, &init, &body, &[8], &[false], &[], true)
+            .expect("must lower");
+        assert!(problem.post.is_none(), "lowering must set post: None");
+        assert_eq!(problem.exit_edges.len(), 1);
+        assert_eq!(problem.exit_edges[0].kind, EdgeKind::Exit);
+        assert_eq!(problem.exit_edges[0].next_values.len(), 1);
     }
 }

@@ -24,6 +24,8 @@ use crate::hir::types::{
     TypeData, TypeId,
 };
 use crate::symbol::Symbol;
+use num_bigint::BigInt;
+use num_traits::Zero;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -1472,6 +1474,26 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
         }
     }
 
+    /// Extract the loop postcondition from the current function's
+    /// `ensures` clause. Returns `Some` only when the `ensures`
+    /// expression converts to a `Cond` over the loop variables;
+    /// otherwise `None` (ϕ₃ vacuously true).
+    ///
+    /// NOTE: this is a free associated function, not a `&self` method —
+    /// `infer_loop_hints` holds `&mut self.smt_solver` via `smt` when
+    /// calling it, and a method call would borrow all of `self` and
+    /// conflict; passing `&self.guarantee_chain` keeps the borrow
+    /// field-scoped and coexists.
+    fn extract_loop_postcondition(
+        chain: &GuaranteeChain<'input>,
+        vars: &[Symbol],
+        signed: &[bool],
+    ) -> Option<crate::hir::loop_ir::Cond> {
+        let guarantee = chain.current()?;
+        let ast_expr = guarantee.ast_expr.as_ref()?;
+        ast_expr_to_cond(ast_expr, vars, signed)
+    }
+
     fn infer_loop_hints(
         &mut self,
         cond: &crate::hir::hir::HirExpr<'input>,
@@ -1636,12 +1658,20 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
             None => (&vars, &init, &instrs, &bit_widths, &signed, &[]),
         };
         let mut verify_counterexample = false;
+        // Extract the postcondition from the ensures clause (computed
+        // outside the closure to avoid borrow conflicts). Pass a
+        // field-scoped `&self.guarantee_chain` rather than a method call:
+        // `smt` holds `&mut self.smt_solver`, and a method call would
+        // borrow all of `self` and conflict.
+        let post_cond: Option<crate::hir::loop_ir::Cond> =
+            Self::extract_loop_postcondition(&self.guarantee_chain, sep_vars, sep_signed);
         // Wrap loops (`use_bv`) carry no trap
         // definedness — their arithmetic is total (`+%`/`-%`).
         let problem_path = crate::hir::loop_ir::loop_instrs_to_loop_problem(
             sep_vars, sep_init, sep_body, sep_bws, sep_signed, sep_params, !use_bv,
         )
-        .and_then(|problem| {
+        .and_then(|mut problem| {
+            problem.post = post_cond.clone();
             // Budget floor applied HERE (production caller), not inside
             // the drivers: the paper's raw count ≈ 2×4W (Theorem 5.5),
             // so 8W + 64 covers wide templates without inflating a
@@ -1682,7 +1712,8 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
                 // on check-3 failure, route this arm alongside
                 // Counterexample.)
                 crate::hir::bii::VerifyOutcome::Verified
-                | crate::hir::bii::VerifyOutcome::TrapUnproven => Some(
+                | crate::hir::bii::VerifyOutcome::TrapUnproven
+                | crate::hir::bii::VerifyOutcome::PostUnproven => Some(
                     crate::hir::bii::template_to_invariant_exprs(arena, &tpl, sep_vars),
                 ),
                 crate::hir::bii::VerifyOutcome::Counterexample => {
@@ -2163,17 +2194,43 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
             for c in candidates {
                 let mut e = String::new();
                 if !crate::hir::smt::expr_to_smt_bv(c, &mut e, &widths_map, candidate_signed) {
-                    self.reject_unverified_decreases(dec, span);
-                    return;
+                    // Candidate involves a Diff row whose bound exceeds
+                    // the variable's native bit-width (computed at the
+                    // synthesis-side value-preserving lift width).  Such a bound is
+                    // trivially true at the variable's width (the
+                    // difference is always within range), so skipping
+                    // the candidate is safe — it adds no useful
+                    // constraint to the premise.
+                    continue;
                 }
                 smt.push_str(&format!("(assert {})\n", e));
             }
             // Guard + transition (sequential SSA with intermediate vars).
-            // The loop-condition guards encode at the SAME signedness as
-            // the synthesis side (`build_refine_query` / `build_bounded_leap_query`):
-            // `Int<N>` variables compare SIGNED (`bvsle`), `UInt<N>` and
-            // unknowns UNSIGNED (`bvule`) — a `TestDiffLe` involving a
-            // signed variable compares signed.
+            // Guards encode via the value-preserving lift (same source of truth as the
+            // synthesis side in bii.rs): each operand is lifted to a
+            // signed-faithful representation, sign-extended to a common
+            // width, and compared with SIGNED predicates.  This replaces
+            // the old direct bvsle/bvule encoding which used different
+            // widths for synthesis vs. verification when operands were
+            // extended to different bit-widths.
+            // cond_to_smt / encode_cmp_bv emit positional names (x_0,
+            // x_1, …) for variables; remap them to the actual names
+            // declared in this query (i, j, …).  Sort by descending
+            // index so longer names (x_10) are replaced before shorter
+            // ones (x_1) to avoid partial-match corruption.
+            let remap_vars = |s: &str| -> String {
+                let mut out = s.to_string();
+                for idx in (0..vars.len()).rev() {
+                    let from = format!("x_{idx}");
+                    let to = vars[idx].as_str();
+                    out = out.replace(&from, &to);
+                }
+                out
+            };
+            let signed_vec: Vec<bool> = vars
+                .iter()
+                .map(|sym| signed.contains(&sym.as_str()))
+                .collect();
             let mut cur: Vec<String> = (0..vars.len())
                 .map(|i| format!("{}", vars[i].as_str()))
                 .collect();
@@ -2181,33 +2238,50 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
             for instr in body {
                 match instr {
                     crate::hir::loop_infer::LoopInstr::TestLe(i, c) => {
-                        let cmp = if signed.contains(&vars[*i].as_str()) {
-                            "bvsle"
-                        } else {
-                            "bvule"
+                        let cond = crate::hir::loop_ir::Cond::Cmp {
+                            op: crate::hir::loop_ir::CmpOp::Le,
+                            lhs: Box::new(crate::hir::loop_ir::ScalarExpr::Var(*i)),
+                            rhs: Box::new(crate::hir::loop_ir::ScalarExpr::Const(BigInt::from(*c))),
+                            signed: signed_vec[*i],
                         };
-                        smt.push_str(&format!(
-                            "(assert ({} {} {}))\n",
-                            cmp,
-                            vars[*i].as_str(),
-                            crate::hir::smt::bv_const_pub(*c, widths[*i])
-                        ));
+                        match crate::hir::bii::cond_to_smt(
+                            &cond,
+                            true,
+                            &widths,
+                            &signed_vec,
+                            vars.len(),
+                        ) {
+                            Some(g) => smt.push_str(&format!("(assert {})\n", remap_vars(&g))),
+                            None => {
+                                self.reject_unverified_decreases(dec, span);
+                                return;
+                            }
+                        }
                     }
                     crate::hir::loop_infer::LoopInstr::TestDiffLe(i, j, c) => {
-                        let cmp = if signed.contains(&vars[*i].as_str())
-                            || signed.contains(&vars[*j].as_str())
-                        {
-                            "bvsle"
-                        } else {
-                            "bvule"
+                        let cond = crate::hir::loop_ir::Cond::Cmp {
+                            op: crate::hir::loop_ir::CmpOp::Le,
+                            lhs: Box::new(crate::hir::loop_ir::ScalarExpr::Sub(
+                                Box::new(crate::hir::loop_ir::ScalarExpr::Var(*i)),
+                                Box::new(crate::hir::loop_ir::ScalarExpr::Var(*j)),
+                                crate::hir::loop_ir::ArithSem::Wrap,
+                            )),
+                            rhs: Box::new(crate::hir::loop_ir::ScalarExpr::Const(BigInt::from(*c))),
+                            signed: signed_vec[*i] || signed_vec[*j],
                         };
-                        smt.push_str(&format!(
-                            "(assert ({} (bvsub {} {}) {}))\n",
-                            cmp,
-                            vars[*i].as_str(),
-                            vars[*j].as_str(),
-                            crate::hir::smt::bv_const_pub(*c, widths[*i].max(widths[*j]))
-                        ));
+                        match crate::hir::bii::cond_to_smt(
+                            &cond,
+                            true,
+                            &widths,
+                            &signed_vec,
+                            vars.len(),
+                        ) {
+                            Some(g) => smt.push_str(&format!("(assert {})\n", remap_vars(&g))),
+                            None => {
+                                self.reject_unverified_decreases(dec, span);
+                                return;
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -2283,7 +2357,27 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
             match smt_solver.run_raw_query(&smt) {
                 crate::hir::smt::RawQueryOutcome::Unsat => { /* strictly decreasing — verified */
                 }
-                _ => self.reject_unverified_decreases(dec, span),
+                crate::hir::smt::RawQueryOutcome::Sat(m) => {
+                    eprintln!(
+                        "[verify_loop_decreases BV] SAT witness found — \
+                         decreases `{:?}` unprovable: {}",
+                        dec,
+                        &m[..m.len().min(512)]
+                    );
+                    self.reject_unverified_decreases(dec, span);
+                }
+                crate::hir::smt::RawQueryOutcome::Unknown => {
+                    eprintln!(
+                        "[verify_loop_decreases BV] z3 returned unknown — \
+                         decreases `{:?}` inconclusive (fail closed)",
+                        dec
+                    );
+                    self.reject_unverified_decreases(dec, span);
+                }
+                crate::hir::smt::RawQueryOutcome::Error(e) => {
+                    eprintln!("[verify_loop_decreases BV] SMT error: {}", e);
+                    self.reject_unverified_decreases(dec, span);
+                }
             }
             return;
         }
@@ -2386,7 +2480,27 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
             .get_or_insert_with(|| crate::hir::smt::SmtSolver::new("z3"));
         match smt_solver.run_raw_query(&smt) {
             crate::hir::smt::RawQueryOutcome::Unsat => { /* strictly decreasing — verified */ }
-            _ => self.reject_unverified_decreases(dec, span),
+            crate::hir::smt::RawQueryOutcome::Sat(m) => {
+                eprintln!(
+                    "[verify_loop_decreases LIA] SAT witness found — \
+                     decreases `{:?}` unprovable: {}",
+                    dec,
+                    &m[..m.len().min(512)]
+                );
+                self.reject_unverified_decreases(dec, span);
+            }
+            crate::hir::smt::RawQueryOutcome::Unknown => {
+                eprintln!(
+                    "[verify_loop_decreases LIA] z3 returned unknown — \
+                     decreases `{:?}` inconclusive (fail closed)",
+                    dec
+                );
+                self.reject_unverified_decreases(dec, span);
+            }
+            crate::hir::smt::RawQueryOutcome::Error(e) => {
+                eprintln!("[verify_loop_decreases LIA] SMT error: {}", e);
+                self.reject_unverified_decreases(dec, span);
+            }
         }
     }
 
@@ -10600,6 +10714,170 @@ fn contains_stmt_runtime_ident<'input>(
             contains_stmt_runtime_ident(inner, ghost_var_scopes, runtime_var_scopes, local_params)
         }
         _ => true,
+    }
+}
+
+/// Try to convert an AST expression into a loop-IR `Cond`.
+/// Only simple comparisons are handled (==, !=, <, >, <=, >=, &&, ||, !
+/// between variables/constants). Returns `None` if the expression
+/// references a non-loop variable (e.g. `codomain`).
+fn ast_expr_to_cond(
+    expr: &crate::ast::Expr,
+    vars: &[Symbol],
+    signed: &[bool],
+) -> Option<crate::hir::loop_ir::Cond> {
+    use crate::hir::loop_ir::{CmpOp, Cond};
+
+    match expr {
+        // ── Boolean literals ──────────────────────────────────────
+        // `true` / `false` map directly to Cond::True / Cond::False.
+        crate::ast::Expr::Literal(crate::ast::Literal::Bool(true), _) => Some(Cond::True),
+        crate::ast::Expr::Literal(crate::ast::Literal::Bool(false), _) => Some(Cond::False),
+
+        // ── Type-annotated expression: strip annotation, recurse ──
+        // `(expr: Type)` carries no semantic effect on the value;
+        // peel the annotation and convert the inner expression.
+        crate::ast::Expr::TypeAnnotated { expr: inner, .. } => {
+            ast_expr_to_cond(inner, vars, signed)
+        }
+
+        // ── Binary operators ──────────────────────────────────────
+        crate::ast::Expr::BinaryOp {
+            left, op, right, ..
+        } => match op {
+            crate::ast::BinOp::And => {
+                let l = ast_expr_to_cond(left, vars, signed)?;
+                let r = ast_expr_to_cond(right, vars, signed)?;
+                Some(Cond::And(Box::new(l), Box::new(r)))
+            }
+            crate::ast::BinOp::Or => {
+                let l = ast_expr_to_cond(left, vars, signed)?;
+                let r = ast_expr_to_cond(right, vars, signed)?;
+                Some(Cond::Or(Box::new(l), Box::new(r)))
+            }
+            crate::ast::BinOp::Eq
+            | crate::ast::BinOp::Neq
+            | crate::ast::BinOp::Lt
+            | crate::ast::BinOp::Gt
+            | crate::ast::BinOp::Le
+            | crate::ast::BinOp::Ge => {
+                let lhs = ast_expr_to_scalar(left, vars)?;
+                let rhs = ast_expr_to_scalar(right, vars)?;
+                let cmp_op = match op {
+                    crate::ast::BinOp::Eq => CmpOp::Eq,
+                    crate::ast::BinOp::Neq => CmpOp::Neq,
+                    crate::ast::BinOp::Lt => CmpOp::Lt,
+                    crate::ast::BinOp::Gt => CmpOp::Gt,
+                    crate::ast::BinOp::Le => CmpOp::Le,
+                    crate::ast::BinOp::Ge => CmpOp::Ge,
+                    _ => unreachable!(),
+                };
+                let s = scalar_uses_signed(&lhs, signed) || scalar_uses_signed(&rhs, signed);
+                Some(Cond::Cmp {
+                    op: cmp_op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    signed: s,
+                })
+            }
+            _ => None,
+        },
+
+        // ── Unary NOT ─────────────────────────────────────────────
+        crate::ast::Expr::UnaryOp {
+            op: crate::ast::UnaryOp::Not,
+            expr: inner,
+            ..
+        } => {
+            let c = ast_expr_to_cond(inner, vars, signed)?;
+            Some(Cond::Not(Box::new(c)))
+        }
+
+        _ => None,
+    }
+}
+
+/// Try to convert an AST expression into a loop-IR `ScalarExpr`.
+/// Handles: identifiers (loop variables), integer literals, Add, Sub,
+/// unary negation, and type-annotated expressions.
+/// Returns `None` for any form outside the linear subset.
+fn ast_expr_to_scalar(
+    expr: &crate::ast::Expr,
+    vars: &[Symbol],
+) -> Option<crate::hir::loop_ir::ScalarExpr> {
+    use crate::hir::loop_ir::{ArithSem, ScalarExpr};
+
+    let idx = |s: Symbol| -> Option<usize> { vars.iter().position(|v| *v == s) };
+
+    match expr {
+        // Loop variable reference
+        crate::ast::Expr::Ident(name, _) => Some(ScalarExpr::Var(idx(*name)?)),
+
+        // Integer literal
+        crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => {
+            Some(ScalarExpr::Const(num_bigint::BigInt::from(v.to_i128()?)))
+        }
+
+        // Addition: a + b
+        crate::ast::Expr::BinaryOp {
+            left,
+            op: crate::ast::BinOp::Add,
+            right,
+            ..
+        } => {
+            let l = ast_expr_to_scalar(left, vars)?;
+            let r = ast_expr_to_scalar(right, vars)?;
+            Some(ScalarExpr::Add(Box::new(l), Box::new(r), ArithSem::Wrap))
+        }
+
+        // Subtraction: a - b
+        crate::ast::Expr::BinaryOp {
+            left,
+            op: crate::ast::BinOp::Sub,
+            right,
+            ..
+        } => {
+            let l = ast_expr_to_scalar(left, vars)?;
+            let r = ast_expr_to_scalar(right, vars)?;
+            Some(ScalarExpr::Sub(Box::new(l), Box::new(r), ArithSem::Wrap))
+        }
+
+        // ── Unary negation: -x → 0 - x ──────────────────────────
+        // The loop IR has no unary neg node; encode as Sub(0, x).
+        crate::ast::Expr::UnaryOp {
+            op: crate::ast::UnaryOp::Neg,
+            expr: inner,
+            ..
+        } => {
+            let inner_s = ast_expr_to_scalar(inner, vars)?;
+            Some(ScalarExpr::Sub(
+                Box::new(ScalarExpr::Const(num_bigint::BigInt::zero())),
+                Box::new(inner_s),
+                ArithSem::Wrap,
+            ))
+        }
+
+        // ── Type-annotated expression: strip annotation, recurse ──
+        // `(x: Int<32>)` carries no semantic effect on the value;
+        // peel the annotation and convert the inner expression.
+        crate::ast::Expr::TypeAnnotated { expr: inner, .. } => ast_expr_to_scalar(inner, vars),
+
+        _ => None,
+    }
+}
+
+/// Whether a `ScalarExpr` involves a signed variable.
+fn scalar_uses_signed(e: &crate::hir::loop_ir::ScalarExpr, signed: &[bool]) -> bool {
+    match e {
+        crate::hir::loop_ir::ScalarExpr::Var(i) => signed.get(*i).copied().unwrap_or(false),
+        crate::hir::loop_ir::ScalarExpr::Const(_) => false,
+        crate::hir::loop_ir::ScalarExpr::Add(l, r, _)
+        | crate::hir::loop_ir::ScalarExpr::Sub(l, r, _) => {
+            scalar_uses_signed(l, signed) || scalar_uses_signed(r, signed)
+        }
+        crate::hir::loop_ir::ScalarExpr::Ite(_, t, f) => {
+            scalar_uses_signed(t, signed) || scalar_uses_signed(f, signed)
+        }
     }
 }
 
