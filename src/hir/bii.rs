@@ -2069,7 +2069,7 @@ fn encode_edge_inductiveness(
     Some(format!("(=> (and {ante_cond} {next_cond}) {a_xp})"))
 }
 
-/// BiiLoopProblem `Refine` query (design doc §5): one ∀ for Init plus one
+/// BiiLoopProblem `Refine` query : one ∀ for Init plus one
 /// ∀ per back-edge implication. Returns None on an encoding failure
 /// (fail-closed).
 fn build_refine_query_problem(
@@ -3226,7 +3226,7 @@ pub(crate) enum VerifyOutcome {
     Inconclusive,
 }
 
-/// Independent template verification (design doc §7): returns
+/// Independent template verification : returns
 /// `VerifyOutcome::Verified` only if every check holds. Does not trust the
 /// synthesizer's internal state — re-verify before emitting a hint:
 ///
