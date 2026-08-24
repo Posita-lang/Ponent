@@ -84,7 +84,7 @@
 //!
 //! - **Solver-call counting**: the query budget counts every raw
 //!   `run_raw_query` invocation, including the separate `(get-model)`
-//!   round-trip that follows each SAT outcome. The paper's Theorem 5.3 /
+//!   round-trip that follows each SAT outcome. Theorem 5.3 of Zuo et al. (2026) /
 //!   5.5 bounds (`2W` / `4W`) count high-level `Refine` queries, so the
 //!   raw count is a constant factor (~2×) above the paper's bound; the
 //!   budget parameter must be sized accordingly (the checker passes a
@@ -169,6 +169,20 @@ pub(crate) enum RowKind {
     /// constrains the clamped value: `l ≤ clamp(x_i + c) ≤ u`; the
     /// SMT encoding uses an `ite` for the clamp (piecewise).
     Clamp(usize, i128),
+}
+
+/// Template row-set level (Zuo et al. 2026, §4.2): how rich the template domain is.
+/// `Interval` = single-variable rows only; `Octagon` adds the
+/// difference/sum pairs; `SparsePoly` (the default) further adds the
+/// sparse template-polyhedra Support3 rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TemplateLevel {
+    /// Interval rows only.
+    Interval,
+    /// Interval + octagon Diff/Sum rows.
+    Octagon,
+    /// Interval + octagon + sparse Support3 rows (the full domain).
+    SparsePoly,
 }
 
 /// A variable's full value range at width `bw`: signed `[−2^(bw−1), 2^(bw−1)−1]`,
@@ -289,9 +303,25 @@ impl BiiTemplate {
     /// (per-operand `ext_operand`), so the offset-domain comparison is
     /// faithful for mixtures too.
     pub(crate) fn new(n_vars: usize, bit_widths: &[u8], signed: &[bool]) -> BiiTemplate {
-        Self::build(n_vars, bit_widths, signed)
+        Self::with_level(n_vars, bit_widths, signed, TemplateLevel::SparsePoly)
     }
-    fn build(n_vars: usize, bit_widths: &[u8], signed: &[bool]) -> BiiTemplate {
+
+    /// Build the template with an explicit row-set level
+    /// (Zuo et al. 2026, §4.2): `Interval` / `Octagon` / `SparsePoly` (default).
+    pub(crate) fn with_level(
+        n_vars: usize,
+        bit_widths: &[u8],
+        signed: &[bool],
+        level: TemplateLevel,
+    ) -> BiiTemplate {
+        Self::build(n_vars, bit_widths, signed, level)
+    }
+    fn build(
+        n_vars: usize,
+        bit_widths: &[u8],
+        signed: &[bool],
+        level: TemplateLevel,
+    ) -> BiiTemplate {
         let bw_of = |v: usize| bit_widths.get(v).copied().unwrap_or(64);
         let signed_of = |v: usize| signed.get(v).copied().unwrap_or(false);
         let mk = |kind: RowKind, bw: u8, row_signed: bool| -> BiiRow {
@@ -313,33 +343,38 @@ impl BiiTemplate {
         // Octagon difference rows `x_i − x_j` (i < j): uniform pairs keep
         // the exact symmetric tops `[−m, m]`; mixed pairs get their exact
         // ASYMMETRIC tops from `full_range`.
-        for i in 0..n_vars {
-            for j in (i + 1)..n_vars {
-                let bw = bw_of(i).max(bw_of(j));
-                rows.push(mk(RowKind::Diff(i, j), bw, signed_of(i) || signed_of(j)));
+        if matches!(level, TemplateLevel::Octagon | TemplateLevel::SparsePoly) {
+            for i in 0..n_vars {
+                for j in (i + 1)..n_vars {
+                    let bw = bw_of(i).max(bw_of(j));
+                    rows.push(mk(RowKind::Diff(i, j), bw, signed_of(i) || signed_of(j)));
+                }
             }
-        }
-        // Octagon sum rows `x_i + x_j` (i < j); uniform tops `[0, 2m]` /
-        // signed `[−2^bw, 2^bw−2]`; mixed tops from `full_range`.
-        for i in 0..n_vars {
-            for j in (i + 1)..n_vars {
-                let bw = bw_of(i).max(bw_of(j));
-                rows.push(mk(RowKind::Sum(i, j), bw, signed_of(i) || signed_of(j)));
+            // Octagon sum rows `x_i + x_j` (i < j); uniform tops `[0, 2m]` /
+            // signed `[−2^bw, 2^bw−2]`; mixed tops from `full_range`.
+            for i in 0..n_vars {
+                for j in (i + 1)..n_vars {
+                    let bw = bw_of(i).max(bw_of(j));
+                    rows.push(mk(RowKind::Sum(i, j), bw, signed_of(i) || signed_of(j)));
+                }
             }
         }
         // Sparse template-polyhedra rows `x_i + s_j·x_j + s_k·x_k`
         // (i < j < k), all four sign combinations.
-        for i in 0..n_vars {
-            for j in (i + 1)..n_vars {
-                for k in (j + 1)..n_vars {
-                    let si = signed_of(i);
-                    let bw = bw_of(i).max(bw_of(j)).max(bw_of(k));
-                    for (sj, sk) in [(true, true), (true, false), (false, true), (false, false)] {
-                        rows.push(mk(
-                            RowKind::Support3(i, j, k, sj, sk),
-                            bw,
-                            si || signed_of(j) || signed_of(k),
-                        ));
+        if matches!(level, TemplateLevel::SparsePoly) {
+            for i in 0..n_vars {
+                for j in (i + 1)..n_vars {
+                    for k in (j + 1)..n_vars {
+                        let si = signed_of(i);
+                        let bw = bw_of(i).max(bw_of(j)).max(bw_of(k));
+                        for (sj, sk) in [(true, true), (true, false), (false, true), (false, false)]
+                        {
+                            rows.push(mk(
+                                RowKind::Support3(i, j, k, sj, sk),
+                                bw,
+                                si || signed_of(j) || signed_of(k),
+                            ));
+                        }
                     }
                 }
             }
@@ -355,7 +390,7 @@ impl BiiTemplate {
         signed: &[bool],
         saturates: &[(usize, i128)],
     ) -> BiiTemplate {
-        let mut tpl = Self::build(n_vars, bit_widths, signed);
+        let mut tpl = Self::build(n_vars, bit_widths, signed, TemplateLevel::SparsePoly);
         for &(i, c) in saturates {
             if i >= n_vars {
                 continue; // defensive: saturates reference loop variables.
@@ -521,7 +556,11 @@ impl BitPositions {
 /// bits set). Rows whose current bound is negative (octagon `Diff` rows
 /// with a negative lower bound) use offset encoding so bit semantics
 /// remain meaningful; rows already non-negative use direct bit ops.
-fn propose_bitwise(cur: &BiiTemplate, pos: &BitPositions) -> Vec<BiiTemplate> {
+fn propose_bitwise(
+    cur: &BiiTemplate,
+    pos: &BitPositions,
+    limits: &BoundaryLimits,
+) -> Vec<BiiTemplate> {
     let mut out = Vec::new();
     let one = BigInt::one();
     for (idx, row) in cur.rows.iter().enumerate() {
@@ -578,12 +617,17 @@ fn propose_bitwise(cur: &BiiTemplate, pos: &BitPositions) -> Vec<BiiTemplate> {
                 // true signed value (monotone with the bit pattern).
                 let new_lb = new_enc_lb - &shift;
                 // `<=` admits singleton candidates (`new_lb == row.ub`):
-                // the paper's Propose (Algorithm 4) only requires the
+                // Propose (Algorithm 4) of Zuo et al. (2026) only requires the
                 // proposed bound to be a valid bit hypothesis, and the
                 // BII can be a singleton interval (Table 2 iterates
                 // `[101, 110]` → `[101, 101]`). Rejecting the equality
                 // case made the search stall on width-1 rows.
-                if new_lb <= row.ub {
+                //
+                // BoundaryLimits pruning: if the proposed lower bound
+                // already exceeds the maximum possible optimal lower
+                // bound `limits.lb[idx]`, it cannot be part of the BII
+                // and is pruned before issuing a solver query.
+                if new_lb <= row.ub && limits.lower_candidate_feasible(idx, &new_lb) {
                     out.push(cur.with_row(idx, new_lb, row.ub.clone()));
                 }
             }
@@ -631,7 +675,12 @@ fn propose_bitwise(cur: &BiiTemplate, pos: &BitPositions) -> Vec<BiiTemplate> {
                 let new_ub = new_enc_ub - &shift;
                 // `>=` admits singleton candidates — see the lower-bound
                 // branch above.
-                if new_ub >= row.lb {
+                //
+                // BoundaryLimits pruning: if the proposed upper bound
+                // already falls below the minimum possible optimal upper
+                // bound `limits.ub[idx]`, it cannot be part of the BII
+                // and is pruned before issuing a solver query.
+                if new_ub >= row.lb && limits.upper_candidate_feasible(idx, &new_ub) {
                     out.push(cur.with_row(idx, row.lb.clone(), new_ub));
                 }
             }
@@ -709,6 +758,22 @@ impl BoundaryLimits {
             }
         }
     }
+
+    /// Whether a lower-bound candidate can still contain the optimal lower
+    /// bound. Zuo et al. 2026, §5.2: the optimum satisfies `l* ≤ limits.lb[idx]`, so
+    /// a proposed `new_lb` above `limits.lb[idx]` cannot be part of the BII
+    /// search region and is pruned before issuing a solver query.
+    fn lower_candidate_feasible(&self, idx: usize, new_lb: &BigInt) -> bool {
+        *new_lb <= self.lb[idx]
+    }
+
+    /// Whether an upper-bound candidate can still contain the optimal upper
+    /// bound. Zuo et al. 2026, §5.2: the optimum satisfies `u* ≥ limits.ub[idx]`, so
+    /// a proposed `new_ub` below `limits.ub[idx]` cannot be part of the BII
+    /// search region and is pruned before issuing a solver query.
+    fn upper_candidate_feasible(&self, idx: usize, new_ub: &BigInt) -> bool {
+        *new_ub >= self.ub[idx]
+    }
 }
 
 /// Synthesize the BII with the bitwise greedy strategy (Algorithm 4) and
@@ -758,7 +823,7 @@ pub(crate) fn synthesize_bitwise_bii(
             // Budget exhausted: `cur` is inductive by construction — every
             // adopted witness passed the ∃∀ query carrying BOTH the Init and
             // the Inductiveness obligation. Return the PARTIAL invariant (the
-            // paper's any-time property, §4 remark after Algorithm 2); `None`
+            // any-time property of Zuo et al. (2026), §4 remark after Algorithm 2); `None`
             // only when nothing was adopted (the result would be the
             // uninformative ⊤).
             return if adopted { Some(cur) } else { None };
@@ -769,18 +834,37 @@ pub(crate) fn synthesize_bitwise_bii(
         }
         prev_unsat = false;
 
-        let candidates = propose_bitwise(&cur, &pos);
+        let candidates = propose_bitwise(&cur, &pos, &limits);
         if candidates.is_empty() {
             // EXHAUSTED pointers (every bit passed — the true
             // termination) vs WINDOW-INVALID proposals: an empty
             // candidate set can mean bits remain whose hypotheses are
             // window-invalid (every candidate was filtered by the l ≤ u
-            // pre-check). The paper's Propose emits ALL bit hypotheses
+            // pre-check). Propose of Zuo et al. (2026) emits ALL bit hypotheses
             // and lets the SOLVER reject impossible ones (the l ≤ u
             // conjunct makes the disjunct trivially false → UNSAT →
             // pointers advance, Lemma 5.2); the Rust pre-filter
             // short-circuits that path, so advance while any pointer is
             // live, return only when every position is exhausted.
+            //
+            // Candidates can be empty for three reasons:
+            //
+            // 1. every bit position has already been exhausted;
+            // 2. every generated bit hypothesis is window-invalid (`l > u`);
+            // 3. every generated bit hypothesis was pruned by BoundaryLimits.
+            //
+            // In case 3, advancement is still sound:
+            //
+            // - a pruned lower-bound hypothesis has `new_lb > limits.lb[idx]`,
+            //   so even the smallest value with this bit set is too large;
+            //   the corresponding BII bit must be 0;
+            //
+            // - a pruned upper-bound hypothesis has `new_ub < limits.ub[idx]`,
+            //   so even the largest value with this bit cleared is too small;
+            //   the corresponding BII bit must be 1.
+            //
+            // Therefore passing the current positions preserves Lemma 5.2's
+            // bit-preservation and progress argument.
             if pos.lpos.iter().chain(pos.upos.iter()).all(|&p| p < 0) {
                 return Some(cur); // every bit position passed — BII reached.
             }
@@ -2173,6 +2257,26 @@ fn build_refine_query_problem(
         smt.push_str(&format!(") {imp}))\n"));
     }
 
+    // Property Strengthening (Yao et al., "Demystifying...", §IV-A):
+    // ∀X. (A'(X) ∧ ¬G(X)) ⇒ Post(X)
+    if let Some(post) = &problem.post {
+        let post_s = cond_to_smt(post, bv, bws, &signed_all, vars_len)?;
+        let g_s = cond_to_smt(&problem.loop_guard, bv, bws, &signed_all, vars_len)?;
+        let a_x = template_formula(rows, vars_len, false, bv, bws, &signed_all);
+
+        smt.push_str("(assert (forall (");
+        for i in 0..vars_len {
+            smt.push_str(&format!("(x_{i} {}) ", sort(bws[i] as u32)));
+        }
+        for (j, p) in problem.params.iter().enumerate() {
+            smt.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
+        }
+        smt.push_str(&format!(
+            ") (=> (and {} (not {})) {})))\n",
+            a_x, g_s, post_s
+        ));
+    }
+
     smt.push_str("(check-sat)\n");
     if get_model {
         smt.push_str("(get-model)\n");
@@ -2257,7 +2361,7 @@ fn build_bounded_leap_query_problem(
         smt.push_str(&format!(" ({} l_{r} u_{r})", rle));
     }
     smt.push_str("))\n");
-    // The paper's `A′ ⊏ A` conjunct (Algorithm 5) — the strict-bound
+    // `A′ ⊏ A` conjunct (Algorithm 5) of Zuo et al. (2026) — the strict-bound
     // disjunction excludes the trivial witness A' = A (Theorem 5.5).
     smt.push_str("(assert (or");
     for (r, row) in rows.iter().enumerate() {
@@ -2317,6 +2421,26 @@ fn build_bounded_leap_query_problem(
         smt.push_str(&format!("(xp_{i} {}) ", sort(bws[i] as u32)));
     }
     smt.push_str(&format!(") {body}))\n"));
+
+    // Property Strengthening (Yao et al., "Demystifying...", §IV-A):
+    // ∀X. (A'(X) ∧ ¬G(X)) ⇒ Post(X)
+    if let Some(post) = &problem.post {
+        let post_s = cond_to_smt(post, bv, bws, &signed_all, vars_len)?;
+        let g_s = cond_to_smt(&problem.loop_guard, bv, bws, &signed_all, vars_len)?;
+        let a_x = template_formula(rows, vars_len, false, bv, bws, &signed_all);
+
+        smt.push_str("(assert (forall (");
+        for i in 0..vars_len {
+            smt.push_str(&format!("(x_{i} {}) ", sort(bws[i] as u32)));
+        }
+        for (j, p) in problem.params.iter().enumerate() {
+            smt.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
+        }
+        smt.push_str(&format!(
+            ") (=> (and {} (not {})) {})))\n",
+            a_x, g_s, post_s
+        ));
+    }
 
     smt.push_str("(check-sat)\n");
     if get_model {
@@ -2380,34 +2504,62 @@ pub(crate) fn synthesize_problem_bii(
     // Any-time partial invariant: whether at least one refinement was
     // adopted (see the budget-exhaustion return below).
     let mut adopted = false;
+    // Adaptive leap cooldown: when the solver struggles on the bounded-leap
+    // query (unknown/error), back off to the bitwise search for a few
+    // iterations instead of thrashing — the leap is retried after the
+    // cooldown expires.
+    let mut leap_cooldown = 0;
 
     loop {
         if calls >= max_queries {
             // Budget exhausted: `cur` is inductive by construction — every
             // adopted witness passed the ∃∀ query carrying BOTH the Init and
             // the Inductiveness obligation. Return the PARTIAL invariant (the
-            // paper's any-time property, §4 remark after Algorithm 2); `None`
+            // any-time property of Zuo et al. (2026), §4 remark after Algorithm 2); `None`
             // only when nothing was adopted (the result would be the
             // uninformative ⊤).
             return if adopted { Some(cur) } else { None };
         }
         if prev_unsat {
             pos.advance();
+            // Each standard UNSAT tick decays the cooldown.
+            if leap_cooldown > 0 {
+                leap_cooldown -= 1;
+            }
         }
         prev_unsat = false;
 
-        let candidates = propose_bitwise(&cur, &pos);
+        let candidates = propose_bitwise(&cur, &pos, &limits);
         if candidates.is_empty() {
             // EXHAUSTED pointers (every bit passed — the true
             // termination) vs WINDOW-INVALID proposals: an empty
             // candidate set can mean bits remain whose hypotheses are
             // window-invalid (every candidate was filtered by the l ≤ u
-            // pre-check). The paper's Propose emits ALL bit hypotheses
+            // pre-check). Propose of Zuo et al. (2026) emits ALL bit hypotheses
             // and lets the SOLVER reject impossible ones (the l ≤ u
             // conjunct makes the disjunct trivially false → UNSAT →
             // pointers advance, Lemma 5.2); the Rust pre-filter
             // short-circuits that path, so advance while any pointer is
             // live, return only when every position is exhausted.
+            //
+            // Candidates can be empty for three reasons:
+            //
+            // 1. every bit position has already been exhausted;
+            // 2. every generated bit hypothesis is window-invalid (`l > u`);
+            // 3. every generated bit hypothesis was pruned by BoundaryLimits.
+            //
+            // In case 3, advancement is still sound:
+            //
+            // - a pruned lower-bound hypothesis has `new_lb > limits.lb[idx]`,
+            //   so even the smallest value with this bit set is too large;
+            //   the corresponding BII bit must be 0;
+            //
+            // - a pruned upper-bound hypothesis has `new_ub < limits.ub[idx]`,
+            //   so even the largest value with this bit cleared is too small;
+            //   the corresponding BII bit must be 1.
+            //
+            // Therefore passing the current positions preserves Lemma 5.2's
+            // bit-preservation and progress argument.
             if pos.lpos.iter().chain(pos.upos.iter()).all(|&p| p < 0) {
                 return Some(cur); // every bit position passed — BII reached.
             }
@@ -2424,7 +2576,10 @@ pub(crate) fn synthesize_problem_bii(
             RawQueryOutcome::Unsat => {
                 prev_unsat = true;
                 limits.prune_unsat(&cur, &candidates);
-                if limits.is_active() {
+                // Only attempt the bounded leap once the cooldown has
+                // expired (a struggling solver on the leap query backs
+                // off to the bitwise search instead of thrashing).
+                if limits.is_active() && leap_cooldown == 0 {
                     if calls >= max_queries {
                         return if adopted { Some(cur) } else { None };
                     }
@@ -2471,7 +2626,10 @@ pub(crate) fn synthesize_problem_bii(
                             }
                         }
                         RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => {
-                            return if adopted { Some(cur) } else { None };
+                            // The solver struggles on the leap query —
+                            // activate the cooldown and back off to the
+                            // bitwise search instead of returning early.
+                            leap_cooldown = 5;
                         }
                     }
                 }
@@ -2544,7 +2702,7 @@ const DBM_VERIFY_MAX_PATHS: usize = 16;
 /// founder's bifurcation).
 ///
 /// The converse is NOT trusted: real-domain closure can miss integer
-/// tightenings (paper §V.D), so a satisfiable query might be a
+/// tightenings (Zuo et al. 2026, §V.D), so a satisfiable query might be a
 /// fabricated model. `Some(false)` therefore only means "fall back to
 /// the SMT verifier for the final verdict" — never a direct
 /// `Counterexample` report.
@@ -2556,7 +2714,7 @@ const DBM_VERIFY_MAX_PATHS: usize = 16;
 /// caller falls back to the SMT verifier unchanged.
 ///
 /// Every closure here runs `ClosureMode::IntegerExact` (the
-/// Harvey–Stuckey closed-and-rounded fixpoint, paper §V.D). This
+/// Harvey–Stuckey closed-and-rounded fixpoint, Zuo et al. 2026, §V.D). This
 /// verifier reasons over INTEGERS by construction (the fast path is
 /// gated `!bv` — LIA mathematical-integer semantics — over
 /// `Int<N>`/`UInt<N>` variables), so the integer-only tightening is
@@ -2607,7 +2765,7 @@ fn dbm_proves_inductiveness(
     };
     // One half-bound of row r as a difference edge `node_a − node_b ≤ c`.
     // `upper` picks `f ≤ ub`; else `f ≥ lb` (encoded as `−f ≤ −lb`).
-    // Node selection follows the paper's Figure 5 translation.
+    // Node selection follows Figure 5 translation of Zuo et al. (2026).
     let row_half = |row: &BiiRow, upper: bool, primed: bool| -> Option<(usize, usize, i128)> {
         let lb = row.lb.to_i128()?;
         let ub = row.ub.to_i128()?;
@@ -2736,7 +2894,7 @@ fn dbm_proves_inductiveness(
             Vec<crate::hir::loop_ir::Cond>,
             Vec<crate::hir::loop_ir::ScalarExpr>,
         )> = Vec::new();
-        if !expand_if_paths(&edge.next_values, &base_conds, &mut paths) {
+        if !expand_if_paths(&edge.next_values, &base_conds, &mut paths, &problem.vars) {
             return None; // too many paths / nested shape — fallback
         }
         for (conds, values) in &paths {
@@ -3133,12 +3291,15 @@ fn next_value_edges(
         _ => false, // multi-variable or |coef| ≠ 1 — outside the fragment
     }
 }
-/// Expand the top-level `Ite`s of the per-variable next-values into
-/// explicit paths: each path carries the branch conditions (the
-/// else-arm as `Not(cond)` — negation happens at the `Cmp` level in
-/// `cond_to_edges`) and the branch-selected, Ite-free next-values.
-/// Nested Ites recurse. Returns `false` when the path count would
-/// exceed `DBM_VERIFY_MAX_PATHS` (fail-closed to the SMT verifier).
+/// Expand the top-level `Ite`s and saturating assignments of the
+/// per-variable next-values into explicit paths: each path carries the
+/// branch conditions (the else-arm as `Not(cond)` — negation happens at
+/// the `Cmp` level in `cond_to_edges`) and the branch-selected, Ite-free
+/// next-values. Nested Ites recurse. A saturating `Add`/`Sub`
+/// (`ArithSem::Saturate`) expands into three linear paths (overflow to
+/// `max`, underflow to `min`, and the in-range successor). Returns
+/// `false` when the path count would exceed `DBM_VERIFY_MAX_PATHS`
+/// (fail-closed to the SMT verifier).
 fn expand_if_paths(
     values: &[crate::hir::loop_ir::ScalarExpr],
     conds: &[crate::hir::loop_ir::Cond],
@@ -3146,15 +3307,26 @@ fn expand_if_paths(
         Vec<crate::hir::loop_ir::Cond>,
         Vec<crate::hir::loop_ir::ScalarExpr>,
     )>,
+    vars: &[crate::hir::loop_ir::BiiVar],
 ) -> bool {
-    use crate::hir::loop_ir::ScalarExpr as E;
+    use crate::hir::loop_ir::{ArithSem, ScalarExpr as E};
+    use num_bigint::BigInt;
+
     let mut split_at = None;
+    let mut is_saturate = false;
+
     for (i, v) in values.iter().enumerate() {
         if matches!(v, E::Ite(..)) {
             split_at = Some(i);
             break;
         }
+        if let E::Add(_, _, ArithSem::Saturate) | E::Sub(_, _, ArithSem::Saturate) = v {
+            split_at = Some(i);
+            is_saturate = true;
+            break;
+        }
     }
+
     let Some(i) = split_at else {
         if out.len() >= DBM_VERIFY_MAX_PATHS {
             return false;
@@ -3162,19 +3334,104 @@ fn expand_if_paths(
         out.push((conds.to_vec(), values.to_vec()));
         return true;
     };
-    let E::Ite(c, t, f) = &values[i] else {
-        unreachable!()
-    };
-    let mut then_values = values.to_vec();
-    then_values[i] = (**t).clone();
-    let mut else_values = values.to_vec();
-    else_values[i] = (**f).clone();
-    let mut then_conds = conds.to_vec();
-    then_conds.push((**c).clone());
-    let mut else_conds = conds.to_vec();
-    else_conds.push(crate::hir::loop_ir::Cond::Not(Box::new((**c).clone())));
-    expand_if_paths(&then_values, &then_conds, out)
-        && expand_if_paths(&else_values, &else_conds, out)
+
+    if is_saturate {
+        // Resolve the saturating expression `Var(x) +/- Const(c)`.
+        let Some((var_idx, c_val, signed, bw)) = (match &values[i] {
+            E::Add(l, r, ArithSem::Saturate) => {
+                if let (E::Var(v), E::Const(c)) = (l.as_ref(), r.as_ref()) {
+                    Some((*v, c.clone(), vars[*v].signed, vars[*v].bw))
+                } else if let (E::Const(c), E::Var(v)) = (l.as_ref(), r.as_ref()) {
+                    Some((*v, c.clone(), vars[*v].signed, vars[*v].bw))
+                } else {
+                    None
+                }
+            }
+            E::Sub(l, r, ArithSem::Saturate) => {
+                if let (E::Var(v), E::Const(c)) = (l.as_ref(), r.as_ref()) {
+                    Some((*v, -c.clone(), vars[*v].signed, vars[*v].bw))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }) else {
+            return false;
+        };
+
+        let (min, max): (BigInt, BigInt) = if signed {
+            let half = BigInt::one() << (bw as usize - 1);
+            (-half.clone(), half - 1)
+        } else {
+            (BigInt::zero(), (BigInt::one() << bw as usize) - 1)
+        };
+
+        let limit_high = &max - &c_val;
+        let limit_low = &min - &c_val;
+
+        // Path 1: overflow (x > limit_high => x' = max).
+        let mut v1 = values.to_vec();
+        v1[i] = E::Const(max.clone());
+        let mut c1 = conds.to_vec();
+        c1.push(crate::hir::loop_ir::Cond::Cmp {
+            op: crate::hir::loop_ir::CmpOp::Gt,
+            lhs: Box::new(E::Var(var_idx)),
+            rhs: Box::new(E::Const(limit_high.clone())),
+            signed,
+        });
+
+        // Path 2: underflow (x < limit_low => x' = min).
+        let mut v2 = values.to_vec();
+        v2[i] = E::Const(min.clone());
+        let mut c2 = conds.to_vec();
+        c2.push(crate::hir::loop_ir::Cond::Cmp {
+            op: crate::hir::loop_ir::CmpOp::Lt,
+            lhs: Box::new(E::Var(var_idx)),
+            rhs: Box::new(E::Const(limit_low.clone())),
+            signed,
+        });
+
+        // Path 3: in-range (limit_low ≤ x ≤ limit_high => x' = x + c).
+        let mut v3 = values.to_vec();
+        v3[i] = E::Add(
+            Box::new(E::Var(var_idx)),
+            Box::new(E::Const(c_val.clone())),
+            ArithSem::Wrap,
+        );
+        let mut c3 = conds.to_vec();
+        c3.push(crate::hir::loop_ir::Cond::And(
+            Box::new(crate::hir::loop_ir::Cond::Cmp {
+                op: crate::hir::loop_ir::CmpOp::Le,
+                lhs: Box::new(E::Var(var_idx)),
+                rhs: Box::new(E::Const(limit_high)),
+                signed,
+            }),
+            Box::new(crate::hir::loop_ir::Cond::Cmp {
+                op: crate::hir::loop_ir::CmpOp::Ge,
+                lhs: Box::new(E::Var(var_idx)),
+                rhs: Box::new(E::Const(limit_low)),
+                signed,
+            }),
+        ));
+
+        expand_if_paths(&v1, &c1, out, vars)
+            && expand_if_paths(&v2, &c2, out, vars)
+            && expand_if_paths(&v3, &c3, out, vars)
+    } else {
+        let E::Ite(c, t, f) = &values[i] else {
+            unreachable!()
+        };
+        let mut then_values = values.to_vec();
+        then_values[i] = (**t).clone();
+        let mut else_values = values.to_vec();
+        else_values[i] = (**f).clone();
+        let mut then_conds = conds.to_vec();
+        then_conds.push((**c).clone());
+        let mut else_conds = conds.to_vec();
+        else_conds.push(crate::hir::loop_ir::Cond::Not(Box::new((**c).clone())));
+        expand_if_paths(&then_values, &then_conds, out, vars)
+            && expand_if_paths(&else_values, &else_conds, out, vars)
+    }
 }
 /// Split an And-chain into its conjuncts (for check 3's per-conjunct
 /// refutation). `True` contributes nothing; `False`/`Or` shapes return
@@ -3254,7 +3511,7 @@ pub(crate) fn verify_template_against_problem(
     // Only the LIA reading is covered (BV mode has modular semantics
     // the mathematical DBM cannot express); `Some(false)` (a satisfiable
     // counter-query — the real-domain closure may have missed an integer
-    // tightening, paper §V.D) and `None` (outside the fragment) both
+    // tightening, Zuo et al. 2026, §V.D) and `None` (outside the fragment) both
     // fall through to the authoritative SMT verifier below.
     if !bv {
         if let Some(true) = dbm_proves_inductiveness(problem, tpl) {
@@ -3457,7 +3714,7 @@ pub(crate) fn verify_template_against_problem(
 /// Algorithm 5's bounded leap query:
 ///  `∃A'.∀X,X'.P(A',X,X') ∧ (B ⊑ A' ⊏ A)`  — the witness must lie inside
 /// the under-approximation `B`, at-or-tighter-than `A`, and STRICTLY
-/// tighter in at least one row (the paper's `⊏`).
+/// tighter in at least one row (`⊏` of Zuo et al. (2026)).
 ///
 /// SMT has no lattice-order primitive, so `⊏` is expanded to the
 /// row-wise disjunction `∃r. l'_r > A.l_r ∨ u'_r < A.u_r`; it is what
@@ -3538,7 +3795,7 @@ fn build_bounded_leap_query(
     }
     smt.push_str("))\n");
 
-    // The paper's `A′ ⊏ A` conjunct (Algorithm 5), expanded into the
+    // `A′ ⊏ A` conjunct (Algorithm 5) of Zuo et al. (2026), expanded into the
     // row-wise strict-bound disjunction: `⊏` excludes the trivial witness
     // A' = A, exactly as the Theorem-5.5 UNSAT termination requires.
     smt.push_str("(assert (or");
@@ -4091,7 +4348,7 @@ mod tests {
         );
     }
 
-    /// Any-time partial invariant (paper §4 remark after Algorithm 2):
+    /// Any-time partial invariant (Zuo et al. 2026, §4 remark after Algorithm 2):
     /// a budget-exhausted driver returns the last INDUCTIVE template —
     /// not None — once at least one witness was adopted.  `i := 0;
     /// while i < 6 { i := i + 1 }` (BII [0,6]) with budget 3: the first
@@ -4299,7 +4556,7 @@ mod tests {
     /// Octagon `x,y := 0,0; while x < 4 { x,y := x+1, y+1 }` — the
     /// Diff row `x − y` is constantly 0, so its BII is the singleton
     /// `[0, 0]`. Exercises (a) the singleton-candidate allowance in
-    /// `propose_bitwise` (the paper's Propose admits `l == u` hypotheses)
+    /// `propose_bitwise` (Propose of Zuo et al. (2026) admits `l == u` hypotheses)
     /// and (b) the offset-encoded BV Diff encoding, whose witness is
     /// parsed back out of the encoded domain. Runs in both LIA and BV
     /// modes.
@@ -4786,7 +5043,8 @@ mod tests {
     fn test_propose_bitwise_sum_row() {
         let tpl = BiiTemplate::new(2, &[4, 4], &[false, false]);
         let pos = BitPositions::new(&tpl);
-        let cands = propose_bitwise(&tpl, &pos);
+        let limits = BoundaryLimits::new(&tpl);
+        let cands = propose_bitwise(&tpl, &pos, &limits);
         let sum_cands: Vec<&BiiTemplate> = cands
             .iter()
             .filter(|c| c.rows.iter().any(|r| matches!(r.kind, RowKind::Sum(..))))
@@ -5016,8 +5274,10 @@ mod tests {
         );
     }
 
-    /// Fragment fallback: Saturate transitions (the clamp is
-    /// piecewise — not a difference transfer) yield `None`.
+    /// Saturate transitions: the clamp is expanded by `expand_if_paths`
+    /// into three linear paths (overflow to max, underflow to min,
+    /// in-range successor), so the DBM path proves the loop directly —
+    /// no SMT fallback.
     #[test]
     fn test_dbm_fallback_saturate() {
         let vars = vec![Symbol::intern("i")];
@@ -5038,8 +5298,8 @@ mod tests {
         tpl.rows[0].ub = BigInt::from(6);
         assert_eq!(
             dbm_proves_inductiveness(&problem, &tpl),
-            None,
-            "Saturate transitions fall back to the SMT verifier"
+            Some(true),
+            "Saturate transitions are proven by the DBM path via 3-path expansion"
         );
     }
 
@@ -5143,7 +5403,7 @@ mod tests {
     /// INTEGER negation ¬(x ≤ 2) = x ≥ 3). The cycle becomes
     /// −12 + 0 + 8 + 0 = −4 < 0 — a negative diagonal: the template is
     /// PROVEN inductive (Some(true), no solver round-trip). This is
-    /// the paper's Figure-6 tension arriving through the transition:
+    /// Figure-6 tension of Zuo et al. (2026) arriving through the transition:
     /// the equality chain 2x' = 2y = 5 pins the half-integer y = 2.5,
     /// which the rounding breaks.
     ///
@@ -5507,7 +5767,8 @@ mod tests {
     fn test_g3_propose_bitwise_signed_sum() {
         let tpl = BiiTemplate::new(2, &[4, 4], &[true, true]);
         let pos = BitPositions::new(&tpl);
-        let cands = propose_bitwise(&tpl, &pos);
+        let limits = BoundaryLimits::new(&tpl);
+        let cands = propose_bitwise(&tpl, &pos, &limits);
         assert!(
             cands
                 .iter()
@@ -6192,6 +6453,208 @@ mod tests {
             result,
             Some(true),
             "DBM must prove Check 4 for single-guard loop"
+        );
+    }
+
+    /// Lower-bound candidates beyond `limits.lb` are pruned by
+    /// BoundaryLimits before any solver query (Zuo et al. 2026, §5.2: the optimal
+    /// lower bound satisfies `l* ≤ limits.lb`, so a candidate above it
+    /// cannot be part of the BII).
+    #[test]
+    fn test_propose_bitwise_prunes_lower_bound_with_limits() {
+        let mut tpl = BiiTemplate::new(1, &[8], &[false]);
+        tpl.rows[0].lb = BigInt::zero();
+        tpl.rows[0].ub = BiiRow::max_ub(8);
+
+        let pos = BitPositions::new(&tpl);
+
+        let mut limits = BoundaryLimits::new(&tpl);
+
+        // Ad hoc: the optimal lower bound is at most 3.
+        limits.lb[0] = BigInt::from(3);
+
+        let cands = propose_bitwise(&tpl, &pos, &limits);
+
+        // No lower-bound candidate may exceed 3.
+        assert!(
+            cands.iter().all(|c| c.rows[0].lb <= BigInt::from(3)),
+            "BoundaryLimits must prune impossible lower-bound proposals"
+        );
+    }
+
+    /// Upper-bound candidates below `limits.ub` are pruned by
+    /// BoundaryLimits before any solver query (Zuo et al. 2026, §5.2: the optimal
+    /// upper bound satisfies `u* ≥ limits.ub`, so a candidate below it
+    /// cannot be part of the BII).
+    #[test]
+    fn test_propose_bitwise_prunes_upper_bound_with_limits() {
+        let mut tpl = BiiTemplate::new(1, &[8], &[false]);
+        tpl.rows[0].lb = BigInt::zero();
+        tpl.rows[0].ub = BiiRow::max_ub(8);
+
+        let pos = BitPositions::new(&tpl);
+
+        let mut limits = BoundaryLimits::new(&tpl);
+
+        // Ad hoc: the optimal upper bound is at least 200.
+        limits.ub[0] = BigInt::from(200);
+
+        let cands = propose_bitwise(&tpl, &pos, &limits);
+
+        // No upper-bound candidate may fall below 200.
+        assert!(
+            cands.iter().all(|c| c.rows[0].ub >= BigInt::from(200)),
+            "BoundaryLimits must prune impossible upper-bound proposals"
+        );
+    }
+
+    /// `TemplateLevel::Octagon` must NOT generate Support3 rows, but must
+    /// still generate Diff rows.
+    #[test]
+    fn test_template_level_octagon_no_support3() {
+        let tpl = BiiTemplate::with_level(
+            3,
+            &[8, 8, 8],
+            &[false, false, false],
+            TemplateLevel::Octagon,
+        );
+        let has_support3 = tpl
+            .rows
+            .iter()
+            .any(|r| matches!(r.kind, RowKind::Support3(..)));
+        assert!(
+            !has_support3,
+            "Octagon level must NOT generate Support3 rows"
+        );
+
+        let has_diff = tpl.rows.iter().any(|r| matches!(r.kind, RowKind::Diff(..)));
+        assert!(has_diff, "Octagon level must generate Diff rows");
+    }
+
+    /// Property Strengthening (Yao et al., "Demystifying...", §IV-A):
+    /// the post-condition constraint
+    /// `∀X. (A'(X) ∧ ¬G(X)) ⇒ Post(X)` is spliced into the refine query.
+    #[test]
+    fn test_property_strengthening_in_synthesis() {
+        use crate::hir::loop_ir::{BiiLoopProblem, BiiVar, CmpOp, Cond, ScalarExpr};
+        let mk = |s: &str| BiiVar {
+            symbol: Symbol::intern(s),
+            bw: 8,
+            signed: false,
+        };
+        let problem = BiiLoopProblem {
+            vars: vec![mk("i")],
+            params: vec![],
+            init: vec![ScalarExpr::Const(BigInt::zero())],
+            loop_guard: Cond::True,
+            back_edges: vec![],
+            exit_edges: vec![],
+            saturates: vec![],
+            post: Some(Cond::Cmp {
+                op: CmpOp::Le,
+                lhs: Box::new(ScalarExpr::Var(0)),
+                rhs: Box::new(ScalarExpr::Const(BigInt::from(10))),
+                signed: false,
+            }),
+        };
+        let tpl = BiiTemplate::new(1, &[8], &[false]);
+        let candidates = vec![tpl];
+        // BV mode: the post bound renders as `(_ bv10 8)`.
+        let q = build_refine_query_problem(&problem, &candidates, false, true, &[8]).unwrap();
+
+        // The query must contain the negated guard and the post bound.
+        // The post constant lifts to `bits(10)+1 = 5` bits (Route B
+        // width rule for constants).
+        assert!(q.contains("(not true)"), "Query must contain negated guard");
+        assert!(
+            q.contains("(_ bv10 5)"),
+            "Query must contain post-condition bound"
+        );
+    }
+
+    /// Saturate DBM expansion: the DBM path can prove a loop with a
+    /// saturating assignment (`x' = clamp(x + 10)`) directly, without
+    /// falling back to SMT.
+    #[test]
+    fn test_dbm_saturate_expansion() {
+        use crate::hir::loop_ir::{
+            ArithSem, BiiLoopProblem, BiiVar, Cond, EdgeKind, ScalarExpr, TransitionEdge,
+        };
+        let mk = |s: &str| BiiVar {
+            symbol: Symbol::intern(s),
+            bw: 8,
+            signed: false,
+        };
+
+        // A saturating assignment: x' = clamp(x + 10).
+        let next_val = ScalarExpr::Add(
+            Box::new(ScalarExpr::Var(0)),
+            Box::new(ScalarExpr::Const(BigInt::from(10))),
+            ArithSem::Saturate,
+        );
+
+        let problem = BiiLoopProblem {
+            vars: vec![mk("x")],
+            params: vec![],
+            init: vec![ScalarExpr::Const(BigInt::from(200))],
+            loop_guard: Cond::True,
+            back_edges: vec![TransitionEdge {
+                kind: EdgeKind::Back,
+                guard: None,
+                definedness: None,
+                next_values: vec![next_val],
+            }],
+            exit_edges: vec![],
+            saturates: vec![(0, 10)],
+            post: None,
+        };
+
+        let mut tpl = BiiTemplate::new(1, &[8], &[false]);
+        tpl.rows[0].lb = BigInt::from(200);
+        tpl.rows[0].ub = BigInt::from(255); // Saturate ceiling
+
+        // If the Saturate expansion succeeds, the DBM path returns
+        // Some(true) instead of None (SMT fallback).
+        assert_eq!(
+            dbm_proves_inductiveness(&problem, &tpl),
+            Some(true),
+            "DBM must prove Saturate loops via path expansion without SMT fallback"
+        );
+    }
+
+    /// Adaptive leap cooldown: the BoundaryLimits state machine stays
+    /// healthy across UNSAT pruning and SAT tightening.
+    #[test]
+    fn test_adaptive_leap_cooldown_logic() {
+        let tpl = BiiTemplate::new(1, &[8], &[false]);
+        let mut limits = BoundaryLimits::new(&tpl);
+
+        // Simulate UNSAT pruning: a candidate tightening lb to 10 and
+        // ub to 20 moves the limits to lb=9 / ub=21 (one past the
+        // proposal).
+        let cands = vec![tpl.with_row(0, BigInt::from(10), BigInt::from(20))];
+        limits.prune_unsat(&tpl, &cands);
+        assert!(limits.is_active(), "Limits should be active after pruning");
+        assert_eq!(
+            limits.lb[0],
+            BigInt::from(9),
+            "prune_unsat must tighten lb to lb-1"
+        );
+        assert_eq!(
+            limits.ub[0],
+            BigInt::from(21),
+            "prune_unsat must widen ub to ub+1"
+        );
+
+        // SAT tightening only strengthens: `l* ≤ 15` does not move lb
+        // (already 9 < 15), and `u* ≥ 5` does not move ub (already
+        // 21 > 5) — the limits stay as pruned.
+        let bounds = vec![(BigInt::from(5), BigInt::from(15))];
+        limits.tighten_sat(&bounds);
+        assert_eq!(
+            limits.lb[0],
+            BigInt::from(9),
+            "SAT tightening must only strengthen, never weaken"
         );
     }
 }

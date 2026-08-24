@@ -7188,6 +7188,15 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
                     diag = diag.with_suggestion(suggestion.message);
                 }
+                // ── Inference-origin trace ──────────────────────────
+                for (ty, label) in [(expected, "expected type"), (actual, "found type")] {
+                    if let Some((vid, origin_span)) = self.infer_origin(ty) {
+                        diag = diag.with_secondary_label(
+                            origin_span,
+                            format!("{} was originally inferred as `?{}` here", label, vid),
+                        );
+                    }
+                }
                 diag
             })
     }
@@ -7344,6 +7353,16 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
             }
         }
         None
+    }
+
+    /// Look up the inference-variable origin of a type WITHOUT following
+    /// `set_binding` chains.  See `FnCtxt::infer_origin` for the rationale.
+    fn infer_origin(&self, ty: TypeId) -> Option<(usize, crate::ast::Span)> {
+        let var_id = self.ctx.get_infer_var_id(ty)?;
+        match self.infer.var_origins().get(var_id)? {
+            crate::hir::infer::VarOrigin::Expression(Some(span)) => Some((var_id, *span)),
+            _ => None,
+        }
     }
 
     /// Look up a variable's definition span in the scoped `local_variable_spans`
@@ -7511,6 +7530,18 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
                                      Remove the quotes to use it as a numeric literal.",
                             ));
                         }
+                    }
+                }
+                // ── Inference-origin trace ──────────────────────────
+                // Additionally, if the "other" operand's TypeId was originally
+                // an InferVar (now bound to a concrete type), show where that
+                // inference variable was created.
+                if let Some((vid, infer_span)) = self.infer_origin(resolved_other) {
+                    if Some(infer_span) != other_span {
+                        d.labels_mut().push(Label::secondary(
+                            infer_span,
+                            format!("type was originally inferred as `?{}` here", vid),
+                        ));
                     }
                 }
                 return Err(std::mem::replace(d, Diagnostic::error("placeholder")));
@@ -8869,7 +8900,7 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
         // GADT refinement, SYNTAX.md §"Nested GADT Refinement").  This runs
         // after `push_gadt_arm`, so the GADT fact registry has an active
         // arm to write into.
-        let pending = std::mem::take(&mut self.ctx.gadt.pending_eqs);
+        let pending = self.ctx.gadt.take_pending_eqs();
         for eq in pending {
             // Nested GADT satisfiability gate: an impossible
             // nested constructor must not contribute equalities to the arm.
@@ -9060,7 +9091,7 @@ impl<'input: 'a, 'a> TypeChecker<'a, 'input> {
             } else if all_same {
                 // All alternatives agree → propagate to the branch body
                 // (into pending_eqs; apply_gadt_refinement registers it).
-                self.ctx.gadt.pending_eqs.push(eq.clone());
+                self.ctx.gadt.push_pending_eq(eq.clone());
             }
             // Some alternative unconstrained (!all_same && !conflict) →
             // do not propagate (the parameter stays abstract).

@@ -10902,3 +10902,42 @@ fn test_lookup_method_generic_match_probe() {
         "method lookup must not push diagnostics"
     );
 }
+
+/// `get_infer_var_id` sees through `set_binding` (it inspects the raw
+/// `TypeData` slot), and `var_origins` still records the `Expression`
+/// creation site of an inference variable after it has been unified to
+/// a concrete type — the two facts the inference-origin trace relies on.
+#[test]
+fn test_infer_origin_trace() {
+    use crate::ast::Span;
+    use crate::hir::infer::InferenceContext;
+    use crate::hir::types::TypeContext;
+
+    let mut ctx = TypeContext::new();
+    let mut infer = InferenceContext::new();
+
+    // Create an InferVar with Expression origin at span (10, 20).
+    let span = Span::new(10, 20);
+    let var_ty = infer.new_type_var(
+        &mut ctx,
+        TypeVariableKind::Integer,
+        VarOrigin::Expression(Some(span)),
+    );
+
+    // Unify the InferVar to Int<32> — this calls set_binding internally.
+    let int_ty = ctx.int(32, true);
+    let _ = ctx.unify(var_ty, int_ty);
+
+    // After unification, get_infer_var_id must still see the raw InferVar.
+    assert!(
+        ctx.get_infer_var_id(var_ty).is_some(),
+        "get_infer_var_id must see through set_binding"
+    );
+
+    // var_origins must still record the Expression origin.
+    let vid = ctx.get_infer_var_id(var_ty).unwrap();
+    match &infer.var_origins()[vid] {
+        VarOrigin::Expression(Some(s)) => assert_eq!(*s, span),
+        other => panic!("expected Expression(Some(_)), got {:?}", other),
+    }
+}

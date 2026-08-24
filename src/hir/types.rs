@@ -1650,7 +1650,7 @@ impl<'input> TypeContext<'input> {
     }
 
     pub fn alloc(&mut self, data: TypeData) -> TypeId {
-        let (id, arc) = self.factory.alloc(data);
+        let (id, _arc) = self.factory.alloc(data);
         // Keep self.types in sync with the factory's arena so that
         // get()/get_raw() can find types created via alloc().
         // Also sync any types that were created directly via

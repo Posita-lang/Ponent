@@ -8,7 +8,7 @@ use crate::ast::{Attribute, BinOp, Expr, GenericArg, Literal, Pattern, Span, Stm
 use crate::diagnostics::{Applicability, Diagnostic, DiagnosticKind, Suggestion, SuggestionStyle};
 use crate::hir::comptime::{ComptimeEvalContext, ComptimeValue};
 use crate::hir::hir::{HirCatchBranch, HirExpr, HirMatchArm, HirParam, HirPattern, HirStmt};
-use crate::hir::infer::{Constraint, InferenceContext, TypeVariableKind};
+use crate::hir::infer::{Constraint, InferenceContext, TypeVariableKind, VarOrigin};
 use crate::hir::symbol::{TypeBinding, TypeKind};
 use crate::hir::types::{Characteristic, DefId, Subst, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
@@ -146,6 +146,27 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         })
     }
 
+    /// Look up the inference-variable origin of a type WITHOUT following
+    /// `set_binding` chains.
+    ///
+    /// Uses `TypeContext::get_infer_var_id` (which inspects the raw
+    /// `TypeData` slot, ignoring any binding) to discover whether this
+    /// `TypeId` was originally allocated as an `InferVar`.  If so,
+    /// consults `InferenceContext::var_origins` for the creation site.
+    /// Returns `(infer_var_id, source_span)` when the variable was
+    /// created by a user expression.
+    ///
+    /// This enables diagnostics to say "type `?4` was originally inferred
+    /// here" even after the variable has been unified to a concrete type
+    /// such as `Int<32>`.
+    fn infer_origin(&self, ty: TypeId) -> Option<(usize, crate::ast::Span)> {
+        let var_id = self.checker.ctx.get_infer_var_id(ty)?;
+        match self.checker.infer.var_origins().get(var_id)? {
+            VarOrigin::Expression(Some(span)) => Some((var_id, *span)),
+            _ => None,
+        }
+    }
+
     /// Generate a human-readable reason for a type mismatch between two
     /// types, explaining *why* they are incompatible.
     /// Delegates to [`TypeChecker::type_mismatch_reason`].
@@ -259,6 +280,17 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 let mut diag = Diagnostic::error(msg).with_code_str("E030").with_span(span);
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
                     diag = diag.with_suggestion(suggestion.message);
+                }
+                // ── Inference-origin trace ──────────────────────────
+                // If either side was originally an InferVar (now unified to
+                // a concrete type), point back to where it was first created.
+                for (ty, label) in [(expected, "expected type"), (actual, "found type")] {
+                    if let Some((vid, origin_span)) = self.infer_origin(ty) {
+                        diag = diag.with_secondary_label(
+                            origin_span,
+                            format!("{} was originally inferred as `?{}` here", label, vid),
+                        );
+                    }
                 }
                 diag
             })
@@ -4696,7 +4728,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                             self.checker.resolve_type_to_struct_or_enum(enum_ty, *span)
                         {
                             for (pn, ct) in &variant_def.eq_spec {
-                                self.checker.ctx.gadt.pending_eqs.push(
+                                self.checker.ctx.gadt.push_pending_eq(
                                     crate::hir::checker::PendingInnerGadtEq {
                                         param_name: *pn,
                                         concrete_ty: ct.clone(),
