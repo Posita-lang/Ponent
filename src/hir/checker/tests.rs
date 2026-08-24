@@ -7148,9 +7148,11 @@ def main() -> Int<32> { return 0; }",
     #[test]
     fn test_explicit_move_in_tuple_consumes_place() {
         let result = check_source(
-            "type Person = struct { name: String, age: Int<32> }
+            "type Token = struct { id: Int<32> }
+             impl Drop for Token { def drop(&mut self) {} }
+             type Person = struct { token: Token, age: Int<32> }
              def main() -> Int<32> {
-                 set a = Person { name = \"Alice\", age = 30 };
+                 set a = Person { token = Token { id = 1 }, age = 30 };
                  set t = (move a, 1);
                  set u = a;
                  return u.age;
@@ -7168,9 +7170,11 @@ def main() -> Int<32> { return 0; }",
     #[test]
     fn test_match_arm_value_consumes_place() {
         let result = check_source(
-            "type Person = struct { name: String, age: Int<32> }
+            "type Token = struct { id: Int<32> }
+             impl Drop for Token { def drop(&mut self) {} }
+             type Person = struct { token: Token, age: Int<32> }
              def main() -> Int<32> {
-                 set a = Person { name = \"Alice\", age = 30 };
+                 set a = Person { token = Token { id = 1 }, age = 30 };
                  set r = match 0 { _ => a };
                  set u = a;
                  return u.age;
@@ -8225,14 +8229,16 @@ fn test_ro_freeze_const_index_blocks_dynamic_index() {
 }
 
 /// The non-Copy wiring (the §Copy `type_is_copy` — the Adt/struct is
-/// non-Copy): a struct containing a `String` field — its move must be
-/// tracked (the use-after-move rejected).
+/// non-Copy): a struct with `impl Drop` — its move must be tracked
+/// (the use-after-move rejected).
 #[test]
 fn test_move_struct_non_copy() {
     let result = check_source(
-        "type Person = struct { name: String, age: Int<32> }
+        "type Token = struct { id: Int<32> }
+         impl Drop for Token { def drop(&mut self) {} }
+         type Person = struct { token: Token, age: Int<32> }
          def main() -> Int<32> {
-             set p = Person { name = \"Alice\", age = 30 };
+             set p = Person { token = Token { id = 1 }, age = 30 };
              set q = p;
              set r = p;
              return 0;

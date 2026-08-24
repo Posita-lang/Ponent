@@ -545,61 +545,79 @@ fn mark_value_consumed<'input>(
     }
 }
 
+/// Format a `FrozenPlace` into a human-readable string for error messages.
+fn format_frozen_place(place: &FrozenPlace, out: &mut String) {
+    match place {
+        FrozenPlace::Root(v) => {
+            out.push_str(&v.as_str());
+        }
+        FrozenPlace::Field(base, field) => {
+            format_frozen_place(base, out);
+            out.push('.');
+            out.push_str(&field.as_str());
+        }
+        FrozenPlace::Index(base) => {
+            format_frozen_place(base, out);
+            out.push_str("[..]");
+        }
+        FrozenPlace::ConstIndex(base, idx) => {
+            format_frozen_place(base, out);
+            out.push('[');
+            out.push_str(&idx.to_string());
+            out.push(']');
+        }
+        FrozenPlace::Deref(base) => {
+            out.push('*');
+            format_frozen_place(base, out);
+        }
+    }
+}
+
 fn check_stmt_moves<'input>(
     stmt: &HirStmt<'input>,
     moved: &mut HashSet<FrozenPlace>,
     non_copy: &mut HashSet<Symbol>,
     errs: &mut Vec<String>,
 ) {
-    // The statement's reads — a use of a moved value is the error.  For
-    // an assignment, the TARGET is written (the target re-initialization) —
-    // not read — the reads are the value only.
-    let reads = match stmt {
+    // The statement's reads — a use of a moved place is the error.
+    // Collect precise read places (FrozenPlace) rather than bare symbols,
+    // so partial move checking can distinguish arr[0] (hollow) from arr[1]
+    // (available).
+    let read_places: Vec<FrozenPlace> = match stmt {
         HirStmt::Assign {
             value, target, op, ..
         } => {
             let mut out = Vec::new();
-            used_vars_in_expr_into(value, &mut out);
-            // A compound assignment (`a += 1`) READS the target (its old
-            // value) in addition to writing it — a moved `a`
-            // used in `a += 1` must be rejected (use-after-move).
+            collect_read_places_into(value, &mut out);
             if op.is_some() {
-                // A compound assignment READS the
-                // WHOLE target (its old value is consumed) — not just a
-                // bare `Ident` (`arr[i] += 1` reads `arr` and `i` too).
-                used_vars_in_expr_into(target, &mut out);
+                // Compound assignment reads the whole target's old value.
+                collect_read_places_into(target, &mut out);
             } else {
-                // A plain write (`*r = 7`, `arr[i] = x`, `p.f = x`)
-                // READS the target's DEREF/INDEX/FIELD BASES (the
-                // pointer/array/field-offset must be read to reach the
-                // write location) — but NOT the final leaf Ident (the
-                // written place itself is not read).  The liveness must
-                // see the `r` in `*r = 7` so a loan on `r` stays live
-                // through its deref-write (the Polonius ancestor-clobber
-                // shape: `arr = ...; *r = 7` must reject).
-                used_vars_in_write_target(target, &mut out);
+                // Plain write: only reads the target's index/base (not the
+                // target itself — the written place is not read).
+                collect_read_places_in_write_target(target, &mut out);
             }
             out
         }
-        _ => used_vars_in_stmt(stmt),
+        _ => {
+            let mut out = Vec::new();
+            collect_read_places_in_stmt(stmt, &mut out);
+            out
+        }
     };
-    for v in reads {
-        // The place-level check: a read of a moved place (or of one of
-        // its descendants — the read touches the moved storage) is a
-        // use-after-move.  Sibling places are unaffected.
-        //
-        // BOTH prefix directions are checked: reading a sub-place of a
-        // moved whole (mp = Root(x), read = Field(x,y)) AND reading the
-        // whole when a sub-place was moved (mp = Field(x,y), read =
-        // Root(x) — a partial move invalidates the whole variable per
-        // SYNTAX.md §Move Semantics).  The single-direction check let
-        // `set b = move a.y; set c = a;` slip through.
-        let read_place = FrozenPlace::Root(v);
+    for read_place in &read_places {
+        // Bidirectional prefix check:
+        // - moved place is prefix of read → read touches moved sub-place
+        // - read is prefix of moved → read touches whole containing a moved part
+        // For ConstIndex: arr[0] and arr[1] are NOT prefixes of each other,
+        // so moving arr[0] does not block reading arr[1].
         if moved
             .iter()
-            .any(|mp| place_is_prefix_of(mp, &read_place) || place_is_prefix_of(&read_place, mp))
+            .any(|mp| place_is_prefix_of(mp, read_place) || place_is_prefix_of(read_place, mp))
         {
-            errs.push(format!("use of moved value: `{}`", v));
+            let mut place_str = String::new();
+            format_frozen_place(read_place, &mut place_str);
+            errs.push(format!("use of moved value: `{}`", place_str));
         }
     }
     match stmt {
@@ -616,7 +634,9 @@ fn check_stmt_moves<'input>(
             if src_is_non_copy {
                 non_copy.insert(*n);
             }
-            moved.remove(&FrozenPlace::Root(*n));
+            // Re-initialization: clear ALL moved marks for this variable
+            // (including sub-places like ConstIndex, Field, etc.).
+            moved.retain(|mp| place_root_symbol(mp) != Some(*n));
         }
         // The branch path propagation — the branches' moved states
         // merge (the union) at the join: a variable moved on ANY branch
@@ -655,17 +675,20 @@ fn check_stmt_moves<'input>(
             *moved = merged;
         }
         // The re-initialization — an assignment to a moved variable
-        // re-initializes it (the RFC unified rule: any hole filled — the
-        // value is usable again).
+        // re-initializes it. Use precise place-based removal:
+        // - arr[0] = value → removes ConstIndex(Root(arr), 0) exactly
+        // - arr = [1,2,3]  → removes Root(arr) + all sub-places (whole overwrite)
+        // - *r = value     → removes Deref(Root(r)) exactly
+        // - p.f = value    → removes Field(Root(p), f) exactly
         HirStmt::Assign { target, value, .. } => {
-            if let HirExpr::Ident(name, _, _) = target.as_ref() {
-                moved.remove(&FrozenPlace::Root(*name));
-                // (documented imprecision): the RFC "any hole
-                // filled" re-initialization clears the whole ROOT, but a
-                // sub-place hole (`move a.y` then `a = fresh`) leaves
-                // `Field(a, y)` in the moved set — a conservative
-                // over-rejection (safe direction); the per-hole clearing
-                // is future work.
+            if let Some(target_place) = hir_expr_place(target) {
+                moved.remove(&target_place);
+                // If target is a Root (whole-variable assignment), clear all
+                // sub-place hollow marks for that variable.
+                if matches!(target_place, FrozenPlace::Root(_)) {
+                    moved
+                        .retain(|mp| !place_is_prefix_of(&target_place, mp) && *mp != target_place);
+                }
             }
             // The RHS of an assignment CONSUMES the value — `b = a`
             // moves `a` (previously unrecorded → double moves passed).
@@ -936,6 +959,303 @@ fn used_vars_in_write_target<'input>(expr: &HirExpr<'input>, out: &mut Vec<Symbo
     }
 }
 
+/// Collect all precise read places (`FrozenPlace`) from an expression.
+/// Top-level places (e.g. `arr[0]`) are collected as their full
+/// `ConstIndex`/`Index` form, not as `Root(arr)` — enabling the partial
+/// move check to distinguish `arr[0]` from `arr[1]`.
+fn collect_read_places_into<'input>(expr: &HirExpr<'input>, out: &mut Vec<FrozenPlace>) {
+    collect_read_places_into_inner(expr, false, out);
+}
+
+fn collect_read_places_into_inner<'input>(
+    expr: &HirExpr<'input>,
+    in_place_base: bool,
+    out: &mut Vec<FrozenPlace>,
+) {
+    match expr {
+        HirExpr::Ident(name, _, _) => {
+            if !in_place_base {
+                out.push(FrozenPlace::Root(*name));
+            }
+        }
+        HirExpr::FieldAccess { base, .. } => {
+            if !in_place_base {
+                if let Some(p) = hir_expr_place(expr) {
+                    out.push(p);
+                }
+            }
+            collect_read_places_into_inner(base, true, out);
+        }
+        HirExpr::Index { base, index, .. } => {
+            if !in_place_base {
+                if let Some(p) = hir_expr_place(expr) {
+                    out.push(p);
+                }
+            }
+            collect_read_places_into_inner(base, true, out);
+            collect_read_places_into_inner(index, false, out);
+        }
+        HirExpr::UnaryOp {
+            op: UnaryOp::Deref,
+            expr: inner,
+            ..
+        } => {
+            if !in_place_base {
+                if let Some(p) = hir_expr_place(expr) {
+                    out.push(p);
+                }
+            }
+            collect_read_places_into_inner(inner, true, out);
+        }
+        HirExpr::UnaryOp {
+            op: UnaryOp::RefMut | UnaryOp::Ro | UnaryOp::Ref,
+            expr: inner,
+            ..
+        } => {
+            collect_read_places_into_inner(inner, false, out);
+        }
+        HirExpr::UnaryOp { expr: inner, .. } => {
+            collect_read_places_into_inner(inner, false, out);
+        }
+        HirExpr::BinaryOp { left, right, .. } => {
+            collect_read_places_into_inner(left, false, out);
+            collect_read_places_into_inner(right, false, out);
+        }
+        HirExpr::Move(inner, _, _) => {
+            collect_read_places_into_inner(inner, in_place_base, out);
+        }
+        HirExpr::Call { callee, args, .. } => {
+            collect_read_places_into_inner(callee, false, out);
+            for a in args {
+                collect_read_places_into_inner(a, false, out);
+            }
+        }
+        HirExpr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_read_places_into_inner(scrutinee, false, out);
+            for a in arms {
+                if let Some(g) = &a.guard {
+                    collect_read_places_into_inner(g, false, out);
+                }
+                collect_read_places_in_stmt(&HirStmt::Expression(a.body.clone()), out);
+            }
+        }
+        HirExpr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        }
+        | HirExpr::IfLet {
+            scrutinee: cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_read_places_into_inner(cond, false, out);
+            for s in then_branch {
+                collect_read_places_in_stmt(s, out);
+            }
+            if let Some(e) = else_branch {
+                for s in e {
+                    collect_read_places_in_stmt(s, out);
+                }
+            }
+        }
+        HirExpr::LeaveWith { expr: inner, .. } => {
+            collect_read_places_into_inner(inner, false, out);
+        }
+        HirExpr::Catch { expr, branches, .. } => {
+            collect_read_places_into_inner(expr, false, out);
+            for b in branches {
+                for s in &b.body {
+                    collect_read_places_in_stmt(s, out);
+                }
+            }
+        }
+        HirExpr::Block(stmts, _, _) => {
+            for s in stmts {
+                collect_read_places_in_stmt(s, out);
+            }
+        }
+        HirExpr::Tuple(elems, _, _) | HirExpr::Array(elems, _, _) => {
+            for el in elems {
+                collect_read_places_into_inner(el, false, out);
+            }
+        }
+        HirExpr::StructLit { fields, .. } => {
+            for (_, val) in fields {
+                collect_read_places_into_inner(val, false, out);
+            }
+        }
+        HirExpr::EnumLit { payload, .. } => {
+            if let Some(p) = payload {
+                collect_read_places_into_inner(p, false, out);
+            }
+        }
+        HirExpr::Cast { expr: inner, .. }
+        | HirExpr::TypeAnnotated { expr: inner, .. }
+        | HirExpr::Try { expr: inner, .. }
+        | HirExpr::Await { expr: inner, .. }
+        | HirExpr::Old { expr: inner, .. }
+        | HirExpr::PolyBox { expr: inner, .. }
+        | HirExpr::PolyUnbox { expr: inner, .. }
+        | HirExpr::Return { value: inner, .. } => {
+            collect_read_places_into_inner(inner, false, out);
+        }
+        HirExpr::Range { start, end, .. } => {
+            if let Some(s) = start {
+                collect_read_places_into_inner(s, false, out);
+            }
+            if let Some(e) = end {
+                collect_read_places_into_inner(e, false, out);
+            }
+        }
+        HirExpr::AttrAccess { base, .. } => {
+            collect_read_places_into_inner(base, false, out);
+        }
+        HirExpr::Quantified { range, body, .. } => {
+            collect_read_places_into_inner(range, false, out);
+            collect_read_places_into_inner(body, false, out);
+        }
+        HirExpr::UnsafeBlock { body, .. } => {
+            for s in body {
+                collect_read_places_in_stmt(s, out);
+            }
+        }
+        HirExpr::Closure { body, .. } => {
+            for s in body {
+                collect_read_places_in_stmt(s, out);
+            }
+        }
+        HirExpr::Task { block, .. } => {
+            for s in block {
+                collect_read_places_in_stmt(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Statement-level precise read place collection.
+fn collect_read_places_in_stmt<'input>(stmt: &HirStmt<'input>, out: &mut Vec<FrozenPlace>) {
+    match stmt {
+        HirStmt::VariableDef { value: Some(v), .. } => {
+            collect_read_places_into(v, out);
+        }
+        HirStmt::Assign {
+            target, value, op, ..
+        } => {
+            collect_read_places_into(value, out);
+            if op.is_some() {
+                collect_read_places_into(target, out);
+            } else {
+                collect_read_places_in_write_target(target, out);
+            }
+        }
+        HirStmt::Return { value: Some(v), .. } => {
+            collect_read_places_into(v, out);
+        }
+        HirStmt::Expression(expr) => {
+            collect_read_places_into(expr, out);
+        }
+        HirStmt::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        }
+        | HirStmt::IfLet {
+            scrutinee: cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_read_places_into(cond, out);
+            for s in then_branch {
+                collect_read_places_in_stmt(s, out);
+            }
+            if let Some(e) = else_branch {
+                for s in e {
+                    collect_read_places_in_stmt(s, out);
+                }
+            }
+        }
+        HirStmt::While { cond, body, .. }
+        | HirStmt::WhileLet {
+            scrutinee: cond,
+            body,
+            ..
+        } => {
+            collect_read_places_into(cond, out);
+            for s in body {
+                collect_read_places_in_stmt(s, out);
+            }
+        }
+        HirStmt::For { iterable, body, .. } => {
+            collect_read_places_into(iterable, out);
+            for s in body {
+                collect_read_places_in_stmt(s, out);
+            }
+        }
+        HirStmt::Loop { body, .. } => {
+            for s in body {
+                collect_read_places_in_stmt(s, out);
+            }
+        }
+        HirStmt::ComptimeBlock { body, .. }
+        | HirStmt::Isolate { body, .. }
+        | HirStmt::Unsafe { body, .. } => {
+            for s in body {
+                collect_read_places_in_stmt(s, out);
+            }
+        }
+        HirStmt::ScopeCleanup {
+            when_condition,
+            body,
+            ..
+        } => {
+            if let Some(cond) = when_condition {
+                collect_read_places_into(cond, out);
+            }
+            for s in body {
+                collect_read_places_in_stmt(s, out);
+            }
+        }
+        HirStmt::GhostVariableDef { inner, .. } => {
+            collect_read_places_in_stmt(inner, out);
+        }
+        _ => {}
+    }
+}
+
+/// Read-place collection for plain assignment targets.
+/// Only collects index expressions (not the target itself or its base),
+/// matching the semantics of `used_vars_in_write_target`.
+fn collect_read_places_in_write_target<'input>(expr: &HirExpr<'input>, out: &mut Vec<FrozenPlace>) {
+    match expr {
+        HirExpr::Ident(..) => {}
+        HirExpr::Index { base, index, .. } => {
+            collect_read_places_into(index, out);
+            collect_read_places_in_write_target(base, out);
+        }
+        HirExpr::FieldAccess { base, .. } => {
+            collect_read_places_in_write_target(base, out);
+        }
+        HirExpr::UnaryOp {
+            op: UnaryOp::Deref,
+            expr: inner,
+            ..
+        } => {
+            collect_read_places_in_write_target(inner, out);
+        }
+        _ => {
+            collect_read_places_into(expr, out);
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Flow-sensitive borrow-check post-pass (the CFG consumer).
 //
@@ -1195,7 +1515,22 @@ pub(crate) fn hir_expr_place<'input>(e: &HirExpr<'input>) -> Option<FrozenPlace>
             expr,
             ..
         } => hir_expr_place(expr),
+        // `move expr` refers to the same place as `expr` — strip the
+        // wrapper so `move arr[0]` yields `ConstIndex(Root(arr), 0)`.
+        HirExpr::Move(inner, _, _) => hir_expr_place(inner),
         _ => None,
+    }
+}
+
+/// Extract the root `Symbol` from a `FrozenPlace`.
+/// `Root(a)` → `Some(a)`; `Field`/`Index`/`ConstIndex`/`Deref` recurse to base.
+fn place_root_symbol(place: &FrozenPlace) -> Option<Symbol> {
+    match place {
+        FrozenPlace::Root(v) => Some(*v),
+        FrozenPlace::Field(base, _)
+        | FrozenPlace::Index(base)
+        | FrozenPlace::ConstIndex(base, _)
+        | FrozenPlace::Deref(base) => place_root_symbol(base),
     }
 }
 
@@ -3085,6 +3420,182 @@ mod tests {
             "r is dead at the later `a = 5` (last use passed)"
         );
     }
+
+    // ── Partial move (hollow) tests ──────────────────────────────────
+    // NOTE: We use `[&mut Int<32>; N]` as the element type because
+    // `&mut T` is non-Copy (mutable references are affine).  Struct types
+    // like `String` are NOT registered as type names in the resolver.
+
+    /// Explicit move of arr[0] then read arr[0] — must be rejected.
+    #[test]
+    fn test_partial_move_element_rejected() {
+        let result = check_source(
+            "def main() -> Int<32> {
+                set mut target = 0;
+                set mut arr: [&mut Int<32>; 3] = [&mut target, &mut target, &mut target];
+                let s = move arr[0];
+                let t = move arr[0];
+                return 0;
+            }",
+        );
+        assert!(
+            result.is_err(),
+            "reading a moved element must be rejected: {:?}",
+            result
+        );
+    }
+
+    /// Explicit move of arr[0] then read arr[1] — must be accepted.
+    #[test]
+    fn test_partial_move_sibling_ok() {
+        let result = check_source(
+            "def main() -> Int<32> {
+                set mut a = 0;
+                set mut b = 0;
+                set mut c = 0;
+                set mut arr: [&mut Int<32>; 3] = [&mut a, &mut b, &mut c];
+                let s = move arr[0];
+                let t = move arr[1];
+                return 0;
+            }",
+        );
+        assert!(
+            result.is_ok(),
+            "sibling element must still be accessible: {:?}",
+            result
+        );
+    }
+
+    /// Move arr[0], re-fill via whole-array assignment of a fresh array, then read arr[0] — must be accepted.
+    #[test]
+    fn test_partial_move_refill() {
+        let result = check_source(
+            "def main() -> Int<32> {
+                set mut a = 0;
+                set mut b = 0;
+                set mut c = 0;
+                set mut arr: [&mut Int<32>; 3] = [&mut a, &mut b, &mut c];
+                let s = move arr[0];
+                set mut d = 0;
+                set mut e = 0;
+                set mut f = 0;
+                arr = [&mut d, &mut e, &mut f];
+                let t = move arr[0];
+                return 0;
+            }",
+        );
+        assert!(
+            result.is_ok(),
+            "re-filled element must be accessible again: {:?}",
+            result
+        );
+    }
+
+    /// Move arr[0], whole-array overwrite, then read arr[0] — accepted.
+    #[test]
+    fn test_partial_move_whole_overwrite() {
+        let result = check_source(
+            "def main() -> Int<32> {
+                set mut t1 = 0;
+                set mut t2 = 0;
+                set mut t3 = 0;
+                set mut arr: [&mut Int<32>; 3] = [&mut t1, &mut t2, &mut t3];
+                let s = move arr[0];
+                arr = [&mut t1, &mut t2, &mut t3];
+                let t = move arr[0];
+                return 0;
+            }",
+        );
+        assert!(
+            result.is_ok(),
+            "whole-array overwrite must clear hollow marks: {:?}",
+            result
+        );
+    }
+
+    /// Move arr[0], then read whole arr — must be rejected (hollow element
+    /// invalidates the whole variable).
+    #[test]
+    fn test_partial_move_read_whole_array() {
+        let result = check_source(
+            "def main() -> Int<32> {
+                set mut target = 0;
+                set mut arr: [&mut Int<32>; 3] = [&mut target, &mut target, &mut target];
+                let s = move arr[0];
+                let t = arr;
+                return 0;
+            }",
+        );
+        assert!(
+            result.is_err(),
+            "reading whole array with hollow element must be rejected: {:?}",
+            result
+        );
+    }
+
+    /// Dynamic index move: `move arr[i]` then `move arr[i]` — must be
+    /// rejected (dynamic index is conservatively any element).
+    #[test]
+    fn test_partial_move_dynamic_index() {
+        let result = check_source(
+            "def main() -> Int<32> {
+                set mut target = 0;
+                set mut arr: [&mut Int<32>; 3] = [&mut target, &mut target, &mut target];
+                let i: Int<32> = 0;
+                let s = move arr[i];
+                let t = move arr[i];
+                return 0;
+            }",
+        );
+        assert!(
+            result.is_err(),
+            "dynamic index after move must be rejected: {:?}",
+            result
+        );
+    }
+
+    /// Dynamic index move then different literal index — must be rejected
+    /// (dynamic is conservatively ANY element).
+    #[test]
+    fn test_partial_move_dynamic_then_literal() {
+        let result = check_source(
+            "def main() -> Int<32> {
+                set mut target = 0;
+                set mut arr: [&mut Int<32>; 3] = [&mut target, &mut target, &mut target];
+                let i: Int<32> = 0;
+                let s = move arr[i];
+                let t = move arr[1];
+                return 0;
+            }",
+        );
+        assert!(
+            result.is_err(),
+            "dynamic index move must conservatively block literal index: {:?}",
+            result
+        );
+    }
+
+    /// Whole-array reassignment clears all moved marks for that variable.
+    #[test]
+    fn test_partial_move_whole_reassign() {
+        let result = check_source(
+            "def main() -> Int<32> {
+                set mut t1 = 0;
+                set mut t2 = 0;
+                set mut t3 = 0;
+                set mut arr: [&mut Int<32>; 3] = [&mut t1, &mut t2, &mut t3];
+                let s = move arr[0];
+                arr = [&mut t1, &mut t2, &mut t3];
+                let t = move arr[0];
+                return 0;
+            }",
+        );
+        assert!(
+            result.is_ok(),
+            "whole-array reassignment must clear all moved marks: {:?}",
+            result
+        );
+    }
 }
 
 /// The affine consumption walk: a non-Copy leaf packed into the RHS
@@ -3201,6 +3712,36 @@ fn mark_consumed_places<'input>(
             for s in block {
                 mark_consumed_stmt(s, non_copy, moved);
             }
+        }
+
+        // Array element move: `let x = arr[0]` or `let x = move arr[0]`.
+        // Mark the exact element place (ConstIndex/Index) as moved when the
+        // root is non-Copy. The `move` keyword on a Copy value is still a
+        // copy (ownership is not transferred), so we check non_copy in both
+        // cases. Do NOT recurse to base — `arr` itself is not consumed.
+        HirExpr::Index { index, .. } => {
+            if let Some(place) = hir_expr_place(e) {
+                if let Some(root) = place_root_symbol(&place) {
+                    if non_copy.contains(&root) {
+                        moved.insert(place);
+                    }
+                }
+            }
+            // The index expression may contain consumable sub-expressions.
+            mark_consumed_places(index, non_copy, moved);
+        }
+        // Struct field implicit move: `let x = obj.field` (when obj is non-Copy).
+        // Mark the exact field place as moved. Recurse into base because the
+        // base may itself be a consumed expression (e.g. function call result).
+        HirExpr::FieldAccess { base, .. } => {
+            if let Some(place) = hir_expr_place(e) {
+                if let Some(root) = place_root_symbol(&place) {
+                    if non_copy.contains(&root) {
+                        moved.insert(place);
+                    }
+                }
+            }
+            mark_consumed_places(base, non_copy, moved);
         }
 
         _ => {}
