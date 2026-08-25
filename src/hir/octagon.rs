@@ -2,10 +2,10 @@
 //! from `type_eq.rs` to keep the equality-checking module focused.
 //!
 //! A difference-bound matrix over **2n nodes** — `Xᵢ⁺ = 2i` (the variable)
-//! and `Xᵢ⁻ = 2i+1` (its negation) — with **strong closure** (Figure 8),
-//! meet/join/widen, and loop-transfer functions. There is NO implicit
-//! zero node: single-variable bounds live on the **self-dual edges**
-//! `m[2i][2i+1]` (`2Xᵢ ≤ 2c`, i.e. `Xᵢ ≤ c`) and `m[2i+1][2i]`
+//! and `Xᵢ⁻ = 2i+1` (its negation) — with **strong closure** ([Miné06]
+//! Figure 8), meet/join/widen, and loop-transfer functions. There is NO
+//! implicit zero node: single-variable bounds live on the **self-dual
+//! edges** `m[2i][2i+1]` (`2Xᵢ ≤ 2c`, i.e. `Xᵢ ≤ c`) and `m[2i+1][2i]`
 //! (`−2Xᵢ ≤ −2c`, i.e. `Xᵢ ≥ c`); the mirror of node `i` is `i ⊕ 1`, and
 //! the mirror of edge `(i, j)` is `(j⊕1, i⊕1)`.
 //!
@@ -15,6 +15,25 @@
 //! projections (`var_ub` / `var_lb` / `diff_bound` / `sum_ub`), never
 //! raw cells. External API accepts plain `c`, internal storage uses the
 //! doubled space.
+//!
+//! # References
+//!
+//! Citations in this module use the following shorthand:
+//!
+//! - `[Miné06]` — Antoine Miné, "The Octagon Abstract Domain",
+//!   Higher-Order and Symbolic Computation 19(1), 2006. The primary
+//!   source for the 2n-node DBM representation, strong closure
+//!   (Figure 8), coherence, join/widen, and the loop-transfer
+//!   functions. ("The octagon paper" below always means this one.)
+//! - `[Miné01]` — Antoine Miné, "A New Numerical Abstract Domain Based
+//!   on Difference-Bound Matrices", PADO II, LNCS 2053, 2001. The
+//!   earlier DBM-based domain that `[Miné06]` extends; cited here for
+//!   historical context, not for a specific algorithm used in this
+//!   module.
+//! - `[HS97]` — Warwick Harvey and Peter J. Stuckey, "A Unit Two
+//!   Variable Per Inequality Integer Constraint Solver for Constraint
+//!   Logic Programming", ACSC 1997. Source of the integer-tightening
+//!   step discussed in `[Miné06]` §V.D.
 
 /// `∞` marker — the largest representable bound (`i128::MAX / 4` keeps
 /// saturated additions from colliding with true `i128::MAX`).
@@ -34,8 +53,17 @@ pub(crate) fn sat_add(a: i128, b: i128) -> i128 {
 
 /// Saturated `a - b`.
 pub(crate) fn sat_sub(a: i128, b: i128) -> i128 {
-    if a == DBM_INF || b == DBM_INF {
-        return DBM_INF;
+    if a == DBM_INF && b == DBM_INF {
+        return DBM_INF; // ∞ - ∞ conservatively treated as ∞
+    }
+    if a == DBM_INF {
+        return DBM_INF; // ∞ - finite = ∞
+    }
+    if b == DBM_INF {
+        return i128::MIN; // finite - ∞ = -∞
+    }
+    if b == i128::MIN {
+        return DBM_INF; // finite - (-∞) = ∞
     }
     match a.checked_sub(b) {
         Some(s) if s < DBM_INF => s,
@@ -47,7 +75,10 @@ pub(crate) fn sat_sub(a: i128, b: i128) -> i128 {
 /// Saturated negation.
 pub(crate) fn sat_neg(a: i128) -> i128 {
     if a == DBM_INF {
-        return DBM_INF;
+        return i128::MIN; // -(+∞) = -∞
+    }
+    if a == i128::MIN {
+        return DBM_INF; // -(-∞) = +∞
     }
     match a.checked_neg() {
         Some(s) if s < DBM_INF => s,
@@ -79,6 +110,23 @@ pub(crate) fn sat_mul2(c: i128) -> i128 {
     }
 }
 
+/// Saturating multiplication by 2 for **bound insertion** (`set` /
+/// `set_mirrored`). Unlike `sat_mul2`, negative overflow weakens to
+/// `DBM_INF` (no bound) instead of `i128::MIN`: `i128::MIN` is reserved
+/// as the negative-infinity marker in `sat_sub`/`sat_neg`, so storing it
+/// as an edge bound would let the same cell value mean a finite bound in
+/// `node_bound` and `-∞` in `sat_sub` — an unsound collision. Weakening
+/// to no bound is the sound over-approximation.
+fn sat_mul2_bound(c: i128) -> i128 {
+    if c == DBM_INF {
+        return DBM_INF;
+    }
+    match c.checked_mul(2) {
+        Some(v) if v < DBM_INF && v > i128::MIN => v,
+        _ => DBM_INF, // out of finite range: weaken to no bound
+    }
+}
+
 /// Compute the mirror index for coherence: node `i` mirrors to `i ⊕ 1`
 /// (`Xᵢ⁺ = 2i ↔ Xᵢ⁻ = 2i+1`).
 #[inline]
@@ -88,7 +136,7 @@ const fn mirror_index(i: usize) -> usize {
 
 /// A difference-bound matrix over `2n` nodes: `Xᵢ⁺ = Xᵢ` and
 /// `Xᵢ⁻ = -Xᵢ`. `m[i][j]` encodes `node_i - node_j ≤ c` **in doubled
-/// space** (`m[i][j] = 2*c`). (The paper's convention is the transpose —
+/// space** (`m[i][j] = 2*c`). ([Miné06]'s convention is the transpose —
 /// `m⁺ᵢⱼ` bounds `vⱼ − vᵢ`; Figure 8's operators are unchanged
 /// under transposition.) Single-variable bounds hang on the
 /// self-dual edges: `m[2i][2i+1]` carries `2Xᵢ ≤ 2c` (stored `4c`),
@@ -104,13 +152,13 @@ pub(crate) struct Dbm {
 }
 
 /// Closure strategy — the Harvey–Stuckey integer-tightening profile
-/// (paper §V.D).
+/// ([HS97]; see [Miné06] §V.D).
 ///
-/// `Strong` is the paper's Figure 8 strong closure — sound over reals,
+/// `Strong` is [Miné06]'s Figure 8 strong closure — sound over reals,
 /// rationals AND integers (an over-approximation for the latter).
 ///
 /// `IntegerExact` additionally interleaves the HS tightening step
-/// (§V.D: `2x ≤ 2c+1 ⟹ 2x ≤ 2c` — knowing x is an integer, the
+/// ([Miné06] §V.D: `2x ≤ 2c+1 ⟹ 2x ≤ 2c` — knowing x is an integer, the
 /// self-dual edge constants round down) with re-closure until the
 /// closed-and-rounded fixpoint, at O(N⁴) cost (Strong alone is O(N³)).
 /// SOUND ONLY over INTEGER domains: over rationals the rounding
@@ -161,7 +209,7 @@ impl Dbm {
         if self.bottom {
             return;
         }
-        let stored = if c == DBM_INF { DBM_INF } else { sat_mul2(c) };
+        let stored = sat_mul2_bound(c);
         let idx = self.ix(i, j);
         if stored < self.m[idx] {
             self.m[idx] = stored;
@@ -179,28 +227,7 @@ impl Dbm {
 
     /// Internal helper: set a bound and its mirror in a raw matrix slice.
     fn set_mirrored_internal(m: &mut [i128], i: usize, j: usize, c: i128, size: usize) {
-        let stored = if c == DBM_INF {
-            DBM_INF
-        } else {
-            // Saturate on overflow to DBM_INF (conservative) or i128::MIN
-            // to preserve negative diagonal.
-            match c.checked_mul(2) {
-                Some(v) => {
-                    if v < DBM_INF {
-                        v
-                    } else {
-                        DBM_INF
-                    }
-                }
-                None => {
-                    if c < 0 {
-                        i128::MIN // underflow
-                    } else {
-                        DBM_INF
-                    }
-                }
-            }
-        };
+        let stored = sat_mul2_bound(c);
         let idx1 = i * size + j;
         if stored < m[idx1] {
             m[idx1] = stored;
@@ -234,19 +261,21 @@ impl Dbm {
         }
     }
 
-    /// Strong closure (Figure 8) preserving coherence and deriving
+    /// Strong closure ([Miné06] Figure 8) preserving coherence and deriving
     /// octagonal constraints. Returns `false` if the system is
     /// unsatisfiable (negative diagonal), setting `bottom = true`.
     pub(crate) fn close(&mut self) -> bool {
         self.close_with(ClosureMode::Strong)
     }
 
-    /// One pass of the strong closure (paper Figure 8): the C⁺_k / S⁺
-    /// interleaving over all k, in place. Extracted from `close_with`
+    /// One pass of the strong closure, adapted from [Miné06] Figure 8
+    /// (all-pivot variant — see the body comment on even-pivot
+    /// equivalence): the C⁺_k / S⁺ interleaving over all k, in place.
+    /// Extracted from `close_with`
     /// so `IntegerExact` can re-run it between Harvey–Stuckey
     /// tightening rounds without duplicating the loop body.
     fn strong_closure_pass(m: &mut [i128], size: usize) {
-        // The paper's loop applies C⁺ only at even pivots (Figure 8:
+        // [Miné06]'s loop applies C⁺ only at even pivots (its Figure 8:
         // S⁺(C⁺_{2k}(·))); C⁺_{k̄} has the same five terms as C⁺_k, so
         // iterating over all 2n nodes applies each pivot twice —
         // redundant work, same result.
@@ -256,7 +285,7 @@ impl Dbm {
         // five C⁺ terms below stay mirror-symmetric under `i ↦ i⊕1`.
         for k in 0..size {
             let k_bar = mirror_index(k);
-            // ---- C⁺_k (paper Figure 8). Each term is a path
+            // ---- C⁺_k ([Miné06] Figure 8). Each term is a path
             // i → … → j in the potential graph, so every arm of
             // the min is a sound bound on node_i − node_j:
             //   1. m[i][j]                         (direct)
@@ -267,7 +296,8 @@ impl Dbm {
             // The mirror of every term is again one of the five
             // terms of the mirrored entry (j̄, ī), so C⁺_k maps
             // coherent matrices to coherent matrices — the
-            // property Figure 8's C⁺ is designed around (§V.C).
+            // property [Miné06] Figure 8's C⁺ is designed around
+            // ([Miné06] §V.C).
             for i in 0..size {
                 for j in 0..size {
                     let mut best = m[i * size + j];
@@ -309,7 +339,7 @@ impl Dbm {
                     m[i * size + j] = best;
                 }
             }
-            // ---- S⁺ (paper Figure 8): m[i][j] ≤ (m[i][ī] + m[j̄][j]) / 2.
+            // ---- S⁺ ([Miné06] Figure 8): m[i][j] ≤ (m[i][ī] + m[j̄][j]) / 2.
             // In doubled storage the derived value is (t1+t2)/2 — e.g.
             // 2v₀ ≤ 1 ∧ 2v₁ ≤ 2 derives v₀+v₁ ≤ 1.5, stored 3. Odd sums
             // (two half-integer bounds compose
@@ -337,10 +367,10 @@ impl Dbm {
         }
     }
 
-    /// Harvey–Stuckey tightening (paper §V.D): round every
+    /// Harvey–Stuckey tightening ([HS97]; see [Miné06] §V.D): round every
     /// self-dual edge's stored bound down to a multiple of 4 — the
     /// edge (2v, 2v+1) carries `2x ≤ s/2` with 2x an EVEN integer, so
-    /// `2x ≤ s/2` ⟺ `2x ≤ 4⌊s/4⌋` over Z (the paper's undoubled rule
+    /// `2x ≤ s/2` ⟺ `2x ≤ 4⌊s/4⌋` over Z ([Miné06]'s undoubled rule
     /// `2x ≤ 2c+1 ⟹ 2x ≤ 2c`). Self-dual edges are their own mirrors,
     /// so coherence is preserved. Returns whether anything changed.
     /// `DBM_INF` is never rounded (it is not a bound).
@@ -366,22 +396,22 @@ impl Dbm {
             return false;
         }
         let size = self.size;
-        // Strong closure (paper Figure 8): one pass of the C⁺_k / S⁺
-        // interleaving over all k.
+        // Strong closure (all-pivot variant of [Miné06] Figure 8): one
+        // pass of the C⁺_k / S⁺ interleaving over all k.
         Self::strong_closure_pass(&mut self.m, size);
-        // ---- Harvey–Stuckey integer tightening (paper §V.D) ----
+        // ---- Harvey–Stuckey integer tightening ([HS97]; see [Miné06] §V.D) ----
         // `IntegerExact` interleaves the tightening around the closure
         // loops until a fixpoint (closed AND rounded — the normal form
         // Harvey–Stuckey build, O(N⁴)). The tightening rounds every
         // self-dual edge's stored bound down to a multiple of 4: the
         // edge carries `2x ≤ s/2`, and over INTEGERS 2x is even, so
-        // the constraint is equivalent to `2x ≤ 4⌊s/4⌋` (paper:
+        // the constraint is equivalent to `2x ≤ 4⌊s/4⌋` ([Miné06]:
         // `2x ≤ 2c+1 ⟹ 2x ≤ 2c`). Each constraint's integer solution
         // set is UNCHANGED by the rounding, so any prefix of the
         // iteration stays sound over integers — and unsound over
         // rationals (2x ≤ 5 admits x = 2.5; the tightened 2x ≤ 4 does
         // not): integer domains only. Rounds are capped defensively
-        // (HS need O(N); stopping early forfeits only normal-form
+        // (an engineering bound; stopping early forfeits only normal-form
         // tightness, never soundness).
         if mode == ClosureMode::IntegerExact {
             let max_rounds = size + 2;
@@ -462,7 +492,7 @@ impl Dbm {
         if r.bottom { Dbm::bottom() } else { r }
     }
 
-    /// Check the strong-closure invariants (paper Figure 8), read-only —
+    /// Check the strong-closure invariants ([Miné06] Figure 8), read-only —
     /// never repairs.  Four properties:
     ///
     /// 1. **Coherence**: `m[i][j] == m[j̄][ī]` (the mirrored entry).
@@ -549,7 +579,7 @@ impl Dbm {
     ///   - coherence: the mirror of a point-wise max is the point-wise
     ///     max of the mirrors (M_j̄ī = max(A_j̄ī, B_j̄ī) = M_ij);
     ///   - diagonal: min(0, 0) = 0.
-    /// (Miné 2001, Thm 7.3 remark: "if the two arguments of ∨ are
+    /// ([Miné06], Thm 7.3 remark: "if the two arguments of ∨ are
     /// strongly closed, then the result is also strongly closed.")
     ///
     /// # Bottom is unreachable (non-bottom operands)
@@ -561,7 +591,8 @@ impl Dbm {
     /// # IntegerExact note
     ///
     /// The max of two multiples of 4 is a multiple of 4, so this join
-    /// also preserves the Harvey–Stuckey rounded normal form (§V.D)
+    /// also preserves the Harvey–Stuckey rounded normal form
+    /// ([HS97]; see [Miné06] §V.D)
     /// whenever both operands carry it — this operation never exits it.
     ///
     /// # Precondition
@@ -605,8 +636,8 @@ impl Dbm {
     }
 
     /// widen (∇): termination-guaranteeing upper approximation.
-    /// Definition (paper): if new bound is ≤ old, keep old; otherwise ∞.
-    /// Does NOT call close after widening (paper §VI.D).
+    /// Definition ([Miné06]): if new bound is ≤ old, keep old; otherwise ∞.
+    /// Does NOT call close after widening ([Miné06] §VI.D).
     pub(crate) fn widen(&self, new: &Dbm) -> Dbm {
         if self.bottom {
             return new.clone();
@@ -660,11 +691,14 @@ impl Dbm {
     ///   δ(σ_j̄ − σ_ī) = δ(σ_i − σ_j), the same as (i, j) itself;
     /// - diagonal: σ_u − σ_u = 0, untouched — a zero diagonal cannot
     ///   become negative, so bottom is unreachable (non-bottom input).
-    ///   (Saturation corners: at δ = DBM_INF the early returns break the
-    ///   add-then-sub cancellation on BOTH self-loops; at δ = i128::MIN
-    ///   the sub-first diagonal m[q][q] overflows positive and lands on
-    ///   `_ => DBM_INF` — the code below restores the diagonal
-    ///   unconditionally, the Miné Fig. 7 `[C_k(n)]_ii ≜ 0` discipline.)
+    ///   (Saturation corners — δ = DBM_INF or δ = i128::MIN — never reach
+    ///   the raw update: the potential argument requires exact
+    ///   reweighting, so `assign_add_var` forgets the variable first; see
+    ///   below. Even on the finite-δ path an INDIVIDUAL entry can clip
+    ///   (e.g. `sat_add(20, δ) = DBM_INF` when `20 + δ ≥ DBM_INF`); the
+    ///   update tracks that and falls back to a closing pass — a clipped
+    ///   matrix is still a point-wise over-approximation of the exact
+    ///   reweighting, so closure restores strong closure soundly.)
     ///
     /// Every stored shift is even (δ = 2c), so the ceil-halving inside
     /// S⁺'s encoded form sees unchanged input parity.
@@ -672,44 +706,123 @@ impl Dbm {
     /// # IntegerExact note
     ///
     /// A self-dual edge shifts by ±2δ = ±4c, a multiple of 4: this
-    /// transfer PRESERVES the Harvey–Stuckey rounded normal form (§V.D),
+    /// transfer PRESERVES the Harvey–Stuckey rounded normal form
+    /// ([HS97]; see [Miné06] §V.D),
     /// so a follow-up `close_with(ClosureMode::IntegerExact)` is a no-op
     /// (the tightening step finds nothing to round).  The sole exception
-    /// is the saturation regime above (δ = DBM_INF or δ = i128::MIN),
-    /// where self-dual edges land on INF/saturated values and the mod-4
-    /// arithmetic is vacuous.
+    /// is the saturation regime (δ = DBM_INF or δ = i128::MIN), where the
+    /// variable is forgotten instead of shifted — no rounded-form claim.
+    /// Forget variable `i` (existential projection): drop its rows and
+    /// columns, then re-close. Used as the sound fallback when a
+    /// transfer function's result would be unrepresentable — the
+    /// weakened (unconstrained) result is an over-approximation, never
+    /// a spurious `bottom`.
+    fn forget_var(&self, i: usize) -> Dbm {
+        if self.bottom {
+            return Dbm::bottom();
+        }
+
+        let p = 2 * i;
+        let q = 2 * i + 1;
+        let mut m = self.m.clone();
+
+        for j in 0..self.size {
+            m[p * self.size + j] = DBM_INF;
+            m[q * self.size + j] = DBM_INF;
+            m[j * self.size + p] = DBM_INF;
+            m[j * self.size + q] = DBM_INF;
+        }
+
+        m[p * self.size + p] = 0;
+        m[q * self.size + q] = 0;
+
+        let mut r = Dbm {
+            size: self.size,
+            m,
+            bottom: false,
+        };
+        r.close();
+
+        if r.bottom { Dbm::bottom() } else { r }
+    }
+
     pub(crate) fn assign_add_var(&self, i: usize, c: i128) -> Dbm {
         if self.bottom {
             return Dbm::bottom();
         }
+        let delta = sat_mul2(c); // doubled space
+        // If the additive shift saturates (δ = DBM_INF positive, δ =
+        // i128::MIN negative), the potential reweighting is no longer
+        // exact: raw entries land on INF/saturated values, the no-close
+        // argument breaks, and `i128::MIN` cells collide with the -∞
+        // marker. The shifted bounds are unrepresentable — forget the
+        // variable (sound over-approximation) instead of shifting.
+        if delta == DBM_INF || delta == i128::MIN {
+            return self.forget_var(i);
+        }
         let p = 2 * i; // X⁺
         let q = 2 * i + 1; // X⁻
         let mut m = self.m.clone();
-        let delta = sat_mul2(c); // doubled space
+        // The no-close path is exact potential reweighting,
+        // m'[u][v] = m[u][v] + δ(σ_u − σ_v), which transports every
+        // closure inequality unchanged. Saturation of an INDIVIDUAL
+        // entry breaks that equality: a finite edge clipped to DBM_INF
+        // is a weakening, so a still-finite path i→…→j can force a
+        // tighter direct edge that the stored DBM_INF violates (triangle
+        // closure lost); a clip to i128::MIN collides with the −∞
+        // marker. Track both and fall back to a closing pass — the
+        // clipped matrix is a point-wise over-approximation of the exact
+        // reweighting, so closing it restores strong closure soundly.
+        let mut saturated = false;
         for j in 0..self.size {
-            m[p * self.size + j] = sat_add(m[p * self.size + j], delta);
-            m[j * self.size + p] = sat_sub(m[j * self.size + p], delta);
-            m[q * self.size + j] = sat_sub(m[q * self.size + j], delta);
-            m[j * self.size + q] = sat_add(m[j * self.size + q], delta);
+            let old = m[p * self.size + j];
+            let new = sat_add(old, delta);
+            saturated |=
+                (new == DBM_INF && old != DBM_INF) || (new == i128::MIN && old != i128::MIN);
+            m[p * self.size + j] = new;
+
+            let old = m[j * self.size + p];
+            let new = sat_sub(old, delta);
+            saturated |=
+                (new == DBM_INF && old != DBM_INF) || (new == i128::MIN && old != i128::MIN);
+            m[j * self.size + p] = new;
+
+            let old = m[q * self.size + j];
+            let new = sat_sub(old, delta);
+            saturated |=
+                (new == DBM_INF && old != DBM_INF) || (new == i128::MIN && old != i128::MIN);
+            m[q * self.size + j] = new;
+
+            let old = m[j * self.size + q];
+            let new = sat_add(old, delta);
+            saturated |=
+                (new == DBM_INF && old != DBM_INF) || (new == i128::MIN && old != i128::MIN);
+            m[j * self.size + q] = new;
         }
-        // The true self-loop is always exactly 0; both saturation
-        // corners (δ = DBM_INF: both diagonals via early returns;
-        // δ = i128::MIN: the sub-first diagonal m[q][q] — checked_sub(0,
-        // MIN) overflows POSITIVE at a = 0, misses the `a < 0 && b > 0`
-        // arm, lands on _ => DBM_INF, then nothing can cancel) are
-        // repaired by unconditional normalization — the same discipline
-        // as Miné Fig. 7's `[C_k(n)]_ii ≜ 0` — rather than by
-        // corner-matched guards.  No-op on the finite-δ path (the two
-        // writes cancel exactly in checked arithmetic), so it cannot
+        // The true self-loop is always exactly 0; unconditional
+        // normalization keeps the diagonal exact — the same discipline as
+        // [Miné06] Fig. 7's `[C_k(n)]_ii ≜ 0`. On the finite-δ path the two
+        // writes cancel exactly in checked arithmetic, so it cannot
         // over-trigger.
         m[p * self.size + p] = 0;
         m[q * self.size + q] = 0;
-        // Potential shift preserves strong closure (see doc): no close().
-        Dbm {
+        let mut r = Dbm {
             size: self.size,
             m,
             bottom: false,
+        };
+        if saturated {
+            // An entry clipped to a saturation sentinel breaks the exact
+            // reweighting, so strong closure is no longer transported by
+            // the potential-shift argument. Close the weakened matrix
+            // (see loop comment); the diagonal normalization above means
+            // bottom is unreachable, but keep the check for safety.
+            r.close();
+            if r.bottom {
+                return Dbm::bottom();
+            }
         }
+        r
     }
 
     /// `X := c`
@@ -717,6 +830,21 @@ impl Dbm {
         if self.bottom {
             return Dbm::bottom();
         }
+
+        // Upper stored bound is 4c, lower stored bound is -4c. If either
+        // would leave the finite range, the assignment is unrepresentable —
+        // forget the variable (sound over-approximation) rather than encode
+        // a one-sided bound that closure could treat as inconsistency.
+        let upper = c.checked_mul(4);
+        let lower = c.checked_mul(-4);
+
+        let exact = matches!(upper, Some(v) if v < DBM_INF && v > i128::MIN)
+            && matches!(lower, Some(v) if v < DBM_INF && v > i128::MIN);
+
+        if !exact {
+            return self.forget_var(i);
+        }
+
         let p = 2 * i; // X⁺
         let q = 2 * i + 1; // X⁻
         let mut m = self.m.clone();
@@ -733,8 +861,13 @@ impl Dbm {
         // X ≤ c => X⁺ - X⁻ ≤ 2c (stored 4c)
         // X ≥ c => X⁻ - X⁺ ≤ -2c (stored -4c)
         // set_mirrored_internal mirrors a self-dual edge to itself.
-        Self::set_mirrored_internal(&mut m, p, q, 2 * c, self.size);
-        Self::set_mirrored_internal(&mut m, q, p, -2 * c, self.size);
+        // With the exact-range check above, sat_mul2(c) and
+        // sat_mul2(sat_neg(c)) are guaranteed finite (2c and -2c stay in
+        // range), so the edges never saturate.
+        let upper_actual = sat_mul2(c);
+        let lower_actual = sat_mul2(sat_neg(c));
+        Self::set_mirrored_internal(&mut m, p, q, upper_actual, self.size);
+        Self::set_mirrored_internal(&mut m, q, p, lower_actual, self.size);
         let mut r = Dbm {
             size: self.size,
             m,
@@ -746,6 +879,9 @@ impl Dbm {
 
     /// `X := Y`
     pub(crate) fn assign_copy_var(&self, i: usize, j: usize) -> Dbm {
+        if i == j {
+            return self.clone();
+        }
         if self.bottom {
             return Dbm::bottom();
         }
@@ -787,7 +923,7 @@ impl Dbm {
             return Dbm::bottom();
         }
         let mut r = self.clone();
-        r.set_mirrored(2 * i, 2 * i + 1, 2 * c);
+        r.set_mirrored(2 * i, 2 * i + 1, sat_mul2(c));
         r.close();
         if r.bottom { Dbm::bottom() } else { r }
     }
@@ -799,7 +935,7 @@ impl Dbm {
             return Dbm::bottom();
         }
         let mut r = self.clone();
-        r.set_mirrored(2 * i + 1, 2 * i, -2 * c);
+        r.set_mirrored(2 * i + 1, 2 * i, sat_mul2(sat_neg(c)));
         r.close();
         if r.bottom { Dbm::bottom() } else { r }
     }
@@ -841,13 +977,27 @@ impl Dbm {
     /// self-dual edge may carry `2X ≥ 2c+1` (stored `-(4c+1)`), whose
     /// exact integer lower bound is `c+1` — `floor((4c+1)/4) = c` would
     /// be one-off-weak.
+    ///
+    /// Saturation behavior:
+    /// Strong closure can produce the self-dual cell
+    /// `m[2i+1][2i] = i128::MIN`, which represents the lower-bound
+    /// constraint `X⁻ - X⁺ ≤ -2^127` (i.e. `X ≥ 2^125` exactly).
+    /// `node_bound` reads this as `-2^126`; then `sat_neg(-2^126)`
+    /// attempts to compute `+2^126`, which is above the finite
+    /// representable range and therefore saturates to `DBM_INF`.
+    /// `DBM_INF` is the module's "no finite bound" sentinel; returning
+    /// `Some(DBM_INF)` would be both wrong and ambiguous. The current
+    /// implementation maps that clipped value back to `None` (∞), the
+    /// sound over-approximation for an unrepresentable lower bound.
     #[allow(dead_code)]
     pub(crate) fn var_lb(&self, i: usize) -> Option<i128> {
-        self.node_bound(2 * i + 1, 2 * i).map(|v| sat_neg(v >> 1))
+        self.node_bound(2 * i + 1, 2 * i)
+            .map(|v| sat_neg(v >> 1))
+            .and_then(|b| if b == DBM_INF { None } else { Some(b) })
     }
 
     /// Semantic projection: `Xᵢ + Xⱼ ≤ c` or `None` (∞) — the sum rides
-    /// the edge `X⁺ᵢ − X⁻ⱼ` (paper Figure 5: `vᵢ + vⱼ ≤ c` ⟺
+    /// the edge `X⁺ᵢ − X⁻ⱼ` ([Miné06] Figure 5: `vᵢ + vⱼ ≤ c` ⟺
     /// `v⁺ᵢ − v⁻ⱼ ≤ c`), whose edge constant IS the semantic bound (no
     /// extra halving beyond `node_bound`'s).
     #[allow(dead_code)]
@@ -890,7 +1040,7 @@ mod tests {
         d.set(0, 1, 0); // X⁺ - X⁻ ≤ 0 ⟹ X ≤ 0
         assert!(!d.close());
         assert!(d.bottom);
-        // ⊥ is the identity of ⊔ (paper §VII.A): join(⊥, ⊤) = ⊤.
+        // ⊥ is the identity of ⊔ ([Miné06] §VII.A): join(⊥, ⊤) = ⊤.
         // dbm_fixpoint relies on this semantics to handle infeasible
         // bodies (join(cur, ⊥) = cur).
         let j = d.join(&Dbm::new(1));
@@ -948,18 +1098,23 @@ mod tests {
         assert_eq!(d.var_ub(1), Some(3));
         assert_eq!(d.sum_ub(0, 1), Some(8), "interval→sum via self-dual edges");
 
-        // C. S⁺ self-dual composition (paper Figure 9): 2X ≤ 1 ∧ 2Y ≤ 2
-        // ⟹ X+Y ≤ 1.5; the integer tight read is 1 (node_bound's floor
-        // semantics, see its docs).
+        // C. A Figure-9-style S⁺ self-dual composition ([Miné06] Figure 9):
+        // 2X ≤ 1 ∧ 2Y ≤ 2 ⟹ X+Y ≤ 1.5; the integer tight read is 1
+        // (node_bound's floor semantics, see its docs).
         let mut d = Dbm::new(2);
         d.set_mirrored(0, 1, 1);
         d.set_mirrored(2, 3, 2);
         assert!(d.close());
-        assert_eq!(d.sum_ub(0, 1), Some(1), "S⁺ composition (Figure 9)");
+        assert_eq!(
+            d.sum_ub(0, 1),
+            Some(1),
+            "S⁺ composition (cf. [Miné06] Figure 9)"
+        );
     }
 
-    /// The Figure 6 case (Harvey–Stuckey integer tightening, paper
-    /// §V.D): `2x ≤ 1 ∧ 2x ≥ 1` is real-satisfiable (x = 0.5) but
+    /// A Figure-6-style half-integer integer-unsatisfiable case
+    /// (cf. [Miné06] Figure 6 and §V.D; Harvey–Stuckey tightening [HS97]):
+    /// `2x ≤ 1 ∧ 2x ≥ 1` is real-satisfiable (x = 0.5) but
     /// integer-UNsatisfiable (2x is even); IntegerExact rounds both
     /// self-dual edges (`2x ≤ 1` → `2x ≤ 0`, `2x ≥ 1` → `2x ≥ 2`) and
     /// closes to ⊥, while Strong (the real/rational reading) stays sat.
@@ -978,7 +1133,7 @@ mod tests {
         );
     }
 
-    /// The paper's Figure 9 composition over integers —
+    /// A [Miné06] Figure-9-style composition over integers —
     /// `2v₀ ≤ 1 ∧ 2v₁ ≤ 2`. Strong derives `v₀+v₁ ≤ 1.5` (stored 3,
     /// pinned by `test_strong_closure_deduces_sum`); IntegerExact
     /// first rounds `2v₀ ≤ 1` to `2v₀ ≤ 0`, and the re-run S⁺ then
@@ -1135,7 +1290,7 @@ mod tests {
         }
     }
     fn reference_assign_add(a: &Dbm, i: usize, c: i128) -> Dbm {
-        // The with-close() reference path (the pre-change implementation).
+        // Reference path that always applies close() after the raw update.
         let p = 2 * i;
         let q = 2 * i + 1;
         let mut m = a.m.clone();
@@ -1169,18 +1324,35 @@ mod tests {
             assert!(!fast.bottom);
             assert!(fast.is_strongly_closed());
         }
-        // Saturation corners: c = i128::MAX/4 drives δ to DBM_INF
-        // (positive saturation — breaks both diagonals); c = −2^126
-        // drives δ to i128::MIN through the `Some` arm (negative
-        // saturation — breaks only the sub-first diagonal m[q][q]).
-        // reference_assign_add closes, which normalizes the diagonal, so
-        // bit-equality plus is_strongly_closed catches either corner.
-        for &(i, c) in &[(0usize, i128::MAX / 4), (0, -(1i128 << 126))] {
+        // A large-but-representable finite δ (c = ±(DBM_INF/4 − 1)): no
+        // entry saturates, so the no-close fast path and the closing
+        // reference still agree exactly.
+        for &(i, c) in &[(0usize, DBM_INF / 4 - 1), (0, -(DBM_INF / 4 - 1))] {
             let fast = a.assign_add_var(i, c);
             let slow = reference_assign_add(&a, i, c);
-            assert_eq!(fast, slow, "saturation corner (i={}, c={})", i, c);
+            assert_eq!(
+                fast, slow,
+                "large finite-delta mismatch at (i={}, c={})",
+                i, c
+            );
             assert!(!fast.bottom);
             assert!(fast.is_strongly_closed());
+        }
+        // Saturation corners: c = i128::MAX/4 drives δ to DBM_INF
+        // (positive saturation); c = −2^126 drives δ to i128::MIN — the
+        // exact doubled value collides with the −∞ marker. The shift is
+        // unrepresentable, so assign_add_var forgets the variable (sound
+        // over-approximation), never bottom.
+        for &(i, c) in &[(0usize, i128::MAX / 4), (0, -(1i128 << 126))] {
+            let r = a.assign_add_var(i, c);
+            assert!(
+                !r.bottom,
+                "saturation corner (i={}, c={}) must not be bottom",
+                i, c
+            );
+            assert_eq!(r.var_ub(i), None, "saturation corner (i={}, c={})", i, c);
+            assert_eq!(r.var_lb(i), None, "saturation corner (i={}, c={})", i, c);
+            assert!(r.is_strongly_closed());
         }
         // Half-integer derived bounds shift through unchanged parity.
         let mut h = Dbm::new(2);
@@ -1209,7 +1381,7 @@ mod tests {
         // Both operands closed under IntegerExact: every finite
         // self-dual stored bound is a multiple of 4; the point-wise max
         // of two multiples of 4 is a multiple of 4 — join never exits
-        // the Harvey–Stuckey rounded normal form (§V.D).
+        // the Harvey–Stuckey rounded normal form ([HS97]; see [Miné06] §V.D).
         let mut a = Dbm::new(2);
         a.set_mirrored(0, 1, 5); // 2x ≤ 5 → rounds to 2x ≤ 4
         a.set_mirrored(1, 0, -2); // 2x ≥ 2 (stored −4, clean)
@@ -1229,4 +1401,177 @@ mod tests {
             }
         }
     }
+}
+
+#[test]
+fn test_overflow_and_edge_cases() {
+    // 1. assign_const_var with the largest exactly representable constant:
+    //    the self-dual edges store ±4c, so 4c must stay below DBM_INF.
+    let d = Dbm::new(1);
+    let max_var = DBM_INF / 4 - 1;
+    let r = d.assign_const_var(0, max_var);
+    assert!(
+        !r.bottom,
+        "assign_const_var should not collapse to bottom on large valid constants"
+    );
+    assert_eq!(r.var_ub(0), Some(max_var));
+    assert_eq!(r.var_lb(0), Some(max_var));
+
+    // 2. assign_const_var with an unrepresentable constant forgets the
+    //    variable: 4c reaches/exceeds DBM_INF (positive side), or -4c
+    //    does (negative side). No one-sided bound is encoded. (Note the
+    //    floor division: DBM_INF = 2^125 − 1, so DBM_INF/4 = 2^123 − 1 is
+    //    still representable; +1/−1 steps to the first out-of-range c.)
+    let too_big = DBM_INF / 4 + 1; // 4c = 2^125 ≥ DBM_INF
+    let r = Dbm::new(1).assign_const_var(0, too_big);
+    assert!(!r.bottom);
+    assert_eq!(r.var_ub(0), None);
+    assert_eq!(r.var_lb(0), None);
+
+    let too_neg = -(DBM_INF / 4) - 1; // -4c = 2^125 ≥ DBM_INF
+    let r = Dbm::new(1).assign_const_var(0, too_neg);
+    assert!(!r.bottom);
+    assert_eq!(r.var_ub(0), None);
+    assert_eq!(r.var_lb(0), None);
+
+    // 3. test_le_var with an unrepresentable constant weakens to no bound
+    let d = Dbm::new(1);
+    let c = (i128::MAX / 2) + 1; // 2^126: 4c overflows the finite range
+    let r = d.test_le_var(0, c);
+    assert!(!r.bottom);
+    assert_eq!(r.var_ub(0), None);
+
+    // 4. test_ge_var with an unrepresentable constant weakens to no bound
+    let d = Dbm::new(1);
+    let c_neg = i128::MIN / 2; // -2^126
+    let r = d.test_ge_var(0, c_neg);
+    assert!(!r.bottom);
+    assert_eq!(r.var_lb(0), None);
+
+    // 5. assign_copy_var(i, i) preserves matrix exactly
+    let mut d = Dbm::new(2);
+    d.set_mirrored(0, 1, 10); // X <= 5
+    d.set_mirrored(2, 3, 4); // Y <= 2
+    d.close();
+    let original = d.clone();
+    let copied = d.assign_copy_var(0, 0);
+    assert_eq!(
+        original, copied,
+        "assign_copy_var(i, i) must be a no-op identity"
+    );
+}
+
+/// Regression test: individual-entry saturation in `assign_add_var`.
+///
+/// Even when the additive shift `δ` itself is finite, a particular matrix
+/// entry may clip to a saturation sentinel. For example,
+/// `c = (DBM_INF − 7) / 2 = 2^124 − 4` gives `δ = 2c = DBM_INF − 7`.
+/// Then `8 + δ = 2^125 ≥ DBM_INF`, so the direct edge clips to `DBM_INF`.
+/// The exact shifted bound is unrepresentable; clipping to `DBM_INF`
+/// is the sound weakening. The update detects any clipped entry and
+/// falls back to a closing pass. This test verifies the result remains
+/// strongly closed and non-bottom.
+#[test]
+fn test_assign_add_var_saturation_closes() {
+    let mut a = Dbm::new(2);
+    a.set_mirrored(0, 1, 2); // X⁺ − X⁻ ≤ 2 (2X ≤ 2): stored 4
+    a.set_mirrored(1, 2, 2); // X⁻ − Z⁺ ≤ 2: stored 4 (+ mirror (3,0))
+    a.set_mirrored(0, 2, 4); // X⁺ − Z⁺ ≤ 4: stored 8 (+ mirror (3,1))
+    assert!(a.close());
+    assert_eq!(a.m[0 * a.size + 2], 8);
+    assert!(a.is_strongly_closed());
+
+    let c = (DBM_INF - 7) / 2; // δ = 2c = DBM_INF − 7 (even, no floor loss)
+    let r = a.assign_add_var(0, c);
+    assert!(!r.bottom);
+    assert!(r.is_strongly_closed(), "saturated update must stay closed");
+    // 8 + δ = 2^125 is unrepresentable; the sound weakening is DBM_INF.
+    // The X⁻ path also dies (the self-dual edge shifts by 2δ and clips),
+    // so closure cannot recover anything finite here.
+    assert_eq!(
+        r.m[0 * r.size + 2],
+        DBM_INF,
+        "clipped edge stays a sound weakening"
+    );
+    assert_eq!(r.m[3 * r.size + 1], DBM_INF, "mirror clipped coherently");
+}
+
+/// The same fallback, demonstrated on a deliberately loose input: the
+/// direct edge clips to `DBM_INF` while a two-edge path stays finite, so
+/// the raw no-close result would violate triangle closure. This is the
+/// exact interaction the saturation tracking guards against. On a
+/// strictly closed input, closure inequalities would force the path ≥
+/// direct edge, so a clip would weaken the path too and the raw result
+/// would stay closed by itself; the fallback guarantees the
+/// strong-closure postcondition for ANY input, closed or not.
+#[test]
+fn test_assign_add_var_saturation_repairs_loose_input() {
+    let mut a = Dbm::new(2);
+    a.set_mirrored(0, 1, 2); // X⁺ − X⁻ ≤ 2: stored 4
+    a.set_mirrored(0, 2, 1); // X⁺ − Z⁺ ≤ 1: stored 2 (+ mirror (3,1))
+    a.set_mirrored(2, 3, 2); // Z⁺ − Z⁻ ≤ 2 (2Z ≤ 2): stored 4
+    a.set_mirrored(0, 3, 5); // X⁺ − Z⁻ ≤ 5: stored 10 (+ mirror (2,1))
+    // The direct edge (10) is looser than the path X⁺→Z⁺→Z⁻ (2 + 4):
+    // coherent but NOT strongly closed.
+    assert!(!a.is_strongly_closed(), "premise: loose input");
+
+    let c = (1i128 << 124) - 4; // δ = 2c = 2^125 − 8 = DBM_INF − 7
+    let r = a.assign_add_var(0, c);
+    assert!(!r.bottom);
+    // Raw shift: direct edge clips to DBM_INF (10 + δ ≥ DBM_INF) while
+    // the shifted path X⁺→Z⁺→Z⁻ = (2 + δ) + 4 = 2^125 − 2 stays finite —
+    // the raw no-close result would violate triangle closure. The
+    // fallback closing pass recovers the path bound.
+    assert!(
+        r.is_strongly_closed(),
+        "fallback close must repair the loose input"
+    );
+    assert_eq!(
+        r.m[0 * r.size + 3],
+        (1i128 << 125) - 2,
+        "direct edge re-closed to the surviving path bound"
+    );
+    assert_eq!(
+        r.m[2 * r.size + 1],
+        (1i128 << 125) - 2,
+        "mirror edge recovered coherently"
+    );
+}
+
+/// Saturated lower-bound projection must return `None`, not a clipped
+/// sentinel.
+///
+/// Strong closure can produce the self-dual cell
+/// `m[2i+1][2i] = i128::MIN`, which represents the constraint
+/// `X⁻ − X⁺ ≤ −2^127` (i.e. `X ≥ 2^125` exactly). The projection path is:
+/// `node_bound` reads this as `−2^126`, then `sat_neg(−2^126)` attempts
+/// to compute `+2^126`, which exceeds the finite representable range and
+/// saturates to `DBM_INF`. Because `DBM_INF` is the module's "no finite
+/// bound" sentinel, returning `Some(DBM_INF)` would be both wrong and
+/// ambiguous. The current implementation maps that clipped value back to
+/// `None` (∞), which is the sound over-approximation for an
+/// unrepresentable lower bound.
+#[test]
+fn test_var_lb_saturated_lower_edge_is_none() {
+    let mut d = Dbm::new(2);
+    // Raw writes: closure composes X⁻→Z⁺ and Z⁺→X⁺ into
+    // X⁻−X⁺ ≤ −2^127 = i128::MIN (self-dual lower edge of X).
+    d.m[1 * d.size + 2] = -(1i128 << 126); // X⁻ − Z⁺ ≤ −2^126
+    d.m[3 * d.size + 0] = -(1i128 << 126); // mirror of (1,2)
+    d.m[2 * d.size + 0] = -(1i128 << 126); // Z⁺ − X⁺ ≤ −2^126
+    d.m[1 * d.size + 3] = -(1i128 << 126); // mirror of (2,0)
+    assert!(d.close(), "constraints are satisfiable (no negative cycle)");
+    assert!(!d.bottom);
+    assert_eq!(
+        d.m[1 * d.size + 0],
+        i128::MIN,
+        "closure must produce the saturated self-dual cell"
+    );
+    // The current projection maps the clipped result back to None.
+    assert_eq!(
+        d.var_lb(0),
+        None,
+        "saturated lower bound projects to ∞, not Some(DBM_INF)"
+    );
+    assert_eq!(d.var_ub(0), None);
 }
