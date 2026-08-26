@@ -2,20 +2,20 @@ use super::*;
 
 impl<'input> TypeContext<'input> {
     /// Apply Yoneda reduction if this type matches the pattern
-    /// `∀X. (A ⇒ X) ⇒ B⟨X⟩`  →  `B[X ↦ A]`
-    /// or `∀X. (X ⇒ A) ⇒ B⟨X⟩`  →  `B[X ↦ A]`.
-    /// Matches both explicit `Forall` nodes and implicit `Fn`-encoded patterns.
+    ///  `∀X. (A ⇒ X) ⇒ B⟨X⟩`   →   `B[X ↦ A]`
+    /// or  `∀X. (X ⇒ A) ⇒ B⟨X⟩`   →   `B[X ↦ A]` .
+    /// Matches both explicit  `Forall`  nodes and implicit  `Fn` -encoded patterns.
     ///
     /// Uses iteration with convergence detection (max 10 rounds) to handle
     /// chained reductions like Forall(X, Forall(Y, ...)) where reducing the
     /// outer Forall exposes a new reducible inner Forall. This follows the
     /// same convergence principle as Yen's KSP algorithm:
-    /// "keep iterating until no more candidates can be generated".
+    ///  "keep iterating until no more candidates can be generated ".
     pub fn try_yoneda_reduce(&mut self, ty: TypeId) -> TypeId {
         // Limit iterations to prevent DoS from maliciously constructed types.
         // In practice, Yoneda/co-Yoneda reduction converges in ≤3 iterations
         // because each pass either eliminates a Forall node or reaches a
-        // fixed point.  10 is a generous safety ceiling.
+        // fixed point. 10 is a generous safety ceiling.
         const MAX_ITERATIONS: usize = 10;
         let mut result = ty;
         for _iteration in 0..MAX_ITERATIONS {
@@ -30,7 +30,7 @@ impl<'input> TypeContext<'input> {
 
     /// Single-pass Yoneda reduction (used internally by `try_yoneda_reduce`).
     ///
-    /// Matches the ≡_X / ≡_X schemas from Pistone & Tranchini (2022) §2.
+    /// Matches the ≡_X / ≡^X schemas from Pistone & Tranchini (2022) §2.
     /// These are type-level instances of the Yoneda Lemma and its dual
     /// (Mac Lane §III.2): Nat(D(r, —), K) ≅ K(r), applied to the
     /// representable functor D(X, —) in the category of types.
@@ -42,16 +42,54 @@ impl<'input> TypeContext<'input> {
     /// ∀Y⃗. B⟨X ↦ Σₖ ∃Z⃗ₖ. Πⱼ Aⱼₖ⟨X⟩⟩
     /// ```
     ///
-    /// **≡_X (co-Yoneda)** – each branch's *first param* is the bound variable X:
+    /// **≡^X (co-Yoneda)** – each branch's *first param* is the bound variable X:
     /// ```text
     /// ∀X. ∀Y⃗. ⟨ ∀Z⃗ₖ. X ⇒ Aⱼ⟨X⟩ ⟩ₖ ⇒ B⟨X⟩
-    ///   ≡_X
+    ///   ≡^X
     /// ∀Y⃗. B⟨X ↦ νX. ∀Z⃗ₖ. Πⱼ Aⱼ⟨X⟩⟩
     /// ```
     ///
-    /// Terms: `Σₖ` = sum (multi-branch → Tuple of results), `Πⱼ` = product (Tuple),
+    /// Terms: `Σₖ` = coproduct (multi-branch → sum of branch replacements), `Πⱼ` = product (Tuple),
     /// `∃Z⃗ₖ` = Exists node when the branch has inner quantifiers.
     /// μX/νX fixpoints are elided when X does not appear in B⟨X⟩ (common case).
+    ///
+    /// ## Dual-Track Candidate Strategy
+    ///
+    /// When a branch is `X ⇒ X`, it simultaneously matches the Yoneda pattern
+    /// (`ret == X`) and the co-Yoneda pattern (`ips[0] == X`). A greedy local
+    /// choice would commit to Yoneda and potentially fail the global variance
+    /// check, missing a valid co-Yoneda reduction (e.g., `∀X.(X⇒X)⇒(X⇒D)`).
+    ///
+    /// To solve this, we collect candidates for BOTH schemas independently
+    /// (Dual-Track), and then adjudicate globally based on the variance of `B⟨X⟩`.
+    /// If `X ∉ FV(ret)`, both variance checks vacuously pass, and both paths
+    /// yield the exact same result (the replacement is ignored by `replace_generic`),
+    /// making the Yoneda-first preference mathematically safe.
+    ///
+    /// ## Conservatism & Scope
+    ///
+    /// This implementation is intentionally a **conservative, fail-closed subset**
+    /// of the full paper's reduction:
+    /// - **Root-only rewriting:** We only attempt reduction at the head redex
+    ///   immediately after stripping outer `∀Y⃗`. Nested redexes (e.g. inside Tuples
+    ///   or ADT args) are not recursively traversed here. This is deliberate; nested
+    ///   normalization is handled by the outer type equivalence/solver loop.
+    /// - **Shallow βη pre-normalization:** We only flatten one level of
+    ///   Tuple-of-Fn branches. We deliberately skip deep associativity normalization
+    ///   and bare `X` branches (which would imply `∀X.X ≡ 1`). This avoids the most
+    ///   contentious instances of ε-theory (parametricity) that may not hold in
+    ///   standard Set semantics with empty types.
+    ///
+    /// ## Soundness Invariants
+    ///
+    /// The correctness of this reduction relies on the following system-level invariants:
+    /// 1. `check_variance` correctly handles binder shadowing (flips signs for Fn params,
+    ///    preserves for Tuple/Coproduct/Forall/Exists/Mu/Nu bodies).
+    /// 2. `replace_generic` is capture-avoiding (respects binder shadowing).
+    /// 3. `fresh_param_index` generates globally unique, monotonically increasing indices
+    ///    that never collide with existing bound variables in the context.
+    /// 4. `TypeId` equality is structural (or interned), ensuring convergence detection
+    ///    (`result == before`) works correctly.
     ///
     /// ## Note on partial solving (2026-07)
     ///
@@ -97,18 +135,14 @@ impl<'input> TypeContext<'input> {
                     _ => break,
                 }
             }
+
             let body_data = self.get_arc(inner);
             if let TypeData::Fn { params, ret } = &*body_data {
                 let pi = *param_index;
                 let ret = *ret;
-                let mut branch_replacements: Vec<TypeId> = Vec::new();
-                let mut is_coyoneda = false;
-                // co-Yoneda (≡_X): no Σₖ — multiple branches combine via product,
-                // not coproduct. Each branch's Aⱼ = whole function tail after X.
-                // (Pistone & Tranchini 2022 §2, ≡_X formula)
-                let mut coyoneda_replacements: Vec<TypeId> = Vec::new();
+
                 // βη normalization: expand Tuple-of-Fn branches into separate branches.
-                // (Pistone & Tranchini 2022 §2, βη-isomorphisms: (A→C)×(B→C) ≅ (A+B)→C)
+                // (Pistone & Tranchini 2022 §2, βη-isomorphisms: currying (A×B)→C ≡ A→(B→C))
                 // A single branch that is a Tuple of Fns is expanded so that each
                 // Fn component becomes an independent branch for Yoneda/co-Yoneda matching.
                 let mut normalized_params: Vec<TypeId> = Vec::with_capacity(params.len());
@@ -121,12 +155,24 @@ impl<'input> TypeContext<'input> {
                         _ => normalized_params.push(b),
                     }
                 }
+
+                if normalized_params.is_empty() {
+                    return ty;
+                }
+
+                // ── Dual-Track Candidate Collection ─────────────────────────
+                // We collect candidates for BOTH schemas independently.
+                let mut yoneda_candidates: Vec<Option<TypeId>> =
+                    Vec::with_capacity(normalized_params.len());
+                let mut coyoneda_candidates: Vec<Option<TypeId>> =
+                    Vec::with_capacity(normalized_params.len());
+
                 for &branch in &normalized_params {
                     // Peel outer Forall layers (∀Z⃗ₖ).
                     let mut inner_quantifiers: Vec<(usize, Symbol)> = Vec::new();
-                    let mut inner = branch;
+                    let mut inner_branch = branch;
                     loop {
-                        let inner_data = self.get_arc(inner);
+                        let inner_data = self.get_arc(inner_branch);
                         match &*inner_data {
                             TypeData::Forall {
                                 param_index: fi,
@@ -134,32 +180,28 @@ impl<'input> TypeContext<'input> {
                                 body: b,
                             } => {
                                 inner_quantifiers.push((*fi, *fn_));
-                                inner = *b;
+                                inner_branch = *b;
                             }
                             _ => break,
                         }
                     }
-                    let inner_data = self.get_arc(inner);
+
+                    let mut yoneda_repl = None;
+                    let mut coyoneda_repl = None;
+
+                    let inner_data = self.get_arc(inner_branch);
                     if let TypeData::Fn {
                         params: ips,
                         ret: ir,
                     } = &*inner_data
                     {
                         // Check ≡_X (Yoneda): ir = GenericParam(pi)
-                        let yoneda_match = match self.get(*ir) {
-                            TypeData::GenericParam { index, .. } if *index == pi => true,
-                            _ => false,
-                        };
-                        // Check ≡_X (co-Yoneda): ips[0] = GenericParam(pi)
-                        let coyoneda_match = if !ips.is_empty() {
-                            match self.get(ips[0]) {
-                                TypeData::GenericParam { index, .. } if *index == pi => true,
-                                _ => false,
-                            }
-                        } else {
-                            false
-                        };
-                        // Process Yoneda case
+                        let yoneda_match = matches!(self.get(*ir), TypeData::GenericParam { index, .. } if *index == pi);
+
+                        // Check ≡^X (co-Yoneda): ips[0] = GenericParam(pi)
+                        let coyoneda_match = !ips.is_empty()
+                            && matches!(self.get(ips[0]), TypeData::GenericParam { index, .. } if *index == pi);
+
                         if yoneda_match {
                             let product = if ips.len() == 1 {
                                 ips[0]
@@ -174,7 +216,7 @@ impl<'input> TypeContext<'input> {
                                 // with a globally-unique index (via fresh_param_index) that
                                 // also cannot collide with pi, preventing false positives
                                 // in needs_fix while guaranteeing full capture avoidance.
-                                for (eq, en) in &inner_quantifiers {
+                                for (eq, en) in inner_quantifiers.iter().rev() {
                                     let mut fresh_idx = self.fresh_param_index();
                                     if fresh_idx == pi {
                                         fresh_idx = self.fresh_param_index();
@@ -193,13 +235,11 @@ impl<'input> TypeContext<'input> {
                                 }
                                 w
                             };
-                            branch_replacements.push(repl);
+                            yoneda_repl = Some(repl);
                         }
-                        // Process co-Yoneda case (only if not already handled by Yoneda)
-                        if !yoneda_match && coyoneda_match {
-                            is_coyoneda = true;
-                            // ≡_X: each branch's Aⱼ = the whole function tail after X
-                            // (Pistone & Tranchini 2022 §2, ≡_X formula).
+
+                        if coyoneda_match {
+                            // ≡^X: each branch's Aⱼ = the whole function tail after X
                             // Multiple branches combine via product, NOT coproduct.
                             let replacement = if ips.len() <= 1 {
                                 *ir
@@ -210,7 +250,7 @@ impl<'input> TypeContext<'input> {
                                 replacement
                             } else {
                                 let mut w = replacement;
-                                for (eq, en) in &inner_quantifiers {
+                                for (eq, en) in inner_quantifiers.iter().rev() {
                                     let mut fresh_idx = self.fresh_param_index();
                                     if fresh_idx == pi {
                                         fresh_idx = self.fresh_param_index();
@@ -221,99 +261,93 @@ impl<'input> TypeContext<'input> {
                                 }
                                 w
                             };
-                            coyoneda_replacements.push(repl);
+                            coyoneda_repl = Some(repl);
                         }
                     }
+
+                    yoneda_candidates.push(yoneda_repl);
+                    coyoneda_candidates.push(coyoneda_repl);
                 }
-                // ≡_X and ≡^X are exclusive global patterns (paper §2):
-                // ALL branches must match the SAME schema.  Mixed branches
-                // (some Yoneda, some co-Yoneda) cannot be reduced.
-                if !branch_replacements.is_empty() && !coyoneda_replacements.is_empty() {
-                    return ty;
-                }
-                // EVERY parameter must match the schema — a non-matching
-                // parameter (e.g. `Int` in `∀X. (A → X) → Int → X`) aborts
-                // the reduction (fail-closed): silently dropping it would
-                // equate `A` with `Int → A`, breaking type soundness.
-                let total_matches = branch_replacements.len() + coyoneda_replacements.len();
-                if total_matches == 0 || total_matches != normalized_params.len() {
+
+                let all_yoneda = yoneda_candidates.iter().all(|c| c.is_some());
+                let all_coyoneda = coyoneda_candidates.iter().all(|c| c.is_some());
+
+                if !all_yoneda && !all_coyoneda {
                     return ty;
                 }
 
-                // ── Variance preconditions (Pistone & Tranchini 2022 §2) ──
-                // Yoneda (≡_X) requires B⟨X⟩ to be entirely positive, and each
-                // replacement Σₖ ∃Z⃗ₖ. Πⱼ Aⱼₖ⟨X⟩ to be positive for μ legality.
-                // co-Yoneda (≡^X) requires B⟨X⟩ to be entirely negative, and each
-                // replacement Πⱼ Aⱼ⟨X⟩ to be positive for ν legality.
-                if !branch_replacements.is_empty() {
-                    // Yoneda case
-                    if !self.check_positive_only(pi, ret)
-                        || branch_replacements
+                // ── Global Adjudication ─────────────────────────────────────
+                // Try Yoneda first. If it fails variance checks, fall through to co-Yoneda.
+                if all_yoneda {
+                    let branch_replacements: Vec<TypeId> =
+                        yoneda_candidates.iter().map(|c| c.unwrap()).collect();
+                    // Yoneda (≡_X) requires B⟨X⟩ to be entirely positive, and each
+                    // replacement Σₖ ∃Z⃗ₖ. Πⱼ Aⱼₖ⟨X⟩ to be positive for μ legality.
+                    if self.check_positive_only(pi, ret)
+                        && branch_replacements
                             .iter()
-                            .any(|&r| !self.check_positive_only(pi, r))
+                            .all(|&r| self.check_positive_only(pi, r))
                     {
-                        return ty;
-                    }
-                } else if !coyoneda_replacements.is_empty() {
-                    // co-Yoneda case
-                    if !self.check_negative_only(pi, ret)
-                        || coyoneda_replacements
-                            .iter()
-                            .any(|&r| !self.check_positive_only(pi, r))
-                    {
-                        return ty;
+                        // Σₖ is the categorical coproduct (sum type), NOT a product.
+                        let sigma = self.coproduct(branch_replacements);
+                        let needs_fix = self.type_contains_param(pi, sigma);
+                        let replacement = if needs_fix {
+                            self.alloc(TypeData::Mu {
+                                param_index: pi,
+                                param_name: "X".into(),
+                                body: sigma,
+                            })
+                        } else {
+                            sigma
+                        };
+                        let mut result = self.replace_generic(ret, pi, replacement);
+                        // Re-wrap preserved outer quantifiers ∀Y⃗ (paper Fig.3).
+                        for (oi, on) in outer_quantifiers.into_iter().rev() {
+                            result = self.forall(oi, on, result);
+                        }
+                        return result;
                     }
                 }
 
-                let sigma = if is_coyoneda {
-                    // ≡_X: no Σₖ — multiple branches combine via product (tuple),
-                    // not coproduct.  (Pistone & Tranchini 2022 §2, ≡_X formula)
-                    if coyoneda_replacements.len() == 1 {
-                        coyoneda_replacements[0]
-                    } else {
-                        self.tuple(coyoneda_replacements.clone())
+                if all_coyoneda {
+                    let coyoneda_replacements: Vec<TypeId> =
+                        coyoneda_candidates.iter().map(|c| c.unwrap()).collect();
+                    // co-Yoneda (≡^X) requires B⟨X⟩ to be entirely negative, and each
+                    // replacement Πⱼ Aⱼ⟨X⟩ to be positive for ν legality.
+                    if self.check_negative_only(pi, ret)
+                        && coyoneda_replacements
+                            .iter()
+                            .all(|&r| self.check_positive_only(pi, r))
+                    {
+                        // ≡^X: no Σₖ — multiple branches combine via product (tuple).
+                        let sigma = if coyoneda_replacements.len() == 1 {
+                            coyoneda_replacements[0]
+                        } else {
+                            self.tuple(coyoneda_replacements)
+                        };
+                        let needs_fix = self.type_contains_param(pi, sigma);
+                        let replacement = if needs_fix {
+                            self.alloc(TypeData::Nu {
+                                param_index: pi,
+                                param_name: "X".into(),
+                                body: sigma,
+                            })
+                        } else {
+                            sigma
+                        };
+                        let mut result = self.replace_generic(ret, pi, replacement);
+                        for (oi, on) in outer_quantifiers.into_iter().rev() {
+                            result = self.forall(oi, on, result);
+                        }
+                        return result;
                     }
-                } else {
-                    // Σₖ is the categorical coproduct (sum type), NOT a product.
-                    // For ∀X.(A₁⇒X)⇒(A₂⇒X)⇒X  →  A₁ + A₂
-                    self.coproduct(branch_replacements)
-                };
-                // Wrap with μX/νX only when the branch product(s) depend on X
-                // (Pistone & Tranchini 2022 §2, eq.3 & eq.4):
-                //   Yoneda (A⟨X⟩⇒X):    B⟨X⟩ → B⟨X↦μX.A⟨X⟩⟩
-                //   co-Yoneda (X⇒A⟨X⟩): B⟨X⟩ → B⟨X↦νX.A⟨X⟩⟩
-                // When A⟨X⟩ = Int (no X), no fixpoint needed:
-                //   ∀X.(Int⇒X)⇒B⟨X⟩  →  B⟨X↦Int⟩
-                let needs_fix = self.type_contains_param(pi, sigma);
-                let replacement = if needs_fix {
-                    if is_coyoneda {
-                        self.alloc(TypeData::Nu {
-                            param_index: pi,
-                            param_name: "X".into(),
-                            body: sigma,
-                        })
-                    } else {
-                        self.alloc(TypeData::Mu {
-                            param_index: pi,
-                            param_name: "X".into(),
-                            body: sigma,
-                        })
-                    }
-                } else {
-                    sigma
-                };
-                let mut result = self.replace_generic(ret, pi, replacement);
-                // Re-wrap preserved outer quantifiers ∀Y⃗ (paper Fig.3).
-                for (oi, on) in outer_quantifiers.into_iter().rev() {
-                    result = self.forall(oi, on, result);
                 }
-                return result;
+
+                return ty;
             }
             return ty;
         }
-
-        // No explicit Forall → no reduction (Case B was removed, as all legal
-        // Yoneda/co-Yoneda patterns are captured by the explicit Forall case).
+        // No explicit Forall → no reduction.
         ty
     }
 
