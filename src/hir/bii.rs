@@ -26,7 +26,7 @@
 //! validated unsigned scope (Lemma 5.2 / Theorem 5.3) and carries
 //! its own in-line soundness arguments. The template family is the
 //! sparse template-polyhedra hierarchy of the paper's Section 4
-//! (Interval ⊂ Octagon ⊂ SparsePoly — "additionally include"),
+//! (Interval ⊂ Zone ⊂ Octagon ⊂ SparsePoly — "additionally include"),
 //! exercised at the full SparsePoly level.
 //!
 //! All bound arithmetic uses `num_bigint::BigInt` to support bit-widths
@@ -172,13 +172,16 @@ pub(crate) enum RowKind {
 }
 
 /// Template row-set level (Zuo et al. 2026, §4.2): how rich the template domain is.
-/// `Interval` = single-variable rows only; `Octagon` adds the
-/// difference/sum pairs; `SparsePoly` (the default) further adds the
-/// sparse template-polyhedra Support3 rows.
+/// `Interval` = single-variable rows only; `Zone` adds difference rows
+/// (`x − y ≤ c`); `Octagon` further adds sum rows (`x + y ≤ c`);
+/// `SparsePoly` (the default) further adds the sparse template-polyhedra
+/// Support3 rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TemplateLevel {
     /// Interval rows only.
     Interval,
+    /// Interval + octagon Diff rows (zone domain: `x − y ≤ c` only, no sums).
+    Zone,
     /// Interval + octagon Diff/Sum rows.
     Octagon,
     /// Interval + octagon + sparse Support3 rows (the full domain).
@@ -340,18 +343,21 @@ impl BiiTemplate {
         for i in 0..n_vars {
             rows.push(mk(RowKind::Interval(i), bw_of(i), signed_of(i)));
         }
-        // Octagon difference rows `x_i − x_j` (i < j): uniform pairs keep
-        // the exact symmetric tops `[−m, m]`; mixed pairs get their exact
-        // ASYMMETRIC tops from `full_range`.
-        if matches!(level, TemplateLevel::Octagon | TemplateLevel::SparsePoly) {
+        // Zone/Octagon difference rows `x_i − x_j` (i < j): uniform pairs
+        // keep the exact symmetric tops `[−m, m]`; mixed pairs get their
+        // exact ASYMMETRIC tops from `full_range`.
+        if matches!(level, TemplateLevel::Zone | TemplateLevel::Octagon | TemplateLevel::SparsePoly)
+        {
             for i in 0..n_vars {
                 for j in (i + 1)..n_vars {
                     let bw = bw_of(i).max(bw_of(j));
                     rows.push(mk(RowKind::Diff(i, j), bw, signed_of(i) || signed_of(j)));
                 }
             }
-            // Octagon sum rows `x_i + x_j` (i < j); uniform tops `[0, 2m]` /
-            // signed `[−2^bw, 2^bw−2]`; mixed tops from `full_range`.
+        }
+        // Octagon sum rows `x_i + x_j` (i < j); uniform tops `[0, 2m]` /
+        // signed `[−2^bw, 2^bw−2]`; mixed tops from `full_range`.
+        if matches!(level, TemplateLevel::Octagon | TemplateLevel::SparsePoly) {
             for i in 0..n_vars {
                 for j in (i + 1)..n_vars {
                     let bw = bw_of(i).max(bw_of(j));
@@ -6529,6 +6535,68 @@ mod tests {
 
         let has_diff = tpl.rows.iter().any(|r| matches!(r.kind, RowKind::Diff(..)));
         assert!(has_diff, "Octagon level must generate Diff rows");
+    }
+
+    /// `TemplateLevel::Zone` generates Interval and Diff rows but NOT Sum or Support3 rows.
+    #[test]
+    fn test_template_level_zone() {
+        let tpl = BiiTemplate::with_level(
+            3,
+            &[8, 8, 8],
+            &[false, false, false],
+            TemplateLevel::Zone,
+        );
+        // 3 Interval rows (one per variable)
+        let interval_count = tpl
+            .rows
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::Interval(_)))
+            .count();
+        assert_eq!(interval_count, 3, "Zone must generate Interval rows");
+        // C(3,2) = 3 Diff rows
+        let diff_count = tpl
+            .rows
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::Diff(..)))
+            .count();
+        assert_eq!(diff_count, 3, "Zone must generate Diff rows");
+        // No Sum rows
+        let has_sum = tpl.rows.iter().any(|r| matches!(r.kind, RowKind::Sum(..)));
+        assert!(!has_sum, "Zone must NOT generate Sum rows");
+        // No Support3 rows
+        let has_support3 = tpl
+            .rows
+            .iter()
+            .any(|r| matches!(r.kind, RowKind::Support3(..)));
+        assert!(!has_support3, "Zone must NOT generate Support3 rows");
+        // Total row count: 3 + 3 = 6
+        assert_eq!(tpl.rows.len(), 6);
+    }
+
+    /// Zone ⊂ Octagon ⊂ SparsePoly: each level is a strict superset of the previous.
+    #[test]
+    fn test_template_level_hierarchy() {
+        let interval = BiiTemplate::with_level(3, &[8, 8, 8], &[false; 3], TemplateLevel::Interval);
+        let zone = BiiTemplate::with_level(3, &[8, 8, 8], &[false; 3], TemplateLevel::Zone);
+        let octagon = BiiTemplate::with_level(3, &[8, 8, 8], &[false; 3], TemplateLevel::Octagon);
+        let sparse = BiiTemplate::with_level(3, &[8, 8, 8], &[false; 3], TemplateLevel::SparsePoly);
+
+        assert!(interval.rows.len() < zone.rows.len());
+        assert!(zone.rows.len() < octagon.rows.len());
+        assert!(octagon.rows.len() < sparse.rows.len());
+
+        // Zone = Interval + Diff
+        let zone_diff_count = zone
+            .rows
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::Diff(..)))
+            .count();
+        let zone_interval_count = zone
+            .rows
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::Interval(_)))
+            .count();
+        assert_eq!(zone.rows.len(), zone_interval_count + zone_diff_count);
     }
 
     /// Property Strengthening (Yao et al., "Demystifying...", §IV-A):

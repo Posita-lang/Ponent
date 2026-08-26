@@ -13,6 +13,7 @@ use crate::hir::loop_ir::Cond;
 use crate::hir::octagon::{Dbm, sat_neg};
 use crate::symbol::Symbol;
 use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 
 pub(crate) fn dbm_fixpoint(
     init: &Dbm,
@@ -26,12 +27,23 @@ pub(crate) fn dbm_fixpoint(
         if next.eq(&cur) {
             return Some(cur); // a fixpoint — no need to widen.
         }
-        // Join first (absorbs one-step tightenings), then widen (freezes
-        // relaxing bounds — the termination guarantee).
+        // Miné's widening chain m_i = m_{i-1} ▽ (n_i)ᵇ (Thm 8.2): the
+        // RIGHT operand is the CLOSED transfer result, the LEFT (the
+        // chain state) stays deliberately UNCLOSED (closing it risks the
+        // non-terminating chain of [Miné06] Figure 10). Joining `cur`
+        // with `next` before widening is REDUNDANT — the widening keeps
+        // `cur_ij` iff `next_ij ≤ cur_ij`, and max(cur_ij, next_ij) ≤
+        // cur_ij reduces to the same condition, so the join never
+        // changes widen's keep-or-∞ decision — hence we widen against
+        // the closed transfer result directly. Before the widening
+        // phase, `cur` is still closed (joins of closed operands), so
+        // `join`'s closed-operand precondition holds.
+        let mut next_closed = next;
+        let _ = next_closed.close(); // bottom stays bottom; the join/widen below handle it
         let widened = if iter >= widen_after {
-            cur.widen(&cur.join(&next))
+            cur.widen(&next_closed)
         } else {
-            cur.join(&next)
+            cur.join(&next_closed)
         };
         if widened.eq(&cur) {
             return Some(widened);
@@ -71,25 +83,175 @@ pub(crate) enum LoopInstr {
     If(Box<Cond>, Vec<LoopInstr>, Vec<LoopInstr>),
 }
 
+/// Apply a `Cond` as a DBM guard (octagonal fragment only).
+/// Returns the guarded DBM, or the original DBM if the condition
+/// is outside the octagonal fragment (sound over-approximation).
+fn apply_cond_as_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
+    use crate::hir::loop_ir::{Cond, CmpOp, ScalarExpr};
+    match cond {
+        Cond::True => dbm.clone(),
+        Cond::False => Dbm::bottom(),
+        Cond::Cmp { op, lhs, rhs, .. } => {
+            // Only handle Var-vs-Const and Var-vs-Var (the shapes
+            // produced by hir_cond_to_cond).
+            match (lhs.as_ref(), rhs.as_ref()) {
+                (ScalarExpr::Var(i), ScalarExpr::Const(c)) => {
+                    let Some(c) = c.to_i128() else { return dbm.clone() };
+                    match op {
+                        CmpOp::Le => dbm.test_le_var(*i, c),
+                        CmpOp::Lt => dbm.test_le_var(*i, c.saturating_sub(1)),
+                        CmpOp::Ge => dbm.test_ge_var(*i, c),
+                        CmpOp::Gt => dbm.test_ge_var(*i, c.saturating_add(1)),
+                        CmpOp::Eq => dbm.test_var_eq(*i, c),
+                        CmpOp::Neq => dbm.clone(), // non-convex, skip
+                    }
+                }
+                (ScalarExpr::Var(i), ScalarExpr::Var(j)) => {
+                    match op {
+                        // i ≤ j ⟺ i − j ≤ 0
+                        CmpOp::Le => dbm.test_diff_le(*i, *j, 0),
+                        CmpOp::Lt => dbm.test_diff_le(*i, *j, -1),
+                        CmpOp::Ge => dbm.test_diff_le(*j, *i, 0),
+                        CmpOp::Gt => dbm.test_diff_le(*j, *i, -1),
+                        CmpOp::Eq => dbm.test_diff_eq(*i, *j, 0),
+                        CmpOp::Neq => dbm.clone(),
+                    }
+                }
+                _ => dbm.clone(), // outside fragment
+            }
+        }
+        Cond::And(a, b) => {
+            let da = apply_cond_as_guard(dbm, a);
+            if da.bottom {
+                return Dbm::bottom();
+            }
+            let db = apply_cond_as_guard(dbm, b);
+            if db.bottom {
+                return Dbm::bottom();
+            }
+            da.guard_and(&db)
+        }
+        Cond::Or(a, b) => {
+            let da = apply_cond_as_guard(dbm, a);
+            let db = apply_cond_as_guard(dbm, b);
+            if da.bottom {
+                return db;
+            }
+            if db.bottom {
+                return da;
+            }
+            da.guard_or(&db)
+        }
+        Cond::Not(inner) => apply_negated_guard(dbm, inner),
+    }
+}
+
+/// Apply the NEGATION of a `Cond` as a DBM guard.
+fn apply_negated_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
+    use crate::hir::loop_ir::{Cond, CmpOp, ScalarExpr};
+    match cond {
+        Cond::True => Dbm::bottom(),
+        Cond::False => dbm.clone(),
+        Cond::Cmp { op, lhs, rhs, .. } => {
+            match (lhs.as_ref(), rhs.as_ref()) {
+                (ScalarExpr::Var(i), ScalarExpr::Const(c)) => {
+                    let Some(c) = c.to_i128() else { return dbm.clone() };
+                    match op {
+                        // ¬(X ≤ c) = X ≥ c+1
+                        CmpOp::Le => dbm.guard_not_le_var(*i, c),
+                        CmpOp::Lt => dbm.guard_not_le_var(*i, c.saturating_sub(1)),
+                        CmpOp::Ge => dbm.guard_not_ge_var(*i, c),
+                        CmpOp::Gt => dbm.guard_not_ge_var(*i, c.saturating_add(1)),
+                        CmpOp::Eq => dbm.clone(), // ¬(X=c) is non-convex
+                        CmpOp::Neq => dbm.clone(),
+                    }
+                }
+                (ScalarExpr::Var(i), ScalarExpr::Var(j)) => {
+                    match op {
+                        CmpOp::Le => dbm.guard_not_diff_le(*i, *j, 0),
+                        CmpOp::Lt => dbm.guard_not_diff_le(*i, *j, -1),
+                        CmpOp::Ge => dbm.guard_not_diff_le(*j, *i, 0),
+                        CmpOp::Gt => dbm.guard_not_diff_le(*j, *i, -1),
+                        _ => dbm.clone(),
+                    }
+                }
+                _ => dbm.clone(),
+            }
+        }
+        // De Morgan: ¬(a∧b) = ¬a∨¬b; ¬(a∨b) = ¬a∧¬b
+        Cond::And(a, b) => {
+            let na = apply_negated_guard(dbm, a);
+            let nb = apply_negated_guard(dbm, b);
+            if na.bottom {
+                return nb;
+            }
+            if nb.bottom {
+                return na;
+            }
+            na.guard_or(&nb)
+        }
+        Cond::Or(a, b) => {
+            let na = apply_negated_guard(dbm, a);
+            if na.bottom {
+                return Dbm::bottom();
+            }
+            let nb = apply_negated_guard(dbm, b);
+            if nb.bottom {
+                return Dbm::bottom();
+            }
+            na.guard_and(&nb)
+        }
+        Cond::Not(inner) => apply_cond_as_guard(dbm, inner),
+    }
+}
+
 fn apply_loop_instr(dbm: &Dbm, instr: &LoopInstr) -> Dbm {
     match instr {
         LoopInstr::AddVar(i, c) => dbm.assign_add_var(*i, *c),
-        // Saturating arithmetic is not tracked by the
-        // DBM fixpoint (clamp is piecewise) — ignore it (the BII path
-        // handles saturate via Clamp rows and runs first; a DBM fallback
-        // candidate lacking the clamp effect is a weak hint, validated by
-        // SMT).
-        LoopInstr::AddSat(..) => dbm.clone(),
+        // Saturating arithmetic: clamp(x+c) ⊆ x+c, so plain addition
+        // is a sound over-approximation (the clamp only narrows the
+        // reachable set). The BII path handles the exact clamp via
+        // Clamp rows; this DBM fallback uses the wider (but sound)
+        // additive transfer. [Miné06] Def 2.4.
+        LoopInstr::AddSat(i, c) => dbm.assign_add_var(*i, *c),
         LoopInstr::ConstVar(i, c) => dbm.assign_const_var(*i, *c),
         LoopInstr::CopyVar(i, j) => dbm.assign_copy_var(*i, *j),
         LoopInstr::TestLe(i, c) => dbm.test_le_var(*i, *c),
         LoopInstr::TestGe(i, c) => dbm.test_ge_var(*i, *c),
         LoopInstr::TestDiffLe(i, j, c) => dbm.test_diff_le(*i, *j, *c),
-        // The DBM fixpoint does not track `if` paths —
-        // ignore the branch (the BII path handles `if` via `Ite` and runs
-        // first; a DBM fallback candidate lacking the branch effect is a
-        // weak hint, still validated by SMT before discharge).
-        LoopInstr::If(..) => dbm.clone(),
+        // The DBM fixpoint now tracks `if` branches via a branch join
+        // ([Miné06] §VIII.A Figure 11: m⁺₇ = m⁺₄ ⊔ m⁺₆). The BII path
+        // handles `if` via `Ite` and runs first; this DBM fallback
+        // joins the two guarded arms (sound over-approximation, still
+        // validated by SMT before discharge).
+        LoopInstr::If(cond, then_arm, else_arm) => {
+            // [Miné06] §VIII.A: m⁺₇ = m⁺₄ ⊔ m⁺₆ (branch join).
+            let then_dbm = apply_cond_as_guard(dbm, cond);
+            let else_dbm = apply_negated_guard(dbm, cond);
+            // Apply each arm's instructions sequentially.
+            let then_result = then_arm.iter().fold(then_dbm, |d, ins| {
+                if d.bottom {
+                    Dbm::bottom()
+                } else {
+                    apply_loop_instr(&d, ins)
+                }
+            });
+            let else_result = else_arm.iter().fold(else_dbm, |d, ins| {
+                if d.bottom {
+                    Dbm::bottom()
+                } else {
+                    apply_loop_instr(&d, ins)
+                }
+            });
+            // Join the two branch results.
+            if then_result.bottom {
+                return else_result;
+            }
+            if else_result.bottom {
+                return then_result;
+            }
+            then_result.join(&else_result)
+        }
     }
 }
 
@@ -111,8 +273,23 @@ fn fuse_adjacent_instrs(instrs: &[LoopInstr]) -> Vec<LoopInstr> {
                 let mut sum = *c;
                 while let Some(&LoopInstr::AddVar(j, d)) = iter.peek() {
                     if *i == *j {
-                        sum += d;
-                        iter.next(); // consume it
+                        match sum.checked_add(*d) {
+                            Some(s) => {
+                                sum = s;
+                                iter.next(); // consume it
+                            }
+                            None => {
+                                // The fused constant would overflow i128:
+                                // bail on fusion — emit the accumulated
+                                // AddVar, then let `d` start a fresh one
+                                // (the instruction is preserved unfused,
+                                // so the transformation stays
+                                // semantics-preserving).
+                                iter.next(); // consume `d` first
+                                fused.push(LoopInstr::AddVar(*i, sum));
+                                sum = *d;
+                            }
+                        }
                     } else {
                         break;
                     }
@@ -134,11 +311,18 @@ fn fuse_adjacent_instrs(instrs: &[LoopInstr]) -> Vec<LoopInstr> {
 /// `X ≤ ub ⟺  2X ≤  2·ub` rides edge `(2i, 2i+1)`.
 fn apply_type_bounds(m: &mut Dbm, bounds: &[(Option<i128>, Option<i128>)]) {
     for (i, (lb, ub)) in bounds.iter().enumerate() {
+        // Saturating multiplication: an out-of-range bound (|2·c| would
+        // overflow i128) saturates and is then REFUSED by
+        // `sat_mul2_bound` inside `set_mirrored` (weakened to no bound)
+        // — never a wrapped, wrong constraint. (The `let _ = m.close()`
+        // below discards the bottom signal; a contradictory bound set
+        // leaves a bottom matrix whose size-0 shape is caught by the
+        // caller's downstream guards.)
         if let Some(l) = lb {
-            m.set_mirrored(2 * i + 1, 2 * i, -2 * l);
+            m.set_mirrored(2 * i + 1, 2 * i, (-2_i128).saturating_mul(*l));
         }
         if let Some(u) = ub {
-            m.set_mirrored(2 * i, 2 * i + 1, 2 * u);
+            m.set_mirrored(2 * i, 2 * i + 1, 2_i128.saturating_mul(*u));
         }
     }
     // Close to propagate transitive and octagonal implications.
@@ -194,9 +378,18 @@ pub(crate) fn infer_loop_invariant_exprs<'a>(
     };
 
     // 6. Compute the widened fixpoint (fail closed).
-    let Some(fp) = dbm_fixpoint(&m, &step, max_iter, widen_after) else {
+    let Some(mut fp) = dbm_fixpoint(&m, &step, max_iter, widen_after) else {
         return Vec::new();
     };
+
+    // Close to materialize implicit bounds before extraction.
+    // The widened fixpoint may be unclosed (widen's output is
+    // deliberately not strongly closed, [Miné06] §VI.D / Thm 8.2);
+    // the closure derives all entailed octagonal constraints
+    // (Thm 4.3: normal form, same V⁺-domain). A bottom result
+    // (close() == false) leaves `fp` as ⊥, and the size guard in
+    // `dbm_to_invariant_exprs` returns no candidates — fail-closed.
+    let _ = fp.close();
 
     // 7. Extract invariant expressions from the final DBM.
     dbm_to_invariant_exprs(arena, &fp, vars)
@@ -945,6 +1138,38 @@ where
 /// `(2i, 2i+1)` edge; `X ≥ −floor(c/2)` on the mirror). All other edges
 /// are plain differences of ±nodes and emit their `node_bound` constant
 /// verbatim (`node_bound` already halves the doubled storage once).
+/// The mirror of edge `(i, j)` is `(j⊕1, i⊕1)` — both store the SAME
+/// bound (coherence) and encode the SAME logical constraint
+/// (`node_i − node_j ≤ c` is identical to `node_{j⊕1} − node_{i⊕1} ≤ c`
+/// because `node_{k⊕1} = −node_k`). Emitting both would double the
+/// candidate list for the SMT solver, so only the CANONICAL
+/// representative of each mirror pair is emitted:
+/// - the diagonal `(i, i)` is skipped entirely (always 0 after closure);
+/// - a self-dual edge `(i, i⊕1)` is its own mirror — emitted once
+///   (both `(2i, 2i+1)` and `(2i+1, 2i)` emit, as the upper/lower
+///   single-variable bounds are DIFFERENT constraints);
+/// - otherwise emit the lexicographically smaller of `(i, j)` and its
+///   mirror (the mirror involution is perfect, so exactly one of each
+///   pair qualifies).
+#[inline]
+fn is_canonical(i: usize, j: usize) -> bool {
+    if i == j {
+        return false; // diagonal — always 0 after closure
+    }
+    let j_bar = j ^ 1;
+    let i_bar = i ^ 1;
+    if j == i_bar {
+        return true; // self-dual edge: its own mirror
+    }
+    (i, j) <= (j_bar, i_bar)
+}
+
+/// Emit invariant candidate expressions from a CLOSED DBM (the loop
+/// fixpoint): single-variable bounds ride the self-dual edges, all
+/// other edges are plain differences of ±nodes. Only the canonical
+/// representative of each mirror pair is emitted (see `is_canonical`) —
+/// coherence makes the mirror a duplicate of the same logical
+/// constraint, so emitting it too would double the SMT candidate list.
 pub(crate) fn dbm_to_invariant_exprs<'a>(
     arena: &'a bumpalo::Bump,
     dbm: &Dbm,
@@ -990,7 +1215,11 @@ pub(crate) fn dbm_to_invariant_exprs<'a>(
     let mut out = Vec::new();
     for a in 0..dbm.size {
         for b in 0..dbm.size {
-            if a == b {
+            // Only the canonical representative of each mirror pair —
+            // the mirror `(b⊕1, a⊕1)` stores the same bound (coherence)
+            // and encodes the same logical constraint, so emitting it
+            // too would duplicate the candidate.
+            if !is_canonical(a, b) {
                 continue;
             }
             // `node_bound` halves the doubled storage ONCE — `c` below is

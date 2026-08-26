@@ -235,8 +235,13 @@ pub(crate) fn loop_instrs_to_loop_problem(
                     || signed.get(*j).copied().unwrap_or(false),
             }),
             LoopInstr::AddVar(i, c) => {
+                // Capture the SSA value BEFORE this AddVar — the def
+                // condition uses the PRE-update value (for a chained
+                // `i := i+1; i := i+1` the second def is `(i+1) ≤ max−1`,
+                // not `i ≤ max−1`).
+                let pre = values[*i].clone();
                 values[*i] = ScalarExpr::Add(
-                    Box::new(values[*i].clone()),
+                    Box::new(pre.clone()),
                     Box::new(ScalarExpr::Const(BigInt::from(*c))),
                     ArithSem::Wrap,
                 );
@@ -272,21 +277,22 @@ pub(crate) fn loop_instrs_to_loop_problem(
                         (BigInt::zero(), (BigInt::one() << bw as usize) - 1)
                     };
                     if *c > 0 {
-                        // no-trap ⟺ i + c ≤ max ⟺ i ≤ max − c.
+                        // no-trap ⟺ pre + c ≤ max ⟺ pre ≤ max − c
+                        // (pre = the SSA value before this AddVar).
                         def_parts.push(Cond::Cmp {
                             op: CmpOp::Le,
-                            lhs: Box::new(ScalarExpr::Var(*i)),
+                            lhs: Box::new(pre.clone()),
                             rhs: Box::new(ScalarExpr::Const(max - &c_big)),
                             signed: is_signed,
                         });
                     } else {
-                        // no-trap ⟺ i + c ≥ min ⟺ i ≥ min − c
+                        // no-trap ⟺ pre + c ≥ min ⟺ pre ≥ min − c
                         // (= min + |c|; unsigned min = 0 reproduces
                         // the old `i ≥ |c|` exactly — byte-identical
                         // for unsigned variables).
                         def_parts.push(Cond::Cmp {
                             op: CmpOp::Ge,
-                            lhs: Box::new(ScalarExpr::Var(*i)),
+                            lhs: Box::new(pre.clone()),
                             rhs: Box::new(ScalarExpr::Const(min - &c_big)),
                             signed: is_signed,
                         });
@@ -320,11 +326,24 @@ pub(crate) fn loop_instrs_to_loop_problem(
                 };
             }
             LoopInstr::If(cond, then, else_) => {
-                // Merge both arms into an `Ite` per
-                // assigned variable. NB: trap definedness for assignments
-                // inside `if` arms is not generated yet (only the body's
-                // top-level `AddVar`s contribute defs).
                 let cond = fix_signed(cond, signed, vars.len());
+
+                // Generate trap definedness for AddVar inside each arm.
+                // Each arm's no-trap condition is pushed UNCONDITIONALLY
+                // (no branch-condition guard): the edge's `definedness`
+                // is AND-folded from `def_parts` and must stay an
+                // And-chain of Cmps for the DBM proof path
+                // (`dbm_proves_inductiveness` Check 2 encodes it as a
+                // positive antecedent, which cannot represent a
+                // disjunction). Requiring both arms' no-trap
+                // unconditionally is a sound over-approximation
+                // (fail-closed), stronger than the branch-refined
+                // `(cond → then_def) ∧ (¬cond → else_def)`.
+                if trap {
+                    collect_arm_definedness(&values, then, bit_widths, signed, &mut def_parts);
+                    collect_arm_definedness(&values, else_, bit_widths, signed, &mut def_parts);
+                }
+
                 let then_vals = apply_block(&values, then, signed, vars.len())?;
                 let else_vals = apply_block(&values, else_, signed, vars.len())?;
                 for i in 0..vars.len() {
@@ -334,6 +353,14 @@ pub(crate) fn loop_instrs_to_loop_problem(
                             Box::new(then_vals[i].clone()),
                             Box::new(else_vals[i].clone()),
                         );
+                    }
+                }
+                // Collect saturates from both arms.
+                for arm in [then, else_] {
+                    for ins in arm {
+                        if let LoopInstr::AddSat(si, sc) = ins {
+                            saturates.push((*si, *sc));
+                        }
                     }
                 }
             }
@@ -569,7 +596,8 @@ fn apply_block(
             LoopInstr::AddSat(i, c) => {
                 // Saturating assignment inside an `if`
                 // arm — the successor is `clamp(x + c)` (Clamp-row
-                // semantics; saturates for arms are not collected yet).
+                // semantics; the saturates are collected by the caller's
+                // If-arm scan).
                 v[*i] = ScalarExpr::Add(
                     Box::new(v[*i].clone()),
                     Box::new(ScalarExpr::Const(BigInt::from(*c))),
@@ -604,6 +632,62 @@ fn apply_block(
         }
     }
     Some(v)
+}
+
+/// Collect trap definedness for `AddVar` instructions inside an
+/// `if` arm. Each arm's no-trap condition is pushed UNCONDITIONALLY
+/// (no branch-condition guard): the edge's `definedness` is AND-folded
+/// from `def_parts` and must stay an And-chain of Cmps for the DBM
+/// proof path, which cannot represent the branch-refined disjunction
+/// `(cond ∧ then_def) ∨ (¬cond ∧ else_def)`. Requiring both arms'
+/// no-trap unconditionally is a sound over-approximation (fail-closed).
+fn collect_arm_definedness(
+    values: &[ScalarExpr],
+    stmts: &[LoopInstr],
+    bit_widths: &[u8],
+    signed: &[bool],
+    def_parts: &mut Vec<Cond>,
+) {
+    for ins in stmts {
+        match ins {
+            LoopInstr::AddVar(i, c) if *c != 0 => {
+                let bw = bit_widths.get(*i).copied().unwrap_or(64) as u32;
+                let is_signed = signed.get(*i).copied().unwrap_or(false);
+                let c_big = BigInt::from(*c);
+                let (min, max) = if is_signed {
+                    let half = BigInt::one() << (bw as usize - 1);
+                    (-half.clone(), half - 1)
+                } else {
+                    (BigInt::zero(), (BigInt::one() << bw as usize) - 1)
+                };
+                let no_trap = if *c > 0 {
+                    Cond::Cmp {
+                        op: CmpOp::Le,
+                        lhs: Box::new(values[*i].clone()),
+                        rhs: Box::new(ScalarExpr::Const(max - &c_big)),
+                        signed: is_signed,
+                    }
+                } else {
+                    Cond::Cmp {
+                        op: CmpOp::Ge,
+                        lhs: Box::new(values[*i].clone()),
+                        rhs: Box::new(ScalarExpr::Const(min - &c_big)),
+                        signed: is_signed,
+                    }
+                };
+                // Push the arm's no-trap condition unconditionally —
+                // see the function doc for why the branch guard is
+                // omitted (DBM-proof compatibility, fail-closed).
+                def_parts.push(no_trap);
+            }
+            LoopInstr::If(_, inner_then, inner_else) => {
+                // Recurse into nested ifs.
+                collect_arm_definedness(values, inner_then, bit_widths, signed, def_parts);
+                collect_arm_definedness(values, inner_else, bit_widths, signed, def_parts);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Fill the comparison signedness of a `Cond` from the per-variable
@@ -1353,8 +1437,27 @@ mod tests {
         match e {
             ScalarExpr::Var(i) => state.get(*i).copied(),
             ScalarExpr::Const(c) => c.to_i128(),
-            ScalarExpr::Add(l, r, _) => Some(eval_expr(l, state)? + eval_expr(r, state)?),
-            ScalarExpr::Sub(l, r, _) => Some(eval_expr(l, state)? - eval_expr(r, state)?),
+            ScalarExpr::Add(l, r, sem) => {
+                let lv = eval_expr(l, state)?;
+                let rv = eval_expr(r, state)?;
+                Some(match sem {
+                    crate::hir::loop_ir::ArithSem::Saturate => {
+                        // Clamp to i128 range (oracle uses mathematical
+                        // integers; the actual clamp bounds come from the
+                        // row's bw/signed).
+                        lv.saturating_add(rv)
+                    }
+                    _ => lv + rv,
+                })
+            }
+            ScalarExpr::Sub(l, r, sem) => {
+                let lv = eval_expr(l, state)?;
+                let rv = eval_expr(r, state)?;
+                Some(match sem {
+                    crate::hir::loop_ir::ArithSem::Saturate => lv.saturating_sub(rv),
+                    _ => lv - rv,
+                })
+            }
             ScalarExpr::Ite(c, t, f) => {
                 if eval_cond(c, state)? {
                     eval_expr(t, state)
