@@ -1560,8 +1560,10 @@ impl InferenceContext {
         // the caller passes back here.  Machine-checked so the
         // stack-discipline invariant (which the O(1) interval ancestor test
         // relies on) cannot silently degrade; a caller-bug rewind to a
-        // non-ancestor would break the tin/tout bookkeeping.
-        debug_assert!(
+        // non-ancestor would break the tin/tout bookkeeping.  `assert!` (not
+        // `debug_assert!`) so the guard is active in release builds too —
+        // a caller bug must fail closed, never silently corrupt the tree.
+        assert!(
             self.region_tree
                 .is_ancestor(prev_region, self.region_tree.current),
             "exit_level: prev_region must be an ancestor of the current region (caller bug)"
@@ -2160,6 +2162,14 @@ impl InferenceContext {
         }
         let instances: Vec<usize> = self.forward_refs[pg_var_id].clone();
         let mut updated = 0;
+        // Track whether every instance propagated successfully.  A failed
+        // `ctx.unify` (the instance's own constraints conflict with the PG
+        // variable's resolution — a genuine type error) must NOT clear the
+        // forward references: clearing would leave the instance as a
+        // dangling, unreachable variable that can never be re-processed.
+        // Keeping the association (fail-closed) lets the conflict surface
+        // when the instance's other constraints are solved.
+        let mut all_propagated = true;
         for inst_id in instances {
             if inst_id < self.var_type_ids.len() {
                 let instance_ty_id = self.var_type_ids[inst_id];
@@ -2169,21 +2179,23 @@ impl InferenceContext {
                 // recursively copy.
                 self.s_inst_copy_walk(ctx, instance_ty_id, resolve_ty);
                 // Bind instance to the concrete type
-                if let Err(_) = ctx.unify(instance_ty_id, resolve_ty) {
-                    // unification error will be caught elsewhere
+                if ctx.unify(instance_ty_id, resolve_ty).is_err() {
+                    all_propagated = false;
                 }
                 // Recursively propagate if resolve_ty contains other PG vars
                 self.s_inst_copy_deepen(ctx, resolve_ty);
                 updated += 1;
             }
         }
-        // Clear forward refs (all propagated).  Log a ClearForwardRefs entry
-        // carrying the entries so a rollback restores the registrations.
-        if !self.forward_refs[pg_var_id].is_empty() {
+        // Clear forward refs ONLY when every instance propagated.  Log a
+        // ClearForwardRefs entry carrying the entries so a rollback restores
+        // the registrations.  On a failed propagation the forward refs are
+        // left untouched (no undo needed — the state is unchanged).
+        if all_propagated && !self.forward_refs[pg_var_id].is_empty() {
             let entries = self.forward_refs[pg_var_id].clone();
             self.push_undo(InferUndoLog::ClearForwardRefs(pg_var_id, entries));
+            self.forward_refs[pg_var_id].clear();
         }
-        self.forward_refs[pg_var_id].clear();
         updated
     }
 
@@ -2309,12 +2321,23 @@ impl InferenceContext {
 
         // ── Fallback: level-based heuristic ───────────────────────
         // When Z3 is unavailable or the query times out, use the
-        // conservative level-based approximation.
+        // conservative level-based approximation.  Guarded by an ancestor
+        // check: a deeper level alone does NOT prove the variable is
+        // determined by the outer context — a variable in a sibling branch
+        // is not being "exited", and lowering it to the root would
+        // prematurely monomorphize a still-generalizable PG variable,
+        // losing principality.  S-Exists-Lower (OmniML §5.3) requires the
+        // variable to be unified with variables from OUTSIDE its region;
+        // the ancestor check is the cheap conservative proxy for "we are
+        // exiting to the variable's enclosing scope".
         let var_region = self.type_vars[var_id].region_id;
         let var_level = self.region_tree.get_level(var_region);
         let cur_region = self.region_tree.current;
         let cur_level = self.region_tree.get_level(cur_region);
-        if var_level > 0 && var_level > cur_level {
+        if var_level > 0
+            && var_level > cur_level
+            && self.region_tree.is_ancestor(cur_region, var_region)
+        {
             // Move the variable from its current region's pool to the root pool
             // before updating region_id, keeping the pool and the field consistent.
             let root_id = self.region_tree.root;

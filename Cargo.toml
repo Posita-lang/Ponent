@@ -45,8 +45,19 @@ polonius-engine = "0.13"
 # (differential dataflow primitives) — library mode, crates.io.
 flowlog-runtime = "0.3"
 
+# Octagon abstract-domain micro-benchmarks (`benches/octagon.rs`).
+criterion = "0.5"
+
 # The FlowLog library-mode compiler (build.rs) — compiles the vendored
 # `polonius_int.dl` rule set into a Rust module for the differential
 # benchmark (crates.io, no hard-coded paths).
 [build-dependencies]
 flowlog-build = "0.4"
+
+# Octagon abstract-domain benchmarks (criterion; `harness = false` so
+# criterion's own runner drives them). The bench `#[path]`-includes
+# `src/hir/octagon.rs` directly (the crate is a binary with an empty
+# lib, and octagon.rs is self-contained with no `crate::` references).
+[[bench]]
+name = "octagon"
+harness = false
