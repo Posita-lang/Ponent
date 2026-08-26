@@ -230,7 +230,7 @@ const fn mirror_index(i: usize) -> usize {
 /// under transposition.) Single-variable bounds hang on the
 /// self-dual edges:  `m[2i][2i+1]`  carries  `2Xᵢ ≤ 2c`  (stored  `4c` ),
 ///  `m[2i+1][2i]`  carries  `-2Xᵢ ≤ -2c`  (stored  `-4c` ).
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Dbm {
     ///  `2 * n_vars`  (no implicit zero node).
     pub(crate) size: usize,
@@ -238,6 +238,21 @@ pub(crate) struct Dbm {
     pub(crate) m: Vec<i128>,
     ///  `true`  if the constraint system is unsatisfiable (⊥).
     pub(crate) bottom: bool,
+    ///  `true`  if the matrix is known strongly closed (or ⊥, which is
+    /// vacuously closed — see `is_strongly_closed`). Maintained by every
+    /// mutation (`set`/`set_mirrored` clear it; `close_with` sets it);
+    /// lets `join`'s debug tripwire be O(1) instead of an O(N³)
+    /// `is_strongly_closed` check.
+    pub(crate) closed: bool,
+}
+
+/// Equality compares the constraint set only — the `closed` flag is
+/// metadata (derivable from `m`), so two matrices with identical values
+/// but different closure bookkeeping compare equal.
+impl PartialEq for Dbm {
+    fn eq(&self, other: &Self) -> bool {
+        self.size == other.size && self.m == other.m && self.bottom == other.bottom
+    }
 }
 
 /// Closure strategy — the Harvey–Stuckey integer-tightening profile
@@ -336,16 +351,31 @@ impl OctExpr {
         OctExpr::Const(c)
     }
     pub(crate) fn add(self, rhs: OctExpr) -> Self {
-        OctExpr::Add(Box::new(self), Box::new(rhs))
+        match (self, rhs) {
+            (OctExpr::Const(a), OctExpr::Const(b)) => OctExpr::Const(sat_add(a, b)),
+            (a, b) => OctExpr::Add(Box::new(a), Box::new(b)),
+        }
     }
     pub(crate) fn sub(self, rhs: OctExpr) -> Self {
-        OctExpr::Sub(Box::new(self), Box::new(rhs))
+        match (self, rhs) {
+            (OctExpr::Const(a), OctExpr::Const(b)) => OctExpr::Const(sat_sub(a, b)),
+            (a, b) => OctExpr::Sub(Box::new(a), Box::new(b)),
+        }
     }
     pub(crate) fn neg(self) -> Self {
-        OctExpr::Neg(Box::new(self))
+        match self {
+            OctExpr::Const(a) => OctExpr::Const(sat_neg(a)),
+            a => OctExpr::Neg(Box::new(a)),
+        }
     }
     pub(crate) fn scale(k: i128, inner: OctExpr) -> Self {
-        OctExpr::Scale(k, Box::new(inner))
+        if k == 0 {
+            return OctExpr::Const(0); // 0 · e = 0 — fold before building the node
+        }
+        match inner {
+            OctExpr::Const(a) => OctExpr::Const(sat_mul(k, a)),
+            inner => OctExpr::Scale(k, Box::new(inner)),
+        }
     }
 
     /// Evaluate this expression over the intervals extracted from `dbm`
@@ -396,6 +426,10 @@ impl OctExpr {
                 (sat_neg(b), sat_neg(a))
             }
 
+            // 0 · [a,b] = [0, 0] — even for an unbounded interval
+            // (sat_mul(0, ∞) would return ∞, losing precision).
+            OctExpr::Scale(0, _) => (0, 0),
+
             OctExpr::Scale(k, inner) => {
                 let (a, b) = inner.eval_interval(dbm);
                 if *k >= 0 {
@@ -432,8 +466,9 @@ impl OctExpr {
 impl Dbm {
     /// Create a new, unconstrained (top) matrix.
     pub(crate) fn new(n_vars: usize) -> Dbm {
-        let size = 2 * n_vars;
-        let mut m = vec![DBM_INF; size * size];
+        let size = n_vars.checked_mul(2).expect("too many variables");
+        let len = size.checked_mul(size).expect("matrix too large");
+        let mut m = vec![DBM_INF; len];
         for i in 0..size {
             m[i * size + i] = 0;
         }
@@ -441,6 +476,7 @@ impl Dbm {
             size,
             m,
             bottom: false,
+            closed: true,
         }
     }
 
@@ -450,6 +486,7 @@ impl Dbm {
             size: 0,
             m: Vec::new(),
             bottom: true,
+            closed: true, // ⊥ is vacuously strongly closed
         }
     }
 
@@ -495,6 +532,7 @@ impl Dbm {
         let idx = self.ix(i, j);
         if stored < self.m[idx] {
             self.m[idx] = stored;
+            self.closed = false; // one-sided set breaks closure
         }
     }
 
@@ -506,6 +544,7 @@ impl Dbm {
         }
         self.check_node(i, j);
         Self::set_mirrored_internal(&mut self.m, i, j, c, self.size);
+        self.closed = false; // a new bound breaks closure
     }
 
     /// Internal helper: set a bound and its mirror in a raw matrix slice.
@@ -599,40 +638,45 @@ impl Dbm {
             // coherent matrices to coherent matrices — the
             // property [Miné06] Figure 8's C⁺ is designed around
             // ([Miné06] §V.C).
+            // Row offsets are hoisted out of the inner loops (pure
+            // algebraic refactor — same indices, no semantic change).
+            let row_k = k * size;
+            let row_kb = k_bar * size;
             for i in 0..size {
+                let row_i = i * size;
                 for j in 0..size {
-                    let mut best = m[i * size + j];
-                    let t_ik = m[i * size + k];
-                    let t_kj = m[k * size + j];
+                    let mut best = m[row_i + j];
+                    let t_ik = m[row_i + k];
+                    let t_kj = m[row_k + j];
                     if t_ik != DBM_INF && t_kj != DBM_INF {
                         let s = sat_add_closed(t_ik, t_kj);
                         if s < best {
                             best = s;
                         }
                     }
-                    let t_ikb = m[i * size + k_bar];
-                    let t_kbj = m[k_bar * size + j];
+                    let t_ikb = m[row_i + k_bar];
+                    let t_kbj = m[row_kb + j];
                     if t_ikb != DBM_INF && t_kbj != DBM_INF {
                         let s = sat_add_closed(t_ikb, t_kbj);
                         if s < best {
                             best = s;
                         }
                     }
-                    let t_kkb = m[k * size + k_bar];
+                    let t_kkb = m[row_k + k_bar];
                     if t_ik != DBM_INF && t_kkb != DBM_INF && t_kbj != DBM_INF {
                         let s = sat_add_closed(sat_add_closed(t_ik, t_kkb), t_kbj);
                         if s < best {
                             best = s;
                         }
                     }
-                    let t_kbk = m[k_bar * size + k];
+                    let t_kbk = m[row_kb + k];
                     if t_ikb != DBM_INF && t_kbk != DBM_INF && t_kj != DBM_INF {
                         let s = sat_add_closed(sat_add_closed(t_ikb, t_kbk), t_kj);
                         if s < best {
                             best = s;
                         }
                     }
-                    m[i * size + j] = best;
+                    m[row_i + j] = best;
                 }
             }
             // One S⁺ pass after each pivot's C⁺ (the interleaving of
@@ -749,6 +793,10 @@ impl Dbm {
     /// Close under the given `ClosureMode`. See the enum docs for the
     /// integer-tightening profile.
     pub(crate) fn close_with(&mut self, mode: ClosureMode) -> bool {
+        // Every exit path leaves the matrix strongly closed (or ⊥, which
+        // is vacuously closed), so the flag is set up front — the closure
+        // passes below are atomic from the caller's perspective.
+        self.closed = true;
         if self.bottom {
             return false;
         }
@@ -870,6 +918,7 @@ impl Dbm {
             size: self.size,
             m,
             bottom: false,
+            closed: true, // the fresh top matrix is strongly closed
         }
     }
 
@@ -898,6 +947,7 @@ impl Dbm {
             size: self.size,
             m,
             bottom: false,
+            closed: true,
         };
         r.close();
         if r.bottom { Dbm::bottom() } else { r }
@@ -1017,7 +1067,7 @@ impl Dbm {
     /// strongly closed ([Miné06] §VI.D): re-close it before joining.
     pub(crate) fn join(&self, other: &Dbm) -> Dbm {
         debug_assert!(
-            self.is_strongly_closed() && other.is_strongly_closed(),
+            self.closed && other.closed,
             "join requires strongly closed operands — a violation is either a \
              closure-preservation bug in this module, or a caller feeding a \
              non-closed state (widen's output is deliberately unclosed — \
@@ -1031,23 +1081,26 @@ impl Dbm {
         }
         assert_eq!(self.size, other.size, "join requires same-size operands");
         let size = self.size;
-        let m: Vec<i128> = self
+        // Point-wise max; the diagonal is 0 in both strongly-closed
+        // operands, so force it to 0 — avoids the idx/size and idx%size
+        // divisions in the hot path (min on the diagonal is identical
+        // to max here, both being 0 for closed operands).
+        let mut m: Vec<i128> = self
             .m
             .iter()
             .zip(&other.m)
-            .enumerate()
-            .map(|(idx, (a, b))| {
-                let i = idx / size;
-                let j = idx % size;
-                if i == j { (*a).min(*b) } else { (*a).max(*b) }
-            })
+            .map(|(a, b)| (*a).max(*b))
             .collect();
+        for i in 0..size {
+            m[i * size + i] = 0;
+        }
         // Strongly closed ∨ strongly closed = strongly closed (see doc):
         // no closure pass, bottom unreachable.
         Dbm {
             size,
             m,
             bottom: false,
+            closed: true,
         }
     }
 
@@ -1080,6 +1133,9 @@ impl Dbm {
             size: self.size,
             m,
             bottom: false,
+            // widen's output is deliberately NOT strongly closed
+            // ([Miné06] §VI.D) — re-close before join.
+            closed: false,
         }
     }
 
@@ -1197,6 +1253,7 @@ impl Dbm {
             size: self.size,
             m,
             bottom: false,
+            closed: true,
         };
         if saturated {
             r.close();
@@ -1242,6 +1299,7 @@ impl Dbm {
             size: self.size,
             m,
             bottom: false,
+            closed: true,
         };
         r.close();
         if r.bottom { Dbm::bottom() } else { r }
@@ -1389,10 +1447,9 @@ impl Dbm {
     ///   1. `X + Y ≤ c`   (sum guard)
     ///   2. `−X − Y ≤ −c` (negated-sum guard with bound −c)
     ///
-    /// The conjunction is implemented as sequential guard application:
-    /// apply the first guard to get a refined DBM, then apply the
-    /// second guard to that result. This is equivalent to the meet
-    /// of the two individual guard refinements.
+    /// The conjunction is implemented as a single pass that sets both
+    /// bounds and closes once — equivalent to the meet of the two
+    /// individual guard refinements (close is a kernel operator).
     ///
     /// Soundness: if either sub-guard produces ⊥, the conjunction is ⊥.
     ///
@@ -1403,14 +1460,15 @@ impl Dbm {
         }
         self.check_var(i);
         self.check_var(j);
-        // Step 1: apply X + Y ≤ c
-        let r1 = self.test_sum_le(i, j, c);
-        if r1.bottom {
-            return Dbm::bottom();
-        }
-        // Step 2: apply −X − Y ≤ −c
-        let r2 = r1.test_neg_sum_le(i, j, sat_neg(c));
-        if r2.bottom { Dbm::bottom() } else { r2 }
+        // Both bounds in one pass, then a single close: the two
+        // sub-guards share the same base matrix, and closing once over
+        // the combined constraint set is equivalent to closing after
+        // each (close is a kernel operator).
+        let mut r = self.clone();
+        r.set_mirrored(2 * i, 2 * j + 1, c); // X + Y ≤ c
+        r.set_mirrored(2 * j + 1, 2 * i, sat_neg(c)); // −X − Y ≤ −c
+        r.close();
+        if r.bottom { Dbm::bottom() } else { r }
     }
 
     /// Test `X − Y = c` (equality guard for difference).
@@ -1429,14 +1487,15 @@ impl Dbm {
         }
         self.check_var(i);
         self.check_var(j);
-        // Step 1: apply X − Y ≤ c
-        let r1 = self.test_diff_le(i, j, c);
-        if r1.bottom {
-            return Dbm::bottom();
-        }
-        // Step 2: apply Y − X ≤ −c
-        let r2 = r1.test_diff_le(j, i, sat_neg(c));
-        if r2.bottom { Dbm::bottom() } else { r2 }
+        // Both bounds in one pass, then a single close: the two
+        // sub-guards share the same base matrix, and closing once over
+        // the combined constraint set is equivalent to closing after
+        // each (close is a kernel operator).
+        let mut r = self.clone();
+        r.set_mirrored(2 * i, 2 * j, c); // X − Y ≤ c
+        r.set_mirrored(2 * j, 2 * i, sat_neg(c)); // Y − X ≤ −c
+        r.close();
+        if r.bottom { Dbm::bottom() } else { r }
     }
 
     /// Test `X = c` (equality guard for a single variable).
@@ -1445,7 +1504,7 @@ impl Dbm {
     ///   `X = c`  ⟺  `X ≤ c ∧ X ≥ c`
     ///
     /// This is the conjunction of `test_le_var(i, c)` and
-    /// `test_ge_var(i, c)`, applied sequentially.
+    /// `test_ge_var(i, c)`, merged into a single set + one close.
     ///
     /// (Internal `close()` is `Strong`.)
     pub(crate) fn test_var_eq(&self, i: usize, c: i128) -> Dbm {
@@ -1453,12 +1512,15 @@ impl Dbm {
             return Dbm::bottom();
         }
         self.check_var(i);
-        let r1 = self.test_le_var(i, c);
-        if r1.bottom {
-            return Dbm::bottom();
-        }
-        let r2 = r1.test_ge_var(i, c);
-        if r2.bottom { Dbm::bottom() } else { r2 }
+        // Both bounds in one pass, then a single close: the two
+        // sub-guards share the same base matrix, and closing once over
+        // the combined constraint set is equivalent to closing after
+        // each (close is a kernel operator).
+        let mut r = self.clone();
+        r.set_mirrored(2 * i, 2 * i + 1, sat_mul2(c)); // X ≤ c
+        r.set_mirrored(2 * i + 1, 2 * i, sat_mul2(sat_neg(c))); // X ≥ c
+        r.close();
+        if r.bottom { Dbm::bottom() } else { r }
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -1638,6 +1700,7 @@ impl Dbm {
             size: self.size,
             m,
             bottom: false,
+            closed: true,
         };
         r.close();
         if r.bottom { Dbm::bottom() } else { r }
@@ -1757,6 +1820,7 @@ impl Dbm {
             size: self.size,
             m,
             bottom: false,
+            closed: true,
         };
         r.close();
         if r.bottom { Dbm::bottom() } else { r }
@@ -1790,6 +1854,7 @@ impl Dbm {
             size: self.size,
             m,
             bottom: false,
+            closed: true,
         };
         r.close();
         if r.bottom { Dbm::bottom() } else { r }
@@ -2306,6 +2371,7 @@ mod tests {
             size,
             m,
             bottom: false,
+            closed: true,
         };
         r.close();
         r
@@ -2361,6 +2427,7 @@ mod tests {
             size: a.size,
             m,
             bottom: false,
+            closed: true,
         };
         r.close();
         r

@@ -346,8 +346,10 @@ impl BiiTemplate {
         // Zone/Octagon difference rows `x_i − x_j` (i < j): uniform pairs
         // keep the exact symmetric tops `[−m, m]`; mixed pairs get their
         // exact ASYMMETRIC tops from `full_range`.
-        if matches!(level, TemplateLevel::Zone | TemplateLevel::Octagon | TemplateLevel::SparsePoly)
-        {
+        if matches!(
+            level,
+            TemplateLevel::Zone | TemplateLevel::Octagon | TemplateLevel::SparsePoly
+        ) {
             for i in 0..n_vars {
                 for j in (i + 1)..n_vars {
                     let bw = bw_of(i).max(bw_of(j));
@@ -6540,12 +6542,8 @@ mod tests {
     /// `TemplateLevel::Zone` generates Interval and Diff rows but NOT Sum or Support3 rows.
     #[test]
     fn test_template_level_zone() {
-        let tpl = BiiTemplate::with_level(
-            3,
-            &[8, 8, 8],
-            &[false, false, false],
-            TemplateLevel::Zone,
-        );
+        let tpl =
+            BiiTemplate::with_level(3, &[8, 8, 8], &[false, false, false], TemplateLevel::Zone);
         // 3 Interval rows (one per variable)
         let interval_count = tpl
             .rows

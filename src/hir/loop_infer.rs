@@ -87,7 +87,7 @@ pub(crate) enum LoopInstr {
 /// Returns the guarded DBM, or the original DBM if the condition
 /// is outside the octagonal fragment (sound over-approximation).
 fn apply_cond_as_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
-    use crate::hir::loop_ir::{Cond, CmpOp, ScalarExpr};
+    use crate::hir::loop_ir::{CmpOp, Cond, ScalarExpr};
     match cond {
         Cond::True => dbm.clone(),
         Cond::False => Dbm::bottom(),
@@ -96,7 +96,9 @@ fn apply_cond_as_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
             // produced by hir_cond_to_cond).
             match (lhs.as_ref(), rhs.as_ref()) {
                 (ScalarExpr::Var(i), ScalarExpr::Const(c)) => {
-                    let Some(c) = c.to_i128() else { return dbm.clone() };
+                    let Some(c) = c.to_i128() else {
+                        return dbm.clone();
+                    };
                     match op {
                         CmpOp::Le => dbm.test_le_var(*i, c),
                         CmpOp::Lt => dbm.test_le_var(*i, c.saturating_sub(1)),
@@ -148,14 +150,16 @@ fn apply_cond_as_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
 
 /// Apply the NEGATION of a `Cond` as a DBM guard.
 fn apply_negated_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
-    use crate::hir::loop_ir::{Cond, CmpOp, ScalarExpr};
+    use crate::hir::loop_ir::{CmpOp, Cond, ScalarExpr};
     match cond {
         Cond::True => Dbm::bottom(),
         Cond::False => dbm.clone(),
         Cond::Cmp { op, lhs, rhs, .. } => {
             match (lhs.as_ref(), rhs.as_ref()) {
                 (ScalarExpr::Var(i), ScalarExpr::Const(c)) => {
-                    let Some(c) = c.to_i128() else { return dbm.clone() };
+                    let Some(c) = c.to_i128() else {
+                        return dbm.clone();
+                    };
                     match op {
                         // ¬(X ≤ c) = X ≥ c+1
                         CmpOp::Le => dbm.guard_not_le_var(*i, c),
@@ -166,15 +170,13 @@ fn apply_negated_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
                         CmpOp::Neq => dbm.clone(),
                     }
                 }
-                (ScalarExpr::Var(i), ScalarExpr::Var(j)) => {
-                    match op {
-                        CmpOp::Le => dbm.guard_not_diff_le(*i, *j, 0),
-                        CmpOp::Lt => dbm.guard_not_diff_le(*i, *j, -1),
-                        CmpOp::Ge => dbm.guard_not_diff_le(*j, *i, 0),
-                        CmpOp::Gt => dbm.guard_not_diff_le(*j, *i, -1),
-                        _ => dbm.clone(),
-                    }
-                }
+                (ScalarExpr::Var(i), ScalarExpr::Var(j)) => match op {
+                    CmpOp::Le => dbm.guard_not_diff_le(*i, *j, 0),
+                    CmpOp::Lt => dbm.guard_not_diff_le(*i, *j, -1),
+                    CmpOp::Ge => dbm.guard_not_diff_le(*j, *i, 0),
+                    CmpOp::Gt => dbm.guard_not_diff_le(*j, *i, -1),
+                    _ => dbm.clone(),
+                },
                 _ => dbm.clone(),
             }
         }
