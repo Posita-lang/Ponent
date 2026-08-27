@@ -11,7 +11,8 @@ impl<'input> TypeContext<'input> {
     ///   - Tuple/Array/Slice/Struct args/Enum args/Forall body/Exists base:
     ///     covariant → cumulative sign unchanged
     pub(crate) fn check_variance(&self, param: usize, ty: TypeId, expected_sign: isize) -> bool {
-        self.check_variance_with_sign(param, ty, expected_sign, 1)
+        let mut scope = Vec::new();
+        self.check_variance_with_sign(param, ty, expected_sign, 1, &mut scope)
     }
 
     fn check_variance_with_sign(
@@ -20,20 +21,51 @@ impl<'input> TypeContext<'input> {
         ty: TypeId,
         expected_sign: isize,
         cumulative_sign: isize,
+        scope: &mut Vec<usize>,
     ) -> bool {
-        // Resolve bindings first: an unresolved InferVar would be treated as a
-        // leaf node with no outgoing variance edges, causing any variance check
-        // to silently return `true`.  This would allow InferVars to later be
-        // bound to types containing restricted-parameter occurrences, bypassing
-        // the variance constraint entirely.
         let ty = self.resolve_binding(ty);
-        // Check cache first
-        let cache_key = (param, ty, expected_sign, cumulative_sign);
-        if let Some(&cached) = self.variance_cache.borrow().get(&cache_key) {
-            return cached;
+        let scope_was_empty = scope.is_empty();
+
+        // Only when the current scope is empty (i.e., no binder shadowing) do we use the global cache
+        if scope_was_empty {
+            let cache_key = (param, ty, expected_sign, cumulative_sign);
+            if let Some(&cached) = self.variance_cache.borrow().get(&cache_key) {
+                return cached;
+            }
         }
-        let result = self.check_variance_uncached(param, ty, expected_sign, cumulative_sign);
-        self.variance_cache.borrow_mut().insert(cache_key, result);
+
+        // Handle the binder of the current type (if any), pushing its index onto the stack
+        let data = self.get(ty);
+        let binder_count = match data {
+            TypeData::Forall { param_index, .. }
+            | TypeData::Mu { param_index, .. }
+            | TypeData::Nu { param_index, .. }
+            | TypeData::Exists { param_index, .. } => {
+                scope.push(*param_index);
+                1
+            }
+            TypeData::Poly { quantifiers, .. } => {
+                for &(pi, _) in quantifiers {
+                    scope.push(pi);
+                }
+                quantifiers.len()
+            }
+            _ => 0,
+        };
+
+        let result = self.check_variance_uncached(param, ty, expected_sign, cumulative_sign, scope);
+
+        // Pop the current binder(s)
+        for _ in 0..binder_count {
+            scope.pop();
+        }
+
+        // If the original scope was empty, store the result in the cache
+        if scope_was_empty {
+            let cache_key = (param, ty, expected_sign, cumulative_sign);
+            self.variance_cache.borrow_mut().insert(cache_key, result);
+        }
+
         result
     }
 
@@ -43,49 +75,57 @@ impl<'input> TypeContext<'input> {
         ty: TypeId,
         expected_sign: isize,
         cumulative_sign: isize,
+        scope: &mut Vec<usize>,
     ) -> bool {
-        // Use pre-computed variance edges instead of pattern-matching TypeData.
-        // This is faster because edges are computed once and reused.
         let edges = self.get_variance_edges(ty);
+
+        // Leaf node: no child edges
+        if edges.is_empty() {
+            if let TypeData::GenericParam { index, .. } = self.get(ty) {
+                // Check if this parameter is shadowed by the current scope
+                if scope.iter().rev().any(|&s| s == *index) {
+                    return true; // Bound, so it does not affect the check for external free parameters
+                }
+                return *index == param && cumulative_sign == expected_sign;
+            }
+            return true; // Other leaf types do not contain parameters
+        }
+
+        // Non-leaf node: check edges one by one
         for edge in &edges {
-            if self.type_contains_param(param, edge.target) {
-                // Propagate sign: contravariant flips, invariant blocks
+            // Only process this edge if the target type contains the free parameter
+            if self.type_contains_free_param(param, edge.target, scope) {
                 match edge.sign {
                     -1 => {
-                        // Contravariant: flip cumulative sign
+                        // Contravariant: flip cumulative_sign
                         if !self.check_variance_with_sign(
                             param,
                             edge.target,
                             expected_sign,
                             -cumulative_sign,
+                            scope,
                         ) {
                             return false;
                         }
                     }
                     0 => {
-                        // Invariant: param cannot appear
+                        // Invariant position: free parameter is not allowed here
                         return false;
                     }
                     _ => {
-                        // Covariant: keep cumulative sign
+                        // Covariant: keep cumulative_sign
                         if !self.check_variance_with_sign(
                             param,
                             edge.target,
                             expected_sign,
                             cumulative_sign,
+                            scope,
                         ) {
                             return false;
                         }
                     }
                 }
             }
-        }
-        // No edges → no sub-types (leaf node). Check if THIS node is the param.
-        if edges.is_empty()
-            && let TypeData::GenericParam { index, .. } = self.get(ty)
-            && *index == param
-        {
-            return cumulative_sign == expected_sign;
         }
         true
     }
@@ -175,36 +215,96 @@ impl<'input> TypeContext<'input> {
         }
     }
 
-    /// Check if a GenericParam with the given index appears anywhere in a type.
-    pub fn type_contains_param(&self, param: usize, ty: TypeId) -> bool {
-        match self.get(ty) {
-            TypeData::GenericParam { index, .. } => *index == param,
-            TypeData::Fn { params, ret } => {
-                params.iter().any(|&p| self.type_contains_param(param, p))
-                    || self.type_contains_param(param, *ret)
+    /// Check if a GenericParam with the given index appears freely (not bound)
+    /// anywhere in a type, respecting binder scopes.
+    pub fn type_contains_free_param(
+        &self,
+        param: usize,
+        ty: TypeId,
+        scope: &mut Vec<usize>,
+    ) -> bool {
+        let ty = self.resolve_binding(ty);
+        let data = self.get(ty);
+
+        // Handle the binder of the current type (push onto stack)
+        let binder_count = match data {
+            TypeData::Forall { param_index, .. }
+            | TypeData::Mu { param_index, .. }
+            | TypeData::Nu { param_index, .. }
+            | TypeData::Exists { param_index, .. } => {
+                scope.push(*param_index);
+                1
             }
-            TypeData::Adt { args, .. } => args.iter().any(|&a| self.type_contains_param(param, a)),
-            TypeData::Tuple { elems } => elems.iter().any(|&e| self.type_contains_param(param, e)),
+            TypeData::Poly { quantifiers, .. } => {
+                for &(pi, _) in quantifiers {
+                    scope.push(pi);
+                }
+                quantifiers.len()
+            }
+            _ => 0,
+        };
+
+        let result = match data {
+            TypeData::GenericParam { index, .. } => {
+                // Check if shadowed by current scope
+                if scope.iter().rev().any(|&s| s == *index) {
+                    false
+                } else {
+                    *index == param
+                }
+            }
+            TypeData::Fn { params, ret } => {
+                params
+                    .iter()
+                    .any(|&p| self.type_contains_free_param(param, p, scope))
+                    || self.type_contains_free_param(param, *ret, scope)
+            }
+            TypeData::Adt { args, .. } => args
+                .iter()
+                .any(|&a| self.type_contains_free_param(param, a, scope)),
+            TypeData::Tuple { elems } => elems
+                .iter()
+                .any(|&e| self.type_contains_free_param(param, e, scope)),
             TypeData::Coproduct { alternatives } => alternatives
                 .iter()
-                .any(|&a| self.type_contains_param(param, a)),
+                .any(|&a| self.type_contains_free_param(param, a, scope)),
             TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
-                self.type_contains_param(param, *elem)
+                self.type_contains_free_param(param, *elem, scope)
             }
             TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
-                self.type_contains_param(param, *ty)
+                self.type_contains_free_param(param, *ty, scope)
             }
             TypeData::Ptr { size, pointee, .. } => {
-                self.type_contains_param(param, *pointee) || self.type_contains_param(param, *size)
+                self.type_contains_free_param(param, *pointee, scope)
+                    || self.type_contains_free_param(param, *size, scope)
             }
-            TypeData::AssociatedType { self_ty, .. } => self.type_contains_param(param, *self_ty),
-            TypeData::Poly { body, .. } => self.type_contains_param(param, *body),
-            TypeData::Forall { body, .. } => self.type_contains_param(param, *body),
-            TypeData::Exists { base, .. } => self.type_contains_param(param, *base),
-            TypeData::Mu { body, .. } | TypeData::Nu { body, .. } => {
-                self.type_contains_param(param, *body)
+            TypeData::AssociatedType { self_ty, .. } => {
+                self.type_contains_free_param(param, *self_ty, scope)
             }
-            _ => false,
+            TypeData::Forall { body, .. }
+            | TypeData::Exists { base: body, .. }
+            | TypeData::Mu { body, .. }
+            | TypeData::Nu { body, .. }
+            | TypeData::Poly { body, .. } => {
+                // Note: the current binder is already on the stack, so parameters with the same name in the body will be shadowed
+                self.type_contains_free_param(param, *body, scope)
+            }
+            _ => false, // Other leaf types do not contain parameters
+        };
+
+        // Pop the current binder(s)
+        for _ in 0..binder_count {
+            scope.pop();
         }
+
+        result
+    }
+
+    /// Legacy wrapper: checks if `param` appears anywhere in `ty`,
+    /// ignoring binder scopes (i.e., treating all occurrences as free).
+    /// This matches the original behavior before binder-aware fixes.
+    pub fn type_contains_param(&self, param: usize, ty: TypeId) -> bool {
+        let mut scope = Vec::new();
+        self.type_contains_free_param(param, ty, &mut scope)
     }
 }

@@ -2,21 +2,22 @@ use super::*;
 
 impl<'input> TypeContext<'input> {
     /// Apply Yoneda reduction if this type matches the pattern
-    ///  `∀X. (A ⇒ X) ⇒ B⟨X⟩`   →   `B[X ↦ A]`
-    /// or  `∀X. (X ⇒ A) ⇒ B⟨X⟩`   →   `B[X ↦ A]` .
-    /// Matches both explicit  `Forall`  nodes and implicit  `Fn` -encoded patterns.
+    ///   `∀X. (A ⇒ X) ⇒ B⟨X⟩`    →    `B[X ↦ A]`
+    /// or   `∀X. (X ⇒ A) ⇒ B⟨X⟩`    →    `B[X ↦ A]`  .
+    /// Matches both explicit   `Forall`   nodes and implicit   `Fn`  -encoded patterns.
     ///
     /// Uses iteration with convergence detection (max 10 rounds) to handle
     /// chained reductions like Forall(X, Forall(Y, ...)) where reducing the
-    /// outer Forall exposes a new reducible inner Forall. This follows the
+    /// outer F orall exposes a new reducible inner Forall. This follows the
     /// same convergence principle as Yen's KSP algorithm:
-    ///  "keep iterating until no more candidates can be generated ".
+    ///   "keep iterating until no more candidates can be generated  ".
     pub fn try_yoneda_reduce(&mut self, ty: TypeId) -> TypeId {
         // Limit iterations to prevent DoS from maliciously constructed types.
         // In practice, Yoneda/co-Yoneda reduction converges in ≤3 iterations
-        // because each pass either eliminates a Forall node or reaches a
+        // because each pass either  eliminates a Forall node or reaches a
         // fixed point. 10 is a generous safety ceiling.
         const MAX_ITERATIONS: usize = 10;
+
         let mut result = ty;
         for _iteration in 0..MAX_ITERATIONS {
             let before = result;
@@ -25,6 +26,7 @@ impl<'input> TypeContext<'input> {
                 break; // converged
             }
         }
+
         result
     }
 
@@ -197,7 +199,6 @@ impl<'input> TypeContext<'input> {
                     {
                         // Check ≡_X (Yoneda): ir = GenericParam(pi)
                         let yoneda_match = matches!(self.get(*ir), TypeData::GenericParam { index, .. } if *index == pi);
-
                         // Check ≡^X (co-Yoneda): ips[0] = GenericParam(pi)
                         let coyoneda_match = !ips.is_empty()
                             && matches!(self.get(ips[0]), TypeData::GenericParam { index, .. } if *index == pi);
@@ -208,23 +209,53 @@ impl<'input> TypeContext<'input> {
                             } else {
                                 self.tuple(ips.clone())
                             };
+
                             let repl = if inner_quantifiers.is_empty() {
                                 product
                             } else {
                                 let mut w = product;
-                                // Barendregt-inspired renaming: replace each peeled index
-                                // with a globally-unique index (via fresh_param_index) that
-                                // also cannot collide with pi, preventing false positives
-                                // in needs_fix while guaranteeing full capture avoidance.
-                                for (eq, en) in inner_quantifiers.iter().rev() {
-                                    let mut fresh_idx = self.fresh_param_index();
-                                    if fresh_idx == pi {
-                                        fresh_idx = self.fresh_param_index();
+
+                                // Build the ∃Z⃗ block in peel order.
+                                //
+                                // Peeling `∀Z₁. ∀Z₂. ...` gives:
+                                //
+                                //     [(Z₁), (Z₂)]
+                                //
+                                // Folding in that order produces:
+                                //
+                                //     ∃Z₂. ∃Z₁. ...
+                                //
+                                // This is the nesting pinned by
+                                // `test_yoneda_two_inner_quantifiers`.
+                                //
+                                // Reuse the peeled binder indices unless they would be captured.
+                                // Only freshen when the index collides with the outer `X`, a
+                                // preserved outer `∀Y`, or an already introduced existential.
+                                let mut bound: Vec<usize> = vec![pi];
+                                bound.extend(outer_quantifiers.iter().map(|(idx, _)| *idx));
+
+                                let peeled_indices: Vec<usize> =
+                                    inner_quantifiers.iter().map(|(idx, _)| *idx).collect();
+
+                                for (eq, en) in inner_quantifiers.iter() {
+                                    let mut idx = *eq;
+
+                                    if bound.contains(&idx) {
+                                        idx = self.fresh_param_index();
+
+                                        while bound.contains(&idx)
+                                            || idx == pi
+                                            || peeled_indices.contains(&idx)
+                                        {
+                                            idx = self.fresh_param_index();
+                                        }
+
+                                        let fresh_gp = self.generic_param(idx, *en);
+                                        w = self.replace_generic(w, *eq, fresh_gp);
                                     }
-                                    let fresh_gp = self.generic_param(fresh_idx, *en);
-                                    w = self.replace_generic(w, *eq, fresh_gp);
+
                                     w = self.exists(
-                                        fresh_idx,
+                                        idx,
                                         *en,
                                         w,
                                         crate::ast::Expr::Literal(
@@ -232,9 +263,13 @@ impl<'input> TypeContext<'input> {
                                             crate::ast::Span::new(0, 0),
                                         ),
                                     );
+
+                                    bound.push(idx);
                                 }
+
                                 w
                             };
+
                             yoneda_repl = Some(repl);
                         }
 
@@ -281,6 +316,7 @@ impl<'input> TypeContext<'input> {
                 if all_yoneda {
                     let branch_replacements: Vec<TypeId> =
                         yoneda_candidates.iter().map(|c| c.unwrap()).collect();
+
                     // Yoneda (≡_X) requires B⟨X⟩ to be entirely positive, and each
                     // replacement Σₖ ∃Z⃗ₖ. Πⱼ Aⱼₖ⟨X⟩ to be positive for μ legality.
                     if self.check_positive_only(pi, ret)
@@ -300,11 +336,14 @@ impl<'input> TypeContext<'input> {
                         } else {
                             sigma
                         };
+
                         let mut result = self.replace_generic(ret, pi, replacement);
+
                         // Re-wrap preserved outer quantifiers ∀Y⃗ (paper Fig.3).
                         for (oi, on) in outer_quantifiers.into_iter().rev() {
                             result = self.forall(oi, on, result);
                         }
+
                         return result;
                     }
                 }
@@ -312,6 +351,7 @@ impl<'input> TypeContext<'input> {
                 if all_coyoneda {
                     let coyoneda_replacements: Vec<TypeId> =
                         coyoneda_candidates.iter().map(|c| c.unwrap()).collect();
+
                     // co-Yoneda (≡^X) requires B⟨X⟩ to be entirely negative, and each
                     // replacement Πⱼ Aⱼ⟨X⟩ to be positive for ν legality.
                     if self.check_negative_only(pi, ret)
@@ -325,6 +365,7 @@ impl<'input> TypeContext<'input> {
                         } else {
                             self.tuple(coyoneda_replacements)
                         };
+
                         let needs_fix = self.type_contains_param(pi, sigma);
                         let replacement = if needs_fix {
                             self.alloc(TypeData::Nu {
@@ -335,18 +376,23 @@ impl<'input> TypeContext<'input> {
                         } else {
                             sigma
                         };
+
                         let mut result = self.replace_generic(ret, pi, replacement);
+
                         for (oi, on) in outer_quantifiers.into_iter().rev() {
                             result = self.forall(oi, on, result);
                         }
+
                         return result;
                     }
                 }
 
                 return ty;
             }
+
             return ty;
         }
+
         // No explicit Forall → no reduction.
         ty
     }

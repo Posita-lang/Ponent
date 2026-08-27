@@ -351,8 +351,6 @@ impl<'input> TypeContext<'input> {
 
     /// Combine children κ values into a node's κ, given the type constructor.
     /// Called when all of a node's outgoing edges point to determined nodes.
-    /// Combine children κ values into a node's κ, given the type constructor.
-    /// Called when all of a node's outgoing edges point to determined nodes.
     /// `kappa_map` maps child TypeId → determined Characteristic.
     #[allow(dead_code)]
     fn combine_kappa(
@@ -375,14 +373,22 @@ impl<'input> TypeContext<'input> {
             TypeData::Tuple { elems } => {
                 let mut total = 1usize;
                 let mut has_infinite = false;
+                let mut has_undecidable = false;
+
                 for &e in elems {
                     match ck(self, e, kappa_map) {
                         Characteristic::FiniteExhaustible(n) => total = total.saturating_mul(n),
                         Characteristic::InfiniteEnumerable => has_infinite = true,
-                        Characteristic::Undecidable => return Characteristic::Undecidable,
+                        Characteristic::Undecidable => has_undecidable = true,
                     }
                 }
-                if has_infinite {
+
+                // 0 absorbs everything: ∅ × A ≅ ∅ for any A (including infinite/undecidable)
+                if total == 0 {
+                    Characteristic::FiniteExhaustible(0)
+                } else if has_undecidable {
+                    Characteristic::Undecidable
+                } else if has_infinite {
                     Characteristic::InfiniteEnumerable
                 } else {
                     Characteristic::FiniteExhaustible(total)
@@ -403,13 +409,20 @@ impl<'input> TypeContext<'input> {
                     Characteristic::FiniteExhaustible(usize::MAX)
                 }
             }
-            TypeData::Array { elem, size } => match ck(self, *elem, kappa_map) {
-                Characteristic::FiniteExhaustible(n) => {
-                    Characteristic::FiniteExhaustible(n.saturating_pow(*size as u32))
+            TypeData::Array { elem, size } => {
+                // Empty array: exactly one inhabitant, regardless of element type
+                if *size == 0 {
+                    return Characteristic::FiniteExhaustible(1);
                 }
-                Characteristic::InfiniteEnumerable => Characteristic::InfiniteEnumerable,
-                Characteristic::Undecidable => Characteristic::Undecidable,
-            },
+
+                match ck(self, *elem, kappa_map) {
+                    Characteristic::FiniteExhaustible(n) => {
+                        Characteristic::FiniteExhaustible(n.saturating_pow(*size as u32))
+                    }
+                    Characteristic::InfiniteEnumerable => Characteristic::InfiniteEnumerable,
+                    Characteristic::Undecidable => Characteristic::Undecidable,
+                }
+            }
             TypeData::Slice { .. }
             | TypeData::Ref { .. }
             | TypeData::Pointer { .. }

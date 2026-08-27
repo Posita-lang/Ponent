@@ -508,6 +508,12 @@ pub struct TypeContext<'input> {
     /// All GADT-related state (fact registry + depth counter + existential
     /// scope stack + pending inner equalities) aggregated into one
     /// structure; see `GadtContext`.
+    /// Binder scope stack: tracks GenericParam indices currently under a
+    /// Forall/Exists/Mu/Nu/Poly binder during unification.  Used to detect
+    /// scope escape — a GenericParam that is bound in an active binder must
+    /// not be unified with a foreign type (which would leak the quantified
+    /// variable into the surrounding context).
+    pub(crate) binder_stack: RefCell<Vec<usize>>,
     pub(crate) gadt: GadtContext<'input>,
 }
 
@@ -581,6 +587,7 @@ impl<'input> TypeContext<'input> {
             edition: Edition::latest(),
             target,
             factory,
+            binder_stack: RefCell::new(Vec::new()),
             gadt: GadtContext::new(),
         };
         ctx.builtin_unit = ctx.alloc(TypeData::Unit);
@@ -3040,6 +3047,14 @@ pub enum TypeError {
         current_level: usize,
         span: crate::ast::Span,
     },
+    /// Binder scope escape: a GenericParam that is currently bound under an
+    /// active Forall/Exists/Mu/Nu/Poly binder was unified with a foreign
+    /// type, which would leak the quantified variable into the surrounding
+    /// context.
+    ScopeEscape {
+        index: usize,
+        span: crate::ast::Span,
+    },
     MutableBorrow {
         span: crate::ast::Span,
     },
@@ -3109,6 +3124,7 @@ impl TypeError {
             | TypeError::TraitNotImplemented { span, .. }
             | TypeError::InvariantViolation { span, .. }
             | TypeError::SkolemEscape { span, .. }
+            | TypeError::ScopeEscape { span, .. }
             | TypeError::OutOfBounds { span, .. }
             | TypeError::CircularDependency { span, .. }
             | TypeError::DuplicateDefinition { span, .. }

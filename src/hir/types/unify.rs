@@ -20,6 +20,9 @@ impl<'input> TypeContext<'input> {
 
     #[must_use]
     pub fn unify(&mut self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
+        // FIX: binder scope — clear stack at top-level entry.
+        self.binder_stack.borrow_mut().clear();
+
         // ── Transaction: capture current bindings for rollback ──
         self.begin_transaction();
 
@@ -62,6 +65,8 @@ impl<'input> TypeContext<'input> {
         // to a type from a deeper scope is rejected. (GHC §TcLevel)
         region_tree: Option<&crate::hir::infer::InferRegionTree>,
     ) -> Result<TypeId, TypeError> {
+        // FIX: binder scope — clear stack at top-level entry.
+        self.binder_stack.borrow_mut().clear();
         self.unify_seen.borrow_mut().clear();
         self.unify_internal(a, b, Variance::Invariant, region_tree, 0)
     }
@@ -69,6 +74,8 @@ impl<'input> TypeContext<'input> {
     /// without mutating the global unification state.  Uses a temporary
     /// transaction internally to discard any side effects.
     pub fn can_unify(&mut self, a: TypeId, b: TypeId) -> bool {
+        // FIX: binder scope — clear stack at top-level entry.
+        self.binder_stack.borrow_mut().clear();
         self.begin_transaction();
         let saved_seen = self.unify_seen.borrow().clone();
         self.unify_seen.borrow_mut().clear();
@@ -329,7 +336,17 @@ impl<'input> TypeContext<'input> {
                         .unwrap_or(crate::ast::Span::new(0, 0)),
                 });
             }
-            (TypeData::GenericParam { .. }, _) => {
+            (TypeData::GenericParam { index, .. }, _) => {
+                // FIX: binder scope guard — if this GenericParam is currently
+                // bound in an active binder, unifying it with a foreign type
+                // would be a scope escape.
+                if self.binder_stack.borrow().contains(index) {
+                    return Err(TypeError::ScopeEscape {
+                        index: *index,
+                        span: (*self.current_unify_span.borrow())
+                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                    });
+                }
                 // A GADT skolem must not be bound into a variable through a
                 // compound type (e.g. `GenericParam ~ [S]`): the witness
                 // would escape the arm (SYNTAX.md §"Existential
@@ -359,7 +376,15 @@ impl<'input> TypeContext<'input> {
                 }
                 Ok(b)
             }
-            (_, TypeData::GenericParam { .. }) => {
+            (_, TypeData::GenericParam { index, .. }) => {
+                // FIX: binder scope guard — symmetric.
+                if self.binder_stack.borrow().contains(index) {
+                    return Err(TypeError::ScopeEscape {
+                        index: *index,
+                        span: (*self.current_unify_span.borrow())
+                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                    });
+                }
                 if self.contains_gadt_skolem(a) {
                     return Err(TypeError::SkolemEscape {
                         var_id: usize::MAX,
@@ -848,23 +873,37 @@ impl<'input> TypeContext<'input> {
                 },
             ) => {
                 let body_variance = variance.xform(Variance::Covariant);
-                if *pi1 != *pi2 {
+                // FIX: binder scope — push binder index before recursing into body.
+                let result = if *pi1 != *pi2 {
                     // α-conversion with capture avoidance: rename BOTH bodies
                     // to a FRESH index that cannot appear free in either body.
                     let fresh_idx = self.fresh_param_index();
                     let fresh_gp = self.generic_param(fresh_idx, *pn2);
                     let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
                     let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
-                    self.unify_internal(
+                    self.binder_stack.borrow_mut().push(fresh_idx);
+                    let res = self.unify_internal(
                         b1_renamed,
                         b2_renamed,
                         body_variance,
                         region_tree,
                         coercion_depth + 1,
-                    )?;
+                    );
+                    self.binder_stack.borrow_mut().pop();
+                    res
                 } else {
-                    self.unify_internal(*b1, *b2, body_variance, region_tree, coercion_depth + 1)?;
-                }
+                    self.binder_stack.borrow_mut().push(*pi1);
+                    let res = self.unify_internal(
+                        *b1,
+                        *b2,
+                        body_variance,
+                        region_tree,
+                        coercion_depth + 1,
+                    );
+                    self.binder_stack.borrow_mut().pop();
+                    res
+                };
+                result?;
                 if !self.set_binding(a, b) {
                     return Err(TypeError::Mismatch {
                         expected: a,
@@ -889,21 +928,35 @@ impl<'input> TypeContext<'input> {
                 },
             ) => {
                 let base_variance = variance.xform(Variance::Covariant);
-                if *pi1 != *pi2 {
+                // FIX: binder scope — push binder index before recursing into base.
+                let result = if *pi1 != *pi2 {
                     let fresh_idx = self.fresh_param_index();
                     let fresh_gp = self.generic_param(fresh_idx, *n2);
                     let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
                     let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
-                    self.unify_internal(
+                    self.binder_stack.borrow_mut().push(fresh_idx);
+                    let res = self.unify_internal(
                         b1_renamed,
                         b2_renamed,
                         base_variance,
                         region_tree,
                         coercion_depth + 1,
-                    )?;
+                    );
+                    self.binder_stack.borrow_mut().pop();
+                    res
                 } else {
-                    self.unify_internal(*b1, *b2, base_variance, region_tree, coercion_depth + 1)?;
-                }
+                    self.binder_stack.borrow_mut().push(*pi1);
+                    let res = self.unify_internal(
+                        *b1,
+                        *b2,
+                        base_variance,
+                        region_tree,
+                        coercion_depth + 1,
+                    );
+                    self.binder_stack.borrow_mut().pop();
+                    res
+                };
+                result?;
                 if !self.set_binding(a, b) {
                     return Err(TypeError::Mismatch {
                         expected: a,
@@ -930,21 +983,35 @@ impl<'input> TypeContext<'input> {
                 // fresh indices for each mismatched quantifier.
                 let mut b1_renamed = *b1;
                 let mut b2_renamed = *b2;
+                // FIX: binder scope — collect indices that are in scope for the body.
+                let mut scope_indices = Vec::with_capacity(q1.len());
                 for ((i1, _), (i2, pn2)) in q1.iter().zip(q2.iter()) {
                     if i1 != i2 {
                         let fresh_idx = self.fresh_param_index();
                         let fresh_gp = self.generic_param(fresh_idx, *pn2);
                         b1_renamed = self.replace_generic(b1_renamed, *i1, fresh_gp);
                         b2_renamed = self.replace_generic(b2_renamed, *i2, fresh_gp);
+                        scope_indices.push(fresh_idx);
+                    } else {
+                        scope_indices.push(*i1);
                     }
                 }
-                self.unify_internal(
+                // Push all scope indices (in order).
+                for &idx in &scope_indices {
+                    self.binder_stack.borrow_mut().push(idx);
+                }
+                let res = self.unify_internal(
                     b1_renamed,
                     b2_renamed,
                     body_variance,
                     region_tree,
                     coercion_depth + 1,
-                )?;
+                );
+                // Pop in reverse order.
+                for _ in 0..scope_indices.len() {
+                    self.binder_stack.borrow_mut().pop();
+                }
+                res?;
                 if !self.set_binding(a, b) {
                     return Err(TypeError::Mismatch {
                         expected: a,
@@ -969,21 +1036,35 @@ impl<'input> TypeContext<'input> {
                 },
             ) => {
                 let body_variance = variance.xform(Variance::Covariant);
-                if *pi1 != *pi2 {
+                // FIX: binder scope — push binder index before recursing into body.
+                let result = if *pi1 != *pi2 {
                     let fresh_idx = self.fresh_param_index();
                     let fresh_gp = self.generic_param(fresh_idx, *pn2);
                     let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
                     let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
-                    self.unify_internal(
+                    self.binder_stack.borrow_mut().push(fresh_idx);
+                    let res = self.unify_internal(
                         b1_renamed,
                         b2_renamed,
                         body_variance,
                         region_tree,
                         coercion_depth + 1,
-                    )?;
+                    );
+                    self.binder_stack.borrow_mut().pop();
+                    res
                 } else {
-                    self.unify_internal(*b1, *b2, body_variance, region_tree, coercion_depth + 1)?;
-                }
+                    self.binder_stack.borrow_mut().push(*pi1);
+                    let res = self.unify_internal(
+                        *b1,
+                        *b2,
+                        body_variance,
+                        region_tree,
+                        coercion_depth + 1,
+                    );
+                    self.binder_stack.borrow_mut().pop();
+                    res
+                };
+                result?;
                 if !self.set_binding(a, b) {
                     return Err(TypeError::Mismatch {
                         expected: a,
@@ -1008,21 +1089,35 @@ impl<'input> TypeContext<'input> {
                 },
             ) => {
                 let body_variance = variance.xform(Variance::Covariant);
-                if *pi1 != *pi2 {
+                // FIX: binder scope — push binder index before recursing into body.
+                let result = if *pi1 != *pi2 {
                     let fresh_idx = self.fresh_param_index();
                     let fresh_gp = self.generic_param(fresh_idx, *pn2);
                     let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
                     let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
-                    self.unify_internal(
+                    self.binder_stack.borrow_mut().push(fresh_idx);
+                    let res = self.unify_internal(
                         b1_renamed,
                         b2_renamed,
                         body_variance,
                         region_tree,
                         coercion_depth + 1,
-                    )?;
+                    );
+                    self.binder_stack.borrow_mut().pop();
+                    res
                 } else {
-                    self.unify_internal(*b1, *b2, body_variance, region_tree, coercion_depth + 1)?;
-                }
+                    self.binder_stack.borrow_mut().push(*pi1);
+                    let res = self.unify_internal(
+                        *b1,
+                        *b2,
+                        body_variance,
+                        region_tree,
+                        coercion_depth + 1,
+                    );
+                    self.binder_stack.borrow_mut().pop();
+                    res
+                };
+                result?;
                 if !self.set_binding(a, b) {
                     return Err(TypeError::Mismatch {
                         expected: a,
