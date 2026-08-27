@@ -12,7 +12,7 @@
 //! All stored bounds are  doubled  (2×c) to represent half-integers
 //! exactly. Interval (self-dual) rows therefore carry 4× the interval
 //! half-width in raw storage — readers must go through the semantic
-//! pr ojections ( `var_ub`  /  `var_lb`  /  `diff_bound`  /  `sum_ub` ), never
+//! projections ( `var_ub`  /  `var_lb`  /  `diff_bound`  /  `sum_ub` ), never
 //! raw cells. External API accepts plain  `c` , internal storage uses the
 //! doubled space.
 //!
@@ -23,7 +23,7 @@
 //! composing) are UNREPRESENTABLE: the closure CLAMPS them to  `MIN + 4`
 //! ( `sat_add_closed`  — a sound, monotone weakening, so the no-close
 //! preservation lemmas keep their proofs, and the clamped value is
-//! still negative, so an extreme negative cycle still reports b ottom),
+//! still negative, so an extreme negative cycle still reports bottom),
 //!  `sat_mul2_bound`  refuses the marker on the insertion side,
 //!  `tighten_self_dual`  clamps its rounding off it, and  `close_with`
 //! weakens any raw  `i128::MIN`  cell to  `DBM_INF`  as belt-and-braces.
@@ -36,7 +36,7 @@
 //! violations. The one legitimate producer of non-closed states is
 //!  `widen`  ([Miné06] §VI.D — closing its output would risk the
 //! non-terminating chain of Figure 10 / Thm 8.2); re-close a widened
-//! state before joining it. Every other transfer preserv es closure.
+//! state before joining it. Every other transfer preserves closure.
 //!
 //! # References
 //!
@@ -63,7 +63,7 @@
 //!   by  `ClosureMode::IntegerExact` : on a closed integer octagonal
 //!   graph, one tightening pass plus a single floor-halved
 //!   strong-coherence step computes the tight closure exactly, and an
-//!   O(n) self-d ual-pair check decides Z-consistency.
+//!   O(n) self-dual-pair check decides Z-consistency.
 //! -  `[EAGLE]`  — Peisen Yao et al., "Demystifying Template-based
 //!   Invariant Generation for Bit-Vector Programs", 2024. Context for
 //!   octagon templates in template-based invariant generation and the
@@ -93,7 +93,7 @@ pub(crate) fn sat_add(a: i128, b: i128) -> i128 {
 /// a multiple of 4 (so the  `IntegerExact`  rounding cannot push it onto
 /// the marker). Crucially the clamped value is still NEGATIVE, so a
 /// negative cycle — however extreme — still drives a diagonal below 0
-/// and re ports bottom. The interval clamp is MONOTONE in both arguments
+/// and reports bottom. The interval clamp is MONOTONE in both arguments
 /// (unlike a point clamp, which jumps at exactly  `i128::MIN`  and breaks
 /// the lattice), so the closure operator built from it is monotone and
 /// the no-close preservation lemmas ( `join` ,  `assign_add_var` ) keep
@@ -270,10 +270,10 @@ impl PartialEq for Dbm {
 /// pass. Total  cost O(N³) — the same order as  `Strong` , with NO
 /// fixpoint iteration and NO round cap: [BHZ07] Thm 2 proves one
 /// round on a closed graph yields the tight closure exactly, and
-/// Thm 3 proves the self-dual-pair ch eck decides integer
+/// Thm 3 proves the self-dual-pair check decides integer
 /// (in)consistency, so a failed check reports ⊥ soundly and
 /// completely. (This replaces a former tighten/re-close fixpoint
-/// loop whose worst-case round c ount was exponential in the bit
+/// loop whose worst-case round count was exponential in the bit
 /// width and capped at an engineering bound of 4N+64.)
 /// SOUND ONLY over INTEGER domains: over rationals the rounding
 /// discards solutions ( `2x ≤ 5`  admits x = 2.5; the tightened
@@ -322,20 +322,22 @@ pub(crate) enum ClosureMode {
 /// `(±x ± y ≤ c)`, so a general assignment `X := e` cannot be encoded
 /// exactly. The strategy from [Miné06] is:
 ///
-/// 1. Extract the interval `[lb_i, ub_i]` of each variable via
+/// 1. **Project**: extract the interval `[lb_i, ub_i]` of each variable via
 ///    projection (Theorem 6):
 ///      `lb_i = −(m+)•_{2i+1, 2i} / 2`,  `ub_i = (m+)•_{2i, 2i+1} / 2`
 ///    (In our doubled storage: `var_lb(i)` and `var_ub(i)`.)
 ///
-/// 2. Evaluate `e` using interval arithmetic to obtain `[e_lo, e_hi]`
-///    ⊇ { e(s) | s ∈ D⁺(m⁺) }.
+/// 2. **Evaluate**: compute `[e_lo, e_hi]` ⊇ e([lb₀, ub₀], ...)
+///    using interval arithmetic. The result is a sound
+///    over-approximation: for all concrete states s ∈ D⁺(m⁺),
+///    `e(s) ∈ [e_lo, e_hi]`.
 ///
-/// 3. Produce the abstract post-state:
+/// 3. **Assign**: produce the abstract post-state:
 ///    ```text
 ///    [m⁺(vₖ ← e)]ᵢⱼ =
-///      (m⁺)•ᵢⱼ           if i, j ∉ {2k, 2k+1}
-///      e_hi              if (i, j) = (2k, 2k+1)   [X ≤ e_hi]
-///      −e_lo             if (i, j) = (2k+1, 2k)   [X ≥ e_lo]
+///      (m⁺)•ᵢⱼ           if i, j ∉ {2k, 2k+1}   (retain other info)
+///      e_hi              if (i, j) = (2k, 2k+1)  [X ≤ e_hi]
+///      −e_lo             if (i, j) = (2k+1, 2k)  [X ≥ e_lo]
 ///      +∞                elsewhere (X's other edges)
 ///    ```
 ///    (Definition 2.6 + the interval refinement described in §VI.E.)
@@ -620,27 +622,17 @@ impl Dbm {
         self.close_with(ClosureMode::Strong)
     }
 
-    /// One pass of the strong closure, adapted from [Miné06] Figure 8
-    /// (all-pivot variant — see the body comment on even-pivot
-    /// equivalence): the C⁺_k / S⁺ interleaving over all k, in place.
-    /// Extracted from `close_with` so it can be re-run after the
-    /// coherence repair; its S⁺ tail lives in `strong_coherence_pass`,
-    /// which the BHZ tight-closure round ([BHZ07]) also invokes
-    /// standalone after tightening.
+    /// One pass of the strong closure, adapted from [Miné06] Figure 8.
+    /// The loop iterates only over even pivots (`k = 0, 2, 4, ...`).
+    /// This is sufficient because the pivot `k̄ = k⊕1` produces the same
+    /// set of five C⁺ arms as pivot `k` (the mirror map sends each arm
+    /// to an arm of the mirrored entry); on a coherent matrix the two
+    /// pivots are equivalent. Iterating all `2n` nodes would be redundant.
+    /// The S⁺ pass is applied after each pivot (interleaved as in Figure 8).
+    /// Extracted from `close_with` so it can be re-run after coherence repair;
+    /// its S⁺ tail lives in `strong_coherence_pass`, which the BHZ
+    /// tight-closure round also invokes standalone after tightening.
     fn strong_closure_pass(m: &mut [i128], size: usize) {
-        // [Miné06]'s loop applies C⁺ only at even pivots (its Figure 8:
-        // S⁺(C⁺_{2k}(·))); C⁺_{k̄} has the same five terms as C⁺_k, so
-        // iterating over all 2n nodes applies each pivot twice —
-        // redundant work, same result.
-        // k iterates over ALL 2n nodes. The mirror of every node is
-        // `i ⊕ 1`; with no implicit zero node the single-variable bounds
-        // [Miné06] Figure 8 applies C⁺ only at EVEN pivots:
-        // `m⁺_{k+1} = S⁺(C⁺_{2k}(m⁺_k))` for `k = 0..N-1`. The odd
-        // pivot `k̄ = k ⊕ 1` is redundant: its five C⁺ terms are the
-        // mirror of pivot `k`'s (the mirror map `i ↦ i⊕1` sends each
-        // of the five arms to another arm of the mirrored entry), so
-        // on a coherent matrix it re-derives the same bounds. Iterating
-        // only the even pivots halves the O(N³) closure work.
         for k in (0..size).step_by(2) {
             let k_bar = mirror_index(k);
             // ---- C⁺_k ([Miné06] Figure 8). Each term is a path
@@ -656,8 +648,6 @@ impl Dbm {
             // coherent matrices to coherent matrices — the
             // property [Miné06] Figure 8's C⁺ is designed around
             // ([Miné06] §V.C).
-            // Row offsets are hoisted out of the inner loops (pure
-            // algebraic refactor — same indices, no semantic change).
             let row_k = k * size;
             let row_kb = k_bar * size;
             for i in 0..size {
@@ -742,11 +732,12 @@ impl Dbm {
     }
 
     /// Harvey–Stuckey tightening ([HS97]; see [Miné06] §V.D): round every
-    /// self-dual edge's stored bound down to a multiple of 4 — the
-    /// edge (2v, 2v+1) carries `2x ≤ s/2` with 2x an EVEN integer, so
-    /// `2x ≤ s/2` ⟺ `2x ≤ 4⌊s/4⌋` over Z ([Miné06]'s undoubled rule
-    /// `2x ≤ 2c+1 ⟹ 2x ≤ 2c`). Self-dual edges are their own mirrors,
-    /// so coherence is preserved. Returns whether anything changed.
+    /// self-dual edge's stored bound down to a multiple of 4.
+    /// The edge (2v, 2v+1) carries `2x ≤ s/2`. Since `2x` is an even integer,
+    /// `2x ≤ s/2` is equivalent to `2x ≤ 2⌊s/4⌋`; the stored value becomes
+    /// `4⌊s/4⌋`. 
+    /// Self-dual edges are their own mirrors, so coherence is preserved.
+    /// Returns whether anything changed.
     /// `DBM_INF` is never rounded (it is not a bound).
     fn tighten_self_dual(m: &mut [i128], size: usize) -> bool {
         let mut changed = false;
@@ -811,37 +802,23 @@ impl Dbm {
     /// Close under the given `ClosureMode`. See the enum docs for the
     /// integer-tightening profile.
     pub(crate) fn close_with(&mut self, mode: ClosureMode) -> bool {
-        // Every exit path leaves the matrix strongly closed (or ⊥, which
-        // is vacuously closed), so the flag is set up front — the closure
-        // passes below are atomic from the caller's perspective.
         self.closed = true;
         if self.bottom {
             return false;
         }
         let size = self.size;
-        // Strong closure (all-pivot variant of [Miné06] Figure 8): one
-        // pass of the C⁺_k / S⁺ interleaving over all k.
+        // Strong closure (even-pivot variant of [Miné06] Figure 8).
         Self::strong_closure_pass(&mut self.m, size);
+
         // ---- Bagnara–Hill–Zaffanella tight closure ([BHZ07], Figure 2) ----
-        // `IntegerExact` applies, to the closed matrix above: ONE
-        // Harvey–Stuckey tightening pass ([HS97]; see [Miné06] §V.D:
-        // `2x ≤ 2c+1 ⟹ 2x ≤ 2c`; the rounding preserves the INTEGER
-        // solution set of each constraint — and is unsound over
-        // rationals: 2x ≤ 5 admits x = 2.5, the tightened 2x ≤ 4 does
-        // not — integer domains only), an O(n) Z-consistency check on
-        // each self-dual pair, and a single strong-coherence (S⁺)
-        // pass. [BHZ07] Thm 2 proves that ONE round on a closed graph
-        // computes the tight closure exactly — no fixpoint iteration,
-        // no round cap; Thm 3 proves the self-dual-pair check decides
-        // Z-consistency, so a failed check is a sound and COMPLETE ⊥
-        // report.
         if mode == ClosureMode::IntegerExact {
             if !Self::tight_closure_round(&mut self.m, size) {
                 self.bottom = true;
                 return false;
             }
         }
-        // ---- Enforce coherence (LOAD-BEARING, not just defensive) ----
+
+        // ---- Enforce coherence (LOAD-BEARING) ----
         // The min-copy repairs (a) non-coherent inputs built with the
         // one-sided `set`, and (b) the mirror asymmetry the closure pass
         // itself can CREATE in the corner domain, where the clamped
@@ -856,8 +833,8 @@ impl Dbm {
         // (one round suffices), but `sat_add_closed` is non-associative
         // at the clamp boundary (MIN+4 vs MIN+8), so the re-close after
         // a repair can re-introduce asymmetry in the corner domain.
-        // We iterate until不动点 or the bound is reached. The bound is
-        // conservative — empirical convergence is ≤2 rounds.
+        // We iterate until fixed point or the bound is reached. The bound
+        // is conservative — empirical convergence is ≤2 rounds.
         let mut repair_rounds = 0u32;
         const MAX_REPAIR_ROUNDS: u32 = 3;
         loop {
@@ -892,9 +869,8 @@ impl Dbm {
             if repair_rounds >= MAX_REPAIR_ROUNDS {
                 // Engineering safety net: force coherence by taking the
                 // min of each mirror pair. Sound (only tightens) and
-                // terminates the loop. This should not happen in
-                // practice — it guards against pathological clamp-boundary
-                // interactions in `sat_add_closed`.
+                // terminates the loop. Re-run closure afterwards to
+                // restore strong closure on the coherent matrix.
                 for i in 0..size {
                     for j in 0..size {
                         let i_bar = mirror_index(i);
@@ -906,9 +882,18 @@ impl Dbm {
                         self.m[j_bar * size + i_bar] = v;
                     }
                 }
+                // Re-run closure after forced symmetry repair.
+                Self::strong_closure_pass(&mut self.m, size);
+                if mode == ClosureMode::IntegerExact {
+                    if !Self::tight_closure_round(&mut self.m, size) {
+                        self.bottom = true;
+                        return false;
+                    }
+                }
                 break;
             }
         }
+
         // ---- Diagonal unsatisfiability check ----
         for i in 0..size {
             let d = self.m[i * size + i];
@@ -918,6 +903,7 @@ impl Dbm {
             }
             self.m[i * size + i] = 0; // normalize
         }
+
         // ---- i128::MIN normalization (belt-and-braces) ----
         // `i128::MIN` is the −∞ marker in `sat_sub`/`sat_neg`, so no
         // stored cell may carry it. The closure passes never WRITE it
@@ -925,17 +911,23 @@ impl Dbm {
         // `sat_add_closed`), `tighten_self_dual` clamps its rounding off
         // it, and `sat_mul2_bound` refuses it on insertion; this loop
         // only cleans up raw cell writes (e.g. in tests). Weakening to
-        // `DBM_INF` cannot break strong closure (the closure invariant
-        // and the checker both use the clamped arithmetic). Runs AFTER
-        // the diagonal check so a negative cycle is detected first.
+        // `DBM_INF` cannot break strong closure because the closure
+        // invariant and the checker both use the clamped arithmetic
+        // and the actual stored `MIN` never appears in normal operation.
+        // Runs AFTER the diagonal check so a negative cycle is detected first.
         for cell in self.m.iter_mut() {
             if *cell == i128::MIN {
                 *cell = DBM_INF;
             }
         }
-        // Debug tripwire: the IntegerExact output must be in the
-        // Harvey–Stuckey rounded normal form (every finite self-dual
-        // stored bound ≡ 0 (mod 4)) — [BHZ07] Def. 5 property (7).
+
+        // ---- Debug tripwire: strong closure invariant ----
+        debug_assert!(
+            self.is_strongly_closed(),
+            "close_with must produce a strongly closed matrix"
+        );
+
+        // ---- IntegerExact normal form check ----
         if mode == ClosureMode::IntegerExact {
             debug_assert!(
                 (0..size / 2).all(|v| {
@@ -948,6 +940,7 @@ impl Dbm {
                 "IntegerExact output must be in the rounded normal form"
             );
         }
+
         self.bottom = false;
         true
     }
@@ -1156,6 +1149,9 @@ impl Dbm {
     /// the next widening can create the non-terminating chain of
     /// [Miné06] Figure 10 / Thm 8.2). Callers that need a closed state
     /// (e.g. before `join`) must re-close it.
+    ///
+    /// The right operand need not be closed; precision benefits from a
+    /// closed right operand but soundness does not require it.
     pub(crate) fn widen(&self, new: &Dbm) -> Dbm {
         if self.bottom {
             return new.clone();
@@ -1235,7 +1231,18 @@ impl Dbm {
     /// (the tightening step finds nothing to round).  The sole exception
     /// is the saturation regime (δ = DBM_INF or δ = i128::MIN), where the
     /// variable is forgotten instead of shifted — no rounded-form claim.
+    ///
+    /// # Precondition
+    ///
+    /// The input must be strongly closed for the fast path to be valid.
+    /// If the input is not closed, the result may not be closed either.
+    /// The debug assertion enforces this; in release builds the caller is
+    /// responsible for providing a closed matrix.
     pub(crate) fn assign_add_var(&self, i: usize, c: i128) -> Dbm {
+        debug_assert!(
+            self.closed,
+            "assign_add_var requires a strongly closed input for the no-close lemma"
+        );
         if self.bottom {
             return Dbm::bottom();
         }
@@ -1779,10 +1786,17 @@ impl Dbm {
     ///    ```text
     ///    [m⁺(vₖ ← e)]ᵢⱼ =
     ///      (m⁺)•ᵢⱼ    if i, j ∉ {2k, 2k+1}   (retain other info)
-    ///      e_hi       if (i, j) = (2k, 2k+1)  (X ≤ e_hi, stored 2·e_hi)
-    ///      −e_lo      if (i, j) = (2k+1, 2k)  (X ≥ e_lo, stored −2·e_lo)
+    ///      e_hi       if (i, j) = (2k, 2k+1)  (X ≤ e_hi)
+    ///      −e_lo      if (i, j) = (2k+1, 2k)  (X ≥ e_lo)
     ///      +∞         elsewhere on X's rows/cols
     ///    ```
+    ///
+    /// # Storage details
+    ///
+    /// The self-dual edge (p, q) stores the bound `2·(e_hi)` in
+    /// `set_mirrored`'s argument; since `set_mirrored` doubles again,
+    /// the final stored value is `4·e_hi`. The code uses `sat_mul2(e_hi)`
+    /// as the argument, which is exactly `2·e_hi`.
     ///
     /// # Precision
     ///
