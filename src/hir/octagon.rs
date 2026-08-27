@@ -735,7 +735,7 @@ impl Dbm {
     /// self-dual edge's stored bound down to a multiple of 4.
     /// The edge (2v, 2v+1) carries `2x ≤ s/2`. Since `2x` is an even integer,
     /// `2x ≤ s/2` is equivalent to `2x ≤ 2⌊s/4⌋`; the stored value becomes
-    /// `4⌊s/4⌋`. 
+    /// `4⌊s/4⌋`.
     /// Self-dual edges are their own mirrors, so coherence is preserved.
     /// Returns whether anything changed.
     /// `DBM_INF` is never rounded (it is not a bound).
