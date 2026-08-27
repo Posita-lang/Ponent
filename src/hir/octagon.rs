@@ -286,6 +286,24 @@ impl PartialEq for Dbm {
 /// reasons over integers by construction: the BII inductiveness
 /// verifier ( `dbm_proves_inductiveness`  in  `bii.rs` , LIA mode only).
 /// The DBM fixpoint and the type-equality closure stay on  `Strong` .
+///
+/// # Consumer discipline
+///
+/// The rounded normal form (all finite self-dual bounds ≡ 0 mod 4) is
+/// **VOLATILE**. The following operations internally close with `Strong`
+/// and EXIT the normal form:
+///
+/// - `meet`
+/// - `test_le_var`, `test_ge_var`, `test_diff_le`, `test_sum_le`,
+///   `test_neg_sum_le`, `test_sum_eq`, `test_diff_eq`, `test_var_eq`
+/// - `assign_const_var`, `assign_copy_var` / `assign_copy_add_var`
+/// - `forget_var` (and its callers: `assign_add_var` saturation fallback,
+///   `assign_expr_var` unrepresentable fallback)
+///
+/// **Rule**: any consumer that relies on integer-exact bounds MUST call
+/// `close_with(ClosureMode::IntegerExact)` as the LAST operation before
+/// reading. The BII inductiveness verifier (`dbm_proves_inductiveness`)
+/// follows this rule.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ClosureMode {
     Strong,
@@ -833,35 +851,62 @@ impl Dbm {
         // closedness conditions may no longer hold (the copied bounds
         // can open NEW paths whose closure is not yet derived), so the
         // strong closure is re-run below.
-        let mut repaired = false;
-        for i in 0..size {
-            for j in 0..size {
-                let i_bar = mirror_index(i);
-                let j_bar = mirror_index(j);
-                let a = self.m[i * size + j];
-                let b = self.m[j_bar * size + i_bar];
-                if a < b {
-                    self.m[j_bar * size + i_bar] = a;
-                    repaired = true;
-                } else if b < a {
-                    self.m[i * size + j] = b;
-                    repaired = true;
+        //
+        // Bounded loop: in exact arithmetic the repair is idempotent
+        // (one round suffices), but `sat_add_closed` is non-associative
+        // at the clamp boundary (MIN+4 vs MIN+8), so the re-close after
+        // a repair can re-introduce asymmetry in the corner domain.
+        // We iterate until不动点 or the bound is reached. The bound is
+        // conservative — empirical convergence is ≤2 rounds.
+        let mut repair_rounds = 0u32;
+        const MAX_REPAIR_ROUNDS: u32 = 3;
+        loop {
+            let mut repaired = false;
+            for i in 0..size {
+                for j in 0..size {
+                    let i_bar = mirror_index(i);
+                    let j_bar = mirror_index(j);
+                    let a = self.m[i * size + j];
+                    let b = self.m[j_bar * size + i_bar];
+                    if a < b {
+                        self.m[j_bar * size + i_bar] = a;
+                        repaired = true;
+                    } else if b < a {
+                        self.m[i * size + j] = b;
+                        repaired = true;
+                    }
                 }
             }
-        }
-        if repaired {
-            // A fired repair means the matrix was not mirror-symmetric
-            // going in: re-run the strong closure to restore the
-            // closedness conditions (for the corner-domain asymmetry the
-            // rescue is already complete — the re-run is a no-op).
-            // IntegerExact re-runs its tight-closure round so the
-            // rounded normal form survives the re-close.
+            if !repaired {
+                break;
+            }
+            repair_rounds += 1;
+            // Re-run closure to restore closedness conditions after repair.
             Self::strong_closure_pass(&mut self.m, size);
             if mode == ClosureMode::IntegerExact {
                 if !Self::tight_closure_round(&mut self.m, size) {
                     self.bottom = true;
                     return false;
                 }
+            }
+            if repair_rounds >= MAX_REPAIR_ROUNDS {
+                // Engineering safety net: force coherence by taking the
+                // min of each mirror pair. Sound (only tightens) and
+                // terminates the loop. This should not happen in
+                // practice — it guards against pathological clamp-boundary
+                // interactions in `sat_add_closed`.
+                for i in 0..size {
+                    for j in 0..size {
+                        let i_bar = mirror_index(i);
+                        let j_bar = mirror_index(j);
+                        let a = self.m[i * size + j];
+                        let b = self.m[j_bar * size + i_bar];
+                        let v = a.min(b);
+                        self.m[i * size + j] = v;
+                        self.m[j_bar * size + i_bar] = v;
+                    }
+                }
+                break;
             }
         }
         // ---- Diagonal unsatisfiability check ----
@@ -1660,6 +1705,11 @@ impl Dbm {
     ///
     /// (Internal `close()` is `Strong`.)
     pub(crate) fn assign_copy_add_var(&self, i: usize, j: usize, c: i128) -> Dbm {
+        debug_assert!(
+            self.closed,
+            "assign_copy_add_var requires strongly closed input for precision — \
+             re-close the operand first (widen output is deliberately unclosed)"
+        );
         if i == j {
             // X := X + c is an additive shift, not a copy.
             return self.assign_add_var(i, c);
@@ -1759,6 +1809,11 @@ impl Dbm {
     ///
     /// (Internal `close()` is `Strong`.)
     pub(crate) fn assign_expr_var(&self, i: usize, expr: &OctExpr) -> Dbm {
+        debug_assert!(
+            self.closed,
+            "assign_expr_var requires strongly closed input for precision — \
+             re-close the operand first (widen output is deliberately unclosed)"
+        );
         if self.bottom {
             return Dbm::bottom();
         }
