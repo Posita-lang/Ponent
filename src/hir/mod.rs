@@ -10,6 +10,7 @@ pub(crate) mod loop_ir;
 pub(crate) mod octagon;
 mod resolver;
 mod shape_var;
+pub mod parametricity;
 pub mod target;
 mod smt;
 mod symbol;

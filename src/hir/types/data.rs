@@ -1,9 +1,12 @@
+use parking_lot::Mutex;
 use rustc_hash::FxHashMap as HashMap;
-use std::cell::Cell;
-use std::cell::RefCell;
+use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering as AtomicOrdering;
 
 use super::*;
 use crate::ast::OverflowPolicy;
@@ -210,13 +213,13 @@ pub enum TypeData {
     Adt {
         kind: AdtKind,
         def_id: DefId,
-        args: Vec<TypeId>,
+        args: SmallVec<[TypeId; 4]>,
     },
     /// (Mac Lane §III.4): the product a × b is the universal
     /// object with projections p: a×b → a, q: a×b → b, satisfying
     /// C(c, a×b) ≅ C(c, a) × C(c, b).  Dual to Coproduct (§III.3).    
     Tuple {
-        elems: Vec<TypeId>,
+        elems: SmallVec<[TypeId; 4]>,
     },
     Array {
         elem: TypeId,
@@ -243,7 +246,7 @@ pub enum TypeData {
         pointee: TypeId,
     },
     Fn {
-        params: Vec<TypeId>,
+        params: SmallVec<[TypeId; 4]>,
         ret: TypeId,
     },
     DynTrait {
@@ -290,7 +293,7 @@ pub enum TypeData {
     /// ∀X.(A₁⇒X)⇒⋯⇒(Aₙ⇒X)⇒X is exactly this universal property internalized
     /// as a polymorphic type.
     Coproduct {
-        alternatives: Vec<TypeId>,
+        alternatives: SmallVec<[TypeId; 4]>,
     },
     /// Least fixed-point type: μX.A⟨X⟩.
     /// X is the recursive type variable, identified by param_index in body.
@@ -346,7 +349,7 @@ pub enum TypeData {
     /// (e.g. in `TypeContext::poly()`) would catch such violations at the
     /// construction site rather than silently propagating them.
     Poly {
-        quantifiers: Vec<(usize, Symbol)>,
+        quantifiers: SmallVec<[(usize, Symbol); 2]>,
         body: TypeId,
     },
     /// Fixed-precision rational type: `Rational<p, q>`.
@@ -366,7 +369,7 @@ pub enum TypeData {
     Error,
     /// A compile-time validated regular expression pattern: `Regex<"pattern">`.
     Regex {
-        pattern: String,
+        pattern: Symbol,
     },
     /// `type` — the type of types, used as a first-class value in comptime
     /// contexts.  When a comptime function returns `type`, it returns a
@@ -503,94 +506,98 @@ impl TypeData {
     ///
     /// When `symbols` is `Some`, ADT types (structs, enums) are rendered with
     /// their actual name (e.g. `MyStruct`) instead of a generic `struct`/`enum`.
+    ///
+    /// Returns [`Cow`] so that constant renderings (and interned ADT names)
+    /// borrow a `&'static str` instead of allocating; only computed
+    /// renderings own a `String`.
     pub fn display_with<'input>(
         &self,
         ctx: &TypeContext<'input>,
         symbols: Option<&crate::hir::symbol::SymbolTable>,
-    ) -> String {
+    ) -> Cow<'static, str> {
         match self {
             TypeData::Ref { ty, mutable, .. } => {
                 let inner = ctx.get(*ty).display_with(ctx, symbols);
                 if *mutable {
-                    format!("&mut {}", inner)
+                    Cow::Owned(format!("&mut {}", inner))
                 } else {
-                    format!("&{}", inner)
+                    Cow::Owned(format!("&{}", inner))
                 }
             }
             TypeData::Slice { elem } => {
                 let inner = ctx.get(*elem).display_with(ctx, symbols);
-                format!("&[{}]", inner)
+                Cow::Owned(format!("&[{}]", inner))
             }
             TypeData::Array { elem, size } => {
                 let inner = ctx.get(*elem).display_with(ctx, symbols);
-                format!("[{}; {}]", inner, size)
+                Cow::Owned(format!("[{}; {}]", inner, size))
             }
             TypeData::Tuple { elems } => {
-                let parts: Vec<String> = elems
+                let parts: Vec<Cow<'static, str>> = elems
                     .iter()
                     .map(|e| ctx.get(*e).display_with(ctx, symbols))
                     .collect();
-                format!("({})", parts.join(", "))
+                Cow::Owned(format!("({})", parts.join(", ")))
             }
             TypeData::Fn { params, ret } => {
-                let params: Vec<String> = params
+                let params: Vec<Cow<'static, str>> = params
                     .iter()
                     .map(|p| ctx.get(*p).display_with(ctx, symbols))
                     .collect();
                 let ret = ctx.get(*ret).display_with(ctx, symbols);
-                format!("fn({}) -> {}", params.join(", "), ret)
+                Cow::Owned(format!("fn({}) -> {}", params.join(", "), ret))
             }
-            TypeData::Ptr { size, pointee } => {
-                format!(
-                    "Ptr<size={}, pointee={}>",
-                    ctx.get(*size).display_with(ctx, symbols),
-                    ctx.get(*pointee).display_with(ctx, symbols)
-                )
+            TypeData::Ptr { size, pointee } => Cow::Owned(format!(
+                "Ptr<size={}, pointee={}>",
+                ctx.get(*size).display_with(ctx, symbols),
+                ctx.get(*pointee).display_with(ctx, symbols)
+            )),
+            TypeData::Pointer { ty } => {
+                Cow::Owned(format!("*{}", ctx.get(*ty).display_with(ctx, symbols)))
             }
-            TypeData::Pointer { ty } => format!("*{}", ctx.get(*ty).display_with(ctx, symbols)),
             TypeData::Adt { kind, def_id, .. } => {
                 if def_id == &DefId::SENTINEL_STR {
-                    "Str".to_string()
+                    Cow::Borrowed("Str")
                 } else if let Some(symbols) = symbols {
                     if let Some(name) = symbols.type_name_by_def_id(*def_id) {
-                        name.as_str().to_string()
+                        Cow::Borrowed(name.as_str())
                     } else {
                         match kind {
-                            AdtKind::Struct => "struct".to_string(),
-                            AdtKind::Enum => "enum".to_string(),
+                            AdtKind::Struct => Cow::Borrowed("struct"),
+                            AdtKind::Enum => Cow::Borrowed("enum"),
                         }
                     }
                 } else {
                     match kind {
-                        AdtKind::Struct => "struct".to_string(),
-                        AdtKind::Enum => "enum".to_string(),
+                        AdtKind::Struct => Cow::Borrowed("struct"),
+                        AdtKind::Enum => Cow::Borrowed("enum"),
                     }
                 }
             }
             TypeData::Int { bits, signed, .. } => {
                 if *signed {
-                    format!("Int<{}>", bits)
+                    Cow::Owned(format!("Int<{}>", bits))
                 } else {
-                    format!("UInt<{}>", bits)
+                    Cow::Owned(format!("UInt<{}>", bits))
                 }
             }
-            TypeData::UInt { bits, .. } => format!("UInt<{}>", bits),
-            TypeData::Float { bits } => format!("Float<{}>", bits),
-            TypeData::Bool => "Bool".to_string(),
-            TypeData::Char => "Char".to_string(),
-            TypeData::Byte => "Byte".to_string(),
-            TypeData::USize => "USize".to_string(),
-            TypeData::Never => "!".to_string(),
-            TypeData::Error => "!!".to_string(),
+            TypeData::UInt { bits, .. } => Cow::Owned(format!("UInt<{}>", bits)),
+            TypeData::Float { bits } => Cow::Owned(format!("Float<{}>", bits)),
+            TypeData::Bool => Cow::Borrowed("Bool"),
+            TypeData::Char => Cow::Borrowed("Char"),
+            TypeData::Byte => Cow::Borrowed("Byte"),
+            TypeData::USize => Cow::Borrowed("USize"),
+            TypeData::Never => Cow::Borrowed("!"),
+            TypeData::Error => Cow::Borrowed("!!"),
             TypeData::Rational {
                 int_bits,
                 frac_bits,
                 ..
-            } => format!("Rational<{}, {}>", int_bits, frac_bits),
-            TypeData::InferVar { id, .. } => format!("infer#{}", id),
+            } => Cow::Owned(format!("Rational<{}, {}>", int_bits, frac_bits)),
+            TypeData::InferVar { id, .. } => Cow::Owned(format!("infer#{}", id)),
             // For all other types, use the Display trait (which shows TypeTag
             // for leaf types and doesn't need TypeContext<'input>).
-            other => format!("{}", other),
+            other => Cow::Owned(format!("{}", other)),
         }
     }
 }
@@ -600,6 +607,30 @@ impl TypeData {
 pub enum AdtKind {
     Struct,
     Enum,
+}
+
+/// Rigidity of a type variable, distinguishing user-specified (rigid) types
+/// from inferred (wobbly) types (Peyton Jones et al. PLDI'06 §2).
+///
+/// In GADT type inference, type refinement applies only to *rigid* types —
+/// those explicitly specified by the user in annotations, signatures, or
+/// `when` constraints.  *Wobbly* types (created by the inference engine)
+/// are never refined by GADT equalities, preventing unsound refinement of
+/// inferred types that the programmer did not commit to.
+///
+/// # Examples
+/// - A user-written `fn foo(x: Int<32>)` declares `x`'s type as **Rigid**.
+/// - An inferred type variable `?a` created by the engine is **Wobbly**.
+/// - A GADT `when T == Int<32>` constraint refines `T` only if `T` is rigid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Rigidity {
+    /// The type was explicitly specified by the user (annotation, signature,
+    /// or `when` constraint).  GADT refinement applies to rigid types.
+    Rigid,
+    /// The type was inferred by the type inference engine.  GADT refinement
+    /// must not apply to wobbly types — they represent unconstrained
+    /// inference variables that the programmer has not committed to.
+    Wobbly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -658,87 +689,105 @@ pub(crate) struct VarianceEdge {
     pub(crate) sign: isize,
 }
 
-/// A type factory that can create new types with shared (immutable) access.
-/// The type arena is wrapped in `RefCell` so that types can be created
-/// without `&mut` access to the `TypeContext<'input>`.
-#[derive(Debug)]
-pub struct TypeFactory {
-    types: RefCell<Vec<Arc<TypeData>>>,
-    pub(crate) type_map: RefCell<HashMap<TypeData, TypeId>>,
-    /// Index up to which types have been synced by TypeContext<'input>.
-    /// `drain_new_types()` returns all types from this index onward
-    /// and advances it.  This avoids the O(n) while loop in
-    /// `TypeContext::alloc` that previously scanned the entire arena.
-    sync_index: Cell<usize>,
+/// The SHARED half of the type system: the interner.
+///
+/// One `TypeFactory` is created per compilation and held behind an `Arc` by
+/// every `TypeContext<'input>` — the global context and each per-query one.
+/// Sharing it is what keeps `TypeId`s globally comparable: two contexts
+/// that intern `Int<32>` separately would mint two different ids and every
+/// `TypeId` equality check would silently disagree.
+///
+/// The arena is a `boxcar::Vec`: an append-only, chunked vec whose reads
+/// are lock-free and whose `push` takes `&self`.  So the interner grows
+/// *without* a read lock, and `TypeContext::get` still hands out a plain
+/// `&TypeData` — the two properties the query system needs.
+///
+/// Everything in here is either read-mostly (behind a `RwLock`, so a
+/// concurrent reader never blocks another reader) or atomic.  Nothing here
+/// is per-query inference state: that lives on `TypeContext<'input>`, so
+/// each query gets its own bindings and can run in parallel.
+pub struct TypeFactory<'input> {
+    pub(crate) types: boxcar::Vec<Arc<TypeData>>,
+    /// The intern map (structural type → id).  A `Mutex`, not a `RwLock`:
+    /// `alloc` is a check-then-push, and two threads that both miss would
+    /// push two identical `TypeData`s and hand out two different `TypeId`s
+    /// — silently breaking every `TypeId` equality check downstream.  The
+    /// lock serialises the whole `alloc`, so interning stays atomic.  It is
+    /// uncontended today (queries run serially) and costs one
+    /// uncontended acquire per new type.
+    pub(crate) type_map: Mutex<HashMap<TypeData, TypeId>>,
+    /// The regex-pattern validation cache (pattern → valid).
+    pub(crate) regex_cache: RwLock<HashMap<Symbol, bool>>,
+    /// Per-`TypeId` refinement metadata (invariant, default value).
+    pub(crate) meta: RwLock<HashMap<TypeId, TypeMeta<'input>>>,
+    /// `DefId` → the `TypeId` minted for it.
+    pub(crate) def_id_to_type_id: RwLock<HashMap<DefId, TypeId>>,
+    /// Registered ADT definitions (def_id → fields + Drop).
+    pub(crate) adt_defs: RwLock<HashMap<DefId, AdtDef>>,
+    /// (param_index, TypeId, expected_sign, cumulative_sign) → variance check result.
+    pub(crate) variance_cache: RwLock<HashMap<(usize, TypeId, isize, isize), bool>>,
+    /// Pre-computed variance-annotated outgoing edges per `TypeId`.
+    pub(crate) variance_edges: RwLock<HashMap<TypeId, Vec<VarianceEdge>>>,
+    /// Universe counter for Higher-Ranked Type skolemization.  Shared so
+    /// that universes are unique across per-query contexts.
+    pub(crate) next_universe: AtomicUsize,
+    /// Counter for GADT existential skolem IDs.
+    pub(crate) next_gadt_skolem_id: AtomicUsize,
+    /// Counter for generating fresh parameter indices (Exists/Forall).
+    pub(crate) next_param_index: AtomicUsize,
+    /// Counter for overlap/specialization freshening variables.  Base
+    /// offset mirrors the former global `OVERLAP_FRESH_VAR_ID` (1_000_000).
+    pub(crate) next_overlap_fresh_id: AtomicUsize,
 }
 
-impl<'input> TypeFactory {
+impl<'input> TypeFactory<'input> {
     pub fn new() -> Self {
         TypeFactory {
-            types: RefCell::new(Vec::new()),
-            type_map: RefCell::new(HashMap::default()),
-            sync_index: Cell::new(0),
+            types: boxcar::Vec::new(),
+            type_map: Mutex::new(HashMap::default()),
+            regex_cache: RwLock::new(HashMap::default()),
+            meta: RwLock::new(HashMap::default()),
+            def_id_to_type_id: RwLock::new(HashMap::default()),
+            adt_defs: RwLock::new(HashMap::default()),
+            variance_cache: RwLock::new(HashMap::default()),
+            variance_edges: RwLock::new(HashMap::default()),
+            next_universe: AtomicUsize::new(0),
+            next_gadt_skolem_id: AtomicUsize::new(0),
+            next_param_index: AtomicUsize::new(0),
+            next_overlap_fresh_id: AtomicUsize::new(1_000_000),
         }
     }
 
     pub fn alloc(&self, data: TypeData) -> (TypeId, Arc<TypeData>) {
-        // ═══════════════════════════════════════════════════════════════
-        // Borrow order constraint: immutable borrow for volatile check
-        // MUST be dropped before the mutable borrow for push below.
-        // Rust's RefCell does not allow upgrading a shared borrow to an
-        // exclusive one — the two must be sequential, not concurrent.
-        // ═══════════════════════════════════════════════════════════════
-        let types_borrow = self.types.borrow();
-        let can_cache = !is_type_volatile_inner(&data, Some(&types_borrow));
-        drop(types_borrow); // ← release before mutable borrow
+        let can_cache = !is_type_volatile_inner(&data, Some(&self.types));
         if can_cache {
-            let type_map = self.type_map.borrow();
+            let mut type_map = self.type_map.lock();
             if let Some(&id) = type_map.get(&data) {
-                drop(type_map); // ← release before borrowing types below
-                // Cache hit — return the existing Arc from the types vec.
-                let types = self.types.borrow();
-                return (id, types[id.index()].clone());
+                // Cache hit — return the existing Arc from the arena.
+                return (id, self.types.get(id.index()).expect("cached id").clone());
             }
+            let tag = TypeTag::from(&data) as usize;
+            let arc = Arc::new(data.clone()); // clone for Arc (HashMap needs original by value)
+            // `push` returns the index it claimed, so the id is derived from
+            // the allocation itself rather than from a racy `len()` read.
+            let index = self.types.push(arc.clone());
+            let id = TypeId::from_raw(((index + 1) << TypeId::TAG_BITS) | tag);
+            type_map.insert(data, id);
+            return (id, arc);
         }
         let tag = TypeTag::from(&data) as usize;
-        let mut types = self.types.borrow_mut();
-        let index = types.len();
+        let arc = Arc::new(data);
+        let index = self.types.push(arc.clone());
         let id = TypeId::from_raw(((index + 1) << TypeId::TAG_BITS) | tag);
-        let arc = Arc::new(data.clone()); // clone for Arc (HashMap needs original by value)
-        types.push(arc.clone());
-        drop(types);
-        if can_cache {
-            self.type_map.borrow_mut().insert(data, id);
-        }
         (id, arc)
     }
 
     pub fn len(&self) -> usize {
-        self.types.borrow().len()
+        self.types.count()
     }
 
-    /// Drain newly created types since the last call to this method.
-    /// Returns `Arc` clones for all types from the current sync index
-    /// to the end of the arena, then advances the sync index.
-    /// Used by `TypeContext<'input>` to keep its `self.types` cache in sync
-    /// without scanning the entire arena on every allocation.
-    pub fn drain_new_types(&self) -> Vec<Arc<TypeData>> {
-        let types = self.types.borrow();
-        let start = self.sync_index.get();
-        let end = types.len();
-        if start >= end {
-            return Vec::new();
-        }
-        let mut result = Vec::with_capacity(end - start);
-        for i in start..end {
-            result.push(types[i].clone());
-        }
-        self.sync_index.set(end);
-        result
-    }
-
-    pub fn borrow_types(&self) -> std::cell::Ref<'_, Vec<Arc<TypeData>>> {
-        self.types.borrow()
+    pub fn borrow_types(&self) -> &boxcar::Vec<Arc<TypeData>> {
+        &self.types
     }
 
     pub fn int(&self, bits: u32, signed: bool) -> TypeId {
@@ -762,7 +811,7 @@ impl<'input> TypeFactory {
         self.alloc(TypeData::Float { bits }).0
     }
 
-    pub fn tuple(&self, elems: Vec<TypeId>) -> TypeId {
+    pub fn tuple(&self, elems: SmallVec<[TypeId; 4]>) -> TypeId {
         self.alloc(TypeData::Tuple { elems }).0
     }
 
@@ -807,13 +856,13 @@ impl<'input> TypeFactory {
         self.alloc(TypeData::Ptr { size, pointee }).0
     }
 
-    pub fn function(&self, params: Vec<TypeId>, ret: TypeId) -> TypeId {
+    pub fn function(&self, params: SmallVec<[TypeId; 4]>, ret: TypeId) -> TypeId {
         self.alloc(TypeData::Fn { params, ret }).0
     }
 
-    pub fn regex(&self, pattern: String) -> TypeId {
+    pub fn regex(&self, pattern: Symbol) -> TypeId {
         debug_assert!(
-            regex_syntax::parse(&pattern).is_ok(),
+            regex_syntax::parse(pattern.as_str()).is_ok(),
             "Regex pattern must be valid"
         );
         self.alloc(TypeData::Regex { pattern }).0

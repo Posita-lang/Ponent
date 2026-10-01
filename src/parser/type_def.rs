@@ -6,16 +6,16 @@ use crate::diagnostics::Diagnostic;
 use crate::lexer::Token;
 use crate::symbol::Symbol;
 
-impl<'input> Parser<'input> {
+impl<'src, 'input> Parser<'src, 'input> {
     // -------------------------------------------------------------------------
     // Main `type` definition entry
     // -------------------------------------------------------------------------
 
     pub(super) fn parse_type_def(
         &mut self,
-        mut attributes: Vec<Attribute<'input>>,
+        attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let name = match self.advance() {
@@ -101,7 +101,7 @@ impl<'input> Parser<'input> {
         params: Vec<TypeParam<'input>>,
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         self.expect(Token::LBrace)?;
         let mut fields = Vec::new();
         loop {
@@ -164,7 +164,7 @@ impl<'input> Parser<'input> {
         params: Vec<TypeParam<'input>>,
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let trait_ty = self.parse_type()?;
         let modifiers = self.parse_type_modifiers()?;
         if matches!(self.peek(), Ok(Token::Semicolon)) {
@@ -193,7 +193,7 @@ impl<'input> Parser<'input> {
         params: Vec<TypeParam<'input>>,
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         self.expect(Token::LBrace)?;
         let mut variants = Vec::new();
         loop {
@@ -321,7 +321,7 @@ impl<'input> Parser<'input> {
 
     pub(super) fn parse_gadt_constraints(
         &mut self,
-    ) -> Result<Vec<(Symbol, Type<'input>)>, Diagnostic> {
+    ) -> Result<Vec<(Symbol, Type<'input>)>, Diagnostic<'src>> {
         let mut constraints = Vec::new();
         loop {
             let param_name = match self.advance() {
@@ -363,7 +363,9 @@ impl<'input> Parser<'input> {
     // Type modifiers (`with default = ...`, `with overflow = ...`, etc.)
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_type_modifiers(&mut self) -> Result<Vec<TypeModifier<'input>>, Diagnostic> {
+    pub(super) fn parse_type_modifiers(
+        &mut self,
+    ) -> Result<Vec<TypeModifier<'input>>, Diagnostic<'src>> {
         let mut modifiers = Vec::new();
         while matches!(self.peek(), Ok(Token::With)) {
             self.advance().ok();
@@ -450,7 +452,7 @@ impl<'input> Parser<'input> {
     pub(super) fn parse_layout_def(
         &mut self,
         mut attributes: Vec<Attribute<'input>>,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
@@ -517,7 +519,7 @@ impl<'input> Parser<'input> {
 
     pub(super) fn parse_type_capture_params(
         &mut self,
-    ) -> Result<Vec<TypeParam<'input>>, Diagnostic> {
+    ) -> Result<Vec<TypeParam<'input>>, Diagnostic<'src>> {
         self.advance().ok();
         let mut params = Vec::new();
         loop {

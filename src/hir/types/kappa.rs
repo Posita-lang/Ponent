@@ -30,9 +30,9 @@ impl<'input> TypeContext<'input> {
         // Resolve bindings first: if ty is an InferVar or GenericParam that has
         // been bound to a concrete type, compute κ on the resolved type instead
         // of the unbound variable.
-        let ty = self.resolve_binding(ty);
+        let ty = self.resolve_binding_compressed(ty);
         // Check cache first.
-        if let Some(&cached) = self.kappa_cache.borrow().get(&ty) {
+        if let Some(&cached) = self.kappa_cache.get(&ty) {
             return cached;
         }
         let reduced = self.try_yoneda_reduce(ty);
@@ -45,7 +45,7 @@ impl<'input> TypeContext<'input> {
         // terminate.
         let result = self.solve_kappa(&self.build_kappa_graph(reduced));
         // Cache the result.
-        self.kappa_cache.borrow_mut().insert(ty, result);
+        self.kappa_cache.insert(ty, result);
         result
     }
 

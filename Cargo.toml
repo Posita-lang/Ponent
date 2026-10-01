@@ -2,6 +2,12 @@
 name = "ponent"
 version = "0.0.0"
 edition = "2024"
+# Feature-implied floor: let-chains (`if let ... && ...`) require 1.88,
+# edition 2024 requires 1.85, `Option::is_none_or` requires 1.82.  Set so
+# an older toolchain fails with cargo's "requires rustc X" message instead
+# of a confusing cascade of syntax errors.  Not probed on every release —
+# it is the floor the features demand, not a claim about the newest one.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 
 [features]
@@ -34,6 +40,9 @@ stacker = "0.1.25"
 num-bigint = "0.4"
 num-traits = "0.2"
 sexp = "1.1.4"
+parking_lot = "0.12"
+arc-swap = "1.9.2"
+boxcar = "0.2.14"
 
 # The AUTHORITATIVE Polonius R1-R8 engine (rustc's own), used as a
 # differential oracle in tests: our `evaluate_rules` must agree with it
@@ -53,6 +62,23 @@ criterion = "0.5"
 # benchmark (crates.io, no hard-coded paths).
 [build-dependencies]
 flowlog-build = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[profile.release]
+# Whole-program optimisation + a single codegen unit: better inlining
+# across the (large) parser / types / solver modules.
+#
+# MEASURED: a cold release build is ~27m, but almost all of that is
+# first-time release compilation of the dependency graph (incl. the
+# vendored z3 C++ build), not LTO.  A one-file rebuild — the number
+# that governs the release iteration loop — is ~1m23s with fat LTO,
+# which is cheap enough to keep.  Revisit only if that regresses.
+lto = "fat"
+codegen-units = 1
+# NOT "abort": `QuerySystem::get` wraps `Q::compute` in `catch_unwind`
+# to poison its latch, and the query stress/poisoning tests (defense d4)
+# rely on unwinding.  "abort" would silently break them.
+panic = "unwind"
 
 # Octagon abstract-domain benchmarks (criterion; `harness = false` so
 # criterion's own runner drives them). The bench `#[path]`-includes

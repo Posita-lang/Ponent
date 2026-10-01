@@ -433,8 +433,23 @@ fn where_clauses_compatible<'input>(
                 // the bounds are mutually exclusive → the impls cannot
                 // both apply → NOT overlapping.  If they DO unify, this
                 // pair is the same requirement — keep looking.
+                //
+                // Stage 5a: before declaring exclusivity, fall back to the
+                // canonical-form (βη/Yoneda) equivalence query — two
+                // Yoneda-isomorphic argument lists (e.g. `∀X.(A⇒X)⇒B` vs
+                // `B[A/X]`) do NOT unify structurally but ARE the same
+                // requirement.  Gate-conservative: `None` (parametricity
+                // broken) or `false` keep the exclusivity verdict — the
+                // fallback can only MERGE requirements, never split them.
                 if !args_ok {
-                    return false;
+                    let equiv = e_args.len() == n_args.len()
+                        && e_args
+                            .iter()
+                            .zip(n_args)
+                            .all(|(a, b)| ctx.yoneda_equiv_check(*a, *b) == Some(true));
+                    if !equiv {
+                        return false;
+                    }
                 }
             }
             // Different self types: the bounds constrain different types,

@@ -53,21 +53,23 @@ impl JsonEmitter {
         "  ".repeat(level)
     }
 
-    fn diagnostic_to_json(&self, diag: &Diagnostic, indent_lvl: usize) -> String {
+    fn diagnostic_to_json(&self, diag: &Diagnostic<'_>, indent_lvl: usize) -> String {
         let i = indent_lvl;
+        let ind = Self::indent(i);
+        let ind1 = Self::indent(i + 1);
         let mut s = String::from("{\n");
 
         // level
         s.push_str(&format!(
             "{}  \"level\": {},\n",
-            Self::indent(i),
+            ind,
             Self::escape_json(diag.level.as_str())
         ));
 
         // message
         s.push_str(&format!(
             "{}  \"message\": {},\n",
-            Self::indent(i),
+            ind,
             Self::escape_json(&diag.message)
         ));
 
@@ -75,17 +77,17 @@ impl JsonEmitter {
         if let Some(ref code) = diag.code {
             s.push_str(&format!(
                 "{}  \"code\": {},\n",
-                Self::indent(i),
+                ind,
                 Self::escape_json(code.code())
             ));
             s.push_str(&format!(
                 "{}  \"title\": {},\n",
-                Self::indent(i),
+                ind,
                 Self::escape_json(code.title())
             ));
             s.push_str(&format!(
                 "{}  \"category\": {},\n",
-                Self::indent(i),
+                ind,
                 Self::escape_json(code.category().as_str())
             ));
         }
@@ -94,7 +96,7 @@ impl JsonEmitter {
         if let Some(span) = diag.spans.first() {
             s.push_str(&format!(
                 "{}  \"span\": {{\"start\": {}, \"end\": {}}},\n",
-                Self::indent(i),
+                ind,
                 span.start,
                 span.end,
             ));
@@ -102,11 +104,11 @@ impl JsonEmitter {
 
         // labels
         if !diag.labels.is_empty() {
-            s.push_str(&format!("{}  \"labels\": [\n", Self::indent(i)));
+            s.push_str(&format!("{}  \"labels\": [\n", ind));
             for (idx, lbl) in diag.labels.iter().enumerate() {
                 s.push_str(&format!(
                     "{}    {{\"start\": {}, \"end\": {}, \"message\": {}, \"kind\": {:?}}}",
-                    Self::indent(i),
+                    ind,
                     lbl.span.start,
                     lbl.span.end,
                     Self::escape_json(&lbl.message),
@@ -117,25 +119,25 @@ impl JsonEmitter {
                 }
                 s.push('\n');
             }
-            s.push_str(&format!("{}  ],\n", Self::indent(i)));
+            s.push_str(&format!("{}  ],\n", ind));
         }
 
         // help
         if let Some(ref help) = diag.help {
             s.push_str(&format!(
                 "{}  \"help\": {},\n",
-                Self::indent(i),
+                ind,
                 Self::escape_json(help)
             ));
         }
 
         // suggestions
         if !diag.suggestions.is_empty() {
-            s.push_str(&format!("{}  \"suggestions\": [\n", Self::indent(i)));
+            s.push_str(&format!("{}  \"suggestions\": [\n", ind));
             for (idx, sug) in diag.suggestions.iter().enumerate() {
                 s.push_str(&format!(
                     "{}    {}",
-                    Self::indent(i + 1),
+                    ind1,
                     Self::escape_json(&sug.message)
                 ));
                 if idx < diag.suggestions.len() - 1 {
@@ -143,18 +145,18 @@ impl JsonEmitter {
                 }
                 s.push('\n');
             }
-            s.push_str(&format!("{}  ],\n", Self::indent(i)));
+            s.push_str(&format!("{}  ],\n", ind));
         }
 
         // call chain
         if let Some(ref chain) = diag.call_chain
             && !chain.is_empty()
         {
-            s.push_str(&format!("{}  \"callChain\": [\n", Self::indent(i)));
+            s.push_str(&format!("{}  \"callChain\": [\n", ind));
             for (idx, entry) in chain.entries().iter().enumerate() {
                 s.push_str(&format!(
                     "{}    {{\"label\": {}, \"kind\": {:?}}}",
-                    Self::indent(i),
+                    ind,
                     Self::escape_json(&entry.message),
                     entry.kind,
                 ));
@@ -163,21 +165,21 @@ impl JsonEmitter {
                 }
                 s.push('\n');
             }
-            s.push_str(&format!("{}  ],\n", Self::indent(i)));
+            s.push_str(&format!("{}  ],\n", ind));
         }
 
-        s.push_str(&format!("{}}}", Self::indent(i)));
+        s.push_str(&format!("{}}}", ind));
         s
     }
 }
 
 impl super::DiagnosticEmitter for JsonEmitter {
-    fn emit(&mut self, diag: &Diagnostic) {
+    fn emit(&mut self, diag: &Diagnostic<'_>) {
         let json = self.diagnostic_to_json(diag, 0);
         eprintln!("{}", json);
     }
 
-    fn emit_all(&mut self, diags: &[Diagnostic]) {
+    fn emit_all(&mut self, diags: &[Diagnostic<'_>]) {
         if diags.is_empty() {
             eprintln!("[]");
             return;

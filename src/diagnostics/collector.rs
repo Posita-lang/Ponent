@@ -13,17 +13,20 @@ use super::{Diagnostic, EmissionGuarantee};
 /// This separation enables incremental workflows: after a re-check, only
 /// unreported diagnostics need to be displayed, avoiding the re-emission of
 /// already-known errors.
+///
+/// `'src` is the lifetime of the source buffer the contained diagnostics may
+/// borrow (see [`Diagnostic`]).
 #[derive(Debug, Clone)]
-pub struct DiagCtxt {
+pub struct DiagCtxt<'src> {
     /// Diagnostics already emitted or checkpointed.
-    reported: Vec<Diagnostic>,
+    reported: Vec<Diagnostic<'src>>,
     /// Fresh diagnostics not yet emitted.
-    unreported: Vec<Diagnostic>,
+    unreported: Vec<Diagnostic<'src>>,
     /// If false, warning-level diagnostics are suppressed.
     pub can_emit_warnings: bool,
 }
 
-impl DiagCtxt {
+impl<'src> DiagCtxt<'src> {
     pub fn new() -> Self {
         DiagCtxt {
             reported: Vec::new(),
@@ -34,7 +37,7 @@ impl DiagCtxt {
 
     /// Push a diagnostic into `unreported` and return an `EmissionGuarantee`
     /// proving the diagnostic was recorded (inspired by rustc's `ErrorGuaranteed`).
-    pub fn push(&mut self, diag: Diagnostic) -> EmissionGuarantee {
+    pub fn push(&mut self, diag: Diagnostic<'src>) -> EmissionGuarantee {
         if diag.is_warning() && !self.can_emit_warnings {
             return EmissionGuarantee::suppressed();
         }
@@ -59,8 +62,19 @@ impl DiagCtxt {
     }
 
     /// Extend `unreported` with a batch of diagnostics.
-    pub fn extend(&mut self, diags: Vec<Diagnostic>) {
+    pub fn extend(&mut self, diags: Vec<Diagnostic<'src>>) {
         self.unreported.extend(diags);
+    }
+
+    /// Attach `source` to every diagnostic (reported and unreported) that does
+    /// not already carry one.  Called at a producer's boundary so downstream
+    /// emitters can render snippets without cloning the source buffer.
+    pub fn attach_source(&mut self, source: &'src str) {
+        for diag in self.reported.iter_mut().chain(self.unreported.iter_mut()) {
+            if diag.source().is_none() {
+                diag.set_source(Some(source));
+            }
+        }
     }
 
     /// Total diagnostics (reported + unreported).
@@ -74,12 +88,12 @@ impl DiagCtxt {
     }
 
     /// Iterate over all diagnostics (reported first, then unreported).
-    pub fn iter(&self) -> impl Iterator<Item = &Diagnostic> {
+    pub fn iter(&self) -> impl Iterator<Item = &Diagnostic<'src>> {
         self.reported.iter().chain(self.unreported.iter())
     }
 
     /// Consume `self` and return all diagnostics (reported, then unreported).
-    pub fn into_inner(self) -> Vec<Diagnostic> {
+    pub fn into_inner(self) -> Vec<Diagnostic<'src>> {
         let mut all = self.reported;
         all.extend(self.unreported);
         all
@@ -122,17 +136,27 @@ impl DiagCtxt {
     // ── Accessors ───────────────────────────────────────────────────
 
     /// All error-level diagnostics (reported + unreported).
-    pub fn errors(&self) -> Vec<&Diagnostic> {
+    pub fn errors(&self) -> Vec<&Diagnostic<'src>> {
         self.iter().filter(|d| d.is_error()).collect()
     }
 
     /// All warning-level diagnostics (reported + unreported).
-    pub fn warnings(&self) -> Vec<&Diagnostic> {
+    pub fn warnings(&self) -> Vec<&Diagnostic<'src>> {
         self.iter().filter(|d| d.is_warning()).collect()
     }
 
+    /// Iterate over all error-level diagnostics without allocating.
+    pub fn for_each_error<F: FnMut(&Diagnostic<'src>)>(&self, mut f: F) {
+        self.iter().filter(|d| d.is_error()).for_each(|d| f(d))
+    }
+
+    /// Iterate over all warning-level diagnostics without allocating.
+    pub fn for_each_warning<F: FnMut(&Diagnostic<'src>)>(&self, mut f: F) {
+        self.iter().filter(|d| d.is_warning()).for_each(|d| f(d))
+    }
+
     /// Iterate over all diagnostics, yielding them with 1-based index.
-    pub fn enumerate(&self) -> impl Iterator<Item = (usize, &Diagnostic)> {
+    pub fn enumerate(&self) -> impl Iterator<Item = (usize, &Diagnostic<'src>)> {
         self.iter().enumerate().map(|(i, d)| (i + 1, d))
     }
 
@@ -147,19 +171,19 @@ impl DiagCtxt {
     }
 
     /// Get a mutable reference to the last **unreported** diagnostic, if any.
-    pub fn last_mut(&mut self) -> Option<&mut Diagnostic> {
+    pub fn last_mut(&mut self) -> Option<&mut Diagnostic<'src>> {
         self.unreported.last_mut()
     }
 
     // ── reported / unreported management (inspired by Lean 4's MessageLog) ──
 
     /// Access the reported diagnostics.
-    pub fn reported(&self) -> &[Diagnostic] {
+    pub fn reported(&self) -> &[Diagnostic<'src>] {
         &self.reported
     }
 
     /// Access the unreported diagnostics.
-    pub fn unreported(&self) -> &[Diagnostic] {
+    pub fn unreported(&self) -> &[Diagnostic<'src>] {
         &self.unreported
     }
 
@@ -184,12 +208,12 @@ impl DiagCtxt {
     }
 
     /// Drain the unreported list and return it.
-    pub fn drain_unreported(&mut self) -> Vec<Diagnostic> {
+    pub fn drain_unreported(&mut self) -> Vec<Diagnostic<'src>> {
         std::mem::take(&mut self.unreported)
     }
 
     /// Drain the reported list and return it.
-    pub fn drain_reported(&mut self) -> Vec<Diagnostic> {
+    pub fn drain_reported(&mut self) -> Vec<Diagnostic<'src>> {
         std::mem::take(&mut self.reported)
     }
 
@@ -226,14 +250,14 @@ impl DiagCtxt {
     }
 }
 
-impl Default for DiagCtxt {
+impl Default for DiagCtxt<'_> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl From<Vec<Diagnostic>> for DiagCtxt {
-    fn from(diags: Vec<Diagnostic>) -> Self {
+impl<'src> From<Vec<Diagnostic<'src>>> for DiagCtxt<'src> {
+    fn from(diags: Vec<Diagnostic<'src>>) -> Self {
         DiagCtxt {
             reported: Vec::new(),
             unreported: diags,
@@ -242,9 +266,9 @@ impl From<Vec<Diagnostic>> for DiagCtxt {
     }
 }
 
-impl IntoIterator for DiagCtxt {
-    type Item = Diagnostic;
-    type IntoIter = std::vec::IntoIter<Diagnostic>;
+impl<'src> IntoIterator for DiagCtxt<'src> {
+    type Item = Diagnostic<'src>;
+    type IntoIter = std::vec::IntoIter<Diagnostic<'src>>;
 
     fn into_iter(self) -> Self::IntoIter {
         let mut all = self.reported;

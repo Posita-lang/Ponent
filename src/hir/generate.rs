@@ -348,7 +348,7 @@ impl<'a, 'input> GenerateExpander<'a, 'input> {
                 };
                 let def_id = symbols.lookup_type_by_path(&base_path)?;
                 // Resolve each generic argument.
-                let arg_ids: Vec<TypeId> = args
+                let arg_ids: smallvec::SmallVec<[TypeId; 4]> = args
                     .iter()
                     .filter_map(|arg| match arg {
                         GenericArg::Positional(t) => self.resolve_type_ast(t, symbols),
@@ -393,16 +393,15 @@ pub fn get_type_info<'input>(
     match ctx.get(resolved) {
         TypeData::Adt { def_id, .. } => {
             if let Some(binding) = symbols.lookup_type_by_def_id(*def_id) {
-                // Generic parameters.  `Symbol::as_str()` returns `String`
-                // (the interner does not expose a `&'input str` view), so we
-                // store these as `Cow::Owned`.
+                // Generic parameters.  `Symbol::as_str()` returns a `&'static str`
+                // view into the interner arena, so we borrow instead of owning.
                 for p in &binding.params {
-                    params.push(Cow::Owned(p.name.as_str()));
+                    params.push(Cow::Borrowed(p.name.as_str()));
                 }
                 // Struct fields
                 for f in &binding.fields {
                     fields.push(FieldInfo {
-                        name: Cow::Owned(f.name.as_str()),
+                        name: Cow::Borrowed(f.name.as_str()),
                         ty: f.ty,
                     });
                 }
@@ -416,7 +415,7 @@ pub fn get_type_info<'input>(
                         None => Vec::new(),
                     };
                     variants.push(VariantInfo {
-                        name: Cow::Owned(v.name.as_str()),
+                        name: Cow::Borrowed(v.name.as_str()),
                         payload,
                     });
                 }
@@ -506,9 +505,9 @@ fn type_name<'input>(
         TypeData::Adt { def_id, .. } => {
             if let Some(symbols) = symbols {
                 if let Some(name) = symbols.type_name_by_def_id(*def_id) {
-                    // `Symbol::as_str()` returns `String` (the interner does
-                    // not expose a `&'input str` view), so we must own it.
-                    return Cow::Owned(name.as_str());
+                    // `Symbol::as_str()` returns a `&'static str` view into the
+                    // interner arena — borrow instead of owning.
+                    return Cow::Borrowed(name.as_str());
                 }
             }
             Cow::Owned(format!("{:?}", def_id))
@@ -573,7 +572,7 @@ fn resolve_ast_type_to_typeid<'input>(
             // Try to match known type names (bare names without generic args).
             if path.len() == 1 {
                 let name = path[0].as_str();
-                match name.as_str() {
+                match name {
                     // Bare `Int` defaults to `Int<32>`.  If `Int` is bound to a
                     // generic parameter in the current scope, `lookup_type_by_path`
                     // above will resolve it first, so this fallback only triggers
@@ -604,7 +603,7 @@ fn resolve_ast_type_to_typeid<'input>(
                     None
                 });
                 if let Some(bits) = bits {
-                    match name.as_str() {
+                    match name {
                         "Int" if bits >= 1 && bits <= 64 => return ctx.int(bits, true),
                         "Int" => return ctx.error(), // out-of-range Int rejected
                         "UInt" if bits >= 1 && bits <= 64 => return ctx.uint(bits),

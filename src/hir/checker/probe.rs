@@ -45,19 +45,19 @@ use crate::hir::checker::TypeChecker;
 /// `lookup_method_uncached` (checker/mod.rs) runs each candidate
 /// attempt inside a probe, committing only the attempt that finds the
 /// requested method.
-pub struct CheckerProbe<'a, 'c, 'input> {
-    checker: &'a mut TypeChecker<'c, 'input>,
+pub struct CheckerProbe<'a, 'c, 'src, 'input> {
+    checker: &'a mut TypeChecker<'c, 'src, 'input>,
     snapshot_len: usize,
     diag_len: usize,
     committed: bool,
 }
 
-impl<'a, 'c, 'input> CheckerProbe<'a, 'c, 'input> {
+impl<'a, 'c, 'src, 'input> CheckerProbe<'a, 'c, 'src, 'input> {
     /// Run `f` with mutable access to the checker.  Returns `f`'s
     /// result verbatim; the probe stays open regardless.
     pub fn with<T, E>(
         &mut self,
-        f: impl for<'b> FnOnce(&'b mut TypeChecker<'c, 'input>) -> Result<T, E>,
+        f: impl for<'b> FnOnce(&'b mut TypeChecker<'c, 'src, 'input>) -> Result<T, E>,
     ) -> Result<T, E> {
         f(&mut *self.checker)
     }
@@ -69,7 +69,7 @@ impl<'a, 'c, 'input> CheckerProbe<'a, 'c, 'input> {
     }
 }
 
-impl Drop for CheckerProbe<'_, '_, '_> {
+impl Drop for CheckerProbe<'_, '_, '_, '_> {
     fn drop(&mut self) {
         if self.committed {
             self.checker.infer.commit_snapshot(self.snapshot_len);
@@ -82,7 +82,7 @@ impl Drop for CheckerProbe<'_, '_, '_> {
     }
 }
 
-impl<'input, 'c> TypeChecker<'c, 'input> {
+impl<'src, 'input, 'c> TypeChecker<'c, 'src, 'input> {
     /// Open a probe: `InferenceContext::start_snapshot` +
     /// `TypeContext::begin_transaction` + a diagnostics watermark.
     ///
@@ -96,7 +96,7 @@ impl<'input, 'c> TypeChecker<'c, 'input> {
     ///     }
     /// }
     /// ```
-    pub fn begin_probe<'a>(&'a mut self) -> CheckerProbe<'a, 'c, 'input> {
+    pub fn begin_probe<'a>(&'a mut self) -> CheckerProbe<'a, 'c, 'src, 'input> {
         let snapshot_len = self.infer.start_snapshot();
         let diag_len = self.diagnostics.unreported_len();
         self.ctx.begin_transaction();

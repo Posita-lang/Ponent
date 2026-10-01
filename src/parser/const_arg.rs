@@ -5,7 +5,7 @@ use crate::ast::*;
 use crate::diagnostics::Diagnostic;
 use crate::lexer::Token;
 
-impl<'input> Parser<'input> {
+impl<'src, 'input> Parser<'src, 'input> {
     /// Rustc-style pre-check: does the current token definitively start a
     /// const generic argument rather than a type? When true, the generic arg
     /// loop parses directly as an expression without any type-first attempt.
@@ -32,7 +32,7 @@ impl<'input> Parser<'input> {
     /// Per the Posita syntax spec: complex expressions MUST be wrapped in `{ }`;
     /// only simple literals and identifier paths may appear unbraced.
     /// Analogous to rustc's `parse_const_arg` (rustc_parse/src/parser/path.rs).
-    pub(super) fn parse_const_arg(&mut self) -> Result<AnonConst<'input>, Diagnostic> {
+    pub(super) fn parse_const_arg(&mut self) -> Result<AnonConst<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         let value = if matches!(self.peek(), Ok(Token::LBrace)) {
             self.advance().ok();

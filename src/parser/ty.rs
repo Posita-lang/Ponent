@@ -7,12 +7,12 @@ use crate::lexer::Token;
 use crate::symbol::Symbol;
 use smallvec::smallvec;
 
-impl<'input> Parser<'input> {
+impl<'src, 'input> Parser<'src, 'input> {
     // -------------------------------------------------------------------------
     // Type entry with recursion guard
     // -------------------------------------------------------------------------
 
-    pub fn parse_type(&mut self) -> Result<Type<'input>, Diagnostic> {
+    pub fn parse_type(&mut self) -> Result<Type<'input>, Diagnostic<'src>> {
         self.recursion_depth += 1;
         if self.recursion_depth > self.max_recursion_depth {
             self.recursion_depth -= 1;
@@ -31,7 +31,7 @@ impl<'input> Parser<'input> {
     // Inner type parser (Pratt‑style)
     // -------------------------------------------------------------------------
 
-    fn parse_type_inner(&mut self) -> Result<Type<'input>, Diagnostic> {
+    fn parse_type_inner(&mut self) -> Result<Type<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         match self.peek() {
             Ok(Token::For) => {

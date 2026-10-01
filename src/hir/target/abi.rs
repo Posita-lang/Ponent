@@ -13,7 +13,7 @@ pub fn abi_size<'input>(
     target: &Target,
     ty: TypeId,
     symbols: Option<&SymbolTable<'input>>,
-    diag: &mut DiagCtxt,
+    diag: &mut DiagCtxt<'_>,
 ) -> Option<u64> {
     let resolved = ctx.resolve_binding(ty);
     let data = ctx.get(resolved).clone();
@@ -73,7 +73,7 @@ pub fn abi_alignment<'input>(
     target: &Target,
     ty: TypeId,
     symbols: Option<&SymbolTable<'input>>,
-    diag: &mut DiagCtxt,
+    diag: &mut DiagCtxt<'_>,
 ) -> Option<u64> {
     let resolved = ctx.resolve_binding(ty);
     let data = ctx.get(resolved).clone();

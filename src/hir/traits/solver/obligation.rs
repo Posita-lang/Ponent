@@ -473,18 +473,16 @@ impl Predicate {
             }
             // Quantifier/let wrappers recurse into their inner predicate
             // (unified through `inner_predicate`).
-            Predicate::Forall { .. } | Predicate::Exists { .. } | Predicate::Let { .. } => {
-                match self.inner_predicate() {
-                    Some(inner) => inner.resolve(ctx),
-                    None => Self::make_obligation(
-                        None,
-                        ctx.error(),
-                        vec![],
-                        false,
-                        crate::ast::Span::new(0, 0),
-                    ),
-                }
-            }
+            Predicate::Let { .. } => match self.inner_predicate() {
+                Some(inner) => inner.resolve(ctx),
+                None => Self::make_obligation(
+                    None,
+                    ctx.error(),
+                    vec![],
+                    false,
+                    crate::ast::Span::new(0, 0),
+                ),
+            },
             // Explicit arms for the remaining variants — a newly added
             // Predicate variant is a compile error here instead of being
             // silently swallowed by `_`.
@@ -611,6 +609,7 @@ impl SolveError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smallvec::smallvec;
 
     /// Pins `SolveError::self_ty` / `is_recovery_artifact`: every error
     /// kind that carries a self type reports it (routed through
@@ -694,7 +693,7 @@ mod tests {
     fn test_recovery_artifact_catches_composite_recovery() {
         let mut ctx = TypeContext::new();
         let err_ty = ctx.error();
-        let vec_err = ctx.struct_ty(DefId(100), vec![err_ty]);
+        let vec_err = ctx.struct_ty(DefId(100), smallvec![err_ty]);
         let span = crate::ast::DUMMY_SPAN;
 
         let not_found = SolveError::NotFound {

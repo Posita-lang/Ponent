@@ -3,7 +3,7 @@
 use super::*;
 use crate::lexer::Token;
 
-impl<'input> Parser<'input> {
+impl<'src, 'input> Parser<'src, 'input> {
     /// Generate a diagnostic for an unexpected token, optionally with recovery.
     pub(super) fn unexpected_err(&mut self, expected: &Option<Token>) -> Option<Recovered> {
         let span = self.span();
@@ -110,49 +110,58 @@ impl<'input> Parser<'input> {
     pub(super) fn skip_to_next_top_level(&mut self) {
         loop {
             match self.peek() {
-                Ok(Token::Def)
-                | Ok(Token::Type)
-                | Ok(Token::Trait)
-                | Ok(Token::Impl)
-                | Ok(Token::Constraint)
-                | Ok(Token::Edition)
-                | Ok(Token::Import)
-                | Ok(Token::From)
-                | Ok(Token::Extern)
-                | Ok(Token::Comptime)
-                | Ok(Token::Async)
-                | Ok(Token::At)
-                | Ok(Token::Set)
-                | Ok(Token::Let)
-                | Ok(Token::Layout) => return,
                 Err(()) => return,
-                _ => {
+                Ok(tok) if Self::is_top_level_start(tok) => return,
+                Ok(_) => {
                     self.advance().ok();
                 }
             }
         }
     }
 
+    /// Constant-time top-level-item-start check, mirroring `is_sync_token` /
+    /// `is_stmt_start_keyword`.  `Set`/`Let` ARE valid at top level (global
+    /// variable declarations), so they stop the skip (i.e. are NOT swallowed).
+    fn is_top_level_start(tok: &Token) -> bool {
+        matches!(
+            tok,
+            Token::Def
+                | Token::Type
+                | Token::Trait
+                | Token::Impl
+                | Token::Constraint
+                | Token::Edition
+                | Token::Import
+                | Token::From
+                | Token::Extern
+                | Token::Comptime
+                | Token::Async
+                | Token::At
+                | Token::Set
+                | Token::Let
+                | Token::Layout
+        )
+    }
+
     /// Constant-time sync-token check: the old `sync_tokens`
     /// array was linearly scanned per skipped token during error recovery —
     /// O(skipped × count).  A `matches!` compiles to a kind switch with no
     /// payload comparison.
+    ///
+    /// Only tokens that are genuinely safe recovery-consumption points AND
+    /// cannot begin a statement appear here — variants that are also
+    /// statement-start keywords (`Def`, `Set`, `Let`, `Type`, `Comptime`,
+    /// `Generate`, `At`) are intercepted by `is_stmt_start_keyword` first in
+    /// `synchronize`, so listing them here would be dead membership.
     fn is_sync_token(tok: &Token) -> bool {
         matches!(
             tok,
             Token::Semicolon
                 | Token::RBrace
-                | Token::Def
-                | Token::Set
-                | Token::Let
-                | Token::Type
                 | Token::Import
                 | Token::From
                 | Token::Extern
                 | Token::Edition
-                | Token::At
-                | Token::Comptime
-                | Token::Generate
                 | Token::Async
         )
     }
@@ -216,21 +225,12 @@ pub enum KeywordContext {
 pub(crate) fn edit_distance_limited_into(
     prev: &mut Vec<usize>,
     curr: &mut Vec<usize>,
-    a_buf: &mut Vec<char>,
-    b_buf: &mut Vec<char>,
-    a: &str,
-    b: &str,
+    a: &[char],
+    b: &[char],
     limit: usize,
 ) -> usize {
-    // Reuse the caller-provided buffers (clear + extend) instead of
-    // allocating two `Vec<char>` on every call — `did_you_mean_keyword`
-    // calls this once per candidate keyword.
-    a_buf.clear();
-    a_buf.extend(a.chars());
-    b_buf.clear();
-    b_buf.extend(b.chars());
-    let a_len = a_buf.len();
-    let b_len = b_buf.len();
+    let a_len = a.len();
+    let b_len = b.len();
     // Length-difference pruning: a distance can never be smaller than
     // the character-length difference.
     if a_len.abs_diff(b_len) > limit {
@@ -242,19 +242,27 @@ pub(crate) fn edit_distance_limited_into(
     if b_len == 0 {
         return a_len;
     }
+    let overflow = limit + 1;
     prev.clear();
     prev.extend(0..=b_len);
-    curr.resize(b_len + 1, 0);
-    let overflow = limit + 1;
-    for (i, &ca) in a_buf.iter().enumerate() {
+    curr.resize(b_len + 1, overflow);
+    for (i, &ca) in a.iter().enumerate() {
+        // Fill the whole row with the overflow sentinel up front so stale
+        // values cannot leak between rows; the band below then overwrites
+        // only the in-band cells.  `fill` lowers to a memset-like loop and
+        // replaces the previous out-of-band `chain` refill loop.
+        curr.fill(overflow);
         curr[0] = i + 1;
         let lo = (i + 1).saturating_sub(limit).max(1);
         let hi = ((i + 1) + limit).min(b_len);
         if lo > hi {
-            continue;
+            // Unreachable after length-difference pruning, but a safe
+            // early-out: the whole row is out of band, so the distance
+            // must already exceed the limit.
+            return overflow;
         }
         for j in lo..=hi {
-            let cb = b_buf[j - 1];
+            let cb = b[j - 1];
             let cost = if ca == cb { 0 } else { 1 };
             curr[j] = std::cmp::min(
                 std::cmp::min(curr[j - 1] + 1, prev[j] + 1),
@@ -264,13 +272,30 @@ pub(crate) fn edit_distance_limited_into(
         if (lo..=hi).all(|j| curr[j] > limit) {
             return overflow;
         }
-        for j in (1..lo).chain(hi + 1..=b_len) {
-            curr[j] = overflow;
-        }
         std::mem::swap(prev, curr);
     }
     let result = prev[b_len];
     if result > limit { limit + 1 } else { result }
+}
+
+/// Reusable scratch buffers for the keyword-suggestion engine.
+///
+/// `did_you_mean_keyword` allocates four `Vec`s per call (input chars,
+/// keyword chars, and the two edit-distance rows).  For one-shot compiler
+/// runs that is negligible, but in dense-diagnostic environments (IDE/LSP
+/// incremental re-parses, fuzzing malformed identifiers) suggestion
+/// generation runs many times per parse; owning the buffers lets callers
+/// reuse the same allocations across calls.
+#[derive(Debug, Default)]
+pub struct SuggestionBuffers {
+    /// The lowercased input identifier, collected once per suggestion pass.
+    input_chars: Vec<char>,
+    /// The current candidate keyword, refilled once per candidate.
+    keyword_chars: Vec<char>,
+    /// Edit-distance DP row `i - 1`.
+    prev: Vec<usize>,
+    /// Edit-distance DP row `i`.
+    curr: Vec<usize>,
 }
 
 /// Suggest a close-matching keyword when an unknown identifier is encountered.
@@ -278,11 +303,26 @@ pub(crate) fn edit_distance_limited_into(
 ///
 /// `context` restricts the candidate keyword set to the current syntactic
 /// position, so that e.g. `fn` at top level suggests `def` rather than `for`.
+///
+/// Convenience wrapper that allocates fresh [`SuggestionBuffers`] per call.
+/// Callers that generate suggestions in bulk should prefer
+/// [`did_you_mean_keyword_with_buffers`] to amortize the allocations.
 pub fn did_you_mean_keyword(input: &str, context: KeywordContext) -> Option<String> {
-    // Reusable character buffers for the edit-distance computation — one
-    // allocation per call instead of one per candidate keyword.
-    let mut a_buf = Vec::new();
-    let mut b_buf = Vec::new();
+    did_you_mean_keyword_with_buffers(&mut SuggestionBuffers::default(), input, context)
+}
+
+/// Buffer-reusing variant of [`did_you_mean_keyword`] — see [`SuggestionBuffers`].
+pub fn did_you_mean_keyword_with_buffers(
+    buffers: &mut SuggestionBuffers,
+    input: &str,
+    context: KeywordContext,
+) -> Option<String> {
+    let SuggestionBuffers {
+        input_chars,
+        keyword_chars,
+        prev,
+        curr,
+    } = buffers;
     let keywords: &[&str] = match context {
         KeywordContext::TopLevel => &[
             "def",
@@ -365,25 +405,20 @@ pub fn did_you_mean_keyword(input: &str, context: KeywordContext) -> Option<Stri
     } else {
         input.to_lowercase()
     };
-    let first = input_lower.chars().next();
+    // Collect the input ONCE per suggestion pass — re-splitting it into a
+    // `Vec<char>` per candidate keyword was O(k · input_len) of repeated work.
+    input_chars.clear();
+    input_chars.extend(input_lower.chars());
+    let first = input_chars.first().copied();
     let mut best = None;
-    let max_kw_len = keywords.iter().map(|k| k.len()).max().unwrap_or(0);
-    let mut prev = Vec::with_capacity(max_kw_len + 1);
-    let mut curr = vec![0usize; max_kw_len + 1];
 
     for &kw in keywords {
         if first != kw.chars().next() {
             continue;
         }
-        let d = edit_distance_limited_into(
-            &mut prev,
-            &mut curr,
-            &mut a_buf,
-            &mut b_buf,
-            &input_lower,
-            kw,
-            2,
-        );
+        keyword_chars.clear();
+        keyword_chars.extend(kw.chars());
+        let d = edit_distance_limited_into(prev, curr, input_chars, keyword_chars, 2);
         if d <= 2 {
             match best {
                 None => best = Some((kw, d)),
@@ -401,15 +436,9 @@ pub fn did_you_mean_keyword(input: &str, context: KeywordContext) -> Option<Stri
     if best.is_none() {
         for &kw in keywords {
             let threshold = input.len().max(3);
-            let d = edit_distance_limited_into(
-                &mut prev,
-                &mut curr,
-                &mut a_buf,
-                &mut b_buf,
-                &input_lower,
-                kw,
-                threshold,
-            );
+            keyword_chars.clear();
+            keyword_chars.extend(kw.chars());
+            let d = edit_distance_limited_into(prev, curr, input_chars, keyword_chars, threshold);
             if d <= threshold && (input.len() < 4 || d * 2 <= input.len()) {
                 match best {
                     None => best = Some((kw, d)),

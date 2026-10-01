@@ -59,15 +59,6 @@
 //!
 //! # Deviations from the paper (rationale)
 //!
-//! - **Bounded leap strict-tightening** (Algorithm 5, Theorem 5.5).  The
-//!   leap query conjoins a STRICT-tightening obligation:
-//!   `A′ ⊏ A ≜ ∃r. l′_r > A.l_r ∨ u′_r < A.u_r` — the witness must
-//!   tighten at least one row.  UNSAT then proves `A = A*`: any
-//!   `A* ∈ [B, A]` with `A* ⊏ A` would satisfy the query, so
-//!   unsatisfiability contradicts the existence of a strictly tighter
-//!   inductive template in the bounded region.  The strict conjunct
-//!   adds no query — the 4W bound (Theorem 5.5) is unchanged.
-//!
 //! - **Position-pointer advancement** (Algorithm 4, Lemma 5.2): pointers
 //!   advance only after UNSAT (the template is unchanged), never after
 //!   SAT (the witness changed the template).  This is Algorithm 4's
@@ -83,12 +74,23 @@
 //!   synthesis to fail closed rather than silently ignoring instructions.
 //!
 //! - **Solver-call counting**: the query budget counts every raw
-//!   `run_raw_query` invocation, including the separate `(get-model)`
-//!   round-trip that follows each SAT outcome. Theorem 5.3 of Zuo et al. (2026) /
-//!   5.5 bounds (`2W` / `4W`) count high-level `Refine` queries, so the
-//!   raw count is a constant factor (~2×) above the paper's bound; the
-//!   budget parameter must be sized accordingly (the checker passes a
-//!   generous 512).
+//!   `run_raw_query` invocation. Each `Refine`/leap query is a SINGLE
+//!   round-trip (the `(get-model)` request is appended up front; an
+//!   `unsat` answer is still classified correctly even though z3 then
+//!   errors on the model request). Theorem 5.3 of Zuo et al. (2026) /
+//!   5.5 bounds (`2W` / `4W`) count high-level `Refine` queries; with
+//!   one round-trip per query the raw count matches that bound, and
+//!   `query_budget_floor` sizes the checker's budget at `4W + 64`
+//!   accordingly. A wall-clock deadline (`BII_WALL_CLOCK_DEADLINE_MS`)
+//!   plus a 10 s per-query ceiling (`BII_QUERY_TIMEOUT_MS`) bound the
+//!   total synthesis time; both drivers return the any-time partial
+//!   invariant when either fires.
+//!
+//! - **Template-level escalation**: production builds the LARGEST level of
+//!   the paper's §4.2 hierarchy whose row count fits `BII_MAX_ROWS`
+//!   (`template_level_for`) — SparsePoly's O(n³) rows make each Refine
+//!   query O(rows²), so it is only affordable for tiny loops.
+//!   `BiiTemplate::new` still builds SparsePoly (tests, small loops).
 //!
 //! - **Sum rows**: the template domain now includes `x_i + x_j` rows
 //!   (the full octagon), with correct top bounds `2·(2^bw − 1)` and
@@ -115,6 +117,7 @@ use crate::ast::{self, IntLit};
 use crate::hir::loop_infer::LoopInstr;
 use crate::hir::octagon::{ClosureMode, Dbm};
 use crate::hir::smt::{RawQueryOutcome, SmtSolver};
+use crate::sexp_ext;
 use crate::symbol::Symbol;
 use num_bigint::BigInt;
 use num_traits::{One, Signed, ToPrimitive, Zero};
@@ -390,15 +393,16 @@ impl BiiTemplate {
         BiiTemplate { n_vars, rows }
     }
     /// Template construction for a problem with saturating assignments:
-    /// the fixed rows plus one Clamp row per `x_i := x_i +? c`, over ALL
-    /// operand sets.
+    /// the fixed rows (at `level`) plus one Clamp row per
+    /// `x_i := x_i +? c`, over ALL operand sets.
     pub(crate) fn with_saturates(
         n_vars: usize,
         bit_widths: &[u8],
         signed: &[bool],
+        level: TemplateLevel,
         saturates: &[(usize, i128)],
     ) -> BiiTemplate {
-        let mut tpl = Self::build(n_vars, bit_widths, signed, TemplateLevel::SparsePoly);
+        let mut tpl = Self::build(n_vars, bit_widths, signed, level);
         for &(i, c) in saturates {
             if i >= n_vars {
                 continue; // defensive: saturates reference loop variables.
@@ -428,6 +432,74 @@ impl BiiTemplate {
             n_vars: self.n_vars,
             rows,
         }
+    }
+}
+
+/// The largest template row count the synthesis pipeline is willing to
+/// carry through a `Refine` query. Zuo et al. 2026, §4.2: SparsePoly is
+/// O(n³) rows (`n + 3·C(n,2) + 4·C(n,3)`; n = 5 → 65) and each `Refine`
+/// query is a disjunction over `2·rows` candidates × `3·rows` conjuncts —
+/// O(rows²) ≈ O(n⁶) formula size — so the full level is only affordable
+/// for tiny loops. Production escalates no further than needed.
+pub(crate) const BII_MAX_ROWS: usize = 24;
+
+/// The largest template level whose row count fits [`BII_MAX_ROWS`]
+/// (Zuo et al. 2026 §4.2 hierarchy: `Interval ⊂ Zone ⊂ Octagon ⊂
+/// SparsePoly`). Saturating assignments add one Clamp row each and are
+/// counted against the cap. Falls back to `Interval` when even the bare
+/// interval rows overflow the cap (a pathological caller).
+pub(crate) fn template_level_for(
+    n_vars: usize,
+    bit_widths: &[u8],
+    signed: &[bool],
+    saturates: &[(usize, i128)],
+) -> TemplateLevel {
+    let levels = [
+        TemplateLevel::Interval,
+        TemplateLevel::Zone,
+        TemplateLevel::Octagon,
+        TemplateLevel::SparsePoly,
+    ];
+    let mut chosen = TemplateLevel::Interval;
+    for lvl in levels {
+        let tpl = BiiTemplate::build(n_vars, bit_widths, signed, lvl);
+        if tpl.rows.len() + saturates.len() > BII_MAX_ROWS {
+            break;
+        }
+        chosen = lvl;
+    }
+    chosen
+}
+
+/// Per-query solver timeout for the BII synthesis drivers. The drivers'
+/// quantified ∃∀ queries can individually take minutes on wide templates;
+/// a 60 s ceiling per query × ~2·max(enc_bw) iterations meant a single
+/// loop could hang for ~2 h with no progress signal. 10 s per query keeps
+/// the solver responsive; the wall-clock deadline below bounds the run.
+pub(crate) const BII_QUERY_TIMEOUT_MS: u64 = 10_000;
+
+/// Wall-clock budget for ONE synthesis driver run (both drivers). When it
+/// fires, the driver returns the any-time partial invariant (or `None`).
+pub(crate) const BII_WALL_CLOCK_DEADLINE_MS: u64 = 300_000;
+
+/// Per-driver wall-clock deadline. Without it, a wide template under a
+/// generous query budget can silently burn hours (per-query timeout ×
+/// iteration count); the deadline bounds the WHOLE synthesis run and the
+/// driver returns the any-time partial invariant when it fires.
+struct Deadline {
+    start: std::time::Instant,
+    ms: u64,
+}
+
+impl Deadline {
+    fn started(ms: u64) -> Deadline {
+        Deadline {
+            start: std::time::Instant::now(),
+            ms,
+        }
+    }
+    fn exceeded(&self) -> bool {
+        self.start.elapsed().as_millis() as u64 >= self.ms
     }
 }
 
@@ -466,58 +538,95 @@ pub(crate) fn synthesize_linear_bii(
         if candidates.is_empty() {
             return Some(cur); // nothing tighter is representable — BII.
         }
-        // Refine step 1: the ∃∀ query without `(get-model)` — z3 errors
-        // on `(get-model)` after `unsat`, so the model request is issued
-        // as a SEPARATE query only when the outcome is sat.
-        let query = build_refine_query(&candidates, init, body, false, use_bv, bit_widths, signed)?;
+        // Refine: single round-trip — the query ends with `(get-model)`,
+        // and `call_z3` classifies an `unsat` answer correctly even though
+        // z3 then errors on the model request (non-zero exit, decisive
+        // `unsat` line still in stdout). On sat the witness arrives in the
+        // same response — no second solve.
+        let query = build_refine_query(
+            &candidates,
+            &cur,
+            init,
+            body,
+            true,
+            use_bv,
+            bit_widths,
+            signed,
+        )?;
         calls += 1;
-        if calls > max_refinements * 2 {
+        if calls > max_refinements {
             return None;
         }
         match solver.run_raw_query(&query) {
             RawQueryOutcome::Unsat => return Some(cur), // no tighter inductive invariant.
-            RawQueryOutcome::Sat(_) => {
-                // Refine step 2: same query plus `(get-model)` to read the
-                // witness bounds (the re-solve is cached only across
-                // identical texts; this one differs by the model request).
-                // Budget check before the model round-trip: the SAT path
-                // would otherwise overshoot `max_refinements * 2` by one.
-                if calls >= max_refinements * 2 {
-                    return None;
+            RawQueryOutcome::Sat(model) => match parse_witness(&model, &cur.rows, use_bv) {
+                Some(bounds) => {
+                    apply_bounds(&mut cur, &bounds);
                 }
-                let query_model =
-                    build_refine_query(&candidates, init, body, true, use_bv, bit_widths, signed)?;
-                calls += 1;
-                match solver.run_raw_query(&query_model) {
-                    RawQueryOutcome::Sat(model) => match parse_witness(&model, &cur.rows, use_bv) {
-                        Some(bounds) => {
-                            apply_bounds(&mut cur, &bounds);
-                        }
-                        None => return None, // witness unparsable — fail closed.
-                    },
-                    RawQueryOutcome::Unknown
-                    | RawQueryOutcome::Error(_)
-                    | RawQueryOutcome::Unsat => {
-                        return None; // fail closed.
-                    }
-                }
-            }
+                None => return None, // witness unparsable — fail closed.
+            },
             RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => return None, // fail closed.
         }
     }
     None // step budget exhausted without convergence — fail closed.
 }
 
+/// A single-row tightening proposal (Algorithm 3/4's `Propose`): the
+/// candidate differs from the current template `cur` in EXACTLY row
+/// `row_idx`, whose bounds become `(new_lb, new_ub)`. Replacing the
+/// former whole-`BiiTemplate` candidates removes the per-candidate
+/// `rows.clone()` (O(rows) `BigInt` clones per candidate → O(1)) and is
+/// the prerequisite for the factored candidate disjunction
+/// (`emit_candidate_disjunction`): the factorization
+/// `∨_c (A'⊑c) ⟺ (∧_i A'⊑cur[i]) ∧ ∨_c (A'[j_c]⊑c[j_c])` is
+/// soundness-critical on the invariant below — a LOOSENING candidate
+/// would let the factored query misreport SAT as UNSAT and prematurely
+/// "prove" a non-minimal template optimal.
+#[derive(Clone, Debug)]
+struct Candidate {
+    row_idx: usize,
+    new_lb: BigInt,
+    new_ub: BigInt,
+}
+
+impl Candidate {
+    /// Construct a candidate from `cur`, asserting the factorization
+    /// invariant: single-row diff + pointwise tightening in that row.
+    fn tightened(cur: &BiiTemplate, row_idx: usize, new_lb: BigInt, new_ub: BigInt) -> Candidate {
+        debug_assert!(row_idx < cur.rows.len(), "candidate row out of range");
+        let row = &cur.rows[row_idx];
+        debug_assert!(
+            new_lb >= row.lb && new_ub <= row.ub && new_lb <= new_ub,
+            "candidate must tighten (not loosen) row {row_idx}"
+        );
+        Candidate {
+            row_idx,
+            new_lb,
+            new_ub,
+        }
+    }
+}
+
 /// The immediate lattice neighbors of `A` (Algorithm 3's `Propose`): for
 /// each row, tighten the lower bound by 1 and the upper bound by 1.
-fn propose(cur: &BiiTemplate) -> Vec<BiiTemplate> {
+fn propose(cur: &BiiTemplate) -> Vec<Candidate> {
     let mut out = Vec::new();
     for (idx, row) in cur.rows.iter().enumerate() {
+        // One guard suffices: `row.lb < row.ub` and `row.ub > row.lb` are
+        // the same test — the duplicate `if` was dead code.
         if row.lb < row.ub {
-            out.push(cur.with_row(idx, row.lb.clone() + BigInt::one(), row.ub.clone()));
-        }
-        if row.ub > row.lb {
-            out.push(cur.with_row(idx, row.lb.clone(), row.ub.clone() - BigInt::one()));
+            out.push(Candidate::tightened(
+                cur,
+                idx,
+                row.lb.clone() + BigInt::one(),
+                row.ub.clone(),
+            ));
+            out.push(Candidate::tightened(
+                cur,
+                idx,
+                row.lb.clone(),
+                row.ub.clone() - BigInt::one(),
+            ));
         }
     }
     out
@@ -544,15 +653,24 @@ impl BitPositions {
         }
     }
 
-    /// Advance every position by one (Algorithm 4: "if A = A_last then
-    /// lpos_i -= 1, upos_i -= 1") — the previous query was UNSAT, so the
-    /// bit stays and the search moves to the next lower bit.
+    /// Advance every still-live position by one (Algorithm 4: "if
+    /// A = A_last then lpos_i -= 1, upos_i -= 1") — the previous query was
+    /// UNSAT, so the bit stays and the search moves to the next lower bit.
+    ///
+    /// Positions already exhausted (`< 0`) are NOT decremented further:
+    /// dragging them down would waste iterations whenever a WIDE row
+    /// (e.g. a Support3 row at `bw + 2` encoded bits) is still live, and
+    /// the all-exhausted test `p < 0` is unaffected either way.
     fn advance(&mut self) {
         for p in &mut self.lpos {
-            *p -= 1;
+            if *p >= 0 {
+                *p -= 1;
+            }
         }
         for p in &mut self.upos {
-            *p -= 1;
+            if *p >= 0 {
+                *p -= 1;
+            }
         }
     }
 }
@@ -568,7 +686,7 @@ fn propose_bitwise(
     cur: &BiiTemplate,
     pos: &BitPositions,
     limits: &BoundaryLimits,
-) -> Vec<BiiTemplate> {
+) -> Vec<Candidate> {
     let mut out = Vec::new();
     let one = BigInt::one();
     for (idx, row) in cur.rows.iter().enumerate() {
@@ -636,7 +754,7 @@ fn propose_bitwise(
                 // bound `limits.lb[idx]`, it cannot be part of the BII
                 // and is pruned before issuing a solver query.
                 if new_lb <= row.ub && limits.lower_candidate_feasible(idx, &new_lb) {
-                    out.push(cur.with_row(idx, new_lb, row.ub.clone()));
+                    out.push(Candidate::tightened(cur, idx, new_lb, row.ub.clone()));
                 }
             }
         }
@@ -689,7 +807,7 @@ fn propose_bitwise(
                 // bound `limits.ub[idx]`, it cannot be part of the BII
                 // and is pruned before issuing a solver query.
                 if new_ub >= row.lb && limits.upper_candidate_feasible(idx, &new_ub) {
-                    out.push(cur.with_row(idx, row.lb.clone(), new_ub));
+                    out.push(Candidate::tightened(cur, idx, row.lb.clone(), new_ub));
                 }
             }
         }
@@ -703,6 +821,11 @@ fn propose_bitwise(
 /// prunes a limit; every adopted witness tightens it. The conjunction
 /// `B = ⋀_i [lb[i], ub[i]]` is an under-approximation of the BII, driving
 /// the bounded leap.
+///
+/// When the problem carries a `post` condition, the drivers' Refine query
+/// is Property-Strengthened, so these limits are relative to the
+/// ⊑-least template that is inductive AND proves Post — not the
+/// query-independent BII (see `build_refine_query_problem`'s doc).
 #[derive(Clone, Debug)]
 struct BoundaryLimits {
     lb: Vec<BigInt>,
@@ -730,25 +853,25 @@ impl BoundaryLimits {
         self.lb.iter().zip(&self.ub).all(|(l, u)| l <= u)
     }
 
-    /// UNSAT pruning: the failed candidates tightened exactly ONE bound
-    /// each (relative to the current template `cur`). A failed lower-bound
-    /// tighten to `row.lb` means no invariant exists with a lower bound
-    /// that high → `l* < row.lb`; symmetrically for the upper bound.
-    fn prune_unsat(&mut self, cur: &BiiTemplate, cands: &[BiiTemplate]) {
+    /// UNSAT pruning: each candidate tightened exactly ONE bound in its
+    /// single differing row `c.row_idx` (relative to the current template
+    /// `cur`). A failed lower-bound tighten to `row.lb` means no invariant
+    /// exists with a lower bound that high → `l* < row.lb`; symmetrically
+    /// for the upper bound. O(1) per candidate via the recorded row index.
+    fn prune_unsat(&mut self, cur: &BiiTemplate, cands: &[Candidate]) {
         for c in cands {
-            for (i, row) in c.rows.iter().enumerate() {
-                let base = &cur.rows[i];
-                if row.lb > base.lb {
-                    let new_lb = &row.lb - BigInt::one();
-                    if new_lb < self.lb[i] {
-                        self.lb[i] = new_lb;
-                    }
+            let i = c.row_idx;
+            let base = &cur.rows[i];
+            if c.new_lb > base.lb {
+                let new_lb = &c.new_lb - BigInt::one();
+                if new_lb < self.lb[i] {
+                    self.lb[i] = new_lb;
                 }
-                if row.ub < base.ub {
-                    let new_ub = &row.ub + BigInt::one();
-                    if new_ub > self.ub[i] {
-                        self.ub[i] = new_ub;
-                    }
+            }
+            if c.new_ub < base.ub {
+                let new_ub = &c.new_ub + BigInt::one();
+                if new_ub > self.ub[i] {
+                    self.ub[i] = new_ub;
                 }
             }
         }
@@ -815,9 +938,29 @@ pub(crate) fn synthesize_bitwise_bii(
     max_queries: usize,
     use_bv: bool,
 ) -> Option<BiiTemplate> {
-    let mut cur = BiiTemplate::new(vars.len(), bit_widths, signed);
+    // BII refinement issues exists/forall bit-vector queries that are much
+    // harder than plain discharge queries; give the solver a synthesis-grade
+    // budget instead of the default, which makes these fail closed. The
+    // per-query ceiling is the 10 s synthesis budget; the wall-clock
+    // deadline below bounds the whole run.
+    let _guard = solver.with_timeout_raised(BII_QUERY_TIMEOUT_MS);
+    let deadline = Deadline::started(BII_WALL_CLOCK_DEADLINE_MS);
+    // Escalate the template level only as far as the row cap allows
+    // (`template_level_for`); the LoopInstr path carries no saturates.
+    let mut cur = BiiTemplate::with_level(
+        vars.len(),
+        bit_widths,
+        signed,
+        template_level_for(vars.len(), bit_widths, signed, &[]),
+    );
     let mut pos = BitPositions::new(&cur);
     let mut limits = BoundaryLimits::new(&cur);
+    // Refine-query skeleton cache: every part of the script except the
+    // candidate disjunction is iteration-invariant (the witness bounds are
+    // symbolic constants; the row structure never changes), so the O(rows)
+    // forall block (transition, guard, template formula) is built ONCE and
+    // each round splices only the O(rows) factored disjunction.
+    let refine_sk = build_refine_query_skeleton(&cur, init, body, true, use_bv, bit_widths, signed);
     let mut calls = 0usize;
     // Whether the previous refine step left `cur` unchanged (= UNSAT).
     // Only then do position pointers advance (Algorithm 4 line 7-8).
@@ -825,6 +968,11 @@ pub(crate) fn synthesize_bitwise_bii(
     // Any-time partial invariant: whether at least one refinement was
     // adopted (see the budget-exhaustion return below).
     let mut adopted = false;
+    // Adaptive leap cooldown: when the solver struggles on the bounded-leap
+    // query (unknown/error), back off to the bitwise search for a few
+    // iterations instead of thrashing or aborting — the leap is retried
+    // after the cooldown expires. (Mirrors `synthesize_problem_bii`.)
+    let mut leap_cooldown = 0;
 
     loop {
         if calls >= max_queries {
@@ -836,9 +984,18 @@ pub(crate) fn synthesize_bitwise_bii(
             // uninformative ⊤).
             return if adopted { Some(cur) } else { None };
         }
+        if deadline.exceeded() {
+            // Wall-clock budget exhausted — same any-time contract as the
+            // query-budget exhaustion above.
+            return if adopted { Some(cur) } else { None };
+        }
 
         if prev_unsat {
             pos.advance();
+            // Each standard UNSAT tick decays the cooldown.
+            if leap_cooldown > 0 {
+                leap_cooldown -= 1;
+            }
         }
         prev_unsat = false;
 
@@ -874,20 +1031,63 @@ pub(crate) fn synthesize_bitwise_bii(
             // Therefore passing the current positions preserves Lemma 5.2's
             // bit-preservation and progress argument.
             if pos.lpos.iter().chain(pos.upos.iter()).all(|&p| p < 0) {
-                return Some(cur); // every bit position passed — BII reached.
+                // Every bit has been decided. Prove optimality the way
+                // Algorithm 5 does instead of trusting the walk (the Rust
+                // pre-filter short-circuits the Lemma 5.2 path above): ONE
+                // final `A′ ⊏ A` query. UNSAT ⇒ no strictly tighter
+                // inductive template exists ⇒ `cur` is the BII; SAT ⇒ the
+                // witness is adopted and the walk restarts. When the
+                // BoundaryLimits under-approximation is still ⊥ (inactive),
+                // the `B ⊑ A′` conjuncts are relaxed (None) — bounding the
+                // search to an empty box would make the query vacuously
+                // UNSAT and "prove" a false optimality.
+                let lim = if limits.is_active() {
+                    Some(&limits)
+                } else {
+                    None
+                };
+                if calls < max_queries && !deadline.exceeded() {
+                    if let Some(q) = build_bounded_leap_query(
+                        &cur, lim, init, body, true, use_bv, bit_widths, signed,
+                    ) {
+                        calls += 1;
+                        match solver.run_raw_query(&q) {
+                            RawQueryOutcome::Unsat => return Some(cur), // proven BII
+                            RawQueryOutcome::Sat(model) => {
+                                if let Some(bounds) = parse_witness(&model, &cur.rows, use_bv) {
+                                    apply_bounds(&mut cur, &bounds);
+                                    limits.tighten_sat(&bounds);
+                                    adopted = true;
+                                    // Restart the walk: the witness changed
+                                    // `cur`, so bits may be undecided again.
+                                    pos = BitPositions::new(&cur);
+                                    continue;
+                                }
+                                // Unparsable witness — fall through to the
+                                // any-time return below.
+                            }
+                            RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => {}
+                        }
+                    }
+                }
+                return Some(cur);
             }
             pos.advance();
             continue;
         }
 
-        // Refine step 1: ∃∀ query without get-model.
+        // Refine: single round-trip — `(get-model)` appended up front; an
+        // `unsat` answer (model request errors) is still classified
+        // correctly by `call_z3`'s text-based fallback, and on sat the
+        // witness arrives in the same response.
+        // The script is assembled from the cached skeleton: this round
+        // contributes only the factored candidate disjunction.
         // Encoding failure: if witnesses were already adopted, return the
         // partial invariant rather than discarding it (any-time property).
-        let Some(query) =
-            build_refine_query(&candidates, init, body, false, use_bv, bit_widths, signed)
-        else {
+        let Some(refine_sk) = refine_sk.as_ref() else {
             return if adopted { Some(cur) } else { None };
         };
+        let query = assemble_refine_query(refine_sk, &cur, &candidates, use_bv);
         calls += 1;
 
         match solver.run_raw_query(&query) {
@@ -901,91 +1101,72 @@ pub(crate) fn synthesize_bitwise_bii(
                 // Bounded leap (Alg 5): with a non-empty under-approximation,
                 // a single query can jump straight to the BII in the bounded
                 // region — SAT adopts the witness, UNSAT proves A is the BII.
-                if limits.is_active() {
+                // The leap is skipped while the cooldown is active (the
+                // solver backed off after an unknown/error on a leap query).
+                if limits.is_active() && leap_cooldown == 0 {
                     if calls >= max_queries {
                         return if adopted { Some(cur) } else { None };
                     }
+                    // Single round-trip leap: `(get-model)` is appended up
+                    // front; an `unsat` answer (model request errors, non-
+                    // zero exit) is still classified correctly by
+                    // `call_z3`'s text-based fallback.
                     let Some(leap) = build_bounded_leap_query(
-                        &cur, &limits, init, body, false, use_bv, bit_widths, signed,
+                        &cur,
+                        Some(&limits),
+                        init,
+                        body,
+                        true,
+                        use_bv,
+                        bit_widths,
+                        signed,
                     ) else {
                         return if adopted { Some(cur) } else { None };
                     };
                     calls += 1;
                     match solver.run_raw_query(&leap) {
                         RawQueryOutcome::Unsat => return Some(cur),
-                        RawQueryOutcome::Sat(_) => {
-                            if calls >= max_queries {
-                                return if adopted { Some(cur) } else { None };
-                            }
-                            let Some(leap_m) = build_bounded_leap_query(
-                                &cur, &limits, init, body, true, use_bv, bit_widths, signed,
-                            ) else {
-                                return if adopted { Some(cur) } else { None };
-                            };
-                            calls += 1;
-                            match solver.run_raw_query(&leap_m) {
-                                RawQueryOutcome::Sat(model) => {
-                                    match parse_witness(&model, &cur.rows, use_bv) {
-                                        Some(bounds) => {
-                                            apply_bounds(&mut cur, &bounds);
-                                            limits.tighten_sat(&bounds);
-                                            adopted = true;
-                                            // After a successful leap the pointers
-                                            // should advance past the rejected
-                                            // directions (Algorithm 5 line 12).
-                                            prev_unsat = true;
-                                        }
-                                        None => {
-                                            eprintln!(
-                                                "witness parse failure in leap — synthesis bug"
-                                            );
-                                            return if adopted { Some(cur) } else { None };
-                                        }
-                                    }
+                        RawQueryOutcome::Sat(model) => {
+                            match parse_witness(&model, &cur.rows, use_bv) {
+                                Some(bounds) => {
+                                    apply_bounds(&mut cur, &bounds);
+                                    limits.tighten_sat(&bounds);
+                                    adopted = true;
+                                    // D5 (Algorithm 4's `A = A_last` test):
+                                    // the witness CHANGED `cur`, so the
+                                    // pointers must NOT advance — the bits of
+                                    // the changed rows must be re-examined.
+                                    // prev_unsat stays false.
                                 }
-                                RawQueryOutcome::Unknown
-                                | RawQueryOutcome::Error(_)
-                                | RawQueryOutcome::Unsat => {
+                                None => {
+                                    eprintln!("witness parse failure in leap — synthesis bug");
                                     return if adopted { Some(cur) } else { None };
                                 }
                             }
                         }
                         RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => {
-                            return if adopted { Some(cur) } else { None };
+                            // D6: the solver struggles on the leap query —
+                            // back off to the bitwise search for a few
+                            // iterations instead of abandoning the whole
+                            // synthesis (same semantics as
+                            // `synthesize_problem_bii`).
+                            leap_cooldown = 5;
                         }
                     }
                 }
             }
-            RawQueryOutcome::Sat(_) => {
-                // Refine step 2: get model.
-                if calls >= max_queries {
-                    return if adopted { Some(cur) } else { None };
-                }
-                let Some(query_model) =
-                    build_refine_query(&candidates, init, body, true, use_bv, bit_widths, signed)
-                else {
-                    return if adopted { Some(cur) } else { None };
-                };
-                calls += 1;
-                match solver.run_raw_query(&query_model) {
-                    RawQueryOutcome::Sat(model) => {
-                        match parse_witness(&model, &cur.rows, use_bv) {
-                            Some(bounds) => {
-                                apply_bounds(&mut cur, &bounds);
-                                limits.tighten_sat(&bounds);
-                                adopted = true;
-                                // SAT changed cur — do NOT advance pointers.
-                                // prev_unsat stays false.
-                            }
-                            None => {
-                                eprintln!("witness parse failure in refine — synthesis bug");
-                                return if adopted { Some(cur) } else { None };
-                            }
-                        }
+            RawQueryOutcome::Sat(model) => {
+                // The witness arrived with the sat answer — no second solve.
+                match parse_witness(&model, &cur.rows, use_bv) {
+                    Some(bounds) => {
+                        apply_bounds(&mut cur, &bounds);
+                        limits.tighten_sat(&bounds);
+                        adopted = true;
+                        // SAT changed cur — do NOT advance pointers.
+                        // prev_unsat stays false.
                     }
-                    RawQueryOutcome::Unknown
-                    | RawQueryOutcome::Error(_)
-                    | RawQueryOutcome::Unsat => {
+                    None => {
+                        eprintln!("witness parse failure in refine — synthesis bug");
                         return if adopted { Some(cur) } else { None };
                     }
                 }
@@ -1044,7 +1225,7 @@ fn encode_sequential_transition(
     let mut step = 0usize;
     for instr in body {
         match instr {
-            LoopInstr::AddVar(i, c) => {
+            LoopInstr::AddVar(i, c) | LoopInstr::AddWrap(i, c) => {
                 let name = format!("xs_{}_{}", step, i);
                 step += 1;
                 if bv {
@@ -1057,6 +1238,31 @@ fn encode_sequential_transition(
                     ));
                 } else {
                     parts.push(format!("(= {} (+ {} {}))", name, cur[*i], c));
+                }
+                cur[*i] = name.clone();
+                inter.push(name);
+            }
+            LoopInstr::CopyAddVar(i, j, c) => {
+                // `i := j + c` — copy with constant offset. The source
+                // may be a separated param (external symbol, not a loop
+                // variable) — reference it directly.
+                let name = format!("xs_{}_{}", step, i);
+                step += 1;
+                let src = if *j < cur.len() {
+                    cur[*j].clone()
+                } else {
+                    format!("x_{}", j)
+                };
+                if bv {
+                    let c_big = BigInt::from(*c);
+                    parts.push(format!(
+                        "(= {} (bvadd {} {}))",
+                        name,
+                        src,
+                        bv_const(&c_big, bws[*i] as u32)
+                    ));
+                } else {
+                    parts.push(format!("(= {} (+ {} {}))", name, src, c));
                 }
                 cur[*i] = name.clone();
                 inter.push(name);
@@ -1207,13 +1413,21 @@ fn template_formula(
     // violations block synthesis; false satisfactions are UNSOUND).
     let signed_of = |v: usize| signed.get(v).copied().unwrap_or(false);
     // The clamped successor of a saturating variable —
-    // `x_i := x_i +? c`, recovered from the Clamp rows.
-    let clamp_of = |i: usize| -> Option<(i128, bool)> {
-        rows.iter().find_map(|r| match r.kind {
-            RowKind::Clamp(j, c) if j == i => Some((c, r.signed)),
-            _ => None,
-        })
+    // `x_i := x_i +? c`, recovered from the Clamp rows. Precomputed once
+    // per call (the former per-Interval-row `find_map` scan was
+    // O(n_vars · rows)); first Clamp row wins, matching the scan order.
+    let clamp_map: Vec<Option<(i128, bool)>> = {
+        let mut m = vec![None; vars_len];
+        for r in rows {
+            if let RowKind::Clamp(i, c) = r.kind {
+                if i < vars_len && m[i].is_none() {
+                    m[i] = Some((c, r.signed));
+                }
+            }
+        }
+        m
     };
+    let clamp_of = |i: usize| clamp_map.get(i).copied().flatten();
     let mut parts = Vec::new();
     for (r, row) in rows.iter().enumerate() {
         let f = match row.kind {
@@ -1346,13 +1560,19 @@ fn template_formula_concrete(
     // for mixed rows.
     let signed_of = |v: usize| signed.get(v).copied().unwrap_or(false);
     // The clamped successor of a saturating variable
-    // (see template_formula).
-    let clamp_of = |i: usize| -> Option<(i128, bool)> {
-        rows.iter().find_map(|r| match r.kind {
-            RowKind::Clamp(j, c) if j == i => Some((c, r.signed)),
-            _ => None,
-        })
+    // (see template_formula) — precomputed once per call.
+    let clamp_map: Vec<Option<(i128, bool)>> = {
+        let mut m = vec![None; vars_len];
+        for r in rows {
+            if let RowKind::Clamp(i, c) = r.kind {
+                if i < vars_len && m[i].is_none() {
+                    m[i] = Some((c, r.signed));
+                }
+            }
+        }
+        m
     };
+    let clamp_of = |i: usize| clamp_map.get(i).copied().flatten();
     let mut parts = Vec::new();
     for row in rows {
         let f = match row.kind {
@@ -1449,12 +1669,20 @@ fn template_formula_concrete(
 
 /// Build the SMT-LIB2 query for `Refine`:
 /// `∃A'.(⋁_c A'⊑c) ∧ ∀X,X'.P(A',X,X')`, where `P` = Init ∧ Inductiveness.
-/// `get_model` appends `(get-model)` — issued only on a separate query
-/// after a sat outcome (z3 errors on `(get-model)` after `unsat`).
+/// `get_model` appends `(get-model)` to the SAME script — a single
+/// round-trip. On `unsat` z3 errors on the model request and exits
+/// non-zero, but `call_z3` classifies from the stdout text, so the
+/// decisive `unsat` still lands as `RawQueryOutcome::Unsat`.
 ///
 /// Returns `None` if the transition encoding fails (fail-closed).
+///
+/// Implemented on top of `build_refine_query_skeleton` + `assemble_refine_query`
+/// (every part of the script except the candidate disjunction is
+/// iteration-invariant, so the drivers cache the skeleton and splice only
+/// the disjunction per refinement round).
 fn build_refine_query(
-    candidates: &[BiiTemplate],
+    candidates: &[Candidate],
+    cur: &BiiTemplate,
     init: &[LoopInstr],
     body: &[LoopInstr],
     get_model: bool,
@@ -1462,8 +1690,34 @@ fn build_refine_query(
     bws: &[u8],
     signed: &[bool],
 ) -> Option<String> {
-    let n = candidates[0].n_vars;
-    let rows = &candidates[0].rows;
+    let sk = build_refine_query_skeleton(cur, init, body, get_model, bv, bws, signed)?;
+    Some(assemble_refine_query(&sk, cur, candidates, bv))
+}
+
+/// The iteration-invariant part of the LoopInstr `Refine` query: set-logic,
+/// the witness-bound declares, and the quantified Init+Inductiveness block
+/// plus check-sat/get-model. Only the candidate disjunction varies between
+/// refinement rounds — `assemble_refine_query` splices it between the two
+/// halves, so a synthesis run builds the (O(rows) `template_formula`,
+/// transition, guard) blocks ONCE instead of per query.
+pub(crate) struct RefineSkeleton {
+    prefix: String,
+    suffix: String,
+}
+
+/// Build the skeleton above. Returns `None` if the transition encoding
+/// fails (fail-closed) — same contract as the former monolithic builder.
+fn build_refine_query_skeleton(
+    cur: &BiiTemplate,
+    init: &[LoopInstr],
+    body: &[LoopInstr],
+    get_model: bool,
+    bv: bool,
+    bws: &[u8],
+    signed: &[bool],
+) -> Option<RefineSkeleton> {
+    let n = cur.n_vars;
+    let rows = &cur.rows;
 
     // Per-variable sort: LIA `Int` or QF_BV `(_ BitVec W)`.
     // Uses enc_bw() so Diff/Sum rows get bw+1 bits.
@@ -1474,44 +1728,29 @@ fn build_refine_query(
             "Int".to_string()
         }
     };
-    // `off` maps a TEMPLATE-domain bound to the ENCODED domain used by
-    // the BV sorts (Diff rows shift the signed range `[-m, m]` onto
-    // `[0, 2m]`). LIA has no width, so the offset is ignored there.
-    let lit = |v: &BigInt, bw: u32, off: &BigInt| -> String {
-        if bv {
-            bv_const(&(v + off), bw)
-        } else {
-            v.to_string()
-        }
-    };
-    let ge = if bv { "bvuge" } else { ">=" };
-    let le = if bv { "bvule" } else { "<=" };
 
-    let mut smt = String::new();
+    let mut prefix = String::with_capacity(4096);
     if bv {
-        smt.push_str("(set-logic BV)\n");
+        prefix.push_str("(set-logic BV)\n");
     } else {
-        smt.push_str("(set-logic LIA)\n");
+        prefix.push_str("(set-logic LIA)\n");
     }
     // Bound constants for the witness template A' (the existential part).
     for (r, row) in rows.iter().enumerate() {
         let ebw = row.enc_bw();
-        smt.push_str(&format!(
+        prefix.push_str(&format!(
             "(declare-const l_{r} {})\n(declare-const u_{r} {})\n",
             sort(ebw),
             sort(ebw)
         ));
     }
-    // Candidate disjunction: A' ⊑ c for some candidate c — A' is at least
-    // as tight as c in every row, and never empty (l ≤ u). Bounds are
-    // emitted in the ENCODED domain (Diff rows offset).
-    emit_candidate_disjunction(&mut smt, candidates, &lit, bv);
 
     // The inductiveness formula ∀X,X'.P(A',X,X') with A'(X) = ⋀_r l_r ≤
     // f_r(X) ≤ u_r. The transition is SEQUENTIAL (SSA) — compute it first
     // so its intermediate variables can be quantified alongside X and X'.
     let (inter, trans) = encode_sequential_transition(body, n, bv, bws)?;
 
+    let mut smt = String::with_capacity(8192);
     smt.push_str("(assert (forall (");
     for i in 0..n {
         smt.push_str(&format!("(x_{i} {}) ", sort(bws[i] as u32)));
@@ -1524,7 +1763,11 @@ fn build_refine_query(
             .strip_prefix("xs_")
             .and_then(|s| s.split('_').nth(1))
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                panic!(
+                    "intermediate name must encode var index as xs_{{step}}_{{var}}, got: {name}"
+                )
+            });
         smt.push_str(&format!("({} {}) ", name, sort(bws[var_idx] as u32)));
     }
     smt.push_str(")\n");
@@ -1544,7 +1787,7 @@ fn build_refine_query(
                 let c_big = BigInt::from(*c);
                 pre_parts.push(format!(
                     "(= x_{i} {})",
-                    lit(&c_big, bws[*i] as u32, &BigInt::zero())
+                    render_bound(&c_big, bws[*i] as u32, &BigInt::zero(), bv)
                 ));
             }
             _ => return None,
@@ -1618,7 +1861,11 @@ fn build_refine_query(
                     guard_parts.push(format!("(<= (- x_{i} x_{j}) {})", c));
                 }
             }
-            LoopInstr::AddVar(..) | LoopInstr::ConstVar(..) | LoopInstr::CopyVar(..) => {}
+            LoopInstr::AddVar(..)
+            | LoopInstr::AddWrap(..)
+            | LoopInstr::CopyAddVar(..)
+            | LoopInstr::ConstVar(..)
+            | LoopInstr::CopyVar(..) => {}
             // `if` conditions are path conditions, not loop-header
             // guards — skipped here.
             LoopInstr::If(..) => {}
@@ -1649,7 +1896,27 @@ fn build_refine_query(
     if get_model {
         smt.push_str("(get-model)\n");
     }
-    Some(smt)
+
+    Some(RefineSkeleton {
+        prefix,
+        suffix: smt,
+    })
+}
+
+/// Splice the per-round candidate disjunction between the cached skeleton
+/// halves. The only work per refinement round: the factored O(rows)
+/// disjunction emission plus two string copies.
+fn assemble_refine_query(
+    sk: &RefineSkeleton,
+    cur: &BiiTemplate,
+    candidates: &[Candidate],
+    bv: bool,
+) -> String {
+    let mut smt = String::with_capacity(sk.prefix.len() + sk.suffix.len() + 4096);
+    smt.push_str(&sk.prefix);
+    emit_candidate_disjunction(&mut smt, cur, candidates, bv);
+    smt.push_str(&sk.suffix);
+    smt
 }
 
 // ── BiiLoopProblem synthesis entry  ──
@@ -1684,31 +1951,83 @@ fn row_gt_lt(row: &BiiRow, bv: bool) -> (&'static str, &'static str) {
     }
 }
 
+/// Render a template-domain bound as a literal in the comparison domain:
+/// BV → the encoded-domain `(_ bvN W)` (offset added), LIA → plain
+/// integer. Shared by every query builder so the domain mapping has a
+/// single source of truth.
+fn render_bound(v: &BigInt, bw: u32, off: &BigInt, bv: bool) -> String {
+    if bv {
+        bv_const(&(v + off), bw)
+    } else {
+        v.to_string()
+    }
+}
+
+/// Emit the FACTORED candidate disjunction (see `Candidate` for the
+/// invariant this relies on):
+///
+/// `⋁_c (A'⊑c) ⟺ (∧_r A'⊑cur[r]) ∧ (⋀_r l_r ≤ u_r) ∧ ⋁_c (A'[j_c]⊑c[j_c])`
+///
+/// The former per-candidate form repeated every row of every candidate —
+/// O(|C|·rows) conjuncts (O(rows²) at |C| ≈ 2·rows). The factored form
+/// shares the `A' ⊑ cur` conjunction and the well-formedness `l_r ≤ u_r`
+/// (both candidate-independent: candidates differ from `cur` only in one
+/// row's BOUNDS, never in row metadata, so the comparison operators are
+/// uniform) and emits only the single tightened row per candidate —
+/// O(rows) total. Correctness of the ⟹ direction requires every
+/// candidate to be a pointwise TIGHTENING of `cur` in its single
+/// differing row (`Candidate::tightened` asserts this); a loosening
+/// candidate would make the factored query misreport SAT as UNSAT.
+/// Bounds are emitted in the ENCODED domain (Diff rows offset).
+/// Shared by the LoopInstr and BiiLoopProblem refine builders to avoid
+/// encoding drift between the two query paths.
 fn emit_candidate_disjunction(
     smt: &mut String,
-    candidates: &[BiiTemplate],
-    lit: &dyn Fn(&BigInt, u32, &BigInt) -> String,
+    cur: &BiiTemplate,
+    candidates: &[Candidate],
     bv: bool,
 ) {
-    smt.push_str("(assert (or");
-    for c in candidates {
-        smt.push_str(" (and");
-        for (r, row) in c.rows.iter().enumerate() {
-            let ebw = row.enc_bw();
-            let off = row.offset();
-            let (rge, rle) = row_ge_le(row, bv);
-            smt.push_str(&format!(
-                " ({} l_{r} {}) ({} u_{r} {})",
-                rge,
-                lit(&c.rows[r].lb, ebw, &off),
-                rle,
-                lit(&c.rows[r].ub, ebw, &off)
-            ));
-            smt.push_str(&format!(" ({} l_{r} u_{r})", rle));
-        }
-        smt.push_str(")");
+    smt.push_str("(assert (and\n");
+    // Shared: A' ⊑ cur in every row (all candidates agree here — each
+    // candidate equals `cur` outside its single differing row).
+    for (r, row) in cur.rows.iter().enumerate() {
+        let ebw = row.enc_bw();
+        let off = row.offset();
+        let (rge, rle) = row_ge_le(row, bv);
+        smt.push_str(&format!(
+            "  ({} l_{r} {}) ({} u_{r} {})\n",
+            rge,
+            render_bound(&row.lb, ebw, &off, bv),
+            rle,
+            render_bound(&row.ub, ebw, &off, bv)
+        ));
     }
-    smt.push_str("))\n");
+    // Shared well-formedness: A' is never empty (l_r ≤ u_r) — hoisted out
+    // of the former per-candidate repetition; also gives the solver a
+    // unit-propagation hint against the empty witness.
+    for (r, row) in cur.rows.iter().enumerate() {
+        let (_, rle) = row_ge_le(row, bv);
+        smt.push_str(&format!("  ({} l_{r} u_{r})\n", rle));
+    }
+    // Per candidate: the single strictly-tightened row (O(1) each).
+    smt.push_str("  (or\n");
+    for c in candidates {
+        let row = &cur.rows[c.row_idx];
+        let ebw = row.enc_bw();
+        let off = row.offset();
+        let (rge, rle) = row_ge_le(row, bv);
+        smt.push_str(&format!(
+            "    (and ({} l_{} {}) ({} u_{} {}))\n",
+            rge,
+            c.row_idx,
+            render_bound(&c.new_lb, ebw, &off, bv),
+            rle,
+            c.row_idx,
+            render_bound(&c.new_ub, ebw, &off, bv)
+        ));
+    }
+    // Close: the (or ...), the enclosing (and ...), and the (assert ...).
+    smt.push_str("  )))\n");
 }
 
 /// Under LIA, external-symbol params are unbounded
@@ -1736,6 +2055,41 @@ fn param_range_conds(params: &[crate::hir::loop_ir::BiiVar], bv: bool) -> String
             (BigInt::zero(), (BigInt::one() << p.bw as usize) - 1)
         };
         parts.push(format!("(and (<= {} n_{j}) (<= n_{j} {}))", lo, hi));
+    }
+    if parts.len() == 1 {
+        parts.into_iter().next().unwrap()
+    } else {
+        format!("(and {})", parts.join(" "))
+    }
+}
+
+/// Type-range conditions for the LOOP variables (the LIA counterpart of
+/// `param_range_conds`). Sound under trap semantics: every reachable
+/// state has each variable inside its declared type domain (`Int<N>` ≝
+/// [−2^(bw−1), 2^(bw−1)−1], `UInt<N>` ≝ [0, 2^bw−1]). Without it the LIA
+/// encoding models an `Int<8>` counter over ALL of ℤ, so the synthesized
+/// BII is strictly looser than the machine semantics and disagrees with
+/// the DBM fallback (which seeds type ranges via `apply_type_bounds`).
+/// Under BV nothing is emitted — the sort already bounds the value.
+/// The PRIMED variables (`xp_i`) are deliberately left unconstrained:
+/// an edge that traps (no `definedness` on the path) may have an
+/// out-of-range successor, and the ∀ antecedent must not exclude it.
+fn var_range_conds(vars: &[crate::hir::loop_ir::BiiVar], bv: bool) -> String {
+    if bv || vars.is_empty() {
+        return "true".to_string();
+    }
+    let mut parts = Vec::new();
+    for (i, v) in vars.iter().enumerate() {
+        let (lo, hi) = if v.signed {
+            let half = BigInt::one() << (v.bw as usize - 1);
+            (-half.clone(), half - BigInt::one())
+        } else {
+            (
+                BigInt::zero(),
+                (BigInt::one() << v.bw as usize) - BigInt::one(),
+            )
+        };
+        parts.push(format!("(and (<= {} x_{i}) (<= x_{i} {}))", lo, hi));
     }
     if parts.len() == 1 {
         parts.into_iter().next().unwrap()
@@ -1790,6 +2144,15 @@ fn expr_to_smt_bw(
             if *sem == crate::hir::loop_ir::ArithSem::Saturate {
                 return None;
             }
+            // NB on `ArithSem::Wrap` under LIA: the lowering marks ALL
+            // +/- arithmetic `Wrap` uniformly (loop_ir.rs: "assignment
+            // arithmetic is uniformly marked ArithSem::Wrap — interpreted
+            // by `use_bv` at encoding time"); under LIA it means
+            // mathematical-integer arithmetic, exact for the TRAP
+            // semantics because the inductive step is conditioned on the
+            // edge's `definedness` (stay-in-range) antecedent. It is NOT
+            // a wrap-semantics marker here — the checker routes loops
+            // with type-level wrap policies to `use_bv: true` upstream.
             let (ls, lbw) = expr_to_smt_bw(l, bv, bws, signed, vars_len, ctx_bw)?;
             let (rs, rbw) = expr_to_smt_bw(r, bv, bws, signed, vars_len, ctx_bw)?;
             if bv {
@@ -1819,6 +2182,9 @@ fn expr_to_smt_bw(
             if *sem == crate::hir::loop_ir::ArithSem::Saturate {
                 return None; // saturating arithmetic — fail closed (see Add).
             }
+            // `ArithSem::Wrap` under LIA is the uniform +/- marker (see
+            // the Add arm) — mathematical-integer arithmetic, exact
+            // under the trap definedness antecedent. No guard needed.
             let (ls, lbw) = expr_to_smt_bw(l, bv, bws, signed, vars_len, ctx_bw)?;
             let (rs, rbw) = expr_to_smt_bw(r, bv, bws, signed, vars_len, ctx_bw)?;
             if bv {
@@ -2108,9 +2474,12 @@ fn encode_edge_inductiveness(
     };
     let g = cond_to_smt(&problem.loop_guard, bv, bws, &signed_all, n)?;
     let mut ante = vec![a_x, g];
-    // Param type-range conditions are spliced into the
-    // quantified antecedent — params are quantifier-scoped.
+    // Param AND loop-variable type-range conditions are spliced into the
+    // quantified antecedent — both are quantifier-scoped, and the loop
+    // variables' declared type domains are exactly the reachable states
+    // under trap semantics (D8: the LIA counterpart of `apply_type_bounds`).
     ante.push(param_range_conds(&problem.params, bv));
+    ante.push(var_range_conds(&problem.vars, bv));
     if let Some(guard) = &edge.guard {
         ante.push(cond_to_smt(guard, bv, bws, &signed_all, n)?);
     }
@@ -2164,19 +2533,55 @@ fn encode_edge_inductiveness(
 /// BiiLoopProblem `Refine` query : one ∀ for Init plus one
 /// ∀ per back-edge implication. Returns None on an encoding failure
 /// (fail-closed).
+///
+/// NOTE (Property Strengthening, D11): when `problem.post` is `Some`, both
+/// this builder and `build_bounded_leap_query_problem` conjoin the
+/// Post obligation `∀X. A′(X) ∧ ¬G(X) ⇒ Post(X)` into the Refine query
+/// (Yao et al., "Demystifying…", §IV-A). The synthesized element is then
+/// the ⊑-least template that is INDUCTIVE **AND** ENTAILS Post — strictly
+/// tighter than (or ⊤-blocking instead of) the paper's query-independent
+/// BII. The set of templates proving Post is meet-closed, so a least
+/// element exists and `BoundaryLimits::prune_unsat`'s `l*` semantics
+/// remain valid — but `l*` now denotes the optimum of the
+/// post-constrained set, and the checker's diagnostic should read
+/// "inferred loop invariant (post-strengthened)" when `post` is present.
 fn build_refine_query_problem(
     problem: &crate::hir::loop_ir::BiiLoopProblem,
-    candidates: &[BiiTemplate],
+    candidates: &[Candidate],
+    cur: &BiiTemplate,
     get_model: bool,
     bv: bool,
     bws: &[u8],
 ) -> Option<String> {
+    let sk = build_refine_query_problem_skeleton(problem, cur, get_model, bv, bws)?;
+    Some(assemble_refine_query(&sk, cur, candidates, bv))
+}
+
+/// The iteration-invariant part of the BiiLoopProblem `Refine` query:
+/// set-logic, the witness-bound declares, the Init ∀, one ∀ implication
+/// per back edge, the (optional) Post ∀, and check-sat/get-model. Only
+/// the candidate disjunction varies between refinement rounds —
+/// `assemble_refine_query` splices it between the two halves (each back
+/// edge's `encode_edge_inductiveness` internally calls `template_formula`
+/// twice, so caching skips ~2·(1+edges)+1 O(rows) formula builds per
+/// round). Same shape as [`RefineSkeleton`].
+pub(crate) type ProblemRefineSkeleton = RefineSkeleton;
+
+/// Build the skeleton above. Returns `None` on an encoding failure
+/// (fail-closed) — same contract as the former monolithic builder.
+fn build_refine_query_problem_skeleton(
+    problem: &crate::hir::loop_ir::BiiLoopProblem,
+    cur: &BiiTemplate,
+    get_model: bool,
+    bv: bool,
+    bws: &[u8],
+) -> Option<ProblemRefineSkeleton> {
     let vars_len = problem.vars.len();
     let params_len = problem.params.len();
-    if candidates[0].n_vars != vars_len + params_len {
+    if cur.n_vars != vars_len + params_len {
         return None; // template var count must equal loop vars + params.
     }
-    let rows = &candidates[0].rows;
+    let rows = &cur.rows;
     let signed_all: Vec<bool> = problem
         .vars
         .iter()
@@ -2191,33 +2596,23 @@ fn build_refine_query_problem(
             "Int".to_string()
         }
     };
-    let lit = |v: &BigInt, bw: u32, off: &BigInt| -> String {
-        if bv {
-            bv_const(&(v + off), bw)
-        } else {
-            v.to_string()
-        }
-    };
-    let ge = if bv { "bvuge" } else { ">=" };
-    let le = if bv { "bvule" } else { "<=" };
 
-    let mut smt = String::new();
+    let mut prefix = String::with_capacity(4096);
     if bv {
-        smt.push_str("(set-logic BV)\n");
+        prefix.push_str("(set-logic BV)\n");
     } else {
-        smt.push_str("(set-logic LIA)\n");
+        prefix.push_str("(set-logic LIA)\n");
     }
     for (r, row) in rows.iter().enumerate() {
         let ebw = row.enc_bw();
-        smt.push_str(&format!(
+        prefix.push_str(&format!(
             "(declare-const l_{r} {})\n(declare-const u_{r} {})\n",
             sort(ebw),
             sort(ebw)
         ));
     }
-    // Candidate disjunction (same as build_refine_query).
-    emit_candidate_disjunction(&mut smt, candidates, &lit, bv);
 
+    let mut smt = String::with_capacity(8192);
     // Init: ∀X. ⋀_i (x_i = init_i) ⇒ A'(X). init_i = Var(i) is a tautology
     // (unconstrained). Loop variables only (params have no initial
     // constraint — provided by the caller's state).
@@ -2243,15 +2638,16 @@ fn build_refine_query_problem(
         smt.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
     }
     smt.push_str(&format!(
-        ") (=> (and {} {}) {})))\n",
+        ") (=> (and {} {} {}) {})))\n",
         init_cond,
         param_range_conds(&problem.params, bv),
+        var_range_conds(&problem.vars, bv),
         a_x_init
     ));
 
     // One ∀ implication per back edge (x/xp loop variables, n read-only params).
     for edge in &problem.back_edges {
-        let imp = encode_edge_inductiveness(problem, &candidates[0], edge, bv, bws, false)?;
+        let imp = encode_edge_inductiveness(problem, cur, edge, bv, bws, false)?;
         smt.push_str("(assert (forall (");
         for i in 0..vars_len {
             smt.push_str(&format!("(x_{i} {}) ", sort(bws[i] as u32)));
@@ -2280,8 +2676,11 @@ fn build_refine_query_problem(
             smt.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
         }
         smt.push_str(&format!(
-            ") (=> (and {} (not {})) {})))\n",
-            a_x, g_s, post_s
+            ") (=> (and {} {} (not {})) {})))\n",
+            a_x,
+            var_range_conds(&problem.vars, bv),
+            g_s,
+            post_s
         ));
     }
 
@@ -2289,7 +2688,11 @@ fn build_refine_query_problem(
     if get_model {
         smt.push_str("(get-model)\n");
     }
-    Some(smt)
+
+    Some(ProblemRefineSkeleton {
+        prefix,
+        suffix: smt,
+    })
 }
 
 /// BiiLoopProblem bounded-leap query (Algorithm 5): `B ⊑ A′ ⊏ A` as in
@@ -2298,7 +2701,7 @@ fn build_refine_query_problem(
 fn build_bounded_leap_query_problem(
     problem: &crate::hir::loop_ir::BiiLoopProblem,
     cur: &BiiTemplate,
-    limits: &BoundaryLimits,
+    limits: Option<&BoundaryLimits>,
     get_model: bool,
     bv: bool,
     bws: &[u8],
@@ -2349,23 +2752,29 @@ fn build_bounded_leap_query_problem(
             sort(ebw)
         ));
     }
-    // B ⊑ A′ ⊏ A (Algorithm 5).
+    // B ⊑ A′ ⊏ A (Algorithm 5). `limits == None` relaxes the `B ⊑ A′`
+    // half (the optimality query's "B is still ⊥" case).
     smt.push_str("(assert (and ");
     for (r, row) in rows.iter().enumerate() {
         let ebw = row.enc_bw();
         let off = row.offset();
         let (rge, rle) = row_ge_le(row, bv);
         smt.push_str(&format!(
-            " ({} l_{r} {}) ({} l_{r} {}) ({} u_{r} {}) ({} u_{r} {})",
+            " ({} l_{r} {}) ({} u_{r} {})",
             rge,
             lit(&row.lb, ebw, &off),
             rle,
-            lit(&limits.lb[r], ebw, &off),
-            rge,
-            lit(&limits.ub[r], ebw, &off),
-            rle,
             lit(&row.ub, ebw, &off)
         ));
+        if let Some(limits) = limits {
+            smt.push_str(&format!(
+                " ({} l_{r} {}) ({} u_{r} {})",
+                rle,
+                lit(&limits.lb[r], ebw, &off),
+                rge,
+                lit(&limits.ub[r], ebw, &off)
+            ));
+        }
         smt.push_str(&format!(" ({} l_{r} u_{r})", rle));
     }
     smt.push_str("))\n");
@@ -2402,9 +2811,10 @@ fn build_bounded_leap_query_problem(
         format!("(and {})", init_parts.join(" "))
     };
     parts.push(format!(
-        "(=> (and {} {}) {})",
+        "(=> (and {} {} {}) {})",
         init_cond,
         param_range_conds(&problem.params, bv),
+        var_range_conds(&problem.vars, bv),
         template_formula(rows, vars_len, false, bv, bws, &signed_all)
     ));
     for edge in &problem.back_edges {
@@ -2445,8 +2855,11 @@ fn build_bounded_leap_query_problem(
             smt.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
         }
         smt.push_str(&format!(
-            ") (=> (and {} (not {})) {})))\n",
-            a_x, g_s, post_s
+            ") (=> (and {} {} (not {})) {})))\n",
+            a_x,
+            var_range_conds(&problem.vars, bv),
+            g_s,
+            post_s
         ));
     }
 
@@ -2457,10 +2870,11 @@ fn build_bounded_leap_query_problem(
     Some(smt)
 }
 
-/// The query-budget floor for a template: the paper's raw query count
-/// is ~2× the 4W high-level bound (Theorem 5.5), so 8W raw is the
-/// correct ceiling; a fixed budget under-budgets wide/multi-variable
-/// templates (2 vars @ 64b: W = 258, 8W ≈ 2064) and silently drops the
+/// The query-budget floor for a template: with the single-round-trip
+/// Refine/leap drivers the paper's raw query count matches the 4W
+/// high-level bound (Theorem 5.5), so `4W + 64` is the correct ceiling;
+/// a fixed budget under-budgets wide/multi-variable templates
+/// (2 vars @ 64b: W = 258, 4W ≈ 1032) and silently drops the
 /// hint (fail-closed).  The checker applies this floor when sizing its
 /// synthesis budget; the drivers themselves take the caller's budget
 /// verbatim so tests can assert tight logarithmic bounds (the floor
@@ -2472,10 +2886,13 @@ pub(crate) fn query_budget_floor(
     saturates: &[(usize, i128)],
 ) -> usize {
     // Both modes include mixed-signedness rows — the floor covers the
-    // full template.
-    let tpl = BiiTemplate::with_saturates(n_vars, bit_widths, signed, saturates);
+    // full template, at the level the drivers will actually build
+    // (`template_level_for` — the former unconditional SparsePoly made
+    // the floor explode on ≥ 5-variable loops).
+    let level = template_level_for(n_vars, bit_widths, signed, saturates);
+    let tpl = BiiTemplate::with_saturates(n_vars, bit_widths, signed, level, saturates);
     let w: usize = tpl.rows.iter().map(|r| r.enc_bw() as usize).sum();
-    w * 8 + 64
+    w * 4 + 64
 }
 
 /// BiiLoopProblem BII synthesis (Algorithm 4 + 5 driver unchanged; the
@@ -2489,8 +2906,13 @@ pub(crate) fn synthesize_problem_bii(
     max_queries: usize,
     use_bv: bool,
 ) -> Option<BiiTemplate> {
+    // Same synthesis-grade solver budget as the LoopInstr driver above:
+    // a 10 s per-query ceiling, plus a wall-clock deadline on the run.
+    let _guard = solver.with_timeout_raised(BII_QUERY_TIMEOUT_MS);
+    let deadline = Deadline::started(BII_WALL_CLOCK_DEADLINE_MS);
     // The template domain covers loop variables + external-symbol params
-    // (read-only, enter the template rows).
+    // (read-only, enter the template rows). The template level escalates
+    // only as far as the row cap allows (`template_level_for`).
     let bws_all: Vec<u8> = problem
         .vars
         .iter()
@@ -2503,10 +2925,19 @@ pub(crate) fn synthesize_problem_bii(
         .chain(problem.params.iter())
         .map(|v| v.signed)
         .collect();
-    let mut cur =
-        BiiTemplate::with_saturates(bws_all.len(), &bws_all, &signed_all, &problem.saturates);
+    let mut cur = BiiTemplate::with_saturates(
+        bws_all.len(),
+        &bws_all,
+        &signed_all,
+        template_level_for(bws_all.len(), &bws_all, &signed_all, &problem.saturates),
+        &problem.saturates,
+    );
     let mut pos = BitPositions::new(&cur);
     let mut limits = BoundaryLimits::new(&cur);
+    // Refine-query skeleton cache (see synthesize_bitwise_bii): the Init ∀,
+    // the per-back-edge ∀ implications and the Post ∀ are iteration-
+    // invariant; only the candidate disjunction is spliced per round.
+    let refine_sk = build_refine_query_problem_skeleton(problem, &cur, true, use_bv, &bws_all);
     let mut calls = 0usize;
     let mut prev_unsat = false;
     // Any-time partial invariant: whether at least one refinement was
@@ -2526,6 +2957,11 @@ pub(crate) fn synthesize_problem_bii(
             // any-time property of Zuo et al. (2026), §4 remark after Algorithm 2); `None`
             // only when nothing was adopted (the result would be the
             // uninformative ⊤).
+            return if adopted { Some(cur) } else { None };
+        }
+        if deadline.exceeded() {
+            // Wall-clock budget exhausted — same any-time contract as the
+            // query-budget exhaustion above.
             return if adopted { Some(cur) } else { None };
         }
         if prev_unsat {
@@ -2569,66 +3005,116 @@ pub(crate) fn synthesize_problem_bii(
             // Therefore passing the current positions preserves Lemma 5.2's
             // bit-preservation and progress argument.
             if pos.lpos.iter().chain(pos.upos.iter()).all(|&p| p < 0) {
-                return Some(cur); // every bit position passed — BII reached.
+                // Every bit has been decided. Prove optimality the way
+                // Algorithm 5 does instead of trusting the walk (the Rust
+                // pre-filter short-circuits the Lemma 5.2 path above): ONE
+                // final `A′ ⊏ A` query. UNSAT ⇒ no strictly tighter
+                // inductive template exists ⇒ `cur` is the BII; SAT ⇒ the
+                // witness is adopted and the walk restarts. When the
+                // BoundaryLimits under-approximation is still ⊥ (inactive),
+                // the `B ⊑ A′` conjuncts are relaxed (None) — bounding the
+                // search to an empty box would make the query vacuously
+                // UNSAT and "prove" a false optimality.
+                let lim = if limits.is_active() {
+                    Some(&limits)
+                } else {
+                    None
+                };
+                if calls < max_queries && !deadline.exceeded() {
+                    if let Some(q) =
+                        build_bounded_leap_query_problem(problem, &cur, lim, true, use_bv, &bws_all)
+                    {
+                        calls += 1;
+                        match solver.run_raw_query(&q) {
+                            RawQueryOutcome::Unsat => return Some(cur), // proven BII
+                            RawQueryOutcome::Sat(model) => {
+                                if let Some(bounds) = parse_witness(&model, &cur.rows, use_bv) {
+                                    apply_bounds(&mut cur, &bounds);
+                                    limits.tighten_sat(&bounds);
+                                    adopted = true;
+                                    // Restart the walk: the witness changed
+                                    // `cur`, so bits may be undecided again.
+                                    pos = BitPositions::new(&cur);
+                                    continue;
+                                }
+                                // Unparsable witness — fall through to the
+                                // any-time return below.
+                            }
+                            RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => {}
+                        }
+                    }
+                }
+                return Some(cur);
             }
             pos.advance();
             continue;
         }
 
-        let Some(query) = build_refine_query_problem(problem, &candidates, false, use_bv, &bws_all)
-        else {
+        // One round-trip per Refine: `(get-model)` is appended up front; an
+        // `unsat` answer (z3 then errors on the model request) is still
+        // classified correctly by `call_z3`'s text-based fallback, and on
+        // sat the witness arrives in the same response. This keeps the raw
+        // call count at the paper's Theorem 5.3/5.5 bounds (2W/4W) — the
+        // former no-model-then-with-model double round-trip doubled it.
+        // Encoding failure: if witnesses were already adopted, return the
+        // partial invariant rather than discarding it (any-time property).
+        // The script is assembled from the cached skeleton: this round
+        // contributes only the factored candidate disjunction.
+        // Encoding failure: if witnesses were already adopted, return the
+        // partial invariant rather than discarding it (any-time property).
+        let Some(refine_sk) = refine_sk.as_ref() else {
             return if adopted { Some(cur) } else { None };
         };
+        let query = assemble_refine_query(refine_sk, &cur, &candidates, use_bv);
         calls += 1;
         match solver.run_raw_query(&query) {
             RawQueryOutcome::Unsat => {
+                // No candidate at these bit positions is inductive — prune
+                // the boundary limits (A stays, so the next iteration
+                // advances the position pointers).
                 prev_unsat = true;
                 limits.prune_unsat(&cur, &candidates);
-                // Only attempt the bounded leap once the cooldown has
-                // expired (a struggling solver on the leap query backs
-                // off to the bitwise search instead of thrashing).
+
+                // Bounded leap (Alg 5): with a non-empty under-approximation,
+                // a single query can jump straight to the BII in the bounded
+                // region — SAT adopts the witness, UNSAT proves A is the BII.
+                // The leap is skipped while the cooldown is active (the
+                // solver backed off after an unknown/error on a leap query).
                 if limits.is_active() && leap_cooldown == 0 {
                     if calls >= max_queries {
                         return if adopted { Some(cur) } else { None };
                     }
+                    // Single round-trip leap: `(get-model)` is appended up
+                    // front; an `unsat` answer (model request errors, non-
+                    // zero exit) is still classified correctly by
+                    // `call_z3`'s text-based fallback.
                     let Some(leap) = build_bounded_leap_query_problem(
-                        problem, &cur, &limits, false, use_bv, &bws_all,
+                        problem,
+                        &cur,
+                        Some(&limits),
+                        true,
+                        use_bv,
+                        &bws_all,
                     ) else {
                         return if adopted { Some(cur) } else { None };
                     };
                     calls += 1;
                     match solver.run_raw_query(&leap) {
                         RawQueryOutcome::Unsat => return Some(cur),
-                        RawQueryOutcome::Sat(_) => {
-                            if calls >= max_queries {
-                                return if adopted { Some(cur) } else { None };
-                            }
-                            let Some(leap_m) = build_bounded_leap_query_problem(
-                                problem, &cur, &limits, true, use_bv, &bws_all,
-                            ) else {
-                                return if adopted { Some(cur) } else { None };
-                            };
-                            calls += 1;
-                            match solver.run_raw_query(&leap_m) {
-                                RawQueryOutcome::Sat(model) => {
-                                    match parse_witness(&model, &cur.rows, use_bv) {
-                                        Some(bounds) => {
-                                            apply_bounds(&mut cur, &bounds);
-                                            limits.tighten_sat(&bounds);
-                                            adopted = true;
-                                            prev_unsat = true;
-                                        }
-                                        None => {
-                                            eprintln!(
-                                                "witness parse failure in leap — synthesis bug"
-                                            );
-                                            return if adopted { Some(cur) } else { None };
-                                        }
-                                    }
+                        RawQueryOutcome::Sat(model) => {
+                            match parse_witness(&model, &cur.rows, use_bv) {
+                                Some(bounds) => {
+                                    apply_bounds(&mut cur, &bounds);
+                                    limits.tighten_sat(&bounds);
+                                    adopted = true;
+                                    // D5 (Algorithm 4's `A = A_last` test):
+                                    // the witness CHANGED `cur`, so the
+                                    // pointers must NOT advance — the bits of
+                                    // the changed rows must be re-examined.
+                                    // prev_unsat stays false.
                                 }
-                                RawQueryOutcome::Unknown
-                                | RawQueryOutcome::Error(_)
-                                | RawQueryOutcome::Unsat => {
+                                None => {
+                                    eprintln!("witness parse failure in leap — synthesis bug");
                                     return if adopted { Some(cur) } else { None };
                                 }
                             }
@@ -2642,31 +3128,18 @@ pub(crate) fn synthesize_problem_bii(
                     }
                 }
             }
-            RawQueryOutcome::Sat(_) => {
-                if calls >= max_queries {
-                    return if adopted { Some(cur) } else { None };
-                }
-                let Some(query_model) =
-                    build_refine_query_problem(problem, &candidates, true, use_bv, &bws_all)
-                else {
-                    return if adopted { Some(cur) } else { None };
-                };
-                calls += 1;
-                match solver.run_raw_query(&query_model) {
-                    RawQueryOutcome::Sat(model) => match parse_witness(&model, &cur.rows, use_bv) {
-                        Some(bounds) => {
-                            apply_bounds(&mut cur, &bounds);
-                            limits.tighten_sat(&bounds);
-                            adopted = true;
-                        }
-                        None => {
-                            eprintln!("witness parse failure in refine — synthesis bug");
-                            return if adopted { Some(cur) } else { None };
-                        }
-                    },
-                    RawQueryOutcome::Unknown
-                    | RawQueryOutcome::Error(_)
-                    | RawQueryOutcome::Unsat => {
+            RawQueryOutcome::Sat(model) => {
+                // The witness arrived with the sat answer — no second solve.
+                match parse_witness(&model, &cur.rows, use_bv) {
+                    Some(bounds) => {
+                        apply_bounds(&mut cur, &bounds);
+                        limits.tighten_sat(&bounds);
+                        adopted = true;
+                        // SAT changed cur — do NOT advance pointers.
+                        // prev_unsat stays false.
+                    }
+                    None => {
+                        eprintln!("witness parse failure in refine — synthesis bug");
                         return if adopted { Some(cur) } else { None };
                     }
                 }
@@ -2715,7 +3188,8 @@ const DBM_VERIFY_MAX_PATHS: usize = 16;
 /// the SMT verifier for the final verdict" — never a direct
 /// `Counterexample` report.
 ///
-/// `None` — outside the fragment: Support3/Clamp rows, Saturate
+/// `None` — outside the fragment: a TIGHTENED Support3/Clamp row,
+/// Saturate
 /// transitions, `Or`-disjunctive conditions, `Neq` comparisons,
 /// non-affine next-values, more than `DBM_VERIFY_MAX_PATHS` if-paths,
 /// bounds outside `i128`, or a template/domain size mismatch. The
@@ -2746,12 +3220,39 @@ fn dbm_proves_inductiveness(
     for row in &tpl.rows {
         match row.kind {
             RowKind::Interval(_) | RowKind::Diff(_, _) | RowKind::Sum(_, _) => {}
-            RowKind::Support3(..) | RowKind::Clamp(..) => return None,
+            // A non-octagon row that is still at its construction tops is
+            // VACUOUS: `full_lb ≤ f ≤ full_ub` holds for every state, so it
+            // can be dropped from A(X) and A(X′) alike without weakening
+            // the proof obligation. Only a TIGHTENED Support3/Clamp row
+            // (or a saturating transfer, rejected by `next_value_edges`)
+            // forces the SMT path. This is what makes the DBM fast path
+            // reachable at all for production templates (SparsePoly always
+            // emits Support3 rows for n ≥ 3, trivial for essentially every
+            // real loop).
+            RowKind::Support3(..) | RowKind::Clamp(..) => {
+                if !row.is_trivial() {
+                    return None;
+                }
+            }
         }
         if row.lb.to_i128().is_none() || row.ub.to_i128().is_none() {
             return None; // bounds beyond i128 — stay on the SMT path
         }
     }
+    // Drop the (now-proven trivial) Support3/Clamp rows from every check:
+    // `row_half` returns None for them, so the consuming loops below must
+    // never see them. A vacuous row contributes no constraint to A(X),
+    // A(X′), or any refutation.
+    let live_rows: Vec<&BiiRow> = tpl
+        .rows
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.kind,
+                RowKind::Interval(_) | RowKind::Diff(_, _) | RowKind::Sum(_, _)
+            )
+        })
+        .collect();
     let n_loop = problem.vars.len();
     let n_params = problem.params.len();
     let n_total = n_loop + n_params;
@@ -2871,7 +3372,7 @@ fn dbm_proves_inductiveness(
             }
         }
         if dbm.close_with(ClosureMode::IntegerExact) {
-            for row in &tpl.rows {
+            for row in &live_rows {
                 for upper in [true, false] {
                     let neg = negate(row_half(row, upper, false)?)?;
                     if let Some(false) = refuted(&dbm, neg) {
@@ -2911,7 +3412,7 @@ fn dbm_proves_inductiveness(
                 dbm.set_mirrored(a, b, c);
             }
             // A(X): every row, both halves, original side.
-            for row in &tpl.rows {
+            for row in &live_rows {
                 for upper in [true, false] {
                     let (a, b, c) = row_half(row, upper, false)?;
                     dbm.set_mirrored(a, b, c);
@@ -2937,7 +3438,7 @@ fn dbm_proves_inductiveness(
                 continue; // contradictory premise — vacuous path
             }
             // A(X′): every row, both halves, PRIMED side.
-            for row in &tpl.rows {
+            for row in &live_rows {
                 for upper in [true, false] {
                     let neg = negate(row_half(row, upper, true)?)?;
                     if let Some(false) = refuted(&dbm, neg) {
@@ -2959,7 +3460,7 @@ fn dbm_proves_inductiveness(
         for &(a, b, c) in &param_edges {
             dbm.set_mirrored(a, b, c);
         }
-        for row in &tpl.rows {
+        for row in &live_rows {
             for upper in [true, false] {
                 let (a, b, c) = row_half(row, upper, false)?;
                 dbm.set_mirrored(a, b, c);
@@ -3007,7 +3508,7 @@ fn dbm_proves_inductiveness(
         for &(a, b, c) in &param_edges {
             dbm.set_mirrored(a, b, c);
         }
-        for row in &tpl.rows {
+        for row in &live_rows {
             for upper in [true, false] {
                 let (a, b, c) = row_half(row, upper, false)?;
                 dbm.set_mirrored(a, b, c);
@@ -3721,18 +4222,19 @@ pub(crate) fn verify_template_against_problem(
 
 /// Algorithm 5's bounded leap query:
 ///  `∃A'.∀X,X'.P(A',X,X') ∧ (B ⊑ A' ⊏ A)`  — the witness must lie inside
-/// the under-approximation `B`, at-or-tighter-than `A`, and STRICTLY
-/// tighter in at least one row (`⊏` of Zuo et al. (2026)).
+/// the under-approximation `B`, at-or-tighter-than `A`.
 ///
-/// SMT has no lattice-order primitive, so `⊏` is expanded to the
-/// row-wise disjunction `∃r. l'_r > A.l_r ∨ u'_r < A.u_r`; it is what
-/// excludes the trivial witness A' = A and makes the Theorem-5.5 UNSAT
-/// termination (`A = A*`) reachable.
+/// The `A′ ⊏ A` strict-tightening conjunct is the Algorithm 5 obligation
+/// from the paper: it excludes the trivial witness `A' = A`, so that
+/// UNSAT establishes `A = A*`.  It does not increase the query count —
+/// the 4W bound of Theorem 5.5 is unchanged.  SMT has no lattice-order
+/// primitive, so `⊏` is expanded to the row-wise disjunction
+/// `∃r. l'_r > A.l_r ∨ u'_r < A.u_r`.
 ///
 /// Returns `None` if the transition encoding fails (fail-closed).
 fn build_bounded_leap_query(
     cur: &BiiTemplate,
-    limits: &BoundaryLimits,
+    limits: Option<&BoundaryLimits>,
     init: &[LoopInstr],
     body: &[LoopInstr],
     get_model: bool,
@@ -3782,23 +4284,30 @@ fn build_bounded_leap_query(
     }
 
     // B ⊑ A′ ⊏ A in bound terms (ENCODED domain, Diff rows offset):
-    // A.l_i ≤ l'_i ≤ B.lb_i and B.ub_i ≤ u'_i ≤ A.u_i
+    // A.l_i ≤ l'_i ≤ B.lb_i and B.ub_i ≤ u'_i ≤ A.u_i.
+    // `limits == None` relaxes the `B ⊑ A′` half (the optimality query's
+    // "B is still ⊥" case): only `A.l ≤ l′ ≤ A.u` is asserted then.
     smt.push_str("(assert (and ");
     for (r, row) in rows.iter().enumerate() {
         let ebw = row.enc_bw();
         let off = row.offset();
         let (rge, rle) = row_ge_le(row, bv);
         smt.push_str(&format!(
-            " ({} l_{r} {}) ({} l_{r} {}) ({} u_{r} {}) ({} u_{r} {})",
+            " ({} l_{r} {}) ({} u_{r} {})",
             rge,
             lit(&row.lb, ebw, &off),
             rle,
-            lit(&limits.lb[r], ebw, &off),
-            rge,
-            lit(&limits.ub[r], ebw, &off),
-            rle,
             lit(&row.ub, ebw, &off)
         ));
+        if let Some(limits) = limits {
+            smt.push_str(&format!(
+                " ({} l_{r} {}) ({} u_{r} {})",
+                rle,
+                lit(&limits.lb[r], ebw, &off),
+                rge,
+                lit(&limits.ub[r], ebw, &off)
+            ));
+        }
         smt.push_str(&format!(" ({} l_{r} u_{r})", rle));
     }
     smt.push_str("))\n");
@@ -3836,7 +4345,11 @@ fn build_bounded_leap_query(
             .strip_prefix("xs_")
             .and_then(|s| s.split('_').nth(1))
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                panic!(
+                    "intermediate name must encode var index as xs_{{step}}_{{var}}, got: {name}"
+                )
+            });
         smt.push_str(&format!("({} {}) ", name, sort(bws[var_idx] as u32)));
     }
     smt.push_str(")\n");
@@ -3918,7 +4431,11 @@ fn build_bounded_leap_query(
                     guard_parts.push(format!("(<= (- x_{i} x_{j}) {})", c));
                 }
             }
-            LoopInstr::AddVar(..) | LoopInstr::ConstVar(..) | LoopInstr::CopyVar(..) => {}
+            LoopInstr::AddVar(..)
+            | LoopInstr::AddWrap(..)
+            | LoopInstr::CopyAddVar(..)
+            | LoopInstr::ConstVar(..)
+            | LoopInstr::CopyVar(..) => {}
             // `if` conditions are path conditions, not loop-header
             // guards — skipped here.
             LoopInstr::If(..) => {}
@@ -3955,14 +4472,17 @@ fn build_bounded_leap_query(
 /// Diff rows are mapped back to the template domain `[-m, m]` here; LIA
 /// witnesses are already in the template domain.
 fn parse_witness(model: &str, rows: &[BiiRow], bv: bool) -> Option<Vec<(BigInt, BigInt)>> {
-    let wrapped = format!("({})", model);
-    let top = sexp::parse(&wrapped).ok()?;
+    let forms = sexp_ext::parse_many(model).ok()?;
 
     let mut out = Vec::with_capacity(rows.len());
 
     for r in 0..rows.len() {
-        let lb = parse_define_fun_from_sexp(&top, &format!("l_{r}"))?;
-        let ub = parse_define_fun_from_sexp(&top, &format!("u_{r}"))?;
+        let lb = forms
+            .iter()
+            .find_map(|f| parse_define_fun_from_sexp(f, &format!("l_{r}")))?;
+        let ub = forms
+            .iter()
+            .find_map(|f| parse_define_fun_from_sexp(f, &format!("u_{r}")))?;
         let off = if bv { rows[r].offset() } else { BigInt::zero() };
         // A signed Interval row's witness is a
         // bit-vector pattern — convert it to the TRUE signed value
@@ -3998,12 +4518,10 @@ fn parse_witness(model: &str, rows: &[BiiRow], bv: bool) -> Option<Vec<(BigInt, 
 ///   #x00)
 /// ```
 fn parse_define_fun(model: &str, name: &str) -> Option<BigInt> {
-    // `sexp::parse` parses one top-level S-expression. Model output may
-    // contain several top-level forms, so wrap the whole output in one list.
-    let wrapped = format!("({})", model);
-    let top = sexp::parse(&wrapped).ok()?;
-
-    parse_define_fun_from_sexp(&top, name)
+    let forms = sexp_ext::parse_many(model).ok()?;
+    forms
+        .iter()
+        .find_map(|form| parse_define_fun_from_sexp(form, name))
 }
 
 fn parse_define_fun_from_sexp(top: &Sexp, name: &str) -> Option<BigInt> {
@@ -4148,7 +4666,7 @@ fn parse_bigint_atom(atom: &str) -> Option<BigInt> {
 /// This can happen for Sum rows at 128-bit width where the max bound
 /// is `2^129 − 2 > i128::MAX`.
 pub(crate) fn template_to_invariant_exprs<'a>(
-    arena: &'a bumpalo::Bump,
+    arena: &'a crate::arena::SyncArena<'a>,
     tpl: &BiiTemplate,
     vars: &[Symbol],
 ) -> Vec<&'a crate::ast::Expr<'a>> {
@@ -4176,7 +4694,13 @@ pub(crate) fn template_to_invariant_exprs<'a>(
         })
     };
 
-    let mut out = Vec::new();
+    // D15 (hint hygiene): emit the cheap, high-value rows first and stop
+    // once the row budget is spent. SparsePoly templates carry up to 4·C(n,3)
+    // Support3 rows that are almost always implied by the Interval/Zone
+    // rows — emitting them all feeds a quadratic blow-up into every
+    // downstream `discharge`/`discharge_bv` obligation via `check_hints`.
+    const MAX_HINT_ROWS: usize = 8;
+    let mut selected: Vec<&BiiRow> = Vec::new();
     for row in &tpl.rows {
         if row.is_trivial() {
             continue;
@@ -4198,14 +4722,25 @@ pub(crate) fn template_to_invariant_exprs<'a>(
             continue;
         }
         // Bounds must fit in i128 for the AST literal.
-        let lb_i128 = match row.lb.to_i128() {
-            Some(v) => v,
-            None => continue, // exceeds AST range — skip row.
-        };
-        let ub_i128 = match row.ub.to_i128() {
-            Some(v) => v,
-            None => continue, // exceeds AST range — skip row.
-        };
+        if row.lb.to_i128().is_none() || row.ub.to_i128().is_none() {
+            continue; // exceeds AST range — skip row.
+        }
+        selected.push(row);
+    }
+    // Priority: Interval/Clamp first (direct variable bounds), then the
+    // two-variable octagon rows, then Support3 (rarely add anything the
+    // octagon rows do not imply). Stable, so row order is preserved within
+    // a class.
+    selected.sort_by_key(|r| match r.kind {
+        RowKind::Interval(_) | RowKind::Clamp(..) => 0,
+        RowKind::Diff(..) | RowKind::Sum(..) => 1,
+        RowKind::Support3(..) => 2,
+    });
+
+    let mut out = Vec::new();
+    for row in selected.into_iter().take(MAX_HINT_ROWS) {
+        let lb_i128 = row.lb.to_i128().unwrap();
+        let ub_i128 = row.ub.to_i128().unwrap();
         let f = match row.kind {
             RowKind::Interval(i) => ident(i),
             RowKind::Diff(i, j) => bin(crate::ast::BinOp::Sub, ident(i), ident(j)),
@@ -4272,7 +4807,9 @@ mod tests {
     /// `f ≤ u` for a non-trivial row, and skips top rows.
     #[test]
     fn test_template_to_invariant_exprs() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(
+            crate::arena::SyncArena::new(Box::leak(Box::new(bumpalo::Bump::new()))),
+        ));
         let vars = vec![Symbol::intern("i")];
         let tpl = BiiTemplate {
             n_vars: 1,
@@ -4721,22 +5258,46 @@ mod tests {
     /// letting the leap path accept non-inductive bounds.
     #[test]
     fn test_build_bounded_leap_query_includes_transition() {
-        let tpl = BiiTemplate::new(1, &[8], &[false]);
-        let limits = BoundaryLimits::new(&tpl);
-        let init = vec![LoopInstr::ConstVar(0, 0)];
-        let body = vec![LoopInstr::AddVar(0, 1)];
-        let q = build_bounded_leap_query(&tpl, &limits, &init, &body, false, false, &[8], &[false])
+        // BOTH encodings are live production paths (LIA for trap loops,
+        // BV for wrap-typed loops — `use_bv` is selected per loop), so
+        // the shape assertions run in each mode with mode-matching
+        // comparison operators.
+        for bv in [false, true] {
+            let tpl = BiiTemplate::new(1, &[8], &[false]);
+            let limits = BoundaryLimits::new(&tpl);
+            let init = vec![LoopInstr::ConstVar(0, 0)];
+            let body = vec![LoopInstr::AddVar(0, 1)];
+            let q = build_bounded_leap_query(
+                &tpl,
+                Some(&limits),
+                &init,
+                &body,
+                false,
+                bv,
+                &[8],
+                &[false],
+            )
             .expect("leap query should build");
-        assert!(
-            q.contains("xs_0_0"),
-            "leap query must contain the SSA transition: {}",
-            q
-        );
-        assert!(
-            q.contains("(= xp_0 xs_0_0)"),
-            "leap query must map xp back from the final intermediate: {}",
-            q
-        );
+            assert!(
+                q.contains("xs_0_0"),
+                "leap query must contain the SSA transition: {}",
+                q
+            );
+            assert!(
+                q.contains("(= xp_0 xs_0_0)"),
+                "leap query must map xp back from the final intermediate: {}",
+                q
+            );
+            // The B ⊑ A′ conjuncts are present when limits are supplied;
+            // the l ≤ u well-formedness conjunct uses the mode's own
+            // comparison operator.
+            let le = if bv { "bvule" } else { "<=" };
+            assert!(
+                q.contains(&format!("({le} l_0 u_0)")),
+                "leap query must contain the l ≤ u well-formedness conjunct: {}",
+                q
+            );
+        }
     }
 
     /// The bounded-leap query must emit the paper's `A′ ⊏ A` conjunct (as
@@ -4749,8 +5310,17 @@ mod tests {
         let limits = BoundaryLimits::new(&tpl);
         let init = vec![LoopInstr::ConstVar(0, 0)];
         let body = vec![LoopInstr::AddVar(0, 1)];
-        let q = build_bounded_leap_query(&tpl, &limits, &init, &body, false, false, &[8], &[false])
-            .expect("leap query should build");
+        let q = build_bounded_leap_query(
+            &tpl,
+            Some(&limits),
+            &init,
+            &body,
+            false,
+            false,
+            &[8],
+            &[false],
+        )
+        .expect("leap query should build");
         // The strict tightening disjunction must be present:
         // (or (> l_0 ...) (< u_0 ...) ...)
         assert!(
@@ -4758,6 +5328,64 @@ mod tests {
             "leap query must contain the strict tightening disjunction: {}",
             q
         );
+    }
+
+    /// `limits == None` (the optimality query's "B is still ⊥" case) must
+    /// RELAX the `B ⊑ A′` conjuncts — only the `A.l ≤ l′ ≤ A.u` window and
+    /// the strict disjunction remain. With the old signature (limits by
+    /// reference, always conjoined) a ⊥ B made the optimality query
+    /// vacuously UNSAT and "proved" a false BII.
+    #[test]
+    fn test_build_bounded_leap_query_relaxed_without_limits() {
+        // BOTH encodings are live production paths, so the relaxation
+        // contract is checked in each mode with mode-matching operators.
+        for bv in [false, true] {
+            let tpl = BiiTemplate::new(1, &[8], &[false]);
+            let limits = BoundaryLimits::new(&tpl);
+            let init = vec![LoopInstr::ConstVar(0, 0)];
+            let body = vec![LoopInstr::AddVar(0, 1)];
+            let q_some = build_bounded_leap_query(
+                &tpl,
+                Some(&limits),
+                &init,
+                &body,
+                false,
+                bv,
+                &[8],
+                &[false],
+            )
+            .expect("leap query should build");
+            let q_none =
+                build_bounded_leap_query(&tpl, None, &init, &body, false, bv, &[8], &[false])
+                    .expect("leap query should build");
+            // The B conjuncts are `l′ ≤ B.lb` and `u′ ≥ B.ub` — rendered
+            // `(<= l_0 …)` / `(>= u_0 …)` in LIA, `bvule l_0 …` /
+            // `bvuge u_0 …` in BV. Without limits exactly those two are
+            // gone — saturating subtraction so a total absence fails the
+            // count assert instead of underflowing.
+            let (ge, le) = if bv { ("bvuge", "bvule") } else { (">=", "<=") };
+            for tag in [format!("{le} l_0 "), format!("{ge} u_0 ")] {
+                assert_eq!(
+                    q_none.matches(&tag).count(),
+                    q_some.matches(&tag).count().saturating_sub(1),
+                    "the B conjunct `{tag}` must be dropped when limits is None\
+                     \n--- some ---\n{q_some}\n--- none ---\n{q_none}"
+                );
+            }
+            // The A-window and l ≤ u conjuncts remain in the relaxed query.
+            for tag in [format!("{ge} l_0 "), format!("{le} l_0 u_0")] {
+                assert!(
+                    q_none.contains(&tag),
+                    "the relaxed query must keep the A-window/well-formedness conjunct `{tag}`\
+                     \n--- none ---\n{q_none}"
+                );
+            }
+            // The strict tightening disjunction stays in both.
+            assert!(
+                q_none.contains("(assert (or"),
+                "relaxed leap query must still carry the strict disjunction: {q_none}"
+            );
+        }
     }
 
     /// Sum rows are generated by `BiiTemplate::new` with correct top
@@ -5024,7 +5652,9 @@ mod tests {
     /// `i128::MAX`, so `template_to_invariant_exprs` must skip it.
     #[test]
     fn test_sum_128_skipped_in_ast() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(
+            crate::arena::SyncArena::new(Box::leak(Box::new(bumpalo::Bump::new()))),
+        ));
         let vars = vec![Symbol::intern("x"), Symbol::intern("y")];
         let tpl = BiiTemplate {
             n_vars: 2,
@@ -5053,9 +5683,9 @@ mod tests {
         let pos = BitPositions::new(&tpl);
         let limits = BoundaryLimits::new(&tpl);
         let cands = propose_bitwise(&tpl, &pos, &limits);
-        let sum_cands: Vec<&BiiTemplate> = cands
+        let sum_cands: Vec<&Candidate> = cands
             .iter()
-            .filter(|c| c.rows.iter().any(|r| matches!(r.kind, RowKind::Sum(..))))
+            .filter(|c| matches!(tpl.rows[c.row_idx].kind, RowKind::Sum(..)))
             .collect();
         assert!(
             !sum_cands.is_empty(),
@@ -5311,8 +5941,10 @@ mod tests {
         );
     }
 
-    /// Fragment fallback: Support3 rows yield `None` before any
-    /// check runs (the fragment gate is first).
+    /// Fragment fallback: a TIGHTENED Support3 row yields `None` before
+    /// any check runs (the fragment gate is first). A Support3 row still
+    /// at its full range is VACUOUS and must NOT bail — see
+    /// `test_dbm_gate_trivial_support3_rows_prove`.
     #[test]
     fn test_dbm_fallback_support3() {
         use crate::hir::loop_ir::{
@@ -5342,11 +5974,67 @@ mod tests {
             saturates: vec![],
             post: None,
         };
-        let tpl = BiiTemplate::new(3, &[4, 4, 4], &[false, false, false]);
+        let mut tpl = BiiTemplate::new(3, &[4, 4, 4], &[false, false, false]);
+        // Tighten ONE Support3 row: `x + y + z ≤ 7` (top is 45). The row is
+        // non-vacuous — outside the octagon fragment → the gate bails.
+        let s3_idx = tpl
+            .rows
+            .iter()
+            .position(|r| matches!(r.kind, RowKind::Support3(..)))
+            .expect("3 vars at SparsePoly must emit Support3 rows");
+        tpl.rows[s3_idx].ub = BigInt::from(7);
         assert_eq!(
             dbm_proves_inductiveness(&problem, &tpl),
             None,
-            "Support3 rows fall back to the SMT verifier"
+            "a TIGHTENED Support3 row falls back to the SMT verifier"
+        );
+    }
+
+    /// D3: a Support3/Clamp row still at its construction tops is VACUOUS
+    /// (`full_lb ≤ f ≤ full_ub` holds for every state) and must be DROPPED
+    /// from A(X)/A(X′) instead of bailing to the SMT verifier — this is
+    /// what makes the exact DBM fast path reachable for production
+    /// templates (SparsePoly always emits Support3 rows for n ≥ 3). The
+    /// identity-transition problem with an all-top template (only trivial
+    /// Support3 rows beyond the octagon) must be PROVEN inductive by the
+    /// DBM path alone.
+    #[test]
+    fn test_dbm_gate_trivial_support3_rows_prove() {
+        use crate::hir::loop_ir::{
+            BiiLoopProblem, BiiVar, Cond, EdgeKind, ScalarExpr, TransitionEdge,
+        };
+        let mk = |s: &str| BiiVar {
+            symbol: Symbol::intern(s),
+            bw: 4,
+            signed: false,
+        };
+        let problem = BiiLoopProblem {
+            vars: vec![mk("x"), mk("y"), mk("z")],
+            params: vec![],
+            init: vec![
+                ScalarExpr::Const(BigInt::zero()),
+                ScalarExpr::Const(BigInt::zero()),
+                ScalarExpr::Const(BigInt::zero()),
+            ],
+            loop_guard: Cond::True,
+            back_edges: vec![TransitionEdge {
+                kind: EdgeKind::Back,
+                guard: None,
+                definedness: None,
+                next_values: vec![ScalarExpr::Var(0), ScalarExpr::Var(1), ScalarExpr::Var(2)],
+            }],
+            exit_edges: vec![],
+            saturates: vec![],
+            post: None,
+        };
+        let mut tpl = BiiTemplate::new(3, &[4, 4, 4], &[false, false, false]);
+        // Tighten only OCTAGON rows (inside the fragment); every Support3
+        // row stays at its full range.
+        tpl.rows[0].ub = BigInt::from(2); // Interval(x)
+        assert_eq!(
+            dbm_proves_inductiveness(&problem, &tpl),
+            Some(true),
+            "trivial Support3 rows must not disable the DBM fast path"
         );
     }
 
@@ -5780,7 +6468,7 @@ mod tests {
         assert!(
             cands
                 .iter()
-                .any(|c| c.rows.iter().any(|r| matches!(r.kind, RowKind::Sum(..)))),
+                .any(|c| matches!(tpl.rows[c.row_idx].kind, RowKind::Sum(..))),
             "propose_bitwise must produce candidates for signed Sum rows"
         );
     }
@@ -6485,7 +7173,7 @@ mod tests {
 
         // No lower-bound candidate may exceed 3.
         assert!(
-            cands.iter().all(|c| c.rows[0].lb <= BigInt::from(3)),
+            cands.iter().all(|c| c.new_lb <= BigInt::from(3)),
             "BoundaryLimits must prune impossible lower-bound proposals"
         );
     }
@@ -6511,7 +7199,7 @@ mod tests {
 
         // No upper-bound candidate may fall below 200.
         assert!(
-            cands.iter().all(|c| c.rows[0].ub >= BigInt::from(200)),
+            cands.iter().all(|c| c.new_ub >= BigInt::from(200)),
             "BoundaryLimits must prune impossible upper-bound proposals"
         );
     }
@@ -6624,9 +7312,15 @@ mod tests {
             }),
         };
         let tpl = BiiTemplate::new(1, &[8], &[false]);
-        let candidates = vec![tpl];
+        // One candidate: tighten row 0 to [10, 20] (any row within the
+        // template's full range — the builder only reads the row count).
+        let candidates = vec![Candidate {
+            row_idx: 0,
+            new_lb: BigInt::from(0),
+            new_ub: BiiRow::max_ub(8),
+        }];
         // BV mode: the post bound renders as `(_ bv10 8)`.
-        let q = build_refine_query_problem(&problem, &candidates, false, true, &[8]).unwrap();
+        let q = build_refine_query_problem(&problem, &candidates, &tpl, false, true, &[8]).unwrap();
 
         // The query must contain the negated guard and the post bound.
         // The post constant lifts to `bits(10)+1 = 5` bits (Route B
@@ -6698,7 +7392,11 @@ mod tests {
         // Simulate UNSAT pruning: a candidate tightening lb to 10 and
         // ub to 20 moves the limits to lb=9 / ub=21 (one past the
         // proposal).
-        let cands = vec![tpl.with_row(0, BigInt::from(10), BigInt::from(20))];
+        let cands = vec![Candidate {
+            row_idx: 0,
+            new_lb: BigInt::from(10),
+            new_ub: BigInt::from(20),
+        }];
         limits.prune_unsat(&tpl, &cands);
         assert!(limits.is_active(), "Limits should be active after pruning");
         assert_eq!(
@@ -6722,5 +7420,130 @@ mod tests {
             BigInt::from(9),
             "SAT tightening must only strengthen, never weaken"
         );
+    }
+
+    /// `template_level_for` selects the largest level of the paper's
+    /// §4.2 template hierarchy (`Interval ⊂ Zone ⊂ Octagon ⊂ SparsePoly`)
+    /// whose row count fits `BII_MAX_ROWS`. At 5 variables the row
+    /// counts are Interval=5, Zone=15, Octagon=25, SparsePoly=65; with
+    /// the current cap of 24, Zone is the largest fitting level.
+    #[test]
+    fn test_template_level_for_5_vars() {
+        let level = template_level_for(5, &[8; 5], &[false; 5], &[]);
+        assert_eq!(
+            level,
+            TemplateLevel::Zone,
+            "5 vars: Octagon (25 rows) exceeds BII_MAX_ROWS = {}; Zone must be chosen",
+            BII_MAX_ROWS
+        );
+        let tpl = BiiTemplate::with_level(5, &[8; 5], &[false; 5], level);
+        assert!(
+            tpl.rows.len() <= BII_MAX_ROWS,
+            "the selected level must respect the row cap (rows = {}, cap = {})",
+            tpl.rows.len(),
+            BII_MAX_ROWS
+        );
+        assert_eq!(
+            tpl.rows.len(),
+            15,
+            "Zone at n=5: 5 interval rows + C(5,2)=10 diff rows"
+        );
+    }
+
+    /// A `SparsePoly` template at 3 variables carries 13 rows
+    /// (3 Interval + 3 Diff + 3 Sum + 4 Support3). All four Support3
+    /// rows are full-range here, because x, y, and z are only bounded
+    /// by their interval rows; the DBM verifier must drop those trivial
+    /// rows and prove the loop exactly, without falling back to Z3.
+    #[test]
+    fn test_dbm_gate_trivial_support3_loop_proves() {
+        let vars = vec![
+            Symbol::intern("x"),
+            Symbol::intern("y"),
+            Symbol::intern("z"),
+        ];
+        // x := 0; y := 0; z := 0; while x < 6 { x := x + 1 }
+        // y and z are unmodified (their rows stay full-range).
+        let init = vec![
+            LoopInstr::ConstVar(0, 0),
+            LoopInstr::ConstVar(1, 0),
+            LoopInstr::ConstVar(2, 0),
+        ];
+        let body = vec![LoopInstr::TestLe(0, 5), LoopInstr::AddVar(0, 1)];
+        let problem = crate::hir::loop_ir::loop_instrs_to_loop_problem(
+            &vars,
+            &init,
+            &body,
+            &[8, 8, 8],
+            &[false, false, false],
+            &[],
+            true,
+        )
+        .expect("must lower");
+        // Full SparsePoly template at n=3.
+        let mut tpl = BiiTemplate::new(3, &[8, 8, 8], &[false, false, false]);
+        assert_eq!(
+            tpl.rows
+                .iter()
+                .filter(|r| matches!(r.kind, RowKind::Support3(..)))
+                .count(),
+            4,
+            "3 vars at SparsePoly must emit 4 Support3 rows"
+        );
+        // Tighten ONLY x's interval row to the BII [0, 6].
+        assert!(matches!(tpl.rows[0].kind, RowKind::Interval(0)));
+        tpl.rows[0].lb = BigInt::zero();
+        tpl.rows[0].ub = BigInt::from(6);
+        // The DBM gate must drop the 4 trivial Support3 rows and prove
+        // the octagon fragment exactly.
+        assert_eq!(
+            dbm_proves_inductiveness(&problem, &tpl),
+            Some(true),
+            "trivial Support3 rows must not disable the DBM fast path (D3)"
+        );
+    }
+
+    /// After `synthesize_problem_bii` returns, the returned template is
+    /// the best inductive invariant. A fresh manual `A' ⊏ A` optimality
+    /// query must be UNSAT — no strictly tighter inductive template
+    /// exists.
+    #[test]
+    fn test_synthesize_problem_bii_returns_bii() {
+        let solver = SmtSolver::new("z3");
+        if !solver.check_version() {
+            eprintln!("z3 unavailable — skipping test_synthesize_problem_bii_returns_bii");
+            return;
+        }
+        let vars = vec![Symbol::intern("i")];
+        let init = vec![LoopInstr::ConstVar(0, 0)];
+        let body = vec![LoopInstr::TestLe(0, 5), LoopInstr::AddVar(0, 1)];
+        let problem = crate::hir::loop_ir::loop_instrs_to_loop_problem(
+            &vars,
+            &init,
+            &body,
+            &[8],
+            &[false],
+            &[],
+            true,
+        )
+        .expect("must lower");
+        let tpl = synthesize_problem_bii(&solver, &problem, 512, false).expect("must synthesize");
+        // Sanity: the BII for this loop is [0, 6].
+        assert_eq!(tpl.rows[0].lb, BigInt::zero());
+        assert_eq!(tpl.rows[0].ub, BigInt::from(6));
+        // Final optimality query: `A' ⊏ A` must be UNSAT — no strictly
+        // tighter inductive template exists.
+        let bws_all: Vec<u8> = problem
+            .vars
+            .iter()
+            .chain(problem.params.iter())
+            .map(|v| v.bw)
+            .collect();
+        let leap = build_bounded_leap_query_problem(&problem, &tpl, None, true, false, &bws_all)
+            .expect("optimality leap query must build");
+        match solver.run_raw_query(&leap) {
+            RawQueryOutcome::Unsat => {}
+            _ => panic!("expected UNSAT for the optimality query on a proven BII"),
+        }
     }
 }

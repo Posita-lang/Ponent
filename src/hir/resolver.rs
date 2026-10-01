@@ -6,6 +6,7 @@ use crate::hir::symbol::*;
 use crate::hir::traits::{ImplCandidate, TraitEnv};
 use crate::symbol::Symbol;
 use regex_syntax;
+use smallvec::{SmallVec, smallvec};
 
 /// Recursively search an AST type for a reference to one of `params`
 /// (the enum's declared type parameters).  Used to reject GADT `when`
@@ -194,8 +195,6 @@ fn find_param_ref_in_expr<'input>(
     }
 }
 use rustc_hash::FxHashMap;
-use std::cell::Cell;
-use std::rc::Rc;
 
 /// Represents the result of partially resolving a multi-segment path
 /// (e.g. `Foo::bar::Baz` where only `Foo` is known at resolver time).
@@ -234,11 +233,15 @@ pub(crate) struct ResolutionMap<'input> {
 use crate::hir::types::*;
 use rustc_hash::FxHashMap as HashMap;
 
-pub struct NameResolver<'a, 'input> {
+pub struct NameResolver<'a, 'src, 'input> {
     ctx: &'a mut TypeContext<'input>,
     symbols: SymbolTable<'input>,
     trait_env: TraitEnv<'input>,
-    diagnostics: DiagCtxt,
+    diagnostics: DiagCtxt<'src>,
+    /// The source buffer this resolver's diagnostics may borrow.  Attached
+    /// to every source-less diagnostic at the resolution boundary so that
+    /// downstream emitters can render snippets without cloning the source.
+    source: Option<&'src str>,
     current_scope: usize,
     current_function: Option<DefId>,
     current_type: Option<DefId>,
@@ -274,8 +277,12 @@ struct ImportEntry {
     span: Span,
 }
 
-impl<'input: 'a, 'a> NameResolver<'a, 'input> {
-    pub fn new(ctx: &'a mut TypeContext<'input>, local_crate_id: CrateId) -> Self {
+impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
+    pub fn new(
+        ctx: &'a mut TypeContext<'input>,
+        local_crate_id: CrateId,
+        source: Option<&'src str>,
+    ) -> Self {
         let mut symbols = SymbolTable::new(local_crate_id);
         let mut trait_env = TraitEnv::new();
         // Register built-in types (Result, Option, Channel, etc.) so that
@@ -287,6 +294,7 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
             symbols,
             trait_env,
             diagnostics: DiagCtxt::new(),
+            source,
             current_scope: 0,
             current_function: None,
             current_type: None,
@@ -308,7 +316,7 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
     ) -> (
         SymbolTable<'input>,
         TraitEnv<'input>,
-        DiagCtxt,
+        DiagCtxt<'src>,
         ResolutionMap<'input>,
     ) {
         for item in &program.items {
@@ -319,7 +327,10 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
         let trait_env = std::mem::replace(&mut self.trait_env, TraitEnv::new());
         let mut resolution_map = std::mem::take(&mut self.resolution_map);
         resolution_map.has_main = self.has_main;
-        let diags = std::mem::take(&mut self.diagnostics);
+        let mut diags = std::mem::take(&mut self.diagnostics);
+        if let Some(source) = self.source {
+            diags.attach_source(source);
+        }
 
         (symbols, trait_env, diags, resolution_map)
     }
@@ -347,7 +358,7 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
     ) -> (
         SymbolTable<'input>,
         TraitEnv<'input>,
-        DiagCtxt,
+        DiagCtxt<'src>,
         ResolutionMap<'input>,
     ) {
         // Restore existing resolution state.
@@ -368,7 +379,10 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
         let trait_env = std::mem::replace(&mut self.trait_env, TraitEnv::new());
         let mut resolution_map = std::mem::take(&mut self.resolution_map);
         resolution_map.has_main = self.has_main;
-        let diags = std::mem::take(&mut self.diagnostics);
+        let mut diags = std::mem::take(&mut self.diagnostics);
+        if let Some(source) = self.source {
+            diags.attach_source(source);
+        }
 
         (symbols, trait_env, diags, resolution_map)
     }
@@ -512,7 +526,7 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
                 let mut fields = Vec::new();
                 let mut variants = Vec::new();
                 let mut alias_ast = None;
-                let mut invariant = None;
+                let invariant = None;
                 let mut default_value = None;
                 let mut no_default = false;
                 let mut missing_match = None;
@@ -1106,7 +1120,8 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
                         self.symbols
                             .insert_method_def_id(receiver_def, method.name, method_def);
                     }
-                    let mut param_tys = Vec::with_capacity(method.params.len());
+                    let mut param_tys: SmallVec<[TypeId; 4]> =
+                        SmallVec::with_capacity(method.params.len());
                     for p in &method.params {
                         if let Some(ref param_ty) = p.ty {
                             let resolved_ty = self.resolve_self_in_type(param_ty, for_type);
@@ -1659,7 +1674,7 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
                     && let Some(binding) = self.symbols.lookup_type_by_def_id(def_id)
                     && binding.kind == TypeKind::Struct
                 {
-                    return Some(self.ctx.struct_ty(def_id, vec![]));
+                    return Some(self.ctx.struct_ty(def_id, smallvec![]));
                 }
                 None
             }
@@ -1676,7 +1691,7 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
                     && let Some(binding) = self.symbols.lookup_type_by_def_id(def_id)
                     && binding.kind == TypeKind::Enum
                 {
-                    return Some(self.ctx.enum_ty(def_id, vec![]));
+                    return Some(self.ctx.enum_ty(def_id, smallvec![]));
                 }
                 None
             }
@@ -1685,7 +1700,7 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
                 None
             }
             Expr::Tuple(exprs, ..) => {
-                let mut elems = Vec::new();
+                let mut elems: SmallVec<[TypeId; 4]> = SmallVec::new();
                 for e in exprs {
                     if let Some(ty) = self.resolve_expr(e) {
                         elems.push(ty);
@@ -1745,7 +1760,7 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
                 } else {
                     self.ctx.unit()
                 };
-                let param_tys: Vec<TypeId> = params
+                let param_tys: SmallVec<[TypeId; 4]> = params
                     .iter()
                     .map(|p| {
                         if let Some(ty) = &p.ty {
@@ -1961,6 +1976,10 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
                     self.resolve_pattern(inner);
                 }
             }
+            Pattern::Annotated { inner, ty, .. } => {
+                self.resolve_pattern(inner);
+                self.resolve_type_expr(ty);
+            }
             Pattern::Or(patterns, ..) => {
                 for p in patterns {
                     self.resolve_pattern(p);
@@ -2007,8 +2026,8 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
                         self.resolve_type_expr(&alias)
                     } else if let Some(binding) = self.symbols.lookup_type_by_def_id(def_id) {
                         match binding.kind {
-                            TypeKind::Struct => self.ctx.struct_ty(def_id, vec![]),
-                            TypeKind::Enum => self.ctx.enum_ty(def_id, vec![]),
+                            TypeKind::Struct => self.ctx.struct_ty(def_id, smallvec![]),
+                            TypeKind::Enum => self.ctx.enum_ty(def_id, smallvec![]),
                             _ => self.ctx.error(),
                         }
                     } else {
@@ -2105,7 +2124,7 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
                 if let Some(def_id) = self.ctx.get_def_id_for_type(base_ty) {
                     let binding = self.symbols.lookup_type_by_def_id(def_id).cloned();
                     if let Some(binding) = binding {
-                        let arg_tys: Vec<TypeId> = args
+                        let arg_tys: SmallVec<[TypeId; 4]> = args
                             .iter()
                             .map(|a| self.resolve_type_expr(a.ty().as_ref()))
                             .collect();
@@ -2164,7 +2183,8 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
                 }
             }
             Type::Tuple(tys, ..) => {
-                let elems: Vec<TypeId> = tys.iter().map(|t| self.resolve_type_expr(t)).collect();
+                let elems: SmallVec<[TypeId; 4]> =
+                    tys.iter().map(|t| self.resolve_type_expr(t)).collect();
                 self.ctx.tuple(elems)
             }
             Type::Function { params, ret, .. } => {
@@ -2248,7 +2268,7 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
                     "Regex pattern should have been validated at parse time: {}",
                     pattern,
                 );
-                self.ctx.regex(pattern.clone())
+                self.ctx.regex(Symbol::intern(pattern))
             }
         }
     }
@@ -2367,10 +2387,10 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
                     }
                 })
                 .collect(),
-            return_type: Rc::new(Cell::new(match return_type {
+            return_type: ReturnTypeSlot::new(match return_type {
                 Some(t) => self.resolve_type_expr(t),
                 None => self.ctx.unit(),
-            })),
+            }),
             type_params: type_params.to_vec(),
             where_clause: None,
         }
@@ -2396,7 +2416,7 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
                     }
                 })
                 .collect(),
-            return_type: Rc::new(Cell::new(self.resolve_type_expr(&method.return_type))),
+            return_type: ReturnTypeSlot::new(self.resolve_type_expr(&method.return_type)),
             type_params: Vec::new(),
             where_clause: None,
         }
@@ -2407,7 +2427,7 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
         self.symbols
     }
 
-    pub fn diagnostics(&self) -> &DiagCtxt {
+    pub fn diagnostics(&self) -> &DiagCtxt<'src> {
         &self.diagnostics
     }
 
@@ -2485,7 +2505,7 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
                     .arena
                     .expect("arena required for type construction")
                     .alloc(self.resolve_self_in_type(inner, self_ty)),
-                size.clone(),
+                *size,
                 *span,
             ),
             Type::DynTrait(traits, span) => Type::DynTrait(
@@ -2541,7 +2561,7 @@ impl<'input: 'a, 'a> NameResolver<'a, 'input> {
         items: &Option<Vec<Symbol>>,
         alias: &Option<Symbol>,
         span: Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), Diagnostic<'src>> {
         let import_name = alias.as_ref().or_else(|| path.last()).copied();
 
         // First try to resolve as a type.
@@ -2652,7 +2672,9 @@ mod tests {
         ),
         Vec<String>,
     > {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static crate::arena::SyncArena<'static> =
+            Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
         let mut ctx = TypeContext::new();
         let mut parser = Parser::new(source, arena);
         let program = parser.parse_program().map_err(|diags| {
@@ -2662,7 +2684,7 @@ mod tests {
                 .collect::<Vec<_>>()
         })?;
         let local_crate_id = CrateId(DefId(0));
-        let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, Some(source));
         let (symbols, trait_env, diags, resolution_map) = resolver.resolve_program(&program);
         if diags.has_errors() {
             return Err(diags

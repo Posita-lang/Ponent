@@ -1299,7 +1299,7 @@ pub struct BorrowError {
 /// exclusive / mutation) with the correct codes (E109 / E112 / E110) and
 /// the dual-position label for exclusivity conflicts.  Inlining this at
 /// each call-site previously let `check_method_body` drift.
-pub(crate) fn borrow_error_diagnostic(err: &BorrowError) -> Diagnostic {
+pub(crate) fn borrow_error_diagnostic<'src>(err: &BorrowError) -> Diagnostic<'src> {
     // The fail-closed sentinel: the borrow check could not be performed
     // (the function exceeded the analysis capacity) — a distinct,
     // explicit diagnostic instead of a generic freeze message.
@@ -2915,7 +2915,6 @@ impl<'input> CfgBuilder<'input> {
                         // dispatch block and inverted the test order).
                         else_target = Some(test_block);
                     }
-                    cur = scrutinee_block;
                     // The match's arms join at the exit; if there are no
                     // exits (all arms diverge), the current block is
                     // unreachable.

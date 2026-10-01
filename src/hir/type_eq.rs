@@ -1457,6 +1457,8 @@ fn pattern_binds(name: Symbol, p: &crate::ast::Pattern) -> bool {
         crate::ast::Pattern::Enum { inner, .. } => {
             inner.is_some_and(|sub| pattern_binds(name, sub))
         }
+        // An `@annotated` pattern binds wherever its inner pattern does.
+        crate::ast::Pattern::Annotated { inner, .. } => pattern_binds(name, inner),
         crate::ast::Pattern::Wildcard(_)
         | crate::ast::Pattern::Literal(..)
         | crate::ast::Pattern::Error(_) => false,
@@ -1889,6 +1891,7 @@ mod tests {
         LoopInstr, dbm_fixpoint, dbm_to_invariant_exprs, infer_loop_decreases_expr,
         infer_loop_invariant_exprs,
     };
+    use crate::hir::octagon::DbmThresholds;
     use crate::hir::types::{CrateId, DefId};
 
     fn path<'a>(arena: &'a bumpalo::Bump, seg: &str) -> &'a crate::ast::Type<'a> {
@@ -3172,7 +3175,8 @@ mod tests {
         init.set(1, 0, 0); // −2X ≤ 0 ⟺ X ≥ 0   (X = 0)
         init.close();
         let step = |d: &Dbm| d.assign_add_var(0, 1);
-        let fp = dbm_fixpoint(&init, &step, 100, 2).expect("i := i + 1 converges");
+        let fp = dbm_fixpoint(&init, &step, 100, 2, &DbmThresholds::new(init.size))
+            .expect("i := i + 1 converges");
         assert_eq!(fp.var_lb(0), Some(0), "fixpoint keeps i ≥ 0");
         assert_eq!(fp.var_ub(0), None, "fixpoint widens the upper bound");
     }
@@ -3188,7 +3192,7 @@ mod tests {
         init.close();
         let step = |d: &Dbm| d.assign_add_var(0, 1);
         assert!(
-            dbm_fixpoint(&init, &step, 3, 3).is_none(),
+            dbm_fixpoint(&init, &step, 3, 3, &DbmThresholds::new(init.size)).is_none(),
             "a non-converging step must yield None (fail closed)"
         );
         // The old construction (a diagonal set(0,0,-1) decreasing) built a
@@ -3203,19 +3207,22 @@ mod tests {
     /// yields invariant expressions including `X ≥ 1` and `X ≤ 10`.
     #[test]
     fn test_dbm_to_invariant_exprs() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(
+            crate::arena::SyncArena::new(Box::leak(Box::new(bumpalo::Bump::new()))),
+        ));
+        let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let mut d = Dbm::new(1);
         d.set(0, 1, 20); // 2X ≤ 20 ⟺ X ≤ 10
         d.set(1, 0, -2); // −2X ≤ −2 ⟺ X ≥ 1
         d.close();
         let vars = vec![Symbol::intern("X")];
-        let exprs = dbm_to_invariant_exprs(&arena, &d, &vars);
-        let x = arena.alloc(crate::ast::Expr::Ident(
+        let exprs = dbm_to_invariant_exprs(arena, &d, &vars, None);
+        let x = bump.alloc(crate::ast::Expr::Ident(
             Symbol::intern("X"),
             crate::ast::Span::new(0, 0),
         ));
-        let le10 = cmp_lit(&arena, crate::ast::BinOp::Le, x, 10);
-        let ge1 = cmp_lit(&arena, crate::ast::BinOp::Ge, x, 1);
+        let le10 = cmp_lit(&bump, crate::ast::BinOp::Le, x, 10);
+        let ge1 = cmp_lit(&bump, crate::ast::BinOp::Ge, x, 1);
         assert!(
             exprs.len() >= 2,
             "X ∈ [1, 10] yields at least two facts (got {})",
@@ -3230,17 +3237,19 @@ mod tests {
             "one fact is X ≥ 1"
         );
     }
-
     /// The inference kernel end-to-end — `i = 0; while i < 10 {
     /// i := i + 1 }` yields the invariant candidate `i ≥ 0`; the guard
     /// bound `i ≤ 9` is absorbed by the fixpoint and NOT reported (it only
     /// holds inside the loop, so it is not an invariant).
     #[test]
     fn test_infer_loop_invariant_exprs() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(
+            crate::arena::SyncArena::new(Box::leak(Box::new(bumpalo::Bump::new()))),
+        ));
+        let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let vars = vec![Symbol::intern("i")];
         let exprs = infer_loop_invariant_exprs(
-            &arena,
+            arena,
             &vars,
             &[LoopInstr::ConstVar(0, 0)],
             &[LoopInstr::TestLe(0, 9), LoopInstr::AddVar(0, 1)],
@@ -3248,12 +3257,12 @@ mod tests {
             2,
             None,
         );
-        let i = arena.alloc(crate::ast::Expr::Ident(
+        let i = bump.alloc(crate::ast::Expr::Ident(
             Symbol::intern("i"),
             crate::ast::Span::new(0, 0),
         ));
-        let ge0 = cmp_lit(&arena, crate::ast::BinOp::Ge, i, 0);
-        let le9 = cmp_lit(&arena, crate::ast::BinOp::Le, i, 9);
+        let ge0 = cmp_lit(&bump, crate::ast::BinOp::Ge, i, 0);
+        let le9 = cmp_lit(&bump, crate::ast::BinOp::Le, i, 9);
         assert!(
             exprs.iter().any(|e| expr_eq_ignoring_spans(e, ge0)),
             "the invariant candidate includes i ≥ 0"
@@ -3263,26 +3272,28 @@ mod tests {
             "the guard bound i ≤ 9 must NOT leak into the invariant"
         );
     }
-
     /// The `decreases` inference — `i = 0; while i < 10 { i := i + 1 }`
     /// yields the candidate `9 - i` (the guard bound minus the counter);
     /// a loop without an increasing step has no candidate.
     #[test]
     fn test_infer_loop_decreases() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(
+            crate::arena::SyncArena::new(Box::leak(Box::new(bumpalo::Bump::new()))),
+        ));
+        let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let vars = vec![Symbol::intern("i")];
         let instrs = vec![LoopInstr::TestLe(0, 9), LoopInstr::AddVar(0, 1)];
-        let dec = infer_loop_decreases_expr(&arena, &vars, &instrs);
+        let dec = infer_loop_decreases_expr(arena, &vars, &instrs);
         assert!(dec.is_some(), "a decreasing measure exists");
-        let i = arena.alloc(crate::ast::Expr::Ident(
+        let i = bump.alloc(crate::ast::Expr::Ident(
             Symbol::intern("i"),
             crate::ast::Span::new(0, 0),
         ));
-        let lit9 = arena.alloc(crate::ast::Expr::Literal(
+        let lit9 = bump.alloc(crate::ast::Expr::Literal(
             crate::ast::Literal::Int(crate::ast::IntLit::Small(9)),
             crate::ast::Span::new(0, 0),
         ));
-        let expected = arena.alloc(crate::ast::Expr::BinaryOp {
+        let expected = bump.alloc(crate::ast::Expr::BinaryOp {
             left: lit9,
             op: crate::ast::BinOp::Sub,
             right: i,
@@ -3295,11 +3306,10 @@ mod tests {
         // No increasing step → no candidate.
         let no_step = vec![LoopInstr::TestLe(0, 9)];
         assert!(
-            infer_loop_decreases_expr(&arena, &vars, &no_step).is_none(),
+            infer_loop_decreases_expr(arena, &vars, &no_step).is_none(),
             "no decreasing measure without an increasing step"
         );
     }
-
     /// Regression: `while i < j { i := i + 1 }` translates the strict
     /// guard to `TestDiffLe(i, j, -1)`. The decreases inference must
     /// still produce the candidate `j - i` — an offset-0-only match used to
@@ -3307,21 +3317,24 @@ mod tests {
     /// required).
     #[test]
     fn test_infer_loop_decreases_strict_diff_guard() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(
+            crate::arena::SyncArena::new(Box::leak(Box::new(bumpalo::Bump::new()))),
+        ));
+        let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let vars = vec![Symbol::intern("i"), Symbol::intern("j")];
         // Guard `i < j` → `i - j <= -1`; body `i := i + 1`.
         let instrs = vec![LoopInstr::TestDiffLe(0, 1, -1), LoopInstr::AddVar(0, 1)];
-        let dec = infer_loop_decreases_expr(&arena, &vars, &instrs);
+        let dec = infer_loop_decreases_expr(arena, &vars, &instrs);
         assert!(dec.is_some(), "a decreasing measure exists for `i < j`");
-        let i = arena.alloc(crate::ast::Expr::Ident(
+        let i = bump.alloc(crate::ast::Expr::Ident(
             Symbol::intern("i"),
             crate::ast::Span::new(0, 0),
         ));
-        let j = arena.alloc(crate::ast::Expr::Ident(
+        let j = bump.alloc(crate::ast::Expr::Ident(
             Symbol::intern("j"),
             crate::ast::Span::new(0, 0),
         ));
-        let expected = arena.alloc(crate::ast::Expr::BinaryOp {
+        let expected = bump.alloc(crate::ast::Expr::BinaryOp {
             left: j,
             op: crate::ast::BinOp::Sub,
             right: i,
@@ -3332,31 +3345,33 @@ mod tests {
             "decreases candidate is j - i"
         );
     }
-
     /// Named generic arguments are identified by NAME, not position:
     /// `Foo<n=Int, m=Bool>` and `Foo<m=Bool, n=Int>` are the same type —
     /// the previous zip-by-index comparison rejected reordered named args.
     #[test]
     fn test_named_generic_args_unordered() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(
+            crate::arena::SyncArena::new(Box::leak(Box::new(bumpalo::Bump::new()))),
+        ));
+        let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let syms = symbols();
         let named = |n: &str, t: &'static crate::ast::Type<'static>| {
             crate::ast::GenericArg::Named(Symbol::intern(n), t.clone())
         };
         let a = generic(
-            &arena,
-            path(&arena, "Foo"),
+            &bump,
+            path(&bump, "Foo"),
             vec![
-                named("n", path(&arena, "Int")),
-                named("m", path(&arena, "Bool")),
+                named("n", path(&bump, "Int")),
+                named("m", path(&bump, "Bool")),
             ],
         );
         let b = generic(
-            &arena,
-            path(&arena, "Foo"),
+            &bump,
+            path(&bump, "Foo"),
             vec![
-                named("m", path(&arena, "Bool")),
-                named("n", path(&arena, "Int")),
+                named("m", path(&bump, "Bool")),
+                named("n", path(&bump, "Int")),
             ],
         );
         assert!(
@@ -3365,47 +3380,47 @@ mod tests {
         );
         // Different names are different types.
         let c = generic(
-            &arena,
-            path(&arena, "Foo"),
-            vec![named("n", path(&arena, "Int"))],
+            &bump,
+            path(&bump, "Foo"),
+            vec![named("n", path(&bump, "Int"))],
         );
         let d = generic(
-            &arena,
-            path(&arena, "Foo"),
-            vec![named("m", path(&arena, "Int"))],
+            &bump,
+            path(&bump, "Foo"),
+            vec![named("m", path(&bump, "Int"))],
         );
         assert!(!type_eq_ignoring_spans(c, d, &[], &syms));
         // Positional args keep their order.
         let e = generic(
-            &arena,
-            path(&arena, "Foo"),
+            &bump,
+            path(&bump, "Foo"),
             vec![crate::ast::GenericArg::Positional(
-                path(&arena, "Int").clone(),
+                path(&bump, "Int").clone(),
             )],
         );
         let f = generic(
-            &arena,
-            path(&arena, "Foo"),
+            &bump,
+            path(&bump, "Foo"),
             vec![crate::ast::GenericArg::Positional(
-                path(&arena, "Int").clone(),
+                path(&bump, "Int").clone(),
             )],
         );
         assert!(type_eq_ignoring_spans(e, f, &[], &syms));
         // Mixed positional + named (the named ones are unordered).
         let g = generic(
-            &arena,
-            path(&arena, "Foo"),
+            &bump,
+            path(&bump, "Foo"),
             vec![
-                crate::ast::GenericArg::Positional(path(&arena, "Int").clone()),
-                named("m", path(&arena, "Bool")),
+                crate::ast::GenericArg::Positional(path(&bump, "Int").clone()),
+                named("m", path(&bump, "Bool")),
             ],
         );
         let h = generic(
-            &arena,
-            path(&arena, "Foo"),
+            &bump,
+            path(&bump, "Foo"),
             vec![
-                named("m", path(&arena, "Bool")),
-                crate::ast::GenericArg::Positional(path(&arena, "Int").clone()),
+                named("m", path(&bump, "Bool")),
+                crate::ast::GenericArg::Positional(path(&bump, "Int").clone()),
             ],
         );
         assert!(type_eq_ignoring_spans(g, h, &[], &syms));

@@ -299,6 +299,15 @@ pub(crate) fn loop_instrs_to_loop_problem(
                     }
                 }
             }
+            LoopInstr::AddWrap(i, c) => {
+                // Same successor formula as AddVar, but WRAP semantics —
+                // no trap definedness is emitted (there is no trap).
+                values[*i] = ScalarExpr::Add(
+                    Box::new(values[*i].clone()),
+                    Box::new(ScalarExpr::Const(BigInt::from(*c))),
+                    ArithSem::Wrap,
+                );
+            }
             LoopInstr::AddSat(i, c) => {
                 // Saturating assignment — the transfer
                 // is `x' = clamp(x + c)`; the clamp semantics live in the
@@ -324,6 +333,21 @@ pub(crate) fn loop_instrs_to_loop_problem(
                 } else {
                     ScalarExpr::Var(*j)
                 };
+            }
+            LoopInstr::CopyAddVar(i, j, c) => {
+                // `i := j + c` — copy with constant offset. Source may be
+                // a separated param (`j >= vars.len()`); no trap (wrap
+                // semantics are total).
+                let src = if *j < vars.len() {
+                    values[*j].clone()
+                } else {
+                    ScalarExpr::Var(*j)
+                };
+                values[*i] = ScalarExpr::Add(
+                    Box::new(src),
+                    Box::new(ScalarExpr::Const(BigInt::from(*c))),
+                    ArithSem::Wrap,
+                );
             }
             LoopInstr::If(cond, then, else_) => {
                 let cond = fix_signed(cond, signed, vars.len());
@@ -457,9 +481,11 @@ pub(crate) fn separate_loop_params(
     fn mark_assigned(ins: &LoopInstr, assigned: &mut [bool]) {
         match ins {
             LoopInstr::AddVar(i, _)
+            | LoopInstr::AddWrap(i, _)
             | LoopInstr::AddSat(i, _)
             | LoopInstr::ConstVar(i, _)
-            | LoopInstr::CopyVar(i, _) => {
+            | LoopInstr::CopyVar(i, _)
+            | LoopInstr::CopyAddVar(i, _, _) => {
                 if *i < assigned.len() {
                     assigned[*i] = true;
                 }
@@ -521,9 +547,11 @@ pub(crate) fn separate_loop_params(
             LoopInstr::TestGe(i, c) => LoopInstr::TestGe(remap[*i], *c),
             LoopInstr::TestDiffLe(i, j, c) => LoopInstr::TestDiffLe(remap[*i], remap[*j], *c),
             LoopInstr::AddVar(i, c) => LoopInstr::AddVar(remap[*i], *c),
+            LoopInstr::AddWrap(i, c) => LoopInstr::AddWrap(remap[*i], *c),
             LoopInstr::AddSat(i, c) => LoopInstr::AddSat(remap[*i], *c),
             LoopInstr::ConstVar(i, c) => LoopInstr::ConstVar(remap[*i], *c),
             LoopInstr::CopyVar(i, j) => LoopInstr::CopyVar(remap[*i], remap[*j]),
+            LoopInstr::CopyAddVar(i, j, c) => LoopInstr::CopyAddVar(remap[*i], remap[*j], *c),
             // `if` blocks are remapped recursively (both arms).
             LoopInstr::If(c, then, else_) => LoopInstr::If(
                 c.clone(),
@@ -589,6 +617,27 @@ fn apply_block(
             LoopInstr::AddVar(i, c) => {
                 v[*i] = ScalarExpr::Add(
                     Box::new(v[*i].clone()),
+                    Box::new(ScalarExpr::Const(BigInt::from(*c))),
+                    ArithSem::Wrap,
+                );
+            }
+            LoopInstr::AddWrap(i, c) => {
+                // Wrap inside an `if` arm — no trap, no saturates entry.
+                v[*i] = ScalarExpr::Add(
+                    Box::new(v[*i].clone()),
+                    Box::new(ScalarExpr::Const(BigInt::from(*c))),
+                    ArithSem::Wrap,
+                );
+            }
+            LoopInstr::CopyAddVar(i, j, c) => {
+                // `i := j + c` — source may be a separated param.
+                let src = if *j < vars_len {
+                    v[*j].clone()
+                } else {
+                    ScalarExpr::Var(*j)
+                };
+                v[*i] = ScalarExpr::Add(
+                    Box::new(src),
                     Box::new(ScalarExpr::Const(BigInt::from(*c))),
                     ArithSem::Wrap,
                 );

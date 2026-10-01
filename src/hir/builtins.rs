@@ -3,6 +3,7 @@ use crate::hir::symbol::{SymbolTable, TraitBinding, TypeBinding, TypeKind};
 use crate::hir::traits::{ImplCandidate, TraitEnv};
 use crate::hir::types::{DefId, TypeContext};
 use crate::symbol::Symbol;
+use smallvec::smallvec;
 
 /// Insert a trait with no associated types into the symbol table.
 fn insert_trait<'input>(symbols: &mut SymbolTable<'input>, name: &str, def_id: &mut DefId) {
@@ -564,7 +565,7 @@ pub fn register_builtins<'input>(
     //
     //    We register a generic impl using a generic param index 0.
     let future_output_ty = ctx.generic_param(0, Symbol::intern("T"));
-    let future_for_ty = ctx.enum_ty(future_enum_def_id, vec![future_output_ty]);
+    let future_for_ty = ctx.enum_ty(future_enum_def_id, smallvec![future_output_ty]);
     if let Err(e) = trait_env.add_impl(
         ImplCandidate {
             trait_id: future_trait_id,

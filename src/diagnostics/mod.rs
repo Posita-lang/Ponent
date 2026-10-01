@@ -331,7 +331,7 @@ impl StyledString {
 /// - **Austral**: Error type categorization + multi-format output
 /// - **Vale**: Structured error variants per compiler pass
 #[derive(Debug, Clone)]
-pub struct Diagnostic {
+pub struct Diagnostic<'src> {
     level: DiagnosticLevel,
     message: String,
     code: Option<ErrCode>,
@@ -347,8 +347,10 @@ pub struct Diagnostic {
     labels: Vec<Label>,
     /// Zig-style call chain tracing how the error was reached
     call_chain: Option<CallChain>,
-    /// Retained source text for `^`-underline rendering
-    source: Option<String>,
+    /// Retained source text for `^`-underline rendering.  Borrowed from the
+    /// driver's source buffer, so attaching it to every diagnostic in a
+    /// compilation costs nothing.
+    source: Option<&'src str>,
     /// Source file name displayed in the `┌─ <input>:1:1` location header.
     file_name: String,
     /// Child diagnostics (notes, help messages attached to this diagnostic).
@@ -357,7 +359,7 @@ pub struct Diagnostic {
     related_errors: Vec<RelatedError>,
 }
 
-impl Diagnostic {
+impl<'src> Diagnostic<'src> {
     // ── Read-only accessors ─────────────────────────────────────────
     pub fn level(&self) -> DiagnosticLevel {
         self.level
@@ -409,7 +411,7 @@ impl Diagnostic {
     pub fn related_errors_mut(&mut self) -> &mut Vec<RelatedError> {
         &mut self.related_errors
     }
-    pub fn set_source(&mut self, source: Option<String>) {
+    pub fn set_source(&mut self, source: Option<&'src str>) {
         self.source = source;
     }
     pub fn set_file_name(&mut self, file_name: String) {
@@ -479,7 +481,7 @@ impl Subdiag {
     }
 }
 
-impl Diagnostic {
+impl<'src> Diagnostic<'src> {
     // ── Constructors ───────────────────────────────────────────────
 
     pub fn new(level: DiagnosticLevel, message: impl Into<String>) -> Self {
@@ -572,7 +574,7 @@ impl Diagnostic {
 
     /// Convenience: set error code by string (backward compat).
     /// Prefer `with_code(ErrCode::new(...))` for the new API.
-    pub fn with_code_str(mut self, code: impl Into<String>) -> Self {
+    pub fn with_code_str(mut self, code: impl AsRef<str>) -> Self {
         self.code = Some(ErrCode::new(code));
         self
     }
@@ -641,8 +643,11 @@ impl Diagnostic {
     }
 
     /// Attach source text for `^`-underline rendering.
-    pub fn with_source(mut self, source: impl Into<String>) -> Self {
-        self.source = Some(source.into());
+    ///
+    /// The source is borrowed from the caller (e.g. the driver's source
+    /// buffer), so no copy is made.
+    pub fn with_source(mut self, source: &'src str) -> Self {
+        self.source = Some(source);
         self
     }
 
@@ -745,14 +750,14 @@ impl Diagnostic {
     /// does not yet have them, they are copied over.  This is useful for
     /// progressively enriching a diagnostic as it passes through compiler
     /// passes (the "context augmentation" pattern inspired by Austral).
-    pub fn augment(&mut self, other: &Diagnostic) {
+    pub fn augment(&mut self, other: &Diagnostic<'src>) {
         if self.spans.first().is_none()
             && let Some(span) = other.spans.first()
         {
             self.spans = MultiSpan::new(span);
         }
         if self.source.is_none() {
-            self.source.clone_from(&other.source);
+            self.source = other.source;
         }
         if self.call_chain.is_none() {
             self.call_chain.clone_from(&other.call_chain);
@@ -805,11 +810,11 @@ impl Diagnostic {
 ///     Ok(())
 /// });
 /// ```
-pub fn adorn_with_span<T>(
-    ctxt: &mut DiagCtxt,
+pub fn adorn_with_span<'src, T>(
+    ctxt: &mut DiagCtxt<'src>,
     span: Span,
-    source: Option<&str>,
-    f: impl FnOnce(&mut DiagCtxt) -> Result<T, EmissionGuaranteed>,
+    source: Option<&'src str>,
+    f: impl FnOnce(&mut DiagCtxt<'src>) -> Result<T, EmissionGuaranteed>,
 ) -> Result<T, EmissionGuaranteed> {
     let diag_count_before = ctxt.len();
     let result = f(ctxt);
@@ -826,7 +831,7 @@ pub fn adorn_with_span<T>(
                 diag.spans = MultiSpan::new(span);
             }
             if diag.source.is_none() {
-                diag.source = source.map(|s| s.to_string());
+                diag.source = source;
             }
         }
     }
@@ -839,7 +844,7 @@ pub fn adorn_with_span<T>(
 
 // ── Display ───────────────────────────────────────────────────────
 
-impl fmt::Display for Diagnostic {
+impl fmt::Display for Diagnostic<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let code_str = self.code.as_ref().map(|c| c.code()).unwrap_or("?");
         let level_str = self.level.label().to_uppercase();
@@ -1000,7 +1005,7 @@ pub fn list_error_codes() -> String {
 
 /// Convenience function to emit diagnostics to stderr.
 /// Chooses plain or colored emitter based on the `use_color` flag.
-pub fn emit_diagnostics(diags: &[Diagnostic], use_color: bool) {
+pub fn emit_diagnostics(diags: &[Diagnostic<'_>], use_color: bool) {
     if use_color {
         let mut emitter = ColoredEmitter::new();
         emitter.emit_all(diags);
@@ -1011,8 +1016,8 @@ pub fn emit_diagnostics(diags: &[Diagnostic], use_color: bool) {
 }
 
 /// Convenience function to emit a DiagCtxt.
-pub fn emit_collector(collector: &DiagCtxt, use_color: bool) {
-    let diags: Vec<Diagnostic> = collector.iter().cloned().collect();
+pub fn emit_collector(collector: &DiagCtxt<'_>, use_color: bool) {
+    let diags: Vec<Diagnostic<'_>> = collector.iter().cloned().collect();
     emit_diagnostics(&diags, use_color);
 }
 

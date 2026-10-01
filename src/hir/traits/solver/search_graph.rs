@@ -37,6 +37,7 @@ use rustc_hash::FxHashSet as HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::mem;
+use std::sync::Arc;
 
 // ── Constants ─────────────────────────────────────────────────────
 
@@ -227,7 +228,7 @@ impl GoalKey {
     }
 }
 
-// ── Canonical goal key for infer-var-independent caching ───────────
+// ── Canonical goal key for var-independent caching ───────────
 
 /// A canonical index into the `var_values` vector of a `Response`.
 ///
@@ -279,7 +280,7 @@ pub enum CanonicalTy {
         frac_bits: u8,
     },
     Regex {
-        pattern: String,
+        pattern: Symbol,
     },
     /// Predicate kind discriminator (0 = Trait, 1 = AutoTrait, etc.).
     /// Replaces the old type-punning of `GenericParam { index: N }` as
@@ -409,9 +410,7 @@ pub fn ty_to_canonical<'input>(
             int_bits: *int_bits,
             frac_bits: *frac_bits,
         },
-        TypeData::Regex { pattern } => CanonicalTy::Regex {
-            pattern: pattern.clone(),
-        },
+        TypeData::Regex { pattern } => CanonicalTy::Regex { pattern: *pattern },
         TypeData::Adt {
             kind: _,
             def_id,
@@ -1893,6 +1892,7 @@ impl SearchGraph {
         available_depth: AvailableDepth,
     ) -> Option<CanonicalResponse> {
         let entry = self.global_cache.lookup(key)?;
+        let entry = Arc::unwrap_or_clone(entry);
         // Depth validation.
         if !available_depth.cache_entry_is_applicable(entry.required_depth) {
             return None;
@@ -1912,7 +1912,7 @@ impl SearchGraph {
 
     /// Insert a result into the global cache.
     pub fn insert_global_cache(&mut self, key: CanonicalPredicate, response: CanonicalResponse) {
-        self.global_cache.insert(key, response);
+        self.global_cache.insert(key, Arc::new(response));
     }
 
     // ── Fixpoint iteration ────────────────────────────────────────
@@ -2020,6 +2020,7 @@ mod tests {
     use super::*;
     use crate::hir::traits::solver::obligation::{ObligationCause, ObligationCauseCode, Predicate};
     use crate::hir::types::TypeContext;
+    use smallvec::smallvec;
 
     struct TestDelegate;
     impl<'input> SolverDelegate<'input> for TestDelegate {
@@ -2087,15 +2088,15 @@ mod tests {
         let gp0 = ctx.generic_param(0, "A".into());
         let gp1 = ctx.generic_param(1, "B".into());
         // ∀A B. A → B
-        let body_ab = ctx.function(vec![gp0, gp1], gp1);
+        let body_ab = ctx.function(smallvec![gp0, gp1], gp1);
         let poly_ab = ctx.alloc(TypeData::Poly {
-            quantifiers: vec![(0, a), (1, b)],
+            quantifiers: smallvec![(0, a), (1, b)],
             body: body_ab,
         });
         // ∀A B. A → A
-        let body_aa = ctx.function(vec![gp0, gp1], gp0);
+        let body_aa = ctx.function(smallvec![gp0, gp1], gp0);
         let poly_aa = ctx.alloc(TypeData::Poly {
-            quantifiers: vec![(0, a), (1, b)],
+            quantifiers: smallvec![(0, a), (1, b)],
             body: body_aa,
         });
         let c1 = ty_to_canonical(poly_ab, &ctx, &[]);
@@ -2110,9 +2111,9 @@ mod tests {
         let d = Symbol::intern("D");
         let gp2 = ctx.generic_param(2, "C".into());
         let gp3 = ctx.generic_param(3, "D".into());
-        let body_cd = ctx.function(vec![gp2, gp3], gp3);
+        let body_cd = ctx.function(smallvec![gp2, gp3], gp3);
         let poly_cd = ctx.alloc(TypeData::Poly {
-            quantifiers: vec![(2, c), (3, d)],
+            quantifiers: smallvec![(2, c), (3, d)],
             body: body_cd,
         });
         let c3 = ty_to_canonical(poly_cd, &ctx, &[]);

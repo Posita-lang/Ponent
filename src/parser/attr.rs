@@ -6,12 +6,12 @@ use crate::diagnostics::Diagnostic;
 use crate::lexer::Token;
 use crate::symbol::Symbol;
 
-impl<'input> Parser<'input> {
+impl<'src, 'input> Parser<'src, 'input> {
     // -------------------------------------------------------------------------
     // Attribute parser
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_attribute(&mut self) -> Result<Attribute<'input>, Diagnostic> {
+    pub(super) fn parse_attribute(&mut self) -> Result<Attribute<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let name = match self.advance() {

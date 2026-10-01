@@ -49,6 +49,7 @@ use crate::hir::hir::{HirExpr, HirStmt};
 use crate::hir::place::place_is_prefix_of;
 use crate::hir::types::{FrozenPlace, LoanKind, SignatureFacts, TypeData, TypeId};
 use crate::symbol::Symbol;
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 
 /// A point encoded as a plain integer (the polonius_int.dl point ids):
@@ -1425,35 +1426,83 @@ pub fn extract_facts<'input>(
     Ok((facts, infos, events))
 }
 
+/// Successor/predecessor adjacency precomputed from `PoloniusFacts::cfg_edge`.
+///
+/// Every propagation rule here joins against the edge relation.  Doing
+/// that as `for .. in &facts.cfg_edge` *inside* a fixpoint loop rescanned
+/// every edge on every round, which is what made the closures
+/// superlinear: a single body with 80 loans cost ~1.07s to check,
+/// essentially all of it re-scanning edges that had not changed.  The
+/// adjacency lists make each propagation step proportional to the
+/// neighbours actually reached, and the loops below become worklists that
+/// expand each derived fact exactly once.
+struct CfgIndex {
+    succ: FxHashMap<u64, Vec<u64>>,
+    pred: FxHashMap<u64, Vec<u64>>,
+}
+
+impl CfgIndex {
+    fn new(facts: &PoloniusFacts) -> Self {
+        let mut succ: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+        let mut pred: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+        for &(a, b) in &facts.cfg_edge {
+            succ.entry(a).or_default().push(b);
+            pred.entry(b).or_default().push(a);
+        }
+        // Duplicated edges would only make the worklist revisit the same
+        // neighbour; the `insert` guards already make that idempotent, but
+        // sorting keeps the walk small and deterministic.
+        for v in succ.values_mut().chain(pred.values_mut()) {
+            v.sort_unstable();
+            v.dedup();
+        }
+        CfgIndex { succ, pred }
+    }
+
+    fn succs(&self, p: u64) -> &[u64] {
+        self.succ.get(&p).map_or(&[], |v| v.as_slice())
+    }
+
+    fn preds(&self, p: u64) -> &[u64] {
+        self.pred.get(&p).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Every point named by an edge — the same set the old code built as
+    /// `all_points` for the placeholder fan-out.
+    fn points(&self) -> HashSet<u64> {
+        self.succ.keys().chain(self.pred.keys()).copied().collect()
+    }
+}
+
 /// The origin liveness: `var_live` (the backward closure over var_used_at
 /// and the cfg edges) + `origin_live` (via use_of_var_derefs_origin) —
 /// shared by the loan rules and the subset rules.
-fn origin_liveness(facts: &PoloniusFacts) -> HashSet<(u32, u64)> {
+fn origin_liveness(facts: &PoloniusFacts, index: &CfgIndex) -> HashSet<(u32, u64)> {
     // R3: var_live closure — var_used_at + cfg-edge propagation.
     // The rule is BACKWARD: `var_live(p1) :- var_live(p2), cfg_edge(p1, p2)`
     // — a variable live at an edge's target is also live at its source
     // (liveness flows backward against the edges, from the uses).
+    //
+    // Worklist: each pair is expanded once, walking its PREDECESSORS.
     let mut var_live: HashSet<(u32, u64)> = facts.var_used_at.iter().cloned().collect();
-    loop {
-        let mut new = HashSet::new();
-        for &(v, p1) in &var_live {
-            for &(e1, p2) in &facts.cfg_edge {
-                if p2 == p1 {
-                    new.insert((v, e1));
-                }
+    let mut stack: Vec<(u32, u64)> = facts.var_used_at.clone();
+    while let Some((v, p)) = stack.pop() {
+        for &e1 in index.preds(p) {
+            if var_live.insert((v, e1)) {
+                stack.push((v, e1));
             }
         }
-        let before = var_live.len();
-        var_live.extend(new);
-        if var_live.len() == before {
-            break;
-        }
     }
-    // origin_live_on_entry.
+    // origin_live_on_entry — indexed by variable so the join costs the
+    // origins of each live var rather than a scan of the whole relation.
+    let mut origins_of: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for &(var, origin) in &facts.use_of_var_derefs_origin {
+        origins_of.entry(var).or_default().push(origin);
+    }
     let mut origin_live: HashSet<(u32, u64)> = HashSet::new();
     for &(var, point) in &var_live {
-        for &(var2, origin) in &facts.use_of_var_derefs_origin {
-            if var2 == var {
+        if let Some(origins) = origins_of.get(&var) {
+            for &origin in origins {
                 origin_live.insert((origin, point));
             }
         }
@@ -1461,10 +1510,12 @@ fn origin_liveness(facts: &PoloniusFacts) -> HashSet<(u32, u64)> {
     // Placeholder origins (universal_region) are live at ALL points
     // (authoritative R3/R6/R7: `placeholder(Origin, _)` is a liveness
     // alternative — the pure var-use closure missed them).
-    let all_points: HashSet<u64> = facts.cfg_edge.iter().flat_map(|&(a, b)| [a, b]).collect();
-    for &origin in &facts.universal_region {
-        for &pt in &all_points {
-            origin_live.insert((origin, pt));
+    if !facts.universal_region.is_empty() {
+        let all_points = index.points();
+        for &origin in &facts.universal_region {
+            for &pt in &all_points {
+                origin_live.insert((origin, pt));
+            }
         }
     }
     // NOTE (reference-verified): the official engine's `origin_live_on_entry`
@@ -1491,113 +1542,258 @@ fn origin_liveness(facts: &PoloniusFacts) -> HashSet<(u32, u64)> {
 /// call-site integration feeds them).
 fn subset_closure(
     facts: &PoloniusFacts,
+    index: &CfgIndex,
     origin_live: &HashSet<(u32, u64)>,
-) -> HashSet<(u32, u32, u64)> {
-    let mut subset: HashSet<(u32, u32, u64)> = facts.subset_base.iter().cloned().collect();
-    loop {
-        let mut new = HashSet::new();
-        // R2: the transitive step (subset × subset — the authoritative
-        // Polonius rule `subset(A,C,P) :- subset(A,B,P), subset(B,C,P)`).
-        // Joining with `subset_base` would under-approximate the closure:
-        // a fact derived by R3 (the cfg propagation) could not participate
-        // as the right side of a transitivity step  .
-        for &(a, b, p) in &subset {
-            for &(b2, c, p2) in &subset {
-                if b == b2 && p == p2 && a != c {
-                    new.insert((a, c, p));
-                }
-            }
-        }
-        // R3: the cfg-edge propagation.
-        for &(a, b, p1) in &subset {
-            for &(e1, p2) in &facts.cfg_edge {
-                if e1 == p1 && origin_live.contains(&(a, p2)) && origin_live.contains(&(b, p2)) {
-                    new.insert((a, b, p2));
-                }
-            }
-        }
-        let before = subset.len();
-        subset.extend(new);
-        if subset.len() == before {
-            break;
+) -> (HashSet<(u32, u32, u64)>, FxHashMap<(u32, u64), Vec<u32>>) {
+    let mut subset: HashSet<(u32, u32, u64)> = HashSet::new();
+    // R2 (transitivity) needs, for a fact `(a, b, p)`, both the facts
+    // starting where it ends — `(b, c, p)` — and those ending where it
+    // starts — `(a2, a, p)`.  Indexing both sides turns the O(|subset|²)
+    // self-join into a neighbour lookup per derived fact.
+    let mut by_left: FxHashMap<(u32, u64), Vec<u32>> = FxHashMap::default();
+    let mut by_right: FxHashMap<(u32, u64), Vec<u32>> = FxHashMap::default();
+    let mut stack: Vec<(u32, u32, u64)> = Vec::new();
+    for &f @ (a, b, p) in &facts.subset_base {
+        if subset.insert(f) {
+            by_left.entry((a, p)).or_default().push(b);
+            by_right.entry((b, p)).or_default().push(a);
+            stack.push(f);
         }
     }
-    subset
+    while let Some((a, b, p1)) = stack.pop() {
+        // The derivations are collected first: the index is only appended
+        // to, but holding a borrow of it across the `insert` calls below
+        // is not something the borrow checker will accept.
+        let mut derived: Vec<(u32, u32, u64)> = Vec::new();
+        // R2: the transitive step (the authoritative Polonius rule
+        // `subset(A,C,P) :- subset(A,B,P), subset(B,C,P)`).  Joining with
+        // `subset_base` would under-approximate the closure: a fact
+        // derived by R3 (the cfg propagation) must be able to participate
+        // as the right side of a transitivity step.  A new fact is joined
+        // against everything known both to its right and to its left,
+        // which is the standard semi-naive transitive closure — every
+        // pair is joined when the later of the two is derived.
+        if let Some(cs) = by_left.get(&(b, p1)) {
+            for &c in cs {
+                if a != c && !subset.contains(&(a, c, p1)) {
+                    derived.push((a, c, p1));
+                }
+            }
+        }
+        if let Some(a2s) = by_right.get(&(a, p1)) {
+            for &a2 in a2s {
+                if a2 != b && !subset.contains(&(a2, b, p1)) {
+                    derived.push((a2, b, p1));
+                }
+            }
+        }
+        // R3: the cfg-edge propagation, both origins live at the target.
+        for &p2 in index.succs(p1) {
+            if origin_live.contains(&(a, p2))
+                && origin_live.contains(&(b, p2))
+                && !subset.contains(&(a, b, p2))
+            {
+                derived.push((a, b, p2));
+            }
+        }
+        for f @ (x, y, p) in derived {
+            if subset.insert(f) {
+                by_left.entry((x, p)).or_default().push(y);
+                by_right.entry((y, p)).or_default().push(x);
+                stack.push(f);
+            }
+        }
+    }
+    // `by_left` is returned as well: it is exactly the index R4 needs to
+    // join a loan's origin against its supersets at a point.
+    (subset, by_left)
+}
+
+/// The `origin_contains_loan_on_entry` closure (R1, R4, R5): the issued
+/// loans, the cfg-edge propagation (R5) with the origin live at the
+/// target, and the loan-via-subset propagation (R4).
+///
+/// The old form was a naive round loop: `loop { for fact in contains {
+/// for edge in cfg_edge { .. } } for fact in contains { for s in subset
+/// { .. } } }` — O(rounds x |contains| x |cfg_edge|) plus
+/// O(rounds x |contains| x |subset|).  With 80 loans in one body that was
+/// ~1s of pure re-scanning.  This is the same rules as a worklist: each
+/// derived fact is expanded exactly once, against its cfg successors and
+/// its origin's supersets.
+///
+/// NOTE: this is the UNPRUNED closure.  `evaluate_rules` used to restrict
+/// it to the `relevant` points (those that can forward-reach an
+/// INVALIDATED point).  That pruning is an optimisation, not a semantic:
+/// `relevant` is the backward closure over the edges, so a point outside
+/// it has no successor inside it, and a derivation ending at a relevant
+/// point consists only of relevant points.  Computing the full closure
+/// once therefore yields the same `errors` while also serving
+/// `loan_live_at`, and it removes the invariant that a future rule firing
+/// at a non-invalidated point would have had to extend.
+fn contains_closure(
+    facts: &PoloniusFacts,
+    index: &CfgIndex,
+    origin_live: &HashSet<(u32, u64)>,
+    subset_from: &FxHashMap<(u32, u64), Vec<u32>>,
+) -> HashSet<(u32, u32, u64)> {
+    let killed: HashSet<(u32, u64)> = facts.loan_killed_at.iter().cloned().collect();
+    let mut contains: HashSet<(u32, u32, u64)> = HashSet::new();
+    let mut stack: Vec<(u32, u32, u64)> = Vec::new();
+    for &f in &facts.loan_issued_at {
+        if contains.insert(f) {
+            stack.push(f);
+        }
+    }
+    while let Some((loan, origin, p1)) = stack.pop() {
+        // R5: `contains(L, O, P2) :- contains(L, O, P1), !killed(L, P1),
+        // cfg_edge(P1, P2), origin_live(O, P2)`.
+        if !killed.contains(&(loan, p1)) {
+            for &p2 in index.succs(p1) {
+                if origin_live.contains(&(origin, p2)) && contains.insert((loan, origin, p2)) {
+                    stack.push((loan, origin, p2));
+                }
+            }
+        }
+        // R4: `contains(L, O2, P) :- contains(L, O1, P), subset(O1, O2, P)`.
+        if let Some(supersets) = subset_from.get(&(origin, p1)) {
+            for &o2 in supersets {
+                if contains.insert((loan, o2, p1)) {
+                    stack.push((loan, o2, p1));
+                }
+            }
+        }
+    }
+    contains
+}
+
+/// One body's rules analysis — the shared prefix of every consumer of
+/// `PoloniusFacts`.
+///
+/// `rules_to_borrow_errors` needs the loan-liveness relation (E109/E112),
+/// the R8 errors (E110), the R9 subset errors (the region rule) and the
+/// drop errors (E116).  Each of those used to be a separate `pub fn` that
+/// recomputed `origin_liveness` + `subset_closure` from scratch, and the
+/// two loan closures (`evaluate_rules` pruned, `loan_live_at` unpruned)
+/// were computed separately — four closures per body where one suffices.
+/// Now they are all derived from this single analysis.
+struct Analysis {
+    subset: HashSet<(u32, u32, u64)>,
+    /// R7: `loan_live(loan, point)`.
+    loan_live: HashSet<(u32, u64)>,
+    /// The live `(loan, point)` pairs grouped by point.  Built in
+    /// `loan_live`'s own iteration order so the drop rule emits the same
+    /// pairs in the same order the old nested scan did.
+    live_at: FxHashMap<u64, Vec<u32>>,
+}
+
+impl Analysis {
+    fn new(facts: &PoloniusFacts) -> Self {
+        let index = CfgIndex::new(facts);
+        let origin_live = origin_liveness(facts, &index);
+        let (subset, subset_from) = subset_closure(facts, &index, &origin_live);
+        let contains = contains_closure(facts, &index, &origin_live, &subset_from);
+        let mut loan_live: HashSet<(u32, u64)> = HashSet::new();
+        for &(loan, origin, point) in &contains {
+            if origin_live.contains(&(origin, point)) {
+                loan_live.insert((loan, point));
+            }
+        }
+        let mut live_at: FxHashMap<u64, Vec<u32>> = FxHashMap::default();
+        for &(loan, point) in &loan_live {
+            live_at.entry(point).or_default().push(loan);
+        }
+        // `origin_live`/`subset_from` are consumed here and dropped: the
+        // rules below only need their outputs (`contains`, `subset`).
+        Analysis {
+            subset,
+            loan_live,
+            live_at,
+        }
+    }
+
+    /// R8: `errors(loan, point) :- invalidated(loan, point),
+    /// loan_live(loan, point)`.
+    fn errors(&self, facts: &PoloniusFacts) -> Vec<(u32, u64)> {
+        facts
+            .loan_invalidated_at
+            .iter()
+            .filter(|(l, p)| self.loan_live.contains(&(*l, *p)))
+            .cloned()
+            .collect()
+    }
+
+    /// R9: a subset between two placeholder origins not declared in the
+    /// signature (`known_placeholder_subset`) is rejected.
+    fn subset_errors(&self, facts: &PoloniusFacts) -> Vec<(u32, u32, u64)> {
+        let placeholder: HashSet<u32> = facts.universal_region.iter().cloned().collect();
+        // known_placeholder_subset: the transitive closure.
+        let mut known: HashSet<(u32, u32)> =
+            facts.known_placeholder_subset.iter().cloned().collect();
+        loop {
+            let mut new = HashSet::new();
+            for &(a, b) in &known {
+                for &(b2, c) in &facts.known_placeholder_subset {
+                    if b == b2 {
+                        new.insert((a, c));
+                    }
+                }
+            }
+            let before = known.len();
+            known.extend(new);
+            if known.len() == before {
+                break;
+            }
+        }
+        let mut errs = Vec::new();
+        for &(o1, o2, p) in &self.subset {
+            if o1 != o2
+                && placeholder.contains(&o1)
+                && placeholder.contains(&o2)
+                && !known.contains(&(o1, o2))
+            {
+                errs.push((o1, o2, p));
+            }
+        }
+        errs
+    }
+
+    /// The drop-while-borrowed errors: a dropped value whose loan is
+    /// still live at the drop point (the borrow outlives the value).
+    fn drop_errors(&self, facts: &PoloniusFacts) -> Vec<(u32, u64)> {
+        let mut loan_origin: HashMap<u32, u32> = HashMap::new();
+        for &(l, o, _) in &facts.loan_issued_at {
+            loan_origin.insert(l, o);
+        }
+        let mut errs = Vec::new();
+        for (v, origin) in &facts.drop_of_var_derefs_origin {
+            for &(dv, point) in &facts.var_dropped_at {
+                if dv != *v {
+                    continue;
+                }
+                let Some(loans) = self.live_at.get(&point) else {
+                    continue;
+                };
+                for &loan in loans {
+                    if loan_origin.get(&loan) == Some(origin) {
+                        errs.push((loan, point));
+                    }
+                }
+            }
+        }
+        errs
+    }
 }
 
 /// The authoritative Polonius loan rules (R1-R9 from polonius_int.dl),
 /// evaluated in process.  Returns the `errors(loan, point)` pairs.
+///
+/// NOTE: `rules_to_borrow_errors` no longer calls this — it derives every
+/// rule from one `Analysis`.  These single-rule entry points are kept as
+/// the rule engine's public surface: the oracle tests compare them
+/// against the official `polonius_engine` and against FlowLog, which is
+/// only meaningful rule by rule.
+#[allow(dead_code)]
 pub fn evaluate_rules(facts: &PoloniusFacts) -> Vec<(u32, u64)> {
-    let origin_live = origin_liveness(facts);
-    // Relevant points (the datafrog_opt pruning idea): the loan contains
-    // propagation only needs to reach the points from which an
-    // INVALIDATED point is forward-reachable — the contains at any other
-    // point can never fire an error.  Computed as the backward closure
-    // from the invalidated points along the cfg edges.
-    // PRUNING INVARIANT: `relevant` must contain EVERY
-    // point that can forward-reach an invalidated point — a future rule
-    // that fires errors at non-invalidated points must extend this set.
-    let mut relevant: HashSet<u64> = facts.loan_invalidated_at.iter().map(|(_, p)| *p).collect();
-    loop {
-        let mut new = HashSet::new();
-        for &(e1, p2) in &facts.cfg_edge {
-            if relevant.contains(&p2) {
-                new.insert(e1);
-            }
-        }
-        let before = relevant.len();
-        relevant.extend(new);
-        if relevant.len() == before {
-            break;
-        }
-    }
-    // The subset closure (R1-R3) — feeds R4 (the loan-via-subset step).
-    let subset = subset_closure(facts, &origin_live);
-    // R4-R6: origin_contains_loan_on_entry closure — issued + cfg-edge
-    // propagation (R5) with the origin live at the target + the loan
-    // propagation via the subset (R4), RESTRICTED to the relevant points
-    // (semantically identical — the loan liveness outside the relevant
-    // points cannot fire errors).
-    let mut contains: HashSet<(u32, u32, u64)> = facts
-        .loan_issued_at
-        .iter()
-        .cloned()
-        .filter(|(_, _, p)| relevant.contains(p))
-        .collect();
-    loop {
-        let mut new = HashSet::new();
-        for &(loan, origin, p1) in &contains {
-            for &(e1, p2) in &facts.cfg_edge {
-                if e1 == p1
-                    && !facts.loan_killed_at.contains(&(loan, p1))
-                    && origin_live.contains(&(origin, p2))
-                    && relevant.contains(&p2)
-                {
-                    new.insert((loan, origin, p2));
-                }
-            }
-        }
-        // R4: the loan-via-subset propagation.
-        for &(loan, origin, p) in &contains {
-            for &(s1, o2, sp) in &subset {
-                if s1 == origin && sp == p {
-                    new.insert((loan, o2, p));
-                }
-            }
-        }
-        let before = contains.len();
-        contains.extend(new);
-        if contains.len() == before {
-            break;
-        }
-    }
-    // R7: loan_live_at.
-    let mut loan_live: HashSet<(u32, u64)> = HashSet::new();
-    for &(loan, origin, point) in &contains {
-        if origin_live.contains(&(origin, point)) {
-            loan_live.insert((loan, point));
-        }
-    }
     // R8: errors(loan, point) :- invalidated(loan, point), live(loan, point).
     // The statement-level same-point exemption is GONE: the expression-
     // level points order a statement's operations (the synthetic WRITE
@@ -1605,13 +1801,7 @@ pub fn evaluate_rules(facts: &PoloniusFacts) -> Vec<(u32, u64)> {
     // index, after the value's borrows), so a same-statement
     // write-then-reborrow is decidable without it — matching the
     // official engine's pure R8.
-    let out: Vec<(u32, u64)> = facts
-        .loan_invalidated_at
-        .iter()
-        .filter(|(l, p)| loan_live.contains(&(*l, *p)))
-        .cloned()
-        .collect();
-    out
+    Analysis::new(facts).errors(facts)
 }
 
 /// The the drop-while-borrowed errors — a dropped value whose loan is
@@ -1619,26 +1809,9 @@ pub fn evaluate_rules(facts: &PoloniusFacts) -> Vec<(u32, u64)> {
 /// SEPARATE from `evaluate_rules` (the oracle-comparison baseline): the
 /// official engine has no such error rule, so mixing it in would make
 /// the differential oracle disagree.
+#[allow(dead_code)]
 pub fn evaluate_drop_errors(facts: &PoloniusFacts) -> Vec<(u32, u64)> {
-    let full_live = loan_live_at(facts);
-    let loan_origin: HashMap<u32, u32> = facts
-        .loan_issued_at
-        .iter()
-        .map(|&(l, o, _)| (l, o))
-        .collect();
-    let mut errs = Vec::new();
-    for (v, origin) in &facts.drop_of_var_derefs_origin {
-        for &(dv, point) in &facts.var_dropped_at {
-            if dv == *v {
-                for &(loan, lpt) in &full_live {
-                    if lpt == point && loan_origin.get(&loan) == Some(origin) {
-                        errs.push((loan, point));
-                    }
-                }
-            }
-        }
-    }
-    errs
+    Analysis::new(facts).drop_errors(facts)
 }
 
 /// The FULL `loan_live_at(loan, point)` relation (R4-R7, not restricted
@@ -1646,43 +1819,9 @@ pub fn evaluate_drop_errors(facts: &PoloniusFacts) -> Vec<(u32, u64)> {
 /// E112 exclusivity diagnostics (a read/mutation event at a point where
 /// an overlapping loan is live, or two loans overlapping in a live
 /// region).
+#[allow(dead_code)]
 pub fn loan_live_at(facts: &PoloniusFacts) -> HashSet<(u32, u64)> {
-    let origin_live = origin_liveness(facts);
-    let subset = subset_closure(facts, &origin_live);
-    let mut contains: HashSet<(u32, u32, u64)> = facts.loan_issued_at.iter().cloned().collect();
-    loop {
-        let mut new = HashSet::new();
-        for &(loan, origin, p1) in &contains {
-            for &(e1, p2) in &facts.cfg_edge {
-                if e1 == p1
-                    && !facts.loan_killed_at.contains(&(loan, p1))
-                    && origin_live.contains(&(origin, p2))
-                {
-                    new.insert((loan, origin, p2));
-                }
-            }
-        }
-        // R4: the loan-via-subset propagation.
-        for &(loan, origin, p) in &contains {
-            for &(s1, o2, sp) in &subset {
-                if s1 == origin && sp == p {
-                    new.insert((loan, o2, p));
-                }
-            }
-        }
-        let before = contains.len();
-        contains.extend(new);
-        if contains.len() == before {
-            break;
-        }
-    }
-    let mut loan_live: HashSet<(u32, u64)> = HashSet::new();
-    for &(loan, origin, point) in &contains {
-        if origin_live.contains(&(origin, point)) {
-            loan_live.insert((loan, point));
-        }
-    }
-    loan_live
+    Analysis::new(facts).loan_live
 }
 
 /// Run the flow-sensitive borrow check over a function body.
@@ -1783,7 +1922,13 @@ pub fn rules_to_borrow_errors(
     events: &[(FrozenPlace, Point, bool, crate::ast::Span)],
 ) -> Result<Vec<crate::hir::cfg_graph::BorrowError>, String> {
     let mut out = Vec::new();
-    let loan_live = loan_live_at(facts);
+    // ONE analysis for the whole mapping layer: the loan-liveness
+    // relation, the R8 errors, the R9 subset errors and the drop errors
+    // all read the same closures.  Building them four times (once per
+    // `pub fn` above) was four closures per body, which dominated a
+    // borrow-check on any body with a few dozen loans.
+    let analysis = Analysis::new(facts);
+    let loan_live = &analysis.loan_live;
     // The loan-ISSUANCE points: an invalidation AT a loan-issuance point
     // is a BORROW of the place (a second `&mut` argument), not a
     // mutation — the E112 exclusivity diagnostic reports it, and the
@@ -1791,7 +1936,7 @@ pub fn rules_to_borrow_errors(
     // `f(&mut a, &mut a)`, not E0506).
     let issued_points: HashSet<u64> = facts.loan_issued_at.iter().map(|(_, _, p)| *p).collect();
     // E110: the mutation-freeze (invalidated + live).
-    for (loan, point) in evaluate_rules(facts) {
+    for (loan, point) in analysis.errors(facts) {
         let Some(info) = infos.get(loan as usize) else {
             continue;
         };
@@ -1968,7 +2113,7 @@ pub fn rules_to_borrow_errors(
     // closure propagates one error PER reachable point — deduplicate
     // (one identical diagnostic per violating pair, not per point).
     let mut subset_errs: Vec<(u32, u32)> = Vec::new();
-    for (o1, o2, _p) in evaluate_subset_errors(facts) {
+    for (o1, o2, _p) in analysis.subset_errors(facts) {
         if !subset_errs.contains(&(o1, o2)) {
             subset_errs.push((o1, o2));
         }
@@ -1992,7 +2137,7 @@ pub fn rules_to_borrow_errors(
     // has no such rule — the differential oracle must not see it), but
     // the mapping layer is not oracle-compared: wire it in here so
     // the violation is actually REJECTED, not just computed.
-    for (loan, _point) in evaluate_drop_errors(facts) {
+    for (loan, _point) in analysis.drop_errors(facts) {
         let Some(info) = infos.get(loan as usize) else {
             continue;
         };
@@ -2044,44 +2189,16 @@ pub fn rules_to_borrow_errors(
 /// placeholder subset
 /// errors — a subset relation between two placeholder origins NOT
 /// declared in the signature (`known_placeholder_subset`) is rejected.
+#[allow(dead_code)]
 pub fn evaluate_subset_errors(facts: &PoloniusFacts) -> Vec<(u32, u32, u64)> {
-    let origin_live = origin_liveness(facts);
-    let subset = subset_closure(facts, &origin_live);
-    let placeholder: HashSet<u32> = facts.universal_region.iter().cloned().collect();
-    // known_placeholder_subset: the transitive closure.
-    let mut known: HashSet<(u32, u32)> = facts.known_placeholder_subset.iter().cloned().collect();
-    loop {
-        let mut new = HashSet::new();
-        for &(a, b) in &known {
-            for &(b2, c) in &facts.known_placeholder_subset {
-                if b == b2 {
-                    new.insert((a, c));
-                }
-            }
-        }
-        let before = known.len();
-        known.extend(new);
-        if known.len() == before {
-            break;
-        }
-    }
-    let mut errs = Vec::new();
-    for &(o1, o2, p) in &subset {
-        if o1 != o2
-            && placeholder.contains(&o1)
-            && placeholder.contains(&o2)
-            && !known.contains(&(o1, o2))
-        {
-            errs.push((o1, o2, p));
-        }
-    }
-    errs
+    Analysis::new(facts).subset_errors(facts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hir::checker::tests::check_source;
+    use smallvec::smallvec;
 
     fn first_body(src: &str) -> Vec<HirStmt<'static>> {
         let prog = check_source(src).expect("program must check");
@@ -2207,11 +2324,11 @@ mod tests {
         }
     }
 
-    /// Differential oracle: the OFFICIAL rustc Polonius engine
-    /// (`Algorithm::Naive`) must agree with OUR `evaluate_rules` on
-    /// accept/reject for the same bodies.  This is the strongest
-    /// validation — the official engine shares none of our CFG/liveness
-    /// infrastructure, so shared-infrastructure bugs cannot mask drift.
+    // Differential oracle: the OFFICIAL rustc Polonius engine
+    // (`Algorithm::Naive`) must agree with OUR `evaluate_rules` on
+    // accept/reject for the same bodies.  This is the strongest
+    // validation — the official engine shares none of our CFG/liveness
+    // infrastructure, so shared-infrastructure bugs cannot mask drift.
     #[test]
     fn test_oracle_official_engine_agrees() {
         // (source, expected acceptance) — OUR pass is the reference.
@@ -2338,19 +2455,19 @@ mod tests {
         }
     }
 
-    /// Differential harness (the first step of wiring the Polonius
-    /// engine into production): the handwritten flow-sensitive pass
-    /// (`borrow_check_function`) and the R1-R9 rules engine
-    /// (`evaluate_rules`) must AGREE on accept/reject for the same
-    /// bodies.  This makes drift between the two implementations
-    /// detectable instead of silent.  The handwritten pass stays the
-    /// production authority until the rules engine covers every shape
-    /// (the ancestor-clobber shape is a known gap — see the ignored
-    /// `test_polonius_ancestor_clobber_exclusion`).
+    // Differential harness (the first step of wiring the Polonius
+    // engine into production): the handwritten flow-sensitive pass
+    // (`borrow_check_function`) and the R1-R9 rules engine
+    // (`evaluate_rules`) must AGREE on accept/reject for the same
+    // bodies.  This makes drift between the two implementations
+    // detectable instead of silent.  The handwritten pass stays the
+    // production authority until the rules engine covers every shape
+    // (the ancestor-clobber shape is a known gap — see the ignored
+    // `test_polonius_ancestor_clobber_exclusion`).
     ///
-    /// Uses `check_source_keep_hir` (not `first_body`/`check_source`)
-    /// so rejected programs still yield their HIR body for the
-    /// differential run — `check_source` drops bodies on borrow errors.
+    // Uses `check_source_keep_hir` (not `first_body`/`check_source`)
+    // so rejected programs still yield their HIR body for the
+    // differential run — `check_source` drops bodies on borrow errors.
     #[test]
     fn test_differential_handwritten_vs_rules() {
         // (source, expected acceptance) — the handwritten pass is the
@@ -2423,10 +2540,10 @@ mod tests {
         }
     }
 
-    /// The cross-function extraction — `get(x: &mut T) -> &mut T`
-    /// called as `get(&mut a)` — the argument loan in the input origin +
-    /// the A(ρ) subset_base instantiation at the call point + the callee
-    /// signature facts merged.
+    // The cross-function extraction — `get(x: &mut T) -> &mut T`
+    // called as `get(&mut a)` — the argument loan in the input origin +
+    // the A(ρ) subset_base instantiation at the call point + the callee
+    // signature facts merged.
     #[test]
     fn test_extract_cross_function() {
         // The get signature: x: &mut T (position 0) + the return borrow.
@@ -2479,11 +2596,11 @@ mod tests {
         );
     }
 
-    /// The cross-function wiring — the ENGINE (not just the fact
-    /// extraction) must detect the cross-function returned-borrow freeze:
-    /// `get(&mut a)` instantiates the callee's A(ρ) subset at the call
-    /// point (`subset_base`), so a mutation of `a` while the returned
-    /// borrow `r` is live must be rejected by `evaluate_rules`.
+    // The cross-function wiring — the ENGINE (not just the fact
+    // extraction) must detect the cross-function returned-borrow freeze:
+    // `get(&mut a)` instantiates the callee's A(ρ) subset at the call
+    // point (`subset_base`), so a mutation of `a` while the returned
+    // borrow `r` is live must be rejected by `evaluate_rules`.
     #[test]
     fn test_cross_function_rules_detection() {
         let sig = signature_facts(
@@ -2535,11 +2652,11 @@ mod tests {
         );
     }
 
-    /// Soundness direction: on programs the borrow checker ACCEPTS, the
-    /// authoritative Polonius rules must also find NO errors (no false
-    /// positives).  (The error direction needs a diagnostics-returning
-    /// checker hook — the post-pass's errors are what rejects programs, so
-    /// check_source drops their bodies; documented as a follow-up.)
+    // Soundness direction: on programs the borrow checker ACCEPTS, the
+    // authoritative Polonius rules must also find NO errors (no false
+    // positives).  (The error direction needs a diagnostics-returning
+    // checker hook — the post-pass's errors are what rejects programs, so
+    // check_source drops their bodies; documented as a follow-up.)
     #[test]
     fn test_polonius_equivalence_accepted() {
         for src in [
@@ -2583,8 +2700,8 @@ mod tests {
         }
     }
 
-    /// The CSV writer produces the polonius_int.dl input schema: all 17
-    /// input files exist, and the populated relations are non-empty.
+    // The CSV writer produces the polonius_int.dl input schema: all 17
+    // input files exist, and the populated relations are non-empty.
     #[test]
     fn test_write_facts_csv() {
         let body = first_body(
@@ -2689,6 +2806,33 @@ mod tests {
                 .expect("facts");
                 let self_errs = super::evaluate_rules(&facts).len();
                 let self_time = t0.elapsed();
+                // FlowLog engine only supports int32 — point IDs are
+                // 56-bit (block<<36 | stmt<<16 | expr), so they overflow
+                // for non-trivial CFGs.  Skip the flowlog comparison when
+                // any point exceeds i32 range; the self-evaluator above is
+                // the authoritative borrow-check result.
+                let max_point = i32::MAX as u64;
+                let point_too_large = facts
+                    .cfg_edge
+                    .iter()
+                    .any(|&(a, b)| a > max_point || b > max_point)
+                    || facts.loan_issued_at.iter().any(|&(_, _, p)| p > max_point)
+                    || facts.loan_killed_at.iter().any(|&(_, p)| p > max_point)
+                    || facts.var_used_at.iter().any(|&(_, p)| p > max_point)
+                    || facts.subset_base.iter().any(|&(_, _, p)| p > max_point)
+                    || facts
+                        .loan_invalidated_at
+                        .iter()
+                        .any(|&(_, p)| p > max_point)
+                    || facts.var_defined_at.iter().any(|&(_, p)| p > max_point)
+                    || facts.var_dropped_at.iter().any(|&(_, p)| p > max_point);
+                if point_too_large {
+                    eprintln!(
+                        "bench_self_vs_flowlog: skipping flowlog for loans={loans} points={points} \
+                         (point ID exceeds i32 range — the upstream polonius_int.dl uses int32)",
+                    );
+                    continue;
+                }
                 // FlowLog library mode: feed all input relations, run.
                 let t1 = Instant::now();
                 let mut engine = DatalogBatchEngine::new(1);
@@ -2696,14 +2840,14 @@ mod tests {
                     facts
                         .cfg_edge
                         .iter()
-                        .map(|&(a, b)| (a as i64, b as i64))
+                        .map(|&(a, b)| (a as i32, b as i32))
                         .collect(),
                 );
                 engine.insert_loan_issued_at(
                     facts
                         .loan_issued_at
                         .iter()
-                        .map(|&(loan, origin, point)| (origin as i32, loan as i32, point as i64))
+                        .map(|&(loan, origin, point)| (origin as i32, loan as i32, point as i32))
                         .collect(),
                 );
                 engine.insert_universal_region(
@@ -2717,28 +2861,28 @@ mod tests {
                     facts
                         .loan_killed_at
                         .iter()
-                        .map(|&(l, p)| (l as i32, p as i64))
+                        .map(|&(l, p)| (l as i32, p as i32))
                         .collect(),
                 );
                 engine.insert_subset_base(
                     facts
                         .subset_base
                         .iter()
-                        .map(|&(a, b, c)| (a as i32, b as i32, c as i64))
+                        .map(|&(a, b, c)| (a as i32, b as i32, c as i32))
                         .collect(),
                 );
                 engine.insert_loan_invalidated_at(
                     facts
                         .loan_invalidated_at
                         .iter()
-                        .map(|&(l, p)| (l as i32, p as i64))
+                        .map(|&(l, p)| (l as i32, p as i32))
                         .collect(),
                 );
                 engine.insert_var_used_at(
                     facts
                         .var_used_at
                         .iter()
-                        .map(|&(v, p)| (v as i32, p as i64))
+                        .map(|&(v, p)| (v as i32, p as i32))
                         .collect(),
                 );
                 engine.insert_use_of_var_derefs_origin(
@@ -2759,14 +2903,14 @@ mod tests {
                     facts
                         .var_defined_at
                         .iter()
-                        .map(|&(v, p)| (v as i32, p as i64))
+                        .map(|&(v, p)| (v as i32, p as i32))
                         .collect(),
                 );
                 engine.insert_var_dropped_at(
                     facts
                         .var_dropped_at
                         .iter()
-                        .map(|&(v, p)| (v as i32, p as i64))
+                        .map(|&(v, p)| (v as i32, p as i32))
                         .collect(),
                 );
                 engine.insert_drop_of_var_derefs_origin(
@@ -2822,10 +2966,10 @@ mod tests {
         }
     }
 
-    /// The external FlowLog engine (when available) must agree with the
-    /// in-process evaluator — no errors on accepted programs.  If FlowLog
-    /// is unavailable, the runner returns None and the test passes
-    /// gracefully (the in-process evaluator already validated the rules).
+    // The external FlowLog engine (when available) must agree with the
+    // in-process evaluator — no errors on accepted programs.  If FlowLog
+    // is unavailable, the runner returns None and the test passes
+    // gracefully (the in-process evaluator already validated the rules).
     #[test]
     fn test_flowlog_runner_equivalence() {
         let body = first_body(
@@ -2858,10 +3002,10 @@ mod tests {
         }
     }
 
-    /// Error direction: a program the post-pass REJECTS — the
-    /// authoritative Polonius rules must ALSO find the violation (no false
-    /// negatives).  Uses `check_source_keep_hir` (the post-pass's
-    /// diagnostics reject the program, but the HIR body is kept).
+    // Error direction: a program the post-pass REJECTS — the
+    // authoritative Polonius rules must ALSO find the violation (no false
+    // negatives).  Uses `check_source_keep_hir` (the post-pass's
+    // diagnostics reject the program, but the HIR body is kept).
     #[test]
     fn test_polonius_equivalence_rejected() {
         let (prog, diags) = crate::hir::checker::tests::check_source_keep_hir(
@@ -2899,10 +3043,10 @@ mod tests {
         }
     }
 
-    /// The diagnostic mapping layer — a rejected program must yield
-    /// user-facing `BorrowError`s (E110 mutation-freeze) carrying the
-    /// loan's place/kind/span, so the engine can drive diagnostics
-    /// directly (the bridge to replacing the handwritten pass).
+    // The diagnostic mapping layer — a rejected program must yield
+    // user-facing `BorrowError`s (E110 mutation-freeze) carrying the
+    // loan's place/kind/span, so the engine can drive diagnostics
+    // directly (the bridge to replacing the handwritten pass).
     #[test]
     fn test_rules_to_borrow_errors_mapping() {
         let (prog, diags) = crate::hir::checker::tests::check_source_keep_hir(
@@ -3131,8 +3275,8 @@ mod tests {
         );
     }
 
-    /// The E112 exclusivity mapping — two overlapping loans with one
-    /// live at the other's issuance must surface as `is_exclusive`.
+    // The E112 exclusivity mapping — two overlapping loans with one
+    // live at the other's issuance must surface as `is_exclusive`.
     #[test]
     fn test_mapping_e112_exclusivity() {
         let (prog, diags) = crate::hir::checker::tests::check_source_keep_hir(
@@ -3169,15 +3313,15 @@ mod tests {
         );
     }
 
-    /// The AncestorClobber divergence: a loan on `p.y`
-    /// survives an ancestor clobber `p = ...` — the primary checker does
-    /// NOT kill it (Field/Index exclusion) — so the later use through the
-    /// loan is rejected.  The Polonius extractor must mirror that
-    /// exclusion, and the R1-R9 rules must now also detect the violation
-    /// (previously `evaluate_rules` returned no error for this shape —
-    /// the borrow-variable binding was lost when the HIR wrapped the
-    /// borrow in an `Index`/`TypeAnnotated` node, so the loan degraded
-    /// to a temporary with no liveness connection).
+    // The AncestorClobber divergence: a loan on `p.y`
+    // survives an ancestor clobber `p = ...` — the primary checker does
+    // NOT kill it (Field/Index exclusion) — so the later use through the
+    // loan is rejected.  The Polonius extractor must mirror that
+    // exclusion, and the R1-R9 rules must now also detect the violation
+    // (previously `evaluate_rules` returned no error for this shape —
+    // the borrow-variable binding was lost when the HIR wrapped the
+    // borrow in an `Index`/`TypeAnnotated` node, so the loan degraded
+    // to a temporary with no liveness connection).
     #[test]
     fn test_polonius_ancestor_clobber_exclusion() {
         let (prog, diags) = crate::hir::checker::tests::check_source_keep_hir(
@@ -3224,9 +3368,9 @@ mod tests {
         );
     }
 
-    /// The A(ρ) signature facts — `fn get(x: &mut T) -> &mut T` —
-    /// `universal_region(x)` + `subset_base(x, output)`: the output borrow
-    /// alive ⟹ the input borrow considered alive.
+    // The A(ρ) signature facts — `fn get(x: &mut T) -> &mut T` —
+    // `universal_region(x)` + `subset_base(x, output)`: the output borrow
+    // alive ⟹ the input borrow considered alive.
     #[test]
     fn test_signature_facts_borrow_return() {
         let sig = BorrowSignature {
@@ -3247,7 +3391,7 @@ mod tests {
         );
     }
 
-    /// A signature without borrows produces no facts.
+    // A signature without borrows produces no facts.
     #[test]
     fn test_signature_facts_no_borrows() {
         let facts = signature_facts(&BorrowSignature::default(), &[]);
@@ -3255,10 +3399,10 @@ mod tests {
         assert!(facts.known_placeholder_subset.is_empty());
     }
 
-    /// A function with TWO input borrows
-    /// where the output derives from `x` only — `y` is NOT constrained
-    /// (the conservative all-pairs encoding would wrongly freeze `y` while
-    /// the output is alive).
+    // A function with TWO input borrows
+    // where the output derives from `x` only — `y` is NOT constrained
+    // (the conservative all-pairs encoding would wrongly freeze `y` while
+    // the output is alive).
     #[test]
     fn test_signature_facts_derivation_precision() {
         let sig = BorrowSignature {
@@ -3280,8 +3424,8 @@ mod tests {
         );
     }
 
-    /// The output-derivation analysis — `return x` derives from the
-    /// `x` parameter; a local borrow return derives from nothing.
+    // The output-derivation analysis — `return x` derives from the
+    // `x` parameter; a local borrow return derives from nothing.
     #[test]
     fn test_derive_output_origins() {
         let body = first_body(
@@ -3324,13 +3468,12 @@ mod tests {
         );
     }
 
-    /// The borrow signature extraction with the injected reference
-    /// resolution.
-    #[test]
-    /// The multi-output extraction: TWO reference returns (`__ret0`,
-    /// `__ret1`) must each register its own output origin and its own
-    /// A(ρ) subset from every deriving input — the tuple/struct-return
-    /// shape is no longer collapsed to a single output.
+    // The borrow signature extraction with the injected reference
+    // resolution.
+    // The multi-output extraction: TWO reference returns (`__ret0`,
+    // `__ret1`) must each register its own output origin and its own
+    // A(ρ) subset from every deriving input — the tuple/struct-return
+    // shape is no longer collapsed to a single output.
     #[test]
     fn test_extract_borrow_signature_multi_output() {
         let sig = extract_borrow_signature(
@@ -3359,8 +3502,8 @@ mod tests {
         }
     }
 
-    /// The recursive return-type counting: a tuple of two references
-    /// counts 2; a struct field reference counts via the ADT definition.
+    // The recursive return-type counting: a tuple of two references
+    // counts 2; a struct field reference counts via the ADT definition.
     #[test]
     fn test_count_return_refs_recursive() {
         use crate::ast::{Span, Type};
@@ -3386,10 +3529,10 @@ mod tests {
         );
     }
 
-    /// The EARLY-BOUND mapping: two inputs with the SAME explicit
-    /// lifetime (`&'a mut T` and `&'a T`) share ONE placeholder origin —
-    /// the rustc `UniversalRegions` early-bound region analog.  The
-    /// elided-lifetime case (all `None`) keeps one origin per input.
+    // The EARLY-BOUND mapping: two inputs with the SAME explicit
+    // lifetime (`&'a mut T` and `&'a T`) share ONE placeholder origin —
+    // the rustc `UniversalRegions` early-bound region analog.  The
+    // elided-lifetime case (all `None`) keeps one origin per input.
     #[test]
     fn test_shared_lifetime_same_origin() {
         let a = Symbol::intern("a");
@@ -3414,10 +3557,10 @@ mod tests {
         );
     }
 
-    /// The ADT generic-parameter substitution: a struct field `a: T`
-    /// whose arg is a reference must count as an output (the
-    /// `count_return_refs` Adt branch substitutes GenericParam with the
-    /// concrete args).
+    // The ADT generic-parameter substitution: a struct field `a: T`
+    // whose arg is a reference must count as an output (the
+    // `count_return_refs` Adt branch substitutes GenericParam with the
+    // concrete args).
     #[test]
     fn test_count_return_refs_adt_generic() {
         // Build a TypeContext with a struct `S { a: T }` where T is bound
@@ -3439,7 +3582,7 @@ mod tests {
         let s_id = ctx.alloc(crate::hir::types::TypeData::Adt {
             kind: crate::hir::types::AdtKind::Struct,
             def_id: crate::hir::types::DefId(1),
-            args: vec![ref_id],
+            args: smallvec![ref_id],
         });
         ctx.register_adt(crate::hir::types::DefId(1), s_def);
         assert_eq!(
@@ -3449,12 +3592,12 @@ mod tests {
         );
     }
 
-    /// A reborrow-kill regression guard: the reborrow-kill (`r = r2` —
-    /// an assignment to the
-    /// borrow VARIABLE kills the OLD loan).  The kills vector was
-    /// previously dropped in `extract_facts`, so the old source stayed
-    /// frozen past the reborrow (a false positive).  After the fix, the
-    /// old loan is dead at the reassignment and the source is writable.
+    // A reborrow-kill regression guard: the reborrow-kill (`r = r2` —
+    // an assignment to the
+    // borrow VARIABLE kills the OLD loan).  The kills vector was
+    // previously dropped in `extract_facts`, so the old source stayed
+    // frozen past the reborrow (a false positive).  After the fix, the
+    // old loan is dead at the reassignment and the source is writable.
     #[test]
     fn test_reborrow_kill_engine_path() {
         let (prog, _) = crate::hir::checker::tests::check_source_keep_hir(
@@ -3496,10 +3639,10 @@ mod tests {
         );
     }
 
-    /// TPB (Two-Phase Borrow) unit: a method-call receiver loan marked
-    /// `two_phase` must NOT freeze a READ at its own issuance point — the
-    /// argument evaluation (`v.push(v.len())` reads `v` during the
-    /// reservation).  Without the flag, the same read fires E109.
+    // TPB (Two-Phase Borrow) unit: a method-call receiver loan marked
+    // `two_phase` must NOT freeze a READ at its own issuance point — the
+    // argument evaluation (`v.push(v.len())` reads `v` during the
+    // reservation).  Without the flag, the same read fires E109.
     #[test]
     fn test_two_phase_reserved_read_exempt() {
         use crate::hir::cfg_graph::Point as CfgPoint;
@@ -3548,13 +3691,13 @@ mod tests {
         );
     }
 
-    /// The METHOD-CALL RECEIVER loan end-to-end: `obj.put(5)` (a
-    /// `&mut self` method) — the receiver place `obj` must be collected
-    /// as a two-phase receiver by `collect_method_receiver_places` (the
-    /// TPB marking input).  The receiver LOAN itself is issued on the
-    /// cross-function path (`extract_cross_function`, where the method
-    /// signature registry provides the receiver mutability); plain
-    /// `extract_facts` has no registry and issues no receiver loan.
+    // The METHOD-CALL RECEIVER loan end-to-end: `obj.put(5)` (a
+    // `&mut self` method) — the receiver place `obj` must be collected
+    // as a two-phase receiver by `collect_method_receiver_places` (the
+    // TPB marking input).  The receiver LOAN itself is issued on the
+    // cross-function path (`extract_cross_function`, where the method
+    // signature registry provides the receiver mutability); plain
+    // `extract_facts` has no registry and issues no receiver loan.
     #[test]
     fn test_method_receiver_loan_two_phase() {
         let (prog, _) = crate::hir::checker::tests::check_source_keep_hir(
@@ -3589,10 +3732,10 @@ mod tests {
         );
     }
 
-    /// The drop-while-borrowed — a dropped value whose origin still
-    /// carries a LIVE loan must fire an error (the borrow outlives the
-    /// value).  The `drop_of_var_derefs_origin` facts were extracted but
-    /// previously had NO rule consuming them.
+    // The drop-while-borrowed — a dropped value whose origin still
+    // carries a LIVE loan must fire an error (the borrow outlives the
+    // value).  The `drop_of_var_derefs_origin` facts were extracted but
+    // previously had NO rule consuming them.
     #[test]
     fn test_drop_while_borrowed() {
         let facts = PoloniusFacts {
@@ -3636,11 +3779,11 @@ mod tests {
         assert!(sig2.output_borrows.is_empty());
     }
 
-    /// The A(ρ) subset semantics — an input loan (issued in the
-    /// universal input origin 0) propagates to the output origin 1 (R4 via
-    /// `subset_base(0, 1, _)`), so it stays live wherever the OUTPUT
-    /// origin is live — the input source stays frozen while the returned
-    /// borrow is alive.
+    // The A(ρ) subset semantics — an input loan (issued in the
+    // universal input origin 0) propagates to the output origin 1 (R4 via
+    // `subset_base(0, 1, _)`), so it stays live wherever the OUTPUT
+    // origin is live — the input source stays frozen while the returned
+    // borrow is alive.
     #[test]
     fn test_subset_arho_propagation() {
         let facts = PoloniusFacts {
@@ -3669,9 +3812,9 @@ mod tests {
         assert!(evaluate_subset_errors(&facts).is_empty());
     }
 
-    /// The subset-rejection case: a subset relation between two
-    /// placeholder origins NOT declared in the signature fires the R9
-    /// subset_errors.
+    // The subset-rejection case: a subset relation between two
+    // placeholder origins NOT declared in the signature fires the R9
+    // subset_errors.
     #[test]
     fn test_subset_errors_r9() {
         let facts = PoloniusFacts {
@@ -3687,10 +3830,10 @@ mod tests {
         );
     }
 
-    /// R9 wiring verification: an undeclared placeholder subset must
-    /// surface through `rules_to_borrow_errors` as an E115 borrow error
-    /// (the `Root("<region>")` marker that the diagnostic maps to
-    /// "region subset not declared in signature").
+    // R9 wiring verification: an undeclared placeholder subset must
+    // surface through `rules_to_borrow_errors` as an E115 borrow error
+    // (the `Root("<region>")` marker that the diagnostic maps to
+    // "region subset not declared in signature").
     #[test]
     fn test_r9_wired_into_borrow_errors() {
         let facts = PoloniusFacts {
@@ -3715,10 +3858,10 @@ mod tests {
         );
     }
 
-    /// E116 wiring verification: a dropped value whose loan is still live
-    /// at the drop point must surface through `rules_to_borrow_errors` as
-    /// a `is_drop` borrow error (the marker `borrow_error_diagnostic`
-    /// maps to "cannot drop a value while its borrow is still live").
+    // E116 wiring verification: a dropped value whose loan is still live
+    // at the drop point must surface through `rules_to_borrow_errors` as
+    // a `is_drop` borrow error (the marker `borrow_error_diagnostic`
+    // maps to "cannot drop a value while its borrow is still live").
     #[test]
     fn test_drop_errors_wired_into_borrow_errors() {
         let facts = PoloniusFacts {
@@ -3764,9 +3907,9 @@ mod tests {
         );
     }
 
-    /// The dedup pass: multiple violation points for the SAME loan must
-    /// collapse into ONE identical diagnostic (a loan invalidated at
-    /// several points would otherwise spam the same E110 message).
+    // The dedup pass: multiple violation points for the SAME loan must
+    // collapse into ONE identical diagnostic (a loan invalidated at
+    // several points would otherwise spam the same E110 message).
     #[test]
     fn test_borrow_errors_dedup() {
         let facts = PoloniusFacts {
@@ -3804,8 +3947,8 @@ mod tests {
         );
     }
 
-    /// `loan_killed_at`: a loan KILLED before its invalidated point is NOT
-    /// live there — no error (the R5 `!loan_killed_at` condition).
+    // `loan_killed_at`: a loan KILLED before its invalidated point is NOT
+    // live there — no error (the R5 `!loan_killed_at` condition).
     #[test]
     fn test_loan_killed_semantics() {
         // The statement-level points (16-aligned, matching the CFG
@@ -3826,10 +3969,10 @@ mod tests {
         );
     }
 
-    /// The call-site instantiation — `get(&mut a)` with the A(ρ)
-    /// relation (input 0 → output 1): the argument loan issued in the
-    /// input origin 0 at the call point + the `subset_base(0, 1, point)`
-    /// instantiation.
+    // The call-site instantiation — `get(&mut a)` with the A(ρ)
+    // relation (input 0 → output 1): the argument loan issued in the
+    // input origin 0 at the call point + the `subset_base(0, 1, point)`
+    // instantiation.
     #[test]
     fn test_call_site_facts() {
         let (loans, subset) = call_site_facts(&[0], 7, &[(0, 1)], 0);
@@ -3849,10 +3992,10 @@ mod tests {
         assert!(subset2.is_empty());
     }
 
-    /// The full A(ρ) cross-function scenario — `get(&mut a); *r = 10;
-    /// a = 5;` — the input loan (of `a`) propagates to the output origin
-    /// (R4 via the call-site `subset_base` instantiation), so mutating `a`
-    /// while the returned borrow `r` is alive is an error.
+    // The full A(ρ) cross-function scenario — `get(&mut a); *r = 10;
+    // a = 5;` — the input loan (of `a`) propagates to the output origin
+    // (R4 via the call-site `subset_base` instantiation), so mutating `a`
+    // while the returned borrow `r` is alive is an error.
     #[test]
     fn test_cross_function_arho_scenario() {
         // Signature facts: get(x: &mut T) -> &mut T — universal_region [0],

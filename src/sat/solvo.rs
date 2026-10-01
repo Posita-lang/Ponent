@@ -807,8 +807,8 @@ impl Solver {
                 // Determine which watched literal is ¬lit.
                 let w0_lit = clause.lits[clause.watched[0]];
                 let w1_lit = clause.lits[clause.watched[1]];
-                let is_w0 = (w0_lit == lit_neg(lit));
-                let is_w1 = (w1_lit == lit_neg(lit));
+                let is_w0 = w0_lit == lit_neg(lit);
+                let is_w1 = w1_lit == lit_neg(lit);
 
                 if !is_w0 && !is_w1 {
                     // This clause doesn't actually watch ¬lit (stale entry).

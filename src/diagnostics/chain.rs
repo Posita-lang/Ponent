@@ -1,4 +1,5 @@
 use crate::ast::Span;
+use std::fmt::Write;
 
 /// A single entry in a call/reference chain (Zig-style `referenced by`).
 #[derive(Debug, Clone)]
@@ -81,20 +82,17 @@ impl CallChain {
         let mut out = String::new();
         let header = "referenced by:";
         if use_color {
-            out.push_str(&format!("\x1b[36m{}\x1b[0m\n", header));
+            let _ = writeln!(out, "\x1b[36m{}\x1b[0m", header);
         } else {
-            out.push_str(&format!("{}\n", header));
+            let _ = writeln!(out, "{header}");
         }
 
         for entry in &self.entries {
             let label = entry.kind.as_str();
             if use_color {
-                out.push_str(&format!(
-                    "    \x1b[34m{}\x1b[0m: {}\n",
-                    entry.message, label
-                ));
+                let _ = writeln!(out, "    \x1b[34m{}\x1b[0m: {}", entry.message, label);
             } else {
-                out.push_str(&format!("    {}: {}\n", entry.message, label));
+                let _ = writeln!(out, "    {}: {label}", entry.message);
             }
         }
 

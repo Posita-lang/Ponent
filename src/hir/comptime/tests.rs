@@ -14,8 +14,8 @@ fn make_int<'input>(n: i128) -> HirExpr<'input> {
 
 /// Insert a comptime variable into the evaluator with a unique slot.
 /// Used in tests that need to set up variable state before evaluation.
-fn insert_var<'a, 'input>(
-    ec: &mut ComptimeEvalContext<'a, 'input>,
+fn insert_var<'a, 'src, 'input>(
+    ec: &mut ComptimeEvalContext<'a, 'src, 'input>,
     name: &str,
     val: ComptimeValue<'input>,
 ) {
@@ -26,8 +26,8 @@ fn insert_var<'a, 'input>(
 
 /// Look up a comptime variable by name via the slot mapping.
 /// Returns `None` if the variable doesn't exist in the current scope.
-fn get_var<'a, 'input>(
-    ec: &'a ComptimeEvalContext<'a, 'input>,
+fn get_var<'a, 'src, 'input>(
+    ec: &'a ComptimeEvalContext<'a, 'src, 'input>,
     name: &str,
 ) -> Option<&'a ComptimeValue<'input>> {
     ec.cur_slot

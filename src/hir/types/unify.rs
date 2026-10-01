@@ -12,22 +12,55 @@ impl<'input> TypeContext<'input> {
         b: TypeId,
         span: crate::ast::Span,
     ) -> Result<TypeId, TypeError> {
-        let prev = self.current_unify_span.replace(Some(span));
+        let prev = std::mem::replace(&mut self.current_unify_span, Some(span));
         let r = self.unify(a, b);
-        *self.current_unify_span.borrow_mut() = prev;
+        self.current_unify_span = prev;
         r
     }
 
     #[must_use]
     pub fn unify(&mut self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
         // FIX: binder scope — clear stack at top-level entry.
-        self.binder_stack.borrow_mut().clear();
+        self.binder_stack.clear();
 
         // ── Transaction: capture current bindings for rollback ──
         self.begin_transaction();
 
         // Clear the seen-set before each top-level unification.
-        self.unify_seen.borrow_mut().clear();
+        self.unify_seen.clear();
+
+        // @auto_ro / @auto_coerce: coerce `&mut U → &U` at the CallSite
+        // entry point ONLY — never inside the symmetric unifier.  The
+        // recursion passes `coercion_depth + 1` so this fires exactly once.
+        // `resolve_binding` is required before `self.get()`: without it,
+        // bound InferVars return `InferVar` from `get()` and the pattern
+        // match fails silently, skipping the coercion entirely.
+        let resolved_a = self.resolve_binding_compressed(a);
+        let resolved_b = self.resolve_binding_compressed(b);
+        let (a, b) =
+            if CoercionContext::from_u8(self.current_coercion_ctx.load(AtomicOrdering::Relaxed))
+                == CoercionContext::CallSite
+                && (self.auto_ro || self.auto_coerce)
+                && let TypeData::Ref {
+                    ty: t_a,
+                    mutable: m_a,
+                    lifetime: l_a,
+                    ..
+                } = self.get(resolved_a)
+                && let TypeData::Ref {
+                    ty: t_b,
+                    mutable: m_b,
+                    lifetime: l_b,
+                    ..
+                } = self.get(resolved_b)
+                && !*m_a
+                && *m_b
+            {
+                let b_coerced = self.reference_with_lifetime(*t_b, false, *l_b);
+                (a, b_coerced)
+            } else {
+                (a, b)
+            };
 
         let result = self.unify_internal(a, b, Variance::Invariant, None, 0);
 
@@ -66,23 +99,311 @@ impl<'input> TypeContext<'input> {
         region_tree: Option<&crate::hir::infer::InferRegionTree>,
     ) -> Result<TypeId, TypeError> {
         // FIX: binder scope — clear stack at top-level entry.
-        self.binder_stack.borrow_mut().clear();
-        self.unify_seen.borrow_mut().clear();
+        self.binder_stack.clear();
+        self.unify_seen.clear();
         self.unify_internal(a, b, Variance::Invariant, region_tree, 0)
     }
+    /// Stage 5a (Pistone & Tranchini roadmap): structural unification
+    /// fallback — canonical-form (βη) equivalence query.
+    ///
+    /// When `try_unify`/`can_unify` fails structurally, the types may still
+    /// be Yoneda/βη-isomorphic (e.g. `∀X.(A⇒X)⇒B ≡ B[A/X]`).  This pure
+    /// query lowers both sides to canonical trees (`canonical::to_neg`) and
+    /// compares them — the paper's decidability boundary applies: sound for
+    /// the κ≤0 fragment (decidable βη theory), a *one-sided approximation*
+    /// in the κ≤1 fragment (μ/ν present ⇒ βη axiomatization incomplete).
+    ///
+    /// **Gated**: returns `None` when the compilation unit has broken
+    /// parametricity (`dyn Trait` reification) — equivalence-strength
+    /// consumers must treat `None` as "unknown" and keep the conservative
+    /// answer (fail-closed).  Diagnostics-only callers can use
+    /// `neg_beta_eta_equiv` directly.
+    pub fn yoneda_equiv_check(&mut self, a: TypeId, b: TypeId) -> Option<bool> {
+        self.parametricity.equivalence_allowed()?;
+        Some(self.neg_beta_eta_equiv(a, b))
+    }
+
     /// Pure query: can `a` and `b` be unified?  Returns `true`/`false`
     /// without mutating the global unification state.  Uses a temporary
     /// transaction internally to discard any side effects.
     pub fn can_unify(&mut self, a: TypeId, b: TypeId) -> bool {
         // FIX: binder scope — clear stack at top-level entry.
-        self.binder_stack.borrow_mut().clear();
+        self.binder_stack.clear();
         self.begin_transaction();
-        let saved_seen = self.unify_seen.borrow().clone();
-        self.unify_seen.borrow_mut().clear();
+        let saved_seen = self.unify_seen.clone();
+        self.unify_seen.clear();
         let result = self.unify_internal(a, b, Variance::Invariant, None, 0);
-        *self.unify_seen.borrow_mut() = saved_seen;
+        *&mut self.unify_seen = saved_seen;
         self.rollback_transaction();
         result.is_ok()
+    }
+
+    /// Biased unification for GADT type refinement (Peyton Jones et al.
+    /// PLDI'06 §6.4).  Like `unify`, but respects the rigidity distinction
+    /// between user-specified (rigid) and inferred (wobbly) types:
+    ///
+    /// - **Rigid vs Rigid**: both types are user-specified.  Unification
+    ///   proceeds normally (strict equality check).  A mismatch is a
+    ///   genuine type error.
+    ///
+    /// - **Rigid vs Wobbly**: the rigid type is user-committed; the wobbly
+    ///   type is an unconstrained inference variable.  The wobbly variable
+    ///   is BOUND to the rigid type (not an equality constraint).  This is
+    ///   the "bias" — the rigid type wins.
+    ///
+    /// - **Wobbly vs Wobbly**: both are inference variables.  An equality
+    ///   constraint is created (standard MGU behavior).
+    ///
+    /// This prevents unsound refinement of inferred types: a GADT `when`
+    /// constraint that refines a fresh inference variable to a concrete
+    /// type produces a binding (`?a := Int<32>`), not an equality
+    /// constraint that could later be rolled back or conflict.
+    ///
+    /// # Arguments
+    /// * `a` - The first type (typically the scrutinee's type argument)
+    /// * `b` - The second type (typically the concrete type from the
+    ///          `when` constraint)
+    /// * `a_rigid` - Rigidity of type `a`
+    /// * `b_rigid` - Rigidity of type `b`
+    pub fn unify_biased(
+        &mut self,
+        a: TypeId,
+        b: TypeId,
+        a_rigid: Rigidity,
+        b_rigid: Rigidity,
+    ) -> Result<TypeId, TypeError> {
+        self.binder_stack.clear();
+        self.begin_transaction();
+        self.unify_seen.clear();
+
+        // Resolve bindings before inspecting rigidity and dispatching.
+        // `get` reads raw arena slots; an already-bound InferVar would
+        // appear fresh, causing illegal overwrites or spurious failures.
+        let a = self.resolve_binding_compressed(a);
+        let b = self.resolve_binding_compressed(b);
+
+        let result = match (a_rigid, b_rigid) {
+            (Rigidity::Rigid, Rigidity::Rigid) | (Rigidity::Wobbly, Rigidity::Wobbly) => {
+                // Both same rigidity: standard MGU (equality constraint).
+                self.unify_internal(a, b, Variance::Invariant, None, 0)
+            }
+            (Rigidity::Rigid, Rigidity::Wobbly) => {
+                // `a` is rigid (user-specified), `b` is wobbly (inferred).
+                // Bias: bind `b` to `a` if `b` is a fresh InferVar.
+                if let TypeData::InferVar { .. } = self.get(b) {
+                    self.bias_fresh_vars(b, a)
+                } else {
+                    self.unify_internal(a, b, Variance::Invariant, None, 0)
+                }
+            }
+            (Rigidity::Wobbly, Rigidity::Rigid) => {
+                // `a` is wobbly (inferred), `b` is rigid (user-specified).
+                // Bias: bind `a` to `b` if `a` is a fresh InferVar.
+                if let TypeData::InferVar { .. } = self.get(a) {
+                    self.bias_fresh_vars(a, b)
+                } else {
+                    self.unify_internal(a, b, Variance::Invariant, None, 0)
+                }
+            }
+        };
+
+        match result {
+            Ok(ty) => {
+                self.commit_transaction();
+                Ok(ty)
+            }
+            Err(e) => {
+                self.rollback_transaction();
+                Err(e)
+            }
+        }
+    }
+
+    /// Bind a fresh inference variable `var` to a concrete type `target`,
+    /// walking into compound types to bind nested fresh variables as well
+    /// (Peyton Jones et al. PLDI'06 §6.4, biased MGU).
+    ///
+    /// This is the core of the rigid/wobbly distinction: when a fresh
+    /// inference variable appears in a position that the GADT refinement
+    /// constrains, this method binds it directly to the target type
+    /// rather than creating an equality constraint.  The binding is
+    /// recorded in the transaction undo-log via `set_binding`.
+    ///
+    /// For compound types (tuples, ADTs, refs, etc.), the method
+    /// recursively biases nested fresh variables toward the corresponding
+    /// parts of the target.  If the target is not a compatible compound
+    /// type, the top-level binding is attempted (which may fail if the
+    /// types are structurally incompatible).
+    pub(crate) fn bias_fresh_vars(
+        &mut self,
+        var: TypeId,
+        target: TypeId,
+    ) -> Result<TypeId, TypeError> {
+        // Resolve aliases before occurs-check and structural bias walk.
+        // `get` reads raw arena slots; an aliased InferVar would be
+        // treated as fresh, causing incorrect bias or occurs-check failures.
+        let var = self.resolve_binding_compressed(var);
+        let target = self.resolve_binding_compressed(target);
+
+        // Occurs check: prevent recursive types.
+        if self.occurs_check(var, target) {
+            return Err(TypeError::RecursiveType {
+                ty: var,
+                span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+            });
+        }
+        // GADT skolem escape guard: don't bind a variable to a type
+        // containing a GADT existential skolem (witness would escape).
+        if self.contains_gadt_skolem(target) {
+            return Err(TypeError::SkolemEscape {
+                var_id: usize::MAX,
+                var_level: Self::GADT_SKOLEM_UNIVERSE,
+                current_level: 0,
+                span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+            });
+        }
+        // Structural bias: walk into compound types to bind nested
+        // fresh variables.
+        let var_data = self.get(var);
+        let target_data = self.get(target);
+        match (&*var_data, &*target_data) {
+            // Both tuples of same length: bias each element pair.
+            (
+                TypeData::Tuple { elems: var_elems },
+                TypeData::Tuple {
+                    elems: target_elems,
+                },
+            ) if var_elems.len() == target_elems.len() => {
+                let pairs: Vec<(TypeId, TypeId)> = var_elems
+                    .iter()
+                    .zip(target_elems.iter())
+                    .map(|(&a, &b)| (a, b))
+                    .collect();
+                for (ve, te) in pairs {
+                    if self.is_infer_var(ve) {
+                        self.bias_fresh_vars(ve, te)?;
+                    } else {
+                        self.unify_internal(ve, te, Variance::Invariant, None, 0)?;
+                    }
+                }
+            }
+            // Both ADTs with same def_id and same arg count: bias each arg.
+            (
+                TypeData::Adt {
+                    def_id: vd1,
+                    args: var_args,
+                    ..
+                },
+                TypeData::Adt {
+                    def_id: vd2,
+                    args: target_args,
+                    ..
+                },
+            ) if vd1 == vd2 && var_args.len() == target_args.len() => {
+                let pairs: Vec<(TypeId, TypeId)> = var_args
+                    .iter()
+                    .zip(target_args.iter())
+                    .map(|(&a, &b)| (a, b))
+                    .collect();
+                for (va, ta) in pairs {
+                    if self.is_infer_var(va) {
+                        self.bias_fresh_vars(va, ta)?;
+                    } else {
+                        self.unify_internal(va, ta, Variance::Invariant, None, 0)?;
+                    }
+                }
+            }
+            // Both arrays of same size: bias element.
+            (TypeData::Array { elem: ve, size: vs }, TypeData::Array { elem: te, size: ts })
+                if vs == ts =>
+            {
+                if self.is_infer_var(*ve) {
+                    self.bias_fresh_vars(*ve, *te)?;
+                } else {
+                    self.unify_internal(*ve, *te, Variance::Invariant, None, 0)?;
+                }
+            }
+            // Both slices: bias element.
+            (TypeData::Slice { elem: ve }, TypeData::Slice { elem: te }) => {
+                if self.is_infer_var(*ve) {
+                    self.bias_fresh_vars(*ve, *te)?;
+                } else {
+                    self.unify_internal(*ve, *te, Variance::Invariant, None, 0)?;
+                }
+            }
+            // Both refs (same mutability): bias inner type.
+            (
+                TypeData::Ref {
+                    ty: ve,
+                    mutable: vm,
+                    ..
+                },
+                TypeData::Ref {
+                    ty: te,
+                    mutable: tm,
+                    ..
+                },
+            ) if vm == tm => {
+                if self.is_infer_var(*ve) {
+                    self.bias_fresh_vars(*ve, *te)?;
+                } else {
+                    self.unify_internal(*ve, *te, Variance::Invariant, None, 0)?;
+                }
+            }
+            // Both pointers: bias inner type.
+            (TypeData::Pointer { ty: ve }, TypeData::Pointer { ty: te }) => {
+                if self.is_infer_var(*ve) {
+                    self.bias_fresh_vars(*ve, *te)?;
+                } else {
+                    self.unify_internal(*ve, *te, Variance::Invariant, None, 0)?;
+                }
+            }
+            // Both Fns with same param count: bias params and return.
+            (
+                TypeData::Fn {
+                    params: vp,
+                    ret: vr,
+                },
+                TypeData::Fn {
+                    params: tp,
+                    ret: tr,
+                },
+            ) if vp.len() == tp.len() => {
+                let ret_var = *vr;
+                let ret_target = *tr;
+                let pairs: Vec<(TypeId, TypeId)> =
+                    vp.iter().zip(tp.iter()).map(|(&a, &b)| (a, b)).collect();
+                for (ve, te) in pairs {
+                    if self.is_infer_var(ve) {
+                        self.bias_fresh_vars(ve, te)?;
+                    } else {
+                        self.unify_internal(ve, te, Variance::Invariant, None, 0)?;
+                    }
+                }
+                if self.is_infer_var(ret_var) {
+                    self.bias_fresh_vars(ret_var, ret_target)?;
+                } else {
+                    self.unify_internal(ret_var, ret_target, Variance::Invariant, None, 0)?;
+                }
+            }
+            // Fallback: direct binding (covers leaf types and
+            // structurally incompatible compound types).
+            _ => {}
+        }
+        // Final binding: var → target (only if var is a free InferVar).
+        // When var is a compound type (Tuple, Adt, etc.), the recursive
+        // match arms above already bound the nested inference variables.
+        // Attempting set_binding on a compound TypeId fails — skip it.
+        if self.is_infer_var(var) {
+            if !self.set_binding(var, target) {
+                return Err(TypeError::Mismatch {
+                    expected: var,
+                    found: target,
+                    span: crate::ast::Span::new(0, 0),
+                });
+            }
+        }
+        Ok(target)
     }
 
     fn variance_tag(v: Variance) -> u8 {
@@ -96,15 +417,15 @@ impl<'input> TypeContext<'input> {
     /// Snapshot the `unify_seen` cycle-detection cache so a transactional
     /// query can restore it afterwards (same discipline as `can_unify`).
     pub(crate) fn save_unify_seen(&self) -> std::collections::HashSet<(TypeId, TypeId, u8)> {
-        self.unify_seen.borrow().clone()
+        self.unify_seen.clone()
     }
 
     /// Restore a previously saved `unify_seen` cache snapshot.
     pub(crate) fn restore_unify_seen(
-        &self,
+        &mut self,
         saved: std::collections::HashSet<(TypeId, TypeId, u8)>,
     ) {
-        *self.unify_seen.borrow_mut() = saved;
+        self.unify_seen = saved;
     }
 
     /// Whether a type contains a GADT existential skolem anywhere in its
@@ -112,6 +433,12 @@ impl<'input> TypeContext<'input> {
     /// unification rules to prevent an arm-local witness from escaping
     /// inside a compound type (e.g. `GenericParam ~ [S]`).
     pub(crate) fn contains_gadt_skolem(&self, ty: TypeId) -> bool {
+        // Follow inference aliases to detect hidden GADT skolems.
+        // `get` reads raw arena slots; an InferVar unified with a
+        // SkolemVar would appear as InferVar, allowing the skolem to
+        // bypass the escape check and leak into the outer context.
+        let ty = self.resolve_binding(ty);
+
         match self.get(ty) {
             TypeData::SkolemVar { universe_num, .. }
                 if *universe_num == Self::GADT_SKOLEM_UNIVERSE =>
@@ -233,6 +560,14 @@ impl<'input> TypeContext<'input> {
         region_tree: Option<&crate::hir::infer::InferRegionTree>,
         coercion_depth: usize,
     ) -> Result<TypeId, TypeError> {
+        // Resolve to canonical roots before caching and unification.
+        // This restores the union-find invariant: `get_arc` reads raw
+        // arena slots and does NOT follow binding chains, so operating
+        // on unresolved TypeIds would break transitive equality
+        // propagation and fragment the cycle-detection cache.
+        let a = self.resolve_binding_compressed(a);
+        let b = self.resolve_binding_compressed(b);
+
         // ── Cycle detection, NOT a result cache ─────────────────────
         // `unify_seen` records which (a, b, variance) pairs are already
         // being visited in the CURRENT recursive descent, so that cyclic
@@ -245,7 +580,7 @@ impl<'input> TypeContext<'input> {
         // retried after rollback.
         let tag = Self::variance_tag(variance);
         let key = (a, b, tag);
-        if !self.unify_seen.borrow_mut().insert(key) {
+        if !self.unify_seen.insert(key) {
             // Already visited this pair — assume success to break cycles.
             return Ok(a);
         }
@@ -254,7 +589,7 @@ impl<'input> TypeContext<'input> {
 
         // On error, remove the cache entry so future attempts can retry.
         if result.is_err() {
-            self.unify_seen.borrow_mut().remove(&key);
+            self.unify_seen.remove(&key);
         }
         result
     }
@@ -318,8 +653,7 @@ impl<'input> TypeContext<'input> {
                     var_id: usize::MAX,
                     var_level: *u1,
                     current_level: 0,
-                    span: (*self.current_unify_span.borrow())
-                        .unwrap_or(crate::ast::Span::new(0, 0)),
+                    span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
                 });
             }
             (
@@ -332,19 +666,17 @@ impl<'input> TypeContext<'input> {
                     var_id: usize::MAX,
                     var_level: *u2,
                     current_level: 0,
-                    span: (*self.current_unify_span.borrow())
-                        .unwrap_or(crate::ast::Span::new(0, 0)),
+                    span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
                 });
             }
             (TypeData::GenericParam { index, .. }, _) => {
                 // FIX: binder scope guard — if this GenericParam is currently
                 // bound in an active binder, unifying it with a foreign type
                 // would be a scope escape.
-                if self.binder_stack.borrow().contains(index) {
+                if self.binder_stack.contains(index) {
                     return Err(TypeError::ScopeEscape {
                         index: *index,
-                        span: (*self.current_unify_span.borrow())
-                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 // A GADT skolem must not be bound into a variable through a
@@ -356,15 +688,13 @@ impl<'input> TypeContext<'input> {
                         var_id: usize::MAX,
                         var_level: Self::GADT_SKOLEM_UNIVERSE,
                         current_level: 0,
-                        span: (*self.current_unify_span.borrow())
-                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 if self.occurs_check(a, b) {
                     return Err(TypeError::RecursiveType {
                         ty: a,
-                        span: (*self.current_unify_span.borrow())
-                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 if !self.set_binding(a, b) {
@@ -378,11 +708,10 @@ impl<'input> TypeContext<'input> {
             }
             (_, TypeData::GenericParam { index, .. }) => {
                 // FIX: binder scope guard — symmetric.
-                if self.binder_stack.borrow().contains(index) {
+                if self.binder_stack.contains(index) {
                     return Err(TypeError::ScopeEscape {
                         index: *index,
-                        span: (*self.current_unify_span.borrow())
-                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 if self.contains_gadt_skolem(a) {
@@ -390,15 +719,13 @@ impl<'input> TypeContext<'input> {
                         var_id: usize::MAX,
                         var_level: Self::GADT_SKOLEM_UNIVERSE,
                         current_level: 0,
-                        span: (*self.current_unify_span.borrow())
-                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 if self.occurs_check(b, a) {
                     return Err(TypeError::RecursiveType {
                         ty: b,
-                        span: (*self.current_unify_span.borrow())
-                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 if !self.set_binding(b, a) {
@@ -437,7 +764,7 @@ impl<'input> TypeContext<'input> {
                             var_id: *id,
                             var_level,
                             current_level: cur_level,
-                            span: (*self.current_unify_span.borrow())
+                            span: (*&self.current_unify_span)
                                 .unwrap_or(crate::ast::Span::new(0, 0)),
                         });
                     }
@@ -445,8 +772,7 @@ impl<'input> TypeContext<'input> {
                 if self.occurs_check(a, b) {
                     return Err(TypeError::RecursiveType {
                         ty: a,
-                        span: (*self.current_unify_span.borrow())
-                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 // A GADT skolem must not be bound into an InferVar through
@@ -456,8 +782,7 @@ impl<'input> TypeContext<'input> {
                         var_id: usize::MAX,
                         var_level: Self::GADT_SKOLEM_UNIVERSE,
                         current_level: 0,
-                        span: (*self.current_unify_span.borrow())
-                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 // Per-variable universe escape check (rustc `can_define`):
@@ -473,8 +798,7 @@ impl<'input> TypeContext<'input> {
                         var_id: usize::MAX,
                         var_level: *universe,
                         current_level: 0,
-                        span: (*self.current_unify_span.borrow())
-                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 if !self.set_binding(a, b) {
@@ -503,7 +827,7 @@ impl<'input> TypeContext<'input> {
                             var_id: *id,
                             var_level,
                             current_level: cur_level,
-                            span: (*self.current_unify_span.borrow())
+                            span: (*&self.current_unify_span)
                                 .unwrap_or(crate::ast::Span::new(0, 0)),
                         });
                     }
@@ -511,8 +835,7 @@ impl<'input> TypeContext<'input> {
                 if self.occurs_check(b, a) {
                     return Err(TypeError::RecursiveType {
                         ty: b,
-                        span: (*self.current_unify_span.borrow())
-                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 // The FOREIGN-UNIVERSE guard (mirrors the `(InferVar, _)`
@@ -537,8 +860,7 @@ impl<'input> TypeContext<'input> {
                         var_id: usize::MAX,
                         var_level: *universe,
                         current_level: 0,
-                        span: (*self.current_unify_span.borrow())
-                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 if !self.set_binding(b, a) {
@@ -660,14 +982,9 @@ impl<'input> TypeContext<'input> {
                 Ok(b)
             }
 
-            // Ref: pointee is INVARIANT (per compute_variance_edges signing it sign: 0).
-            // MUTABILITY: the ONLY sound coercion is `&mut T → &T` (surrendering
-            // mutability), and it is gated to the INVARIANT call-site under
-            // `@auto_ro`/`@auto_coerce` (coercion_depth == 0 ∧ CallSite —
-            // SYNTAX.md §Local Relaxation).  Covariant/contravariant structural
-            // positions require the EXACT mutability match — the OLD covariant
-            // "borrow shortening" permission was never surface-documented and is
-            // removed (the implicit downgrade must not leak outside the gate).
+            // Ref: pointee is INVARIANT.  Mutability must match exactly in
+            // all variance positions — the `&mut T → &T` coercion is handled
+            // at the `unify()` entry point under CallSite context only.
             (
                 TypeData::Ref {
                     ty: t1,
@@ -711,70 +1028,30 @@ impl<'input> TypeContext<'input> {
                     // record `(l2, l1)` (the subtype arm records
                     // `(sub, sup)` — its l1 IS the sub side, already
                     // correct).
-                    if self.region_subtype_collect.get() {
-                        self.region_subtype_outlives.borrow_mut().push((*l2, *l1));
+                    if self.region_subtype_collect {
+                        self.region_subtype_outlives.push((*l2, *l1));
                     } else {
                         return Err(TypeError::Mismatch {
                             expected: b,
                             found: a,
-                            span: (*self.current_unify_span.borrow())
+                            span: (*&self.current_unify_span)
                                 .unwrap_or(crate::ast::Span::new(0, 0)),
                         });
                     }
                 }
                 let allow_mutable_coerce = match variance {
-                    // `@auto_ro` relaxes ONLY at call sites (Invariant — per
-                    // SYNTAX.md "at function call sites and method
-                    // resolution"): the `&mut T` argument (b) may coerce to
-                    // a `&T` parameter (a), the sound direction that
-                    // surrenders mutability.  Structural covariant /
-                    // contravariant positions (function-type returns/params,
-                    // nested reference containers) NEVER relax: the only
-                    // sound mutability coercion is `&mut T → &T`, and
-                    // relaxing there would let a shared reference stand in
-                    // for a mutable one (phantom mutation).
-                    Variance::Invariant => {
-                        // NOTE (language-design committee, 2026-08-05): the
-                        // implicit `@auto_ro`/`@auto_coerce` downgrade below
-                        // does NOT register a loan — AND the borrow-check
-                        // post-pass CANNOT see it either (the HIR has no node
-                        // for the type-level implicit downgrade).  The freeze
-                        // is unobservable in the current grammar (argument
-                        // expressions are pure); a future effectful-argument
-                        // feature must add an explicit HIR marker first.  The
-                        // type checker no longer
-                        // participates; the old `loans` bookkeeping was
-                        // removed) —
-                        // under `@auto_ro` the source remains mutable after
-                        // the read-only reborrow.  This divergence is a
-                        // KNOWN limitation: Posita has no lifetime-based
-                        // borrow checker yet, and once one lands the
-                        // read-only guarantee is enforced structurally,
-                        // making the removed `loans` bookkeeping moot for the
-                        // implicit form.  `&ro` / `.freeze!()` remain the
-                        // strictly-frozen explicit forms.
-                        *m1 == *m2
-                            || (coercion_depth == 0
-                                && self.current_coercion_ctx.get() == CoercionContext::CallSite
-                                && (self.auto_ro.get() || self.auto_coerce.get())
-                                && *m2 == true
-                                && *m1 == false)
-                    }
-                    Variance::Covariant => *m1 == *m2,
-                    Variance::Contravariant => *m1 == *m2,
-                    // NOTE: both positions require EXACT mutability match.
-                    // `@auto_ro`/`@auto_coerce` is scoped to
-                    // `coercion_depth == 0 ∧ CallSite` (SYNTAX.md §Local
-                    // Relaxation), so covariant/contravariant structural
-                    // positions never relax — the old code's covariant
-                    // `&mut T → &T` permission was never surface-documented.
+                    // `@auto_ro` coercion is handled at the `unify()` entry
+                    // point (CallSite context only).  Inside the symmetric
+                    // unifier we require an EXACT mutability match in every
+                    // variance position.  The old covariant `&mut T → &T`
+                    // permission was unsound and has been removed.
+                    _ => *m1 == *m2,
                 };
                 if !allow_mutable_coerce {
                     return Err(TypeError::Mismatch {
                         expected: b,
                         found: a,
-                        span: (*self.current_unify_span.borrow())
-                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
                     });
                 }
                 let ty_variance = variance.xform(Variance::Invariant);
@@ -881,7 +1158,7 @@ impl<'input> TypeContext<'input> {
                     let fresh_gp = self.generic_param(fresh_idx, *pn2);
                     let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
                     let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
-                    self.binder_stack.borrow_mut().push(fresh_idx);
+                    self.binder_stack.push(fresh_idx);
                     let res = self.unify_internal(
                         b1_renamed,
                         b2_renamed,
@@ -889,10 +1166,10 @@ impl<'input> TypeContext<'input> {
                         region_tree,
                         coercion_depth + 1,
                     );
-                    self.binder_stack.borrow_mut().pop();
+                    self.binder_stack.pop();
                     res
                 } else {
-                    self.binder_stack.borrow_mut().push(*pi1);
+                    self.binder_stack.push(*pi1);
                     let res = self.unify_internal(
                         *b1,
                         *b2,
@@ -900,7 +1177,7 @@ impl<'input> TypeContext<'input> {
                         region_tree,
                         coercion_depth + 1,
                     );
-                    self.binder_stack.borrow_mut().pop();
+                    self.binder_stack.pop();
                     res
                 };
                 result?;
@@ -934,7 +1211,7 @@ impl<'input> TypeContext<'input> {
                     let fresh_gp = self.generic_param(fresh_idx, *n2);
                     let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
                     let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
-                    self.binder_stack.borrow_mut().push(fresh_idx);
+                    self.binder_stack.push(fresh_idx);
                     let res = self.unify_internal(
                         b1_renamed,
                         b2_renamed,
@@ -942,10 +1219,10 @@ impl<'input> TypeContext<'input> {
                         region_tree,
                         coercion_depth + 1,
                     );
-                    self.binder_stack.borrow_mut().pop();
+                    self.binder_stack.pop();
                     res
                 } else {
-                    self.binder_stack.borrow_mut().push(*pi1);
+                    self.binder_stack.push(*pi1);
                     let res = self.unify_internal(
                         *b1,
                         *b2,
@@ -953,7 +1230,7 @@ impl<'input> TypeContext<'input> {
                         region_tree,
                         coercion_depth + 1,
                     );
-                    self.binder_stack.borrow_mut().pop();
+                    self.binder_stack.pop();
                     res
                 };
                 result?;
@@ -998,7 +1275,7 @@ impl<'input> TypeContext<'input> {
                 }
                 // Push all scope indices (in order).
                 for &idx in &scope_indices {
-                    self.binder_stack.borrow_mut().push(idx);
+                    self.binder_stack.push(idx);
                 }
                 let res = self.unify_internal(
                     b1_renamed,
@@ -1009,7 +1286,7 @@ impl<'input> TypeContext<'input> {
                 );
                 // Pop in reverse order.
                 for _ in 0..scope_indices.len() {
-                    self.binder_stack.borrow_mut().pop();
+                    self.binder_stack.pop();
                 }
                 res?;
                 if !self.set_binding(a, b) {
@@ -1042,7 +1319,7 @@ impl<'input> TypeContext<'input> {
                     let fresh_gp = self.generic_param(fresh_idx, *pn2);
                     let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
                     let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
-                    self.binder_stack.borrow_mut().push(fresh_idx);
+                    self.binder_stack.push(fresh_idx);
                     let res = self.unify_internal(
                         b1_renamed,
                         b2_renamed,
@@ -1050,10 +1327,10 @@ impl<'input> TypeContext<'input> {
                         region_tree,
                         coercion_depth + 1,
                     );
-                    self.binder_stack.borrow_mut().pop();
+                    self.binder_stack.pop();
                     res
                 } else {
-                    self.binder_stack.borrow_mut().push(*pi1);
+                    self.binder_stack.push(*pi1);
                     let res = self.unify_internal(
                         *b1,
                         *b2,
@@ -1061,7 +1338,7 @@ impl<'input> TypeContext<'input> {
                         region_tree,
                         coercion_depth + 1,
                     );
-                    self.binder_stack.borrow_mut().pop();
+                    self.binder_stack.pop();
                     res
                 };
                 result?;
@@ -1095,7 +1372,7 @@ impl<'input> TypeContext<'input> {
                     let fresh_gp = self.generic_param(fresh_idx, *pn2);
                     let b1_renamed = self.replace_generic(*b1, *pi1, fresh_gp);
                     let b2_renamed = self.replace_generic(*b2, *pi2, fresh_gp);
-                    self.binder_stack.borrow_mut().push(fresh_idx);
+                    self.binder_stack.push(fresh_idx);
                     let res = self.unify_internal(
                         b1_renamed,
                         b2_renamed,
@@ -1103,10 +1380,10 @@ impl<'input> TypeContext<'input> {
                         region_tree,
                         coercion_depth + 1,
                     );
-                    self.binder_stack.borrow_mut().pop();
+                    self.binder_stack.pop();
                     res
                 } else {
-                    self.binder_stack.borrow_mut().push(*pi1);
+                    self.binder_stack.push(*pi1);
                     let res = self.unify_internal(
                         *b1,
                         *b2,
@@ -1114,7 +1391,7 @@ impl<'input> TypeContext<'input> {
                         region_tree,
                         coercion_depth + 1,
                     );
-                    self.binder_stack.borrow_mut().pop();
+                    self.binder_stack.pop();
                     res
                 };
                 result?;
@@ -1206,8 +1483,7 @@ impl<'input> TypeContext<'input> {
                     Err(TypeError::Mismatch {
                         expected: b,
                         found: a,
-                        span: (*self.current_unify_span.borrow())
-                            .unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
                     })
                 }
             }
@@ -1215,7 +1491,7 @@ impl<'input> TypeContext<'input> {
             _ => Err(TypeError::Mismatch {
                 expected: b,
                 found: a,
-                span: (*self.current_unify_span.borrow()).unwrap_or(crate::ast::Span::new(0, 0)),
+                span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
             }),
         }
     }

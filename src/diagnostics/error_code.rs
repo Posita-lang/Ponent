@@ -1,8 +1,13 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::OnceLock;
 
 /// The port number of the local explain server, if running.
 static EXPLAIN_PORT: OnceLock<u16> = OnceLock::new();
+
+/// Cached index for fast error-code lookups. Built once on first `lookup` call.
+static CODE_INDEX: OnceLock<HashMap<&'static str, &'static CodeEntry>> = OnceLock::new();
 
 /// Set the port for the local explain server.  Called by the CLI before
 /// displaying error code URLs.
@@ -51,11 +56,14 @@ impl ErrorCategory {
     }
 }
 
-/// A compiler error or warning code, stored as a string (e.g. "E030", "W113").
-/// Metadata (title, category, explanation) is resolved through a lookup table,
+/// A compiler error or warning code (e.g. "E030", "W113").
+///
+/// Stored as a [`Cow<'static, str>`]: codes are declared in [`CODE_TABLE`], so
+/// a known code borrows its `&'static` entry instead of allocating.  Metadata
+/// (title, category, explanation) is resolved through the same lookup table,
 /// removing the need for exhaustive match arms on enum variants.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ErrCode(String);
+pub struct ErrCode(Cow<'static, str>);
 
 /// Error returned when an unknown error code string is used.
 #[derive(Debug, Clone)]
@@ -77,26 +85,35 @@ impl ErrCode {
     /// silently fall back to "unknown error" for `title()` / `category()` /
     /// `explain()`.
     ///
+    /// A code present in [`CODE_TABLE`] borrows its `&'static` entry, so the
+    /// common (literal) path allocates nothing.
+    ///
     /// Prefer [`Self::try_new`] when the input comes from an external source
     /// (user input, CLI arguments, etc.).
-    pub fn new(code: impl Into<String>) -> Self {
-        let code = code.into();
+    pub fn new(code: impl AsRef<str>) -> Self {
+        let code = code.as_ref();
+        let entry = lookup(code);
         debug_assert!(
-            lookup(&code).is_some(),
+            entry.is_some(),
             "unknown error code: {code:?} — must be added to CODE_TABLE in error_code.rs",
         );
-        ErrCode(code)
+        match entry {
+            Some(e) => ErrCode(Cow::Borrowed(e.code)),
+            None => ErrCode(Cow::Owned(code.to_owned())),
+        }
     }
 
     /// Validate that `code` exists in the lookup table, returning
     /// [`UnknownCode`] if it does not.  This check runs in **all** build
     /// profiles (unlike the `debug_assert!` in [`Self::new`]).
-    pub fn try_new(code: impl Into<String>) -> Result<Self, UnknownCode> {
-        let code = code.into();
-        if lookup(&code).is_some() {
-            Ok(ErrCode(code))
-        } else {
-            Err(UnknownCode(code))
+    ///
+    /// On success the canonical `&'static` entry is borrowed; only the
+    /// unknown-code error owns a `String`.
+    pub fn try_new(code: impl AsRef<str>) -> Result<Self, UnknownCode> {
+        let code = code.as_ref();
+        match lookup(code) {
+            Some(e) => Ok(ErrCode(Cow::Borrowed(e.code))),
+            None => Err(UnknownCode(code.to_owned())),
         }
     }
 
@@ -107,21 +124,19 @@ impl ErrCode {
 
     /// Short title, e.g. "type mismatch" or "duplicate definition".
     pub fn title(&self) -> &'static str {
-        lookup(self.0.as_str())
-            .map(|e| e.title)
-            .unwrap_or("unknown error")
+        lookup(&self.0).map(|e| e.title).unwrap_or("unknown error")
     }
 
     /// The error category, e.g. `ErrorCategory::Type`.
     pub fn category(&self) -> ErrorCategory {
-        lookup(self.0.as_str())
+        lookup(&self.0)
             .map(|e| e.category)
             .unwrap_or(ErrorCategory::Generic)
     }
 
     /// Full explanation text, displayed by `ponent --explain E030`.
     pub fn explain(&self) -> &'static str {
-        lookup(self.0.as_str())
+        lookup(&self.0)
             .map(|e| e.explain)
             .unwrap_or("No detailed explanation is available for this error code yet.")
     }
@@ -369,6 +384,12 @@ pub(crate) const CODE_TABLE: &[CodeEntry] = &[
         title: "conflicting impl",
         category: ErrorCategory::Trait,
         explain: "Conflicting implementations of a trait for the same type.",
+    },
+    CodeEntry {
+        code: "E044",
+        title: "return type mismatch",
+        category: ErrorCategory::Inference,
+        explain: "A function with no `return` statements inferred a return type incompatible with `!`. Add an explicit return type or a `return` statement.",
     },
     CodeEntry {
         code: "E050",
@@ -674,7 +695,10 @@ pub(crate) const CODE_TABLE: &[CodeEntry] = &[
 
 /// Look up a code string in the table.
 pub(crate) fn lookup(code: &str) -> Option<&'static CodeEntry> {
-    CODE_TABLE.iter().find(|e| e.code == code)
+    let idx = CODE_INDEX.get_or_init(|| {
+        CODE_TABLE.iter().map(|e| (e.code, e)).collect()
+    });
+    idx.get(code).copied()
 }
 
 impl fmt::Display for ErrorCategory {

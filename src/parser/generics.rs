@@ -6,12 +6,12 @@ use crate::diagnostics::Diagnostic;
 use crate::lexer::Token;
 use crate::symbol::Symbol;
 
-impl<'input> Parser<'input> {
+impl<'src, 'input> Parser<'src, 'input> {
     // -------------------------------------------------------------------------
     // Type parameter list (including const parameters)
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_type_params(&mut self) -> Result<Vec<TypeParam<'input>>, Diagnostic> {
+    pub(super) fn parse_type_params(&mut self) -> Result<Vec<TypeParam<'input>>, Diagnostic<'src>> {
         self.advance().ok(); // consume <
         let mut p = Vec::new();
         loop {
@@ -62,11 +62,12 @@ impl<'input> Parser<'input> {
                 } else {
                     TypeParamKind::Type
                 };
+                let span = self.span();
                 p.push(TypeParam {
                     name,
                     bounds,
                     kind,
-                    span: Span::new(self.span().start, self.span().end),
+                    span,
                 });
             }
             match self.peek() {
@@ -86,7 +87,7 @@ impl<'input> Parser<'input> {
     // Const generic parameter: `const N: Type = default`
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_const_param(&mut self) -> Result<TypeParam<'input>, Diagnostic> {
+    pub(super) fn parse_const_param(&mut self) -> Result<TypeParam<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok(); // consume `const`
         let name = match self.advance() {
@@ -132,7 +133,7 @@ impl<'input> Parser<'input> {
 
     pub(super) fn parse_associated_type_lifetime_params(
         &mut self,
-    ) -> Result<Vec<Symbol>, Diagnostic> {
+    ) -> Result<Vec<Symbol>, Diagnostic<'src>> {
         if !matches!(self.peek(), Ok(Token::Lt)) {
             return Ok(Vec::new());
         }

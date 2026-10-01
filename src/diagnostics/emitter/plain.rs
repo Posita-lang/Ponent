@@ -21,7 +21,7 @@ impl Default for PlainEmitter {
 }
 
 impl super::DiagnosticEmitter for PlainEmitter {
-    fn emit(&mut self, diag: &Diagnostic) {
+    fn emit(&mut self, diag: &Diagnostic<'_>) {
         let rendered = self.renderer.render_diagnostic(diag);
         if !rendered.is_empty() {
             eprint!("{}", rendered);

@@ -8,7 +8,6 @@
 // comparison is a single `u32` comparison — no string allocation, no
 // hashing, no pointer chasing.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -40,19 +39,30 @@ impl Symbol {
     /// Create a new interned symbol from a string slice.
     /// If the string has already been interned, returns the existing symbol.
     pub fn intern(s: &str) -> Self {
-        INTERNER.with(|i| i.borrow_mut().intern(s))
+        let guard = INTERNER.read();
+        if let Some(&sym) = guard.map.get(s) {
+            return sym;
+        }
+        drop(guard);
+        INTERNER.write().intern(s)
     }
 
     /// Retrieve the string representation of this symbol.
-    pub fn as_str(self) -> String {
-        INTERNER.with(|i| i.borrow().resolve(self))
+    ///
+    /// Returns a `&'static str` view into the process-global interner arena.
+    /// The arena is append-only and leaked for the whole process lifetime, so
+    /// the borrow is valid without holding the interner read lock — callers
+    /// never need to `.to_string()` / `.clone()` the result just to keep it
+    /// alive, and `Cow::Owned(name.as_str())` becomes `Cow::Borrowed(name.as_str())`.
+    pub fn as_str(self) -> &'static str {
+        INTERNER.read().resolve_ref(self)
     }
 
     /// Compare against a string slice without allocating.
     /// Internally resolves to `&str` inside the interner lock, avoiding
     /// the `String` allocation that `as_str()` would produce.
     pub fn eq_str(self, s: &str) -> bool {
-        INTERNER.with(|i| i.borrow().resolve_ref(self) == s)
+        INTERNER.read().resolve_ref(self) == s
     }
 }
 
@@ -77,13 +87,15 @@ impl From<&str> for Symbol {
 // ── Interner ───────────────────────────────────────────────────────
 
 /// The global interner state.
+///
+/// Arena entries are leaked (`&'static str`) so that a resolved name stays
+/// valid after the lock is released — the arena is append-only and lives for
+/// the whole process anyway.
 struct Interner {
     /// Map from string content to its `Symbol` (stable index).
     map: HashMap<String, Symbol>,
-    /// Arena: each interned string is stored exactly once.
-    arena: Vec<String>,
-    /// Counter for the next symbol index.
-    next_id: u32,
+    /// Arena: each interned string is stored exactly once.  Index == id.
+    arena: Vec<&'static str>,
 }
 
 impl Interner {
@@ -91,51 +103,46 @@ impl Interner {
         Interner {
             map: HashMap::new(),
             arena: Vec::new(),
-            next_id: 0,
         }
     }
 
     fn intern(&mut self, s: &str) -> Symbol {
-        // Check if already interned.
+        // Check if already interned (a writer may have won the race between
+        // our read-lock probe and this write lock).
         if let Some(&sym) = self.map.get(s) {
             return sym;
         }
-        let id = self.next_id;
-        self.next_id += 1;
-        let owned = s.to_string();
-        let sym = Symbol(id);
-        self.map.insert(owned.clone(), sym);
-        self.arena.push(owned);
+        let sym = Symbol(self.arena.len() as u32);
+        self.map.insert(s.to_string(), sym);
+        self.arena.push(Box::leak(s.to_string().into_boxed_str()));
         sym
     }
 
-    fn resolve(&self, sym: Symbol) -> String {
-        if sym.0 == u32::MAX {
-            return "<invalid>".to_string();
-        }
-        self.arena
-            .get(sym.0 as usize)
-            .cloned()
-            .unwrap_or_else(|| format!("<symbol {}>", sym.0))
-    }
-
     /// Resolve a symbol to a `&str` reference into the arena (no allocation).
-    fn resolve_ref(&self, sym: Symbol) -> &str {
+    fn resolve_ref(&self, sym: Symbol) -> &'static str {
         if sym.0 == u32::MAX {
             return "<invalid>";
         }
         self.arena
             .get(sym.0 as usize)
-            .map(|s| s.as_str())
+            .copied()
             .unwrap_or("<unknown>")
     }
 }
 
-// Use a thread-local interner so that Symbol::intern() is safe to call
-// from any thread (the compiler is primarily single-threaded).
-thread_local! {
-    static INTERNER: RefCell<Interner> = RefCell::new(Interner::new());
-}
+// A PROCESS-global interner, not a thread-local one.
+//
+// `Symbol` is a bare `u32` index into the arena, so a per-thread interner
+// hands every thread a *different* id for the same name.  The type checker
+// runs function bodies on a rayon pool; with a thread-local interner a
+// worker resolving `Copy` or `Int<32>` gets a fresh empty arena, misses
+// every name lookup, and `as_str()` silently returns `<unknown>`.  Symbol
+// identity must therefore be process-wide.
+//
+// Reads (`as_str` / `eq_str`) take the read lock; `intern` probes under a
+// read lock and only upgrades on a miss.
+static INTERNER: std::sync::LazyLock<parking_lot::RwLock<Interner>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(Interner::new()));
 
 /// Pre-intern common keywords and built-in type names so that
 /// the parser and type checker can use `Symbol::from("fn")` etc.

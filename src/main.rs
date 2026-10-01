@@ -12,6 +12,7 @@
     clippy::large_enum_variant
 )]
 
+mod arena;
 mod ast;
 mod cli;
 mod diagnostics;
@@ -29,7 +30,8 @@ mod hir {
     mod infer_tests;
     pub mod loop_infer;
     pub(crate) mod loop_ir;
-    pub(crate) mod octagon;
+    pub mod octagon;
+    pub mod parametricity;
     pub mod place;
     pub mod polonius;
     pub mod query;
@@ -41,6 +43,7 @@ mod hir {
     pub mod traits;
     pub mod type_eq;
     pub mod types;
+    pub mod visit;
     // Debug-only tracing / diagnostics module.
     #[cfg(debug_assertions)]
     pub mod anya;
@@ -48,6 +51,8 @@ mod hir {
 mod lexer;
 mod parser;
 mod sat;
+mod session;
+mod sexp_ext;
 mod symbol;
 mod vfs;
 
@@ -62,15 +67,23 @@ use hir::checker::TypeChecker;
 use hir::resolver::NameResolver;
 use hir::types::{CrateId, DefId, TypeContext};
 use logos::Logos;
+use session::CompilerSession;
 use std::fs;
 use std::process;
 
 /// Attach source text to all diagnostics in a slice so the emitter can
 /// render `^`-underline annotations (Rust-style source context).
-fn attach_source_to_diags(diags: &mut [Diagnostic], source: &str, file_name: &str) {
+///
+/// Diagnostics borrow the source buffer directly (`&'src str`) instead of
+/// holding an owned copy, so this is a cheap pointer write per diagnostic.
+fn attach_source_to_diags<'src>(
+    diags: &mut [Diagnostic<'src>],
+    source: &'src str,
+    file_name: &str,
+) {
     for diag in diags.iter_mut() {
         if diag.source().is_none() {
-            diag.set_source(Some(source.to_string()));
+            diag.set_source(Some(source));
         }
         if diag.file_name() == "<input>" {
             diag.set_file_name(file_name.to_string());
@@ -89,17 +102,17 @@ fn make_emitter(json: bool) -> Box<dyn DiagnosticEmitter> {
 /// Phase 1 (generate expansion) → name resolution → Phase 2 (generate
 /// expansion with resolution) → incremental resolution — all inside one
 /// function so each phase's `&mut ctx` borrow is scoped sequentially.
-fn resolve_and_expand<'input>(
+fn resolve_and_expand<'src, 'input>(
     ctx: &mut TypeContext<'input>,
     program: ast::Program<'input>,
     local_crate_id: CrateId,
-    source: &str,
+    source: &'src str,
     file_name: &str,
 ) -> (
     ast::Program<'input>,
     hir::symbol::SymbolTable<'input>,
     hir::traits::TraitEnv<'input>,
-    Vec<Diagnostic>,
+    Vec<Diagnostic<'src>>,
     hir::resolver::ResolutionMap<'input>,
 ) {
     // Phase 1: expand `generate` blocks before name resolution.
@@ -108,10 +121,11 @@ fn resolve_and_expand<'input>(
     let program = ast::Program {
         items: expanded_items,
         span: program.span,
+        doc_map: program.doc_map,
     };
     // Name resolution (the resolver's `&mut ctx` borrow ends here).
     let (symbols, trait_env, resolver_diags, resolution_map) = {
-        let mut resolver = NameResolver::new(ctx, local_crate_id);
+        let mut resolver = NameResolver::new(ctx, local_crate_id, Some(source));
         resolver.resolve_program(&program)
     };
     let mut all_diags = resolver_diags.into_inner();
@@ -122,10 +136,11 @@ fn resolve_and_expand<'input>(
     let program = ast::Program {
         items: expanded_items,
         span: program.span,
+        doc_map: program.doc_map,
     };
     // Incremental resolution for newly expanded items.
     let (symbols, trait_env, resolver_diags, resolution_map) = if !new_items.is_empty() {
-        let mut resolver = NameResolver::new(ctx, local_crate_id);
+        let mut resolver = NameResolver::new(ctx, local_crate_id, Some(source));
         resolver.resolve_incremental(&new_items, symbols, trait_env, resolution_map)
     } else {
         (symbols, trait_env, DiagCtxt::new(), resolution_map)
@@ -182,262 +197,297 @@ fn resolve_target(target_opt: &Option<String>) -> Result<hir::target::Target, St
     }
 }
 
+/// Compiler options shared by the `Parse` and `Check` handlers.
+struct CompilerOptions {
+    target: Option<String>,
+    strict: bool,
+    enable_experimental: bool,
+    feature: Vec<String>,
+    debug: bool,
+}
+
 fn main() {
+    // One arena for the whole process, leaked so `'input` is `'static` and
+    // lowered HIR can be a query value.  See `crate::arena::leaked`.  Every
+    // allocation goes through the `SyncArena` (never the bare `&Bump`), so
+    // the arena's allocation lock is always respected.
+    let (_bump, session_sync_arena) = crate::arena::leaked();
+
     let cli = cli::Cli::parse();
-    match cli.command {
-        cli::Command::Lex { file } => {
-            let source = match fs::read_to_string(&file) {
-                Ok(s) => s,
-                Err(e) => {
-                    let mut diag = Diagnostic::error(format!("failed to read `{}`: {}", file, e));
-                    // Don't set source — the file couldn't be read, so there's
-                    // no source code to display.  The emitter will render the
-                    // error without source context and close the box with └─.
-                    let mut emitter = ColoredEmitter::new();
-                    emitter.emit(&diag);
-                    emitter.emit_summary(1, 0);
-                    process::exit(1);
-                }
-            };
-            let lexer = lexer::Token::lexer(&source);
-            for result in lexer {
-                match result {
-                    Ok(token) => {
-                        if token != lexer::Token::WhitespaceOrComment {
-                            println!("{:?}", token);
-                        }
-                    }
-                    Err(()) => eprintln!("ERROR: invalid token"),
-                }
-            }
-        }
+    let opts = CompilerOptions {
+        target: cli.target,
+        strict: cli.strict,
+        enable_experimental: cli.enable_experimental,
+        feature: cli.feature,
+        debug: cli.debug,
+    };
+
+    // Each handler returns the diagnostics to render instead of exiting:
+    // `process::exit` from a rayon worker would tear down the whole batch.
+    // The single process exit lives at the end of `main`.
+    let code = match cli.command {
+        cli::Command::Lex { file } => report(run_lex(&file), false),
         cli::Command::Parse { file, ast, json } => {
-            let source = match fs::read_to_string(&file) {
-                Ok(s) => s,
-                Err(e) => {
-                    let mut diag = Diagnostic::error(format!("failed to read `{}`: {}", file, e));
-                    // Don't set source — the file couldn't be read, so there's
-                    // no source code to display.  The emitter will render the
-                    // error without source context and close the box with └─.
-                    let mut emitter = make_emitter(json);
-                    emitter.emit(&diag);
-                    emitter.emit_summary(1, 0);
-                    process::exit(1);
-                }
-            };
-            let arena = bumpalo::Bump::new();
-            let mut parser = parser::Parser::new(&source, &arena);
-            match parser.parse_program() {
-                Ok(program) => {
-                    if ast {
-                        println!("{:#?}", program);
-                    } else {
-                        let target = match resolve_target(&cli.target) {
-                            Ok(t) => t,
-                            Err(msg) => {
-                                let mut diag = Diagnostic::error(msg);
-                                let mut emitter = make_emitter(json);
-                                emitter.emit(&diag);
-                                emitter.emit_summary(1, 0);
-                                process::exit(1);
-                            }
-                        };
-                        let mut ctx = TypeContext::new_with_target(target);
-                        ctx.arena = Some(&arena);
-                        let local_crate_id = CrateId(DefId(0));
-
-                        // Phase 1 → resolve → Phase 2 → incremental resolve,
-                        // all inside a helper so each phase's `&mut ctx`
-                        // borrow is scoped (the helper takes `ctx` once and
-                        // the phases reborrow it sequentially).
-                        let (program, symbols, mut trait_env, all_diags, resolution_map) =
-                            resolve_and_expand(&mut ctx, program, local_crate_id, &source, &file);
-                        let mut all_diags = all_diags;
-                        attach_source_to_diags(&mut all_diags, &source, &file);
-
-                        let has_main = resolution_map.has_main;
-                        let mut checker = TypeChecker::new_with_source(
-                            &mut ctx,
-                            &symbols,
-                            &mut trait_env,
-                            resolution_map,
-                            cli.strict,
-                            cli.enable_experimental,
-                            cli.feature,
-                            cli.debug,
-                            Some(&source),
-                        );
-                        let checker_result = checker.check_program(&program);
-                        // Extract checker diagnostics (warnings, notes) even on success.
-                        let checker_diags = checker.take_diagnostics();
-                        let mut checker_diag_vec: Vec<Diagnostic> = checker_diags.into_inner();
-                        attach_source_to_diags(&mut checker_diag_vec, &source, &file);
-                        if !checker_diag_vec.is_empty() {
-                            let mut emitter = make_emitter(json);
-                            emitter.emit_all(&checker_diag_vec);
-                        }
-                        match checker_result {
-                            Ok(_hir_program) => {
-                                // Checker succeeded — report any resolver diagnostics.
-                                if !all_diags.is_empty() {
-                                    let mut emitter = make_emitter(json);
-                                    emitter.emit_all(&all_diags);
-                                }
-                                // Verify that a `main` function exists.
-                                if !has_main {
-                                    let mut diags = vec![
-                                        Diagnostic::error(
-                                            "`main` function not found in crate",
-                                        )
-                                        .with_code_str("E062")
-                                        .with_help(
-                                            "add a `def main() { ... }` function as the entry point",
-                                        ),
-                                    ];
-                                    attach_source_to_diags(&mut diags, &source, &file);
-                                    let mut emitter = make_emitter(json);
-                                    emitter.emit_all(&diags);
-                                    process::exit(1);
-                                }
-                                if all_diags.is_empty() {
-                                    println!("Type checking succeeded.");
-                                } else {
-                                    process::exit(1);
-                                }
-                            }
-                            Err(errors) => {
-                                let mut diags = errors.into_inner();
-                                attach_source_to_diags(&mut diags, &source, &file);
-                                // Merge checker diagnostics (warnings accumulated
-                                // before the fatal error) into the error output —
-                                // they must not be silently dropped.
-                                diags.extend(checker_diag_vec);
-                                // Merge resolver diagnostics into checker diagnostics.
-                                diags.extend(all_diags);
-                                let mut emitter = make_emitter(json);
-                                emitter.emit_all(&diags);
-                                process::exit(1);
-                            }
-                        }
-                    }
-                }
-                Err(mut diagnostics) => {
-                    attach_source_to_diags(&mut diagnostics, &source, &file);
-                    let mut emitter = make_emitter(json);
-                    emitter.emit_all(&diagnostics);
-                    process::exit(1);
-                }
+            let code = report(run_parse(&file, ast, &opts, session_sync_arena), json);
+            if code == 0 && !ast {
+                println!("Type checking succeeded.");
             }
+            code
         }
         cli::Command::Check { file, json } => {
-            let source = match fs::read_to_string(&file) {
-                Ok(s) => s,
-                Err(e) => {
-                    let mut diag = Diagnostic::error(format!("failed to read `{}`: {}", file, e));
-                    let mut emitter = make_emitter(json);
-                    emitter.emit(&diag);
-                    emitter.emit_summary(1, 0);
-                    process::exit(1);
-                }
-            };
-            let arena = bumpalo::Bump::new();
-            let mut parser = parser::Parser::new(&source, &arena);
-            let program = match parser.parse_program() {
-                Ok(p) => p,
-                Err(mut diagnostics) => {
-                    attach_source_to_diags(&mut diagnostics, &source, &file);
-                    let mut emitter = make_emitter(json);
-                    emitter.emit_all(&diagnostics);
-                    process::exit(1);
-                }
-            };
-            let target = match resolve_target(&cli.target) {
-                Ok(t) => t,
-                Err(msg) => {
-                    let mut diag = Diagnostic::error(msg);
-                    let mut emitter = make_emitter(json);
-                    emitter.emit(&diag);
-                    emitter.emit_summary(1, 0);
-                    process::exit(1);
-                }
-            };
-            let mut ctx = TypeContext::new_with_target(target);
-            ctx.arena = Some(&arena);
-            let local_crate_id = CrateId(DefId(0));
-            let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
-            let (symbols, mut trait_env, resolver_diags, resolution_map) =
-                resolver.resolve_program(&program);
-            let mut all_diags = resolver_diags.into_inner();
-            attach_source_to_diags(&mut all_diags, &source, &file);
-            let mut checker = TypeChecker::new_with_source(
-                &mut ctx,
-                &symbols,
-                &mut trait_env,
-                resolution_map,
-                cli.strict,
-                cli.enable_experimental,
-                cli.feature,
-                cli.debug,
-                Some(&source),
-            );
-            let checker_result = checker.check_program(&program);
-            let checker_diags = checker.take_diagnostics();
-            let mut checker_diag_vec: Vec<Diagnostic> = checker_diags.into_inner();
-            attach_source_to_diags(&mut checker_diag_vec, &source, &file);
-            match checker_result {
-                Ok(_hir) => {
-                    let mut diags = checker_diag_vec;
-                    diags.extend(all_diags);
-                    if !diags.is_empty() {
-                        let mut emitter = make_emitter(json);
-                        emitter.emit_all(&diags);
-                        if diags.iter().any(|d| d.is_error()) {
-                            process::exit(1);
-                        }
-                    }
-                    println!("Type checking succeeded.");
-                }
-                Err(errors) => {
-                    let mut diags = errors.into_inner();
-                    attach_source_to_diags(&mut diags, &source, &file);
-                    diags.extend(all_diags);
-                    let mut emitter = make_emitter(json);
-                    emitter.emit_all(&diags);
-                    process::exit(1);
-                }
+            let code = report(run_check(&file, &opts, session_sync_arena), json);
+            if code == 0 {
+                println!("Type checking succeeded.");
             }
+            code
         }
         cli::Command::Explain { code } => {
-            match code {
-                Some(code) => {
-                    // Start the local explain server on a random port.
-                    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-                        .expect("failed to bind explain server");
-                    let port = listener.local_addr().unwrap().port();
-                    diagnostics::error_code::set_explain_port(port);
+            run_explain(code);
+            0
+        }
+    };
+    if code != 0 {
+        process::exit(code);
+    }
+}
 
-                    let explanation = diagnostics::explain_error_code(&code);
-                    println!("{}", explanation);
+/// Render a handler's diagnostics and return the process exit code: `1` when
+/// any diagnostic is an error, `0` otherwise (warnings alone do not fail).
+fn report(outcome: Result<(), Vec<Diagnostic<'static>>>, json: bool) -> i32 {
+    let diags = match outcome {
+        Ok(()) => return 0,
+        Err(diags) => diags,
+    };
+    let mut emitter = make_emitter(json);
+    emitter.emit_all(&diags);
+    i32::from(diags.iter().any(|d| d.is_error()))
+}
 
-                    let explain_code = code.clone();
-                    let url = format!("http://127.0.0.1:{port}/{explain_code}");
-                    // Open the browser in a background thread so the server
-                    // can accept connections.
-                    let url_bg = url.clone();
-                    std::thread::spawn(move || {
-                        let _ = open_browser(&url_bg);
-                    });
-
-                    // Serve the explain page using the already-bound listener.
-                    diagnostics::explain_server::serve_explain(&listener, &explain_code)
-                        .unwrap_or_else(|e| {
-                            eprintln!("warning: explain server error: {e}");
-                        });
-                }
-                None => {
-                    print!("{}", diagnostics::list_error_codes());
+/// Lex a file, printing each token.  Never exits.
+fn run_lex(file: &str) -> Result<(), Vec<Diagnostic<'static>>> {
+    let source = fs::read_to_string(file).map_err(|e| {
+        // Don't attach source — the file couldn't be read, so there is no
+        // source code to display.  The emitter closes the box with └─.
+        vec![Diagnostic::error(format!(
+            "failed to read `{}`: {}",
+            file, e
+        ))]
+    })?;
+    let lexer = lexer::Token::lexer(&source);
+    for result in lexer {
+        match result {
+            Ok(token) => {
+                if token != lexer::Token::WhitespaceOrComment {
+                    println!("{:?}", token);
                 }
             }
+            Err(()) => eprintln!("ERROR: invalid token"),
+        }
+    }
+    Ok(())
+}
+
+/// Parse a file, and unless `--ast` was given, resolve and type-check it.
+///
+/// Returns the diagnostics to render; never calls `process::exit`, so it is
+/// safe to invoke from a rayon worker.
+fn run_parse(
+    file: &str,
+    ast: bool,
+    opts: &CompilerOptions,
+    sync_arena: &'static arena::SyncArena<'static>,
+) -> Result<(), Vec<Diagnostic<'static>>> {
+    let source = fs::read_to_string(file).map_err(|e| {
+        vec![Diagnostic::error(format!(
+            "failed to read `{}`: {}",
+            file, e
+        ))]
+    })?;
+    // Copy the source into the leaked arena so the diagnostics that borrow it
+    // can outlive this call and be rendered by `main`.
+    let source: &'static str = sync_arena.alloc_str(&source);
+
+    let mut parser = parser::Parser::new(source, sync_arena);
+    let program = match parser.parse_program() {
+        Ok(p) => p,
+        Err(mut diagnostics) => {
+            attach_source_to_diags(&mut diagnostics, source, file);
+            return Err(diagnostics);
+        }
+    };
+    if ast {
+        println!("{:#?}", program);
+        return Ok(());
+    }
+
+    let target = match resolve_target(&opts.target) {
+        Ok(t) => t,
+        Err(msg) => return Err(vec![Diagnostic::error(msg)]),
+    };
+    let mut ctx = TypeContext::new_with_target(target.clone());
+    // A `SyncArena`, not a bare `&Bump`: a bare `&Bump` makes `TypeContext`
+    // neither `Send` nor `Sync`, which is what blocked queries from being
+    // handed it.  See `crate::arena`.
+    ctx.arena = Some(sync_arena);
+    let local_crate_id = CrateId(DefId(0));
+
+    // Phase 1 → resolve → Phase 2 → incremental resolve, all inside a helper
+    // so each phase's `&mut ctx` borrow is scoped (the helper takes `ctx`
+    // once and the phases reborrow it sequentially).
+    let (program, symbols, trait_env, mut all_diags, resolution_map) =
+        resolve_and_expand(&mut ctx, program, local_crate_id, source, file);
+    attach_source_to_diags(&mut all_diags, source, file);
+
+    // From here the session owns the pipeline state, so a query can be handed
+    // all of it through one provider.
+    let mut session = CompilerSession::new(ctx, symbols, trait_env, resolution_map, target);
+
+    let has_main = session.resolution_map.has_main;
+    let mut checker = TypeChecker::new_with_source(
+        &mut session.ctx,
+        &session.symbols,
+        &mut session.trait_env,
+        // `TypeChecker` takes the map by value, so the session keeps its own
+        // copy for queries to read.
+        session.resolution_map.clone(),
+        opts.strict,
+        opts.enable_experimental,
+        opts.feature.clone(),
+        opts.debug,
+        Some(source),
+    );
+    let checker_result = checker.check_program(&program);
+    // Extract checker diagnostics (warnings, notes) even on success.
+    let mut checker_diag_vec = checker.take_diagnostics().into_inner();
+    attach_source_to_diags(&mut checker_diag_vec, source, file);
+    match checker_result {
+        Ok(_hir_program) => {
+            // Checker succeeded — report any resolver diagnostics.
+            let mut diags = checker_diag_vec;
+            diags.extend(all_diags);
+            // Verify that a `main` function exists.
+            if !has_main {
+                let mut main_diag = vec![
+                    Diagnostic::error("`main` function not found in crate")
+                        .with_code_str("E062")
+                        .with_help("add a `def main() { ... }` function as the entry point"),
+                ];
+                attach_source_to_diags(&mut main_diag, source, file);
+                diags.extend(main_diag);
+            }
+            if diags.is_empty() { Ok(()) } else { Err(diags) }
+        }
+        Err(errors) => {
+            let mut diags = errors.into_inner();
+            attach_source_to_diags(&mut diags, source, file);
+            // Merge checker diagnostics (warnings accumulated before the
+            // fatal error) and resolver diagnostics — neither may be dropped.
+            diags.extend(checker_diag_vec);
+            diags.extend(all_diags);
+            Err(diags)
+        }
+    }
+}
+
+/// Parse, resolve, and type-check a file.  Never calls `process::exit`.
+fn run_check(
+    file: &str,
+    opts: &CompilerOptions,
+    sync_arena: &'static arena::SyncArena<'static>,
+) -> Result<(), Vec<Diagnostic<'static>>> {
+    let source = fs::read_to_string(file).map_err(|e| {
+        vec![Diagnostic::error(format!(
+            "failed to read `{}`: {}",
+            file, e
+        ))]
+    })?;
+    let source: &'static str = sync_arena.alloc_str(&source);
+
+    let mut parser = parser::Parser::new(source, sync_arena);
+    let program = match parser.parse_program() {
+        Ok(p) => p,
+        Err(mut diagnostics) => {
+            attach_source_to_diags(&mut diagnostics, source, file);
+            return Err(diagnostics);
+        }
+    };
+    let target = match resolve_target(&opts.target) {
+        Ok(t) => t,
+        Err(msg) => return Err(vec![Diagnostic::error(msg)]),
+    };
+    let mut ctx = TypeContext::new_with_target(target.clone());
+    ctx.arena = Some(sync_arena);
+    let local_crate_id = CrateId(DefId(0));
+    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, Some(source));
+    let (symbols, trait_env, resolver_diags, resolution_map) = resolver.resolve_program(&program);
+    let mut all_diags = resolver_diags.into_inner();
+    attach_source_to_diags(&mut all_diags, source, file);
+
+    // Same session plumbing as the `Parse` path above.
+    let mut session = CompilerSession::new(ctx, symbols, trait_env, resolution_map, target);
+
+    let mut checker = TypeChecker::new_with_source(
+        &mut session.ctx,
+        &session.symbols,
+        &mut session.trait_env,
+        // `TypeChecker` takes the map by value, so the session keeps its own
+        // copy for queries to read.
+        session.resolution_map.clone(),
+        opts.strict,
+        opts.enable_experimental,
+        opts.feature.clone(),
+        opts.debug,
+        Some(source),
+    );
+    let checker_result = checker.check_program(&program);
+    let mut checker_diag_vec = checker.take_diagnostics().into_inner();
+    attach_source_to_diags(&mut checker_diag_vec, source, file);
+    match checker_result {
+        Ok(_hir) => {
+            let mut diags = checker_diag_vec;
+            diags.extend(all_diags);
+            if diags.is_empty() { Ok(()) } else { Err(diags) }
+        }
+        Err(errors) => {
+            let mut diags = errors.into_inner();
+            attach_source_to_diags(&mut diags, source, file);
+            diags.extend(all_diags);
+            Err(diags)
+        }
+    }
+}
+
+/// Show an error-code explanation (blocking while the explain server runs).
+fn run_explain(code: Option<String>) {
+    match code {
+        Some(code) => {
+            // Start the local explain server on a random port.
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind explain server");
+            let port = listener.local_addr().unwrap().port();
+            diagnostics::error_code::set_explain_port(port);
+
+            let explanation = diagnostics::explain_error_code(&code);
+            println!("{}", explanation);
+
+            let explain_code = code.clone();
+            let url = format!("http://127.0.0.1:{port}/{explain_code}");
+            // Open the browser in a background thread so the server can
+            // accept connections.
+            let url_bg = url.clone();
+            std::thread::spawn(move || {
+                let _ = open_browser(&url_bg);
+            });
+
+            // Serve the explain page using the already-bound listener.
+            diagnostics::explain_server::serve_explain(&listener, &explain_code).unwrap_or_else(
+                |e| {
+                    eprintln!("warning: explain server error: {e}");
+                },
+            );
+        }
+        None => {
+            print!("{}", diagnostics::list_error_codes());
         }
     }
 }

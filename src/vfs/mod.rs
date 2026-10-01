@@ -30,10 +30,14 @@ pub struct DirEntry {
 /// test fixtures, or any other storage medium.
 pub trait VfsBackend: fmt::Debug {
     /// Read the full contents of a file at `path`.
-    fn read_file(&self, path: &str) -> Result<String, VfsError>;
+    ///
+    /// Backends never carry diagnostics, so their error type is always
+    /// `VfsError<'static>` — callers that need a shorter lifetime coerce
+    /// it via a `return` (see `ensure_ast`).
+    fn read_file(&self, path: &str) -> Result<String, VfsError<'static>>;
 
     /// List entries in a directory at `path`.
-    fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError>;
+    fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError<'static>>;
 
     /// Return the kind of the entry at `path`, or `None` if it doesn't exist.
     fn path_type(&self, path: &str) -> Option<VfsNodeKind>;
@@ -46,12 +50,12 @@ pub trait VfsBackend: fmt::Debug {
 pub struct FsBackend;
 
 impl VfsBackend for FsBackend {
-    fn read_file(&self, path: &str) -> Result<String, VfsError> {
+    fn read_file(&self, path: &str) -> Result<String, VfsError<'static>> {
         std::fs::read_to_string(path)
             .map_err(|e| VfsError::Io(format!("failed to read '{}': {}", path, e)))
     }
 
-    fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError> {
+    fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError<'static>> {
         let dir = std::fs::read_dir(path)
             .map_err(|e| VfsError::Io(format!("failed to read dir '{}': {}", path, e)))?;
         let mut entries = Vec::new();
@@ -158,14 +162,14 @@ impl MemoryBackend {
 }
 
 impl VfsBackend for MemoryBackend {
-    fn read_file(&self, path: &str) -> Result<String, VfsError> {
+    fn read_file(&self, path: &str) -> Result<String, VfsError<'static>> {
         self.files
             .get(path)
             .cloned()
             .ok_or_else(|| VfsError::Io(format!("file '{}' not found in memory backend", path)))
     }
 
-    fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError> {
+    fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError<'static>> {
         self.dirs.get(path).cloned().ok_or_else(|| {
             VfsError::Io(format!("directory '{}' not found in memory backend", path))
         })
@@ -208,22 +212,23 @@ pub struct VfsNode<'input> {
     pub fs_path: Option<String>,
     /// Shared arena backing every node's parsed AST — owned by the caller
     /// of `scan` and threaded through the whole tree, so re-parsing a node
-    /// never leaks a fresh arena.
-    pub arena: &'input bumpalo::Bump,
+    /// never leaks a fresh arena.  A `SyncArena` (not a bare `&Bump`) so the
+    /// parser allocates through the arena's lock and the handle stays `Send`.
+    pub arena: &'input crate::arena::SyncArena<'input>,
 }
 
 /// Errors that can occur during VFS operations.
 #[derive(Debug, Clone)]
-pub enum VfsError {
+pub enum VfsError<'src> {
     Io(String),
     Lex(String),
     Parse(String),
-    Diagnostics(Vec<Diagnostic>),
+    Diagnostics(Vec<Diagnostic<'src>>),
 }
 
 impl<'input> VfsNode<'input> {
     /// Create a new file node.
-    pub fn new_file(id: usize, name: &str, arena: &'input bumpalo::Bump) -> Self {
+    pub fn new_file(id: usize, name: &str, arena: &'input crate::arena::SyncArena<'input>) -> Self {
         VfsNode {
             kind: VfsNodeKind::File,
             name: name.to_string(),
@@ -239,7 +244,12 @@ impl<'input> VfsNode<'input> {
     }
 
     /// Create a new directory node.
-    pub fn new_dir(id: usize, name: &str, kind: VfsNodeKind, arena: &'input bumpalo::Bump) -> Self {
+    pub fn new_dir(
+        id: usize,
+        name: &str,
+        kind: VfsNodeKind,
+        arena: &'input crate::arena::SyncArena<'input>,
+    ) -> Self {
         VfsNode {
             kind,
             name: name.to_string(),
@@ -260,7 +270,7 @@ impl<'input> VfsNode<'input> {
     ///
     /// Returns `Err(VfsError)` if the source file cannot be read from the backend.
     #[must_use]
-    pub fn ensure_src(&mut self, backend: &dyn VfsBackend) -> Result<(), VfsError> {
+    pub fn ensure_src(&mut self, backend: &dyn VfsBackend) -> Result<(), VfsError<'static>> {
         if self.src.is_some() {
             return Ok(());
         }
@@ -282,7 +292,7 @@ impl<'input> VfsNode<'input> {
     ///
     /// Returns `Err(VfsError)` if the source text cannot be lexed.
     #[must_use]
-    pub fn ensure_tokens(&mut self, backend: &dyn VfsBackend) -> Result<(), VfsError> {
+    pub fn ensure_tokens(&mut self, backend: &dyn VfsBackend) -> Result<(), VfsError<'static>> {
         if self.tokens.is_some() {
             return Ok(());
         }
@@ -309,21 +319,26 @@ impl<'input> VfsNode<'input> {
     ///
     /// Returns `Err(VfsError)` if the token stream cannot be parsed.
     #[must_use]
-    pub fn ensure_ast(&mut self, backend: &dyn VfsBackend) -> Result<(), VfsError> {
+    pub fn ensure_ast(&mut self, backend: &dyn VfsBackend) -> Result<(), VfsError<'input>> {
         if self.ast.is_some() {
             return Ok(());
         }
-        self.ensure_src(backend)?;
-        let src = self
-            .src
-            .as_ref()
-            .ok_or(VfsError::Io("source not loaded".to_string()))?
-            .clone();
-        // The parsed `Program<'input>` borrows from the TREE-level shared
-        // arena (owned by the caller of `scan`), so re-parsing a node
-        // never leaks a fresh arena.
+        // `ensure_src` yields `VfsError<'static>`; a plain `return` performs
+        // the `'static → 'input` subtyping coercion that `?`'s `From` cannot.
+        if let Err(e) = self.ensure_src(backend) {
+            return Err(e);
+        }
         let arena = self.arena;
-        let mut parser = Parser::new(&src, arena);
+        // Copy the source into the TREE-level shared arena (owned by the
+        // caller of `scan`), so the parsed `Program<'input>` may borrow it
+        // and re-parsing a node never leaks a fresh arena.  A borrow of the
+        // node-local `String` could not escape into `VfsError<'input>`.
+        let src: &'input str = arena.alloc_str(
+            self.src
+                .as_deref()
+                .ok_or(VfsError::Io("source not loaded".to_string()))?,
+        );
+        let mut parser = Parser::new(src, arena);
         match parser.parse_program() {
             Ok(program) => {
                 self.ast = Some(program);
@@ -350,8 +365,8 @@ impl<'input> VfsNode<'input> {
         backend: &dyn VfsBackend,
         root: &str,
         id_counter: &mut usize,
-        arena: &'input bumpalo::Bump,
-    ) -> Result<VfsNode<'input>, VfsError> {
+        arena: &'input crate::arena::SyncArena<'input>,
+    ) -> Result<VfsNode<'input>, VfsError<'static>> {
         let path = Path::new(root);
         let name = path
             .file_name()
@@ -436,7 +451,8 @@ mod tests {
         backend.insert_file("/src/main.ps", "def main() -> Int<32> { return 42; }");
 
         // The arena is owned HERE, by the caller, and outlives the tree.
-        let arena = bumpalo::Bump::new();
+        let bump = bumpalo::Bump::new();
+        let arena = crate::arena::SyncArena::new(&bump);
         let mut id_counter = 0;
         let mut root =
             VfsNode::scan(&backend, "/src", &mut id_counter, &arena).expect("scan should succeed");

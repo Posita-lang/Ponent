@@ -436,6 +436,7 @@ pub fn walk_pattern<'ast, 'input, V: Visitor<'ast, 'input>>(
             }
             V::Result::output()
         }
+        Pattern::Annotated { inner, .. } => visitor.visit_pattern(inner),
     }
 }
 
@@ -502,21 +503,36 @@ fn bound_vars<'input>(p: &Pattern<'input>, out: &mut Vec<Symbol>) {
                 bound_vars(sub, out);
             }
         }
+        Pattern::Annotated { inner, .. } => bound_vars(inner, out),
         Pattern::Wildcard(_) | Pattern::Literal(..) | Pattern::Error(_) => {}
     }
 }
 
+/// Checks whether a pattern binds a given identifier — used for capture
+/// avoidance when renaming identifiers in sub-trees.
+fn pattern_binds(p: &Pattern<'_>, sym: Symbol) -> bool {
+    let mut bv = Vec::new();
+    bound_vars(p, &mut bv);
+    bv.contains(&sym)
+}
+
 pub fn replace_ident_in_expr<'input>(
-    arena: &'input bumpalo::Bump,
+    arena: &crate::arena::SyncArena<'input>,
     expr: &Expr<'input>,
     old_name: Symbol,
     new_name: Symbol,
 ) -> &'input Expr<'input> {
-    fn go<'a>(arena: &'a bumpalo::Bump, e: &Expr<'a>, old: Symbol, new: Symbol) -> &'a Expr<'a> {
+    fn go<'a>(
+        arena: &crate::arena::SyncArena<'a>,
+        e: &Expr<'a>,
+        old: Symbol,
+        new: Symbol,
+    ) -> &'a Expr<'a> {
         match e {
-            Expr::Ident(name, span) if *name == old => arena.alloc(Expr::Ident(new, *span)),
+            Expr::Ident(name, span) => {
+                arena.alloc(Expr::Ident(if *name == old { new } else { *name }, *span))
+            }
             Expr::Literal(l, s) => arena.alloc(Expr::Literal(l.clone(), *s)),
-            Expr::Ident(name, span) => arena.alloc(Expr::Ident(*name, *span)),
             Expr::TypeAnnotated { expr, ty, span } => arena.alloc(Expr::TypeAnnotated {
                 expr: go(arena, expr, old, new),
                 // The type annotation is NOT renamed — the desugar only
@@ -677,12 +693,7 @@ pub fn replace_ident_in_expr<'input>(
                         // Capture avoidance (same as Match/IfLet): a branch
                         // binding `old` via its pattern or `as` binder
                         // shadows the rename target inside the branch body.
-                        let mut bv = Vec::new();
-                        bound_vars(&b.pattern, &mut bv);
-                        if let Some(bind_sym) = b.bind {
-                            bv.push(bind_sym);
-                        }
-                        let shadowed = bv.contains(&old);
+                        let shadowed = pattern_binds(&b.pattern, old) || b.bind == Some(old);
                         CatchBranch {
                             pattern: b.pattern.clone(),
                             bind: b.bind,
@@ -743,11 +754,7 @@ pub fn replace_ident_in_expr<'input>(
             } => arena.alloc(Expr::IfLet {
                 pattern: pattern.clone(),
                 scrutinee: go(arena, scrutinee, old, new),
-                then_branch: if {
-                    let mut bv = Vec::new();
-                    bound_vars(pattern, &mut bv);
-                    bv.contains(&old)
-                } {
+                then_branch: if pattern_binds(pattern, old) {
                     then_branch.clone()
                 } else {
                     then_branch
@@ -780,9 +787,7 @@ pub fn replace_ident_in_expr<'input>(
                         // Capture avoidance: a pattern that binds `old`
                         // shadows the outer name — its body must NOT be
                         // renamed (the reference is to the local binding).
-                        let mut bv = Vec::new();
-                        bound_vars(&arm.pattern, &mut bv);
-                        let shadowed = bv.contains(&old);
+                        let shadowed = pattern_binds(&arm.pattern, old);
                         MatchArm {
                             pattern: arm.pattern.clone(),
                             // The guard is evaluated in the scope of the
@@ -868,16 +873,21 @@ pub fn replace_ident_in_expr<'input>(
 /// Rename all occurrences of `old_name` to `new_name` in a statement tree,
 /// allocating the NEW tree in `arena` (functional — the AST is arena-backed).
 pub fn replace_ident_in_stmt<'input>(
-    arena: &'input bumpalo::Bump,
+    arena: &crate::arena::SyncArena<'input>,
     stmt: &Stmt<'input>,
     old_name: Symbol,
     new_name: Symbol,
 ) -> Stmt<'input> {
-    fn go_expr<'a>(arena: &'a bumpalo::Bump, e: &Expr<'a>, old: Symbol, new: Symbol) -> Expr<'a> {
+    fn go_expr<'a>(
+        arena: &crate::arena::SyncArena<'a>,
+        e: &Expr<'a>,
+        old: Symbol,
+        new: Symbol,
+    ) -> Expr<'a> {
         (*replace_ident_in_expr(arena, e, old, new)).clone()
     }
     fn go_stmts<'a>(
-        arena: &'a bumpalo::Bump,
+        arena: &crate::arena::SyncArena<'a>,
         ss: &[Stmt<'a>],
         old: Symbol,
         new: Symbol,
@@ -887,30 +897,26 @@ pub fn replace_ident_in_stmt<'input>(
         // `old` is bound locally, later references point at the local
         // binder and must NOT be renamed (a stateless map would sever
         // them, leaving dangling references).
-        let mut shadowed: std::collections::HashSet<Symbol> = Default::default();
+        let mut shadowed = false;
         ss.iter()
             .map(|s| {
-                if shadowed.contains(&old) {
+                if shadowed {
                     return (*s).clone();
                 }
                 let r = replace_ident_in_stmt(arena, s, old, new);
                 match s {
                     Stmt::VariableDef { name: Some(n), .. } if *n == old => {
-                        shadowed.insert(old);
+                        shadowed = true;
                     }
                     Stmt::VariableDef {
                         pattern: Some(p), ..
-                    } => {
-                        let mut bv = Vec::new();
-                        bound_vars(p, &mut bv);
-                        if bv.contains(&old) {
-                            shadowed.insert(old);
-                        }
+                    } if pattern_binds(p, old) => {
+                        shadowed = true;
                     }
                     // Loop variables (`For`/`WhileLet` pattern bindings)
                     // are scoped to the LOOP BODY only — they do NOT leak
                     // to subsequent block statements, so they must not
-                    // pollute the block-level `shadowed` set (which would
+                    // pollute the block-level `shadowed` flag (which would
                     // wrongly skip renaming the rest of the block).
                     _ => {}
                 }
@@ -919,7 +925,7 @@ pub fn replace_ident_in_stmt<'input>(
             .collect()
     }
     fn go_contract<'a>(
-        arena: &'a bumpalo::Bump,
+        arena: &crate::arena::SyncArena<'a>,
         c: &Contract<'a>,
         old: Symbol,
         new: Symbol,
@@ -1129,9 +1135,7 @@ pub fn replace_ident_in_stmt<'input>(
             // else branch stays in the outer scope and references to
             // `old_name` there refer to the rename target and MUST be
             // renamed regardless of what the pattern binds.
-            let mut bv = Vec::new();
-            bound_vars(pattern, &mut bv);
-            let shadowed = bv.contains(&old_name);
+            let shadowed = pattern_binds(pattern, old_name);
             Stmt::IfLet {
                 pattern: pattern.clone(),
                 scrutinee: go_expr(arena, scrutinee, old_name, new_name),
@@ -1176,9 +1180,7 @@ pub fn replace_ident_in_stmt<'input>(
         } => {
             // Capture avoidance: a pattern binding `old_name`
             // shadows the outer name — the body must NOT be renamed.
-            let mut bv = Vec::new();
-            bound_vars(pattern, &mut bv);
-            let shadowed = bv.contains(&old_name);
+            let shadowed = pattern_binds(pattern, old_name);
             Stmt::WhileLet {
                 label: *label,
                 pattern: pattern.clone(),
@@ -1209,9 +1211,7 @@ pub fn replace_ident_in_stmt<'input>(
             // Capture avoidance: a pattern binding `old_name`
             // shadows the outer name — the loop body must NOT be
             // renamed.
-            let mut bv = Vec::new();
-            bound_vars(pattern, &mut bv);
-            let shadowed = bv.contains(&old_name);
+            let shadowed = pattern_binds(pattern, old_name);
             Stmt::For {
                 label: *label,
                 pattern: pattern.clone(),
@@ -1285,7 +1285,7 @@ pub fn replace_ident_in_stmt<'input>(
             span,
         } => Stmt::Generate {
             attributes: attributes.clone(),
-            for_type: for_type.clone(),
+            for_type: &**for_type,
             body: go_stmts(arena, body, old_name, new_name),
             span: *span,
         },
@@ -1412,8 +1412,12 @@ mod tests {
         })
     }
 
-    fn parse_program(source: &str) -> (Program<'static>, &'static bumpalo::Bump) {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    fn parse_program(
+        source: &str,
+    ) -> (Program<'static>, &'static crate::arena::SyncArena<'static>) {
+        let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static crate::arena::SyncArena<'static> =
+            Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
         let mut parser = Parser::new(source, arena);
         let prog = parser
             .parse_program()
@@ -1423,7 +1427,7 @@ mod tests {
 
     /// Parse a function body and return its first statement.  Top level
     /// only accepts items, so test statements live inside `def f() { ... }`.
-    fn first_fn_stmt(source: &str) -> (Stmt<'static>, &'static bumpalo::Bump) {
+    fn first_fn_stmt(source: &str) -> (Stmt<'static>, &'static crate::arena::SyncArena<'static>) {
         let (prog, arena) = parse_program(source);
         let Stmt::FunctionDef {
             body: Some(body), ..

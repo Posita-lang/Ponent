@@ -29,10 +29,10 @@ pub(crate) fn levenshtein_distance(a: &str, b: &str) -> usize {
 
 /// Find names in `candidates` that are similar to `name` (edit distance ≤ 2),
 /// sorted by closest match. Returns up to 3 suggestions.
-pub(crate) fn find_similar_names<'a>(name: &str, candidates: &'a [String]) -> Vec<&'a str> {
+pub(crate) fn find_similar_names<'a>(name: &str, candidates: &'a [&'a str]) -> Vec<&'a str> {
     let mut scored: Vec<(&str, usize)> = candidates
         .iter()
-        .map(|c| (c.as_str(), levenshtein_distance(name, c)))
+        .map(|c| (*c, levenshtein_distance(name, c)))
         .filter(|(_, d)| *d <= 3 && *d > 0)
         .collect();
     scored.sort_by_key(|(_, d)| *d);
@@ -41,7 +41,7 @@ pub(crate) fn find_similar_names<'a>(name: &str, candidates: &'a [String]) -> Ve
 }
 
 /// Build a "did you mean ...?" suggestion string from similar names.
-pub(crate) fn did_you_mean_suggestion(name: &str, candidates: &[String]) -> Option<String> {
+pub(crate) fn did_you_mean_suggestion(name: &str, candidates: &[&str]) -> Option<String> {
     let similar = find_similar_names(name, candidates);
     if similar.is_empty() {
         None

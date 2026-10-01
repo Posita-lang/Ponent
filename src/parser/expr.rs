@@ -7,12 +7,12 @@ use crate::lexer::Token;
 use crate::symbol::Symbol;
 use smallvec::smallvec;
 
-impl<'input> Parser<'input> {
+impl<'src, 'input> Parser<'src, 'input> {
     // -------------------------------------------------------------------------
     // Expression entry
     // -------------------------------------------------------------------------
 
-    pub fn parse_expr(&mut self) -> Result<Expr<'input>, Diagnostic> {
+    pub fn parse_expr(&mut self) -> Result<Expr<'input>, Diagnostic<'src>> {
         if let Some(e) = self.parse_expr_fast()? {
             return Ok(e);
         }
@@ -25,7 +25,7 @@ impl<'input> Parser<'input> {
     /// without the full Pratt machinery.  A following `:` (type
     /// annotation) or anything else falls back to the general parser.
     #[inline(always)]
-    fn parse_expr_fast(&mut self) -> Result<Option<Expr<'input>>, Diagnostic> {
+    fn parse_expr_fast(&mut self) -> Result<Option<Expr<'input>>, Diagnostic<'src>> {
         // Check the token AFTER the literal FIRST (without consuming):
         // only a terminator (or a type-annotation colon) lets the literal
         // stand alone — otherwise (e.g. `1 + 2`) we must fall back WITHOUT
@@ -66,7 +66,7 @@ impl<'input> Parser<'input> {
     // Pratt parser (binding power)
     // -------------------------------------------------------------------------
 
-    fn parse_expr_bp(&mut self, min_bp: u8) -> Result<Expr<'input>, Diagnostic> {
+    fn parse_expr_bp(&mut self, min_bp: u8) -> Result<Expr<'input>, Diagnostic<'src>> {
         self.recursion_depth += 1;
         if self.recursion_depth > self.max_recursion_depth {
             self.recursion_depth -= 1;
@@ -81,44 +81,48 @@ impl<'input> Parser<'input> {
         result
     }
 
-    fn parse_expr_bp_inner(&mut self, min_bp: u8) -> Result<Expr<'input>, Diagnostic> {
+    fn parse_expr_bp_inner(&mut self, min_bp: u8) -> Result<Expr<'input>, Diagnostic<'src>> {
         let mut lhs = self.parse_prefix()?;
         loop {
-            let token_opt = self.peek().as_ref().ok().cloned();
-            if matches!(token_opt, None)
-                || matches!(
-                    token_opt,
-                    Some(Token::Semicolon)
-                        | Some(Token::RBrace)
-                        | Some(Token::RParen)
-                        | Some(Token::Comma)
-                        | Some(Token::Colon)
-                        | Some(Token::In)
-                )
-            {
-                break;
-            }
-            if let Some((lbp, _)) = self.prefix_binding_power(token_opt.as_ref()) {
-                if lbp < min_bp {
-                    break;
-                }
-                if self.restrictions.contains(ParseRestrictions::NO_COMPARISON) {
-                    let is_compare = token_opt.is_some_and(|t| {
-                        crate::lexer::token_class(&t).contains(crate::lexer::TokenClass::COMPARISON)
-                    });
-                    if is_compare {
-                        break;
+            // Borrow the peeked token directly — no clone needed;
+            // prefix_binding_power is a static fn that doesn't read &self.
+            let lbp = match self.peek() {
+                Ok(tok) if !matches!(
+                    tok,
+                    Token::Semicolon
+                        | Token::RBrace
+                        | Token::RParen
+                        | Token::Comma
+                        | Token::Colon
+                        | Token::In
+                ) =>
+                {
+                    match Self::prefix_binding_power(Some(tok)) {
+                        Some((lbp, _)) => lbp,
+                        None => break,
                     }
                 }
-                lhs = self.parse_infix(lhs, lbp)?;
-            } else {
+                _ => break,
+            };
+            if lbp < min_bp {
                 break;
             }
+            if self.restrictions.contains(ParseRestrictions::NO_COMPARISON) {
+                let is_compare = match self.peek() {
+                    Ok(tok) => crate::lexer::token_class(tok)
+                        .contains(crate::lexer::TokenClass::COMPARISON),
+                    Err(()) => false,
+                };
+                if is_compare {
+                    break;
+                }
+            }
+            lhs = self.parse_infix(lhs, lbp)?;
         }
         Ok(lhs)
     }
 
-    fn prefix_binding_power(&self, token: Option<&Token>) -> Option<(u8, bool)> {
+    fn prefix_binding_power(token: Option<&Token>) -> Option<(u8, bool)> {
         match token {
             // Mul/Div/Rem: precedence 1 (highest per SYNTAX.md)
             Some(Token::Star) | Some(Token::Slash) | Some(Token::Percent) => Some((15, true)),
@@ -177,7 +181,7 @@ impl<'input> Parser<'input> {
     // Prefix expression parser
     // -------------------------------------------------------------------------
 
-    fn parse_prefix(&mut self) -> Result<Expr<'input>, Diagnostic> {
+    fn parse_prefix(&mut self) -> Result<Expr<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         match self.peek() {
             Ok(Token::IntLiteral(_))
@@ -212,7 +216,17 @@ impl<'input> Parser<'input> {
                     return Ok(Expr::Tuple(Vec::new(), Span::new(start, end)));
                 }
                 let expr = self.parse_expr()?;
-                if matches!(self.peek(), Ok(Token::Comma)) {
+                if matches!(self.peek(), Ok(Token::Colon)) {
+                    self.advance().ok();
+                    let ty = self.parse_type()?;
+                    self.expect(Token::RParen)?;
+                    let end = self.span().end;
+                    Ok(Expr::TypeAnnotated {
+                        expr: Self::alloc_shared(self.arena, expr),
+                        ty: Self::alloc_shared(self.arena, ty),
+                        span: Span::new(start, end),
+                    })
+                } else if matches!(self.peek(), Ok(Token::Comma)) {
                     let mut exprs = vec![expr];
                     while matches!(self.peek(), Ok(Token::Comma)) {
                         self.advance().ok();
@@ -647,7 +661,7 @@ impl<'input> Parser<'input> {
     // Closure
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_closure(&mut self, start: usize) -> Result<Expr<'input>, Diagnostic> {
+    pub(super) fn parse_closure(&mut self, start: usize) -> Result<Expr<'input>, Diagnostic<'src>> {
         self.advance().ok();
         let mut params = Vec::new();
         loop {
@@ -724,7 +738,7 @@ impl<'input> Parser<'input> {
     // Path / literal / struct / enum / call
     // -------------------------------------------------------------------------
 
-    fn parse_path_or_literal(&mut self, start: usize) -> Result<Expr<'input>, Diagnostic> {
+    fn parse_path_or_literal(&mut self, start: usize) -> Result<Expr<'input>, Diagnostic<'src>> {
         let mut path = Vec::new();
         let name = match self.advance() {
             Ok(Token::Ident(n)) => n,
@@ -734,10 +748,17 @@ impl<'input> Parser<'input> {
         while matches!(self.peek(), Ok(Token::ColonColon)) {
             self.advance().ok();
             match self.advance() {
-                Ok(tok) if tok.as_ident_symbol().is_some() => {
-                    path.push(tok.as_ident_symbol().expect("guarded by is_some() above"))
-                }
-                _ => return Err(Diagnostic::error("expected identifier after '::'")
+                Ok(tok) => match tok.as_ident_symbol() {
+                    Some(sym) => path.push(sym),
+                    None => return Err(Diagnostic::error("expected identifier after '::'")
+                        .with_code_str("E004")
+                        .with_help(
+                            "`::` must be followed by an identifier — e.g. `std::collections::HashMap`",
+                        )
+                        .with_suggestion("add an identifier after `::`, e.g. `MyModule::MyType`")
+                        .with_span(self.span())),
+                },
+                Err(_) => return Err(Diagnostic::error("expected identifier after '::'")
                     .with_code_str("E004")
                     .with_help(
                         "`::` must be followed by an identifier — e.g. `std::collections::HashMap`",
@@ -827,7 +848,7 @@ impl<'input> Parser<'input> {
         &mut self,
         path: Vec<Symbol>,
         start: usize,
-    ) -> Result<Expr<'input>, Diagnostic> {
+    ) -> Result<Expr<'input>, Diagnostic<'src>> {
         self.expect(Token::LBrace)?;
         let mut fields = Vec::new();
         loop {
@@ -880,7 +901,7 @@ impl<'input> Parser<'input> {
         path: Vec<Symbol>,
         variant: Symbol,
         start: usize,
-    ) -> Result<Expr<'input>, Diagnostic> {
+    ) -> Result<Expr<'input>, Diagnostic<'src>> {
         self.expect(Token::LParen)?;
         if matches!(self.peek(), Ok(Token::RParen)) {
             self.advance().ok();
@@ -923,7 +944,7 @@ impl<'input> Parser<'input> {
         &mut self,
         callee: Expr<'input>,
         start: usize,
-    ) -> Result<Expr<'input>, Diagnostic> {
+    ) -> Result<Expr<'input>, Diagnostic<'src>> {
         self.expect(Token::LParen)?;
         let mut args = Vec::new();
         if !matches!(self.peek(), Ok(Token::RParen)) {
@@ -950,7 +971,7 @@ impl<'input> Parser<'input> {
     // Literal parsing
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_literal(&mut self) -> Result<Expr<'input>, Diagnostic> {
+    pub(super) fn parse_literal(&mut self) -> Result<Expr<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         let token = self.advance().map_err(|_| {
             Diagnostic::error("unexpected token")
@@ -1032,7 +1053,7 @@ impl<'input> Parser<'input> {
     // Infix parsing
     // -------------------------------------------------------------------------
 
-    fn parse_infix(&mut self, lhs: Expr<'input>, bp: u8) -> Result<Expr<'input>, Diagnostic> {
+    fn parse_infix(&mut self, lhs: Expr<'input>, bp: u8) -> Result<Expr<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         match self.peek() {
             Ok(Token::Bang) => {
@@ -1384,7 +1405,7 @@ impl<'input> Parser<'input> {
         op: BinOp,
         bp: u8,
         start: usize,
-    ) -> Result<Expr<'input>, Diagnostic> {
+    ) -> Result<Expr<'input>, Diagnostic<'src>> {
         let rhs = self.parse_expr_bp(bp)?;
         Ok(Expr::BinaryOp {
             left: Self::alloc_shared(self.arena, lhs),
@@ -1398,7 +1419,7 @@ impl<'input> Parser<'input> {
     // `if` expression
     // -------------------------------------------------------------------------
 
-    fn parse_if_expr(&mut self) -> Result<Expr<'input>, Diagnostic> {
+    fn parse_if_expr(&mut self) -> Result<Expr<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         if matches!(self.peek(), Ok(Token::Let)) {
@@ -1473,7 +1494,7 @@ impl<'input> Parser<'input> {
     // Match expression
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_match_expr(&mut self) -> Result<Expr<'input>, Diagnostic> {
+    pub(super) fn parse_match_expr(&mut self) -> Result<Expr<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let scrutinee = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {

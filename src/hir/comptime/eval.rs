@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use crate::ast::JoinExact;
 
 /// A registered comptime function: (parameter_names, body_statements).
 /// The body is wrapped in `Arc` to avoid deep-cloning the AST on every call.
@@ -23,7 +24,7 @@ type ComptimeFn<'input> = (Vec<Symbol>, Arc<[HirStmt<'input>]>);
 fn signed_range(bits: u32) -> (i128, i128) {
     if bits == 0 {
         (0, 0)
-    } else if bits >= 127 {
+    } else if bits >= 128 {
         (i128::MIN, i128::MAX)
     } else {
         let max = (1i128 << (bits - 1)) - 1;
@@ -251,9 +252,9 @@ fn is_pure_expr<'input>(expr: &HirExpr<'input>) -> bool {
 
 /// Evaluation context for comptime blocks.
 /// Tracks step budget and provides expression evaluation.
-pub struct ComptimeEvalContext<'a, 'input> {
+pub struct ComptimeEvalContext<'a, 'src, 'input> {
     ctx: &'a mut TypeContext<'input>,
-    diag: &'a mut DiagCtxt,
+    diag: &'a mut DiagCtxt<'src>,
     steps: usize,
     step_limit: usize,
     /// Estimated memory used by comptime values (in bytes).
@@ -287,7 +288,7 @@ pub struct ComptimeEvalContext<'a, 'input> {
     /// Populated at creation time with comptime block/fn context.
     outer_traceback: Vec<(ComptimeReason, crate::ast::Span)>,
     /// Source text for converting byte offsets to line:column in tracebacks.
-    source: Option<&'a str>,
+    source: Option<&'src str>,
     /// Whether the current comptime block is `@trusted`, granting access to
     /// `@trusted` functions and `unsafe` operations during comptime evaluation.
     allow_trusted: bool,
@@ -301,11 +302,11 @@ pub struct ComptimeEvalContext<'a, 'input> {
     scope_shadows: Vec<HashMap<Symbol, SlotId>>,
 }
 
-impl<'a, 'input> ComptimeEvalContext<'a, 'input> {
+impl<'a, 'src, 'input> ComptimeEvalContext<'a, 'src, 'input> {
     pub fn new(
         ctx: &'a mut TypeContext<'input>,
         symbols: &'a SymbolTable<'input>,
-        diag: &'a mut DiagCtxt,
+        diag: &'a mut DiagCtxt<'src>,
     ) -> Self {
         Self::new_with_source(ctx, symbols, diag, Vec::new(), None)
     }
@@ -313,9 +314,9 @@ impl<'a, 'input> ComptimeEvalContext<'a, 'input> {
     pub fn new_with_source(
         ctx: &'a mut TypeContext<'input>,
         symbols: &'a SymbolTable<'input>,
-        diag: &'a mut DiagCtxt,
+        diag: &'a mut DiagCtxt<'src>,
         outer_traceback: Vec<(ComptimeReason, crate::ast::Span)>,
-        source: Option<&'a str>,
+        source: Option<&'src str>,
     ) -> Self {
         ComptimeEvalContext {
             ctx,
@@ -444,7 +445,7 @@ impl<'a, 'input> ComptimeEvalContext<'a, 'input> {
                 if path.len() == 1 {
                     let name = path[0].as_str();
                     // Built-in types with dedicated fields.
-                    match name.as_str() {
+                    match name {
                         "Bool" | "bool" => return Ok(self.ctx.builtin_bool),
                         "Unit" | "unit" | "()" => return Ok(self.ctx.builtin_unit),
                         "Never" | "never" | "!" => return Ok(self.ctx.builtin_never),
@@ -528,7 +529,7 @@ impl<'a, 'input> ComptimeEvalContext<'a, 'input> {
                             bits_u64, name,
                         ))
                     })?;
-                    match name.as_str() {
+                    match name {
                         "Int" => {
                             if bits < 1 || bits > 64 {
                                 return Err(ComptimeError::type_error(format!(
@@ -568,7 +569,7 @@ impl<'a, 'input> ComptimeEvalContext<'a, 'input> {
                 }
                 // Fall through to error for unknown generic types.
                 let name_str = match base {
-                    Type::Path(p, _) => p.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
+                    Type::Path(p, _) => p.iter().map(|s| s.as_str()).join_exact("::"),
                     _ => "<complex>".to_string(),
                 };
                 Err(ComptimeError::type_error(format!(
@@ -725,7 +726,9 @@ impl<'a, 'input> ComptimeEvalContext<'a, 'input> {
                                 result = val;
                             }
                             None => {
-                                return Err(ComptimeError::UnknownIdentifier(name.as_str()));
+                                return Err(ComptimeError::UnknownIdentifier(
+                                    name.as_str().to_string(),
+                                ));
                             }
                         }
                     } else if let HirExpr::UnaryOp {
@@ -1143,7 +1146,7 @@ impl<'a, 'input> ComptimeEvalContext<'a, 'input> {
                 //    (e.g. `let x = 42; comptime { ... x ... }`).
                 //    If the variable was declared as `let` with a literal initializer,
                 //    the checker already pre-populated `self.variables` with its
-                //    comptime value (see task #2 below), so step 1 caught it.
+                //    comptime value (see above), so step 1 caught it.
                 //    If we reach here, the variable is a true runtime variable whose
                 //    value is NOT known at compile time — emit a clear error instead
                 //    of silently returning the type.
@@ -1171,7 +1174,7 @@ impl<'a, 'input> ComptimeEvalContext<'a, 'input> {
                         name, name,
                     )));
                 }
-                Err(ComptimeError::UnknownIdentifier(name.as_str()))
+                Err(ComptimeError::UnknownIdentifier(name.as_str().to_string()))
             }
             HirExpr::Call {
                 callee,
@@ -1291,7 +1294,9 @@ impl<'a, 'input> ComptimeEvalContext<'a, 'input> {
                             fn_name,
                         )))
                     } else {
-                        Err(ComptimeError::UnknownIdentifier(fn_name.as_str()))
+                        Err(ComptimeError::UnknownIdentifier(
+                            fn_name.as_str().to_string(),
+                        ))
                     }
                 }
             }
@@ -1613,7 +1618,7 @@ impl<'a, 'input> ComptimeEvalContext<'a, 'input> {
                     // Zero-parameter closure: evaluate the body immediately.
                     self.eval_block(body)
                 } else {
-                    { Err(ComptimeError::Deferred) }
+                    Err(ComptimeError::Deferred)
                 }
             }
             HirExpr::Try { expr, .. } => {
@@ -1660,7 +1665,7 @@ impl<'a, 'input> ComptimeEvalContext<'a, 'input> {
                 // `T'default` — access a type attribute.
                 let base_val = self.eval_expr(base)?;
                 let attr_name = attr.as_str();
-                match attr_name.as_str() {
+                match attr_name {
                     "default" => {
                         // T'default — return the type itself as a value.
                         Ok(base_val)

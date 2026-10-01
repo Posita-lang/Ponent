@@ -14,10 +14,12 @@ fn test_find_type_hit_and_dedup() {
     let mut ctx = TypeContext::new();
     let a = ctx.int(32, true);
     let b = ctx.bool();
-    let t1 = ctx.tuple(vec![a, b]);
+    let t1 = ctx.tuple(smallvec![a, b]);
     // Same logical type, rebuilt from the same interned children:
     // find_type must hit and agree with the allocated TypeId.
-    let found = ctx.find_type(&TypeData::Tuple { elems: vec![a, b] });
+    let found = ctx.find_type(&TypeData::Tuple {
+        elems: smallvec![a, b],
+    });
     assert_eq!(found, Some(t1));
 }
 
@@ -36,7 +38,9 @@ fn test_find_type_skips_volatile() {
     );
     // A composite embedding the InferVar is volatile too — no table
     // entry, so find_type declines.
-    let tup = TypeData::Tuple { elems: vec![var] };
+    let tup = TypeData::Tuple {
+        elems: smallvec![var],
+    };
     assert_eq!(
         ctx.find_type(&tup),
         None,
@@ -144,7 +148,7 @@ fn test_typeid_tag_encode_decode() {
     let int_ty = ctx.int(32, true);
     assert_eq!(int_ty.tag(), TypeTag::Int);
 
-    let fn_ty = ctx.function(vec![int_ty], ctx.bool());
+    let fn_ty = ctx.function(smallvec![int_ty], ctx.bool());
     assert_eq!(fn_ty.tag(), TypeTag::Fn);
 }
 
@@ -153,7 +157,7 @@ fn test_typeid_tag_index_roundtrip() {
     let mut ctx = new_ctx();
     let b = ctx.bool();
     let idx = b.index();
-    assert_eq!(*ctx.types[idx], TypeData::Bool);
+    assert_eq!(**ctx.slot(idx), TypeData::Bool);
 }
 
 // -- Variance --
@@ -172,7 +176,7 @@ fn test_variance_invariant_ref() {
     assert!(!ctx.check_variance(0, ref_ty, 1));
     assert!(!ctx.check_variance(0, ref_ty, -1));
     // A covariant tuple containing the param works
-    let tup_ty = ctx.tuple(vec![p0]);
+    let tup_ty = ctx.tuple(smallvec![p0]);
     assert!(ctx.check_variance(0, tup_ty, 1));
 }
 
@@ -272,8 +276,8 @@ fn test_variance_nested_fn() {
     let p0 = ctx.generic_param(0, "T".into());
     let bool_ty = ctx.bool();
     let int_ty = ctx.int(32, true);
-    let inner = ctx.function(vec![p0], bool_ty);
-    let outer = ctx.function(vec![int_ty], inner);
+    let inner = ctx.function(smallvec![p0], bool_ty);
+    let outer = ctx.function(smallvec![int_ty], inner);
     assert!(ctx.type_contains_param(0, outer));
 }
 
@@ -310,7 +314,7 @@ fn test_characteristic_unit() {
 fn test_characteristic_fn() {
     let mut ctx = TypeContext::new();
     let bool_ty = ctx.bool();
-    let fn_ty = ctx.function(vec![bool_ty], bool_ty);
+    let fn_ty = ctx.function(smallvec![bool_ty], bool_ty);
     // Bool → Bool has 2^2 = 4 inhabitants.
     assert_eq!(
         ctx.characteristic(fn_ty),
@@ -340,8 +344,8 @@ fn test_characteristic_ksp_convergence() {
     let p0 = ctx.generic_param(0, "X".into());
     // Simulate μX: Bool × X  via Forall(0, "X", (Bool, X) ⇒ X)
     let body = {
-        let tup = ctx.tuple(vec![bool_ty, p0]);
-        ctx.function(vec![tup], p0)
+        let tup = ctx.tuple(smallvec![bool_ty, p0]);
+        ctx.function(smallvec![tup], p0)
     };
     let ty = ctx.forall(0, "X".into(), body);
     // With axiom links connecting GPIO occurrences as bidirectional edges,
@@ -468,9 +472,9 @@ fn test_replace_generic_fn_ret() {
     let p0 = ctx.generic_param(0, "T".into());
     let p1 = ctx.generic_param(1, "U".into());
     let int_ty = ctx.int(32, true);
-    let fn_ty = ctx.function(vec![p0], p1);
+    let fn_ty = ctx.function(smallvec![p0], p1);
     let replaced = ctx.replace_generic(fn_ty, 0, int_ty);
-    let expected = ctx.function(vec![int_ty], p1);
+    let expected = ctx.function(smallvec![int_ty], p1);
     assert_eq!(replaced, expected);
 }
 
@@ -490,8 +494,8 @@ fn test_yoneda_single_param_case1() {
     let mut ctx = TypeContext::new();
     let p0 = ctx.generic_param(0, "X".into());
     let int_ty = ctx.int(32, true);
-    let inner_fn = ctx.function(vec![int_ty], p0);
-    let outer_fn = ctx.function(vec![inner_fn], p0);
+    let inner_fn = ctx.function(smallvec![int_ty], p0);
+    let outer_fn = ctx.function(smallvec![inner_fn], p0);
     let forall_id = ctx.forall(0, "X".into(), outer_fn);
     let forall = ctx.try_yoneda_reduce(forall_id);
     assert_eq!(forall, int_ty, "∀X.(Int⇒X)⇒X should reduce to Int");
@@ -504,14 +508,14 @@ fn test_yoneda_single_param_case2() {
     let p0 = ctx.generic_param(0, "X".into());
     let int_ty = ctx.int(32, true);
     let bool_ty = ctx.bool();
-    let inner_fn = ctx.function(vec![p0], int_ty);
-    let outer_fn = ctx.function(vec![p0], bool_ty);
-    let combined = ctx.function(vec![inner_fn], outer_fn);
+    let inner_fn = ctx.function(smallvec![p0], int_ty);
+    let outer_fn = ctx.function(smallvec![p0], bool_ty);
+    let combined = ctx.function(smallvec![inner_fn], outer_fn);
     let forall_id = ctx.forall(0, "X".into(), combined);
     let forall = ctx.try_yoneda_reduce(forall_id);
     assert_eq!(
         forall,
-        ctx.function(vec![int_ty], bool_ty),
+        ctx.function(smallvec![int_ty], bool_ty),
         "∀X.(X⇒Int)⇒(X⇒Bool) should reduce to Int⇒Bool"
     );
 }
@@ -521,7 +525,7 @@ fn test_yoneda_no_reduction() {
     // ∀X.Int⇒Int should not reduce
     let mut ctx = TypeContext::new();
     let int_ty = ctx.int(32, true);
-    let fn_ty = ctx.function(vec![int_ty], int_ty);
+    let fn_ty = ctx.function(smallvec![int_ty], int_ty);
     let forall = ctx.forall(0, "X".into(), fn_ty);
     assert!(matches!(ctx.get(forall), TypeData::Forall { .. }));
 }
@@ -536,8 +540,8 @@ fn test_yoneda_partial_match_no_reduction() {
     let mut ctx = TypeContext::new();
     let p0 = ctx.generic_param(0, "X".into());
     let int_ty = ctx.int(32, true);
-    let branch = ctx.function(vec![int_ty], p0); // A → X (A = Int)
-    let outer_fn = ctx.function(vec![branch, int_ty], p0); // (A → X) → Int → X
+    let branch = ctx.function(smallvec![int_ty], p0); // A → X (A = Int)
+    let outer_fn = ctx.function(smallvec![branch, int_ty], p0); // (A → X) → Int → X
     let forall_id = ctx.forall(0, "X".into(), outer_fn);
     let reduced = ctx.try_yoneda_reduce(forall_id);
     assert_eq!(
@@ -559,11 +563,11 @@ fn test_yoneda_multi_param_inner_fn() {
     let p0 = ctx.generic_param(0, "X".into());
     let int_ty = ctx.int(32, true);
     let bool_ty = ctx.bool();
-    let inner_fn = ctx.function(vec![int_ty, bool_ty], p0);
-    let outer_fn = ctx.function(vec![inner_fn], p0);
+    let inner_fn = ctx.function(smallvec![int_ty, bool_ty], p0);
+    let outer_fn = ctx.function(smallvec![inner_fn], p0);
     let forall = ctx.forall(0, "X".into(), outer_fn);
     let reduced = ctx.try_yoneda_reduce(forall);
-    let expected = ctx.tuple(vec![int_ty, bool_ty]);
+    let expected = ctx.tuple(smallvec![int_ty, bool_ty]);
     assert_eq!(
         reduced, expected,
         "∀X.(Int⇒Bool⇒X)⇒X should reduce to (Int,Bool)"
@@ -597,8 +601,8 @@ fn test_yoneda_fn_encoded_no_reduction() {
     let bool_ty = ctx.bool();
 
     // (Int ⇒ Bool ⇒ X) ⇒ X   — X free, no Forall binder anywhere.
-    let inner_fn = ctx.function(vec![int_ty, bool_ty], p0);
-    let ty = ctx.function(vec![inner_fn], p0);
+    let inner_fn = ctx.function(smallvec![int_ty, bool_ty], p0);
+    let ty = ctx.function(smallvec![inner_fn], p0);
 
     assert_eq!(
         ctx.try_yoneda_reduce(ty),
@@ -645,16 +649,16 @@ fn test_coyoneda_multi_param_preserves_return() {
     let bool_ty = ctx.bool();
 
     // Branch: X ⇒ Int ⇒ Float   (the single k-branch of the ≡^X schema)
-    let inner_fn = ctx.function(vec![p0, int_ty], float_ty);
+    let inner_fn = ctx.function(smallvec![p0, int_ty], float_ty);
     // B⟨X⟩ = X ⇒ Bool   (X negative: function-parameter position)
-    let b_ty = ctx.function(vec![p0], bool_ty);
+    let b_ty = ctx.function(smallvec![p0], bool_ty);
     // ∀X.(X⇒Int⇒Float)⇒(X⇒Bool)
-    let outer = ctx.function(vec![inner_fn], b_ty);
+    let outer = ctx.function(smallvec![inner_fn], b_ty);
     let forall = ctx.forall(0, "X".into(), outer);
 
     // Expected: B⟨X ↦ Int⇒Float⟩ = (Int⇒Float)⇒Bool
-    let int_to_float = ctx.function(vec![int_ty], float_ty);
-    let expected = ctx.function(vec![int_to_float], bool_ty);
+    let int_to_float = ctx.function(smallvec![int_ty], float_ty);
+    let expected = ctx.function(smallvec![int_to_float], bool_ty);
 
     assert_eq!(
         ctx.try_yoneda_reduce(forall),
@@ -684,13 +688,13 @@ fn test_yoneda_inner_quantifier_one() {
         base: gp_z,
     });
 
-    let inner_fn = ctx.function(vec![gp_z], p0);
+    let inner_fn = ctx.function(smallvec![gp_z], p0);
     let inner_forall = ctx.alloc(TypeData::Forall {
         param_index: 1,
         param_name: "Z".into(),
         body: inner_fn,
     });
-    let outer_fn = ctx.function(vec![inner_forall], p0);
+    let outer_fn = ctx.function(smallvec![inner_forall], p0);
     let forall_id = ctx.forall(0, "X".into(), outer_fn);
     let result = ctx.try_yoneda_reduce(forall_id);
     assert_eq!(result, expected, "∀X.(∀Z.Z⇒X)⇒X should reduce to ∃Z.Z");
@@ -705,7 +709,7 @@ fn test_yoneda_inner_quantifier_x_in_body() {
     let int_ty = ctx.int(32, true);
 
     // Expected: μX. ∃Z. (Z, X)
-    let tup = ctx.tuple(vec![gp_z, p0]);
+    let tup = ctx.tuple(smallvec![gp_z, p0]);
     let inner_exists = ctx.alloc(TypeData::Exists {
         param_index: 1,
         name: "Z".into(),
@@ -717,14 +721,14 @@ fn test_yoneda_inner_quantifier_x_in_body() {
         body: inner_exists,
     });
 
-    let tup = ctx.tuple(vec![gp_z, p0]);
-    let inner_fn = ctx.function(vec![tup], p0);
+    let tup = ctx.tuple(smallvec![gp_z, p0]);
+    let inner_fn = ctx.function(smallvec![tup], p0);
     let inner_forall = ctx.alloc(TypeData::Forall {
         param_index: 1,
         param_name: "Z".into(),
         body: inner_fn,
     });
-    let outer_fn = ctx.function(vec![inner_forall], p0);
+    let outer_fn = ctx.function(smallvec![inner_forall], p0);
     let forall_id = ctx.forall(0, "X".into(), outer_fn);
     let result = ctx.try_yoneda_reduce(forall_id);
     assert_eq!(
@@ -743,7 +747,7 @@ fn test_yoneda_two_inner_quantifiers() {
     let int_ty = ctx.int(32, true);
 
     // Expected: ∃Z₂. ∃Z₁. (Z₁, Z₂, Int)
-    let tup = ctx.tuple(vec![gp_z1, gp_z2, int_ty]);
+    let tup = ctx.tuple(smallvec![gp_z1, gp_z2, int_ty]);
     let inner_ex = ctx.alloc(TypeData::Exists {
         param_index: 1,
         name: "Z₁".into(),
@@ -755,8 +759,8 @@ fn test_yoneda_two_inner_quantifiers() {
         base: inner_ex,
     });
 
-    let tup = ctx.tuple(vec![gp_z1, gp_z2, int_ty]);
-    let inner_fn = ctx.function(vec![tup], p0);
+    let tup = ctx.tuple(smallvec![gp_z1, gp_z2, int_ty]);
+    let inner_fn = ctx.function(smallvec![tup], p0);
     let inner_forall2 = ctx.alloc(TypeData::Forall {
         param_index: 2,
         param_name: "Z₂".into(),
@@ -767,7 +771,7 @@ fn test_yoneda_two_inner_quantifiers() {
         param_name: "Z₁".into(),
         body: inner_forall2,
     });
-    let outer_fn = ctx.function(vec![inner_forall1], p0);
+    let outer_fn = ctx.function(smallvec![inner_forall1], p0);
     let forall_id = ctx.forall(0, "X".into(), outer_fn);
     let result = ctx.try_yoneda_reduce(forall_id);
     assert_eq!(
@@ -816,15 +820,15 @@ fn test_coyoneda_inner_quantifier_one() {
 
     // Expected: (∀Z.Z) ⇒ Int
     let forall_z = ctx.forall(1, "Z".into(), gp_z);
-    let expected = ctx.function(vec![forall_z], int_ty);
+    let expected = ctx.function(smallvec![forall_z], int_ty);
 
     // Branch: ∀Z. X ⇒ Z
-    let inner_fn = ctx.function(vec![p0], gp_z);
+    let inner_fn = ctx.function(smallvec![p0], gp_z);
     let inner_forall = ctx.forall(1, "Z".into(), inner_fn);
     // B⟨X⟩ = X ⇒ Int   (X negative)
-    let b_ty = ctx.function(vec![p0], int_ty);
+    let b_ty = ctx.function(smallvec![p0], int_ty);
     // ∀X.(∀Z.X⇒Z)⇒(X⇒Int)
-    let outer_fn = ctx.function(vec![inner_forall], b_ty);
+    let outer_fn = ctx.function(smallvec![inner_forall], b_ty);
     let forall_id = ctx.forall(0, "X".into(), outer_fn);
 
     assert_eq!(
@@ -869,23 +873,23 @@ fn test_coyoneda_inner_quantifier_x_in_body() {
     let int_ty = ctx.int(32, true);
 
     // Expected: (νX.∀Z.(Z,X)) ⇒ Int
-    let tup = ctx.tuple(vec![gp_z, p0]);
+    let tup = ctx.tuple(smallvec![gp_z, p0]);
     let inner_forall = ctx.forall(1, "Z".into(), tup);
     let nu = ctx.alloc(TypeData::Nu {
         param_index: 0,
         param_name: "X".into(),
         body: inner_forall,
     });
-    let expected = ctx.function(vec![nu], int_ty);
+    let expected = ctx.function(smallvec![nu], int_ty);
 
     // Branch: ∀Z. X ⇒ (Z, X)
-    let i_tup = ctx.tuple(vec![gp_z, p0]);
-    let inner_fn = ctx.function(vec![p0], i_tup);
+    let i_tup = ctx.tuple(smallvec![gp_z, p0]);
+    let inner_fn = ctx.function(smallvec![p0], i_tup);
     let inner_forall_wrap = ctx.forall(1, "Z".into(), inner_fn);
     // B⟨X⟩ = X ⇒ Int   (X negative)
-    let b_ty = ctx.function(vec![p0], int_ty);
+    let b_ty = ctx.function(smallvec![p0], int_ty);
     // ∀X.(∀Z.X⇒(Z,X))⇒(X⇒Int)
-    let outer_fn = ctx.function(vec![inner_forall_wrap], b_ty);
+    let outer_fn = ctx.function(smallvec![inner_forall_wrap], b_ty);
     let forall_id = ctx.forall(0, "X".into(), outer_fn);
 
     assert_eq!(
@@ -915,23 +919,23 @@ fn test_yoneda_two_branches_with_inner_quantifiers() {
         name: "Z₂".into(),
         base: gp_z2,
     });
-    let expected = ctx.coproduct(vec![ex_z1, ex_z2]);
+    let expected = ctx.coproduct(smallvec![ex_z1, ex_z2]);
 
     // Branch 1: ∀Z₁. Z₁ ⇒ X
-    let inner_fn1 = ctx.function(vec![gp_z1], p0);
+    let inner_fn1 = ctx.function(smallvec![gp_z1], p0);
     let forall1 = ctx.alloc(TypeData::Forall {
         param_index: 1,
         param_name: "Z₁".into(),
         body: inner_fn1,
     });
     // Branch 2: ∀Z₂. Z₂ ⇒ X
-    let inner_fn2 = ctx.function(vec![gp_z2], p0);
+    let inner_fn2 = ctx.function(smallvec![gp_z2], p0);
     let forall2 = ctx.alloc(TypeData::Forall {
         param_index: 2,
         param_name: "Z₂".into(),
         body: inner_fn2,
     });
-    let outer_fn = ctx.function(vec![forall1, forall2], p0);
+    let outer_fn = ctx.function(smallvec![forall1, forall2], p0);
     let forall_id = ctx.forall(0, "X".into(), outer_fn);
     let result = ctx.try_yoneda_reduce(forall_id);
     assert_eq!(
@@ -950,20 +954,20 @@ fn test_yoneda_inner_quantifier_no_x_ref() {
     let int_ty = ctx.int(32, true);
 
     // Expected: ∃Z. (Int ⇒ Z)
-    let arrow = ctx.function(vec![int_ty], gp_z);
+    let arrow = ctx.function(smallvec![int_ty], gp_z);
     let expected = ctx.alloc(TypeData::Exists {
         param_index: 1,
         name: "Z".into(),
         base: arrow,
     });
 
-    let inner_fn = ctx.function(vec![arrow], p0);
+    let inner_fn = ctx.function(smallvec![arrow], p0);
     let inner_forall = ctx.alloc(TypeData::Forall {
         param_index: 1,
         param_name: "Z".into(),
         body: inner_fn,
     });
-    let outer_fn = ctx.function(vec![inner_forall], p0);
+    let outer_fn = ctx.function(smallvec![inner_forall], p0);
     let forall_id = ctx.forall(0, "X".into(), outer_fn);
     let result = ctx.try_yoneda_reduce(forall_id);
     assert_eq!(
@@ -983,8 +987,8 @@ fn test_yoneda_x_to_x_does_not_duplicate_branch() {
     // Σₖ A⟨X⟩ = X and therefore μX.X.
     let mut ctx = TypeContext::new();
     let p0 = ctx.generic_param(0, "X".into());
-    let branch = ctx.function(vec![p0], p0); // X → X
-    let outer = ctx.function(vec![branch], p0); // (X→X) → X
+    let branch = ctx.function(smallvec![p0], p0); // X → X
+    let outer = ctx.function(smallvec![branch], p0); // (X→X) → X
     let forall_id = ctx.forall(0, "X".into(), outer); // ∀X.(X→X)→X
     let ty = ctx.try_yoneda_reduce(forall_id);
 
@@ -1035,8 +1039,8 @@ fn test_subtype_forall_alpha_equiv_fn() {
     let int32 = ctx.int(32, true);
     let p0 = ctx.generic_param(0, "X".into());
     let p7 = ctx.generic_param(7, "Y".into());
-    let fn_x = ctx.function(vec![p0], int32);
-    let fn_y = ctx.function(vec![p7], int32);
+    let fn_x = ctx.function(smallvec![p0], int32);
+    let fn_y = ctx.function(smallvec![p7], int32);
     let fx = ctx.forall(0, "X".into(), fn_x);
     let fy = ctx.forall(7, "Y".into(), fn_y);
     assert!(
@@ -1052,8 +1056,8 @@ fn test_subtype_forall_alpha_equiv_fails_on_body_diff() {
     let int32 = ctx.int(32, true);
     let p0 = ctx.generic_param(0, "X".into());
     let p7 = ctx.generic_param(7, "Y".into());
-    let fn_x = ctx.function(vec![p0], int32); // X → Int
-    let fn_y = ctx.function(vec![int32], p7); // Int → Y
+    let fn_x = ctx.function(smallvec![p0], int32); // X → Int
+    let fn_y = ctx.function(smallvec![int32], p7); // Int → Y
     let fx = ctx.forall(0, "X".into(), fn_x);
     let fy = ctx.forall(7, "Y".into(), fn_y);
     assert!(
@@ -1091,11 +1095,11 @@ fn test_subtype_forall_no_capture_bug() {
     let p1 = ctx.generic_param(1, "Y".into());
 
     // Build sub: ∀X.{0} (X → X) — binder index 0
-    let sub_fn = ctx.function(vec![p0], p0);
+    let sub_fn = ctx.function(smallvec![p0], p0);
     let sub = ctx.forall(0, "X".into(), sub_fn);
 
     // Build sup: ∀Y.{1} (X → X) — binder index 1, body has free GP(0)
-    let sup_fn = ctx.function(vec![p0], p0);
+    let sup_fn = ctx.function(smallvec![p0], p0);
     let sup = ctx.forall(1, "Y".into(), sup_fn);
 
     // ∀X.(X→X) <: ∀Y.(X→X) must be FALSE:
@@ -1116,7 +1120,7 @@ fn test_subtype_forall_no_capture_bug() {
 fn test_subtype_forall_identical() {
     let mut ctx = TypeContext::new();
     let p0 = ctx.generic_param(0, "X".into());
-    let fn_ty = ctx.function(vec![p0], p0);
+    let fn_ty = ctx.function(smallvec![p0], p0);
     let forall = ctx.forall(0, "X".into(), fn_ty);
     assert!(ctx.subtype(forall, forall));
 }
@@ -1127,8 +1131,8 @@ fn test_subtype_forall_body_subtype() {
     let p0 = ctx.generic_param(0, "X".into());
     let never = ctx.never();
     let int32 = ctx.int(32, true);
-    let sub_fn = ctx.function(vec![p0], never);
-    let sup_fn = ctx.function(vec![p0], int32);
+    let sub_fn = ctx.function(smallvec![p0], never);
+    let sup_fn = ctx.function(smallvec![p0], int32);
     let sub_forall = ctx.forall(0, "X".into(), sub_fn);
     let sup_forall = ctx.forall(0, "X".into(), sup_fn);
     assert!(ctx.subtype(sub_forall, sup_forall));
@@ -1150,7 +1154,7 @@ fn test_normalize_associated_type_concrete_self() {
     let adt_ty = ctx.alloc(TypeData::Adt {
         kind: AdtKind::Struct,
         def_id,
-        args: vec![int_ty],
+        args: smallvec![int_ty],
     });
     assert_eq!(
         ctx.try_normalize_associated_type_def_id(adt_ty),
@@ -1168,40 +1172,169 @@ fn test_normalize_associated_type_abstract_self() {
 // ── Transaction + path compression ──────────────────────────
 
 #[test]
-fn test_transaction_rollback_path_compression() {
-    // Verify that resolve_binding path compression inside a transaction
-    // is correctly undone on rollback (Fix 1).
+fn test_transaction_rollback_preserves_binding_chain() {
+    // Verify that a binding change made inside a transaction is correctly
+    // undone on rollback (Fix 1), and that the surrounding chain is intact
+    // afterwards.
     //
-    // NOTE: resolve_binding triggers path compression as a side effect,
-    // so we must NOT call it before setting up the transaction.
+    // `resolve_binding` no longer path-compresses (see the note on
+    // `TypeContext::resolve_binding`): `bindings` is a plain `HashMap`
+    // because interior mutability had to go for `TypeContext` to become
+    // `Sync`, and a `&self` walk cannot rewrite the map.  So this test
+    // now pins the *observable* contract — resolution and rollback —
+    // rather than the compression side effect.
+    let mut ctx = TypeContext::new();
+    let a = ctx.alloc(TypeData::InferVar { id: 1, universe: 0 });
+    let b = ctx.alloc(TypeData::InferVar { id: 2, universe: 0 });
+    let c = ctx.alloc(TypeData::InferVar { id: 3, universe: 0 });
+    let d = ctx.alloc(TypeData::InferVar { id: 4, universe: 0 });
+
+    // Build a binding chain: a → b → c
+    ctx.set_binding(a, b);
+    ctx.set_binding(b, c);
+    assert_eq!(ctx.bindings.get(&a).copied(), Some(b));
+    assert_eq!(ctx.bindings.get(&b).copied(), Some(c));
+    assert_eq!(ctx.resolve_binding(a), c);
+
+    // Inside a transaction, re-point `a` at `d`.  The undo log must
+    // record the old value (`b`).
+    ctx.begin_transaction();
+    ctx.set_binding(a, d);
+    assert_eq!(ctx.resolve_binding(a), d);
+
+    // Rollback — `a` must point at `b` again, and the chain must still
+    // resolve to `c`.
+    ctx.rollback_transaction();
+    assert_eq!(ctx.bindings.get(&a).copied(), Some(b));
+    assert_eq!(ctx.resolve_binding(a), c);
+}
+
+#[test]
+fn test_resolve_binding_mut_compresses_chain() {
     let mut ctx = TypeContext::new();
     let a = ctx.alloc(TypeData::InferVar { id: 1, universe: 0 });
     let b = ctx.alloc(TypeData::InferVar { id: 2, universe: 0 });
     let c = ctx.alloc(TypeData::InferVar { id: 3, universe: 0 });
 
-    // Build a binding chain: a → b → c
+    ctx.set_binding(a, b);
+    ctx.set_binding(b, c);
+    assert_eq!(ctx.bindings.get(&a).copied(), Some(b));
+    assert_eq!(ctx.resolve_binding(a), c);
+
+    assert_eq!(ctx.resolve_binding_mut(a), Some(c));
+    assert_eq!(ctx.bindings.get(&a).copied(), Some(c), "head rewired");
+    assert_eq!(ctx.bindings.get(&b).copied(), Some(c), "mid rewired");
+
+    // Resolution is a pure memo of the same walk: identical before/after.
+    assert_eq!(ctx.resolve_binding(a), c);
+    assert_eq!(ctx.resolve_binding(b), c);
+}
+
+#[test]
+fn test_resolve_binding_compressed_agrees_with_resolve_binding() {
+    let mut ctx = TypeContext::new();
+    let a = ctx.alloc(TypeData::InferVar { id: 1, universe: 0 });
+    let b = ctx.alloc(TypeData::InferVar { id: 2, universe: 0 });
+    let c = ctx.alloc(TypeData::InferVar { id: 3, universe: 0 });
+    let x = ctx.alloc(TypeData::InferVar { id: 4, universe: 0 });
+    let y = ctx.alloc(TypeData::InferVar { id: 5, universe: 0 });
+    let z = ctx.alloc(TypeData::InferVar { id: 6, universe: 0 });
+
+    ctx.set_binding(a, b);
+    ctx.set_binding(b, c);
+    ctx.set_binding(x, y);
+    ctx.set_binding(y, z);
+
+    let compressed = ctx.resolve_binding_compressed(a);
+    let shared = ctx.resolve_binding(a);
+    assert_eq!(compressed, c);
+    assert_eq!(compressed, shared, "compression must not change resolution");
+
+    let via_shared = ctx.resolve_binding(x);
+    let via_compressed = ctx.resolve_binding_compressed(x);
+    assert_eq!(via_shared, z);
+    assert_eq!(via_shared, via_compressed, "agrees on an untouched chain");
+}
+
+#[test]
+fn test_resolve_binding_mut_declines_inside_gadt_arm() {
+    let mut ctx = TypeContext::new();
+    let a = ctx.alloc(TypeData::InferVar { id: 1, universe: 0 });
+    let b = ctx.alloc(TypeData::InferVar { id: 2, universe: 0 });
+    let c = ctx.alloc(TypeData::InferVar { id: 3, universe: 0 });
+
     ctx.set_binding(a, b);
     ctx.set_binding(b, c);
 
-    // Verify the chain exists WITHOUT triggering path compression
-    // (check raw bindings, not resolve_binding).
-    assert_eq!(ctx.bindings.borrow().get(&a).copied(), Some(b));
-    assert_eq!(ctx.bindings.borrow().get(&b).copied(), Some(c));
+    ctx.push_gadt_arm();
+    assert_eq!(
+        ctx.resolve_binding_mut(a),
+        None,
+        "compression must not run while a GADT arm can shadow chain nodes"
+    );
+    assert_eq!(ctx.bindings.get(&a).copied(), Some(b), "chain untouched");
+    // The fallback path still resolves correctly while the arm is live.
+    assert_eq!(ctx.resolve_binding_compressed(a), c);
+    ctx.pop_gadt_arm();
 
-    // Start a transaction and resolve a, triggering path compression
-    // (a → c and b → c, both logged via set_binding).
-    ctx.begin_transaction();
-    let resolved = ctx.resolve_binding(a);
-    assert_eq!(resolved, c);
-    // After compression, a should point directly to c
-    assert_eq!(ctx.bindings.borrow().get(&a).copied(), Some(c));
-
-    // Rollback — should restore the original chain a → b → c
-    ctx.rollback_transaction();
-    // After rollback, a should point to b again
-    assert_eq!(ctx.bindings.borrow().get(&a).copied(), Some(b));
-    // The chain a → b → c should still resolve to c
+    // Once the arm closes the registry is empty again, so compression
+    // is permitted.
+    assert_eq!(ctx.resolve_binding_mut(a), Some(c));
+    assert_eq!(ctx.bindings.get(&a).copied(), Some(c));
     assert_eq!(ctx.resolve_binding(a), c);
+}
+
+#[test]
+fn test_compression_write_is_rolled_back_by_transaction() {
+    let mut ctx = TypeContext::new();
+    let a = ctx.alloc(TypeData::InferVar { id: 1, universe: 0 });
+    let b = ctx.alloc(TypeData::InferVar { id: 2, universe: 0 });
+    let c = ctx.alloc(TypeData::InferVar { id: 3, universe: 0 });
+
+    ctx.set_binding(a, b);
+    ctx.set_binding(b, c);
+
+    ctx.begin_transaction();
+    assert_eq!(ctx.resolve_binding_mut(a), Some(c));
+    assert_eq!(ctx.bindings.get(&a).copied(), Some(c));
+    ctx.rollback_transaction();
+
+    // The undo log must have captured the pre-compression pointer, so the
+    // original chain shape is restored...
+    assert_eq!(ctx.bindings.get(&a).copied(), Some(b));
+    assert_eq!(ctx.resolve_binding(a), c);
+}
+
+#[test]
+fn test_compression_does_not_relocate_generic_binding_origin() {
+    let mut ctx = TypeContext::new();
+    let param = ctx.generic_param(0, "T".into());
+    let mid = ctx.alloc(TypeData::InferVar { id: 7, universe: 0 });
+    let root = ctx.alloc(TypeData::InferVar { id: 8, universe: 0 });
+
+    let original_site = crate::ast::Span::new(10, 20);
+    ctx.current_unify_span = Some(original_site);
+    ctx.set_binding(param, mid);
+    ctx.current_unify_span = None;
+    ctx.set_binding(mid, root);
+    assert_eq!(
+        ctx.generic_binding_origins.get(&param).copied(),
+        Some(original_site)
+    );
+
+    // A later span-carrying unification walks this chain.  Compression
+    // must not record IT as the binding site.
+    let later_site = crate::ast::Span::new(900, 950);
+    ctx.current_unify_span = Some(later_site);
+    assert_eq!(ctx.resolve_binding_mut(param), Some(root));
+    ctx.current_unify_span = None;
+
+    assert_eq!(ctx.bindings.get(&param).copied(), Some(root), "compressed");
+    assert_eq!(
+        ctx.generic_binding_origins.get(&param).copied(),
+        Some(original_site),
+        "compression must not relocate the E104 binding-site origin"
+    );
 }
 
 // ── characteristic resolves bindings ─────────────────────────
@@ -1256,8 +1389,8 @@ fn test_def_id_preserves_prototype() {
     let bool_ty = ctx.bool();
 
     // Create generic instances in various orders
-    let vec_i32 = ctx.struct_ty(def_id, vec![int32]);
-    let vec_bool = ctx.struct_ty(def_id, vec![bool_ty]);
+    let vec_i32 = ctx.struct_ty(def_id, smallvec![int32]);
+    let vec_bool = ctx.struct_ty(def_id, smallvec![bool_ty]);
 
     // These should be different TypeIds (different args)
     assert_ne!(vec_i32, vec_bool, "Vec<i32> and Vec<bool> should differ");
@@ -1324,8 +1457,8 @@ fn test_alpha_conv_poly_unify_and_subtype() {
     let mut ctx = TypeContext::new();
     let p0 = ctx.generic_param(0, "X".into());
     let p3 = ctx.generic_param(3, "Z".into());
-    let poly1 = ctx.poly(vec![(0, "X".into())], p0);
-    let poly2 = ctx.poly(vec![(3, "Z".into())], p3);
+    let poly1 = ctx.poly(smallvec![(0, "X".into())], p0);
+    let poly2 = ctx.poly(smallvec![(3, "Z".into())], p3);
     assert!(ctx.subtype(poly1, poly2));
     assert!(ctx.unify(poly1, poly2).is_ok());
 }
@@ -1362,4 +1495,211 @@ fn test_resolve_existential_witness_opt_in() {
     // Unknown skolem: no witness.
     let other = ctx.generic_param(1, Symbol::intern("Y"));
     assert_eq!(ctx.resolve_existential_witness(other), None);
+}
+
+// ── Rigid / Wobbly distinction tests (PLDI'06 §2,§4,§6) ──────────
+
+/// Rigidity enum: Rigid and Wobbly are distinct and hash correctly.
+#[test]
+fn test_rigidity_distinct() {
+    use crate::hir::types::Rigidity;
+    assert_ne!(Rigidity::Rigid, Rigidity::Wobbly);
+    assert_eq!(Rigidity::Rigid, Rigidity::Rigid);
+    assert_eq!(Rigidity::Wobbly, Rigidity::Wobbly);
+}
+
+/// `unify_biased`: rigid-vs-rigid unification behaves like standard unify.
+#[test]
+fn test_unify_biased_rigid_rigid() {
+    let mut ctx = TypeContext::new();
+    let a = ctx.int(32, true);
+    let b = ctx.int(32, true);
+    let result = ctx.unify_biased(a, b, Rigidity::Rigid, Rigidity::Rigid);
+    assert!(
+        result.is_ok(),
+        "rigid-vs-rigid should unify like standard unify"
+    );
+}
+
+/// `unify_biased`: rigid-vs-rigid mismatch is an error.
+#[test]
+fn test_unify_biased_rigid_rigid_mismatch() {
+    let mut ctx = TypeContext::new();
+    let a = ctx.int(32, true);
+    let b = ctx.int(64, true);
+    let result = ctx.unify_biased(a, b, Rigidity::Rigid, Rigidity::Rigid);
+    assert!(
+        result.is_err(),
+        "rigid-vs-rigid mismatch should be an error"
+    );
+}
+
+/// `unify_biased`: rigid-vs-wobbly binds the wobbly variable to the rigid type.
+#[test]
+fn test_unify_biased_rigid_wobbly_binds() {
+    let mut ctx = TypeContext::new();
+    let wobbly = ctx.alloc(TypeData::InferVar { id: 0, universe: 0 });
+    let rigid = ctx.int(32, true);
+    let result = ctx.unify_biased(wobbly, rigid, Rigidity::Wobbly, Rigidity::Rigid);
+    assert!(result.is_ok(), "rigid-vs-wobbly should succeed");
+    // The wobbly variable should be bound to the rigid type.
+    assert_eq!(ctx.resolve_binding(wobbly), rigid);
+}
+
+/// `unify_biased`: wobbly-vs-rigid binds the wobbly variable (symmetric).
+#[test]
+fn test_unify_biased_wobbly_rigid_binds() {
+    let mut ctx = TypeContext::new();
+    let rigid = ctx.int(32, true);
+    let wobbly = ctx.alloc(TypeData::InferVar { id: 0, universe: 0 });
+    let result = ctx.unify_biased(rigid, wobbly, Rigidity::Rigid, Rigidity::Wobbly);
+    assert!(result.is_ok(), "wobbly-vs-rigid should succeed");
+    // The wobbly variable should be bound to the rigid type.
+    assert_eq!(ctx.resolve_binding(wobbly), rigid);
+}
+
+/// `unify_biased`: wobbly-vs-wobbly uses standard MGU (equality constraint).
+#[test]
+fn test_unify_biased_wobbly_wobbly() {
+    let mut ctx = TypeContext::new();
+    let a = ctx.alloc(TypeData::InferVar { id: 0, universe: 0 });
+    let b = ctx.alloc(TypeData::InferVar { id: 1, universe: 0 });
+    let result = ctx.unify_biased(a, b, Rigidity::Wobbly, Rigidity::Wobbly);
+    assert!(result.is_ok(), "wobbly-vs-wobbly should succeed");
+    // Both should resolve to the same thing (equality constraint).
+    assert_eq!(ctx.resolve_binding(a), ctx.resolve_binding(b));
+}
+
+/// `bias_fresh_vars`: biases fresh InferVars in a compound type.
+#[test]
+fn test_bias_fresh_vars_tuple() {
+    let mut ctx = TypeContext::new();
+    let fresh0 = ctx.alloc(TypeData::InferVar { id: 0, universe: 0 });
+    let fresh1 = ctx.alloc(TypeData::InferVar { id: 1, universe: 0 });
+    let var_tuple = ctx.tuple(smallvec![fresh0, fresh1]);
+    let int32 = ctx.int(32, true);
+    let bool_ty = ctx.bool();
+    let target_tuple = ctx.tuple(smallvec![int32, bool_ty]);
+    let result = ctx.bias_fresh_vars(var_tuple, target_tuple);
+    assert!(result.is_ok(), "bias_fresh_vars on tuple should succeed");
+    // The fresh variables inside the tuple should be bound.
+    assert_eq!(ctx.resolve_binding(fresh0), int32);
+    assert_eq!(ctx.resolve_binding(fresh1), bool_ty);
+}
+
+/// `bias_fresh_vars`: occurs check prevents recursive binding.
+#[test]
+fn test_bias_fresh_vars_occurs_check() {
+    let mut ctx = TypeContext::new();
+    let fresh = ctx.alloc(TypeData::InferVar { id: 0, universe: 0 });
+    // Try to bind fresh to itself (occurs check should reject).
+    let result = ctx.bias_fresh_vars(fresh, fresh);
+    assert!(
+        result.is_err(),
+        "bias_fresh_vars should reject recursive binding"
+    );
+}
+
+/// Stage 5a: yoneda_equiv_check — canonical-form (βη) equivalence fallback
+/// with parametricity gate (fail-closed).
+#[test]
+fn test_yoneda_equiv_check_basic() {
+    let mut ctx = TypeContext::new();
+    let i = ctx.int(32, true);
+    let u = ctx.unit();
+    // Structurally identical fns unify anyway; the canonical query answers true.
+    let f1 = ctx.function(smallvec![i], u);
+    let f2 = ctx.function(smallvec![i], u);
+    assert_eq!(ctx.yoneda_equiv_check(f1, f2), Some(true));
+
+    // Non-equivalent types must answer false.
+    let f3 = ctx.function(smallvec![i], i);
+    assert_eq!(ctx.yoneda_equiv_check(f1, f3), Some(false));
+}
+
+#[test]
+fn test_yoneda_equiv_check_gate_closed() {
+    // A `dyn Trait` (or direct break_parametricity) closes the gate:
+    // fail-closed None for equivalence-strength consumers.
+    let mut ctx = TypeContext::new();
+    let i = ctx.int(32, true);
+    let u = ctx.unit();
+    let f1 = ctx.function(smallvec![i], u);
+    let f2 = ctx.function(smallvec![i], u);
+
+    ctx.parametricity.break_parametricity();
+    assert_eq!(ctx.yoneda_equiv_check(f1, f2), None);
+}
+
+#[test]
+fn test_yoneda_equiv_check_beta_eta_pair() {
+    // ∀X.(Int⇒X)⇒Unit vs (Int⇒Unit)⇒Unit?  Not Yoneda-iso under the
+    // partial Fig.4a axiomatization; but the vacuous-binder law gives
+    // ∀X.Unit ≡ Unit.  Check the βη pair: Int⇒∀X.Unit vs ∀X.(Int⇒Unit).
+    let mut ctx = TypeContext::new();
+    let i = ctx.int(32, true);
+    let u = ctx.unit();
+    let forall_u = ctx.forall(0, "X".into(), u);
+    let lifted = ctx.function(smallvec![i], forall_u);
+    let fn_i_u = ctx.function(smallvec![i], u);
+    let hoisted = ctx.forall(0, "X".into(), fn_i_u);
+    // These do NOT unify structurally (different TypeData shapes).
+    assert_ne!(lifted, hoisted);
+    // But they are βη-isomorphic (A⇒∀X.B ≡ ∀X.A⇒B).
+    assert_eq!(ctx.yoneda_equiv_check(lifted, hoisted), Some(true));
+}
+
+/// Regression: `TypeContext::get`/`get_raw` must assert arena-slot
+/// existence, never `index < types.count()`.
+///
+/// `boxcar::Vec::count()` counts *completed* pushes, and completion order
+/// is not claim order: a thread stalled between `next_index()` and its
+/// `count.fetch_add` leaves `count` below `max_claimed_index + 1` even
+/// though every already-returned index has a fully written slot.  The
+/// assertion below drives that interleaving deterministically via
+/// `push_with` (its closure runs after the claim, before the bump) and
+/// shows a perfectly valid pushed index observing `index >= count()` —
+/// i.e. the old predicate was a load-dependent false positive that made
+/// `cargo test` fail ~1 run in N under full-suite parallelism.
+#[test]
+fn boxcar_count_lags_in_flight_push_so_index_lt_count_is_unsound() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let arena: boxcar::Vec<u32> = boxcar::Vec::new();
+    let claimed = AtomicBool::new(false);
+    let release = AtomicBool::new(false);
+
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            // Claims index 0, then stalls inside the closure — i.e.
+            // between the claim and the `count` increment in `write`.
+            arena.push_with(|_| {
+                claimed.store(true, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                1
+            });
+        });
+
+        while !claimed.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // Completes a push at index 1 while index 0 is still in flight.
+        let idx = arena.push(2);
+        let count = arena.count();
+
+        release.store(true, Ordering::SeqCst);
+
+        assert_eq!(idx, 1);
+        assert_eq!(
+            count, 1,
+            "count must lag the completed push at index 1 while index 0 is in flight"
+        );
+        assert!(
+            idx >= count,
+            "a fully pushed index must be able to observe index >= count() \
+             — otherwise the old get() precondition would hold"
+        );
+    });
 }

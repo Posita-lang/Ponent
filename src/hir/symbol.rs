@@ -3,10 +3,10 @@ use crate::diagnostics::Diagnostic;
 use crate::hir::types::*;
 use crate::symbol::Symbol;
 use indexmap::IndexMap;
+use parking_lot::Mutex;
 use rustc_hash::FxBuildHasher;
 use rustc_hash::FxHashMap as HashMap;
-use std::cell::Cell;
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct FieldBinding<'input> {
@@ -43,10 +43,46 @@ pub struct Parameter<'input> {
     pub default: Option<Expr<'input>>,
 }
 
+/// A shared, thread-safe slot holding a function's return type.
+///
+/// The return type is *late bound*: a recursive function's signature is
+/// registered before its body is checked, so several places hold a handle
+/// to the same slot and observe the update when
+/// `update_function_return_type` (below) patches it.  That is why this is
+/// a shared handle rather than a plain `TypeId`.
+///
+/// Was `Rc<Cell<TypeId>>`.  It cannot be: `Cell`/`Rc` are `!Send + !Sync`,
+/// and the query provider must be `Sync` to drive `par_get`
+/// (`hir::query::QueryProvider`, src/hir/query/mod.rs:1511), so every
+/// piece of compiler state it borrows has to be shareable.  `Arc<Mutex<..>>`
+/// is the drop-in `Send + Sync` equivalent; `get`/`set` keep their old
+/// signatures so call sites are unchanged.
+///
+/// Do not hold the lock across a call that could re-enter `get`/`set` —
+/// `Mutex` is not reentrant, where `Cell` was unaffected.
+#[derive(Debug, Clone)]
+pub struct ReturnTypeSlot(Arc<Mutex<TypeId>>);
+
+impl ReturnTypeSlot {
+    pub fn new(ty: TypeId) -> Self {
+        ReturnTypeSlot(Arc::new(Mutex::new(ty)))
+    }
+
+    #[inline]
+    pub fn get(&self) -> TypeId {
+        *self.0.lock()
+    }
+
+    #[inline]
+    pub fn set(&self, ty: TypeId) {
+        *self.0.lock() = ty;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FunctionSignature<'input> {
     pub params: Vec<Parameter<'input>>,
-    pub return_type: Rc<Cell<TypeId>>,
+    pub return_type: ReturnTypeSlot,
     pub type_params: Vec<TypeParam<'input>>,
     pub where_clause: Option<WhereClause<'input>>,
 }
@@ -234,12 +270,12 @@ impl<'input> SymbolTable<'input> {
         self.current_scope
     }
 
-    pub fn insert_variable(
+    pub fn insert_variable<'src>(
         &mut self,
         name: Symbol,
         binding: VariableBinding,
         span: Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), Diagnostic<'src>> {
         let scope = &mut self.scopes[self.current_scope];
         if !scope.ordered && scope.variables.contains_key(&name) {
             return Err(
@@ -251,12 +287,12 @@ impl<'input> SymbolTable<'input> {
         Ok(())
     }
 
-    pub fn insert_function(
+    pub fn insert_function<'src>(
         &mut self,
         name: Symbol,
         binding: FunctionBinding<'input>,
         span: Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), Diagnostic<'src>> {
         let scope = &mut self.scopes[self.current_scope];
         if scope.functions.contains_key(&name) {
             return Err(
@@ -272,12 +308,12 @@ impl<'input> SymbolTable<'input> {
     /// function definitions: the checker's `update_function_return_type`
     /// patches return types starting from the root scope, so nested defs
     /// must be visible there (rustc-style item collection).
-    pub fn insert_function_at_root(
+    pub fn insert_function_at_root<'src>(
         &mut self,
         name: Symbol,
         binding: FunctionBinding<'input>,
         span: Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), Diagnostic<'src>> {
         let scope = &mut self.scopes[0];
         if scope.functions.contains_key(&name) {
             return Err(
@@ -324,12 +360,12 @@ impl<'input> SymbolTable<'input> {
         );
     }
 
-    pub fn insert_type(
+    pub fn insert_type<'src>(
         &mut self,
         name: Symbol,
         binding: TypeBinding<'input>,
         span: Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), Diagnostic<'src>> {
         let scope = &mut self.scopes[self.current_scope];
         if scope.types.contains_key(&name) {
             return Err(
@@ -357,12 +393,12 @@ impl<'input> SymbolTable<'input> {
         self.def_id_to_full_path.entry(def_id).or_insert(full_path);
     }
 
-    pub fn insert_trait(
+    pub fn insert_trait<'src>(
         &mut self,
         name: Symbol,
         binding: TraitBinding<'input>,
         span: Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), Diagnostic<'src>> {
         let scope = &mut self.scopes[self.current_scope];
         if scope.traits.contains_key(&name) {
             return Err(
@@ -381,12 +417,12 @@ impl<'input> SymbolTable<'input> {
         scope.impls.push(binding);
     }
 
-    pub fn insert_constraint(
+    pub fn insert_constraint<'src>(
         &mut self,
         name: Symbol,
         binding: ConstraintBinding<'input>,
         span: Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), Diagnostic<'src>> {
         let scope = &mut self.scopes[self.current_scope];
         if scope.constraints.contains_key(&name) {
             return Err(Diagnostic::error(format!(
@@ -614,5 +650,37 @@ impl<'input> SymbolTable<'input> {
         } else {
             None
         }
+    }
+}
+
+// ── Send/Sync audit ─────────────────────────────────────────────
+//
+// Compile-time assertions, not tests.  They fail to COMPILE (not to
+// run) when a type stops being shareable, which is the whole point:
+// `QueryProvider: Sync` (src/hir/query/mod.rs:1511) means every piece
+// of compiler state the provider borrows must be `Sync`, or `par_get`
+// cannot hand it to rayon.  Keeping them here means the compiler finds
+// any regression the moment someone reintroduces an `Rc` / `RefCell`.
+#[cfg(test)]
+mod send_sync_audit {
+    use super::*;
+    use crate::hir::resolver::ResolutionMap;
+    use crate::hir::traits::TraitEnv;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn symbol_table_is_send_sync() {
+        assert_send_sync::<SymbolTable<'static>>();
+    }
+
+    #[test]
+    fn trait_env_is_send_sync() {
+        assert_send_sync::<TraitEnv<'static>>();
+    }
+
+    #[test]
+    fn resolution_map_is_send_sync() {
+        assert_send_sync::<ResolutionMap<'static>>();
     }
 }

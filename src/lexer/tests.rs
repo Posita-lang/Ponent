@@ -752,6 +752,43 @@ fn consecutive_operators() {
 }
 
 #[test]
+fn nested_block_comment() {
+    let source = "a/* outer /* inner */ still comment */b";
+    let tokens: Vec<_> = Token::lexer(source)
+        .filter_map(|r| r.ok())
+        .filter(|t| *t != Token::WhitespaceOrComment)
+        .collect();
+    assert_eq!(
+        tokens,
+        vec![
+            Token::Ident(Symbol::intern("a")),
+            Token::Ident(Symbol::intern("b"))
+        ]
+    );
+}
+
+#[test]
+fn deeply_nested_block_comment() {
+    let source = "/* a /* b /* c */ d */ e */ x";
+    let tokens: Vec<_> = Token::lexer(source)
+        .filter_map(|r| r.ok())
+        .filter(|t| *t != Token::WhitespaceOrComment)
+        .collect();
+    assert_eq!(tokens, vec![Token::Ident(Symbol::intern("x"))]);
+}
+
+#[test]
+fn unterminated_block_comment_is_error() {
+    let source = "a/* unterminated";
+    let mut lex = Token::lexer(source);
+    assert_eq!(
+        lex.next().unwrap().unwrap(),
+        Token::Ident(Symbol::intern("a"))
+    );
+    assert!(lex.next().unwrap().is_err());
+}
+
+#[test]
 fn block_comment_with_stars_and_slashes() {
     let source = "/***/a/*/*/b";
     let tokens: Vec<_> = Token::lexer(source)

@@ -84,6 +84,7 @@ impl Stylesheet {
 
     /// Render the stylesheet as a CSS string for the HTML emitter.
     pub fn to_html_css(&self) -> String {
+        let light = Self::light();
         format!(
             r#":root {{
             --bg: {bg};
@@ -147,25 +148,25 @@ impl Stylesheet {
             underline = self.underline,
             explain_fg = self.explain_fg,
             toggle_bg = self.toggle_bg,
-            light_bg = Self::light().bg,
-            light_fg = Self::light().fg,
-            light_diag_bg = Self::light().diag_bg,
-            light_border = Self::light().border,
-            light_error_border = Self::light().error_border,
-            light_error_bg = Self::light().error_bg,
-            light_warning_border = Self::light().warning_border,
-            light_warning_bg = Self::light().warning_bg,
-            light_help_border = Self::light().help_border,
-            light_help_bg = Self::light().help_bg,
-            light_accent = Self::light().accent,
-            light_muted = Self::light().muted,
-            light_source_fg = Self::light().source_fg,
-            light_suggestion = Self::light().suggestion,
-            light_help_text = Self::light().help_text,
-            light_highlight_bg = Self::light().highlight_bg,
-            light_underline = Self::light().underline,
-            light_explain_fg = Self::light().explain_fg,
-            light_toggle_bg = Self::light().toggle_bg,
+            light_bg = light.bg,
+            light_fg = light.fg,
+            light_diag_bg = light.diag_bg,
+            light_border = light.border,
+            light_error_border = light.error_border,
+            light_error_bg = light.error_bg,
+            light_warning_border = light.warning_border,
+            light_warning_bg = light.warning_bg,
+            light_help_border = light.help_border,
+            light_help_bg = light.help_bg,
+            light_accent = light.accent,
+            light_muted = light.muted,
+            light_source_fg = light.source_fg,
+            light_suggestion = light.suggestion,
+            light_help_text = light.help_text,
+            light_highlight_bg = light.highlight_bg,
+            light_underline = light.underline,
+            light_explain_fg = light.explain_fg,
+            light_toggle_bg = light.toggle_bg,
         )
     }
 }

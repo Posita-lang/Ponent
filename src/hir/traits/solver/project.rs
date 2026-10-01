@@ -5,6 +5,7 @@ use crate::hir::traits::solver::obligation::ProjectionTy;
 use crate::hir::types::{DefId, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
 use std::cell::RefCell;
+use std::sync::Arc;
 
 /// Maximum number of entries in the projection cache.
 /// When exceeded, the entire cache is cleared.  This is a simple safeguard
@@ -67,8 +68,8 @@ impl ProjectionCache {
             return None;
         }
 
-        match self.cache.lookup(&key) {
-            Some(ProjectionCacheEntry::Normalized(ty)) => Some(ty),
+        match self.cache.lookup(&key).as_deref() {
+            Some(ProjectionCacheEntry::Normalized(ty)) => Some(*ty),
             Some(ProjectionCacheEntry::Error) => None,
             None => None,
         }
@@ -86,7 +87,8 @@ impl ProjectionCache {
     ) {
         let resolved = ctx.resolve_binding(self_ty);
         let key = ProjectionKey(trait_id, resolved, assoc_name);
-        self.cache.insert(key, ProjectionCacheEntry::Normalized(ty));
+        self.cache
+            .insert(key, Arc::new(ProjectionCacheEntry::Normalized(ty)));
     }
 
     /// Mark a projection as ambiguous (should not be cached permanently).

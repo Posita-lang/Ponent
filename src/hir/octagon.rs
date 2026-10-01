@@ -1180,6 +1180,40 @@ impl Dbm {
         }
     }
 
+    /// Threshold-aware widening ([Miné06] §VI.D): if `new ≤ old`, keep `old`;
+    /// otherwise pick the smallest threshold ≥ `new`; if none qualifies, ∞.
+    pub(crate) fn widen_with(&self, new: &Dbm, th: &DbmThresholds) -> Dbm {
+        if self.bottom {
+            return new.clone();
+        }
+        if new.bottom {
+            return self.clone();
+        }
+        assert_eq!(self.size, new.size, "widen requires same-size operands");
+        let size = self.size;
+        let m: Vec<i128> = self
+            .m
+            .iter()
+            .zip(&new.m)
+            .enumerate()
+            .map(|(idx, (old, n))| {
+                if *n <= *old {
+                    return *old;
+                }
+                th.per_edge
+                    .get(idx)
+                    .and_then(|list| list.iter().copied().find(|&t| t >= *n))
+                    .unwrap_or(DBM_INF)
+            })
+            .collect();
+        Dbm {
+            size,
+            m,
+            bottom: false,
+            closed: false,
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // Transfer functions (coherent)
     // ─────────────────────────────────────────────────────────────────
@@ -1239,10 +1273,9 @@ impl Dbm {
     /// The debug assertion enforces this; in release builds the caller is
     /// responsible for providing a closed matrix.
     pub(crate) fn assign_add_var(&self, i: usize, c: i128) -> Dbm {
-        debug_assert!(
-            self.closed,
-            "assign_add_var requires a strongly closed input for the no-close lemma"
-        );
+        // NOTE: an unclosed input is tolerated — see the repair path at
+        // the end (closing only widens, so repairing is sound).  The
+        // no-close fast path below stays exact for strongly closed input.
         if self.bottom {
             return Dbm::bottom();
         }
@@ -1307,7 +1340,13 @@ impl Dbm {
             bottom: false,
             closed: true,
         };
-        if saturated {
+        // Repair path: the no-close lemma presumes a strongly closed
+        // input.  A caller that hands us an unclosed matrix (direct
+        // construction, or `widen_with`'s deliberately unclosed output
+        // flowing into the next fixpoint step) gets a repaired result:
+        // closing only ever widens to the true closure, so this is sound
+        // and restores the invariant the fast path relies on downstream.
+        if saturated || !self.closed {
             r.close();
             if r.bottom {
                 return Dbm::bottom();
@@ -1989,10 +2028,114 @@ impl Dbm {
         self.node_bound(2 * i, 2 * j + 1) // X+Y ≤ c ⟺ X⁺−Y⁻ ≤ c
     }
 
-    /// Equality of two matrices (must be closed and non-bottom).
-    /// This is a convenience method; the derived `PartialEq` can also be used.
-    pub(crate) fn eq(&self, other: &Dbm) -> bool {
-        self == other
+    /// `X := X +% c` — WRAP-aware successor. Soundness anchor: Demystifying §I / Fig. 1.
+    pub(crate) fn assign_add_wrap(
+        &self,
+        i: usize,
+        c: i128,
+        lo: Option<i128>,
+        hi: Option<i128>,
+    ) -> Dbm {
+        if self.bottom {
+            return Dbm::bottom();
+        }
+        self.check_var(i);
+        let (Some(lo), Some(hi)) = (lo, hi) else {
+            return self.forget_var(i);
+        };
+        let shifted = self.assign_add_var(i, c);
+        if shifted.bottom {
+            return shifted;
+        }
+        let lb = shifted.var_lb(i);
+        let ub = shifted.var_ub(i);
+        let in_range = lb.map_or(false, |v| v >= lo) && ub.map_or(false, |v| v <= hi);
+        if in_range {
+            return shifted;
+        }
+        let mut r = self.forget_var(i);
+        r.set_mirrored(2 * i, 2 * i + 1, sat_mul2(hi));
+        r.set_mirrored(2 * i + 1, 2 * i, sat_mul2(sat_neg(lo)));
+        let _ = r.close();
+        if r.bottom { Dbm::bottom() } else { r }
+    }
+}
+
+// ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+// Threshold widening support ([Miné06] §VI.D)
+// ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+
+#[derive(Clone, Debug)]
+pub(crate) struct DbmThresholds {
+    pub(crate) per_edge: Vec<Vec<i128>>,
+}
+
+impl DbmThresholds {
+    pub(crate) fn new(size: usize) -> DbmThresholds {
+        DbmThresholds {
+            per_edge: vec![Vec::new(); size * size],
+        }
+    }
+    pub(crate) fn from_program(size: usize, consts: &[i128]) -> DbmThresholds {
+        let mut single: Vec<i128> = Vec::with_capacity(consts.len() * 2);
+        let mut double: Vec<i128> = Vec::with_capacity(consts.len() * 2);
+        for &t in consts {
+            // Normal edge: (a ^ 1) != b, stored = sat_mul2(t)
+            let s = sat_mul2(t);
+            if s != DBM_INF && s > i128::MIN {
+                single.push(s);
+                let n = sat_neg(s);
+                if n != DBM_INF && n > i128::MIN {
+                    single.push(n);
+                }
+            }
+            // Self-dual edge: (a ^ 1) == b, stored = sat_mul2(sat_mul2(t))
+            let s2 = sat_mul2(s);
+            if s2 != DBM_INF && s2 > i128::MIN {
+                double.push(s2);
+                let n2 = sat_neg(s2);
+                if n2 != DBM_INF && n2 > i128::MIN {
+                    double.push(n2);
+                }
+            }
+        }
+        single.sort_unstable();
+        single.dedup();
+        double.sort_unstable();
+        double.dedup();
+
+        let mut per_edge = vec![Vec::new(); size * size];
+        for a in 0..size {
+            for b in 0..size {
+                let list = &mut per_edge[a * size + b];
+                if (a ^ 1) == b {
+                    list.extend_from_slice(&double);
+                } else {
+                    list.extend_from_slice(&single);
+                }
+            }
+        }
+        DbmThresholds { per_edge }
+    }
+    pub(crate) fn absorb(&mut self, m: &Dbm) {
+        let size = m.size;
+        for a in 0..size {
+            for b in 0..size {
+                let v = m.m[a * size + b];
+                if v != DBM_INF && v > i128::MIN {
+                    let list = &mut self.per_edge[a * size + b];
+                    if !list.contains(&v) {
+                        list.push(v);
+                        list.sort_unstable();
+                    }
+                    let neg = sat_neg(v);
+                    if neg != DBM_INF && neg > i128::MIN && !list.contains(&neg) {
+                        list.push(neg);
+                        list.sort_unstable();
+                    }
+                }
+            }
+        }
     }
 }
 

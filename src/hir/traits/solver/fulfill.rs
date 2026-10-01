@@ -469,6 +469,7 @@ mod tests {
     use crate::hir::traits::solver::project::ProjectionCache;
     use crate::hir::types::CrateId;
     use crate::hir::types::TypeData;
+    use smallvec::smallvec;
 
     /// Helper: a self-recursive impl `impl<T: Foo> Foo for T`.  The
     /// where-clause bound re-enters the same predicate after the impl's
@@ -513,7 +514,7 @@ mod tests {
             .add_impl(impl_cand, &symbols, &mut ctx, true)
             .expect("self-recursive impl must register");
 
-        let goal_ty = ctx.struct_ty(DefId(100), vec![]);
+        let goal_ty = ctx.struct_ty(DefId(100), smallvec![]);
 
         let result = {
             let mut selcx = SelectionContext::new(
@@ -636,7 +637,7 @@ mod tests {
             .add_impl(impl_cand, &symbols, &mut ctx, true)
             .expect("self-recursive impl must register");
 
-        let goal_ty = ctx.struct_ty(DefId(100), vec![]);
+        let goal_ty = ctx.struct_ty(DefId(100), smallvec![]);
 
         let result = {
             let mut selcx = SelectionContext::new(

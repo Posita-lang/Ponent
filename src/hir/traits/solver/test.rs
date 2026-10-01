@@ -14,6 +14,7 @@ use crate::hir::traits::solver::obligation::{
 use crate::hir::traits::solver::search_graph::canonicalize_goal_key;
 use crate::hir::types::{DefId, TypeContext};
 use crate::symbol::Symbol;
+use smallvec::smallvec;
 
 /// Helper: create a minimal ImplCandidate for testing.
 /// `for_type` is the type the impl is for; `trait_args` are the trait's
@@ -72,7 +73,7 @@ fn test_concrete_same_type_overlaps() {
     let mut ctx = TypeContext::new();
     let trait_id = DefId(42);
     let type_a = DefId(100);
-    let for_ty = ctx.struct_ty(type_a, vec![]);
+    let for_ty = ctx.struct_ty(type_a, smallvec![]);
 
     let existing = make_candidate(trait_id, for_ty, vec![]);
     let new = make_candidate(trait_id, for_ty, vec![]);
@@ -94,8 +95,8 @@ fn test_concrete_different_types_no_overlap() {
     let type_a = DefId(100);
     let type_b = DefId(101);
 
-    let for_ty_a = ctx.struct_ty(type_a, vec![]);
-    let for_ty_b = ctx.struct_ty(type_b, vec![]);
+    let for_ty_a = ctx.struct_ty(type_a, smallvec![]);
+    let for_ty_b = ctx.struct_ty(type_b, smallvec![]);
 
     let existing = make_candidate(trait_id, for_ty_a, vec![]);
     let new = make_candidate(trait_id, for_ty_b, vec![]);
@@ -116,7 +117,7 @@ fn test_concrete_different_trait_no_overlap() {
     let trait_a = DefId(42);
     let trait_b = DefId(99);
     let type_id = DefId(100);
-    let for_ty = ctx.struct_ty(type_id, vec![]);
+    let for_ty = ctx.struct_ty(type_id, smallvec![]);
 
     let existing = make_candidate(trait_a, for_ty, vec![]);
     let new = make_candidate(trait_b, for_ty, vec![]);
@@ -185,11 +186,11 @@ fn test_tuple_with_generic_param_overlaps_same_index() {
 
     // impl<T> Trait for (T,)
     let gp_t = ctx.generic_param(0, Symbol::intern("T"));
-    let tuple_t = ctx.tuple(vec![gp_t]);
+    let tuple_t = ctx.tuple(smallvec![gp_t]);
 
     // impl<U> Trait for (U,)
     let gp_u = ctx.generic_param(0, Symbol::intern("U"));
-    let tuple_u = ctx.tuple(vec![gp_u]);
+    let tuple_u = ctx.tuple(smallvec![gp_u]);
 
     let existing = make_candidate(trait_id, tuple_t, vec![]);
     let new = make_candidate(trait_id, tuple_u, vec![]);
@@ -211,11 +212,11 @@ fn test_tuple_with_generic_param_overlaps_different_index() {
 
     // impl<T> Trait for (T,)
     let gp_0 = ctx.generic_param(0, Symbol::intern("T"));
-    let tuple_0 = ctx.tuple(vec![gp_0]);
+    let tuple_0 = ctx.tuple(smallvec![gp_0]);
 
     // impl<U> Trait for (U,) — but U is index 1 (different)
     let gp_1 = ctx.generic_param(1, Symbol::intern("U"));
-    let tuple_1 = ctx.tuple(vec![gp_1]);
+    let tuple_1 = ctx.tuple(smallvec![gp_1]);
 
     let existing = make_candidate(trait_id, tuple_0, vec![]);
     let new = make_candidate(trait_id, tuple_1, vec![]);
@@ -238,11 +239,11 @@ fn test_adt_with_generic_param_overlaps() {
 
     // impl<T> Trait for Vec<T>
     let gp_t = ctx.generic_param(0, Symbol::intern("T"));
-    let vec_t = ctx.struct_ty(vec_def_id, vec![gp_t]);
+    let vec_t = ctx.struct_ty(vec_def_id, smallvec![gp_t]);
 
     // impl<U> Trait for Vec<U>
     let gp_u = ctx.generic_param(0, Symbol::intern("U"));
-    let vec_u = ctx.struct_ty(vec_def_id, vec![gp_u]);
+    let vec_u = ctx.struct_ty(vec_def_id, smallvec![gp_u]);
 
     let existing = make_candidate(trait_id, vec_t, vec![]);
     let new = make_candidate(trait_id, vec_u, vec![]);
@@ -265,11 +266,11 @@ fn test_adt_with_generic_param_different_index_overlaps() {
 
     // impl<T> Trait for Vec<T>  (index 0)
     let gp_0 = ctx.generic_param(0, Symbol::intern("T"));
-    let vec_0 = ctx.struct_ty(vec_def_id, vec![gp_0]);
+    let vec_0 = ctx.struct_ty(vec_def_id, smallvec![gp_0]);
 
     // impl<U> Trait for Vec<U>  (index 1 — different parameter position)
     let gp_1 = ctx.generic_param(1, Symbol::intern("U"));
-    let vec_1 = ctx.struct_ty(vec_def_id, vec![gp_1]);
+    let vec_1 = ctx.struct_ty(vec_def_id, smallvec![gp_1]);
 
     let existing = make_candidate(trait_id, vec_0, vec![]);
     let new = make_candidate(trait_id, vec_1, vec![]);
@@ -322,11 +323,11 @@ fn test_composite_different_concrete_elem_no_overlap() {
 
     // impl<T> Trait for (T, Int<32>)
     let gp_t = ctx.generic_param(0, Symbol::intern("T"));
-    let tuple_a = ctx.tuple(vec![gp_t, int32]);
+    let tuple_a = ctx.tuple(smallvec![gp_t, int32]);
 
     // impl<U> Trait for (U, Int<64>)
     let gp_u = ctx.generic_param(0, Symbol::intern("U"));
-    let tuple_b = ctx.tuple(vec![gp_u, int64]);
+    let tuple_b = ctx.tuple(smallvec![gp_u, int64]);
 
     let existing = make_candidate(trait_id, tuple_a, vec![]);
     let new = make_candidate(trait_id, tuple_b, vec![]);
@@ -353,7 +354,7 @@ fn test_generic_param_vs_concrete_overlaps() {
     let gp_t = ctx.generic_param(0, Symbol::intern("T"));
 
     // impl Trait for MyStruct
-    let for_ty = ctx.struct_ty(type_id, vec![]);
+    let for_ty = ctx.struct_ty(type_id, smallvec![]);
 
     let existing = make_candidate(trait_id, gp_t, vec![]);
     let new = make_candidate(trait_id, for_ty, vec![]);
@@ -378,9 +379,9 @@ fn test_overlap_against_multiple_existing() {
     let type_b = DefId(101);
     let type_c = DefId(102);
 
-    let for_ty_a = ctx.struct_ty(type_a, vec![]);
-    let for_ty_b = ctx.struct_ty(type_b, vec![]);
-    let for_ty_c = ctx.struct_ty(type_c, vec![]);
+    let for_ty_a = ctx.struct_ty(type_a, smallvec![]);
+    let for_ty_b = ctx.struct_ty(type_b, smallvec![]);
+    let for_ty_c = ctx.struct_ty(type_c, smallvec![]);
 
     let existing_a = make_candidate(trait_id, for_ty_a, vec![]);
     let existing_b = make_candidate(trait_id, for_ty_b, vec![]);
@@ -421,13 +422,13 @@ fn test_adt_nested_generic_param_different_index_overlaps() {
 
     // impl<T> Trait for Outer<Inner<T>>
     let gp_0 = ctx.generic_param(0, Symbol::intern("T"));
-    let inner_t = ctx.struct_ty(inner_def_id, vec![gp_0]);
-    let outer_t = ctx.struct_ty(outer_def_id, vec![inner_t]);
+    let inner_t = ctx.struct_ty(inner_def_id, smallvec![gp_0]);
+    let outer_t = ctx.struct_ty(outer_def_id, smallvec![inner_t]);
 
     // impl<U> Trait for Outer<Inner<U>>  (U is index 1)
     let gp_1 = ctx.generic_param(1, Symbol::intern("U"));
-    let inner_u = ctx.struct_ty(inner_def_id, vec![gp_1]);
-    let outer_u = ctx.struct_ty(outer_def_id, vec![inner_u]);
+    let inner_u = ctx.struct_ty(inner_def_id, smallvec![gp_1]);
+    let outer_u = ctx.struct_ty(outer_def_id, smallvec![inner_u]);
 
     let existing = make_candidate(trait_id, outer_t, vec![]);
     let new = make_candidate(trait_id, outer_u, vec![]);
@@ -688,14 +689,14 @@ fn test_overlap_slow_path_iteration_isolation() {
     // trait_arg Int<32> vs Int<64> does NOT: a partial failure that, before
     // the fix, left fresh-var bindings behind.
     let gp = ctx.generic_param(0, Symbol::intern("T"));
-    let tuple = ctx.tuple(vec![gp]);
+    let tuple = ctx.tuple(smallvec![gp]);
     let int32 = ctx.int(32, true);
     let int64 = ctx.int(64, true);
     let existing0 = make_candidate(trait_id, tuple, vec![int32]);
     // existing[1]: impl Tr for (Int<64>,) — unrelated, must NOT overlap.
-    let tuple64 = ctx.tuple(vec![int64]);
+    let tuple64 = ctx.tuple(smallvec![int64]);
     let existing1 = make_candidate(trait_id, tuple64, vec![]);
-    let new = make_candidate(trait_id, ctx.tuple(vec![gp]), vec![int64]);
+    let new = make_candidate(trait_id, ctx.tuple(smallvec![gp]), vec![int64]);
 
     let existing = vec![existing0, existing1];
     ctx.begin_transaction();
@@ -726,7 +727,7 @@ fn test_where_clause_exclusive_bounds_no_overlap_fast_path() {
     let mut ctx = TypeContext::new();
     let trait_id = DefId(42);
     let foo_trait = DefId(200);
-    let for_ty = ctx.struct_ty(DefId(100), vec![]);
+    let for_ty = ctx.struct_ty(DefId(100), smallvec![]);
     let int32 = ctx.int(32, true);
     let int64 = ctx.int(64, true);
     // impl Tr for MyType where MyType: Foo<Int<32>>
@@ -763,7 +764,7 @@ fn test_where_clause_exclusive_bounds_no_overlap_slow_path() {
     let trait_id = DefId(42);
     let foo_trait = DefId(200);
     let gp = ctx.generic_param(0, Symbol::intern("T"));
-    let tuple = ctx.tuple(vec![gp]);
+    let tuple = ctx.tuple(smallvec![gp]);
     let int32 = ctx.int(32, true);
     let int64 = ctx.int(64, true);
     // impl<T: Foo<Int<32>>> Tr for (T,)
@@ -772,7 +773,7 @@ fn test_where_clause_exclusive_bounds_no_overlap_slow_path() {
     // impl<T: Foo<Int<64>>> Tr for (T,)
     let new = make_candidate_with_bounds(
         trait_id,
-        ctx.tuple(vec![gp]),
+        ctx.tuple(smallvec![gp]),
         vec![],
         vec![(gp, foo_trait, vec![int64])],
     );
@@ -797,7 +798,7 @@ fn test_where_clause_different_traits_still_overlap() {
     let trait_id = DefId(42);
     let display_trait = DefId(200);
     let debug_trait = DefId(201);
-    let for_ty = ctx.struct_ty(DefId(100), vec![]);
+    let for_ty = ctx.struct_ty(DefId(100), smallvec![]);
     let existing = make_candidate_with_bounds(
         trait_id,
         for_ty,
@@ -828,7 +829,7 @@ fn test_where_clause_same_bounds_still_overlap() {
     let mut ctx = TypeContext::new();
     let trait_id = DefId(42);
     let foo_trait = DefId(200);
-    let for_ty = ctx.struct_ty(DefId(100), vec![]);
+    let for_ty = ctx.struct_ty(DefId(100), smallvec![]);
     let int32 = ctx.int(32, true);
     let existing = make_candidate_with_bounds(
         trait_id,
@@ -903,11 +904,11 @@ fn test_overlap_slow_path_freshen_with_binder_shadowing() {
     // ∀X. (X,) paired with a free GenericParam: Tuple([Forall(0,X,X), GP(0)])
     let gp0 = ctx.generic_param(0, Symbol::intern("X"));
     let forall_a = ctx.forall(0, Symbol::intern("X"), gp0);
-    let outer_a = ctx.tuple(vec![forall_a, gp0]);
+    let outer_a = ctx.tuple(smallvec![forall_a, gp0]);
     // Alpha-equivalent: ∀Y. (Y,) with a free GP at a different index.
     let gp1 = ctx.generic_param(1, Symbol::intern("Y"));
     let forall_b = ctx.forall(1, Symbol::intern("Y"), gp1);
-    let outer_b = ctx.tuple(vec![forall_b, gp1]);
+    let outer_b = ctx.tuple(smallvec![forall_b, gp1]);
 
     let existing = make_candidate(trait_id, outer_a, vec![]);
     let new = make_candidate(trait_id, outer_b, vec![]);
@@ -979,10 +980,10 @@ fn test_specializes_balanced_transactions_no_depth_leak() {
     let mut ctx = TypeContext::new();
     let trait_id = DefId(42);
     let gp = ctx.generic_param(0, Symbol::intern("T"));
-    let tuple = ctx.tuple(vec![gp]);
+    let tuple = ctx.tuple(smallvec![gp]);
     let specific = make_candidate(trait_id, tuple, vec![]);
     let gp_u = ctx.generic_param(0, Symbol::intern("U"));
-    let general = make_candidate(trait_id, ctx.tuple(vec![gp_u]), vec![]);
+    let general = make_candidate(trait_id, ctx.tuple(smallvec![gp_u]), vec![]);
 
     let depth_before = ctx.transaction_depth();
     let _ = specializes(&mut ctx, &specific, &general);

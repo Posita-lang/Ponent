@@ -97,8 +97,8 @@ impl<'input> TypeContext<'input> {
                 //
                 // Resolve bindings so that inference variables that have been
                 // bound to concrete types are compared by their resolved form.
-                let r1 = self.resolve_binding(*t1);
-                let r2 = self.resolve_binding(*t2);
+                let r1 = self.resolve_binding_compressed(*t1);
+                let r2 = self.resolve_binding_compressed(*t2);
                 if *m1 != *m2 {
                     // SYNTAX.md §Reference Coercion: by default Posita
                     // does NOT allow `&mut T` to be implicitly coerced to
@@ -121,8 +121,8 @@ impl<'input> TypeContext<'input> {
                     // against the where-constraints); otherwise this is a
                     // pure-relation call (tests, structural checks) and
                     // the strict rejection stands.
-                    if self.region_subtype_collect.get() {
-                        self.region_subtype_outlives.borrow_mut().push((*l1, *l2));
+                    if self.region_subtype_collect {
+                        self.region_subtype_outlives.push((*l1, *l2));
                         // The pointee must still match (invariant) — the
                         // lifetime covariance is the only relaxation.
                         return r1 == r2;
@@ -133,7 +133,8 @@ impl<'input> TypeContext<'input> {
             }
             (TypeData::Pointer { ty: t1 }, TypeData::Pointer { ty: t2 }) => {
                 // Invariant — exact equality required after resolving bindings.
-                self.resolve_binding(*t1) == self.resolve_binding(*t2)
+                self.resolve_binding_compressed(*t1)
+                    == self.resolve_binding_compressed(*t2)
             }
             (
                 TypeData::Fn {
@@ -219,8 +220,10 @@ impl<'input> TypeContext<'input> {
                     pointee: p2,
                 },
             ) => {
-                self.resolve_binding(*s1) == self.resolve_binding(*s2)
-                    && self.resolve_binding(*p1) == self.resolve_binding(*p2)
+                self.resolve_binding_compressed(*s1)
+                    == self.resolve_binding_compressed(*s2)
+                    && self.resolve_binding_compressed(*p1)
+                        == self.resolve_binding_compressed(*p2)
             }
             // Poly: α-convert quantifiers → covariant body
             (

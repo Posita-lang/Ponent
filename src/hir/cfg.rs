@@ -7,7 +7,10 @@ use std::collections::HashMap;
 
 /// A key-value pair representing a cfg condition name and its expected value.
 /// For conditions without a value (e.g. `debug`), the value is `None`.
-type CfgKey = (String, Option<String>);
+///
+/// The key is a `Symbol` (zero-cost `Copy`) and the value borrows the source
+/// literal — no `String` allocation per evaluation.
+type CfgKey<'a> = (Symbol, Option<&'a str>);
 
 /// Evaluate a `@cfg(condition)` attribute against the current target.
 ///
@@ -27,7 +30,7 @@ pub fn eval_cfg<'input>(
     target: &Target,
     features: &[String],
     debug: bool,
-    diag: &mut DiagCtxt,
+    diag: &mut DiagCtxt<'_>,
 ) -> bool {
     // Find the first `@cfg(...)` attribute.
     if !attr.name.eq_str("cfg") {
@@ -42,11 +45,10 @@ pub fn eval_cfg<'input>(
     // @cfg with named args like `@cfg(target_os = "linux")`
     let mut cfg_met = true;
     if !attr.named_args.is_empty() {
-        let mut warned_keys = std::collections::HashSet::new();
+        let mut warned_keys: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
         for (key, value) in &attr.named_args {
-            let key_str = key.as_str();
             let val_str = match value {
-                Expr::Literal(Literal::String(s), _) => s.clone(),
+                Expr::Literal(Literal::String(s), _) => s.as_str(),
                 _ => {
                     // Non-string literal (e.g. @cfg(target_os = 42)) —
                     // the condition is clearly not met.
@@ -54,13 +56,13 @@ pub fn eval_cfg<'input>(
                         "cfg key `{}` requires a string value, found non-string literal; \
                          this condition will never match — use a quoted string, \
                          e.g. `@cfg({} = \"value\")`",
-                        key_str, key_str,
+                        key, key,
                     ));
                     cfg_met = false;
                     continue;
                 }
             };
-            let cfg_key = (key_str, Some(val_str));
+            let cfg_key = (*key, Some(val_str));
             if !eval_cfg_key(&cfg_key, target, features, debug, diag, &mut warned_keys) {
                 cfg_met = false;
             }
@@ -70,7 +72,7 @@ pub fn eval_cfg<'input>(
     // @cfg with positional args like `@cfg(all(...))` or `@cfg(debug)`
     // Also evaluated when named_args are present — both must be met.
     if let Some(expr) = attr.args.first() {
-        let mut warned_keys = std::collections::HashSet::new();
+        let mut warned_keys: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
         let positional_ok = eval_cfg_expr(expr, target, features, debug, diag, &mut warned_keys);
         cfg_met = cfg_met && positional_ok;
     }
@@ -84,20 +86,20 @@ fn eval_cfg_expr<'input>(
     target: &Target,
     features: &[String],
     debug: bool,
-    diag: &mut DiagCtxt,
-    warned_keys: &mut std::collections::HashSet<String>,
+    diag: &mut DiagCtxt<'_>,
+    warned_keys: &mut std::collections::HashSet<Symbol>,
 ) -> bool {
     match expr {
         Expr::Ident(name, _) => {
             // Simple identifier: `@cfg(debug)`
-            let key = (name.as_str(), None);
+            let key = (*name, None);
             eval_cfg_key(&key, target, features, debug, diag, warned_keys)
         }
         Expr::Literal(Literal::Bool(b), _) => *b,
         Expr::Literal(Literal::Int(n), _) => *n != 0,
         Expr::Call { callee, args, .. } => {
             let callee_name = match callee {
-                Expr::Ident(name, _) => name.as_str(),
+                Expr::Ident(name, _) => *name,
                 _ => return false,
             };
             match callee_name.as_str() {
@@ -131,15 +133,15 @@ fn eval_cfg_expr<'input>(
                 BinOp::Eq => {
                     // `key = "value"` — compare left identifier to right string
                     let key = match left {
-                        Expr::Ident(name, _) => name.as_str(),
+                        Expr::Ident(name, _) => *name,
                         _ => return false,
                     };
                     let val = match right {
-                        Expr::Literal(Literal::String(s), _) => s.clone(),
+                        Expr::Literal(Literal::String(s), _) => s.as_str(),
                         _ => return false,
                     };
                     eval_cfg_key(
-                        &(key.to_string(), Some(val)),
+                        &(key, Some(val)),
                         target,
                         features,
                         debug,
@@ -149,15 +151,15 @@ fn eval_cfg_expr<'input>(
                 }
                 BinOp::Neq => {
                     let key = match left {
-                        Expr::Ident(name, _) => name.as_str(),
+                        Expr::Ident(name, _) => *name,
                         _ => return false,
                     };
                     let val = match right {
-                        Expr::Literal(Literal::String(s), _) => s.clone(),
+                        Expr::Literal(Literal::String(s), _) => s.as_str(),
                         _ => return false,
                     };
                     !eval_cfg_key(
-                        &(key.to_string(), Some(val)),
+                        &(key, Some(val)),
                         target,
                         features,
                         debug,
@@ -178,12 +180,12 @@ fn eval_cfg_expr<'input>(
 
 /// Evaluate a single cfg key-value pair.
 fn eval_cfg_key(
-    key: &CfgKey,
+    key: &CfgKey<'_>,
     target: &Target,
     features: &[String],
     debug: bool,
-    diag: &mut DiagCtxt,
-    warned_keys: &mut std::collections::HashSet<String>,
+    diag: &mut DiagCtxt<'_>,
+    warned_keys: &mut std::collections::HashSet<Symbol>,
 ) -> bool {
     let (name, expected_val) = key;
 
@@ -215,7 +217,7 @@ fn eval_cfg_key(
                     crate::hir::target::spec::Endian::Little => "little",
                     crate::hir::target::spec::Endian::Big => "big",
                 };
-                endian_str == expected.as_str()
+                endian_str == *expected
             } else {
                 false
             }
@@ -254,7 +256,7 @@ fn eval_cfg_key(
             // silently skip items.  Only warn once per attribute to avoid
             // noise when multiple `@cfg` attributes on different items
             // reference the same unknown key.
-            if warned_keys.insert(name.clone()) {
+            if warned_keys.insert(*name) {
                 diag.warn(format!(
                     "unknown cfg key `{}` — this condition will never be met; \
                      check for typos or use a known key (target_os, target_arch, \
@@ -284,7 +286,7 @@ fn eval_cfg_key(
 pub fn is_provably_reachable<'input>(
     attr: &Attribute<'input>,
     strict_mode: bool,
-    diag: &mut DiagCtxt,
+    diag: &mut DiagCtxt<'_>,
 ) -> bool {
     if !attr.name.eq_str("cfg") {
         return true;
@@ -314,10 +316,9 @@ pub fn is_provably_reachable<'input>(
     let mut var_keyvals: std::collections::HashMap<i32, (String, String)> =
         std::collections::HashMap::new();
     for (key, value) in &attr.named_args {
-        let key_str = key.as_str();
         if let Expr::Literal(Literal::String(s), _) = value {
-            let lit = var_for(key_str.as_str(), s.as_str());
-            var_keyvals.insert(lit, (key_str.to_string(), s.clone()));
+            let lit = var_for(key.as_str(), s.as_str());
+            var_keyvals.insert(lit, (key.as_str().to_string(), s.clone()));
             solver.add_unit(lit);
         }
     }
@@ -454,8 +455,7 @@ fn build_clauses_inner<'input>(
     match expr {
         Expr::Call { callee, args, .. } => {
             if let Expr::Ident(name, _) = callee {
-                let name_s = name.as_str();
-                match name_s.as_str() {
+                match name.as_str() {
                     "all" => {
                         // all(a, b) → a ∧ b
                         if negated {
@@ -684,7 +684,7 @@ fn push_literals<'input>(
             match (left, right) {
                 (Expr::Ident(key, _), Expr::Literal(Literal::String(val), _)) => {
                     add_literal(
-                        key.as_str().as_str(),
+                        key.as_str(),
                         val.as_str(),
                         var_map,
                         var_counter,
@@ -865,17 +865,17 @@ mod tests {
     }
 
     #[test]
-    /// Verify that two values for the same key containing underscores
-    /// are correctly grouped for mutual exclusion.
+    // Verify that two values for the same key containing underscores
+    // are correctly grouped for mutual exclusion.
     ///
-    /// Old bug: `rfind('_')` on `cfg_target_arch_x86_64` split at the
-    /// wrong underscore, producing key = "target_arch_x86" instead of
-    /// "target_arch". This broke the at-most-one constraint, allowing
-    /// contradictory `target_arch` values to both be true.
+    // Old bug: `rfind('_')` on `cfg_target_arch_x86_64` split at the
+    // wrong underscore, producing key = "target_arch_x86" instead of
+    // "target_arch". This broke the at-most-one constraint, allowing
+    // contradictory `target_arch` values to both be true.
     ///
-    /// This test constructs `all(target_arch = "x86_64", target_arch = "aarch64")`
-    /// and verifies the SAT solver correctly reports it as unsatisfiable,
-    /// because `x86_64` and `aarch64` are mutually exclusive.
+    // This test constructs `all(target_arch = "x86_64", target_arch = "aarch64")`
+    // and verifies the SAT solver correctly reports it as unsatisfiable,
+    // because `x86_64` and `aarch64` are mutually exclusive.
     fn test_cfg_mutual_exclusion_with_underscores() {
         let callee: &'static Expr<'static> = Box::leak(Box::new(Expr::Ident(
             Symbol::intern("all"),

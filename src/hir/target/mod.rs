@@ -53,6 +53,7 @@ impl Target {
         ("arm", 32),
     ];
 
+    #[inline]
     pub fn arch_pointer_width(arch: &str) -> Option<u64> {
         Self::ARCH_POINTER_WIDTHS
             .iter()
@@ -164,6 +165,7 @@ impl Target {
             return Self::builtin("wasm32").expect("built-in wasm32 target should be available");
         }
         // Unknown host — emit a warning and fall back to x86_64 Linux.
+        #[allow(unreachable_code)]
         eprintln!(
             "warning: unknown host platform (arch={}, os={}); \
              using x86_64-linux-gnu as fallback.  \
@@ -178,16 +180,19 @@ impl Target {
     // ── Convenience accessors ────────────────────────────────────
 
     /// Pointer width in bits.
+    #[inline]
     pub fn pointer_width(&self) -> u8 {
         self.spec.pointer_width
     }
 
     /// Pointer size in bytes.
+    #[inline]
     pub fn ptr_size(&self) -> u64 {
         self.spec.pointer_width as u64 / 8
     }
 
     /// Pointer ABI alignment in bytes.
+    #[inline]
     pub fn ptr_align(&self) -> u64 {
         self.data_layout
             .pointer_abi_align
@@ -196,16 +201,19 @@ impl Target {
     }
 
     /// Maximum alignment for any type on this target.
+    #[inline]
     pub fn max_align(&self) -> u64 {
         self.spec.max_align
     }
 
     /// Endianness.
+    #[inline]
     pub fn endian(&self) -> spec::Endian {
         self.spec.endian
     }
 
     /// Integer ABI size in bytes for a given bit width.
+    #[inline]
     pub fn int_abi_size(&self, bits: u32) -> u64 {
         if bits == 0 {
             return 0;
@@ -227,6 +235,7 @@ impl Target {
     /// - `Int<0>` → alignment 1
     /// - Non-power-of-2 sizes → rounded up to the next power of 2
     /// - Architecture-specific overrides (e.g. x86 Linux: Int<64> → 4)
+    #[inline]
     pub fn int_abi_align(&self, bits: u32) -> u64 {
         if bits == 0 {
             return 1;
@@ -261,6 +270,7 @@ impl Target {
     }
 
     /// Float ABI size in bytes for a given bit width.
+    #[inline]
     pub fn float_abi_size(&self, bits: u32) -> u64 {
         self.spec
             .float_sizes
@@ -271,6 +281,7 @@ impl Target {
     }
 
     /// Float ABI alignment in bytes for a given bit width.
+    #[inline]
     pub fn float_abi_align(&self, bits: u32) -> u64 {
         for &(b, _size, align) in &self.data_layout.float_align {
             if b == bits as u8 {

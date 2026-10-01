@@ -9,9 +9,11 @@ use crate::diagnostics::{Applicability, Diagnostic, DiagnosticKind, Suggestion, 
 use crate::hir::comptime::{ComptimeEvalContext, ComptimeValue};
 use crate::hir::hir::{HirCatchBranch, HirExpr, HirMatchArm, HirParam, HirPattern, HirStmt};
 use crate::hir::infer::{Constraint, InferenceContext, TypeVariableKind, VarOrigin};
-use crate::hir::symbol::{TypeBinding, TypeKind};
-use crate::hir::types::{Characteristic, DefId, Subst, TypeContext, TypeData, TypeId};
+use crate::hir::symbol::{FunctionSignature, TypeBinding, TypeKind};
+use crate::hir::types::{Characteristic, DefId, Rigidity, Subst, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
+use smallvec::{SmallVec, smallvec};
+use std::collections::HashSet;
 
 /// Default bit width for `Int` / `UInt` when no explicit width is given.
 const DEFAULT_INT_WIDTH: u32 = 32;
@@ -28,8 +30,8 @@ const EXHAUSTIVE_COUNT_CAP: usize = 256;
 /// and checking, keeping TypeChecker focused on module-level state.
 /// Following the rustc `FnCtxt` pattern — see checker/mod.rs for the
 /// top-level TypeChecker that owns the global state (ctx, symbols, etc.).
-pub struct FnCtxt<'a, 'tcx, 'input> {
-    pub checker: &'tcx mut TypeChecker<'a, 'input>,
+pub struct FnCtxt<'a, 'tcx, 'src, 'input> {
+    pub checker: &'tcx mut TypeChecker<'a, 'src, 'input>,
 }
 
 /// Whether a catch-branch pattern covers the given variant name — recurses
@@ -38,12 +40,13 @@ fn pattern_covers_variant(p: &crate::ast::Pattern, v: &str) -> bool {
     match p {
         crate::ast::Pattern::Enum { variant, .. } => variant.as_str() == v,
         crate::ast::Pattern::Or(pats, _) => pats.iter().any(|p| pattern_covers_variant(p, v)),
+        crate::ast::Pattern::Annotated { inner, .. } => pattern_covers_variant(inner, v),
         _ => false,
     }
 }
 
-impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
-    pub fn new(checker: &'tcx mut TypeChecker<'a, 'input>) -> Self {
+impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
+    pub fn new(checker: &'tcx mut TypeChecker<'a, 'src, 'input>) -> Self {
         FnCtxt { checker }
     }
 
@@ -93,22 +96,36 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         scrut_ty: TypeId,
         pattern: &crate::ast::Pattern<'input>,
         span: crate::ast::Span,
-        body: impl FnOnce(&mut Self, bool) -> Result<T, Diagnostic>,
-    ) -> Result<(HirPattern<'input>, T, bool), Diagnostic> {
+        scrut_rigid: bool,
+        body: impl FnOnce(&mut Self, bool) -> Result<T, Diagnostic<'src>>,
+    ) -> Result<(HirPattern<'input>, T, bool, bool), Diagnostic<'src>> {
         let _scope = self.checker.enter_var_scope();
-        let (p, gadt_reachable, mut guard) =
-            self.checker.begin_gadt_arm(scrut_ty, pattern, span)?;
-        let t = body(self, gadt_reachable)?;
-        // Pop the refinement BEFORE the caller continues (cross-arm
-        // unification / else-branch) so this arm's equalities do not leak.
-        // The guard's idempotent depth check handles the early-return path.
+        let (p, variant_reachable, gadt_reachable, mut guard) =
+            self.checker
+                .begin_gadt_arm(scrut_ty, pattern, span, scrut_rigid)?;
+
+        // Apply θ(Γ) — eagerly refine the variable environment.
+        let _refinement_guard = if gadt_reachable {
+            Some(self.checker.refine_environment_for_gadt_arm())
+        } else {
+            None
+        };
+
+        // Pop the arm's equalities BEFORE the caller continues (cross-arm
+        // unification / else-branch) so this arm's facts do not leak.
+        // Must run on ALL exit paths (including Err from body) so the
+        // GADT fact stack stays balanced regardless of how we exit.
+        let body_result = body(self, gadt_reachable);
         if gadt_reachable {
             self.checker.ctx.pop_gadt_arm();
         }
         // Restore the TcLevel region entered by the arm guard (sets the
         // flag so the guard's Drop does not restore a second time).
         guard.restore_region();
-        Ok((p, t, gadt_reachable))
+        match body_result {
+            Ok(t) => Ok((p, t, variant_reachable, gadt_reachable)),
+            Err(e) => Err(e),
+        }
     }
 
     /// Convenience accessors that delegate to the underlying TypeChecker.
@@ -179,7 +196,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         expected: TypeId,
         actual: TypeId,
         span: Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), Diagnostic<'src>> {
         self.checker
             .ctx
             .unify_tracked(expected, actual, span)
@@ -191,12 +208,14 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                         .checker
                         .ctx
                         .get(expected)
-                        .display_with(self.checker.ctx, Some(self.checker.symbols)),
+                        .display_with(self.checker.ctx, Some(self.checker.symbols))
+                        .into_owned(),
                     found: self
                         .checker
                         .ctx
                         .get(actual)
-                        .display_with(self.checker.ctx, Some(self.checker.symbols)),
+                        .display_with(self.checker.ctx, Some(self.checker.symbols))
+                        .into_owned(),
                     span,
                     found_span: None,
                     reason,
@@ -216,7 +235,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         actual: TypeId,
         span: Span,
         ctx: TypingContext,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), Diagnostic<'src>> {
         self.checker
             .ctx
             .unify_tracked(expected, actual, span)
@@ -231,12 +250,14 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                             .checker
                             .ctx
                             .get(expected)
-                            .display_with(self.checker.ctx, Some(self.checker.symbols)),
+                            .display_with(self.checker.ctx, Some(self.checker.symbols))
+                            .into_owned(),
                         found: self
                             .checker
                             .ctx
                             .get(actual)
-                            .display_with(self.checker.ctx, Some(self.checker.symbols)),
+                            .display_with(self.checker.ctx, Some(self.checker.symbols))
+                            .into_owned(),
                         span,
                         found_span: None,
                         reason,
@@ -296,6 +317,452 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
             })
     }
 
+    /// SCR-APP-lite / SCR-SIG (Peyton Jones et al., "Simple unification-based
+    /// type inference for GADTs," POPL 2006, §5.1): whether the scrutinee's
+    /// type is RIGID — fully specified by a programmer annotation — and
+    /// therefore eligible for GADT type refinement in the case alternatives.
+    /// Two sources of rigidity:
+    ///   1. SCR-SIG: the scrutinee expression itself carries a type
+    ///      annotation (`(e : τ)` / `Expr::TypeAnnotated`).
+    ///   2. SCR-APP-lite: the scrutinee is a variable whose binding was
+    ///      declared with an explicit type annotation (`set x : τ = ...`,
+    ///      `let x : τ = ...`); a bare inferred binding stays WOBBLY and
+    ///      receives no refinement (the order-insensitivity guarantee of
+    ///      PLDI'06 §3: refinement never applies to wobbly types).
+    pub(crate) fn scrut_is_rigid(&mut self, scrut: &Expr<'input>) -> bool {
+        if let Expr::TypeAnnotated { .. } = scrut {
+            return true;
+        }
+        if let Expr::Ident(name, _) = scrut {
+            let ty = match self.checker.local_variable_types.get(*name) {
+                Some(t) => t,
+                None => return false,
+            };
+            return matches!(
+                self.checker.local_variable_types.get_rigidity(*name),
+                Some(Rigidity::Rigid)
+            ) && !self
+                .checker
+                .ctx
+                .is_infer_var(self.checker.ctx.resolve_binding(ty));
+        }
+        if let Expr::Call { callee, args, .. } = scrut {
+            return self.scrut_app_is_rigid(callee, args);
+        }
+        if let Expr::EnumLit {
+            path,
+            variant,
+            payload,
+            ..
+        } = scrut
+        {
+            return self.scrut_constructor_is_rigid(path, variant, payload.as_deref());
+        }
+        false
+    }
+
+    pub(crate) fn scrut_app_is_rigid(
+        &mut self,
+        callee: &Expr<'input>,
+        args: &[Expr<'input>],
+    ) -> bool {
+        match callee {
+            Expr::Ident(name, _) => {
+                if let Some(ty) = self.checker.local_variable_types.get(*name) {
+                    if matches!(
+                        self.checker.local_variable_types.get_rigidity(*name),
+                        Some(Rigidity::Rigid)
+                    ) {
+                        return self.scrut_app_rigid_from_fn_type(ty, args);
+                    }
+                }
+                if let Some(func_binding) = self.checker.symbols.lookup_function(*name) {
+                    return self.scrut_app_rigid_from_signature(&func_binding.signature, args);
+                }
+                false
+            }
+            Expr::FieldAccess {
+                base,
+                field,
+                span: _,
+            } => {
+                // Resolve the base type WITHOUT re-inferring the AST node.
+                // `infer_expr` was already called on the entire scrutinee
+                // before `scrut_is_rigid`; calling it again on `base` would
+                // create duplicate inference variables and corrupt the type
+                // context.  For Ident bases, the type is cached in
+                // `local_variable_types`; for non-Ident bases, conservatively
+                // return false to avoid corruption.
+                let base_ty = if let Expr::Ident(name, _) = base {
+                    match self.checker.local_variable_types.get(*name) {
+                        Some(ty) => ty,
+                        None => return false,
+                    }
+                } else {
+                    return false;
+                };
+                let (param_tys, ret_ty, _) = match self.checker.lookup_method(base_ty, *field) {
+                    Some(info) => info,
+                    None => return false,
+                };
+
+                let mut ret_indices = Vec::new();
+                let mut bound = std::collections::HashSet::new();
+                Self::collect_generic_indices(
+                    ret_ty,
+                    &self.checker.ctx,
+                    &mut ret_indices,
+                    &mut bound,
+                );
+                if ret_indices.is_empty() {
+                    return true;
+                }
+
+                let mut covered = HashSet::new();
+
+                // Receiver
+                if self.scrut_is_rigid(base) {
+                    let mut idxs = Vec::new();
+                    let mut bound = std::collections::HashSet::new();
+                    Self::collect_generic_indices(
+                        param_tys[0],
+                        &self.checker.ctx,
+                        &mut idxs,
+                        &mut bound,
+                    );
+                    covered.extend(idxs);
+                }
+
+                // Explicit arguments
+                for (i, arg) in args.iter().enumerate() {
+                    let param_idx = i + 1;
+                    if param_idx >= param_tys.len() {
+                        break;
+                    }
+                    if self.scrut_is_rigid(arg) {
+                        let mut idxs = Vec::new();
+                        let mut bound = std::collections::HashSet::new();
+                        Self::collect_generic_indices(
+                            param_tys[param_idx],
+                            &self.checker.ctx,
+                            &mut idxs,
+                            &mut bound,
+                        );
+                        covered.extend(idxs);
+                    }
+                }
+
+                ret_indices.iter().all(|idx| covered.contains(idx))
+            }
+            _ => false,
+        }
+    }
+
+    /// SCR-APP for GADT constructors: determines if an EnumLit yields a rigid type.
+    fn scrut_constructor_is_rigid(
+        &mut self,
+        path: &[Symbol],
+        variant: &Symbol,
+        payload: Option<&Expr<'input>>,
+    ) -> bool {
+        let ty_ast =
+            crate::ast::Type::Path(smallvec::SmallVec::from(path), crate::ast::Span::new(0, 0));
+        let Ok(enum_ty) = self.resolve_type(&ty_ast) else {
+            return false;
+        };
+        let Ok((def_id, _)) = self
+            .checker
+            .resolve_type_to_struct_or_enum(enum_ty, crate::ast::Span::new(0, 0))
+        else {
+            return false;
+        };
+        let Some(binding) = self.checker.symbols.lookup_type_by_def_id(def_id) else {
+            return false;
+        };
+
+        let num_type_params = binding.params.len();
+        if num_type_params == 0 {
+            return true;
+        }
+
+        let Some(variant_def) = binding.variants.iter().find(|v| v.name == *variant) else {
+            return false;
+        };
+
+        let payload_rigid = payload.map_or(false, |p| self.scrut_is_rigid(p));
+        if !payload_rigid {
+            return false;
+        }
+
+        let mut covered_params = std::collections::HashSet::new();
+
+        if let Some(payload_ty) = &variant_def.payload {
+            self.collect_ast_param_indices(payload_ty, &binding.params, &mut covered_params);
+        }
+
+        for (param_name, _) in &variant_def.eq_spec {
+            if let Some((idx, _)) = binding
+                .params
+                .iter()
+                .enumerate()
+                .find(|(_, p)| p.name == *param_name)
+            {
+                covered_params.insert(idx);
+            }
+        }
+
+        covered_params.len() == num_type_params
+    }
+
+    fn collect_ast_param_indices(
+        &self,
+        ty: &crate::ast::Type<'input>,
+        params: &[crate::ast::TypeParam<'input>],
+        out: &mut std::collections::HashSet<usize>,
+    ) {
+        match ty {
+            crate::ast::Type::Path(p, _) => {
+                if p.len() == 1 {
+                    if let Some((idx, _)) = params
+                        .iter()
+                        .enumerate()
+                        .find(|(_, param)| param.name == p[0])
+                    {
+                        out.insert(idx);
+                    }
+                }
+            }
+            crate::ast::Type::Generic(base, args, _) => {
+                self.collect_ast_param_indices(base, params, out);
+                for arg in args {
+                    match arg {
+                        crate::ast::GenericArg::Positional(t)
+                        | crate::ast::GenericArg::Named(_, t) => {
+                            self.collect_ast_param_indices(t, params, out);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            crate::ast::Type::Reference { inner, .. }
+            | crate::ast::Type::Slice(inner, _)
+            | crate::ast::Type::Pointer(inner, _) => {
+                self.collect_ast_param_indices(inner, params, out);
+            }
+            crate::ast::Type::Array(elem, _, _) => {
+                self.collect_ast_param_indices(elem, params, out)
+            }
+            crate::ast::Type::Tuple(elems, _) => {
+                for e in elems {
+                    self.collect_ast_param_indices(e, params, out);
+                }
+            }
+            crate::ast::Type::Function {
+                params: f_params,
+                ret,
+                ..
+            } => {
+                for p in f_params {
+                    self.collect_ast_param_indices(p, params, out);
+                }
+                self.collect_ast_param_indices(ret, params, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn scrut_app_rigid_from_signature(
+        &mut self,
+        sig: &FunctionSignature<'input>,
+        args: &[Expr<'input>],
+    ) -> bool {
+        let num_type_params = sig.type_params.len();
+        if num_type_params == 0 {
+            return true;
+        }
+        let arg_rigidities: Vec<bool> = args.iter().map(|a| self.scrut_is_rigid(a)).collect();
+        let mut covered: HashSet<usize> = HashSet::new();
+        for (i, is_rigid) in arg_rigidities.iter().enumerate() {
+            if !is_rigid {
+                continue;
+            }
+            if let Some(param) = sig.params.get(i) {
+                let mut indices = Vec::new();
+                let mut bound = std::collections::HashSet::new();
+                Self::collect_generic_indices(
+                    param.ty,
+                    &self.checker.ctx,
+                    &mut indices,
+                    &mut bound,
+                );
+                for idx in indices {
+                    if idx < num_type_params {
+                        covered.insert(idx);
+                    }
+                }
+            }
+        }
+        let ret_ty = sig.return_type.get();
+        let mut ret_indices = Vec::new();
+        let mut bound = std::collections::HashSet::new();
+        Self::collect_generic_indices(ret_ty, &self.checker.ctx, &mut ret_indices, &mut bound);
+        ret_indices
+            .iter()
+            .filter(|&&idx| idx < num_type_params)
+            .all(|&idx| covered.contains(&idx))
+    }
+
+    fn scrut_app_rigid_from_fn_type(&mut self, fn_ty: TypeId, args: &[Expr<'input>]) -> bool {
+        let mut num_type_params = 0usize;
+        let mut inner = fn_ty;
+        loop {
+            match self.checker.ctx.get(inner) {
+                TypeData::Forall { body, .. } => {
+                    num_type_params += 1;
+                    inner = *body;
+                }
+                TypeData::Poly { quantifiers, body } => {
+                    num_type_params += quantifiers.len();
+                    inner = *body;
+                }
+                _ => break,
+            }
+        }
+        if num_type_params == 0 {
+            return true;
+        }
+        let param_tys = match self.checker.ctx.params_of_fn(inner) {
+            Some(p) => p.to_vec(),
+            None => return false,
+        };
+        let ret_ty = self
+            .checker
+            .ctx
+            .ret_of_fn(inner)
+            .unwrap_or(self.checker.ctx.error());
+        let arg_rigidities: Vec<bool> = args.iter().map(|a| self.scrut_is_rigid(a)).collect();
+        let mut covered: HashSet<usize> = HashSet::new();
+        for (i, is_rigid) in arg_rigidities.iter().enumerate() {
+            if !is_rigid {
+                continue;
+            }
+            if let Some(&pty) = param_tys.get(i) {
+                let mut indices = Vec::new();
+                let mut bound = std::collections::HashSet::new();
+                Self::collect_generic_indices(pty, &self.checker.ctx, &mut indices, &mut bound);
+                for idx in indices {
+                    if idx < num_type_params {
+                        covered.insert(idx);
+                    }
+                }
+            }
+        }
+        let mut ret_indices = Vec::new();
+        let mut bound = std::collections::HashSet::new();
+        Self::collect_generic_indices(ret_ty, &self.checker.ctx, &mut ret_indices, &mut bound);
+        ret_indices
+            .iter()
+            .filter(|&&idx| idx < num_type_params)
+            .all(|&idx| covered.contains(&idx))
+    }
+
+    fn collect_generic_indices(
+        ty: TypeId,
+        ctx: &TypeContext<'input>,
+        out: &mut Vec<usize>,
+        bound: &mut std::collections::HashSet<usize>,
+    ) {
+        let resolved = ctx.resolve_binding(ty);
+        match ctx.get(resolved) {
+            TypeData::GenericParam { index, .. } => {
+                if !bound.contains(index) {
+                    out.push(*index);
+                }
+            }
+            TypeData::Adt { args, .. } => {
+                for &a in args {
+                    Self::collect_generic_indices(a, ctx, out, bound);
+                }
+            }
+            TypeData::Tuple { elems } => {
+                for &e in elems {
+                    Self::collect_generic_indices(e, ctx, out, bound);
+                }
+            }
+            TypeData::Slice { elem } => Self::collect_generic_indices(*elem, ctx, out, bound),
+            TypeData::Array { elem, .. } => Self::collect_generic_indices(*elem, ctx, out, bound),
+            TypeData::Ref { ty, .. } => Self::collect_generic_indices(*ty, ctx, out, bound),
+            TypeData::Pointer { ty } => Self::collect_generic_indices(*ty, ctx, out, bound),
+            TypeData::Ptr { size, pointee } => {
+                Self::collect_generic_indices(*size, ctx, out, bound);
+                Self::collect_generic_indices(*pointee, ctx, out, bound);
+            }
+            TypeData::Fn { params, ret } => {
+                for &p in params {
+                    Self::collect_generic_indices(p, ctx, out, bound);
+                }
+                Self::collect_generic_indices(*ret, ctx, out, bound);
+            }
+            TypeData::Forall {
+                param_index, body, ..
+            } => {
+                let inserted = bound.insert(*param_index);
+                Self::collect_generic_indices(*body, ctx, out, bound);
+                if inserted {
+                    bound.remove(param_index);
+                }
+            }
+            TypeData::Exists {
+                param_index, base, ..
+            } => {
+                let inserted = bound.insert(*param_index);
+                Self::collect_generic_indices(*base, ctx, out, bound);
+                if inserted {
+                    bound.remove(param_index);
+                }
+            }
+            TypeData::Mu {
+                param_index, body, ..
+            } => {
+                let inserted = bound.insert(*param_index);
+                Self::collect_generic_indices(*body, ctx, out, bound);
+                if inserted {
+                    bound.remove(param_index);
+                }
+            }
+            TypeData::Nu {
+                param_index, body, ..
+            } => {
+                let inserted = bound.insert(*param_index);
+                Self::collect_generic_indices(*body, ctx, out, bound);
+                if inserted {
+                    bound.remove(param_index);
+                }
+            }
+            TypeData::Poly { quantifiers, body } => {
+                let mut added = Vec::new();
+                for (idx, _) in quantifiers {
+                    if bound.insert(*idx) {
+                        added.push(*idx);
+                    }
+                }
+                Self::collect_generic_indices(*body, ctx, out, bound);
+                for idx in added {
+                    bound.remove(&idx);
+                }
+            }
+            TypeData::AssociatedType { self_ty, .. } => {
+                Self::collect_generic_indices(*self_ty, ctx, out, bound)
+            }
+            TypeData::Coproduct { alternatives } => {
+                for &a in alternatives {
+                    Self::collect_generic_indices(a, ctx, out, bound);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Seal-the-wall discharge: when the match/if-let has a known expected
     /// type AND the scrutinee is a GADT enum, unify the arm body against
     /// the expected type WHILE the arm's facts are in scope.  Returns true
@@ -307,7 +774,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         body_ty: TypeId,
         span: crate::ast::Span,
         variant: Option<&crate::ast::EnumVariant>,
-    ) -> Result<bool, Diagnostic> {
+    ) -> Result<bool, Diagnostic<'src>> {
         if let Some(exp) = expected {
             let exp_resolved = self.checker.ctx.resolve_binding(exp);
             let body_resolved = self.checker.ctx.resolve_binding(body_ty);
@@ -379,7 +846,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
     fn infer_call_expr(
         &mut self,
         expr: &Expr<'input>,
-    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic> {
+    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic<'src>> {
         let Expr::Call {
             callee,
             args,
@@ -506,12 +973,15 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 && let Some(binding) = self.checker.symbols.lookup_function(name)
                 && (self
                     .checker
+                    .shared
                     .effect_of
                     .get(&binding.def_id)
                     .is_some_and(|e| e.contains(EffectSet::MUTABLE_GLOBAL))
                     || self
                         .checker
+                        .shared
                         .functions_accessing_mutables
+                        .read()
                         .contains(&binding.def_id))
             {
                 self.checker.diagnostics.push(
@@ -609,7 +1079,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
             // be enforced at the call site: isolate blocks forbid
             // MUTABLE_GLOBAL; @pure functions forbid the wider set.
             if let Some((_, _, method_def_id)) = self.checker.lookup_method(base_ty, *field)
-                && let Some(eff) = self.checker.method_effect_of.get(&method_def_id)
+                && let Some(eff) = self.checker.shared.method_effect_of.get(&method_def_id)
             {
                 if self.checker.is_in_isolate() && eff.contains(EffectSet::MUTABLE_GLOBAL) {
                     self.checker.diagnostics.push(
@@ -662,7 +1132,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                     let _receiver_coercion =
                         crate::hir::types::CallSiteCoercion::enter(&self.checker.ctx);
                     // Try direct unification first (self = MyType, receiver = MyType)
-                    let mut unified = self
+                    let unified = self
                         .unify_with(self_param_ty, base_ty, *span, TypingContext::None)
                         .is_ok();
                     if !unified {
@@ -671,7 +1141,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                             self.checker.ctx.get(self_param_ty)
                         {
                             let ref_base = self.checker.ctx.reference(base_ty, false);
-                            unified = self
+                            let _ = self
                                 .unify_with(self_param_ty, ref_base, *span, TypingContext::None)
                                 .is_ok();
                         }
@@ -755,9 +1225,99 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
             if let Ok(ty) = self.resolve_type(&type_path) {
                 // Look up the method on the resolved type.
                 // lookup_method also handles inherent methods.
-                if let Some((param_tys, ret_ty, _method_def_id)) =
+                if let Some((param_tys, ret_ty, method_def_id)) =
                     self.checker.lookup_method(ty, method_name)
                 {
+                    // ── Static method sandbox checks ──────────────────
+                    // Mirror the FieldAccess path: look up the method's
+                    // attributes through inherent impl blocks (which
+                    // `lookup_function` cannot find for methods).
+                    if self.checker.is_in_comptime() || self.checker.is_in_isolate() {
+                        for method in self
+                            .checker
+                            .trait_env
+                            .lookup_inherent_methods(ty, self.checker.ctx)
+                        {
+                            if method.name == method_name {
+                                let has_trusted =
+                                    method.attributes.iter().any(|a| a.name.eq_str("trusted"));
+                                let has_io = method.attributes.iter().any(|a| a.name.eq_str("io"));
+                                if let Err(e) = self.check_call_attribute_violation(
+                                    &method_name,
+                                    true,
+                                    has_trusted,
+                                    has_io,
+                                    *span,
+                                ) {
+                                    return Ok(e);
+                                }
+                                break;
+                            }
+                        }
+                        let trait_methods: Vec<(Symbol, bool, bool)> = self
+                            .checker
+                            .trait_env
+                            .lookup_impls_for_type(ty)
+                            .iter()
+                            .flat_map(|impl_candidate| &impl_candidate.methods)
+                            .filter(|m| m.name == method_name)
+                            .map(|m| {
+                                let has_trusted =
+                                    m.attributes.iter().any(|a| a.name.eq_str("trusted"));
+                                let has_io = m.attributes.iter().any(|a| a.name.eq_str("io"));
+                                (m.name, has_trusted, has_io)
+                            })
+                            .collect::<Vec<_>>();
+                        for (_, has_trusted, has_io) in &trait_methods {
+                            if let Err(e) = self.check_call_attribute_violation(
+                                &method_name,
+                                true,
+                                *has_trusted,
+                                *has_io,
+                                *span,
+                            ) {
+                                return Ok(e);
+                            }
+                        }
+                    }
+                    // ── Isolate / pure-effect check via method_effect_of ──
+                    if let Some(eff) = self.checker.shared.method_effect_of.get(&method_def_id) {
+                        if self.checker.is_in_isolate() && eff.contains(EffectSet::MUTABLE_GLOBAL) {
+                            self.checker.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "cannot call method `{}` inside isolate block: it accesses mutable global state",
+                                    method_name,
+                                ))
+                                .with_code_str("E093")
+                                .with_span(*span)
+                                .with_help("isolate blocks guarantee no external mutable state access; this method reads or writes mutable globals"),
+                            );
+                            return Ok((HirExpr::Error(*span), self.checker.ctx.error()));
+                        }
+                        if self.checker.current_function_pure
+                            && eff.intersects(
+                                EffectSet::MUTABLE_GLOBAL
+                                    | EffectSet::IO
+                                    | EffectSet::UNSAFE
+                                    | EffectSet::PANIC
+                                    | EffectSet::COMPTIME,
+                            )
+                        {
+                            self.checker.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "`@pure` function cannot call method `{}`: it has a forbidden side effect",
+                                    method_name,
+                                ))
+                                .with_code_str("E117")
+                                .with_span(*span)
+                                .with_help(
+                                    "a @pure function must have no side effects, transitively — \
+                                     remove the offending method call or drop @pure",
+                                ),
+                            );
+                            return Ok((HirExpr::Error(*span), self.checker.ctx.error()));
+                        }
+                    }
                     // Static method call: no self parameter to skip.
                     // The method's param_tys already reflect the full signature.
                     if param_tys.len() != args.len() {
@@ -811,7 +1371,11 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         }
 
         // Normal (non-polymorphic) function call — peel any Forall wrapping
-        let inner_call_ty = {
+        // and instantiate remaining GenericParams with fresh InferVars.
+        // If try_synthesize_type_args bails out (e.g. has_contra), we still
+        // need to replace rigid params with flexible vars so arguments can
+        // drive type inference instead of hitting a rigid-variable error.
+        let mut inner_call_ty = {
             let mut t = callee_ty;
             loop {
                 match self.checker.ctx.get(t) {
@@ -821,6 +1385,27 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
             }
             t
         };
+        // Instantiate any leftover FREE GenericParams (the Forall peel above only
+        // handles the top-level quantifiers; nested binders in arg types are
+        // skipped by the bound-variable tracking in collect_generic_param_indices).
+        let mut generic_indices: Vec<usize> = Vec::new();
+        let mut bound = std::collections::HashSet::new();
+        TypeChecker::collect_generic_param_indices(
+            inner_call_ty,
+            &self.checker.ctx,
+            &mut generic_indices,
+            &mut bound,
+        );
+        generic_indices.sort();
+        generic_indices.dedup();
+        for &idx in &generic_indices {
+            let fresh = self.checker.infer.new_type_var(
+                &mut self.checker.ctx,
+                TypeVariableKind::Any,
+                VarOrigin::Synthetic,
+            );
+            inner_call_ty = self.checker.ctx.replace_generic(inner_call_ty, idx, fresh);
+        }
         if let Some(params) = self.checker.ctx.params_of_fn(inner_call_ty) {
             let param_tys = params.to_vec();
             let ret_ty = self
@@ -861,7 +1446,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         &mut self,
         expr: &Expr<'input>,
         expected: Option<TypeId>,
-    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic> {
+    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic<'src>> {
         let Expr::Match {
             scrutinee,
             arms,
@@ -899,6 +1484,10 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
             .checker
             .lookup_type_binding(self.checker.ctx.resolve_binding(scrut_ty))
             .map_or(false, |b| b.variants.iter().any(|v| v.is_gadt()));
+        // SCR gate (PLDI'06 §4.2 / §5.1): refinement applies only when the
+        // scrutinee's type is RIGID (user-annotated).  A wobbly (inferred)
+        // scrutinee keeps the status-quo cross-arm accumulation.
+        let scrut_rigid = self.scrut_is_rigid(scrutinee);
         for arm in arms {
             // GADT refinements are scoped to each arm via the
             // equality registry (see push_gadt_arm).
@@ -912,45 +1501,57 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
             let (
                 pattern_hir,
                 (guard_hir, body_hir, arm_body_ty, this_arm_discharged),
+                variant_reachable,
                 gadt_reachable,
-            ) = self.with_gadt_arm(scrut_ty, &arm.pattern, *span, |fctx, gadt_reachable| {
-                // Always type-check the guard and body, regardless of
-                // reachability, to ensure consistent diagnostics across
-                // match, if-let, and while-let.
-                let guard_hir = arm
-                    .guard
-                    .as_ref()
-                    .map(|g| {
-                        fctx.infer_expr(g, None).map(|(h, ty)| {
-                            if !fctx.checker.ctx.is_bool(ty) {
-                                fctx.checker.diagnostics.push(
-                                    Diagnostic::error("match guard must be boolean")
-                                        .with_span(arm.span),
-                                );
-                            }
-                            Box::new(h)
+            ) = self.with_gadt_arm(
+                scrut_ty,
+                &arm.pattern,
+                *span,
+                scrut_rigid,
+                |fctx, gadt_reachable| {
+                    // Always type-check the guard and body, regardless of
+                    // reachability, to ensure consistent diagnostics across
+                    // match, if-let, and while-let.
+                    let guard_hir = arm
+                        .guard
+                        .as_ref()
+                        .map(|g| {
+                            fctx.infer_expr(g, None).map(|(h, ty)| {
+                                if !fctx.checker.ctx.is_bool(ty) {
+                                    fctx.checker.diagnostics.push(
+                                        Diagnostic::error("match guard must be boolean")
+                                            .with_span(arm.span),
+                                    );
+                                }
+                                Box::new(h)
+                            })
                         })
-                    })
-                    .transpose()?;
-                let (body_hir, body_ty) = fctx.infer_expr(&arm.body, None)?;
-                // Seal: per-arm in-scope discharge (BEFORE pop, so
-                // the arm's facts are still visible to resolve_binding).
-                let variant = fctx
-                    .checker
-                    .resolve_gadt_variant_info(scrut_ty, &arm.pattern, arm.span)
-                    .map(|(_, vd, _)| vd);
-                let this_arm_discharged = gadt_reachable
-                    && scrut_is_gadt
-                    && fctx.try_gadt_discharge(expected, body_ty, arm.span, variant.as_ref())?;
-                if this_arm_discharged {
-                    gadt_discharged = true;
-                }
-                // Resolve the body type — follows bindings to the
-                // concrete type where available (normal resolution,
-                // no longer a GADT-specific capture hack).
-                let arm_body_ty = fctx.checker.ctx.resolve_binding(body_ty);
-                Ok((guard_hir, body_hir, arm_body_ty, this_arm_discharged))
-            })?;
+                        .transpose()?;
+                    let (body_hir, body_ty) = fctx.infer_expr(&arm.body, None)?;
+                    // Seal: per-arm in-scope discharge (BEFORE pop, so
+                    // the arm's facts are still visible to resolve_binding).
+                    let variant = fctx
+                        .checker
+                        .resolve_gadt_variant_info(scrut_ty, &arm.pattern, arm.span)
+                        .map(|(_, vd, _)| vd);
+                    let this_arm_discharged = gadt_reachable
+                        && scrut_is_gadt
+                        && fctx.try_gadt_discharge(
+                            expected,
+                            body_ty,
+                            arm.span,
+                            variant.as_ref(),
+                        )?;
+                    if this_arm_discharged {
+                        gadt_discharged = true;
+                    }
+                    // Resolve the body type — follows bindings to the
+                    // concrete type where available (normal resolution,
+                    // no longer a GADT-specific capture hack).
+                    let arm_body_ty = fctx.checker.ctx.resolve_binding(body_ty);
+                    Ok((guard_hir, body_hir, arm_body_ty, this_arm_discharged))
+                },
+            )?;
             // Cross-arm unification intentionally runs with TcLevel
             // escape checking DISABLED (`region_tree: None` below):
             // `arm_body_ty` is NOT always fully resolved (e.g. bool
@@ -963,69 +1564,71 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 body: Box::new(body_hir),
                 span: arm.span,
             });
-            // Include in cross-arm unification only if reachable,
-            // and only when no arm discharged against a shared
-            // expected type (GHC/OCaml never unify arm types
-            // against each other — each arm satisfies the expected
-            // type under its own givens).
-            if gadt_reachable {
-                if !gadt_discharged {
-                    // A diverging arm (`leave with`/`return` — type
-                    // `Never`) contributes no value to the cross-arm
-                    // type; skip unifying it with the accumulator.
-                    if self.checker.ctx.is_never(arm_body_ty) {
-                        // diverging arm — non-contributing
-                    } else if let Some(prev) = arm_ty {
-                        self.unify_with(prev, arm_body_ty, arm.span, TypingContext::None)?;
-                    } else {
-                        arm_ty = Some(arm_body_ty);
-                        first_pre_discharge_span = Some(arm.span);
+            // Cross-arm unification runs for ALL reachable arms.  The
+            // SCR gate controls whether GADT *refinement* is applied,
+            // NOT whether arm types are unified.  Unreachable GADT arms
+            // (variant_reachable == false) are skipped — their body types
+            // don't contribute to the match result.
+            // gadt_discharged is only set when gadt_reachable &&
+            // scrut_is_gadt && try_gadt_discharge succeeds, so for
+            // non-GADT matches it is always false and normal cross-arm
+            // unification proceeds.
+            if variant_reachable && !gadt_discharged {
+                // A diverging arm (`leave with`/`return` — type
+                // `Never`) contributes no value to the cross-arm
+                // type; skip unifying it with the accumulator.
+                if self.checker.ctx.is_never(arm_body_ty) {
+                    // diverging arm — non-contributing
+                } else if let Some(prev) = arm_ty {
+                    self.unify_with(prev, arm_body_ty, arm.span, TypingContext::None)?;
+                } else {
+                    arm_ty = Some(arm_body_ty);
+                    first_pre_discharge_span = Some(arm.span);
+                }
+            } else if variant_reachable && !this_arm_discharged {
+                // A prior arm discharged against the shared expected type,
+                // but THIS arm did not — its body is otherwise never
+                // checked (the cross-arm unify above is skipped once
+                // gadt_discharged).  Match GHC's per-arm expected-type
+                // check: unify the arm body against the expected type
+                // (post-pop, no facts).  A still-abstract GenericParam
+                // expected with a concrete body fires E104 (generality).
+                // gadt_discharged implies expected is Some (the first
+                // discharge required it, and expected is loop-invariant).
+                debug_assert!(expected.is_some());
+                if let Some(exp) = expected {
+                    let exp_resolved = self.checker.ctx.resolve_binding(exp);
+                    // Direct per-arm mismatch: an abstract GenericParam
+                    // expected with a CONCRETE body is rejected HERE —
+                    // relying on the deferred E104 would mask this
+                    // mismatch for const/where-constrained params (E104
+                    // exempts them), silently accepting an ill-typed arm.
+                    let exp_abstract = matches!(
+                        self.checker.ctx.get_raw(exp_resolved),
+                        TypeData::GenericParam { .. }
+                    );
+                    let body_abstract = matches!(
+                        self.checker.ctx.get_raw(arm_body_ty),
+                        // An unresolved InferVar is NOT provably
+                        // concrete — it may yet resolve to the
+                        // expected GenericParam, so it must not
+                        // trigger the "produces a concrete type"
+                        // E030 prematurely (mirrors the discharge
+                        // guard's `exp_abstract`, which includes
+                        // InferVar).
+                        TypeData::GenericParam { .. } | TypeData::InferVar { .. }
+                    );
+                    if exp_abstract && !body_abstract {
+                        return Err(Diagnostic::error(
+                            "match arm does not satisfy the expected type: the arm \
+                                     produces a concrete type where the generic parameter \
+                                     is expected; each arm must type-check for every \
+                                     instantiation",
+                        )
+                        .with_code_str("E030")
+                        .with_span(arm.span));
                     }
-                } else if !this_arm_discharged {
-                    // A prior arm discharged against the shared expected type,
-                    // but THIS arm did not — its body is otherwise never
-                    // checked (the cross-arm unify above is skipped once
-                    // gadt_discharged).  Match GHC's per-arm expected-type
-                    // check: unify the arm body against the expected type
-                    // (post-pop, no facts).  A still-abstract GenericParam
-                    // expected with a concrete body fires E104 (generality).
-                    // gadt_discharged implies expected is Some (the first
-                    // discharge required it, and expected is loop-invariant).
-                    debug_assert!(expected.is_some());
-                    if let Some(exp) = expected {
-                        let exp_resolved = self.checker.ctx.resolve_binding(exp);
-                        // Direct per-arm mismatch: an abstract GenericParam
-                        // expected with a CONCRETE body is rejected HERE —
-                        // relying on the deferred E104 would mask this
-                        // mismatch for const/where-constrained params (E104
-                        // exempts them), silently accepting an ill-typed arm.
-                        let exp_abstract = matches!(
-                            self.checker.ctx.get_raw(exp_resolved),
-                            TypeData::GenericParam { .. }
-                        );
-                        let body_abstract = matches!(
-                            self.checker.ctx.get_raw(arm_body_ty),
-                            // An unresolved InferVar is NOT provably
-                            // concrete — it may yet resolve to the
-                            // expected GenericParam, so it must not
-                            // trigger the "produces a concrete type"
-                            // E030 prematurely (mirrors the discharge
-                            // guard's `exp_abstract`, which includes
-                            // InferVar).
-                            TypeData::GenericParam { .. } | TypeData::InferVar { .. }
-                        );
-                        if exp_abstract && !body_abstract {
-                            return Err(Diagnostic::error(
-                                "match arm does not satisfy the expected type: the arm \
-                                         produces a concrete type where the generic parameter \
-                                         is expected; each arm must type-check for every \
-                                         instantiation",
-                            )
-                            .with_code_str("E030")
-                            .with_span(arm.span));
-                        }
-                        self.unify_with(exp_resolved, arm_body_ty, arm.span, TypingContext::None)?;
-                    }
+                    self.unify_with(exp_resolved, arm_body_ty, arm.span, TypingContext::None)?;
                 }
             }
         }
@@ -1087,20 +1690,20 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
 
         if !has_wildcard {
             // Enumerate checked variants/patterns from all arms
-            let mut covered_variants: Vec<String> = Vec::new();
+            let mut covered_variants: HashSet<String> = HashSet::new();
             for arm in &hir_arms {
                 match &arm.pattern {
                     HirPattern::Enum { variant, .. } => {
-                        if !covered_variants.contains(&variant.as_str()) {
-                            covered_variants.push(variant.as_str());
+                        if !covered_variants.contains(variant.as_str()) {
+                            covered_variants.insert(variant.as_str().to_string());
                         }
                     }
                     HirPattern::Or(patterns, _) => {
                         for p in patterns {
                             if let HirPattern::Enum { variant, .. } = p
-                                && !covered_variants.contains(&variant.as_str())
+                                && !covered_variants.contains(variant.as_str())
                             {
-                                covered_variants.push(variant.as_str());
+                                covered_variants.insert(variant.as_str().to_string());
                             }
                         }
                     }
@@ -1108,7 +1711,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                         if let HirExpr::Literal(lit, _, _) = expr.as_ref() {
                             let lit_key = format!("{:?}", lit);
                             if !covered_variants.contains(&lit_key) {
-                                covered_variants.push(lit_key);
+                                covered_variants.insert(lit_key);
                             }
                         }
                     }
@@ -1195,6 +1798,12 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
             // Use characteristic κ after resolving inference variables.
             // For InferVars, also check the variable kind directly
             // (characteristic returns usize::MAX for unresolved infer vars).
+            // NOTE: this is a conservative *diagnostic* on types and is NOT
+            // gated on parametricity (see `hir::parametricity` module docs):
+            // κ/counting is sound unconditionally; only Yoneda-reduction-
+            // as-equivalence requires the parametricity gate.  The count
+            // assumes Set semantics for μ/ν (initial/final algebras) — see
+            // the semantic-model note in the same module.
             let char = self.checker.ctx.characteristic(resolved_scrut_ty);
             let total_count_from_char = match char {
                 Characteristic::FiniteExhaustible(n) => Some(n),
@@ -1247,7 +1856,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         &mut self,
         expr: &Expr<'input>,
         expected: Option<TypeId>,
-    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic> {
+    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic<'src>> {
         let Expr::EnumLit {
             path,
             variant,
@@ -1257,8 +1866,10 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         else {
             unreachable!("infer_expr dispatch guarantees the expression variant");
         };
-        let resolved_ty =
-            self.resolve_type(&Type::Path(smallvec::SmallVec::from(path.clone()), *span))?;
+        let resolved_ty = self.resolve_type(&Type::Path(
+            smallvec::SmallVec::from(path.as_slice()),
+            *span,
+        ))?;
         let (def_id, mut args) = self
             .checker
             .resolve_type_to_struct_or_enum(resolved_ty, *span)?;
@@ -1618,7 +2229,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
     fn infer_try_expr(
         &mut self,
         expr: &Expr<'input>,
-    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic> {
+    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic<'src>> {
         let Expr::Try { expr, span } = expr else {
             unreachable!("infer_expr dispatch guarantees the expression variant");
         };
@@ -1678,7 +2289,14 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 // re-inference, NO transaction, NO side-effect leak
                 // (the old rolled-back re-inference leaked
                 // InferenceContext variables and duplicated
-                // diagnostics — no side-effect leak).
+                // diagnostics).
+                // Rationale: OutsideIn(X) separates constraint generation
+                // from solving; this path reads solved types directly
+                // from the HIR instead of regenerating constraints
+                // (re-inference would create new union-find variables and
+                // commit them, leaking state).  See also OmniML's
+                // suspended-constraint discipline for why speculative
+                // inference must be transactional.
                 let base_ty = match &hir {
                     HirExpr::Call { callee, .. } => match callee.as_ref() {
                         HirExpr::FieldAccess { base, .. } => Some(base.ty()),
@@ -1767,7 +2385,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
     fn infer_catch_expr(
         &mut self,
         expr: &Expr<'input>,
-    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic> {
+    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic<'src>> {
         let Expr::Catch {
             expr,
             branches,
@@ -1800,7 +2418,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
             && let Some(binding) = self.checker.symbols.lookup_function(name)
         {
             // Extract the variant names from @must_handle(...) attribute
-            let must_handle_variants: Vec<String> = binding
+            let must_handle_variants: Vec<&'static str> = binding
                 .attributes
                 .iter()
                 .filter(|a| a.name.eq_str("must_handle"))
@@ -1824,9 +2442,9 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                         // be reported as missing.
                         !branches
                             .iter()
-                            .any(|b| pattern_covers_variant(&b.pattern, v.as_str()))
+                            .any(|b| pattern_covers_variant(&b.pattern, v))
                     })
-                    .map(|s| s.as_str())
+                    .copied()
                     .collect();
                 if !missing.is_empty() {
                     let msg = format!(
@@ -1905,7 +2523,12 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 // NO re-inference, NO transaction, NO side-effect
                 // leak (the old rolled-back re-inference leaked
                 // InferenceContext variables and duplicated
-                // diagnostics — no side-effect leak).
+                // diagnostics).
+                // Same rationale as the FieldAccess path above: reading
+                // solved types from HIR avoids regenerating union-find
+                // variables.  Speculative inference must be transactional
+                // (OutsideIn(X) constraint-generation/solving separation;
+                // OmniML suspended-constraint discipline).
                 let base_ty = match &expr_hir {
                     HirExpr::Call { callee, .. } => match callee.as_ref() {
                         HirExpr::FieldAccess { base, .. } => Some(base.ty()),
@@ -1983,7 +2606,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         let mut hir_branches = Vec::new();
         for branch in branches {
             let _scope = self.checker.enter_var_scope();
-            let exist_depth = self.checker.ctx.gadt.exist_skolems.borrow().len();
+            let exist_depth = self.checker.ctx.gadt.exist_skolems.read().len();
             let pattern_hir = self.check_pattern(&branch.pattern, error_ty, exist_depth)?;
             let body_hir = self.check_block(&branch.body)?;
             // SYNTAX.md §Error Handling: "Each branch of `catch`
@@ -2017,7 +2640,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         &mut self,
         expr: &Expr<'input>,
         expected: Option<TypeId>,
-    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic> {
+    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic<'src>> {
         let Expr::IfLet {
             pattern,
             scrutinee,
@@ -2055,12 +2678,18 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
             .checker
             .lookup_type_binding(self.checker.ctx.resolve_binding(scrut_ty))
             .map_or(false, |b| b.variants.iter().any(|v| v.is_gadt()));
+        // SCR gate: refinement applies only to a rigid (annotated) scrutinee.
+        let scrut_rigid = self.scrut_is_rigid(scrutinee);
         let mut gadt_discharged = false;
         // Enter scope so the pattern binding is scoped to the then-branch
         // (lifecycle encapsulated in `with_gadt_arm`).
         let (pattern_hir, then_hir, then_ty, _gadt_reachable) = {
-            let (p, (t, ty), gadt_reachable) =
-                self.with_gadt_arm(scrut_ty, pattern, *span, |fctx, gadt_reachable| {
+            let (p, (t, ty), _variant_reachable, gadt_reachable) = self.with_gadt_arm(
+                scrut_ty,
+                pattern,
+                *span,
+                scrut_rigid,
+                |fctx, gadt_reachable| {
                     let t = fctx.check_block(then_branch)?;
                     // Seal: in-scope discharge BEFORE pop (facts visible).
                     let variant = fctx
@@ -2084,7 +2713,8 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                     // no longer roll back after each arm).
                     let ty = fctx.checker.ctx.resolve_binding(fctx.block_type(&t));
                     Ok((t, ty))
-                })?;
+                },
+            )?;
             (p, t, ty, gadt_reachable)
         }; // _scope dropped inside with_gadt_arm: pattern + then-branch bindings removed
         let else_hir = else_branch
@@ -2169,7 +2799,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         &mut self,
         expr: &Expr<'input>,
         expected: Option<TypeId>,
-    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic> {
+    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic<'src>> {
         // Red zone 256 KiB: when the remaining stack drops below this, grow
         // by a 16 MiB segment (amortized — only triggered on deep chains).
         stacker::maybe_grow(256 * 1024, 16 * 1024 * 1024, || {
@@ -2183,7 +2813,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         &mut self,
         expr: &Expr<'input>,
         expected: Option<TypeId>,
-    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic> {
+    ) -> Result<(HirExpr<'input>, TypeId), Diagnostic<'src>> {
         match expr {
             Expr::Literal(lit, span) => {
                 match lit {
@@ -2239,7 +2869,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 // Check the local variable type cache first (set by VariableDef)
                 if let Some(ty) = self.checker.local_variable_types.get(*name) {
                     // Reading a mutable global outside @trusted is forbidden
-                    if self.checker.mutable_globals.contains(name)
+                    if self.checker.shared.mutable_globals.read().contains(name)
                         && !self.checker.current_function_trusted
                     {
                         self.checker.diagnostics.push(
@@ -2253,13 +2883,19 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                         );
                     }
                     // Track which functions access mutable globals (for isolate checking)
-                    if self.checker.mutable_globals.contains(name)
+                    if self.checker.shared.mutable_globals.read().contains(name)
                         && let Some(def_id) = self.checker.current_function
                     {
-                        self.checker.functions_accessing_mutables.insert(def_id);
+                        self.checker
+                            .shared
+                            .functions_accessing_mutables
+                            .write()
+                            .insert(def_id);
                     }
                     // Reading a mutable global inside an isolate block is also forbidden
-                    if self.checker.mutable_globals.contains(name) && self.checker.is_in_isolate() {
+                    if self.checker.shared.mutable_globals.read().contains(name)
+                        && self.checker.is_in_isolate()
+                    {
                         self.checker.diagnostics.push(
                             Diagnostic::error(format!(
                                 "cannot read mutable global `{}` inside isolate block",
@@ -2609,7 +3245,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                     (None, Some(et)) => et,
                     (None, None) => self.checker.ctx.int(DEFAULT_INT_WIDTH, true),
                 };
-                let ty = self.checker.ctx.tuple(vec![elem_ty, elem_ty]);
+                let ty = self.checker.ctx.tuple(smallvec![elem_ty, elem_ty]);
                 Ok((
                     HirExpr::Range {
                         start: start_hir.map(Box::new),
@@ -2622,8 +3258,10 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 ))
             }
             Expr::StructLit { path, fields, span } => {
-                let resolved_ty =
-                    self.resolve_type(&Type::Path(smallvec::SmallVec::from(path.clone()), *span))?;
+                let resolved_ty = self.resolve_type(&Type::Path(
+                    smallvec::SmallVec::from(path.as_slice()),
+                    *span,
+                ))?;
                 let (def_id, args) = self
                     .checker
                     .resolve_type_to_struct_or_enum(resolved_ty, *span)?;
@@ -2650,7 +3288,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                             .iter()
                             .find(|f| f.name == *name)
                             .ok_or_else(|| {
-                                let field_names: Vec<String> =
+                                let field_names: Vec<&'static str> =
                                     binding.fields.iter().map(|f| f.name.as_str()).collect();
                                 let type_name = format!("{:?}", def_id);
                                 let mut diag =
@@ -2665,7 +3303,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                                         field_names.join(", ")
                                     ));
                                 if let Some(suggestion) =
-                                    did_you_mean_suggestion(&name.as_str(), &field_names)
+                                    did_you_mean_suggestion(name.as_str(), &field_names)
                                 {
                                     diag = diag.with_suggestion(suggestion);
                                 }
@@ -2699,7 +3337,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
             }
             Expr::Tuple(exprs, span) => {
                 let mut hirs = Vec::new();
-                let mut types = Vec::new();
+                let mut types: SmallVec<[TypeId; 4]> = SmallVec::new();
                 for e in exprs {
                     let (hir, ty) = self.infer_expr(e, None)?;
                     hirs.push(hir);
@@ -2735,7 +3373,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 span,
             } => {
                 let mut hir_params = Vec::new();
-                let mut param_tys = Vec::new();
+                let mut param_tys: SmallVec<[TypeId; 4]> = SmallVec::new();
                 for param in params {
                     let ty = param
                         .ty
@@ -2947,8 +3585,8 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 let then_diverges = self.block_diverges(&then_hir);
                 let else_diverges = else_hir.as_ref().is_some_and(|h| self.block_diverges(h));
                 let both_diverge = then_diverges && else_diverges;
-                if *is_expression && !both_diverge && then_ty != else_ty {
-                    self.checker.ctx.unify_tracked(then_ty, else_ty, *span).ok();
+                if *is_expression && !then_diverges && !else_diverges {
+                    self.unify(then_ty, else_ty, *span)?;
                 }
                 let result_ty = if *is_expression {
                     if then_diverges {
@@ -3019,7 +3657,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                         body,
                     } => {
                         // Wrap in Poly — extract quantifier info, reconstruct.
-                        let quantifiers = vec![(param_index, param_name)];
+                        let quantifiers = smallvec![(param_index, param_name)];
                         // Peel any nested Forall layers.
                         let mut all_q = quantifiers;
                         let mut inner_body = body;
@@ -3112,7 +3750,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                             crate::hir::infer::TypeVariableKind::Any,
                             crate::hir::infer::VarOrigin::Synthetic,
                         );
-                        self.checker.ctx.unify_tracked(root, inst_ty, *span).ok();
+                        self.unify(root, inst_ty, *span)?;
                         Ok((
                             HirExpr::PolyUnbox {
                                 expr: Box::new(hir_expr),
@@ -3225,7 +3863,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         index: usize,
         total: usize,
         span: crate::ast::Span,
-    ) -> Result<HirExpr<'input>, Diagnostic> {
+    ) -> Result<HirExpr<'input>, Diagnostic<'src>> {
         // `@auto_ro`'s implicit freeze applies at call sites — set the
         // `CallSite` coercion context BEFORE `check_expr` so that context-
         // sensitive inference inside `check_expr` (e.g. `Expr::EnumLit`
@@ -3245,10 +3883,17 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         // Relaxation): `&Rc<T>` → `&T` through an `@auto_deref`-marked
         // `Deref` impl.  When the argument is a reference whose pointee
         // derefs to the expected pointee, unify through the deref.
-        if self.checker.ctx.auto_coerce.get() {
-            if let (TypeData::Ref { ty: p1, .. }, TypeData::Ref { ty: p2, .. }) =
-                (self.checker.ctx.get(expected), self.checker.ctx.get(ty))
-            {
+        if self.checker.ctx.auto_coerce {
+            // Resolve binding chains BEFORE inspecting TypeData — `expected`
+            // and `ty` may be InferVars that have been unified with Ref types;
+            // ctx.get() on an InferVar returns TypeData::InferVar, not the
+            // bound Ref, causing the coercion to silently fail.
+            let resolved_expected = self.checker.ctx.resolve_binding(expected);
+            let resolved_ty = self.checker.ctx.resolve_binding(ty);
+            if let (TypeData::Ref { ty: p1, .. }, TypeData::Ref { ty: p2, .. }) = (
+                self.checker.ctx.get(resolved_expected),
+                self.checker.ctx.get(resolved_ty),
+            ) {
                 // The BUILT-IN REBORROW COERCION (the reference-of-
                 // reference deref — rustc's call-site deref coercion):
                 // `&mut r` where `r: &mut T` (or `&r` where `r: &T`/
@@ -3396,7 +4041,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         args: &[crate::ast::Expr<'input>],
         param_tys: &[TypeId],
         span: crate::ast::Span,
-    ) -> Result<Vec<HirExpr<'input>>, Diagnostic> {
+    ) -> Result<Vec<HirExpr<'input>>, Diagnostic<'src>> {
         // (committee ruling, 2026-08-05): NO loan is registered for `@auto_ro`
         // implicit downgrades (the freeze is unobservable in the current
         // grammar — see `check_call_argument`).  Explicit loans
@@ -3424,7 +4069,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         expr: &Expr<'input>,
         expected: Expectation,
         ctx: TypingContext,
-    ) -> Result<HirExpr<'input>, Diagnostic> {
+    ) -> Result<HirExpr<'input>, Diagnostic<'src>> {
         // For Call expressions, propagate expected type for better type arg synthesis.
         if let Expr::Call {
             callee,
@@ -3507,7 +4152,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         value: &HirExpr<'input>,
         span: Span,
     ) {
-        let Some(inv_ast) = self.checker.ctx.get_invariant(expected_ty).cloned() else {
+        let Some(inv_ast) = self.checker.ctx.get_invariant(expected_ty) else {
             return; // not a refined type — nothing to check
         };
         // Read the binder from the RAW TypeData (NOT `name_of_exists`,
@@ -3528,7 +4173,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         };
         // Fast path: the value's own type carries an alpha-equivalent
         // invariant — `set y: NonZeroInt = x` where `x: NonZeroInt`.
-        if let Some(v_inv) = self.checker.ctx.get_invariant(value.ty()).cloned()
+        if let Some(v_inv) = self.checker.ctx.get_invariant(value.ty())
             && let Some(v_binder) = (match self.checker.ctx.get_raw(value.ty()) {
                 TypeData::Exists { name, .. } => Some(*name),
                 _ => None,
@@ -3564,8 +4209,10 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                     self.checker.symbols,
                     &mut self.checker.diagnostics,
                 );
-                for (fn_name, (fn_params, fn_body)) in &self.checker.comptime_fn_registry {
-                    ec.register_fn(*fn_name, fn_params.clone(), fn_body.clone());
+                for (fn_name, (fn_params, fn_body)) in
+                    self.checker.shared.comptime_fn_registry.read().clone()
+                {
+                    ec.register_fn(fn_name, fn_params.clone(), fn_body.clone());
                 }
                 ec.eval_expr(other).ok()
             }
@@ -3637,8 +4284,10 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
             self.checker.symbols,
             &mut self.checker.diagnostics,
         );
-        for (fn_name, (fn_params, fn_body)) in &self.checker.comptime_fn_registry {
-            eval.register_fn(*fn_name, fn_params.clone(), fn_body.clone());
+        for (fn_name, (fn_params, fn_body)) in
+            self.checker.shared.comptime_fn_registry.read().clone()
+        {
+            eval.register_fn(fn_name, fn_params.clone(), fn_body.clone());
         }
         let slot = eval.allocate_slot();
         eval.cur_slot.insert(fresh, slot);
@@ -3749,14 +4398,14 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         other: TypeId,
         other_span: Option<Span>,
         span: Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), Diagnostic<'src>> {
         self.checker
             .check_kind_compat(maybe_var, maybe_var_span, other, other_span, span)
     }
 
     /// Resolve a syntactic type to a TypeId — actual implementation.
     #[must_use]
-    pub fn resolve_type(&mut self, ty: &Type<'input>) -> Result<TypeId, Diagnostic> {
+    pub fn resolve_type(&mut self, ty: &Type<'input>) -> Result<TypeId, Diagnostic<'src>> {
         match ty {
             Type::Path(path, span) => {
                 // Lifetime parsed as placeholder path `["'a"]` — skip resolution.
@@ -3766,7 +4415,9 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                         if path.len() == 1
                             && let Some(&ty) = self.checker.local_type_param_cache.get(&path[0])
                         {
-                            return Ok(ty);
+                            // §4.3: rigid annotations inside a GADT arm must see the
+                            // arm's refinement — resolve through the fact registry.
+                            return Ok(self.checker.ctx.resolve_binding(ty));
                         }
                         return Err(Diagnostic::error(format!("type '{}' not found", path[0]))
                             .with_span(*span));
@@ -3830,9 +4481,9 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                         }
                         TypeKind::Struct => {
                             if binding.params.is_empty() {
-                                Ok(self.checker.ctx.struct_ty(def_id, vec![]))
+                                Ok(self.checker.ctx.struct_ty(def_id, smallvec![]))
                             } else {
-                                let args: Vec<TypeId> = (0..binding.params.len())
+                                let args: SmallVec<[TypeId; 4]> = (0..binding.params.len())
                                     .map(|_| {
                                         self.new_infer_var(
                                             TypeVariableKind::Unconstrained,
@@ -3845,9 +4496,9 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                         }
                         TypeKind::Enum => {
                             if binding.params.is_empty() {
-                                Ok(self.checker.ctx.enum_ty(def_id, vec![]))
+                                Ok(self.checker.ctx.enum_ty(def_id, smallvec![]))
                             } else {
-                                let args: Vec<TypeId> = (0..binding.params.len())
+                                let args: SmallVec<[TypeId; 4]> = (0..binding.params.len())
                                     .map(|_| {
                                         self.new_infer_var(
                                             TypeVariableKind::Unconstrained,
@@ -3883,7 +4534,9 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                         if path.len() == 1
                             && let Some(&ty) = self.checker.local_type_param_cache.get(&path[0])
                         {
-                            return Ok(ty);
+                            // §4.3: rigid annotations inside a GADT arm must see the
+                            // arm's refinement — resolve through the fact registry.
+                            return Ok(self.checker.ctx.resolve_binding(ty));
                         }
                         Err(Diagnostic::error(format!("type '{}' not found", path[0]))
                             .with_span(*span))
@@ -3951,7 +4604,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 }
                 let base_ty = self.resolve_type(base)?;
                 let expanded = self.expand_base_type(base_ty, *span)?;
-                let mut arg_tys = Vec::new();
+                let mut arg_tys: SmallVec<[TypeId; 4]> = SmallVec::new();
                 for arg in args {
                     arg_tys.push(self.resolve_type(&arg.ty())?);
                 }
@@ -4030,8 +4683,10 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                                 self.checker.symbols,
                                 &mut self.checker.diagnostics,
                             );
-                            for (name, (params, body)) in &self.checker.comptime_fn_registry {
-                                eval.register_fn(*name, params.clone(), body.clone());
+                            for (name, (params, body)) in
+                                self.checker.shared.comptime_fn_registry.read().clone()
+                            {
+                                eval.register_fn(name, params.clone(), body.clone());
                             }
                             match eval.eval_expr(&size_hir) {
                                 Ok(ComptimeValue::Int(n)) if n >= 0 => {
@@ -4061,14 +4716,14 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 }
             }
             Type::Tuple(tys, _) => {
-                let elems: Vec<_> = tys
+                let elems: SmallVec<[TypeId; 4]> = tys
                     .iter()
                     .map(|t| self.resolve_type(t))
                     .collect::<Result<_, _>>()?;
                 Ok(self.checker.ctx.tuple(elems))
             }
             Type::Function { params, ret, .. } => {
-                let param_tys: Vec<_> = params
+                let param_tys: SmallVec<[TypeId; 4]> = params
                     .iter()
                     .map(|p| self.resolve_type(p))
                     .collect::<Result<_, _>>()?;
@@ -4144,6 +4799,13 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                         ),
                     );
                 }
+                // A `dyn Trait` in the compilation unit breaks parametricity
+                // (runtime type reification distinguishes instantiations) —
+                // close the parametricity gate regardless of strict-mode
+                // rejection.  Yoneda-reduction-as-equivalence consumers
+                // consult this via `neg_beta_eta_equiv_gated`; κ diagnostics
+                // are unaffected (see `hir::parametricity` docs).
+                self.checker.ctx.parametricity.break_parametricity();
                 let trait_ids: Vec<_> = traits
                     .iter()
                     .filter_map(|t| {
@@ -4230,7 +4892,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 } else {
                     // Combine all resolved types into a Coproduct (sum type),
                     // representing the union of all variants.
-                    let mut alternatives = Vec::new();
+                    let mut alternatives: SmallVec<[TypeId; 4]> = SmallVec::new();
                     for ty in resolved {
                         match self.checker.ctx.get(ty) {
                             TypeData::Adt { .. } => alternatives.push(ty),
@@ -4263,7 +4925,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                     ))
                     .with_help(format!("regex parse error: {}", e)));
                 }
-                Ok(self.checker.ctx.regex(pattern.clone()))
+                Ok(self.checker.ctx.regex(Symbol::intern(pattern)))
             }
             Type::Expr(expr, span) => {
                 let (_, ty) = self.infer_expr(expr, None)?;
@@ -4274,7 +4936,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
 
     /// Expand type aliases: if `ty` is an alias, resolve it to its body.
     #[must_use]
-    pub fn expand_base_type(&mut self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
+    pub fn expand_base_type(&mut self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic<'src>> {
         if let Some(def_id) = self.checker.ctx.get_def_id_for_type(ty) {
             if let Some(binding) = self.checker.symbols.lookup_type_by_def_id(def_id) {
                 if binding.kind == TypeKind::Alias {
@@ -4323,7 +4985,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         to: TypeId,
         safe: bool,
         span: Span,
-    ) -> Result<TypeId, Diagnostic> {
+    ) -> Result<TypeId, Diagnostic<'src>> {
         if safe {
             if (self.ctx().is_numeric(from) && self.ctx().is_numeric(to))
                 || (self.ctx().is_bool(from) && self.ctx().is_integer(to))
@@ -4381,14 +5043,14 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         left_span: Option<Span>,
         right_span: Option<Span>,
         span: Span,
-    ) -> Result<TypeId, Diagnostic> {
+    ) -> Result<TypeId, Diagnostic<'src>> {
         self.checker
             .binary_op_type(op, left, right, left_span, right_span, span)
     }
 
     /// Check a statement (delegates to TypeChecker).
     #[must_use]
-    pub fn check_stmt(&mut self, stmt: &Stmt<'input>) -> Result<HirStmt<'input>, Diagnostic> {
+    pub fn check_stmt(&mut self, stmt: &Stmt<'input>) -> Result<HirStmt<'input>, Diagnostic<'src>> {
         self.checker.check_stmt(stmt)
     }
 
@@ -4397,7 +5059,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
     pub fn check_block(
         &mut self,
         stmts: &[Stmt<'input>],
-    ) -> Result<Vec<HirStmt<'input>>, Diagnostic> {
+    ) -> Result<Vec<HirStmt<'input>>, Diagnostic<'src>> {
         self.checker.push_literal_scope();
         let _scope = self.checker.enter_var_scope();
         // Loan scoping: a borrow created inside a lexical block expires at
@@ -4425,7 +5087,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         pattern: &Pattern<'input>,
         expected_ty: TypeId,
         exist_depth: usize,
-    ) -> Result<HirPattern<'input>, Diagnostic> {
+    ) -> Result<HirPattern<'input>, Diagnostic<'src>> {
         let hir = self.check_pattern_inner(pattern, expected_ty, exist_depth)?;
         // Automatically register all pattern-bound variables into local scope
         // (and as runtime, so they shadow outer ghosts for `when` checking).
@@ -4444,11 +5106,11 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
         pattern: &Pattern<'input>,
         expected_ty: TypeId,
         exist_depth: usize,
-    ) -> Result<HirPattern<'input>, Diagnostic> {
+    ) -> Result<HirPattern<'input>, Diagnostic<'src>> {
         if self.checker.ctx.is_infer_var(expected_ty) {
             match pattern {
                 Pattern::Tuple(patterns, span) => {
-                    let elem_tys: Vec<TypeId> = patterns
+                    let elem_tys: SmallVec<[TypeId; 4]> = patterns
                         .iter()
                         .map(|_| {
                             self.new_infer_var(
@@ -4533,6 +5195,37 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 Ok(HirPattern::Slice(hir_before, hir_slice, hir_after, *span))
             }
             Pattern::Error(span) => Ok(HirPattern::Error(*span)),
+            Pattern::Annotated { inner, ty, span } => {
+                let (annot_ty, new_vars) =
+                    self.resolve_pattern_annotation(ty, expected_ty, *span)?;
+
+                // §5.5 PANN on existential payloads (PLDI'06):
+                if self.contains_gadt_skolem(expected_ty) {
+                    if !self.existential_annotation_compatible(expected_ty, annot_ty) {
+                        for v in &new_vars {
+                            self.checker.local_type_param_cache.remove(v);
+                        }
+                        return Err(Diagnostic::error(
+                            "pattern annotation is structurally incompatible \
+                             with the existential payload type",
+                        )
+                        .with_code_str("E030")
+                        .with_span(*span));
+                    }
+                    let res = self.check_pattern(inner, expected_ty, exist_depth);
+                    for v in &new_vars {
+                        self.checker.local_type_param_cache.remove(v);
+                    }
+                    res
+                } else {
+                    self.unify_with(expected_ty, annot_ty, *span, TypingContext::None)?;
+                    let res = self.check_pattern(inner, annot_ty, exist_depth);
+                    for v in &new_vars {
+                        self.checker.local_type_param_cache.remove(v);
+                    }
+                    res
+                }
+            }
             Pattern::Struct {
                 path, fields, span, ..
             } => {
@@ -4545,7 +5238,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 if !matches!(binding.kind, TypeKind::Struct) {
                     return Err(Diagnostic::error("pattern type is not a struct").with_span(*span));
                 }
-                let type_args: Vec<TypeId> = (0..binding.params.len())
+                let type_args: SmallVec<[TypeId; 4]> = (0..binding.params.len())
                     .map(|_| {
                         self.new_infer_var(
                             TypeVariableKind::Unconstrained,
@@ -4617,7 +5310,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 if !matches!(binding.kind, TypeKind::Enum) {
                     return Err(Diagnostic::error("pattern type is not an enum").with_span(*span));
                 }
-                let type_args: Vec<TypeId> = (0..binding.params.len())
+                let type_args: SmallVec<[TypeId; 4]> = (0..binding.params.len())
                     .map(|_| {
                         self.new_infer_var(
                             TypeVariableKind::Unconstrained,
@@ -4659,7 +5352,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 // pattern) all push a NEW frame.
                 let pushed = if !variant_def.exists_params.is_empty() {
                     let top_is_this_variant = {
-                        let stack = self.checker.ctx.gadt.exist_skolems.borrow();
+                        let stack = self.checker.ctx.gadt.exist_skolems.read();
                         // Only frames pushed at or after THIS arm's entry may
                         // be reused — on the shared stack, `last()` can
                         // otherwise be an OUTER arm's frame (nested arm
@@ -4676,8 +5369,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                     if top_is_this_variant {
                         // Reuse the precreate frame; mark it consumed so a
                         // recursive re-encounter pushes a fresh frame.
-                        if let Some(f) = self.checker.ctx.gadt.exist_skolems.borrow_mut().last_mut()
-                        {
+                        if let Some(f) = self.checker.ctx.gadt.exist_skolems.write().last_mut() {
                             f.used = true;
                         }
                         false
@@ -4687,7 +5379,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                             .iter()
                             .map(|_| self.checker.ctx.fresh_gadt_skolem())
                             .collect();
-                        self.checker.ctx.gadt.exist_skolems.borrow_mut().push(
+                        self.checker.ctx.gadt.exist_skolems.write().push(
                             crate::hir::checker::ExistScopeFrame {
                                 def_id,
                                 variant_name: *variant,
@@ -4697,7 +5389,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                         );
                         #[cfg(debug_assertions)]
                         crate::hir::anya::trace_skolem_scope(
-                            &self.checker.ctx.gadt.exist_skolems.borrow(),
+                            &self.checker.ctx.gadt.exist_skolems.read(),
                             &variant_def.exists_params,
                             variant,
                         );
@@ -4706,13 +5398,13 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 } else {
                     false
                 };
-                let result = (|| -> Result<HirPattern<'input>, Diagnostic> {
+                let result = (|| -> Result<HirPattern<'input>, Diagnostic<'src>> {
                     let exist_skolems = self
                         .checker
                         .ctx
                         .gadt
                         .exist_skolems
-                        .borrow()
+                        .read()
                         .last()
                         .map(|f| f.skolems.clone())
                         .unwrap_or_default();
@@ -4724,6 +5416,31 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                     // the expected type).  Registration happens later in
                     // `apply_gadt_refinement` (after `push_gadt_arm`).
                     if variant_def.is_gadt() {
+                        // ── Rigid/wobbly distinction (PLDI'06 §2,§4,§5.3) ──
+                        // Smart patterns: a type parameter is RIGID when it is
+                        // refined by a `when` constraint, OR when it does not
+                        // appear free in the variant payload at all (a purely
+                        // existential position).  Parameters that appear free
+                        // in the payload and are not refined stay WOBBLY —
+                        // wobbly types are never refined (the order-
+                        // insensitivity guarantee of PLDI'06 §3).
+                        for (i, _) in binding.params.iter().enumerate() {
+                            let refined = variant_def
+                                .eq_spec
+                                .iter()
+                                .any(|(pn, _)| *pn == binding.params[i].name);
+                            let payload_free = variant_def.payload.as_ref().map_or(false, |pty| {
+                                type_mentions_param(pty, binding.params[i].name)
+                            });
+                            if refined || (!payload_free && !variant_def.is_gadt()) || !payload_free
+                            {
+                                self.checker.local_variable_types.insert_with_rigidity(
+                                    binding.params[i].name,
+                                    type_args[i],
+                                    crate::hir::types::Rigidity::Rigid,
+                                );
+                            }
+                        }
                         if let Ok((_, inner_args)) =
                             self.checker.resolve_type_to_struct_or_enum(enum_ty, *span)
                         {
@@ -4741,7 +5458,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                             }
                         }
                     }
-                    let inner_ty = variant_def
+                    let inner_ty_result = variant_def
                         .payload
                         .as_ref()
                         .map(|ty| {
@@ -4773,24 +5490,26 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                             // (e.g., `&[X]` where X is an `exists` param), use the
                             // skolem-substituted resolution path.
                             if !exist_skolems.is_empty() {
-                                self.checker
+                                let result = self.checker
                                     .resolve_type_with_skolems(
                                         ty,
                                         &variant_def.exists_params,
                                         &exist_skolems,
-                                    )
-                                    .ok_or_else(|| {
-                                        Diagnostic::error(format!(
-                                            "cannot resolve type for variant '{}' with existential parameters",
-                                            variant,
-                                        ))
-                                        .with_span(*span)
-                                    })
+                                    );
+                                result.ok_or_else(|| {
+                                    Diagnostic::error(format!(
+                                        "cannot resolve type for variant '{}' with existential parameters",
+                                        variant,
+                                    ))
+                                    .with_span(*span)
+                                })
                             } else {
-                                self.resolve_type(ty)
+                                let result = self.resolve_type(ty);
+                                result
                             }
                         })
-                        .unwrap_or(Ok(self.checker.ctx.error()))?;
+                        .unwrap_or(Ok(self.checker.ctx.error()));
+                    let inner_ty = inner_ty_result?;
                     let inner_hir = inner
                         .as_ref()
                         .map(|inner| self.check_pattern(inner, inner_ty, exist_depth))
@@ -4805,7 +5524,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 // Pop AFTER the closure returns (success or `?` early
                 // return) so the scope never leaks on the error path.
                 if pushed {
-                    self.checker.ctx.gadt.exist_skolems.borrow_mut().pop();
+                    self.checker.ctx.gadt.exist_skolems.write().pop();
                 }
                 result
             }
@@ -4925,12 +5644,190 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 }
                 Ok(HirPattern::Or(hir_patterns, *span))
             }
-            _ => {
+        }
+    }
+
+    /// Resolves a pattern annotation type, potentially binding new scoped type variables.
+    /// Enforces the PANN rule: m = w => b = {} (cannot bind new vars if expected type is wobbly).
+    fn resolve_pattern_annotation(
+        &mut self,
+        ty: &crate::ast::Type<'input>,
+        expected_ty: TypeId,
+        span: crate::ast::Span,
+    ) -> Result<(TypeId, Vec<Symbol>), Diagnostic<'src>> {
+        if let Ok(annot_ty) = self.resolve_type(ty) {
+            return Ok((annot_ty, Vec::new()));
+        }
+
+        if let crate::ast::Type::Path(path, _) = ty {
+            if path.len() == 1 {
+                let var_name = path[0];
+
+                if self.checker.ctx.is_infer_var(expected_ty) {
+                    return Err(Diagnostic::error(
+                        "cannot bind new type variables in pattern annotation when the expected type is wobbly (inferred)",
+                    )
+                    .with_code_str("E067")
+                    .with_span(span)
+                    .with_help("add a type annotation to the scrutinee to make it rigid, or use an existing scoped type variable"));
+                }
+
+                let fresh_idx = self.checker.ctx.fresh_param_index();
+                let fresh_gp = self.checker.ctx.generic_param(fresh_idx, var_name);
                 self.checker
-                    .diagnostics
-                    .push(Diagnostic::error("unsupported pattern type").with_span(Span::new(0, 0)));
-                Ok(HirPattern::Error(Span::new(0, 0)))
+                    .local_type_param_cache
+                    .insert(var_name, fresh_gp);
+
+                let annot_ty = self.resolve_type(ty)?;
+                return Ok((annot_ty, vec![var_name]));
             }
+        }
+
+        self.resolve_type(ty).map(|t| (t, Vec::new()))
+    }
+
+    fn contains_gadt_skolem(&self, ty: TypeId) -> bool {
+        let resolved = self.checker.ctx.resolve_binding(ty);
+        match self.checker.ctx.get(resolved) {
+            crate::hir::types::TypeData::SkolemVar { universe_num, .. } => {
+                *universe_num == crate::hir::types::TypeContext::GADT_SKOLEM_UNIVERSE
+            }
+            crate::hir::types::TypeData::Ref { ty, .. } => self.contains_gadt_skolem(*ty),
+            crate::hir::types::TypeData::Slice { elem } => self.contains_gadt_skolem(*elem),
+            crate::hir::types::TypeData::Tuple { elems } => {
+                elems.iter().any(|&e| self.contains_gadt_skolem(e))
+            }
+            crate::hir::types::TypeData::Array { elem, .. } => self.contains_gadt_skolem(*elem),
+            crate::hir::types::TypeData::Pointer { ty } => self.contains_gadt_skolem(*ty),
+            crate::hir::types::TypeData::Adt { args, .. } => {
+                args.iter().any(|&a| self.contains_gadt_skolem(a))
+            }
+            crate::hir::types::TypeData::Fn { params, ret } => {
+                params.iter().any(|&p| self.contains_gadt_skolem(p))
+                    || self.contains_gadt_skolem(*ret)
+            }
+            _ => false,
+        }
+    }
+
+    /// Checks if an inferred type is structurally compatible with an
+    /// existential annotation `(e : \exists \bar{\alpha} . \tau)`.
+    ///
+    /// Based on the ANNOT rule for existential annotations in
+    /// O'Brien, Rémy & Scherer, "Omnidirectional Type Inference for ML"
+    /// (OmniML, POPL 2019), which allows flexible instantiation of
+    /// existentially-bound variables during pattern checking while
+    /// preserving skolem opacity.  A GADT existential skolem
+    /// (`universe_num == GADT_SKOLEM_UNIVERSE`) is always compatible
+    /// because it represents an opaque witness that may unify with
+    /// any concrete type within the arm scope.
+    fn existential_annotation_compatible(&self, expected: TypeId, annot: TypeId) -> bool {
+        let expected_resolved = self.checker.ctx.resolve_binding(expected);
+        let annot_resolved = self.checker.ctx.resolve_binding(annot);
+
+        if expected_resolved == annot_resolved {
+            return true;
+        }
+
+        let e_data = self.checker.ctx.get(expected_resolved).clone();
+        let a_data = self.checker.ctx.get(annot_resolved).clone();
+
+        match (&e_data, &a_data) {
+            (crate::hir::types::TypeData::SkolemVar { universe_num, .. }, _)
+                if *universe_num == crate::hir::types::TypeContext::GADT_SKOLEM_UNIVERSE =>
+            {
+                true
+            }
+            (_, crate::hir::types::TypeData::SkolemVar { universe_num, .. })
+                if *universe_num == crate::hir::types::TypeContext::GADT_SKOLEM_UNIVERSE =>
+            {
+                true
+            }
+
+            (
+                crate::hir::types::TypeData::Ref {
+                    ty: e_ty,
+                    mutable: e_m,
+                    ..
+                },
+                crate::hir::types::TypeData::Ref {
+                    ty: a_ty,
+                    mutable: a_m,
+                    ..
+                },
+            ) => e_m == a_m && self.existential_annotation_compatible(*e_ty, *a_ty),
+
+            (
+                crate::hir::types::TypeData::Slice { elem: e_elem },
+                crate::hir::types::TypeData::Slice { elem: a_elem },
+            ) => self.existential_annotation_compatible(*e_elem, *a_elem),
+
+            (
+                crate::hir::types::TypeData::Tuple { elems: e_elems },
+                crate::hir::types::TypeData::Tuple { elems: a_elems },
+            ) => {
+                e_elems.len() == a_elems.len()
+                    && e_elems
+                        .iter()
+                        .zip(a_elems.iter())
+                        .all(|(&e, &a)| self.existential_annotation_compatible(e, a))
+            }
+
+            (
+                crate::hir::types::TypeData::Array {
+                    elem: e_elem,
+                    size: e_size,
+                },
+                crate::hir::types::TypeData::Array {
+                    elem: a_elem,
+                    size: a_size,
+                },
+            ) => e_size == a_size && self.existential_annotation_compatible(*e_elem, *a_elem),
+
+            (
+                crate::hir::types::TypeData::Pointer { ty: e_ty },
+                crate::hir::types::TypeData::Pointer { ty: a_ty },
+            ) => self.existential_annotation_compatible(*e_ty, *a_ty),
+
+            (
+                crate::hir::types::TypeData::Adt {
+                    def_id: e_def,
+                    args: e_args,
+                    ..
+                },
+                crate::hir::types::TypeData::Adt {
+                    def_id: a_def,
+                    args: a_args,
+                    ..
+                },
+            ) => {
+                e_def == a_def
+                    && e_args.len() == a_args.len()
+                    && e_args
+                        .iter()
+                        .zip(a_args.iter())
+                        .all(|(&e, &a)| self.existential_annotation_compatible(e, a))
+            }
+
+            (
+                crate::hir::types::TypeData::Fn {
+                    params: e_params,
+                    ret: e_ret,
+                },
+                crate::hir::types::TypeData::Fn {
+                    params: a_params,
+                    ret: a_ret,
+                },
+            ) => {
+                e_params.len() == a_params.len()
+                    && e_params
+                        .iter()
+                        .zip(a_params.iter())
+                        .all(|(&e, &a)| self.existential_annotation_compatible(e, a))
+                    && self.existential_annotation_compatible(*e_ret, *a_ret)
+            }
+
+            _ => false,
         }
     }
 
@@ -4980,6 +5877,30 @@ impl<'input: 'a, 'a: 'tcx, 'tcx> FnCtxt<'a, 'tcx, 'input> {
                 }
             }
         }
+    }
+}
+
+fn type_mentions_param<'input>(ty: &crate::ast::Type<'input>, name: Symbol) -> bool {
+    use crate::ast::Type;
+    match ty {
+        Type::Path(segments, _) => segments.len() == 1 && segments[0] == name,
+        Type::Generic(base, args, _) => {
+            type_mentions_param(base, name)
+                || args.iter().any(|arg| match arg {
+                    crate::ast::GenericArg::Positional(t) | crate::ast::GenericArg::Named(_, t) => {
+                        type_mentions_param(t, name)
+                    }
+                    crate::ast::GenericArg::Const(_) => false,
+                })
+        }
+        Type::Reference { inner, .. } => type_mentions_param(inner, name),
+        Type::Slice(inner, _) | Type::Pointer(inner, _) => type_mentions_param(inner, name),
+        Type::Array(elem, _, _) => type_mentions_param(elem, name),
+        Type::Tuple(elems, _) => elems.iter().any(|t| type_mentions_param(t, name)),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(|t| type_mentions_param(t, name)) || type_mentions_param(ret, name)
+        }
+        _ => false,
     }
 }
 

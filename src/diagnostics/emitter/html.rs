@@ -22,12 +22,12 @@ impl Default for HtmlEmitter {
 }
 
 impl super::DiagnosticEmitter for HtmlEmitter {
-    fn emit(&mut self, diag: &Diagnostic) {
+    fn emit(&mut self, diag: &Diagnostic<'_>) {
         let html = self.diagnostic_to_html(diag);
         eprintln!("{}", html);
     }
 
-    fn emit_all(&mut self, diags: &[Diagnostic]) {
+    fn emit_all(&mut self, diags: &[Diagnostic<'_>]) {
         let css = crate::diagnostics::emitter::stylesheet::Stylesheet::dark().to_html_css();
         let mut html = String::from(
             "<!DOCTYPE html>\n<html>\n<head>\n<meta charset='utf-8'>\n\
@@ -89,7 +89,7 @@ impl super::DiagnosticEmitter for HtmlEmitter {
 }
 
 impl HtmlEmitter {
-    fn diagnostic_to_html(&self, diag: &Diagnostic) -> String {
+    fn diagnostic_to_html(&self, diag: &Diagnostic<'_>) -> String {
         let mut html = String::new();
         let level_class = diag.level.as_str();
         let code_str = diag
@@ -203,13 +203,15 @@ impl HtmlEmitter {
         all_labels.extend(labels.iter().cloned());
 
         let mut html = String::new();
+        let mut primary_cols = Vec::new();
 
         for line_idx in first_line..=last_line {
             let line = lines[line_idx];
             let underlines = compute_line_underlines(&all_labels, source, line, line_idx);
 
             // ── Build primary columns set for background highlighting ──
-            let mut primary_cols: Vec<bool> = vec![false; line.len()];
+            primary_cols.clear();
+            primary_cols.resize(line.len(), false);
             for (col, ulen, underline_char, _msg) in &underlines {
                 if *underline_char == '^' {
                     let end = std::cmp::min(col + ulen, line.len());
@@ -310,9 +312,16 @@ impl HtmlEmitter {
     }
 
     fn escape(&self, s: &str) -> String {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                _ => out.push(c),
+            }
+        }
+        out
     }
 }

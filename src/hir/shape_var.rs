@@ -200,7 +200,7 @@ pub enum TypeShape {
     /// Tuple type: τ₁ × τ₂ × … × τₙ
     Tuple(usize),
     /// Named constructor (struct/enum): C τ₁ τ₂ … τₙ
-    Constructor(usize),
+    Constructor(usize, usize),
     /// Polymorphic/existential/fixpoint container: ∀α.τ / ∃α.τ / μα.τ / να.τ
     Poly,
 }
@@ -424,7 +424,7 @@ pub fn shapes_compatible(a: TypeShape, b: TypeShape) -> bool {
         (TypeShape::Unknown, _) | (_, TypeShape::Unknown) => true,
         (TypeShape::Arrow, TypeShape::Arrow) => true,
         (TypeShape::Tuple(n), TypeShape::Tuple(m)) => n == m,
-        (TypeShape::Constructor(_), TypeShape::Constructor(_)) => true,
+        (TypeShape::Constructor(id1, _), TypeShape::Constructor(id2, _)) => id1 == id2,
         (TypeShape::Poly, TypeShape::Poly) => true,
         _ => false,
     }
@@ -435,7 +435,7 @@ pub fn type_data_to_shape(data: &TypeData) -> TypeShape {
     match data {
         TypeData::Fn { .. } => TypeShape::Arrow,
         TypeData::Tuple { elems } => TypeShape::Tuple(elems.len()),
-        TypeData::Adt { args, .. } => TypeShape::Constructor(args.len()),
+        TypeData::Adt { def_id, args, .. } => TypeShape::Constructor(def_id.0, args.len()),
         TypeData::Forall { .. }
         | TypeData::Exists { .. }
         | TypeData::Mu { .. }

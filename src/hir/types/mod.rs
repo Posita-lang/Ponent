@@ -1,12 +1,29 @@
+use parking_lot::RwLock;
 use rustc_hash::FxHashMap as HashMap;
 use std::cell::Cell;
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+pub(crate) use smallvec::{SmallVec, smallvec};
+
 use crate::ast::OverflowPolicy;
 use crate::symbol::Symbol;
+
+// ── TypeFlags bitfield ────────────────────────────────────────────────
+bitflags::bitflags! {
+    /// Compact bitfield caching computed type properties for O(1) lookup.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct TypeFlags: u8 {
+        const IS_INFER_VAR = 0b0000_0001;
+        const IS_CONCRETE = 0b0000_0010;
+        const HAS_REGION_VAR = 0b0000_0100;
+        const IS_FORALL = 0b0000_1000;
+        const IS_FUNCTION = 0b0001_0000;
+        const IS_STRUCT = 0b0010_0000;
+        const IS_GENERIC_PARAM = 0b0100_0000;
+    }
+}
 
 /// Global atomic counter for DefId allocation.
 /// Used by `SymbolTable::allocate_def_id()` to ensure globally unique DefId
@@ -65,6 +82,11 @@ mod variance;
 pub use variance::*;
 mod transaction;
 pub use transaction::*;
+mod canonical;
+mod coherence;
+pub mod predicativity;
+mod rewrite;
+pub mod witness;
 mod yoneda;
 pub use yoneda::*;
 mod subtype;
@@ -169,7 +191,7 @@ pub(crate) fn ty_contains_foreign_universe<'input>(
 /// pure data contract shared by `cfg_graph` (the CFG collector) and
 /// `polonius` (the rules engine) — hosting it in either would force a
 /// module-level cycle between them.
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SignatureFacts {
     /// `universal_region(origin)`: the input borrow origins are
     /// placeholders (the placeholder machinery is adopted — rejection
@@ -187,7 +209,7 @@ pub struct SignatureFacts {
     pub input_borrow_mutable: Vec<bool>,
 }
 
-fn is_type_volatile_inner(data: &TypeData, types: Option<&Vec<Arc<TypeData>>>) -> bool {
+fn is_type_volatile_inner(data: &TypeData, types: Option<&boxcar::Vec<Arc<TypeData>>>) -> bool {
     match data {
         TypeData::InferVar { .. } | TypeData::SkolemVar { .. } => true,
         TypeData::GenericParam { .. }
@@ -239,14 +261,14 @@ fn is_type_volatile_inner(data: &TypeData, types: Option<&Vec<Arc<TypeData>>>) -
     }
 }
 
-fn is_type_volatile_inner_by_id(ty: TypeId, types: Option<&Vec<Arc<TypeData>>>) -> bool {
+fn is_type_volatile_inner_by_id(ty: TypeId, types: Option<&boxcar::Vec<Arc<TypeData>>>) -> bool {
     // If we have access to the type arena, look up the TypeData and check.
     if let Some(types) = types {
         let idx = ty.index();
-        if idx < types.len() {
+        if let Some(slot) = types.get(idx) {
             // Mirror the match in is_type_volatile_inner — handle every variant
             // explicitly so that the fallthrough below is only for the `None` case.
-            return match &*types[idx] {
+            return match &**slot {
                 // Volatile: cannot cache.
                 TypeData::InferVar { .. } | TypeData::SkolemVar { .. } => true,
                 // Leaf / primitive types: never volatile.
@@ -366,23 +388,34 @@ pub(crate) struct AdtDef {
     pub has_drop: bool,
 }
 
+/// The PER-QUERY half of the type system.
+///
+/// `TypeContext<'input>` owns the mutable inference state — bindings,
+/// transactions, GADT refinements, and the caches that depend on them.
+/// The type arena and the structural caches live in the shared
+/// [`TypeFactory`] behind an `Arc`, so several contexts can exist at once
+/// over one interner and still agree on `TypeId`s.  That is what lets a
+/// per-function query take its own context: inference for two functions
+/// never touches the same bindings, but both see the same types.
+///
+/// Note that `get()` reads `bindings` (via `resolve_binding`), so *all*
+/// type inspection depends on this half.  Parallelism therefore comes from
+/// one context per query, not from sharing one context between queries.
 pub struct TypeContext<'input> {
     /// The parser's arena — set in the compiler driver (main.rs) so the
     /// checker can allocate NEW AST nodes (e.g. the `type T = Base where
     /// value > 0` desugar builds `invariant _where_N > 0`).  `None` in
     /// unit tests / target-layout tests that don't desugar.
-    pub arena: Option<&'input bumpalo::Bump>,
-    /// The regex-pattern validation cache (pattern → valid) — repeated
-    /// `Regex<"pattern">` constructions skip the re-parse.
-    regex_cache: HashMap<String, bool>,
-    types: Vec<Arc<TypeData>>,
-    pub(crate) bindings: RefCell<HashMap<TypeId, TypeId>>,
-    meta: HashMap<TypeId, TypeMeta<'input>>,
-    def_id_to_type_id: HashMap<DefId, TypeId>,
-    /// The registered ADT definitions (def_id → fields + Drop) — used by
-    /// `type_is_copy` to decide the §Copy derivation (all fields
-    /// recursively Copy + no Drop impl).
-    adt_defs: RefCell<HashMap<DefId, AdtDef>>,
+    /// Wrapped in `SyncArena`, not a bare `&Bump`: `bumpalo::Bump` is not
+    /// `Sync`, and `&T: Send`/`&T: Sync` both require `T: Sync`, so a bare
+    /// `&Bump` here made `TypeContext` neither `Send` nor `Sync`.  See
+    /// `crate::arena` for why the wrapper is sound.
+    pub arena: Option<&'input crate::arena::SyncArena<'input>>,
+    /// The SHARED interner: the type arena plus every cache that does not
+    /// depend on inference state.  Behind an `Arc` so a per-query context
+    /// can share it instead of copying it.
+    interner: Arc<TypeFactory<'input>>,
+    pub(crate) bindings: HashMap<TypeId, TypeId>,
     pub builtin_unit: TypeId,
     pub builtin_never: TypeId,
     pub builtin_error: TypeId,
@@ -397,11 +430,6 @@ pub struct TypeContext<'input> {
     /// `Type` — a dedicated struct-like type
     /// for comptime layout descriptors, replacing the old `ctx.error()` fallback.
     pub builtin_layout_descriptor: TypeId,
-    /// Cache for variance check results: (param_index, TypeId, expected_sign, cumulative_sign) → bool.
-    variance_cache: RefCell<HashMap<(usize, TypeId, isize, isize), bool>>,
-    /// Pre-computed variance-annotated outgoing edges for each TypeId.
-    /// Built lazily on first variance check, then reused.
-    variance_edges: RefCell<HashMap<TypeId, Vec<VarianceEdge>>>,
     /// Region-subtype collection switch + collected outlives pairs.
     /// When the checker enables region collection (per function
     /// signature), `subtype`'s Ref arm records `(l1, l2)` for
@@ -409,14 +437,20 @@ pub struct TypeContext<'input> {
     /// constraint `'a: 'b`) instead of rejecting; the solver consumes the
     /// collected pairs.  When disabled (pure-relation calls, tests), the
     /// old strict rejection stands.
-    pub(crate) region_subtype_collect: Cell<bool>,
-    pub(crate) region_subtype_outlives: RefCell<Vec<(Symbol, Symbol)>>,
+    pub(crate) region_subtype_collect: bool,
+    pub(crate) region_subtype_outlives: Vec<(Symbol, Symbol)>,
+    /// Compilation-unit parametricity state (roadmap Stage 4): set by the
+    /// checker when a parametricity-breaking construct (`dyn Trait` type
+    /// reification) is lowered.  Consulted by Yoneda-reduction-as-
+    /// equivalence consumers via `equiv_yoneda_allowed`; κ diagnostics are
+    /// NOT gated.  See `hir::parametricity` module docs.
+    pub parametricity: crate::hir::parametricity::ParametricityGate,
     /// When an opaque type's concrete type is inferred inside the defining
     /// scope, the hidden type is stored here. `resolve_opaque` checks this
     /// map before falling back to the `TypeData::Opaque.hidden` field.
     /// Uses `RefCell` because the defining scope may set hidden types
     /// during type checking after TypeContext<'input> creation.
-    opaque_hidden: RefCell<HashMap<TypeId, TypeId>>,
+    opaque_hidden: HashMap<TypeId, TypeId>,
     /// Transaction stack for atomic unification (OmniML-style rollback via undo log).
     /// Each entry is a list of (key, old_value) pairs recording every binding
     /// change made during that transaction.  On rollback the changes are undone
@@ -425,71 +459,54 @@ pub struct TypeContext<'input> {
     /// when the binding table is large and transactions are frequent.
     /// Note: the types arena (self.types) is NOT truncated on rollback because
     /// TypeId values may be held externally; the arena is append-only.
-    transaction_stack: RefCell<Vec<Vec<(TypeId, Option<TypeId>)>>>,
+    transaction_stack: Vec<Vec<(TypeId, Option<TypeId>)>>,
     /// Parallel undo log for `opaque_hidden` changes.  Each transaction
     /// level has a list of (opaque_type_id, previous_hidden_value) pairs
     /// that are restored on rollback.
-    opaque_hidden_undo: RefCell<Vec<Vec<(TypeId, Option<TypeId>)>>>,
+    opaque_hidden_undo: Vec<Vec<(TypeId, Option<TypeId>)>>,
     /// Cache for unification with variance: prevents infinite recursion on
     /// self-referential types.  Keyed by (a, b, variance_tag) where
     /// variance_tag = 0 for Invariant, 1 for Covariant, 2 for Contravariant.
-    unify_seen: RefCell<HashSet<(TypeId, TypeId, u8)>>,
+    unify_seen: HashSet<(TypeId, TypeId, u8)>,
     /// Current "operation span" hint: set by `unify_tracked` so that
     /// `set_binding` can record WHERE a GenericParam got bound (precise
     /// E104 error location).  `None` outside span-carrying unifications,
     /// so solver-driven bindings do not inherit a stale span.
-    pub(crate) current_unify_span: RefCell<Option<crate::ast::Span>>,
+    pub(crate) current_unify_span: Option<crate::ast::Span>,
     /// The current unification's coercion context: `@auto_ro`'s
     /// `&mut T → &T` relaxation applies ONLY at function call sites
     /// (SYNTAX.md) — set to `CallSite` while checking call arguments, and
     /// `Structural` elsewhere (array/ADT elements, struct fields, ...).
-    pub(crate) current_coercion_ctx: std::cell::Cell<CoercionContext>,
+    pub(crate) current_coercion_ctx: std::sync::atomic::AtomicU8,
     /// Count of seal-the-wall violations (GADT refinements attempting to
     /// NEWLY bind a GenericParam into the global table).  Incremented in
     /// ALL builds — the binding is skipped, so the global table is never
     /// polluted; the counter keeps the violation observable.
-    pub(crate) seal_violations: std::cell::Cell<usize>,
+    pub(crate) seal_violations: usize,
     /// Whether the function currently being checked has `@auto_ro`
     /// (SYNTAX.md §Local Relaxation): allows `&mut T` to be implicitly
     /// coerced to `&T` within the function body.  Set/restored around
     /// each function body check (save/restore, so nested functions nest).
-    pub(crate) auto_ro: std::cell::Cell<bool>,
+    pub(crate) auto_ro: bool,
     /// Whether the function currently being checked has `@auto_coerce`
     /// (SYNTAX.md §Local Relaxation): enables ALL safe implicit
     /// coercions (`&mut T` → `&T` like `@auto_ro`, plus deref coercions).
     /// Set/restored around the function body; forbidden in `@trusted`
     /// functions and Strict Mode.
-    pub(crate) auto_coerce: std::cell::Cell<bool>,
+    pub(crate) auto_coerce: bool,
     /// Binding origins for GenericParams: param TypeId → span of the
     /// unifying operation that bound it.  Consulted by the E104
     /// generality check to point at the precise binding site instead of
     /// the whole function definition.
-    pub(crate) generic_binding_origins: RefCell<HashMap<TypeId, crate::ast::Span>>,
+    pub(crate) generic_binding_origins: HashMap<TypeId, crate::ast::Span>,
     /// Cache for κ(A) characteristic results.  Cleared when bindings change.
-    kappa_cache: RefCell<HashMap<TypeId, Characteristic>>,
-    /// Universe counter for Higher-Ranked Type skolemization (rustc-style).
-    /// Each `for<'a>` binder comparison enters a fresh universe.
-    next_universe: Cell<usize>,
-    /// Counter for GADT existential skolem IDs.  Separate from
-    /// `next_universe` so that `while-let` loops on existential
-    /// GADT variants don't perpetually increment the universe counter.
-    /// Reset between compilation units.
-    next_gadt_skolem_id: Cell<usize>,
-    /// Counter for generating fresh parameter indices (used by Exists/Forall).
-    next_param_index: Cell<usize>,
-    /// Local counter for the overlap/specialization freshening variables
-    /// (replaces the former process-global `OVERLAP_FRESH_VAR_ID`).
-    /// Per-`TypeContext`, so long-running processes never accumulate a
-    /// single unbounded global and tests are isolated (each context starts
-    /// at the same base and allocates upward).  The base offset keeps the
-    /// fresh vars out of the ID space used by the main inference context.
-    next_overlap_fresh_id: Cell<usize>,
+    kappa_cache: HashMap<TypeId, Characteristic>,
+    /// Cached type property flags for O(1) lookup on hot paths.
+    type_flags: HashMap<TypeId, TypeFlags>,
     /// Language edition for this compilation unit.
     edition: Edition,
     /// Target platform information (arch, ABI, sizes, alignments).
     pub target: crate::hir::target::Target,
-    /// A type factory for comptime code that needs to create new types.
-    pub factory: TypeFactory,
     /// GADT equality registry — stack of per-arm equality lists.
     ///
     /// Each entry records `(from_type, to_type)` meaning "within the
@@ -513,7 +530,7 @@ pub struct TypeContext<'input> {
     /// scope escape — a GenericParam that is bound in an active binder must
     /// not be unified with a foreign type (which would leak the quantified
     /// variable into the surrounding context).
-    pub(crate) binder_stack: RefCell<Vec<usize>>,
+    pub(crate) binder_stack: Vec<usize>,
     pub(crate) gadt: GadtContext<'input>,
 }
 
@@ -521,12 +538,12 @@ impl<'input> TypeContext<'input> {
     /// Register an ADT definition (struct/enum) — used by `type_is_copy`
     /// to decide the §Copy derivation.
     pub(crate) fn register_adt(&self, def_id: DefId, def: AdtDef) {
-        self.adt_defs.borrow_mut().insert(def_id, def);
+        self.interner.adt_defs.write().insert(def_id, def);
     }
 
     /// Look up a registered ADT definition.
     pub(crate) fn adt_def(&self, def_id: DefId) -> Option<AdtDef> {
-        self.adt_defs.borrow().get(&def_id).cloned()
+        self.interner.adt_defs.read().get(&def_id).cloned()
     }
 
     /// Mark an ADT as implementing `Drop` (an `impl Drop for T` exists) —
@@ -543,15 +560,10 @@ impl<'input> TypeContext<'input> {
     }
 
     pub fn new_with_target(target: crate::hir::target::Target) -> Self {
-        let factory = TypeFactory::new();
         let mut ctx = TypeContext {
             arena: None,
-            regex_cache: HashMap::default(),
-            types: Vec::new(),
-            bindings: RefCell::new(HashMap::default()),
-            meta: HashMap::default(),
-            def_id_to_type_id: HashMap::default(),
-            adt_defs: RefCell::new(HashMap::default()),
+            interner: Arc::new(TypeFactory::new()),
+            bindings: HashMap::default(),
             builtin_unit: TypeId::NONE,
             builtin_never: TypeId::NONE,
             builtin_error: TypeId::NONE,
@@ -562,32 +574,26 @@ impl<'input> TypeContext<'input> {
             builtin_str: TypeId::NONE,
             builtin_str_ref: TypeId::NONE,
             builtin_layout_descriptor: TypeId::NONE,
-            variance_cache: RefCell::new(HashMap::default()),
-            variance_edges: RefCell::new(HashMap::default()),
-            region_subtype_collect: Cell::new(false),
-            region_subtype_outlives: RefCell::new(Vec::new()),
-            opaque_hidden: RefCell::new(HashMap::default()),
-            opaque_hidden_undo: RefCell::new(Vec::new()),
-            transaction_stack: RefCell::new(Vec::new()),
-            unify_seen: RefCell::new(HashSet::default()),
-            current_unify_span: RefCell::new(None),
-            current_coercion_ctx: std::cell::Cell::new(CoercionContext::Structural),
-            seal_violations: std::cell::Cell::new(0),
-            auto_ro: std::cell::Cell::new(false),
-            auto_coerce: std::cell::Cell::new(false),
-            generic_binding_origins: RefCell::new(HashMap::default()),
-            kappa_cache: RefCell::new(HashMap::default()),
-            next_universe: Cell::new(0),
-            next_gadt_skolem_id: Cell::new(0),
-            next_param_index: Cell::new(0),
-            // Base offset mirrors the former global `OVERLAP_FRESH_VAR_ID`
-            // (1_000_000): keeps overlap-fresh vars out of the main
-            // inference context's low ID space.
-            next_overlap_fresh_id: Cell::new(1_000_000),
+            region_subtype_collect: false,
+            region_subtype_outlives: Vec::new(),
+            parametricity: crate::hir::parametricity::ParametricityGate::new(),
+            opaque_hidden: HashMap::default(),
+            opaque_hidden_undo: Vec::new(),
+            transaction_stack: Vec::new(),
+            unify_seen: HashSet::default(),
+            current_unify_span: None,
+            current_coercion_ctx: std::sync::atomic::AtomicU8::new(
+                CoercionContext::Structural.to_u8(),
+            ),
+            seal_violations: 0,
+            auto_ro: false,
+            auto_coerce: false,
+            generic_binding_origins: HashMap::default(),
+            kappa_cache: HashMap::default(),
+            type_flags: HashMap::default(),
             edition: Edition::latest(),
             target,
-            factory,
-            binder_stack: RefCell::new(Vec::new()),
+            binder_stack: Vec::new(),
             gadt: GadtContext::new(),
         };
         ctx.builtin_unit = ctx.alloc(TypeData::Unit);
@@ -601,7 +607,7 @@ impl<'input> TypeContext<'input> {
         ctx.builtin_str = ctx.alloc(TypeData::Adt {
             kind: AdtKind::Struct,
             def_id: DefId::SENTINEL_STR,
-            args: vec![],
+            args: smallvec![],
         });
         // &Str = Ref { ty: Str, mutable: false }
         ctx.builtin_str_ref = ctx.reference(ctx.builtin_str, false);
@@ -609,19 +615,85 @@ impl<'input> TypeContext<'input> {
         ctx.builtin_layout_descriptor = ctx.alloc(TypeData::Adt {
             kind: AdtKind::Struct,
             def_id: DefId::SENTINEL_LAYOUT_DESC,
-            args: vec![],
+            args: smallvec![],
         });
         ctx
     }
 
-    pub fn get_invariant(&self, id: TypeId) -> Option<&crate::ast::Expr<'input>> {
-        self.meta.get(&id).and_then(|m| m.invariant.as_ref())
+    /// Build a context that shares `other`'s interner but starts with fresh
+    /// inference state.
+    ///
+    /// This is the per-query constructor.  The new context sees exactly the
+    /// same type arena, the same `meta`/`def_id_to_type_id`/`adt_defs`
+    /// registrations and the same builtin `TypeId`s — so `TypeId`s minted
+    /// before the split stay meaningful and comparable — but it gets its own
+    /// bindings, transaction stack, GADT state and binding-dependent caches.
+    ///
+    /// Two contexts built this way can therefore be used concurrently: each
+    /// mutates only its own inference state, and the shared half is
+    /// internally synchronised.
+    ///
+    /// The `arena` and `edition`/`target` are copied, not shared: the arena
+    /// is already a `Sync` view of the parser's bump, and the other two are
+    /// plain values.
+    pub fn new_sharing(other: &Self) -> Self {
+        TypeContext {
+            arena: other.arena,
+            interner: Arc::clone(&other.interner),
+            bindings: HashMap::default(),
+            builtin_unit: other.builtin_unit,
+            builtin_never: other.builtin_never,
+            builtin_error: other.builtin_error,
+            builtin_bool: other.builtin_bool,
+            builtin_char: other.builtin_char,
+            builtin_byte: other.builtin_byte,
+            builtin_usize: other.builtin_usize,
+            builtin_str: other.builtin_str,
+            builtin_str_ref: other.builtin_str_ref,
+            builtin_layout_descriptor: other.builtin_layout_descriptor,
+            region_subtype_collect: false,
+            region_subtype_outlives: Vec::new(),
+            parametricity: crate::hir::parametricity::ParametricityGate::new(),
+            opaque_hidden: HashMap::default(),
+            opaque_hidden_undo: Vec::new(),
+            transaction_stack: Vec::new(),
+            unify_seen: HashSet::default(),
+            current_unify_span: None,
+            current_coercion_ctx: std::sync::atomic::AtomicU8::new(
+                CoercionContext::Structural.to_u8(),
+            ),
+            seal_violations: 0,
+            auto_ro: false,
+            auto_coerce: false,
+            generic_binding_origins: HashMap::default(),
+            kappa_cache: HashMap::default(),
+            type_flags: HashMap::default(),
+            edition: other.edition,
+            target: other.target.clone(),
+            binder_stack: Vec::new(),
+            gadt: GadtContext::new(),
+        }
+    }
+
+    /// Returns the refinement invariant recorded for `id`, if any.
+    ///
+    /// Returns an owned `Expr` rather than a borrow: `meta` lives behind a
+    /// lock now (it is shared state), so the reference would outlive the
+    /// guard.  `Expr` is `Clone` and these are short AST fragments.
+    pub fn get_invariant(&self, id: TypeId) -> Option<crate::ast::Expr<'input>> {
+        self.interner
+            .meta
+            .read()
+            .get(&id)
+            .and_then(|m| m.invariant.as_ref().cloned())
     }
 
     /// Allocate a fresh, globally-unique parameter index for Exists/Forall binders.
     pub fn fresh_param_index(&self) -> usize {
-        let idx = self.next_param_index.get();
-        self.next_param_index.set(idx + 1);
+        let idx = self.interner.next_param_index.load(AtomicOrdering::Relaxed);
+        self.interner
+            .next_param_index
+            .store(idx + 1, AtomicOrdering::Relaxed);
         idx
     }
 
@@ -635,32 +707,36 @@ impl<'input> TypeContext<'input> {
         self.edition = edition;
     }
 
-    pub fn alloc(&mut self, data: TypeData) -> TypeId {
-        let (id, _arc) = self.factory.alloc(data);
-        // Keep self.types in sync with the factory's arena so that
-        // get()/get_raw() can find types created via alloc().
-        // Also sync any types that were created directly via
-        // ctx.factory() (bypassing ctx.alloc()) — e.g. from layout
-        // resolution helpers (resolve_single_ast_type in layout.rs).
-        // `drain_new_types()` already includes `arc`, so don't push it again.
-        self.types.extend(self.factory.drain_new_types());
-        id
+    /// Allocate a type.  Takes `&self`: the arena is append-only and
+    /// lock-free (see the `boxcar::Vec` in `TypeFactory`), so interning
+    /// does not need exclusive access.  That is what lets a shared
+    /// `&TypeContext` still create types during checking.
+    pub fn alloc(&self, data: TypeData) -> TypeId {
+        self.interner.alloc(data).0
     }
 
-    /// Get a reference to the type factory, which can create new types
-    /// with shared (immutable) access via its internal `RefCell`.
-    pub fn factory(&self) -> &TypeFactory {
-        &self.factory
+    /// The shared interner.  Comptime code that needs to mint types with
+    /// only `&self` uses this; every context built from the same session
+    /// shares one, so the resulting `TypeId`s are directly comparable.
+    pub fn factory(&self) -> &TypeFactory<'input> {
+        &self.interner
     }
 
-    /// Sync any types created via `ctx.factory().alloc()` into `self.types`
-    /// so they become visible to `ctx.get()` / `ctx.get_raw()`.
+    /// Read a slot of the type arena by index.
     ///
-    /// Must be called after any direct `ctx.factory().alloc()` usage that
-    /// bypasses `ctx.alloc()`.  Without this, the type exists in the
-    /// factory's arena but `ctx.get(id)` will panic with index out of bounds.
-    pub fn sync_factory(&mut self) {
-        self.types.extend(self.factory.drain_new_types());
+    /// The arena is append-only, so a slot that `TypeId`s point at is
+    /// always initialized — an out-of-range index means a `TypeId` was
+    /// minted for a type that never made it into the shared interner.
+    #[inline]
+    pub(crate) fn slot(&self, index: usize) -> &Arc<TypeData> {
+        self.interner.types.get(index).unwrap_or_else(|| {
+            panic!(
+                "type slot {} is not initialized (arena holds {}) — \
+                 a TypeId was minted for a type that was never allocated",
+                index,
+                self.interner.types.count()
+            )
+        })
     }
 
     /// Check whether a `TypeData` transitively contains any volatile type
@@ -733,7 +809,7 @@ impl<'input> TypeContext<'input> {
         // happens to be bound to a concrete type, allowing composite types
         // containing the raw volatile TypeId to be incorrectly cached.
         if matches!(
-            &*self.types[id.index()],
+            &**self.slot(id.index()),
             TypeData::InferVar { .. } | TypeData::SkolemVar { .. }
         ) {
             return true;
@@ -745,7 +821,7 @@ impl<'input> TypeContext<'input> {
         if resolved == id {
             return false;
         }
-        self.type_is_volatile(&self.types[resolved.index()])
+        self.type_is_volatile(&self.slot(resolved.index()))
     }
 
     /// The Copy determination (§Copy): the scalars are Copy; the function
@@ -822,15 +898,22 @@ impl<'input> TypeContext<'input> {
     /// Returns the resolved `TypeData` for a `TypeId`, following bindings.
     pub fn get(&self, id: TypeId) -> &TypeData {
         let resolved = self.resolve_binding(id);
+        // Entry-existence, NOT `index < count()`: `boxcar::Vec::count()`
+        // counts *completed* pushes, and completions happen in claim order
+        // only by accident — a thread stalled between `next_index()` and its
+        // final `count.fetch_add` leaves `count` below `max_index + 1` even
+        // though every returned `TypeId`'s slot is fully written.  Under
+        // concurrent `alloc` (rayon checker workers) an `index < count()`
+        // assertion is therefore a false positive; `types.get(i).is_some()`
+        // (the same check `slot()` makes) is the real invariant.
         debug_assert!(
-            resolved.index() < self.types.len(),
-            "TypeContext::get() index {} out of bounds (types.len={}) — \
-             type may have been created via ctx.factory().alloc() without \
-             calling sync_factory() first",
+            self.interner.types.get(resolved.index()).is_some(),
+            "TypeContext::get() index {} is not an initialized arena slot \
+             (types.len={}) — TypeId minted for a type that was never allocated",
             resolved.index(),
-            self.types.len(),
+            self.interner.types.count(),
         );
-        &self.types[resolved.index()]
+        &self.slot(resolved.index())
     }
 
     /// Returns the raw `TypeData` for a `TypeId` WITHOUT following bindings.
@@ -838,15 +921,17 @@ impl<'input> TypeContext<'input> {
     /// so it can inspect the original type before any substitution.
     /// Useful for binder-scope checks where the raw type identity matters.
     pub fn get_raw(&self, id: TypeId) -> &TypeData {
+        // See `get()`: entry-existence, never `index < count()` — `count()`
+        // lags in-flight pushes and makes this a false positive under
+        // concurrent `alloc`.
         debug_assert!(
-            id.index() < self.types.len(),
-            "TypeContext::get_raw() index {} out of bounds (types.len={}) — \
-             type may have been created via ctx.factory().alloc() without \
-             calling sync_factory() first",
+            self.interner.types.get(id.index()).is_some(),
+            "TypeContext::get_raw() index {} is not an initialized arena slot \
+             (types.len={}) — TypeId minted for a type that was never allocated",
             id.index(),
-            self.types.len(),
+            self.interner.types.count(),
         );
-        &self.types[id.index()]
+        &self.slot(id.index())
     }
 
     /// Returns an `Arc<TypeData>` instead of a borrow, enabling cheap clone via
@@ -855,11 +940,40 @@ impl<'input> TypeContext<'input> {
     /// unification) to avoid deep-copying `Vec<TypeId>` and `String` fields.
     pub fn get_arc(&self, id: TypeId) -> Arc<TypeData> {
         let resolved = self.resolve_binding(id);
-        Arc::clone(&self.types[resolved.index()])
+        Arc::clone(&self.slot(resolved.index()))
     }
 
     pub fn is_infer_var(&self, id: TypeId) -> bool {
         matches!(self.get(id), TypeData::InferVar { .. })
+    }
+
+    /// Get cached type flags, computing lazily on first access.
+    pub fn get_type_flags(&mut self, ty: TypeId) -> TypeFlags {
+        if let Some(flags) = self.type_flags.get(&ty) {
+            return *flags;
+        }
+        let flags = self.compute_type_flags(ty);
+        self.type_flags.insert(ty, flags);
+        flags
+    }
+
+    fn compute_type_flags(&self, ty: TypeId) -> TypeFlags {
+        let mut flags = TypeFlags::empty();
+        match self.get(ty) {
+            TypeData::InferVar { .. } => flags |= TypeFlags::IS_INFER_VAR,
+            _ => flags |= TypeFlags::IS_CONCRETE,
+        }
+        match self.get(ty) {
+            TypeData::GenericParam { .. } => flags |= TypeFlags::IS_GENERIC_PARAM,
+            TypeData::Fn { .. } => flags |= TypeFlags::IS_FUNCTION,
+            TypeData::Forall { .. } => flags |= TypeFlags::IS_FORALL,
+            TypeData::Adt {
+                kind: AdtKind::Struct,
+                ..
+            } => flags |= TypeFlags::IS_STRUCT,
+            _ => {}
+        }
+        flags
     }
 
     /// Check if the RAW TypeId slot (ignoring bindings) is an InferVar,
@@ -867,7 +981,7 @@ impl<'input> TypeContext<'input> {
     /// follow `set_binding` chains, so it correctly identifies the
     /// original InferVar even after it has been unified with a concrete type.
     pub(crate) fn get_infer_var_id(&self, id: TypeId) -> Option<usize> {
-        if let TypeData::InferVar { id: raw_id, .. } = &*self.types[id.index()] {
+        if let TypeData::InferVar { id: raw_id, .. } = &**self.slot(id.index()) {
             Some(*raw_id)
         } else {
             None
@@ -887,7 +1001,7 @@ impl<'input> TypeContext<'input> {
             // unified with another type after being stored in opaque_hidden.
             current = self.resolve_binding(current);
             // Check the opaque_hidden map first (defining scope reveal).
-            if let Some(hidden) = self.opaque_hidden.borrow().get(&current) {
+            if let Some(hidden) = self.opaque_hidden.get(&current) {
                 let hidden = self.resolve_binding(*hidden);
                 if !visited.insert(hidden) {
                     return current; // cycle detected
@@ -895,7 +1009,7 @@ impl<'input> TypeContext<'input> {
                 current = hidden;
                 continue;
             }
-            match &*self.types[current.index()] {
+            match &**self.slot(current.index()) {
                 TypeData::Opaque {
                     hidden: Some(hidden),
                     ..
@@ -922,7 +1036,7 @@ impl<'input> TypeContext<'input> {
     pub fn set_opaque_hidden(&mut self, id: TypeId, hidden: TypeId) -> Result<(), String> {
         // If there is an existing hidden type, unify rather than overwrite.
         // Copy out the existing value first to avoid borrow conflicts.
-        let existing = self.opaque_hidden.borrow().get(&id).copied();
+        let existing = self.opaque_hidden.get(&id).copied();
         if let Some(existing) = existing {
             self.unify(existing, hidden).map_err(|_| {
                 format!(
@@ -933,11 +1047,11 @@ impl<'input> TypeContext<'input> {
             return Ok(());
         }
         // Record undo before inserting, if a transaction is active.
-        if let Some(log) = self.opaque_hidden_undo.borrow_mut().last_mut() {
-            let old = self.opaque_hidden.borrow().get(&id).copied();
+        if let Some(log) = self.opaque_hidden_undo.last_mut() {
+            let old = self.opaque_hidden.get(&id).copied();
             log.push((id, old));
         }
-        self.opaque_hidden.borrow_mut().insert(id, hidden);
+        self.opaque_hidden.insert(id, hidden);
         Ok(())
     }
 
@@ -1034,13 +1148,6 @@ impl<'input> TypeContext<'input> {
         // a maliciously constructed chain from DoS-ing the compiler.
         const MAX_CHAIN_DEPTH: usize = 10_000;
 
-        // Invariant: path compression calls set_binding, which records undo
-        // entries in the active transaction.  If there is no active transaction,
-        // the undo log is empty and rollback would be incomplete — but this is
-        // only a concern when called inside a transaction.  The assertion below
-        // fires in debug builds if path compression is needed but no transaction
-        // is active, catching silent contract violations early.
-
         // First pass: follow the binding chain to the root with a single
         // immutable borrow.  This is a simple linked-list traversal through
         // the bindings map until we reach an unbound TypeId.
@@ -1060,16 +1167,14 @@ impl<'input> TypeContext<'input> {
             if let Some(mapped) = self.resolve_gadt_eq(current) {
                 return self.resolve_binding_tail(mapped);
             }
-            let bindings = self.bindings.borrow();
+            let bindings = &self.bindings;
             if let Some(&next) = bindings.get(&current) {
-                drop(bindings);
                 current = next;
                 depth += 1;
                 if depth > MAX_CHAIN_DEPTH {
                     break;
                 }
             } else {
-                drop(bindings);
                 break;
             }
         }
@@ -1077,33 +1182,20 @@ impl<'input> TypeContext<'input> {
         if let Some(mapped) = self.resolve_gadt_eq(current) {
             return self.resolve_binding_tail(mapped);
         }
-        // Path compression (only for non-GADT bindings): point every node
-        // along the chain directly to the root so that future lookups are
-        // O(1) instead of O(depth).  Uses set_binding per step to ensure
-        // the transaction undo log captures each mutation.
-        // If no transaction is active, set_binding still performs the
-        // mutation but skips undo logging — path compression is safe in
-        // either mode.
-        if current != id {
-            let mut path = id;
-            let mut depth = 0;
-            while path != current {
-                let next = {
-                    let bindings = self.bindings.borrow();
-                    bindings.get(&path).copied()
-                };
-                if let Some(next_val) = next {
-                    let _ = self.set_binding(path, current);
-                    path = next_val;
-                    depth += 1;
-                    if depth > MAX_CHAIN_DEPTH {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
+        // NOTE: path compression is deliberately NOT performed here.
+        //
+        // It used to run inside this `&self` walk, mutating `bindings`
+        // through a `RefCell`.  `bindings` is now a plain `HashMap` (the
+        // interior mutability had to go for `TypeContext` to become
+        // `Sync`), and compressing needs `&mut self` — which `get()` and
+        // the other `&self` readers cannot supply.  Chains are already
+        // bounded by `MAX_CHAIN_DEPTH` above, so dropping the memoization
+        // costs a bounded amount of walking and changes no observable
+        // result: compression was purely a cache of this same walk.
+        //
+        // `&mut self` receivers that walk a chain anyway can opt into the
+        // compression via `resolve_binding_mut` / `resolve_binding_compressed`
+        // below.
 
         current
     }
@@ -1112,8 +1204,6 @@ impl<'input> TypeContext<'input> {
     /// registry at each step.  Used internally by `resolve_binding` to
     /// resolve the target of a GADT equality mapping.
     ///
-    /// Unlike `resolve_binding`, this does NOT path-compress because the
-    /// GADT equality is scoped to the current arm and must not leak.
     /// It DOES chase GADT registry entries so that transitive equalities
     /// like `A →[GADT] B →[GADT] C` resolve correctly.
     /// Follow ONLY the `bindings` chain to the root, NEVER consulting the
@@ -1126,10 +1216,9 @@ impl<'input> TypeContext<'input> {
         let mut current = id;
         let mut depth = 0;
         loop {
-            let bindings = self.bindings.borrow();
+            let bindings = &self.bindings;
             match bindings.get(&current) {
                 Some(&next) => {
-                    drop(bindings);
                     current = next;
                     depth += 1;
                     if depth > MAX_CHAIN_DEPTH {
@@ -1141,6 +1230,118 @@ impl<'input> TypeContext<'input> {
         }
     }
 
+    /// Walk `id`'s binding chain to its root, rewiring every intermediate
+    /// node straight to that root, and return the root.
+    ///
+    /// Returns `None` when compression must not run.  The caller MUST then
+    /// fall back to `resolve_binding`, which performs the identical walk —
+    /// so the fallback is always observationally equal to this method.
+    ///
+    /// Correctness conditions for rewiring
+    /// -----------------------------------
+    /// `resolve_binding` consults the GADT equality registry at *every*
+    /// node of a chain, not only the root.  Rewriting `a → b → c` to
+    /// `a → c` makes any refinement keyed at `b` unreachable from `a`, and
+    /// the result would silently change.  Two guards make it safe:
+    ///
+    /// * `arm_depth == 0`.  With no arm live, `gadt.param_refinements` is
+    ///   empty (`exit_arm` pops the frame it pushed in `enter_arm`), so no
+    ///   refinement can be hidden.  While an arm IS live we bail: a
+    ///   refinement key canonicalised to the chain root at registration
+    ///   time (`resolve_binding_no_gadt`) can still be rebound mid-arm —
+    ///   the seal-the-wall guard only pins `GenericParam` keys, whereas
+    ///   `InferVar` and GADT-`SkolemVar` keys are registered as
+    ///   `ParamRefinement` too (`checker/mod.rs::register_gadt_eq_directional`)
+    ///   and may become non-root intermediates.  Compressing through such
+    ///   a node hides the refinement.
+    /// * The registry must be *observed* empty.  Checked once here rather
+    ///   than per node, so invariant drift degrades to "no compression"
+    ///   instead of a wrong answer.
+    ///
+    /// Compression never changes what `resolve_binding` returns for any
+    /// type — each rewired node still reaches the same root — so caches
+    /// keyed on resolved types (`kappa_cache`, `type_flags`) stay valid,
+    /// and no invalidation is needed.
+    pub(crate) fn resolve_binding_mut(&mut self, id: TypeId) -> Option<TypeId> {
+        if self.gadt.arm_depth.load(AtomicOrdering::Relaxed) > 0 {
+            return None;
+        }
+        {
+            let refs = self.gadt.param_refinements.read();
+            if refs.iter().any(|arm| !arm.is_empty()) {
+                return None;
+            }
+        }
+
+        const MAX_CHAIN_DEPTH: usize = 10_000;
+
+        // Inline capacity, not a heap path: this runs from `unify_internal`'s
+        // recursion, so the common short-chain case must not allocate.
+        let mut path: SmallVec<[TypeId; 4]> = SmallVec::new();
+        let mut current = id;
+        let mut depth = 0;
+        loop {
+            let next = {
+                let bindings = &self.bindings;
+                bindings.get(&current).copied()
+            };
+            match next {
+                Some(next) => {
+                    path.push(current);
+                    current = next;
+                    depth += 1;
+                    if depth > MAX_CHAIN_DEPTH {
+                        return None;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        for node in path {
+            self.compress_binding(node, current);
+        }
+
+        Some(current)
+    }
+
+    /// `resolve_binding` for `&mut self` receivers, compressing the chain
+    /// when that is safe.  Returns exactly what `resolve_binding` returns,
+    /// on every path.
+    pub(crate) fn resolve_binding_compressed(&mut self, id: TypeId) -> TypeId {
+        match self.resolve_binding_mut(id) {
+            Some(root) => root,
+            None => self.resolve_binding(id),
+        }
+    }
+
+    /// Repoint `key` at `value`, recording the old value in the active
+    /// transaction's undo log so `rollback_transaction` reconstructs the
+    /// pre-compression chain.
+    ///
+    /// Deliberately NOT `set_binding`: compression must not touch
+    /// `generic_binding_origins`.  That map records *binding sites* for
+    /// the E104 diagnostic, and a compression write has no site of its
+    /// own — recording `current_unify_span` there would relocate the
+    /// error to whichever unify happened to walk the chain.  The
+    /// seal-the-wall guard is also skipped, which is why callers must
+    /// only reach this with `arm_depth == 0`.
+    fn compress_binding(&mut self, key: TypeId, value: TypeId) {
+        debug_assert_eq!(
+            self.gadt.arm_depth.load(AtomicOrdering::Relaxed),
+            0,
+            "compress_binding reached while a GADT arm is active"
+        );
+        if self.bindings.get(&key) == Some(&value) {
+            return;
+        }
+        if let Some(log) = self.transaction_stack.last_mut() {
+            let old = self.bindings.get(&key).copied();
+            log.push((key, old));
+        }
+        self.bindings.insert(key, value);
+    }
+
     fn resolve_binding_tail(&self, id: TypeId) -> TypeId {
         const MAX_CHAIN_DEPTH: usize = 10_000;
         let mut current = id;
@@ -1148,7 +1349,7 @@ impl<'input> TypeContext<'input> {
         loop {
             // Follow bindings one step.
             let bound = {
-                let bindings = self.bindings.borrow();
+                let bindings = &self.bindings;
                 bindings.get(&current).copied()
             };
             if let Some(next) = bound {
@@ -1186,14 +1387,10 @@ impl<'input> TypeContext<'input> {
     ///
     /// See `push_gadt_arm` (OCaml `equated_types` lookup, ctype.ml:3926-3936).
     fn resolve_gadt_eq(&self, id: TypeId) -> Option<TypeId> {
-        let facts = self.gadt.facts.borrow();
-        for arm in facts.iter().rev() {
-            for fact in arm.iter() {
-                if let GadtFact::ParamRefinement { from, to } = fact
-                    && *from == id
-                {
-                    return Some(*to);
-                }
+        let refs = self.gadt.param_refinements.read();
+        for map in refs.iter().rev() {
+            if let Some(&to) = map.get(&id) {
+                return Some(to);
             }
         }
         None
@@ -1217,7 +1414,7 @@ impl<'input> TypeContext<'input> {
     /// rules (future).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn resolve_existential_witness(&self, skolem: TypeId) -> Option<TypeId> {
-        let facts = self.gadt.facts.borrow();
+        let facts = self.gadt.facts.read();
         for arm in facts.iter().rev() {
             for fact in arm.iter() {
                 if let GadtFact::ExistentialEquation { lhs, rhs } = fact
@@ -1245,14 +1442,19 @@ impl<'input> TypeContext<'input> {
     /// `OVERLAP_FRESH_VAR_ID`).  Per-context, so long-running processes
     /// and parallel tests never share a single unbounded counter.
     pub fn alloc_overlap_fresh_var(&mut self, universe: usize) -> TypeId {
-        let id = self.next_overlap_fresh_id.get();
-        self.next_overlap_fresh_id.set(id + 1);
+        let id = self
+            .interner
+            .next_overlap_fresh_id
+            .load(AtomicOrdering::Relaxed);
+        self.interner
+            .next_overlap_fresh_id
+            .store(id + 1, AtomicOrdering::Relaxed);
         self.alloc(TypeData::InferVar { id, universe })
     }
 
     pub fn get_def_id_for_type(&self, id: TypeId) -> Option<DefId> {
         let resolved = self.resolve_binding(id);
-        match &self.types[resolved.index()].as_ref() {
+        match &self.slot(resolved.index()).as_ref() {
             TypeData::Adt { def_id, .. } => Some(*def_id),
             TypeData::DynTrait { traits } => traits.first().copied(),
             _ => None,
@@ -1260,11 +1462,14 @@ impl<'input> TypeContext<'input> {
     }
 
     pub fn register_def_id(&mut self, def_id: DefId, type_id: TypeId) {
-        self.def_id_to_type_id.insert(def_id, type_id);
+        self.interner
+            .def_id_to_type_id
+            .write()
+            .insert(def_id, type_id);
     }
 
     pub fn get_type_id_for_def_id(&self, def_id: DefId) -> Option<TypeId> {
-        self.def_id_to_type_id.get(&def_id).copied()
+        self.interner.def_id_to_type_id.read().get(&def_id).copied()
     }
 
     pub fn int(&mut self, bits: u32, signed: bool) -> TypeId {
@@ -1336,11 +1541,13 @@ impl<'input> TypeContext<'input> {
     /// any future deserialization path.  The parser also validates the
     /// pattern before emitting `Type::Regex`, so this `debug_assert!` is
     /// a safety net for debug builds only.
-    pub fn regex(&mut self, pattern: String) -> TypeId {
+    pub fn regex(&mut self, pattern: Symbol) -> TypeId {
         let valid = *self
+            .interner
             .regex_cache
-            .entry(pattern.clone())
-            .or_insert_with(|| regex_syntax::parse(&pattern).is_ok());
+            .write()
+            .entry(pattern)
+            .or_insert_with(|| regex_syntax::parse(pattern.as_str()).is_ok());
         debug_assert!(valid, "regex() called with an invalid pattern");
         self.alloc(TypeData::Regex { pattern })
     }
@@ -1373,7 +1580,7 @@ impl<'input> TypeContext<'input> {
         self.builtin_error
     }
 
-    pub fn struct_ty(&mut self, def_id: DefId, args: Vec<TypeId>) -> TypeId {
+    pub fn struct_ty(&mut self, def_id: DefId, args: SmallVec<[TypeId; 4]>) -> TypeId {
         let id = self.alloc(TypeData::Adt {
             kind: AdtKind::Struct,
             def_id,
@@ -1383,28 +1590,36 @@ impl<'input> TypeContext<'input> {
         // Generic instances (e.g. Vec<i32>, Vec<bool>) share the same DefId
         // and must not overwrite the prototype — OmniML uses Constr + Ident
         // for constructor identity; our DefId is the analog of Ident.t.
-        self.def_id_to_type_id.entry(def_id).or_insert(id);
+        self.interner
+            .def_id_to_type_id
+            .write()
+            .entry(def_id)
+            .or_insert(id);
         id
     }
 
-    pub fn enum_ty(&mut self, def_id: DefId, args: Vec<TypeId>) -> TypeId {
+    pub fn enum_ty(&mut self, def_id: DefId, args: SmallVec<[TypeId; 4]>) -> TypeId {
         let id = self.alloc(TypeData::Adt {
             kind: AdtKind::Enum,
             def_id,
             args,
         });
         // Same as struct_ty — register prototype only, never overwrite.
-        self.def_id_to_type_id.entry(def_id).or_insert(id);
+        self.interner
+            .def_id_to_type_id
+            .write()
+            .entry(def_id)
+            .or_insert(id);
         id
     }
 
-    pub fn tuple(&mut self, elems: Vec<TypeId>) -> TypeId {
+    pub fn tuple(&mut self, elems: SmallVec<[TypeId; 4]>) -> TypeId {
         self.alloc(TypeData::Tuple { elems })
     }
 
     /// Create a coproduct (sum type) Σ Aᵢ — "one of the alternatives".
     /// Used by Yoneda reduction to encode branch choice.
-    pub fn coproduct(&mut self, alternatives: Vec<TypeId>) -> TypeId {
+    pub fn coproduct(&mut self, alternatives: SmallVec<[TypeId; 4]>) -> TypeId {
         match alternatives.len() {
             0 => self.never(),
             1 => alternatives[0],
@@ -1449,14 +1664,14 @@ impl<'input> TypeContext<'input> {
         self.alloc(TypeData::Ptr { size, pointee })
     }
 
-    pub fn function(&mut self, params: Vec<TypeId>, ret: TypeId) -> TypeId {
+    pub fn function(&mut self, params: SmallVec<[TypeId; 4]>, ret: TypeId) -> TypeId {
         self.alloc(TypeData::Fn { params, ret })
     }
 
     /// Allocate a polytype `[∀ᾱ. τ]` — a boxed first-class polymorphic type.
     /// `quantifiers` are (index, name) pairs for universally quantified variables.
     /// `body` references them via `GenericParam`.
-    pub fn poly(&mut self, quantifiers: Vec<(usize, Symbol)>, body: TypeId) -> TypeId {
+    pub fn poly(&mut self, quantifiers: SmallVec<[(usize, Symbol); 2]>, body: TypeId) -> TypeId {
         // Defense-in-depth: enforce the OmniML closedness invariant
         // (omniml/lib/constraint_solver/principal_shape.ml — `Poly.invariant`):
         // the polytope body must be closed — no `InferVar`, no nested `Poly`.
@@ -1604,7 +1819,7 @@ impl<'input> TypeContext<'input> {
             name,
             base,
         });
-        self.meta.entry(id).or_insert(TypeMeta {
+        self.interner.meta.write().entry(id).or_insert(TypeMeta {
             default_value: None,
             invariant: Some(invariant),
             no_default: false,
@@ -1637,7 +1852,7 @@ impl<'input> TypeContext<'input> {
         match &*data {
             TypeData::GenericParam { index, .. } if *index == param_index => replacement,
             TypeData::Fn { params, ret } => {
-                let new_params: Vec<TypeId> = params
+                let new_params: SmallVec<[TypeId; 4]> = params
                     .iter()
                     .map(|&p| self.replace_generic(p, param_index, replacement))
                     .collect();
@@ -1676,8 +1891,9 @@ impl<'input> TypeContext<'input> {
                     });
                     // Preserve Exists metadata (invariant, default_value), matching
                     // the same invariant in subst()'s Exists arm.
-                    if let Some(meta) = self.meta.get(&ty).cloned() {
-                        self.meta.entry(new_id).or_insert(meta);
+                    let src_meta = self.interner.meta.read().get(&ty).cloned();
+                    if let Some(meta) = src_meta {
+                        self.interner.meta.write().entry(new_id).or_insert(meta);
                     }
                     new_id
                 }
@@ -1761,14 +1977,14 @@ impl<'input> TypeContext<'input> {
                 self.associated_type(*trait_id, *name, new_self)
             }
             TypeData::Tuple { elems } => {
-                let new_elems: Vec<TypeId> = elems
+                let new_elems: SmallVec<[TypeId; 4]> = elems
                     .iter()
                     .map(|&e| self.replace_generic(e, param_index, replacement))
                     .collect();
                 self.tuple(new_elems)
             }
             TypeData::Adt { kind, def_id, args } => {
-                let new_args: Vec<TypeId> = args
+                let new_args: SmallVec<[TypeId; 4]> = args
                     .iter()
                     .map(|&a| self.replace_generic(a, param_index, replacement))
                     .collect();
@@ -1779,7 +1995,7 @@ impl<'input> TypeContext<'input> {
                 })
             }
             TypeData::Coproduct { alternatives } => {
-                let new_alts: Vec<TypeId> = alternatives
+                let new_alts: SmallVec<[TypeId; 4]> = alternatives
                     .iter()
                     .map(|&a| self.replace_generic(a, param_index, replacement))
                     .collect();
@@ -1831,7 +2047,7 @@ impl<'input> TypeContext<'input> {
         if resolved == param {
             return true;
         }
-        match &self.types[resolved.index()].as_ref() {
+        match &self.slot(resolved.index()).as_ref() {
             TypeData::Adt { args, .. } => args.iter().any(|&a| self.occurs_check(param, a)),
             TypeData::Tuple { elems } => elems.iter().any(|&e| self.occurs_check(param, e)),
             TypeData::Coproduct { alternatives } => {
@@ -1876,9 +2092,9 @@ impl<'input> TypeContext<'input> {
 
     /// Insert a binding, recording the old value in the current transaction's
     /// undo log if one is active.  Always use this instead of
-    /// `self.bindings.borrow_mut().insert(...)` so that transactions can
+    /// `self.bindings.insert(...)` so that transactions can
     /// correctly roll back.
-    pub(crate) fn set_binding(&self, key: TypeId, value: TypeId) -> bool {
+    pub(crate) fn set_binding(&mut self, key: TypeId, value: TypeId) -> bool {
         // ── Seal-the-wall guard ─────────────────────────────────────
         // GADT arm processing must never bind a GenericParam into the
         // global bindings table: refinements live in GadtContext.facts
@@ -1887,31 +2103,30 @@ impl<'input> TypeContext<'input> {
         // `arm_depth > 0` means the refinement machinery leaked into the
         // global table (cross-arm contamination / post-arm leakage).
         //
-        // Exemption: PATH-COMPRESSION re-writes.  Pattern<'input> instantiation
+        // Exemption: idempotent re-writes.  Pattern<'input> instantiation
         // legitimately binds a scrutinee generic param to a synthetic
-        // infer var (`T → ?a`) at arm_depth 0 (before push), and
-        // `resolve_binding` inside the arm then path-compresses that
-        // existing chain — a re-write of an already-bound key to the
-        // SAME resolved type, not a new leak.
+        // infer var (`T → ?a`) at arm_depth 0 (before push), and later
+        // unification inside the arm may re-write that SAME binding to
+        // the SAME resolved type — not a new leak.
         // Fail closed in ALL builds (not just debug): a seal violation
         // means the refinement machinery leaked a GenericParam binding
         // into the global table.  Recoverable: SKIP the binding (do not
         // pollute the table) and record the violation — no panic (which
         // would abort the compiler process).
-        if self.gadt.arm_depth.get() > 0
+        if self.gadt.arm_depth.load(AtomicOrdering::Relaxed) > 0
             && matches!(self.get_raw(key), TypeData::GenericParam { .. })
         {
             // Check if this is path compression (re-binding to the same
             // resolved type) — the ONLY permitted GenericParam binding
             // inside an arm.  Any DIFFERENT binding is a seal violation.
-            if self.bindings.borrow().contains_key(&key)
+            if self.bindings.contains_key(&key)
                 && self.resolve_binding_no_gadt(key) == self.resolve_binding_no_gadt(value)
             {
                 // Path compression to the same type — no-op, skip the
                 // unnecessary write.
                 return true;
             }
-            self.seal_violations.set(self.seal_violations.get() + 1);
+            self.seal_violations = self.seal_violations + 1;
             return false;
         }
         // Record the origin span for GenericParam bindings (precise E104
@@ -1919,17 +2134,15 @@ impl<'input> TypeContext<'input> {
         // (`unify_tracked`); solver-driven bindings record nothing and
         // E104 falls back to the function span.
         if matches!(self.get_raw(key), TypeData::GenericParam { .. })
-            && let Some(origin) = *self.current_unify_span.borrow()
+            && let Some(origin) = self.current_unify_span
         {
-            self.generic_binding_origins
-                .borrow_mut()
-                .insert(key, origin);
+            self.generic_binding_origins.insert(key, origin);
         }
-        if let Some(log) = self.transaction_stack.borrow_mut().last_mut() {
-            let old = self.bindings.borrow().get(&key).copied();
+        if let Some(log) = self.transaction_stack.last_mut() {
+            let old = self.bindings.get(&key).copied();
             log.push((key, old));
         }
-        self.bindings.borrow_mut().insert(key, value);
+        self.bindings.insert(key, value);
         true
     }
 
@@ -1945,8 +2158,10 @@ impl<'input> TypeContext<'input> {
     }
 
     pub fn enter_universe(&mut self) -> (usize, TypeId) {
-        let universe = self.next_universe.get();
-        self.next_universe.set(universe + 1);
+        let universe = self.interner.next_universe.load(AtomicOrdering::Relaxed);
+        self.interner
+            .next_universe
+            .store(universe + 1, AtomicOrdering::Relaxed);
         // Dynamically create a SkolemVar with the correct universe_num
         let skolem = self.alloc(TypeData::SkolemVar {
             id: universe,
@@ -1961,13 +2176,22 @@ impl<'input> TypeContext<'input> {
     /// that is not tied to the Forall-level universe hierarchy.
     /// This prevents unbounded `next_universe` growth in `while-let`
     /// loops on existential GADT variants.
-    /// A sentinel universe number for GADT existential skolems.
-    /// Must be larger than any HRTB universe to ensure escape detection.
+    ///
+    /// Sentinel universe number for GADT existential skolems; must be
+    /// larger than any HRTB universe so `check_skolem_escape` can
+    /// distinguish them.  The isolation from the main universe counter
+    /// mirrors OutsideIn(X)'s treatment of implication-constraint
+    /// skolems as a separate scope (Vytiniotis et al., JFP 2011).
     pub const GADT_SKOLEM_UNIVERSE: usize = usize::MAX;
 
     pub fn fresh_gadt_skolem(&mut self) -> TypeId {
-        let id = self.next_gadt_skolem_id.get();
-        self.next_gadt_skolem_id.set(id + 1);
+        let id = self
+            .interner
+            .next_gadt_skolem_id
+            .load(AtomicOrdering::Relaxed);
+        self.interner
+            .next_gadt_skolem_id
+            .store(id + 1, AtomicOrdering::Relaxed);
         self.alloc(TypeData::SkolemVar {
             id,
             universe_num: Self::GADT_SKOLEM_UNIVERSE,
@@ -2036,13 +2260,13 @@ impl<'input> TypeContext<'input> {
         if self.type_is_volatile(data) {
             return None;
         }
-        self.factory.type_map.borrow().get(data).copied()
+        self.interner.type_map.lock().get(data).copied()
     }
 
     pub fn subst(&mut self, ty: TypeId, subst: &Subst) -> TypeId {
         let resolved = self.resolve_binding(ty);
         // Clone the data to avoid borrow conflicts when calling self.subst() recursively.
-        let data = self.types[resolved.index()].clone();
+        let data = self.slot(resolved.index()).clone();
         match &*data {
             TypeData::GenericParam { index, .. } => subst.get(*index).copied().unwrap_or(ty),
             TypeData::Int {
@@ -2063,7 +2287,8 @@ impl<'input> TypeContext<'input> {
             | TypeData::Unit
             | TypeData::Error => ty,
             TypeData::Adt { kind, def_id, args } => {
-                let new_args: Vec<TypeId> = args.iter().map(|&a| self.subst(a, subst)).collect();
+                let new_args: SmallVec<[TypeId; 4]> =
+                    args.iter().map(|&a| self.subst(a, subst)).collect();
                 let new_id = self.alloc(TypeData::Adt {
                     kind: *kind,
                     def_id: *def_id,
@@ -2072,7 +2297,8 @@ impl<'input> TypeContext<'input> {
                 new_id
             }
             TypeData::Tuple { elems } => {
-                let new_elems: Vec<TypeId> = elems.iter().map(|&e| self.subst(e, subst)).collect();
+                let new_elems: SmallVec<[TypeId; 4]> =
+                    elems.iter().map(|&e| self.subst(e, subst)).collect();
                 self.tuple(new_elems)
             }
             TypeData::Array { elem, size } => {
@@ -2101,7 +2327,7 @@ impl<'input> TypeContext<'input> {
                 self.ptr(new_size, new_pointee)
             }
             TypeData::Fn { params, ret } => {
-                let new_params: Vec<TypeId> =
+                let new_params: SmallVec<[TypeId; 4]> =
                     params.iter().map(|&p| self.subst(p, subst)).collect();
                 let new_ret = self.subst(*ret, subst);
                 self.function(new_params, new_ret)
@@ -2236,8 +2462,9 @@ impl<'input> TypeContext<'input> {
                             base: new_base,
                         });
                         // Copy the original Exists meta (invariant, default_value) to the new node
-                        if let Some(meta) = self.meta.get(&ty).cloned() {
-                            self.meta.entry(new_id).or_insert(meta);
+                        let src_meta = self.interner.meta.read().get(&ty).cloned();
+                        if let Some(meta) = src_meta {
+                            self.interner.meta.write().entry(new_id).or_insert(meta);
                         }
                         new_id
                     }
@@ -2249,14 +2476,15 @@ impl<'input> TypeContext<'input> {
                         base: new_base,
                     });
                     // Copy the original Exists meta (invariant, default_value) to the new node
-                    if let Some(meta) = self.meta.get(&ty).cloned() {
-                        self.meta.entry(new_id).or_insert(meta);
+                    let src_meta = self.interner.meta.read().get(&ty).cloned();
+                    if let Some(meta) = src_meta {
+                        self.interner.meta.write().entry(new_id).or_insert(meta);
                     }
                     new_id
                 }
             }
             TypeData::Coproduct { alternatives } => {
-                let new_alts: Vec<TypeId> =
+                let new_alts: SmallVec<[TypeId; 4]> =
                     alternatives.iter().map(|&a| self.subst(a, subst)).collect();
                 self.coproduct(new_alts)
             }
@@ -2294,7 +2522,7 @@ impl<'input> TypeContext<'input> {
         {
             return replacement;
         }
-        let data = self.types[resolved.index()].clone();
+        let data = self.slot(resolved.index()).clone();
         match &*data {
             TypeData::Int { .. }
             | TypeData::UInt { .. }
@@ -2309,7 +2537,7 @@ impl<'input> TypeContext<'input> {
             | TypeData::InferVar { .. }
             | TypeData::GenericParam { .. } => ty,
             TypeData::Adt { kind, def_id, args } => {
-                let new_args: Vec<TypeId> = args
+                let new_args: SmallVec<[TypeId; 4]> = args
                     .iter()
                     .map(|&a| self.replace_type_ids(a, replacements))
                     .collect();
@@ -2320,7 +2548,7 @@ impl<'input> TypeContext<'input> {
                 })
             }
             TypeData::Tuple { elems } => {
-                let new_elems: Vec<TypeId> = elems
+                let new_elems: SmallVec<[TypeId; 4]> = elems
                     .iter()
                     .map(|&e| self.replace_type_ids(e, replacements))
                     .collect();
@@ -2353,7 +2581,7 @@ impl<'input> TypeContext<'input> {
             }
             TypeData::Fn { params, ret } => {
                 let new_ret = self.replace_type_ids(*ret, replacements);
-                let new_params: Vec<TypeId> = params
+                let new_params: SmallVec<[TypeId; 4]> = params
                     .iter()
                     .map(|&p| self.replace_type_ids(p, replacements))
                     .collect();
@@ -2400,7 +2628,7 @@ impl<'input> TypeContext<'input> {
                 })
             }
             TypeData::Coproduct { alternatives } => {
-                let new_alts: Vec<TypeId> = alternatives
+                let new_alts: SmallVec<[TypeId; 4]> = alternatives
                     .iter()
                     .map(|&a| self.replace_type_ids(a, replacements))
                     .collect();
@@ -2439,7 +2667,7 @@ impl<'input> TypeContext<'input> {
         }
     }
 
-    fn struct_ty_no_alloc(&self, def_id: DefId, args: Vec<TypeId>) -> Option<TypeId> {
+    fn struct_ty_no_alloc(&self, def_id: DefId, args: SmallVec<[TypeId; 4]>) -> Option<TypeId> {
         self.find_type(&TypeData::Adt {
             kind: AdtKind::Struct,
             def_id,
@@ -2447,7 +2675,7 @@ impl<'input> TypeContext<'input> {
         })
     }
 
-    fn enum_ty_no_alloc(&self, def_id: DefId, args: Vec<TypeId>) -> Option<TypeId> {
+    fn enum_ty_no_alloc(&self, def_id: DefId, args: SmallVec<[TypeId; 4]>) -> Option<TypeId> {
         self.find_type(&TypeData::Adt {
             kind: AdtKind::Enum,
             def_id,
@@ -2455,7 +2683,7 @@ impl<'input> TypeContext<'input> {
         })
     }
 
-    fn tuple_ty_no_alloc(&self, elems: Vec<TypeId>) -> Option<TypeId> {
+    fn tuple_ty_no_alloc(&self, elems: SmallVec<[TypeId; 4]>) -> Option<TypeId> {
         self.find_type(&TypeData::Tuple { elems })
     }
 
@@ -2483,11 +2711,11 @@ impl<'input> TypeContext<'input> {
         self.find_type(&TypeData::Ptr { size, pointee })
     }
 
-    fn fn_ty_no_alloc(&self, params: Vec<TypeId>, ret: TypeId) -> Option<TypeId> {
+    fn fn_ty_no_alloc(&self, params: SmallVec<[TypeId; 4]>, ret: TypeId) -> Option<TypeId> {
         self.find_type(&TypeData::Fn { params, ret })
     }
 
-    fn coproduct_ty_no_alloc(&self, alternatives: Vec<TypeId>) -> Option<TypeId> {
+    fn coproduct_ty_no_alloc(&self, alternatives: SmallVec<[TypeId; 4]>) -> Option<TypeId> {
         self.find_type(&TypeData::Coproduct { alternatives })
     }
 
@@ -2918,11 +3146,7 @@ impl<'input> TypeContext<'input> {
     }
 
     pub fn set_meta(&mut self, id: TypeId, meta: TypeMeta<'input>) {
-        self.meta.insert(id, meta);
-    }
-
-    pub fn get_meta(&self, id: TypeId) -> Option<&TypeMeta<'input>> {
-        self.meta.get(&id)
+        self.interner.meta.write().insert(id, meta);
     }
 }
 
@@ -3142,6 +3366,129 @@ impl TypeError {
             | TypeError::PatternNotExhaustive { span }
             | TypeError::PatternRedundant { span } => *span,
         }
+    }
+
+    /// Overwrite the source span of this error.
+    /// Used by the solver to patch errors originating from deep in `unify`
+    /// with the span of the constraint that triggered the unification.
+    pub fn set_span(&mut self, new_span: crate::ast::Span) {
+        match self {
+            TypeError::Mismatch { span, .. }
+            | TypeError::UndefinedName { span, .. }
+            | TypeError::TypeNotFound { span, .. }
+            | TypeError::GenericArgumentCount { span, .. }
+            | TypeError::TraitNotImplemented { span, .. }
+            | TypeError::InvariantViolation { span, .. }
+            | TypeError::SkolemEscape { span, .. }
+            | TypeError::ScopeEscape { span, .. }
+            | TypeError::OutOfBounds { span, .. }
+            | TypeError::CircularDependency { span, .. }
+            | TypeError::DuplicateDefinition { span, .. }
+            | TypeError::PrivateField { span, .. }
+            | TypeError::PrivateType { span, .. }
+            | TypeError::PrivateFunction { span, .. }
+            | TypeError::PatternTypeMismatch { span, .. }
+            | TypeError::RecursiveType { span, .. }
+            | TypeError::CannotInfer { span }
+            | TypeError::MutableBorrow { span }
+            | TypeError::ImmutableBorrow { span }
+            | TypeError::DivisionByZero { span }
+            | TypeError::Overflow { span }
+            | TypeError::NeverType { span }
+            | TypeError::PatternNotExhaustive { span }
+            | TypeError::PatternRedundant { span } => *span = new_span,
+        }
+    }
+}
+
+/// Auto-trait audit for the type context.
+///
+/// `TypeContext` is deliberately **not** `Sync` — it carries ~20
+/// `Cell`/`RefCell` fields (`bindings`, `transaction_stack`,
+/// `binder_stack`, `current_unify_span`, …) whose values are *positional*:
+/// two threads interleaving on them would corrupt each other's unification
+/// state even if each individual field were locked.
+///
+/// It *is* `Send`, and that is what makes it usable from a `Sync` query
+/// provider: `Mutex<T>: Sync` only needs `T: Send`, so wrapping the whole
+/// context in one mutex yields a `Sync` handle that hands out `&mut
+/// TypeContext` to exactly one query at a time.  See
+/// `crate::session::CompilerSession`.
+///
+/// These tests exist so that adding an `Rc`/`RefCell` field (or making an
+/// existing one hold a non-`Send` type) fails at compile time here rather
+/// than silently removing the option of sharing the context.
+#[cfg(test)]
+mod send_sync_audit {
+    use super::TypeContext;
+    use super::TypeData;
+    use std::sync::Arc;
+
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    #[test]
+    fn type_context_is_send_and_shareable_under_a_lock() {
+        // `Mutex`/`RwLock` are `Sync` iff their contents are `Send`, so
+        // these three lines are what the session's design rests on.
+        assert_send::<TypeContext<'static>>();
+        assert_send::<parking_lot::Mutex<TypeContext<'static>>>();
+        assert_send::<parking_lot::RwLock<TypeContext<'static>>>();
+    }
+
+    /// The interner half of `TypeContext` must be shareable by reference:
+    /// `&T: Send` and `&T: Sync` both require `T: Sync`, so a session that
+    /// hands `&TypeContext` to parallel queries cannot work without it.
+    /// Every remaining mutable-inference field lives behind a lock precisely
+    /// so this bound holds.
+    #[test]
+    fn type_context_is_sync() {
+        assert_sync::<TypeContext<'static>>();
+        assert_sync::<crate::hir::types::data::TypeFactory<'static>>();
+        assert_sync::<crate::hir::types::gadt::GadtContext<'static>>();
+    }
+
+    /// The whole point of the split: several contexts can exist at once
+    /// over one interner, be moved to other threads, and still agree on
+    /// `TypeId`s.  `Send` is what lets a query own its context outright.
+    #[test]
+    fn per_query_contexts_share_one_interner() {
+        assert_send::<TypeContext<'static>>();
+        assert_send::<Arc<crate::hir::types::data::TypeFactory<'static>>>();
+
+        let mut base = TypeContext::new();
+        let a = base.alloc(TypeData::Bool);
+        let mut query = TypeContext::new_sharing(&base);
+
+        // Same interner ⇒ the same id resolves to the same type, and an id
+        // minted by one context is legible to the other.
+        assert_eq!(query.get(a), &TypeData::Bool);
+        assert_eq!(base.get(query.alloc(TypeData::Char)), &TypeData::Char);
+
+        // Inference state is NOT shared: binding in `query` is invisible to
+        // `base`, which is what makes per-query checking independent.
+        let var = base.alloc(TypeData::InferVar { id: 0, universe: 0 });
+        query.set_binding(var, a);
+        assert_eq!(query.resolve_binding(var), a);
+        assert_eq!(base.resolve_binding(var), var);
+    }
+
+    /// `TypeContext` is `Sync`, so `&TypeContext` crosses threads — but
+    /// that only buys read-only sharing of the interner.  Mutating
+    /// inference state still needs `&mut`, which is why parallelism comes
+    /// from one context per query rather than one shared context.
+    #[test]
+    fn shared_context_can_be_read_from_two_threads() {
+        let ctx = TypeContext::new();
+        let b = ctx.alloc(TypeData::Bool);
+        let shared = &ctx;
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(move || {
+                    assert_eq!(shared.get(b), &TypeData::Bool);
+                });
+            }
+        });
     }
 }
 

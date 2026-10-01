@@ -2,12 +2,83 @@ use crate::hir::infer::PrincipalShape;
 use crate::hir::types::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::time::Duration;
 
-static Z3_WARNED: OnceLock<bool> = OnceLock::new();
+#[derive(Debug, Clone)]
+enum Z3Availability {
+    Available,
+    NotFound(String),
+    VersionTooOld { found: String, required: String },
+}
+
+impl Z3Availability {
+    fn is_available(&self) -> bool {
+        matches!(self, Z3Availability::Available)
+    }
+
+    fn error_message(&self) -> String {
+        match self {
+            Z3Availability::Available => String::new(),
+            Z3Availability::NotFound(path) => {
+                format!("SMT solver ({}) not found", path)
+            }
+            Z3Availability::VersionTooOld { found, required } => {
+                format!(
+                    "SMT solver version {} is below minimum {}; please upgrade",
+                    found, required
+                )
+            }
+        }
+    }
+}
+
+static Z3_AVAILABILITY: LazyLock<Mutex<HashMap<Arc<str>, Z3Availability>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static Z3_WARNED_PATHS: LazyLock<Mutex<HashSet<Arc<str>>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn parse_z3_version(output: &str) -> Option<Vec<u64>> {
+    let version_str = output.split_whitespace().nth(2)?;
+    let parts: Vec<u64> = version_str
+        .split('.')
+        .filter_map(|p| p.parse::<u64>().ok())
+        .collect();
+    if parts.len() < 2 { None } else { Some(parts) }
+}
+
+fn z3_version_at_least(found: &[u64], min: &str) -> bool {
+    let min_parts: Vec<u64> = min
+        .split('.')
+        .filter_map(|p| p.parse::<u64>().ok())
+        .collect();
+    for (i, &p) in found.iter().enumerate() {
+        let m = min_parts.get(i).copied().unwrap_or(0);
+        if p < m {
+            return false;
+        }
+        if p > m {
+            return true;
+        }
+    }
+    true
+}
+
+/// Process-wide cache for SMT query results.
+/// Keys are the full SMT-LIB2 string (including timeout/memory options) so
+/// that different callers with different timeouts get independent cache entries.
+/// Caching *all* result types (Sat, Unsat, Unknown, Timeout, Error) is safe
+/// because the query string is the complete input — a timeout today means the
+/// same formula will time out again with the same budget.
+static SMT_RESULT_CACHE: LazyLock<Mutex<HashMap<String, SmtResult>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Default timeout for Z3 solver invocations (milliseconds).
 pub(crate) const Z3_TIMEOUT_MS: u64 = 5_000;
@@ -16,10 +87,112 @@ pub(crate) const Z3_TIMEOUT_MS: u64 = 5_000;
 /// defense after synthesis, so it gets a longer budget than synthesis
 /// queries (committee ruling on the verifier-overhead decision point).
 pub(crate) const VERIFY_TIMEOUT_MS: u64 = 60_000;
+/// Timeout for BII synthesis refinement queries. These are exists/forall
+/// bit-vector formulas (existential template bounds, universal inductiveness)
+/// and are much harder than discharge queries; the default 5 s budget makes
+/// them fail closed with `unknown`.
+pub(crate) const BII_SYNTHESIS_TIMEOUT_MS: u64 = 60_000;
 /// Default memory limit for Z3 (megabytes).
 const Z3_MEMORY_LIMIT_MB: u64 = 512;
+/// Maximum number of entries retained in the process-wide SMT result cache.
+/// When the limit is reached, the cache is cleared. This is intentionally
+/// simple; a more sophisticated eviction policy is not required yet.
+const SMT_RESULT_CACHE_LIMIT: usize = 20_000;
 /// Minimum required Z3 major version.
 const Z3_MIN_VERSION: &str = "4.8.0";
+
+/// Fixed SMT-LIB2 prelude for `check_unicity`.
+///
+/// This prelude does not depend on the target inference variable, bindings,
+/// equality constraints, timeout, or memory limit. It is built once and reused
+/// by every `check_unicity` query.
+static UNICITY_PRELUDE: LazyLock<String> = LazyLock::new(|| {
+    let mut smt = String::with_capacity(8192);
+
+    smt.push_str("(set-option :produce-models false)\n");
+    smt.push_str("(set-logic ALL)\n\n");
+
+    // ── 1. Declare uninterpreted sort Type ────────────────
+    smt.push_str("(declare-sort Type 0)\n\n");
+
+    // ── 2. Shape tag constants ──────────────────────────────
+    smt.push_str("(declare-const SHAPE_UNKNOWN Int)\n");
+    smt.push_str("(declare-const SHAPE_ARROW Int)\n");
+    smt.push_str("(declare-const SHAPE_TUPLE Int)\n");
+    smt.push_str("(declare-const SHAPE_CONSTRUCTOR Int)\n");
+    smt.push_str("(declare-const SHAPE_POLY Int)\n");
+    smt.push_str("(declare-const SHAPE_SCALAR Int)\n");
+    smt.push_str("(assert (= SHAPE_UNKNOWN 0))\n");
+    smt.push_str("(assert (= SHAPE_ARROW 1))\n");
+    smt.push_str("(assert (= SHAPE_TUPLE 2))\n");
+    smt.push_str("(assert (= SHAPE_CONSTRUCTOR 3))\n");
+    smt.push_str("(assert (= SHAPE_POLY 4))\n");
+    smt.push_str("(assert (= SHAPE_SCALAR 5))\n\n");
+
+    // ── 3. Type constructor functions ────────────────────────
+    smt.push_str("(declare-fun type-int32 () Type)\n");
+    smt.push_str("(declare-fun type-int64 () Type)\n");
+    smt.push_str("(declare-fun type-bool () Type)\n");
+    smt.push_str("(declare-fun type-unit () Type)\n");
+    smt.push_str("(declare-fun type-never () Type)\n");
+    smt.push_str("(declare-fun type-char () Type)\n");
+    smt.push_str("(declare-fun type-byte () Type)\n");
+    smt.push_str("(declare-fun type-fn (Type Type) Type)\n");
+    smt.push_str("(declare-fun type-tuple2 (Type Type) Type)\n");
+    smt.push_str("(declare-fun type-struct (Int Type) Type)\n");
+    smt.push_str("(declare-fun type-poly (Type) Type)\n");
+    smt.push_str("(declare-fun type-rational (Int Int) Type)\n");
+    smt.push_str("(declare-fun type-ref (Type Bool) Type)\n");
+    smt.push_str("(declare-fun type-ptr (Type Type) Type)\n");
+    smt.push_str("(declare-fun type-slice (Type) Type)\n");
+    smt.push_str("(declare-fun type-array (Type Int) Type)\n");
+    smt.push_str("(declare-fun type-coproduct (Type Type) Type)\n");
+    smt.push_str("(declare-fun type-pointer (Type) Type)\n");
+    smt.push_str("(declare-fun type-float32 () Type)\n");
+    smt.push_str("(declare-fun type-float64 () Type)\n");
+    smt.push_str("(declare-fun type-dyn-trait (Int) Type)\n");
+    smt.push_str("(declare-fun type-type () Type)\n");
+    smt.push_str("(declare-fun type-unknown () Type)\n\n");
+
+    // ── 4. Shape-of and arity-of functions ────────────────────
+    smt.push_str("(declare-fun shape-of (Type) Int)\n");
+    smt.push_str("(declare-fun arity-of (Type) Int)\n\n");
+
+    // ── 5. Shape and arity axioms ────────────────────────────
+    smt.push_str("(assert (= (shape-of type-int32) SHAPE_SCALAR))\n");
+    smt.push_str("(assert (= (shape-of type-int64) SHAPE_SCALAR))\n");
+    smt.push_str("(assert (= (shape-of type-bool) SHAPE_SCALAR))\n");
+    smt.push_str("(assert (= (shape-of type-unit) SHAPE_UNKNOWN))\n");
+    smt.push_str("(assert (= (shape-of type-never) SHAPE_UNKNOWN))\n");
+    smt.push_str("(assert (= (shape-of type-char) SHAPE_SCALAR))\n");
+    smt.push_str("(assert (= (shape-of type-byte) SHAPE_SCALAR))\n");
+    smt.push_str("(assert (= (shape-of type-float32) SHAPE_SCALAR))\n");
+    smt.push_str("(assert (= (shape-of type-float64) SHAPE_SCALAR))\n");
+    smt.push_str(
+        "(assert (forall ((a Type) (b Type)) (and (= (shape-of (type-fn a b)) SHAPE_ARROW) (= (arity-of (type-fn a b)) 2))))\n",
+    );
+    smt.push_str(
+        "(assert (forall ((a Type) (b Type)) (and (= (shape-of (type-tuple2 a b)) SHAPE_TUPLE) (= (arity-of (type-tuple2 a b)) 2))))\n",
+    );
+    smt.push_str("(assert (forall ((tag Int) (a Type)) (and (= (shape-of (type-struct tag a)) SHAPE_CONSTRUCTOR) (= (arity-of (type-struct tag a)) 1))))\n");
+    smt.push_str("(assert (forall ((a Type)) (= (shape-of (type-poly a)) SHAPE_POLY)))\n");
+    smt.push_str(
+        "(assert (forall ((p Int) (q Int)) (= (shape-of (type-rational p q)) SHAPE_SCALAR)))\n",
+    );
+    smt.push_str("(assert (forall ((a Type) (m Bool)) (and (= (shape-of (type-ref a m)) SHAPE_CONSTRUCTOR) (= (arity-of (type-ref a m)) 1))))\n");
+    smt.push_str("(assert (forall ((s Type) (p Type)) (and (= (shape-of (type-ptr s p)) SHAPE_CONSTRUCTOR) (= (arity-of (type-ptr s p)) 2))))\n");
+    smt.push_str("(assert (forall ((a Type)) (and (= (shape-of (type-slice a)) SHAPE_CONSTRUCTOR) (= (arity-of (type-slice a)) 1))))\n");
+    smt.push_str("(assert (forall ((a Type) (n Int)) (and (= (shape-of (type-array a n)) SHAPE_CONSTRUCTOR) (= (arity-of (type-array a n)) 1))))\n");
+    smt.push_str("(assert (forall ((a Type) (b Type)) (and (= (shape-of (type-coproduct a b)) SHAPE_CONSTRUCTOR) (= (arity-of (type-coproduct a b)) 2))))\n");
+    smt.push_str("(assert (forall ((a Type)) (and (= (shape-of (type-pointer a)) SHAPE_CONSTRUCTOR) (= (arity-of (type-pointer a)) 1))))\n");
+    smt.push_str(
+        "(assert (forall ((tag Int)) (= (shape-of (type-dyn-trait tag)) SHAPE_CONSTRUCTOR)))\n",
+    );
+    smt.push_str("(assert (= (shape-of type-type) SHAPE_UNKNOWN))\n");
+    smt.push_str("(assert (= (shape-of type-unknown) SHAPE_UNKNOWN))\n\n");
+
+    smt
+});
 
 /// SMT-LIB2-based unicity checker using Z3.
 ///
@@ -90,9 +263,7 @@ impl Drop for KillOnDropChild {
 }
 
 pub struct SmtSolver {
-    solver_path: String,
-    /// Cache of SMT query → result, avoiding re-spawning Z3 for identical queries.
-    query_cache: RefCell<HashMap<String, SmtResult>>,
+    solver_path: Arc<str>,
     /// Per-instance solver timeout in milliseconds (overrides the default
     /// `Z3_TIMEOUT_MS` for callers that need heavier quantified queries).
     /// Interior mutability so `set_timeout` can re-tune a shared instance
@@ -109,13 +280,11 @@ impl SmtSolver {
     /// BII synthesis tests with wide templates (e.g. 3-variable support-
     /// three rows) exceed the 5 s default on their quantified ∃∀ queries.
     pub fn with_timeout(solver_path: &str, timeout_ms: u64) -> Self {
-        let solver = SmtSolver {
-            solver_path: solver_path.to_string(),
-            query_cache: RefCell::new(HashMap::new()),
+        SmtSolver {
+            solver_path: Arc::from(solver_path),
             timeout_ms: RefCell::new(timeout_ms),
-        };
-        // Verify Z3 version on first use (lazy, via check_version).
-        solver
+        }
+        // Query caching is handled by the process-wide SMT_RESULT_CACHE static.
     }
 
     /// Adjust the per-query timeout at runtime. Interior mutability keeps
@@ -126,45 +295,81 @@ impl SmtSolver {
         *self.timeout_ms.borrow_mut() = timeout_ms;
     }
 
-    /// Verify that the Z3 binary meets the minimum version requirement.
-    /// Returns `true` if the version check passes or if Z3 is not found (warning only).
+    /// Temporarily raises the solver timeout and returns a guard that
+    /// restores the previous value on drop (including panic unwind).
+    pub(crate) fn with_timeout_raised<'a>(&'a self, ms: u64) -> TimeoutGuard<'a> {
+        let previous = *self.timeout_ms.borrow();
+        self.set_timeout(ms);
+        TimeoutGuard {
+            solver: self,
+            previous_ms: previous,
+        }
+    }
+}
+
+impl SmtSolver {
     pub fn check_version(&self) -> bool {
-        let output = match Command::new(&self.solver_path)
+        self.availability().is_available()
+    }
+
+    pub fn availability(&self) -> Z3Availability {
+        {
+            let cache = Z3_AVAILABILITY.lock().unwrap();
+            if let Some(avail) = cache.get(&self.solver_path) {
+                return avail.clone();
+            }
+        }
+        let avail = self.probe_availability_uncached();
+        Z3_AVAILABILITY
+            .lock()
+            .unwrap()
+            .insert(self.solver_path.clone(), avail.clone());
+        avail
+    }
+
+    pub fn ensure_available(&self) -> Result<(), String> {
+        let avail = self.availability();
+        if avail.is_available() {
+            return Ok(());
+        }
+        let msg = avail.error_message();
+        let mut warned = Z3_WARNED_PATHS.lock().unwrap();
+        if warned.insert(self.solver_path.clone()) {
+            eprintln!("warning: {}", msg);
+        }
+        Err(msg)
+    }
+
+    fn probe_availability_uncached(&self) -> Z3Availability {
+        let output = match Command::new(&*self.solver_path)
             .arg("--version")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
         {
             Ok(o) if o.status.success() => o,
-            _ => return false,
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                return Z3Availability::NotFound(format!("{}: {}", self.solver_path, stderr));
+            }
+            Err(e) => return Z3Availability::NotFound(format!("{}: {}", self.solver_path, e)),
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // Z3 --version outputs: "Z3 version 4.8.12 - 64 bit"
-        let version_str = match stdout.split_whitespace().nth(2) {
-            Some(v) => v,
-            None => return false,
-        };
-        let parts: Vec<u64> = version_str
-            .split('.')
-            .filter_map(|p| p.parse::<u64>().ok())
-            .collect();
-        if parts.len() < 2 {
-            return false;
+        match parse_z3_version(&stdout) {
+            Some(parts) if z3_version_at_least(&parts, Z3_MIN_VERSION) => Z3Availability::Available,
+            Some(parts) => Z3Availability::VersionTooOld {
+                found: parts
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join("."),
+                required: Z3_MIN_VERSION.to_string(),
+            },
+            None => Z3Availability::NotFound(format!(
+                "{}: could not parse version from: {}",
+                self.solver_path, stdout
+            )),
         }
-        let min_parts: Vec<u64> = Z3_MIN_VERSION
-            .split('.')
-            .filter_map(|p| p.parse::<u64>().ok())
-            .collect();
-        for (i, &p) in parts.iter().enumerate() {
-            let min = min_parts.get(i).copied().unwrap_or(0);
-            if p < min {
-                return false;
-            }
-            if p > min {
-                return true;
-            }
-        }
-        true
     }
 
     /// Main entry: check whether `ty` (an InferVar or resolved type) has a
@@ -186,19 +391,20 @@ impl SmtSolver {
             return Some(match ctx.get(resolved) {
                 TypeData::Fn { .. } => PrincipalShape::Arrow,
                 TypeData::Tuple { elems } => PrincipalShape::Tuple(elems.len()),
-                TypeData::Adt { args, .. } => PrincipalShape::Constructor(args.len()),
+                TypeData::Adt { def_id, args, .. } => {
+                    PrincipalShape::Constructor(def_id.0, args.len())
+                }
                 TypeData::Forall { .. }
                 | TypeData::Exists { .. }
                 | TypeData::Poly { .. }
                 | TypeData::SkolemVar { .. } => PrincipalShape::Poly,
                 TypeData::Int { .. }
                 | TypeData::UInt { .. }
-                | TypeData::Float { .. }
-                | TypeData::Bool
-                | TypeData::Char
-                | TypeData::Byte
                 | TypeData::USize
-                | TypeData::Rational { .. } => PrincipalShape::Scalar,
+                | TypeData::Rational { .. } => PrincipalShape::Integer,
+                TypeData::Float { .. } => PrincipalShape::Float,
+                TypeData::Bool => PrincipalShape::Bool,
+                TypeData::Char | TypeData::Byte => PrincipalShape::Char,
                 _ => PrincipalShape::Unknown,
             });
         }
@@ -208,120 +414,105 @@ impl SmtSolver {
             _ => return None,
         };
 
-        // Build the full SMT-LIB2 query
-        let mut smt = String::new();
-        smt.push_str("(set-option :produce-models true)\n");
-        smt.push_str("(set-logic ALL)\n\n");
+        // Fast path: no constraints means the variable is completely free,
+        // so it cannot have a unique shape.
+        if bindings.is_empty() && eq_constraints.is_empty() {
+            return None;
+        }
 
-        // ── 1. Declare uninterpreted sort Type ────────────────
-        smt.push_str("(declare-sort Type 0)\n\n");
+        // Fast path: solve simple equality/binding closures without Z3.
+        //
+        // If the target equivalence class has classifiable concrete bindings
+        // that all agree on one shape, return that shape. If they disagree,
+        // return None. If any binding in the closure cannot be classified by
+        // this fast path, fall through to Z3.
+        {
+            let mut adjacency: HashMap<usize, Vec<usize>> = HashMap::new();
+            for &(a, b) in eq_constraints {
+                adjacency.entry(a).or_default().push(b);
+                adjacency.entry(b).or_default().push(a);
+            }
 
-        // ── 2. Shape tag constants ──────────────────────────────
-        smt.push_str("(declare-const SHAPE_UNKNOWN Int)\n");
-        smt.push_str("(declare-const SHAPE_ARROW Int)\n");
-        smt.push_str("(declare-const SHAPE_TUPLE Int)\n");
-        smt.push_str("(declare-const SHAPE_CONSTRUCTOR Int)\n");
-        smt.push_str("(declare-const SHAPE_POLY Int)\n");
-        smt.push_str("(declare-const SHAPE_SCALAR Int)\n");
-        smt.push_str("(assert (= SHAPE_UNKNOWN 0))\n");
-        smt.push_str("(assert (= SHAPE_ARROW 1))\n");
-        smt.push_str("(assert (= SHAPE_TUPLE 2))\n");
-        smt.push_str("(assert (= SHAPE_CONSTRUCTOR 3))\n");
-        smt.push_str("(assert (= SHAPE_POLY 4))\n");
-        smt.push_str("(assert (= SHAPE_SCALAR 5))\n\n");
+            let mut visited: HashSet<usize> = HashSet::new();
+            let mut stack = vec![var_id];
+            visited.insert(var_id);
 
-        // ── 3. Type constructor functions ────────────────────────
-        smt.push_str("(declare-fun type-int32 () Type)\n");
-        smt.push_str("(declare-fun type-int64 () Type)\n");
-        smt.push_str("(declare-fun type-bool () Type)\n");
-        smt.push_str("(declare-fun type-unit () Type)\n");
-        smt.push_str("(declare-fun type-never () Type)\n");
-        smt.push_str("(declare-fun type-char () Type)\n");
-        smt.push_str("(declare-fun type-byte () Type)\n");
-        smt.push_str("(declare-fun type-fn (Type Type) Type)\n");
-        smt.push_str("(declare-fun type-tuple2 (Type Type) Type)\n");
-        smt.push_str("(declare-fun type-struct (Int Type) Type)\n");
-        smt.push_str("(declare-fun type-poly (Type) Type)\n");
-        smt.push_str("(declare-fun type-rational (Int Int) Type)\n");
-        smt.push_str("(declare-fun type-ref (Type Bool) Type)\n");
-        smt.push_str("(declare-fun type-ptr (Type Type) Type)\n");
-        smt.push_str("(declare-fun type-slice (Type) Type)\n");
-        smt.push_str("(declare-fun type-array (Type Int) Type)\n");
-        smt.push_str("(declare-fun type-coproduct (Type Type) Type)\n");
-        smt.push_str("(declare-fun type-pointer (Type) Type)\n");
-        smt.push_str("(declare-fun type-float32 () Type)\n");
-        smt.push_str("(declare-fun type-float64 () Type)\n");
-        smt.push_str("(declare-fun type-dyn-trait (Int) Type)\n");
-        smt.push_str("(declare-fun type-type () Type)\n\n");
+            let mut found_shape: Option<PrincipalShape> = None;
+            let mut can_decide = true;
 
-        // ── 4. Shape-of and arity-of functions ────────────────────
-        smt.push_str("(declare-fun shape-of (Type) Int)\n");
-        smt.push_str("(declare-fun arity-of (Type) Int)\n\n");
+            while let Some(current) = stack.pop() {
+                if let Some(&bound_ty) = bindings.get(&current) {
+                    match Self::fast_concrete_shape(ctx, bound_ty) {
+                        Some(shape) => {
+                            if let Some(previous) = found_shape.as_ref() {
+                                if !Self::same_principal_shape(previous, &shape) {
+                                    return None;
+                                }
+                            } else {
+                                found_shape = Some(shape);
+                            }
+                        }
+                        None => {
+                            can_decide = false;
+                            break;
+                        }
+                    }
+                }
 
-        // ── 5. Shape and arity axioms ────────────────────────────
-        smt.push_str("(assert (= (shape-of type-int32) SHAPE_SCALAR))\n");
-        smt.push_str("(assert (= (shape-of type-int64) SHAPE_SCALAR))\n");
-        smt.push_str("(assert (= (shape-of type-bool) SHAPE_SCALAR))\n");
-        smt.push_str("(assert (= (shape-of type-unit) SHAPE_UNKNOWN))\n");
-        smt.push_str("(assert (= (shape-of type-never) SHAPE_UNKNOWN))\n");
-        smt.push_str("(assert (= (shape-of type-char) SHAPE_SCALAR))\n");
-        smt.push_str("(assert (= (shape-of type-byte) SHAPE_SCALAR))\n");
-        smt.push_str("(assert (= (shape-of type-float32) SHAPE_SCALAR))\n");
-        smt.push_str("(assert (= (shape-of type-float64) SHAPE_SCALAR))\n");
-        smt.push_str(
-            "(assert (forall ((a Type) (b Type)) (and (= (shape-of (type-fn a b)) SHAPE_ARROW) (= (arity-of (type-fn a b)) 2))))\n",
-        );
-        smt.push_str(
-            "(assert (forall ((a Type) (b Type)) (and (= (shape-of (type-tuple2 a b)) SHAPE_TUPLE) (= (arity-of (type-tuple2 a b)) 2))))\n",
-        );
-        smt.push_str("(assert (forall ((tag Int) (a Type)) (and (= (shape-of (type-struct tag a)) SHAPE_CONSTRUCTOR) (= (arity-of (type-struct tag a)) 1))))\n");
-        smt.push_str("(assert (forall ((a Type)) (= (shape-of (type-poly a)) SHAPE_POLY)))\n");
-        smt.push_str(
-            "(assert (forall ((p Int) (q Int)) (= (shape-of (type-rational p q)) SHAPE_SCALAR)))\n",
-        );
-        smt.push_str("(assert (forall ((a Type) (m Bool)) (and (= (shape-of (type-ref a m)) SHAPE_CONSTRUCTOR) (= (arity-of (type-ref a m)) 1))))\n");
-        smt.push_str("(assert (forall ((s Type) (p Type)) (and (= (shape-of (type-ptr s p)) SHAPE_CONSTRUCTOR) (= (arity-of (type-ptr s p)) 2))))\n");
-        smt.push_str("(assert (forall ((a Type)) (and (= (shape-of (type-slice a)) SHAPE_CONSTRUCTOR) (= (arity-of (type-slice a)) 1))))\n");
-        smt.push_str("(assert (forall ((a Type) (n Int)) (and (= (shape-of (type-array a n)) SHAPE_CONSTRUCTOR) (= (arity-of (type-array a n)) 1))))\n");
-        smt.push_str("(assert (forall ((a Type) (b Type)) (and (= (shape-of (type-coproduct a b)) SHAPE_CONSTRUCTOR) (= (arity-of (type-coproduct a b)) 2))))\n");
-        smt.push_str("(assert (forall ((a Type)) (and (= (shape-of (type-pointer a)) SHAPE_CONSTRUCTOR) (= (arity-of (type-pointer a)) 1))))\n");
-        smt.push_str(
-            "(assert (forall ((tag Int)) (= (shape-of (type-dyn-trait tag)) SHAPE_CONSTRUCTOR)))\n",
-        );
-        smt.push_str("(assert (= (shape-of type-type) SHAPE_UNKNOWN))\n\n");
+                if let Some(neighbors) = adjacency.get(&current) {
+                    for &next in neighbors {
+                        if visited.insert(next) {
+                            stack.push(next);
+                        }
+                    }
+                }
+            }
+
+            if can_decide {
+                if let Some(shape) = found_shape {
+                    return Some(shape);
+                }
+
+                // The target equivalence class has no concrete binding that
+                // can make the shape unique.
+                return None;
+            }
+        }
+
+        // Build the full SMT-LIB2 query. The fixed prelude is shared across calls.
+        let mut smt = String::with_capacity(UNICITY_PRELUDE.len() + 1024);
+        smt.push_str(UNICITY_PRELUDE.as_str());
 
         // ── 6. Inference variable ──────────────────────────────
-        smt.push_str(&format!("(declare-const iv_{} Type)\n", var_id));
+        let _ = writeln!(smt, "(declare-const iv_{} Type)", var_id);
 
         // ── 7. Bindings ──────────────────────────────────────────
         for (vid, bound_ty) in bindings {
             let term = Self::type_to_smt_term(ctx, *bound_ty);
-            smt.push_str(&format!("(assert (= iv_{} {}))\n", vid, term));
+            let _ = writeln!(smt, "(assert (= iv_{} {}))", vid, term);
         }
 
         // ── 8. Eq constraints ────────────────────────────────────
         for (a, b) in eq_constraints {
-            smt.push_str(&format!("(assert (= iv_{} iv_{}))\n", a, b));
+            let _ = writeln!(smt, "(assert (= iv_{} iv_{}))", a, b);
         }
 
         // ── 9. Push/assert/pop for each candidate shape ──────────
         let shape_names = [
             ("SHAPE_UNKNOWN", PrincipalShape::Unknown),
-            ("SHAPE_SCALAR", PrincipalShape::Scalar),
+            ("SHAPE_INTEGER", PrincipalShape::Integer),
             ("SHAPE_ARROW", PrincipalShape::Arrow),
             ("SHAPE_TUPLE", PrincipalShape::Tuple(2)),
-            ("SHAPE_CONSTRUCTOR", PrincipalShape::Constructor(0)),
+            ("SHAPE_CONSTRUCTOR", PrincipalShape::Constructor(0, 0)),
             ("SHAPE_POLY", PrincipalShape::Poly),
         ];
 
         for (name, _ps) in &shape_names {
-            smt.push_str(&format!(
-                "(push 1)\n\
-                 (assert (= (shape-of iv_{}) {}))\n\
-                 (check-sat)\n\
-                 (pop 1)\n",
+            let _ = writeln!(
+                smt,
+                "(push 1)\n(assert (= (shape-of iv_{}) {}))\n(check-sat)\n(pop 1)",
                 var_id, name
-            ));
+            );
         }
 
         // ── 10. Query Z3 ─────────────────────────────────────────
@@ -331,7 +522,7 @@ impl SmtSolver {
             SmtResult::Unsat => {
                 // Unsat: Z3 proved that no model satisfies the constraints.
                 // The target variable has no possible shape, which means
-                // the constraints are contradictory.  We cannot determine
+                // the constraints are contradictory. We cannot determine
                 // a unique shape — return None.
                 None
             }
@@ -348,6 +539,96 @@ impl SmtSolver {
                 // Z3 not available or error — fall back to heuristic.
                 Some(PrincipalShape::Unknown)
             }
+        }
+    }
+
+    /// Conservative fast-path shape classification for concrete types.
+    ///
+    /// Returns `Some(shape)` only when this code can classify the shape in a
+    /// way compatible with the SMT encoding. Returns `None` when the type
+    /// should fall back to the full SMT query.
+    fn fast_concrete_shape<'input>(
+        ctx: &TypeContext<'input>,
+        ty: TypeId,
+    ) -> Option<PrincipalShape> {
+        let resolved = ctx.resolve_binding(ty);
+
+        Some(match ctx.get(resolved) {
+            TypeData::InferVar { .. } => return None,
+
+            TypeData::Int { .. }
+            | TypeData::UInt { .. }
+            | TypeData::USize
+            | TypeData::Rational { .. } => PrincipalShape::Integer,
+            TypeData::Float { .. } => PrincipalShape::Float,
+            TypeData::Bool => PrincipalShape::Bool,
+            TypeData::Char | TypeData::Byte => PrincipalShape::Char,
+
+            TypeData::Unit | TypeData::Never | TypeData::Type => PrincipalShape::Unknown,
+
+            TypeData::Fn { params, .. } => {
+                if params.len() == 1 || params.len() == 2 {
+                    PrincipalShape::Arrow
+                } else {
+                    PrincipalShape::Unknown
+                }
+            }
+
+            TypeData::Tuple { elems } => {
+                if elems.is_empty() {
+                    PrincipalShape::Unknown
+                } else if elems.len() == 1 {
+                    return Self::fast_concrete_shape(ctx, elems[0]);
+                } else {
+                    PrincipalShape::Tuple(2)
+                }
+            }
+
+            TypeData::Forall { .. }
+            | TypeData::Exists { .. }
+            | TypeData::Poly { .. }
+            | TypeData::Mu { .. }
+            | TypeData::Nu { .. } => PrincipalShape::Poly,
+
+            TypeData::Coproduct { alternatives } => {
+                if alternatives.len() == 1 {
+                    return Self::fast_concrete_shape(ctx, alternatives[0]);
+                } else if alternatives.len() == 2 {
+                    PrincipalShape::Constructor(0, 0)
+                } else {
+                    PrincipalShape::Unknown
+                }
+            }
+
+            TypeData::Adt { .. }
+            | TypeData::Ref { .. }
+            | TypeData::Pointer { .. }
+            | TypeData::Ptr { .. }
+            | TypeData::Slice { .. }
+            | TypeData::Array { .. }
+            | TypeData::DynTrait { .. } => PrincipalShape::Constructor(0, 0),
+
+            TypeData::AssociatedType { self_ty, .. } => {
+                return Self::fast_concrete_shape(ctx, *self_ty);
+            }
+
+            TypeData::Error
+            | TypeData::GenericParam { .. }
+            | TypeData::SkolemVar { .. }
+            | TypeData::Regex { .. }
+            | TypeData::Opaque { .. } => PrincipalShape::Unknown,
+        })
+    }
+
+    /// Compare two `PrincipalShape` values conservatively for the fast path.
+    ///
+    /// Tuple arity is compared explicitly. Constructor payloads are ignored
+    /// because the SMT unicity query currently only distinguishes the broad
+    /// `SHAPE_CONSTRUCTOR` tag, not the precise constructor identity.
+    fn same_principal_shape(a: &PrincipalShape, b: &PrincipalShape) -> bool {
+        match (a, b) {
+            (PrincipalShape::Tuple(x), PrincipalShape::Tuple(y)) => x == y,
+            _ => std::mem::discriminant(a) == std::mem::discriminant(b),
         }
     }
 
@@ -581,10 +862,10 @@ pub(crate) fn expr_to_smt(e: &crate::ast::Expr, out: &mut String) -> bool {
 /// signed (`sbvle`/`sbvge`), `UInt<N>` is unsigned (`bvule`/`bvuge`).
 pub(crate) fn expr_involves_signed(
     e: &crate::ast::Expr,
-    signed: &std::collections::HashSet<String>,
+    signed: &std::collections::HashSet<&'static str>,
 ) -> bool {
     match e {
-        crate::ast::Expr::Ident(s, _) => signed.contains(&s.as_str()),
+        crate::ast::Expr::Ident(s, _) => signed.contains(s.as_str()),
         crate::ast::Expr::BinaryOp { left, right, .. } => {
             expr_involves_signed(left, signed) || expr_involves_signed(right, signed)
         }
@@ -669,7 +950,7 @@ pub(crate) fn expr_to_smt_bv(
     e: &crate::ast::Expr,
     out: &mut String,
     widths: &HashMap<crate::symbol::Symbol, u8>,
-    signed: Option<&std::collections::HashSet<String>>,
+    signed: Option<&std::collections::HashSet<&'static str>>,
 ) -> bool {
     expr_to_smt_bv_at(e, out, None, widths, signed)
 }
@@ -705,7 +986,7 @@ fn expr_to_smt_bv_at(
     out: &mut String,
     ctx_w: Option<u8>,
     widths: &HashMap<crate::symbol::Symbol, u8>,
-    signed: Option<&std::collections::HashSet<String>>,
+    signed: Option<&std::collections::HashSet<&'static str>>,
 ) -> bool {
     match e {
         crate::ast::Expr::Ident(s, _) => {
@@ -715,7 +996,7 @@ fn expr_to_smt_bv_at(
             {
                 return false; // mixed-width operand — fail closed.
             }
-            out.push_str(&s.as_str());
+            out.push_str(s.as_str());
             true
         }
         crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => {
@@ -849,7 +1130,7 @@ fn expr_to_smt_bv_at(
 /// names) — the `declare-const` set for a hint query.
 fn collect_idents(e: &crate::ast::Expr, out: &mut Vec<String>) {
     match e {
-        crate::ast::Expr::Ident(s, _) => out.push(s.as_str()),
+        crate::ast::Expr::Ident(s, _) => out.push(s.as_str().to_string()),
         crate::ast::Expr::Literal(..) => {}
         crate::ast::Expr::BinaryOp { left, right, .. } => {
             collect_idents(left, out);
@@ -1016,7 +1297,7 @@ impl SmtSolver {
         hints: &[&crate::ast::Expr<'input>],
         obligation: &crate::ast::Expr<'input>,
         widths: &HashMap<crate::symbol::Symbol, u8>,
-        signed: Option<&std::collections::HashSet<String>>,
+        signed: Option<&std::collections::HashSet<&'static str>>,
         hints_unsigned: bool,
     ) -> bool {
         let mut smt = String::new();
@@ -1062,12 +1343,8 @@ impl SmtSolver {
             return SmtResult::Error("empty query".into());
         }
 
-        // Check the query cache first — avoids spawning Z3 for identical queries.
-        {
-            let cache = self.query_cache.borrow();
-            if let Some(cached) = cache.get(smt) {
-                return cached.clone();
-            }
+        if let Err(msg) = self.ensure_available() {
+            return SmtResult::Error(msg);
         }
 
         // Build the SMT query with timeout and memory limit baked in.
@@ -1082,7 +1359,17 @@ impl SmtSolver {
         ));
         smt_with_limits.push_str(smt);
 
-        let mut child = match Command::new(&self.solver_path)
+        // Check the process-wide cache first — avoids spawning Z3 for identical
+        // queries across all solver instances. The full smt_with_limits string is
+        // the cache key so different timeouts produce independent entries.
+        {
+            let cache = SMT_RESULT_CACHE.lock().unwrap();
+            if let Some(cached) = cache.get(&smt_with_limits) {
+                return cached.clone();
+            }
+        }
+
+        let mut child = match Command::new(&*self.solver_path)
             .arg("-in")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1091,10 +1378,6 @@ impl SmtSolver {
         {
             Ok(c) => KillOnDropChild(c),
             Err(e) => {
-                Z3_WARNED.get_or_init(|| {
-                    eprintln!("warning: SMT solver ({}) not found: {}; unicity check uses fallback heuristic", self.solver_path, e);
-                    true
-                });
                 return SmtResult::Error(format!("solver not found: {}", e));
             }
         };
@@ -1125,19 +1408,48 @@ impl SmtSolver {
                 SmtResult::Sat(stdout)
             }
         } else {
-            // Check stderr for timeout indicator.
+            // Non-zero exit is NOT always a real error: a query ending in
+            // `(get-model)` after an `unsat` answer makes z3 print
+            // `(error "model is not available")` and exit non-zero, but the
+            // DECISIVE result line is still in stdout. Classify from the
+            // text before giving up, so single-round-trip queries
+            // (`check-sat` + `get-model` in one script) work for `unsat`
+            // too.
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr);
             if stderr.contains("timeout") {
                 SmtResult::Timeout
+            } else if stdout.lines().any(|l| l.trim() == "unknown") {
+                SmtResult::Unknown
             } else {
-                SmtResult::Error(format!("z3 error: {}", stderr.trim()))
+                match stdout.lines().rev().find_map(|l| match l.trim() {
+                    "sat" => Some(true),
+                    "unsat" => Some(false),
+                    _ => None,
+                }) {
+                    Some(true) => SmtResult::Sat(stdout),
+                    Some(false) => SmtResult::Unsat,
+                    // No decisive result line — a genuine solver error.
+                    None => SmtResult::Error(format!("z3 error: {}", stderr.trim())),
+                }
             }
         };
 
-        // Cache the result before returning.
-        self.query_cache
-            .borrow_mut()
-            .insert(smt.to_string(), result.clone());
+        // Cache the result before returning so future identical queries hit the
+        // static cache instead of re-spawning Z3.
+        {
+            let mut cache = SMT_RESULT_CACHE.lock().unwrap();
+
+            // Simple bounded-cache policy: clear the whole cache when it grows too
+            // large. This avoids unbounded memory growth without introducing an
+            // LRU dependency.
+            if cache.len() >= SMT_RESULT_CACHE_LIMIT {
+                cache.clear();
+            }
+
+            cache.insert(smt_with_limits, result.clone());
+        }
+
         result
     }
 
@@ -1447,7 +1759,7 @@ mod tests {
         let le = bin(&arena, BinOp::Le, x, lit(&arena, 127));
         let mut s = String::new();
         let mut signed = std::collections::HashSet::new();
-        signed.insert("x".to_string());
+        signed.insert("x");
         assert!(expr_to_smt_bv(
             le,
             &mut s,
@@ -1494,7 +1806,7 @@ mod tests {
         let ge = bin(&arena, BinOp::Ge, x, lit(&arena, -5));
         let mut signed_out = String::new();
         let mut signed = std::collections::HashSet::new();
-        signed.insert("x".to_string());
+        signed.insert("x");
         assert!(expr_to_smt_bv(
             ge,
             &mut signed_out,
@@ -1529,5 +1841,20 @@ mod tests {
             "no signed set → unsigned bvuge (got: {})",
             unsigned_out
         );
+    }
+}
+
+/// RAII guard that restores the solver's timeout to its previous value
+/// when dropped. Used by synthesis entry points that temporarily raise
+/// the budget for hard ∃∀ queries without leaking the elevation to
+/// subsequent callers of the same solver instance.
+pub(crate) struct TimeoutGuard<'a> {
+    solver: &'a SmtSolver,
+    previous_ms: u64,
+}
+
+impl<'a> Drop for TimeoutGuard<'a> {
+    fn drop(&mut self) {
+        self.solver.set_timeout(self.previous_ms);
     }
 }

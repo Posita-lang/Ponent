@@ -10,14 +10,20 @@ pub mod stylesheet;
 /// Each emitter handles a specific format (plain text, colored, JSON, HTML).
 pub trait DiagnosticEmitter {
     /// Emit a single diagnostic.
-    fn emit(&mut self, diag: &Diagnostic);
+    fn emit(&mut self, diag: &Diagnostic<'_>);
 
     /// Emit multiple diagnostics, optionally with a summary.
-    fn emit_all(&mut self, diags: &[Diagnostic]) {
-        let error_count = diags.iter().filter(|d| d.is_error()).count();
-        let warning_count = diags.iter().filter(|d| d.is_warning()).count();
+    fn emit_all(&mut self, diags: &[Diagnostic<'_>]) {
+        let mut error_count = 0;
+        let mut warning_count = 0;
 
         for diag in diags {
+            if diag.is_error() {
+                error_count += 1;
+            }
+            if diag.is_warning() {
+                warning_count += 1;
+            }
             self.emit(diag);
         }
 

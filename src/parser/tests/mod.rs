@@ -1,7 +1,13 @@
 use super::*;
 
+/// Leak a fresh `'static` arena for tests that return `'static` ASTs.
+fn leaked_arena() -> &'static crate::arena::SyncArena<'static> {
+    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    Box::leak(Box::new(crate::arena::SyncArena::new(bump)))
+}
+
 fn check_parse(source: &str) -> Program<'static> {
-    let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let arena = leaked_arena();
     let mut parser = Parser::new(source, arena);
     match parser.parse_program() {
         Ok(prog) => {
@@ -16,8 +22,8 @@ fn check_parse(source: &str) -> Program<'static> {
     }
 }
 
-fn check_parse_err(source: &str) -> Vec<Diagnostic> {
-    let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+fn check_parse_err<'src>(source: &'src str) -> Vec<Diagnostic<'src>> {
+    let arena = leaked_arena();
     let mut parser = Parser::new(source, arena);
     parser.parse_program().err().unwrap_or_else(|| {
         panic!(
@@ -30,9 +36,17 @@ fn check_parse_err(source: &str) -> Vec<Diagnostic> {
 /// Construct a parser over `source` backed by a leaked `'static` arena,
 /// for tests that need direct access to the parser (tokens, pending
 /// stack, etc.) rather than just its result.
-fn new_parser(source: &str) -> Parser<'static> {
-    let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
-    Parser::new(source, arena)
+fn new_parser<'src>(source: &'src str) -> Parser<'src, 'static> {
+    Parser::new(source, leaked_arena())
+}
+
+/// The parser must be `Send` (and `Sync`) so it can run on a rayon worker:
+/// its arena handle is a `&SyncArena`, not a `&Bump` — a bare `&Bump` is
+/// `!Send` because `Bump: !Sync`, which is what blocked parallel parsing.
+#[test]
+fn parser_is_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Parser<'static, 'static>>();
 }
 
 /// Parse `source` and assert that it fails (error result or diagnostics).
@@ -54,42 +68,23 @@ fn check_parse_fails(source: &str) {
 fn test_edit_distance_limited_banded() {
     let mut prev = Vec::new();
     let mut curr = Vec::new();
+    // Input/candidate strings are pre-split into `Vec<char>` once by the
+    // caller (see `SuggestionBuffers` in recovery.rs).
+    let retrun: Vec<char> = "retrun".chars().collect();
+    let ret: Vec<char> = "return".chars().collect();
+    let leave: Vec<char> = "leave".chars().collect();
     assert_eq!(
-        edit_distance_limited_into(
-            &mut prev,
-            &mut curr,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            "retrun",
-            "return",
-            2
-        ),
+        edit_distance_limited_into(&mut prev, &mut curr, &retrun, &ret, 2),
         2
     );
     // Within the lenient threshold.
     assert_eq!(
-        edit_distance_limited_into(
-            &mut prev,
-            &mut curr,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            "retrun",
-            "leave",
-            6
-        ),
+        edit_distance_limited_into(&mut prev, &mut curr, &retrun, &leave, 6),
         5
     );
     // Exceeds the limit → clamped to limit + 1.
     assert_eq!(
-        edit_distance_limited_into(
-            &mut prev,
-            &mut curr,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            "retrun",
-            "leave",
-            2
-        ),
+        edit_distance_limited_into(&mut prev, &mut curr, &retrun, &leave, 2),
         3
     );
 }
@@ -109,6 +104,32 @@ fn test_did_you_mean_keyword_suggestion() {
     assert_eq!(
         did_you_mean_keyword("xyzabc", KeywordContext::Statement).as_deref(),
         None
+    );
+}
+
+/// The buffer-reusing variant must produce identical results to the
+/// allocating wrapper, across successive calls that reuse the same
+/// `SuggestionBuffers` (simulating many diagnostics per parse).
+#[test]
+fn test_did_you_mean_keyword_with_buffers_reuse() {
+    let mut buffers = SuggestionBuffers::default();
+    let cases = [
+        ("retrun", KeywordContext::Statement),
+        ("Retrun", KeywordContext::Statement),
+        ("xyzabc", KeywordContext::Statement),
+        ("retrun", KeywordContext::Statement),
+    ];
+    for (input, context) in cases {
+        assert_eq!(
+            did_you_mean_keyword_with_buffers(&mut buffers, input, context),
+            did_you_mean_keyword(input, context),
+            "buffered variant diverged from the wrapper for {input:?}"
+        );
+    }
+    assert_eq!(
+        did_you_mean_keyword_with_buffers(&mut buffers, "retrun", KeywordContext::Statement)
+            .as_deref(),
+        Some("did you mean `return`?")
     );
 }
 
@@ -813,12 +834,34 @@ fn test_cfg_attribute() {
 fn test_module_doc_comment() {
     let src = "//! module doc\ndef main() { }";
     let program = check_parse(src);
+    // Module docs (`//!`) belong to the doc side channel, NOT to any
+    // item's `doc` field — the grammar stream must stay doc-free.
     match &program.items[0] {
         Stmt::FunctionDef { doc, .. } => {
-            assert_eq!(doc.as_deref(), Some("module doc"));
+            assert_eq!(doc.as_deref(), None);
         }
         _ => panic!("expected FunctionDef"),
     }
+    assert_eq!(program.doc_map.docs.len(), 1);
+    assert!(program.doc_map.docs[0].is_module);
+    assert_eq!(program.doc_map.docs[0].text, "module doc");
+}
+
+#[test]
+fn test_item_doc_comment_via_doc_channel() {
+    let src = "/// @spec A spec\n/// more\ndef f(x) { return x; }";
+    let program = check_parse(src);
+    // `///` docs are diverted to the doc channel by the lexer, then
+    // pulled back into the item's `doc` field by anchor — the grammar
+    // stream itself must contain no doc tokens.
+    match &program.items[0] {
+        Stmt::FunctionDef { doc, .. } => {
+            assert_eq!(doc.as_deref(), Some("@spec A spec\nmore"));
+        }
+        _ => panic!("expected FunctionDef"),
+    }
+    assert_eq!(program.doc_map.docs.len(), 2);
+    assert!(program.doc_map.docs.iter().all(|d| !d.is_module));
 }
 
 #[test]
@@ -1206,7 +1249,9 @@ fn test_replace_ident_renames_into_nested_stmt() {
         panic!("expected a function def");
     };
     let if_stmt = &body.as_ref().unwrap()[0];
-    let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let arena: &'static crate::arena::SyncArena<'static> =
+        Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
     let renamed = crate::ast::visit::replace_ident_in_stmt(
         arena,
         if_stmt,

@@ -2,12 +2,44 @@
 
 use crate::symbol::Symbol;
 use bitflags::bitflags;
-use logos::Logos;
+use logos::{Lexer, Logos};
 
 use super::literal::{
     parse_byte_string_literal, parse_char_literal, parse_float_literal, parse_int_literal,
     parse_string_literal,
 };
+
+/// Scan a (possibly nested) block comment starting at an already-matched
+/// `/*`. `/*` increments depth, `*/` decrements it; the token ends when
+/// depth returns to zero. An unterminated comment consumes the rest of
+/// the input and yields a lexer error so diagnostics can report it.
+fn block_comment<'a>(lex: &mut Lexer<'a, Token>) -> logos::FilterResult<(), ()> {
+    let mut rest = lex.remainder().as_bytes();
+    let mut consumed = 0usize;
+    let mut depth = 1usize;
+    while rest.len() >= 2 {
+        let (a, b) = (rest[0], rest[1]);
+        if a == b'*' && b == b'/' {
+            depth -= 1;
+            consumed += 2;
+            rest = &rest[2..];
+            if depth == 0 {
+                lex.bump(consumed);
+                return logos::FilterResult::Emit(());
+            }
+        } else if a == b'/' && b == b'*' {
+            depth += 1;
+            consumed += 2;
+            rest = &rest[2..];
+        } else {
+            consumed += 1;
+            rest = &rest[1..];
+        }
+    }
+    // Unterminated: consume everything and fail.
+    lex.bump(consumed);
+    logos::FilterResult::Error(())
+}
 
 bitflags! {
     #[derive(Clone, Copy, Debug, Default)]
@@ -58,7 +90,7 @@ pub fn token_class(tok: &Token) -> TokenClass {
 pub enum Token {
     #[regex("[ \t\r\n\x0C]+", logos::skip)]
     #[regex("//[^\n]*", logos::skip, allow_greedy = true)]
-    #[regex("/\\*[^\\*]*\\*+(?:[^/\\*][^\\*]*\\*+)*/", logos::skip)]
+    #[regex("/\\*", block_comment)]
     WhitespaceOrComment,
     #[regex("///[^\n]*", |lex| lex.slice()[3..].trim().to_string(), allow_greedy = true)]
     DocComment(String),

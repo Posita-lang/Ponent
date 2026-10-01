@@ -133,8 +133,14 @@ impl DataLayout {
                     }
                 }
                 'a' => {
-                    // a:ABI:Pref  (aggregate)
-                    let parts: Vec<&str> = component[1..].split(':').collect();
+                    // a:ABI:Pref  (aggregate) — `a` is immediately followed by `:`
+                    let inner = if component.len() > 1 && component.as_bytes().get(1) == Some(&b':')
+                    {
+                        &component[2..]
+                    } else {
+                        &component[1..]
+                    };
+                    let parts: Vec<&str> = inner.split(':').collect();
                     if parts.len() >= 2 {
                         let abi: u64 = parts[0].parse().map_err(|_| {
                             format!(
@@ -217,5 +223,11 @@ mod tests {
         let dl = DataLayout::parse("").unwrap();
         assert_eq!(dl.endian, Endian::Little);
         assert!(dl.pointer_abi_align.is_none());
+    }
+
+    #[test]
+    fn test_parse_aggregate_align() {
+        let dl = DataLayout::parse("e-m:e-p:32:32:32-Fi8-i64:64:64-a:0:32-n32-S64").unwrap();
+        assert_eq!(dl.aggregate_align, Some((0, 32)));
     }
 }

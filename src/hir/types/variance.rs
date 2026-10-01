@@ -29,7 +29,7 @@ impl<'input> TypeContext<'input> {
         // Only when the current scope is empty (i.e., no binder shadowing) do we use the global cache
         if scope_was_empty {
             let cache_key = (param, ty, expected_sign, cumulative_sign);
-            if let Some(&cached) = self.variance_cache.borrow().get(&cache_key) {
+            if let Some(&cached) = self.interner.variance_cache.read().get(&cache_key) {
                 return cached;
             }
         }
@@ -63,7 +63,10 @@ impl<'input> TypeContext<'input> {
         // If the original scope was empty, store the result in the cache
         if scope_was_empty {
             let cache_key = (param, ty, expected_sign, cumulative_sign);
-            self.variance_cache.borrow_mut().insert(cache_key, result);
+            self.interner
+                .variance_cache
+                .write()
+                .insert(cache_key, result);
         }
 
         result
@@ -133,11 +136,14 @@ impl<'input> TypeContext<'input> {
     /// Get (or compute) the variance-annotated outgoing edges for a TypeId.
     /// Edges represent "this type → child type with given variance sign".
     fn get_variance_edges(&self, ty: TypeId) -> Vec<VarianceEdge> {
-        if let Some(edges) = self.variance_edges.borrow().get(&ty) {
+        if let Some(edges) = self.interner.variance_edges.read().get(&ty) {
             return edges.clone();
         }
         let edges = self.compute_variance_edges(ty);
-        self.variance_edges.borrow_mut().insert(ty, edges.clone());
+        self.interner
+            .variance_edges
+            .write()
+            .insert(ty, edges.clone());
         edges
     }
 

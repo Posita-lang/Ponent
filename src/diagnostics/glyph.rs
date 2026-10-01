@@ -192,7 +192,7 @@ impl GlyphRenderer {
 
     /// Render a single diagnostic to its full formatted string.
     /// Returns an empty string if the diagnostic has no source text.
-    pub fn render_diagnostic(&self, diag: &Diagnostic) -> String {
+    pub fn render_diagnostic(&self, diag: &Diagnostic<'_>) -> String {
         let mut out = String::new();
 
         // ┌─ error[E003]: message
@@ -220,7 +220,7 @@ impl GlyphRenderer {
 
             // Build (line_range, span) pairs for merging.
             let lines: Vec<&str> = source.lines().collect();
-            let mut ranges: Vec<((usize, usize), Span)> = sorted_spans
+            let ranges: Vec<((usize, usize), Span)> = sorted_spans
                 .iter()
                 .map(|&sp| {
                     let start_pos = byte_to_linecol(source, sp.start);
@@ -345,7 +345,7 @@ impl GlyphRenderer {
 
     // ── Header ──────────────────────────────────────────────────
 
-    fn write_header(&self, out: &mut String, diag: &Diagnostic) {
+    fn write_header(&self, out: &mut String, diag: &Diagnostic<'_>) {
         let level_label = diag.level.label();
         let level_color = diag.level.ansi_color();
         let code_str = diag.code.as_ref().map(|c| c.code()).unwrap_or("?");
@@ -489,6 +489,7 @@ impl GlyphRenderer {
         // Render each line in the range
         // Pre-compute multi-line labels so we can render connectors
         // on middle/end lines where no underline is visible.
+        let mut primary_cols = Vec::new();
         let mut multi_line_labels: Vec<(usize, usize, char, String)> = Vec::new();
         for lbl in &all_labels {
             let label_start = span_line(lbl.span, source);
@@ -519,7 +520,8 @@ impl GlyphRenderer {
             // Build a set of columns that are covered by a primary underline
             // (underline_char == '^').  These columns will get a subtle
             // background color to make the error location stand out.
-            let mut primary_cols: Vec<bool> = vec![false; line.len()];
+            primary_cols.clear();
+            primary_cols.resize(line.len(), false);
             for (col, ulen, underline_char, _msg) in &underlines {
                 if *underline_char == '^' {
                     let end = std::cmp::min(col + ulen, line.len());
@@ -874,7 +876,7 @@ pub(crate) fn compute_line_underlines<'a>(
 ) -> Vec<(usize, usize, char, &'a str)> {
     let line_start = line_start_byte(source, line_idx);
     let line_end = line_start + line.len();
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(labels.len());
 
     for lbl in labels {
         let span_start = lbl.span.start;
@@ -962,6 +964,40 @@ const KEYWORDS: &[&str] = &[
     "not",
     "fn",
 ];
+
+/// Groups by first byte to match [`KEYWORDS`]; the
+/// `keyword_dispatch_matches_contains` test asserts they stay in sync.
+#[inline]
+fn is_keyword(word: &str) -> bool {
+    let Some(&first) = word.as_bytes().first() else {
+        return false;
+    };
+    let hit = match first {
+        b'a' => matches!(word, "as" | "and"),
+        b'b' => matches!(word, "break"),
+        b'c' => matches!(word, "comptime" | "constraint" | "continue"),
+        b'd' => matches!(word, "decreases" | "def"),
+        b'e' => matches!(word, "edition" | "else" | "ensures" | "enum" | "extern"),
+        b'f' => matches!(word, "false" | "fn" | "for"),
+        b'i' => matches!(word, "if" | "impl" | "import" | "in" | "invariant" | "is"),
+        b'l' => matches!(word, "leave" | "let" | "loop"),
+        b'm' => matches!(word, "match" | "mut"),
+        b'n' => matches!(word, "not"),
+        b'o' => matches!(word, "or"),
+        b'p' => matches!(word, "pub"),
+        b'r' => matches!(word, "ref" | "requires" | "return"),
+        b's' => matches!(word, "set" | "struct"),
+        b't' => matches!(word, "trait" | "true" | "type"),
+        b'w' => matches!(word, "where" | "while" | "with"),
+        _ => false,
+    };
+    debug_assert_eq!(
+        hit,
+        KEYWORDS.contains(&word),
+        "is_keyword disagrees with KEYWORDS for {word:?}"
+    );
+    hit
+}
 
 /// Posita built-in type names to highlight in bright blue.
 const TYPES: &[&str] = &[
@@ -1095,7 +1131,7 @@ fn highlight_code_impl(line: &str, use_color: bool, add_backtick_quotes: bool) -
                 i = type_end;
                 continue;
             }
-            if KEYWORDS.contains(&word) {
+            if is_keyword(word) {
                 let _ = std::fmt::write(&mut out, format_args!("{bold}{}{reset}", word));
                 continue;
             }
@@ -1222,5 +1258,31 @@ mod tests {
         assert!(s.contains("aborting due to previous error"));
         let s = renderer.render_summary(3, 0);
         assert!(s.contains("aborting due to 3 previous errors"));
+    }
+
+    /// `is_keyword` re-derives `KEYWORDS` by hand, so every keyword — plus
+    /// strings exercising the empty case, case sensitivity, prefixes and
+    /// every unhandled first byte — must agree with `KEYWORDS::contains`.
+    #[test]
+    fn keyword_dispatch_matches_contains() {
+        let mut cases: Vec<String> = KEYWORDS.iter().map(|k| (*k).to_string()).collect();
+        cases.extend(
+            [
+                "", "x", "Def", "DEF", "define", "defs", "iff", "let_", "zzz", "αβ", "def2",
+            ]
+            .iter()
+            .map(|s| (*s).to_string()),
+        );
+        for b in b'a'..=b'z' {
+            cases.push(format!("{}zzz", b as char));
+        }
+
+        for word in &cases {
+            assert_eq!(
+                is_keyword(word),
+                KEYWORDS.contains(&word.as_str()),
+                "is_keyword disagrees with KEYWORDS::contains for {word:?}"
+            );
+        }
     }
 }

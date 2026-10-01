@@ -7,29 +7,32 @@ use crate::lexer::Token;
 use crate::symbol::Symbol;
 use smallvec::smallvec;
 
-impl<'input> Parser<'input> {
+impl<'src, 'input> Parser<'src, 'input> {
     // -------------------------------------------------------------------------
     // Item dispatch
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_item(&mut self) -> Result<Stmt<'input>, Diagnostic> {
-        // Collect leading @attributes and doc comments from the source.
+    pub(super) fn parse_item(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
+        // Collect leading @attributes.  Doc comments are NOT in the
+        // grammar stream (they live in the doc side channel); pull this
+        // item's docs back from the channel by anchor position.
         let mut attributes = Vec::new();
-        let mut doc = None;
         loop {
             match self.peek() {
                 Ok(Token::At) => attributes.push(self.parse_attribute()?),
-                Ok(Token::DocComment(s)) => {
-                    doc = Some(s.clone());
-                    self.advance().ok();
-                }
-                Ok(Token::ModuleDocComment(s)) => {
-                    doc = Some(s.clone());
-                    self.advance().ok();
-                }
                 _ => break,
             }
         }
+        // Doc anchor: the semantic-token position the parser will
+        // consume next for this item.  `peek()` has already consumed
+        // from `tokens` into `peeked`, so the position is cursor-1 when
+        // a token is cached.
+        let item_anchor = if self.peeked.is_some() {
+            self.cursor - 1
+        } else {
+            self.cursor
+        };
+        let doc = self.take_doc_for_anchor(item_anchor);
         match self.peek() {
             Ok(Token::Comptime) => self.parse_comptime_item(attributes, doc),
             Ok(Token::Async) => {
@@ -86,9 +89,13 @@ impl<'input> Parser<'input> {
                     .with_help("only items (`def`, `type`, `trait`, `import`, `edition`, `constraint`, `extern`, `impl`, `comptime`, `async`, `set`, `let`) are allowed at the top level")
                     .with_span(self.span());
                 if let Some(Token::Ident(name)) = &tok {
-                    if let Some(suggestion) =
-                        did_you_mean_keyword(&name.as_str(), KeywordContext::TopLevel)
-                    {
+                    // Reuse the parser-owned suggestion buffers (error path;
+                    // avoids re-allocating the char/DP vectors per diagnostic).
+                    if let Some(suggestion) = did_you_mean_keyword_with_buffers(
+                        &mut self.suggestion_buffers,
+                        &name.as_str(),
+                        KeywordContext::TopLevel,
+                    ) {
                         diag = diag.with_suggestion(suggestion);
                     } else {
                         diag = diag.with_suggestion("move this token inside a function body, or start a new top-level declaration");
@@ -114,7 +121,7 @@ impl<'input> Parser<'input> {
         &mut self,
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let trusted = if matches!(self.peek(), Ok(Token::At)) {
@@ -245,7 +252,7 @@ impl<'input> Parser<'input> {
         doc: Option<String>,
         is_comptime: bool,
         is_async: bool,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         let name = match self.advance() {
             Ok(Token::Ident(name)) => {
@@ -358,7 +365,7 @@ impl<'input> Parser<'input> {
         &mut self,
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let name =
@@ -493,7 +500,7 @@ impl<'input> Parser<'input> {
     pub(super) fn parse_impl_block(
         &mut self,
         attributes: Vec<Attribute<'input>>,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let type_params = if matches!(self.peek(), Ok(Token::Lt)) {
@@ -564,7 +571,7 @@ impl<'input> Parser<'input> {
         })
     }
 
-    pub(super) fn parse_impl_method(&mut self) -> Result<ImplMethod<'input>, Diagnostic> {
+    pub(super) fn parse_impl_method(&mut self) -> Result<ImplMethod<'input>, Diagnostic<'src>> {
         let mut attributes = Vec::new();
         while matches!(self.peek(), Ok(Token::At)) {
             attributes.push(self.parse_attribute()?);
@@ -653,7 +660,7 @@ impl<'input> Parser<'input> {
     // `self` parameter
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_self_param(&mut self) -> Result<Param<'input>, Diagnostic> {
+    pub(super) fn parse_self_param(&mut self) -> Result<Param<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         let has_ampersand = matches!(self.peek(), Ok(Token::Ampersand));
         let mutable = if has_ampersand {
@@ -723,7 +730,7 @@ impl<'input> Parser<'input> {
     // Function / closure parameter
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_param(&mut self) -> Result<Param<'input>, Diagnostic> {
+    pub(super) fn parse_param(&mut self) -> Result<Param<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
@@ -775,7 +782,7 @@ impl<'input> Parser<'input> {
     // Contracts (requires / ensures / invariant / decreases / terminates)
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_contract(&mut self) -> Result<Contract<'input>, Diagnostic> {
+    pub(super) fn parse_contract(&mut self) -> Result<Contract<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         match self.advance().map_err(|_| Diagnostic::error("unexpected token")
             .with_code_str("E003")
@@ -892,7 +899,7 @@ impl<'input> Parser<'input> {
     // Where clause
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_where_clause(&mut self) -> Result<WhereClause<'input>, Diagnostic> {
+    pub(super) fn parse_where_clause(&mut self) -> Result<WhereClause<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let mut predicates = Vec::new();
@@ -986,7 +993,7 @@ impl<'input> Parser<'input> {
     pub(super) fn parse_extern_function(
         &mut self,
         attributes: Vec<Attribute<'input>>,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let abi = match self.advance() {
@@ -1053,7 +1060,7 @@ impl<'input> Parser<'input> {
     // Edition
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_edition(&mut self) -> Result<Stmt<'input>, Diagnostic> {
+    pub(super) fn parse_edition(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         self.expect(Token::Assign)?;
@@ -1079,7 +1086,7 @@ impl<'input> Parser<'input> {
     // Import
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_import(&mut self) -> Result<Stmt<'input>, Diagnostic> {
+    pub(super) fn parse_import(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         let is_from = matches!(self.peek(), Ok(Token::From));
         if is_from {
@@ -1245,7 +1252,7 @@ impl<'input> Parser<'input> {
     // Constraint definition
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_constraint(&mut self) -> Result<Stmt<'input>, Diagnostic> {
+    pub(super) fn parse_constraint(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let name = match self.advance() {
@@ -1312,7 +1319,7 @@ impl<'input> Parser<'input> {
     fn parse_generate_item(
         &mut self,
         attributes: Vec<Attribute<'input>>,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         match self.advance() {

@@ -48,7 +48,9 @@ mod tests;
 // Public exports
 // -----------------------------------------------------------------------------
 pub(crate) use recovery::edit_distance_limited_into;
-pub use recovery::{KeywordContext, did_you_mean_keyword};
+pub use recovery::{
+    KeywordContext, SuggestionBuffers, did_you_mean_keyword, did_you_mean_keyword_with_buffers,
+};
 
 // -----------------------------------------------------------------------------
 // Core types
@@ -135,13 +137,20 @@ struct Checkpoint {
 // Parser struct
 // -----------------------------------------------------------------------------
 
-pub struct Parser<'input> {
-    arena: &'input bumpalo::Bump,
+pub struct Parser<'src, 'input> {
+    /// The parser allocates AST nodes through a `SyncArena`, not a bare
+    /// `&Bump`: a bare `&Bump` is `!Send`, and allocating through the raw
+    /// borrow would bypass `SyncArena`'s allocation lock.  See
+    /// `crate::arena`.
+    arena: &'input crate::arena::SyncArena<'input>,
+    /// The source text being parsed — attached to diagnostics so the emitter
+    /// can render `^`-underline context without a later copy.
+    source: &'src str,
     tokens: Vec<SpannedToken>,
     cursor: usize,
     peeked: Option<Result<Token, ()>>,
     pending: Vec<Token>,
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<Diagnostic<'src>>,
     recursion_depth: usize,
     max_recursion_depth: usize,
     restrictions: ParseRestrictions,
@@ -163,20 +172,55 @@ pub struct Parser<'input> {
     /// statement-start keyword; if reached again at the same progress,
     /// recovery force-consumes a token (no net progress was made).
     sync_stall: Option<u64>,
+    /// Reusable scratch buffers for `did_you_mean` keyword suggestions
+    /// (error path only).  Owning them lets repeated suggestions within
+    /// one parse reuse the same allocations instead of re-allocating four
+    /// `Vec`s per misspelled identifier.
+    suggestion_buffers: SuggestionBuffers,
+    /// Doc/trivia side channel captured during the upfront lex.
+    pub doc_map: DocMap,
 }
 
-impl<'input> Parser<'input> {
+impl<'src, 'input> Parser<'src, 'input> {
     // -------------------------------------------------------------------------
     // Construction and token pipeline
     // -------------------------------------------------------------------------
 
-    pub fn new(source: &str, arena: &'input bumpalo::Bump) -> Self {
-        let mut tokens = Vec::new();
+    pub fn new(source: &'src str, arena: &'input crate::arena::SyncArena<'input>) -> Self {
+        // Heuristic: on average, each token is ≈ 4 source bytes (identifier/keyword + delimiter).
+        // Guessing wrong only means one extra allocation (freed along with the parser); guessing right saves log(n) reallocation copies.
+        let token_cap = source.len() / 4 + 1;
+        let mut tokens = Vec::with_capacity(token_cap);
+        let mut doc_map = DocMap::default();
+        doc_map.token_offsets.reserve(token_cap);
         let mut lexer = Token::lexer(source);
         let mut diagnostics = Vec::new();
         loop {
             let (token, span_range) = match lexer.next() {
-                Some(Ok(Token::WhitespaceOrComment)) => continue,
+                Some(Ok(Token::WhitespaceOrComment)) => {
+                    // Defensive: logos skips trivia via `logos::skip`, so
+                    // this arm should be unreachable; keep it harmless.
+                    continue;
+                }
+                Some(Ok(Token::DocComment(body))) | Some(Ok(Token::ModuleDocComment(body))) => {
+                    let span_range = lexer.span();
+                    let is_module = matches!(
+                        source.get(span_range.start..span_range.start + 3),
+                        Some("//!")
+                    );
+                    // Doc channel: record and REMOVE from the grammar
+                    // stream — docs never enter the semantic stream; the
+                    // item parser pulls them back via the anchor.
+                    doc_map.docs.push(DocEntry {
+                        text: body,
+                        // Anchor: the next semantic token to be pushed —
+                        // the item this doc documents.
+                        anchor: tokens.len(),
+                        is_module,
+                        span: Span::new(span_range.start, span_range.end),
+                    });
+                    continue;
+                }
                 Some(Ok(token)) => (token, lexer.span()),
                 Some(Err(())) => {
                     let bad_span = lexer.span();
@@ -191,13 +235,39 @@ impl<'input> Parser<'input> {
                 }
                 None => break,
             };
+            // Second channel: everything skipped between the previous
+            // semantic token and this one is trivia.  logos does not
+            // yield skipped tokens (`logos::skip`), so reconstruct the
+            // runs from the span gaps.
+            let prev_end: usize = tokens
+                .last()
+                .map(|t: &SpannedToken| t.span.end)
+                .unwrap_or(0);
+            if span_range.start > prev_end {
+                let gap = &source[prev_end..span_range.start];
+                doc_map.trivia.push(TriviaEntry {
+                    span: Span::new(prev_end, span_range.start),
+                    kind: if gap.contains("//") || gap.contains("/*") {
+                        TriviaKind::Comment
+                    } else {
+                        TriviaKind::Whitespace
+                    },
+                });
+            }
             tokens.push(SpannedToken {
                 token,
                 span: Span::new(span_range.start, span_range.end),
             });
+            // #3 position-channel sidetable: parallel to `tokens`, so
+            // token index (the doc-anchor index) → byte span.  Never
+            // hashed (StableHash contract).
+            doc_map
+                .token_offsets
+                .push((span_range.start, span_range.end));
         }
         Parser {
             arena,
+            source,
             tokens,
             cursor: 0,
             peeked: None,
@@ -212,14 +282,42 @@ impl<'input> Parser<'input> {
             expected_token_types: Vec::new(),
             progress: 0,
             sync_stall: None,
+            suggestion_buffers: SuggestionBuffers::default(),
+            doc_map,
         }
     }
 
     /// Allocate an AST node in the parser's arena, returning a SHARED
-    /// `&'input` reference (bumpalo::Bump::alloc returns `&mut T`; the
-    /// AST fields expect shared references).
-    fn alloc_shared<T>(arena: &'input bumpalo::Bump, val: T) -> &'input T {
+    /// `&'input` reference (`SyncArena::alloc` returns `&mut T`; the AST
+    /// fields expect shared references).
+    fn alloc_shared<T>(arena: &'input crate::arena::SyncArena<'input>, val: T) -> &'input T {
         arena.alloc(val)
+    }
+
+    /// The semantic token stream as seen by the parser (doc comments
+    /// and trivia already diverted to the doc channel).  Exposed for
+    /// the d8b two-channel invariance test.
+    pub fn semantic_tokens(&self) -> Vec<Token> {
+        self.tokens.iter().map(|st| st.token.clone()).collect()
+    }
+
+    /// Pop every doc entry anchored exactly at `anchor` (the semantic
+    /// token position of the item being parsed) and merge their texts
+    /// into one doc string.  Module-level docs (`//!`) are left in the
+    /// channel — they are not item docs.
+    fn take_doc_for_anchor(&mut self, anchor: usize) -> Option<String> {
+        let texts: Vec<String> = self
+            .doc_map
+            .docs
+            .iter()
+            .filter(|d| d.anchor == anchor && !d.is_module)
+            .map(|d| d.text.clone())
+            .collect();
+        if texts.is_empty() {
+            None
+        } else {
+            Some(texts.join("\n"))
+        }
     }
 
     fn next_token(&mut self) -> Result<Token, ()> {
@@ -303,7 +401,7 @@ impl<'input> Parser<'input> {
     // Expect / consume helpers
     // -------------------------------------------------------------------------
 
-    pub fn expect(&mut self, expected: Token) -> Result<Token, Diagnostic> {
+    pub fn expect(&mut self, expected: Token) -> Result<Token, Diagnostic<'src>> {
         if matches!(self.peek(), Ok(tok) if tok == &expected) {
             self.advance().ok();
             Ok(expected)
@@ -333,7 +431,7 @@ impl<'input> Parser<'input> {
     /// `>>` is ambiguous — it could be a right-shift or two closing angle brackets.
     /// `expect_gt()` greedily treats it as the latter, pushing the second `>`
     /// onto the pending stack for the outer generic level.
-    fn expect_gt(&mut self) -> Result<(), Diagnostic> {
+    fn expect_gt(&mut self) -> Result<(), Diagnostic<'src>> {
         match self.peek() {
             Ok(Token::Gt) => {
                 self.advance().ok();
@@ -396,8 +494,8 @@ impl<'input> Parser<'input> {
     /// to before `f` was called and return the error.
     fn try_parse<T>(
         &mut self,
-        f: impl FnOnce(&mut Self) -> Result<T, Diagnostic>,
-    ) -> Result<T, Diagnostic> {
+        f: impl FnOnce(&mut Self) -> Result<T, Diagnostic<'src>>,
+    ) -> Result<T, Diagnostic<'src>> {
         let cp = self.checkpoint();
         match f(self) {
             Ok(val) => Ok(val),
@@ -415,9 +513,9 @@ impl<'input> Parser<'input> {
     /// interpretation, and if it doesn't work, try the other.
     fn try_parse_or<T>(
         &mut self,
-        f: impl FnOnce(&mut Self) -> Result<T, Diagnostic>,
-        fallback: impl FnOnce(&mut Self) -> Result<T, Diagnostic>,
-    ) -> Result<T, Diagnostic> {
+        f: impl FnOnce(&mut Self) -> Result<T, Diagnostic<'src>>,
+        fallback: impl FnOnce(&mut Self) -> Result<T, Diagnostic<'src>>,
+    ) -> Result<T, Diagnostic<'src>> {
         let cp = self.checkpoint();
         match f(self) {
             Ok(val) => Ok(val),
@@ -505,7 +603,7 @@ impl<'input> Parser<'input> {
     /// source contains syntax errors.  The parser attempts to recover and
     /// continue after each error, so multiple diagnostics may be returned.
     #[must_use]
-    pub fn parse_program(&mut self) -> Result<Program<'input>, Vec<Diagnostic>> {
+    pub fn parse_program(&mut self) -> Result<Program<'input>, Vec<Diagnostic<'src>>> {
         let start = self.span().start;
         let mut items = Vec::new();
         loop {
@@ -534,9 +632,21 @@ impl<'input> Parser<'input> {
         let end = self.span().end;
         let span = Span::new(start, end);
         if self.diagnostics.is_empty() {
-            Ok(Program { items, span })
+            Ok(Program {
+                items,
+                span,
+                doc_map: mem::take(&mut self.doc_map),
+            })
         } else {
-            Err(mem::take(&mut self.diagnostics))
+            let mut diags = mem::take(&mut self.diagnostics);
+            // Attach the source to every diagnostic so the emitter can render
+            // `^`-underline context (idempotent — later callers are no-ops).
+            for d in &mut diags {
+                if d.source().is_none() {
+                    d.set_source(Some(self.source));
+                }
+            }
+            Err(diags)
         }
     }
 }

@@ -563,3 +563,44 @@ impl<'input> HirStmt<'input> {
         }
     }
 }
+
+#[cfg(test)]
+mod send_audit {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    /// `CheckFn` returns lowered HIR, and a query value must be
+    /// `Send + 'static`.  With the session's leaked arena the HIR's
+    /// lifetime is `'static`, so all that remains is `Send` — every
+    /// borrowed child has to be `Sync`.  This pins that.
+    #[test]
+    fn lowered_hir_is_send_when_the_arena_outlives_the_session() {
+        assert_send::<crate::hir::hir::HirStmt<'static>>();
+        assert_send::<crate::hir::hir::HirProgram<'static>>();
+    }
+
+    /// The Pass-3 body parallelisation shares the resolver's `SymbolTable`
+    /// and the parsed `Program` by reference across rayon workers; the
+    /// worker `TypeChecker` also holds `Arc<SharedCheckState>` and a
+    /// cloned `TraitEnv`.  Every one of those must be `Sync` or the
+    /// `par_iter` closure will not compile.
+    #[test]
+    fn pass3_worker_inputs_are_sync() {
+        assert_sync::<crate::hir::symbol::SymbolTable<'static>>();
+        assert_sync::<crate::ast::Program<'static>>();
+        assert_sync::<crate::hir::traits::TraitEnv<'static>>();
+        assert_sync::<crate::hir::checker::SharedCheckState<'static>>();
+        assert_sync::<crate::hir::resolver::ResolutionMap<'static>>();
+    }
+
+    /// The Phase B borrow/move post-pass runs one function's body per
+    /// rayon worker, sharing the bodies by reference.  Sharing a
+    /// `&[HirStmt]` across threads needs `HirStmt: Sync`, which is
+    /// strictly stronger than `Send` — `Cell`/`RefCell` anywhere in the
+    /// tree would break it.  This pins that.
+    #[test]
+    fn lowered_hir_is_sync_so_bodies_can_be_shared_with_rayon() {
+        assert_sync::<crate::hir::hir::HirStmt<'static>>();
+        assert_sync::<crate::hir::hir::HirExpr<'static>>();
+    }
+}

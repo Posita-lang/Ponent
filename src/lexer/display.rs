@@ -207,8 +207,6 @@ impl Token {
             Token::DocComment(s) => format!("documentation comment `///{}`", s),
             Token::ModuleDocComment(s) => format!("module documentation comment `//!{}`", s),
             Token::Trusted => "`trusted`".to_string(),
-            // Fallback for tokens not explicitly listed
-            other => format!("{:?}", other),
         }
     }
 }

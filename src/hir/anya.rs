@@ -3,6 +3,7 @@
 use crate::hir::infer::{GenStatus, InferRegionTree, PoolUndoEntry};
 use crate::hir::shape_var::Status;
 use crate::hir::types::TypeContext;
+use std::sync::atomic::Ordering as AtomicOrdering;
 
 /// ── Tracing infrastructure ─────────────────────────────────────────
 
@@ -16,9 +17,6 @@ pub(crate) fn tracing_enabled() -> bool {
     *TRACE_ENABLED.get_or_init(|| std::env::var("PONENT_TRACE").is_ok())
 }
 
-/// Per-thread recursion depth for trace indentation.  Managed by
-/// `TraceGuard`; incremented on entering a traced function and restored
-/// on exit (even on early return).
 #[cfg(debug_assertions)]
 thread_local! {
     static TRACE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -223,7 +221,7 @@ pub fn log_gen_statuses(gen_statuses: &[GenStatus]) {
 /// Print the current GADT fact registry for debugging.
 /// Shows each arm's facts: param refinements and existential equations.
 pub fn log_gadt_registry<'input>(ctx: &TypeContext<'input>) {
-    let facts = ctx.gadt.facts.borrow();
+    let facts = ctx.gadt.facts.read();
     let depth = facts.len();
     eprintln!("[GADT registry] {} arm(s) active:", depth);
     for (arm_i, arm) in facts.iter().enumerate() {
@@ -239,8 +237,8 @@ pub fn log_gadt_registry<'input>(ctx: &TypeContext<'input>) {
 /// Also cross-validates the depth counter with the stack length.
 /// Panics if the registry depth is non-zero when expected to be zero.
 pub fn assert_gadt_registry_empty<'input>(ctx: &TypeContext<'input>) {
-    let eq_depth = ctx.gadt.facts.borrow().len();
-    let counter = ctx.gadt.arm_depth.get();
+    let eq_depth = ctx.gadt.facts.read().len();
+    let counter = ctx.gadt.arm_depth.load(AtomicOrdering::Relaxed);
     assert_eq!(
         eq_depth, counter,
         "GADT registry desync: gadt_facts.len()={} but gadt_arm_depth={}",

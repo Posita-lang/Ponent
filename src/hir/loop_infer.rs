@@ -10,7 +10,7 @@
 //! themselves.
 
 use crate::hir::loop_ir::Cond;
-use crate::hir::octagon::{Dbm, sat_neg};
+use crate::hir::octagon::{ClosureMode, DBM_INF, Dbm, DbmThresholds, sat_neg};
 use crate::symbol::Symbol;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -20,6 +20,7 @@ pub(crate) fn dbm_fixpoint(
     step: &dyn Fn(&Dbm) -> Dbm,
     max_iter: usize,
     widen_after: usize,
+    thresholds: &DbmThresholds,
 ) -> Option<Dbm> {
     let mut cur = init.clone();
     for iter in 0..max_iter {
@@ -37,11 +38,17 @@ pub(crate) fn dbm_fixpoint(
         // changes widen's keep-or-∞ decision — hence we widen against
         // the closed transfer result directly. Before the widening
         // phase, `cur` is still closed (joins of closed operands), so
-        // `join`'s closed-operand precondition holds.
+        // `join`'s closed-operand precondition holds. From the widening
+        // phase on, `widen_with` thresholds are consulted before ∞: a
+        // bound that crosses a threshold from the loop's own constants
+        // and type bounds stabilizes AT the threshold instead of ∞
+        // ([Miné06] §VI.D delayed thresholds), which preserves
+        // termination (thresholds are finite and each is crossed at
+        // most once) while keeping precision.
         let mut next_closed = next;
         let _ = next_closed.close(); // bottom stays bottom; the join/widen below handle it
         let widened = if iter >= widen_after {
-            cur.widen(&next_closed)
+            cur.widen_with(&next_closed, thresholds)
         } else {
             cur.join(&next_closed)
         };
@@ -53,6 +60,8 @@ pub(crate) fn dbm_fixpoint(
     // `max_iter` exhausted without convergence: fail closed. The last
     // matrix is NOT a fixpoint — its bounds are not loop invariants, so
     // the caller must not turn them into candidates.
+    // (`infer_loop_invariant_exprs` honors this by returning `Vec::new()`
+    // on `None` — no hint candidates are emitted.)
     None
 }
 
@@ -61,25 +70,15 @@ pub(crate) fn dbm_fixpoint(
 /// `infer_loop_invariant_exprs`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LoopInstr {
-    /// `i := i + c`
     AddVar(usize, i128),
-    /// `i := i +? c` (saturating arithmetic — clamps to the type range;
-    /// the clamp semantics live in the template's Clamp rows).
+    AddWrap(usize, i128),
     AddSat(usize, i128),
-    /// `i := c`
     ConstVar(usize, i128),
-    /// `i := j`
     CopyVar(usize, usize),
-    /// guard test `i ≤ c`
+    CopyAddVar(usize, usize, i128),
     TestLe(usize, i128),
-    /// guard test `i ≥ c` (constant lower bound: `i > c` lowers to `i ≥ c+1`)
     TestGe(usize, i128),
-    /// guard test `i - j ≤ c`
     TestDiffLe(usize, usize, i128),
-    /// `if cond { then } else { else_ }` — straight-line blocks merged
-    /// into `Ite` expressions by the lowering. `cond`
-    /// is a comparison over loop variables; the signedness is filled by
-    /// the lowering, which has the per-variable types.
     If(Box<Cond>, Vec<LoopInstr>, Vec<LoopInstr>),
 }
 
@@ -167,7 +166,9 @@ fn apply_negated_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
                         CmpOp::Ge => dbm.guard_not_ge_var(*i, c),
                         CmpOp::Gt => dbm.guard_not_ge_var(*i, c.saturating_add(1)),
                         CmpOp::Eq => dbm.clone(), // ¬(X=c) is non-convex
-                        CmpOp::Neq => dbm.clone(),
+                        // ¬(X ≠ c) ⟺ X = c — exact, and now reachable
+                        // since hir_cond_to_cond emits Neq conds.
+                        CmpOp::Neq => dbm.test_var_eq(*i, c),
                     }
                 }
                 (ScalarExpr::Var(i), ScalarExpr::Var(j)) => match op {
@@ -175,6 +176,8 @@ fn apply_negated_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
                     CmpOp::Lt => dbm.guard_not_diff_le(*i, *j, -1),
                     CmpOp::Ge => dbm.guard_not_diff_le(*j, *i, 0),
                     CmpOp::Gt => dbm.guard_not_diff_le(*j, *i, -1),
+                    // ¬(i ≠ j) ⟺ i = j — exact.
+                    CmpOp::Neq => dbm.test_diff_eq(*i, *j, 0),
                     _ => dbm.clone(),
                 },
                 _ => dbm.clone(),
@@ -207,45 +210,41 @@ fn apply_negated_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
     }
 }
 
-fn apply_loop_instr(dbm: &Dbm, instr: &LoopInstr) -> Dbm {
+fn apply_loop_instr(
+    dbm: &Dbm,
+    instr: &LoopInstr,
+    type_bounds: &[(Option<i128>, Option<i128>)],
+) -> Dbm {
     match instr {
         LoopInstr::AddVar(i, c) => dbm.assign_add_var(*i, *c),
-        // Saturating arithmetic: clamp(x+c) ⊆ x+c, so plain addition
-        // is a sound over-approximation (the clamp only narrows the
-        // reachable set). The BII path handles the exact clamp via
-        // Clamp rows; this DBM fallback uses the wider (but sound)
-        // additive transfer. [Miné06] Def 2.4.
+        LoopInstr::AddWrap(i, c) => {
+            let (lo, hi) = type_bounds.get(*i).copied().unwrap_or((None, None));
+            dbm.assign_add_wrap(*i, *c, lo, hi)
+        }
         LoopInstr::AddSat(i, c) => dbm.assign_add_var(*i, *c),
         LoopInstr::ConstVar(i, c) => dbm.assign_const_var(*i, *c),
         LoopInstr::CopyVar(i, j) => dbm.assign_copy_var(*i, *j),
+        LoopInstr::CopyAddVar(i, j, c) => dbm.assign_copy_add_var(*i, *j, *c),
         LoopInstr::TestLe(i, c) => dbm.test_le_var(*i, *c),
         LoopInstr::TestGe(i, c) => dbm.test_ge_var(*i, *c),
         LoopInstr::TestDiffLe(i, j, c) => dbm.test_diff_le(*i, *j, *c),
-        // The DBM fixpoint now tracks `if` branches via a branch join
-        // ([Miné06] §VIII.A Figure 11: m⁺₇ = m⁺₄ ⊔ m⁺₆). The BII path
-        // handles `if` via `Ite` and runs first; this DBM fallback
-        // joins the two guarded arms (sound over-approximation, still
-        // validated by SMT before discharge).
         LoopInstr::If(cond, then_arm, else_arm) => {
-            // [Miné06] §VIII.A: m⁺₇ = m⁺₄ ⊔ m⁺₆ (branch join).
             let then_dbm = apply_cond_as_guard(dbm, cond);
             let else_dbm = apply_negated_guard(dbm, cond);
-            // Apply each arm's instructions sequentially.
             let then_result = then_arm.iter().fold(then_dbm, |d, ins| {
                 if d.bottom {
                     Dbm::bottom()
                 } else {
-                    apply_loop_instr(&d, ins)
+                    apply_loop_instr(&d, ins, type_bounds)
                 }
             });
             let else_result = else_arm.iter().fold(else_dbm, |d, ins| {
                 if d.bottom {
                     Dbm::bottom()
                 } else {
-                    apply_loop_instr(&d, ins)
+                    apply_loop_instr(&d, ins, type_bounds)
                 }
             });
-            // Join the two branch results.
             if then_result.bottom {
                 return else_result;
             }
@@ -270,35 +269,44 @@ fn fuse_adjacent_instrs(instrs: &[LoopInstr]) -> Vec<LoopInstr> {
     let mut iter = instrs.iter().peekable();
     while let Some(instr) = iter.next() {
         match instr {
-            LoopInstr::AddVar(i, c) => {
-                // Look ahead for another AddVar on the same variable.
+            LoopInstr::AddVar(i, c) | LoopInstr::AddWrap(i, c) => {
+                let is_wrap = matches!(instr, LoopInstr::AddWrap(..));
                 let mut sum = *c;
-                while let Some(&LoopInstr::AddVar(j, d)) = iter.peek() {
-                    if *i == *j {
-                        match sum.checked_add(*d) {
-                            Some(s) => {
-                                sum = s;
-                                iter.next(); // consume it
-                            }
-                            None => {
-                                // The fused constant would overflow i128:
-                                // bail on fusion — emit the accumulated
-                                // AddVar, then let `d` start a fresh one
-                                // (the instruction is preserved unfused,
-                                // so the transformation stays
-                                // semantics-preserving).
-                                iter.next(); // consume `d` first
-                                fused.push(LoopInstr::AddVar(*i, sum));
-                                sum = *d;
+                let mut dead = false;
+                while let Some(next) = iter.peek() {
+                    match next {
+                        LoopInstr::AddVar(j, d) | LoopInstr::AddWrap(j, d) if *i == *j => {
+                            match sum.checked_add(*d) {
+                                Some(s) => {
+                                    sum = s;
+                                    iter.next();
+                                }
+                                None => {
+                                    iter.next();
+                                    if is_wrap {
+                                        fused.push(LoopInstr::AddWrap(*i, sum));
+                                    } else {
+                                        fused.push(LoopInstr::AddVar(*i, sum));
+                                    }
+                                    sum = *d;
+                                }
                             }
                         }
-                    } else {
-                        break;
+                        LoopInstr::ConstVar(j, _) | LoopInstr::CopyVar(j, _) if *i == *j => {
+                            dead = true;
+                            break;
+                        }
+                        _ => break,
                     }
                 }
-                fused.push(LoopInstr::AddVar(*i, sum));
+                if !dead {
+                    if is_wrap {
+                        fused.push(LoopInstr::AddWrap(*i, sum));
+                    } else {
+                        fused.push(LoopInstr::AddVar(*i, sum));
+                    }
+                }
             }
-            // Other instructions are passed through unchanged.
             _ => fused.push(instr.clone()),
         }
     }
@@ -311,15 +319,14 @@ fn fuse_adjacent_instrs(instrs: &[LoopInstr]) -> Vec<LoopInstr> {
 /// SELF-DUAL edges (paper Figure 5 — there is no implicit zero node):
 /// `X ≥ lb ⟺ −2X ≤ −2·lb` rides edge `(2i+1, 2i)` and
 /// `X ≤ ub ⟺  2X ≤  2·ub` rides edge `(2i, 2i+1)`.
-fn apply_type_bounds(m: &mut Dbm, bounds: &[(Option<i128>, Option<i128>)]) {
+fn apply_type_bounds(m: &mut Dbm, bounds: &[(Option<i128>, Option<i128>)]) -> bool {
     for (i, (lb, ub)) in bounds.iter().enumerate() {
         // Saturating multiplication: an out-of-range bound (|2·c| would
         // overflow i128) saturates and is then REFUSED by
         // `sat_mul2_bound` inside `set_mirrored` (weakened to no bound)
-        // — never a wrapped, wrong constraint. (The `let _ = m.close()`
-        // below discards the bottom signal; a contradictory bound set
-        // leaves a bottom matrix whose size-0 shape is caught by the
-        // caller's downstream guards.)
+        // — never a wrapped, wrong constraint. The `close()` verdict is
+        // PROPAGATED: a contradictory bound set is bottom, and the
+        // caller must fail closed instead of trusting a ⊥-shaped state.
         if let Some(l) = lb {
             m.set_mirrored(2 * i + 1, 2 * i, (-2_i128).saturating_mul(*l));
         }
@@ -328,7 +335,7 @@ fn apply_type_bounds(m: &mut Dbm, bounds: &[(Option<i128>, Option<i128>)]) {
         }
     }
     // Close to propagate transitive and octagonal implications.
-    let _ = m.close();
+    m.close()
 }
 
 /// The inference kernel of the `@hint(assertion)` injection pipeline —
@@ -346,7 +353,7 @@ fn apply_type_bounds(m: &mut Dbm, bounds: &[(Option<i128>, Option<i128>)]) {
 /// value ranges (e.g. from `UInt<N>` or `Int<N>`). This reduces the
 /// number of fixpoint iterations.
 pub(crate) fn infer_loop_invariant_exprs<'a>(
-    arena: &'a bumpalo::Bump,
+    arena: &'a crate::arena::SyncArena<'a>,
     vars: &[Symbol],
     init: &[LoopInstr],
     body: &[LoopInstr],
@@ -357,44 +364,106 @@ pub(crate) fn infer_loop_invariant_exprs<'a>(
     // 1. Fuse adjacent instructions in the body (semantics‑preserving).
     let fused_body = fuse_adjacent_instrs(body);
 
+    // Empty fallback so `apply_loop_instr` always has a typed slice.
+    let empty_bounds: Vec<(Option<i128>, Option<i128>)> = vec![(None, None); vars.len()];
+    let tbs: &[(Option<i128>, Option<i128>)] = type_bounds.unwrap_or(&empty_bounds);
+
     // 2. Build the initial DBM.
     let mut m = Dbm::new(vars.len());
 
-    // 3. Apply type bounds if provided.
+    // 3. Apply type bounds if provided (contradictory declared bounds →
+    // fail closed: no candidates).
     if let Some(bounds) = type_bounds {
-        apply_type_bounds(&mut m, bounds);
+        if !apply_type_bounds(&mut m, bounds) {
+            return Vec::new();
+        }
     }
 
     // 4. Apply the initialisation instructions (they set up the pre‑state).
     for instr in init {
-        m = apply_loop_instr(&m, instr);
+        m = apply_loop_instr(&m, instr, tbs);
     }
 
     // 5. Define the step function using the fused body.
     let step = |d: &Dbm| {
         let mut r = d.clone();
         for instr in &fused_body {
-            r = apply_loop_instr(&r, instr);
+            r = apply_loop_instr(&r, instr, tbs);
         }
         r
     };
 
     // 6. Compute the widened fixpoint (fail closed).
-    let Some(mut fp) = dbm_fixpoint(&m, &step, max_iter, widen_after) else {
+    let mut consts: Vec<i128> = vec![0];
+    for (lo, hi) in tbs {
+        if let Some(v) = lo {
+            consts.push(*v);
+        }
+        if let Some(v) = hi {
+            consts.push(*v);
+        }
+    }
+    for ins in init.iter().chain(body.iter()) {
+        collect_thresholds(ins, &mut consts);
+    }
+    for i in 0..vars.len() {
+        if let Some(v) = m.var_lb(i) {
+            consts.push(v);
+        }
+        if let Some(v) = m.var_ub(i) {
+            consts.push(v);
+        }
+    }
+    let mut th = DbmThresholds::from_program(m.size, &consts);
+    th.absorb(&m);
+
+    // Auto-size the budget ([Miné06]): plain widening converges within
+    // size²+1 iterations (each cell rises monotonically through a chain
+    // of at most size² distinct values); threshold widening multiplies
+    // that by the threshold-set size, so the caller-supplied budget is
+    // only ever a MINIMUM — exhaustion now returns None (no hints) only
+    // for genuinely non-converging transfers, not because a magic number
+    // (100) ran out on a larger system.
+    let max_iter = max_iter.max(m.size * m.size + 8);
+
+    let Some(mut fp) = dbm_fixpoint(&m, &step, max_iter, widen_after, &th) else {
         return Vec::new();
     };
 
-    // Close to materialize implicit bounds before extraction.
-    // The widened fixpoint may be unclosed (widen's output is
-    // deliberately not strongly closed, [Miné06] §VI.D / Thm 8.2);
-    // the closure derives all entailed octagonal constraints
-    // (Thm 4.3: normal form, same V⁺-domain). A bottom result
-    // (close() == false) leaves `fp` as ⊥, and the size guard in
-    // `dbm_to_invariant_exprs` returns no candidates — fail-closed.
-    let _ = fp.close();
+    // Integer-exact closure as the LAST step before extraction
+    // ([BHZ07] Thm 2–3): Strong closure alone is one half-step weaker
+    // on every relational row.
+    if !fp.close_with(ClosureMode::IntegerExact) {
+        return Vec::new();
+    }
 
     // 7. Extract invariant expressions from the final DBM.
-    dbm_to_invariant_exprs(arena, &fp, vars)
+    dbm_to_invariant_exprs(arena, &fp, vars, type_bounds)
+}
+
+/// Collect thresholds from a sequence of loop instructions.
+/// Includes constants from init/body and declared type bounds.
+fn collect_thresholds(ins: &LoopInstr, out: &mut Vec<i128>) {
+    match ins {
+        LoopInstr::AddVar(_, c)
+        | LoopInstr::AddWrap(_, c)
+        | LoopInstr::AddSat(_, c)
+        | LoopInstr::ConstVar(_, c)
+        | LoopInstr::TestLe(_, c)
+        | LoopInstr::TestGe(_, c) => {
+            out.push(*c);
+            out.push(c.saturating_add(1));
+            out.push(c.saturating_sub(1));
+        }
+        LoopInstr::TestDiffLe(_, _, c) => out.push(*c),
+        LoopInstr::CopyAddVar(_, _, c) => out.push(*c),
+        LoopInstr::CopyVar(..) => {}
+        LoopInstr::If(_, t, e) => {
+            for i in t.iter().chain(e.iter()) {
+                collect_thresholds(i, out);
+            }
+        }
+    }
 }
 
 /// Infer a `decreases` candidate — a non-negative integer expression
@@ -412,7 +481,7 @@ pub(crate) fn infer_loop_invariant_exprs<'a>(
 /// `None` when no decreasing measure is recognized (fail-closed — the
 /// caller then keeps the explicit `decreases` requirement).
 pub(crate) fn infer_loop_decreases_expr<'a>(
-    arena: &'a bumpalo::Bump,
+    arena: &'a crate::arena::SyncArena<'a>,
     vars: &[Symbol],
     instrs: &[LoopInstr],
 ) -> Option<&'a crate::ast::Expr<'a>> {
@@ -896,6 +965,21 @@ pub(crate) fn hir_loop_to_loop_instrs<'input>(
     Some((vars, instrs))
 }
 
+/// Flip a comparison operator for `Literal op Ident` → `Ident op' Literal`
+/// normalization. Non-ordering operators return `None` (the caller bails).
+fn flip_cmp_op(op: crate::ast::BinOp) -> Option<crate::ast::BinOp> {
+    use crate::ast::BinOp;
+    Some(match op {
+        BinOp::Lt => BinOp::Gt,
+        BinOp::Le => BinOp::Ge,
+        BinOp::Gt => BinOp::Lt,
+        BinOp::Ge => BinOp::Le,
+        BinOp::Eq => BinOp::Eq,
+        BinOp::Neq => BinOp::Neq,
+        _ => return None,
+    })
+}
+
 /// Translate a comparison expression into a `Cond` for an `if` branch
 /// condition. Signedness is filled by the lowering
 /// (`fix_signed`), which has the per-variable types.
@@ -912,7 +996,17 @@ where
     else {
         return None;
     };
-    let (i, j, c) = match (left.as_ref(), right.as_ref()) {
+    // Normalize `Literal op Ident` to `Ident op' Literal` (`10 > i` ⟺
+    // `i < 10`) — the lowering previously returned None for this shape,
+    // stranding a common guard form.
+    let (op, left, right) = match (left.as_ref(), right.as_ref()) {
+        (HirExpr::Literal(..), HirExpr::Ident(..)) => match flip_cmp_op(*op) {
+            Some(flipped) => (flipped, right.as_ref(), left.as_ref()),
+            None => return None,
+        },
+        _ => (*op, left.as_ref(), right.as_ref()),
+    };
+    let (i, j, c) = match (left, right) {
         (HirExpr::Ident(i, _, _), HirExpr::Literal(crate::ast::Literal::Int(c), _, _)) => {
             (i, None, Some(c.clone()))
         }
@@ -931,6 +1025,11 @@ where
         (crate::ast::BinOp::Le, Some(j), None) => (O::Le, E::Var(idx(*j)?)),
         (crate::ast::BinOp::Gt, Some(j), None) => (O::Gt, E::Var(idx(*j)?)),
         (crate::ast::BinOp::Ge, Some(j), None) => (O::Ge, E::Var(idx(*j)?)),
+        // var-vs-var equality: the DBM has `test_diff_eq` and the BII
+        // encoding handles `=` natively — previously this shape bailed
+        // and produced no hints at all.
+        (crate::ast::BinOp::Eq, Some(j), None) => (O::Eq, E::Var(idx(*j)?)),
+        (crate::ast::BinOp::Neq, Some(j), None) => (O::Neq, E::Var(idx(*j)?)),
         _ => return None,
     };
     Some(C::Cmp {
@@ -1173,9 +1272,10 @@ fn is_canonical(i: usize, j: usize) -> bool {
 /// coherence makes the mirror a duplicate of the same logical
 /// constraint, so emitting it too would double the SMT candidate list.
 pub(crate) fn dbm_to_invariant_exprs<'a>(
-    arena: &'a bumpalo::Bump,
+    arena: &'a crate::arena::SyncArena<'a>,
     dbm: &Dbm,
     vars: &[Symbol],
+    type_bounds: Option<&[(Option<i128>, Option<i128>)]>,
 ) -> Vec<&'a crate::ast::Expr<'a>> {
     // Fail-closed on a shape mismatch (a caller passing a matrix built
     // over a different variable table): emitting from mismatched nodes
@@ -1236,16 +1336,39 @@ pub(crate) fn dbm_to_invariant_exprs<'a>(
                 if a % 2 == 0 {
                     // X⁺ − X⁻ ≤ c ⟺ 2X ≤ c ⟹ X ≤ floor(c/2).
                     let ub = c >> 1;
+                    // Hint hygiene (BiiRow::is_trivial on the BII side):
+                    // a bound at or beyond the declared type range carries
+                    // no information the solver doesn't already have —
+                    // skip it instead of feeding the SMT query noise.
+                    if let Some(Some(declared)) =
+                        type_bounds.and_then(|tb| tb.get(a / 2)).map(|(_, u)| *u)
+                    {
+                        if ub >= declared {
+                            continue;
+                        }
+                    }
                     out.push(bin(crate::ast::BinOp::Le, ident(vars[a / 2]), lit(ub)));
                 } else {
                     // X⁻ − X⁺ ≤ c ⟺ −2X ≤ c ⟹ X ≥ ceil(−c/2) = −floor(c/2).
                     let lb = sat_neg(c >> 1);
+                    if let Some(Some(declared)) =
+                        type_bounds.and_then(|tb| tb.get(b / 2)).map(|(l, _)| *l)
+                    {
+                        if lb <= declared {
+                            continue;
+                        }
+                    }
                     out.push(bin(crate::ast::BinOp::Ge, ident(vars[b / 2]), lit(lb)));
                 }
             } else {
                 // Two distinct nodes: `(±Xᵢ) − (±Xⱼ) ≤ c` — covers the
                 // difference (`X−Y ≤ c`, edge (2i, 2j)), the sum
                 // (`X+Y ≤ c`, edge (2i, 2j+1)), and their negated mirrors.
+                // Trivially-wide rows (no real information) are skipped —
+                // same hygiene as the interval arms above.
+                if c >= DBM_INF >> 2 || c <= -(DBM_INF >> 2) {
+                    continue;
+                }
                 out.push(bin(
                     crate::ast::BinOp::Le,
                     bin(crate::ast::BinOp::Sub, node(a), node(b)),
@@ -1260,6 +1383,7 @@ pub(crate) fn dbm_to_invariant_exprs<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hir::type_eq::expr_eq_ignoring_spans;
 
     /// Type-level overflow policy (suffix > type
     /// policy > default trap): a PLAIN `+` on a saturating type lowers
@@ -1401,11 +1525,13 @@ mod tests {
     /// (regression: TestGe is consumed by the DBM fixpoint correctly).
     #[test]
     fn test_ge_end_to_end_descending_loop() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(
+            crate::arena::SyncArena::new(Box::leak(Box::new(bumpalo::Bump::new()))),
+        ));
         let vars = vec![Symbol::intern("i")];
         let init = vec![LoopInstr::ConstVar(0, 5)];
         let body = vec![LoopInstr::TestGe(0, 1), LoopInstr::AddVar(0, -1)];
-        let exprs = infer_loop_invariant_exprs(&arena, &vars, &init, &body, 100, 2, None);
+        let exprs = infer_loop_invariant_exprs(arena, &vars, &init, &body, 100, 2, None);
         assert!(
             !exprs.is_empty(),
             "descending loop must produce candidates (i ∈ [1, 5])"
@@ -1445,10 +1571,12 @@ mod tests {
     /// (guard `i ≥ 1`, body `AddVar(i, -1)`) → candidate `(i - 1) + 1`.
     #[test]
     fn test_decreases_descending_counter() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(
+            crate::arena::SyncArena::new(Box::leak(Box::new(bumpalo::Bump::new()))),
+        ));
         let vars = vec![Symbol::intern("i")];
         let instrs = vec![LoopInstr::TestGe(0, 1), LoopInstr::AddVar(0, -1)];
-        let dec = infer_loop_decreases_expr(&arena, &vars, &instrs)
+        let dec = infer_loop_decreases_expr(arena, &vars, &instrs)
             .expect("descending counter must yield a decreases candidate");
         // Shape `(i - lb) + 1`.
         match dec {
@@ -1471,10 +1599,12 @@ mod tests {
     /// i := i + 1 }` → candidate `5 - i` (guard `i ≤ 5`).
     #[test]
     fn test_decreases_increasing_counter() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(
+            crate::arena::SyncArena::new(Box::leak(Box::new(bumpalo::Bump::new()))),
+        ));
         let vars = vec![Symbol::intern("i")];
         let instrs = vec![LoopInstr::TestLe(0, 5), LoopInstr::AddVar(0, 1)];
-        let dec = infer_loop_decreases_expr(&arena, &vars, &instrs)
+        let dec = infer_loop_decreases_expr(arena, &vars, &instrs)
             .expect("increasing counter must yield a decreases candidate");
         // Shape `ub - i`.
         match dec {
@@ -1491,5 +1621,153 @@ mod tests {
             },
             other => panic!("expected 5 - i, got {other:?}"),
         }
+    }
+
+    /// A6 normalization: `Literal op Ident` (e.g. `10 > i`) must translate
+    /// like the flipped `i < 10` — previously this shape returned `None`
+    /// and the guard was stranded.
+    #[test]
+    fn test_hir_cond_literal_first_normalization() {
+        use crate::hir::hir::HirExpr;
+        use crate::hir::loop_ir::{CmpOp, Cond, ScalarExpr};
+
+        let ty = crate::hir::types::TypeContext::new().int(8, true);
+        let span = crate::ast::Span::new(0, 0);
+        let i = Symbol::intern("i");
+        let idx = |s: Symbol| (s == i).then_some(0usize);
+        let ident = || HirExpr::Ident(i, ty, span);
+        let lit = |n: i128| {
+            HirExpr::Literal(
+                crate::ast::Literal::Int(crate::ast::IntLit::Small(n)),
+                ty,
+                span,
+            )
+        };
+        let bin = |op, l, r| HirExpr::BinaryOp {
+            left: Box::new(l),
+            op,
+            right: Box::new(r),
+            ty,
+            span,
+        };
+
+        // `10 > i` normalizes to i < 10.
+        let got = hir_cond_to_cond(&bin(crate::ast::BinOp::Gt, lit(10), ident()), &idx)
+            .expect("Literal-op-Ident must normalize");
+        assert_eq!(
+            got,
+            Cond::Cmp {
+                op: CmpOp::Lt,
+                lhs: Box::new(ScalarExpr::Var(0)),
+                rhs: Box::new(ScalarExpr::Const(num_bigint::BigInt::from(10))),
+                signed: false,
+            }
+        );
+
+        // `5 <= i` normalizes to i >= 5.
+        let got = hir_cond_to_cond(&bin(crate::ast::BinOp::Le, lit(5), ident()), &idx)
+            .expect("Literal-op-Ident must normalize");
+        assert!(
+            matches!(got, Cond::Cmp { op: CmpOp::Ge, .. }),
+            "5 <= i must normalize to i >= 5, got {got:?}"
+        );
+
+        // `i != 3` passes through unchanged.
+        let got = hir_cond_to_cond(&bin(crate::ast::BinOp::Neq, ident(), lit(3)), &idx)
+            .expect("Ident-op-Literal direct form");
+        assert!(
+            matches!(got, Cond::Cmp { op: CmpOp::Neq, .. }),
+            "i != 3 must keep its shape, got {got:?}"
+        );
+    }
+
+    /// Var-vs-var Eq/Neq guards: `i == j` and `i != j` previously bailed
+    /// (no hints at all); now Eq applies exactly (`test_diff_eq`) and the
+    /// negation of Neq (`apply_negated_guard`) also lands on i = j.
+    #[test]
+    fn test_var_var_eq_neq_guards() {
+        use crate::hir::hir::HirExpr;
+        use crate::hir::loop_ir::Cond;
+
+        let ty = crate::hir::types::TypeContext::new().int(8, true);
+        let span = crate::ast::Span::new(0, 0);
+        let (i, j) = (Symbol::intern("i"), Symbol::intern("j"));
+        let idx = |s: Symbol| match s {
+            _ if s == i => Some(0usize),
+            _ if s == j => Some(1usize),
+            _ => None,
+        };
+        let bin = |op| HirExpr::BinaryOp {
+            left: Box::new(HirExpr::Ident(i, ty, span)),
+            op,
+            right: Box::new(HirExpr::Ident(j, ty, span)),
+            ty,
+            span,
+        };
+
+        let eq =
+            hir_cond_to_cond(&bin(crate::ast::BinOp::Eq), &idx).expect("var-var Eq must translate");
+        let neq = hir_cond_to_cond(&bin(crate::ast::BinOp::Neq), &idx)
+            .expect("var-var Neq must translate");
+
+        // Both directions of `i == j` are now enforced in the DBM:
+        // i - j ≤ 0 and j - i ≤ 0.
+        let guarded = apply_cond_as_guard(&Dbm::new(2), &eq);
+        assert!(!guarded.bottom, "i == j is satisfiable in a fresh DBM");
+        // The negation of `i != j` is exactly `i == j` (not a clone of top).
+        let not_neq = apply_negated_guard(&Dbm::new(2), &neq);
+        let not_neq_direct = apply_cond_as_guard(&Dbm::new(2), &eq);
+        assert_eq!(
+            not_neq.m, not_neq_direct.m,
+            "¬(i ≠ j) must equal the i == j guard, not fall back to top"
+        );
+    }
+
+    /// Budget auto-scaling: a caller-supplied budget too small to converge
+    /// (here 1, far below size²+8) must no longer starve the fixpoint —
+    /// `infer_loop_invariant_exprs` floors `max_iter` at size²+8, so the
+    /// classic counter still yields its invariant instead of the fail-
+    /// closed empty result.
+    #[test]
+    fn test_budget_autoscale_recovers_tiny_budget() {
+        let arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(
+            crate::arena::SyncArena::new(Box::leak(Box::new(bumpalo::Bump::new()))),
+        ));
+        let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let vars = vec![Symbol::intern("i"), Symbol::intern("j")];
+        // i = 0; j = 0; while i < 100 { i := i + 1; j := j + 1 } — a two-
+        // variable monotone chain whose bound-raising needs several
+        // fixpoint rounds; a raw budget of 1 cannot converge.
+        let exprs = infer_loop_invariant_exprs(
+            arena,
+            &vars,
+            &[LoopInstr::ConstVar(0, 0), LoopInstr::ConstVar(1, 0)],
+            &[
+                LoopInstr::TestLe(0, 99),
+                LoopInstr::AddVar(0, 1),
+                LoopInstr::AddVar(1, 1),
+            ],
+            1, // deliberately starved budget — the size²+8 floor rescues it
+            2,
+            None,
+        );
+        let i = bump.alloc(crate::ast::Expr::Ident(
+            Symbol::intern("i"),
+            crate::ast::Span::new(0, 0),
+        ));
+        let zero = bump.alloc(crate::ast::Expr::Literal(
+            crate::ast::Literal::Int(crate::ast::IntLit::Small(0)),
+            crate::ast::Span::new(0, 0),
+        ));
+        let ge0 = bump.alloc(crate::ast::Expr::BinaryOp {
+            left: i,
+            op: crate::ast::BinOp::Ge,
+            right: zero,
+            span: crate::ast::Span::new(0, 0),
+        });
+        assert!(
+            exprs.iter().any(|e| expr_eq_ignoring_spans(e, ge0)),
+            "the starved budget must not drop the i ≥ 0 invariant (autoscaling floor)"
+        );
     }
 }

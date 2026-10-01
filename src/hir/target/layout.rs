@@ -68,7 +68,7 @@ pub fn compute_adt_layout<'input>(
     symbols: Option<&SymbolTable<'input>>,
     target: &Target,
     ty: TypeId,
-    diag: &mut DiagCtxt,
+    diag: &mut DiagCtxt<'_>,
 ) -> Option<LayoutDescriptor> {
     let resolved = ctx.resolve_binding(ty);
     let def_id = match ctx.get(resolved) {
@@ -111,7 +111,7 @@ pub fn compute_adt_layout<'input>(
             let field_types: Vec<(String, TypeId)> = binding
                 .fields
                 .iter()
-                .map(|f| (f.name.as_str(), f.ty))
+                .map(|f| (f.name.as_str().to_string(), f.ty))
                 .collect();
             compute_struct_layout(
                 ctx,
@@ -137,14 +137,11 @@ pub fn compute_adt_layout<'input>(
                 .map(|v| match &v.payload {
                     Some(payload_ty) => {
                         let fields = resolve_ast_type_payload(payload_ty, ctx, symbols);
-                        (v.name.as_str(), fields)
+                        (v.name.as_str().to_string(), fields)
                     }
-                    None => (v.name.as_str(), Vec::new()),
+                    None => (v.name.as_str().to_string(), Vec::new()),
                 })
                 .collect();
-            // Sync any types created by resolve_ast_type_payload via ctx.alloc()
-            // into ctx.types so they are visible to subsequent ctx.get() calls.
-            ctx.sync_factory();
 
             let enum_layout = compute_enum_layout(
                 ctx,
@@ -195,7 +192,7 @@ pub fn compute_struct_layout<'input>(
     c_layout: bool,
     transparent: bool,
     symbols: Option<&SymbolTable<'input>>,
-    diag: &mut DiagCtxt,
+    diag: &mut DiagCtxt<'_>,
 ) -> Option<LayoutDescriptor> {
     if transparent && field_types.len() == 1 {
         // @transparent: layout is identical to the sole field.
@@ -308,7 +305,7 @@ pub fn compute_enum_layout<'input>(
     packed: bool,
     align_override: Option<u64>,
     symbols: Option<&SymbolTable<'input>>,
-    diag: &mut DiagCtxt,
+    diag: &mut DiagCtxt<'_>,
 ) -> Option<EnumLayout> {
     // Compute layout of each variant's payload.
     let mut variants: Vec<VariantLayout> = Vec::with_capacity(variant_payloads.len());
@@ -364,19 +361,17 @@ pub fn compute_enum_layout<'input>(
         v.offset = payload_offset;
     }
 
-    let total_size = if packed {
-        discr_size + max_payload_size
-    } else {
-        let total = payload_offset + max_payload_size;
-        let enum_align = align_override
-            .unwrap_or_else(|| discr_align.max(max_payload_align.min(target.max_align())));
-        align_up(total, enum_align)
-    };
-
     let enum_align = if packed {
         1
     } else {
         align_override.unwrap_or_else(|| discr_align.max(max_payload_align.min(target.max_align())))
+    };
+
+    let total_size = if packed {
+        discr_size + max_payload_size
+    } else {
+        let total = payload_offset + max_payload_size;
+        align_up(total, enum_align)
     };
 
     Some(EnumLayout {
@@ -444,7 +439,7 @@ fn resolve_single_ast_type<'input>(
             // Fallback: try to match known names.
             if path.len() == 1 {
                 let name = path[0].as_str();
-                match name.as_str() {
+                match name {
                     "Int" | "Int<32>" => return ctx.int(32, true),
                     "UInt" | "UInt<32>" => return ctx.uint(32),
                     "Int<8>" => return ctx.int(8, true),

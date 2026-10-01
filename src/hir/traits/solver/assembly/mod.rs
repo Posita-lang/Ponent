@@ -1048,6 +1048,7 @@ fn try_match_impl<'input>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smallvec::smallvec;
 
     /// Regression for the `solver_unify` binding discipline: an `InferVar`
     /// that is ALREADY BOUND must never be re-bound.  `solver_unify`
@@ -1063,7 +1064,7 @@ mod tests {
     fn test_solver_unify_preserves_existing_var_binding() {
         let mut ctx = TypeContext::new();
         let var = ctx.alloc_infer_var(7, 0);
-        let concrete = ctx.struct_ty(DefId(100), vec![]);
+        let concrete = ctx.struct_ty(DefId(100), smallvec![]);
         let param = ctx.generic_param(0, crate::symbol::Symbol::intern("T"));
         // The var was already resolved earlier in inference: ?v ↦ S.
         assert!(ctx.set_binding(var, concrete), "fixture: pre-bind the var");

@@ -5,8 +5,9 @@ use crate::hir::symbol::{SymbolTable, TypeKind};
 use crate::hir::traits::solver::coherence::check_overlap;
 use crate::hir::types::{DefId, Subst, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
+use parking_lot::RwLock;
 use rustc_hash::FxHashMap as HashMap;
-use std::cell::RefCell;
+use smallvec::{SmallVec, smallvec};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Base offset (1_000_000) for fresh generic-match variables: keeps them
@@ -59,7 +60,7 @@ pub struct MethodInfo<'input> {
     /// pipeline (lookup, effect labels, diagnostics).
     pub def_id: DefId,
     pub name: Symbol,
-    pub param_tys: Vec<TypeId>,
+    pub param_tys: SmallVec<[TypeId; 4]>,
     pub ret_ty: TypeId,
     pub span: Span,
     pub attributes: Vec<crate::ast::Attribute<'input>>,
@@ -69,7 +70,6 @@ pub struct MethodInfo<'input> {
     pub has_auto_deref: bool,
 }
 
-#[derive(Clone)]
 pub struct TraitEnv<'input> {
     impls: Vec<ImplCandidate<'input>>,
     /// Inherent (non-trait) methods indexed by the DefId of the type they're implemented on.
@@ -79,9 +79,31 @@ pub struct TraitEnv<'input> {
     /// the substitution so that a cache hit returns the exact same candidate that
     /// originally produced the subst — avoiding mismatches when multiple impls
     /// share the same trait_id.
-    /// Uses RefCell for interior mutability so that lookup_impl_generic can remain
-    /// `&self` (the cache is transparent to callers).
-    impl_generic_cache: RefCell<HashMap<(DefId, TypeId), Option<(usize, Subst)>>>,
+    ///
+    /// Uses a lock for interior mutability so that `lookup_impl_generic` can
+    /// remain `&self` (the cache is transparent to callers).
+    ///
+    /// Was a `RefCell`.  It cannot be: `RefCell` is `!Sync`, so `TraitEnv` —
+    /// and therefore `Arc<TraitEnv>` — was not `Send`, which rules it out of
+    /// anything the query provider hands to rayon (`QueryProvider: Sync`,
+    /// src/hir/query/mod.rs:1511).  `RwLock` is the `Send + Sync` equivalent
+    /// and suits a read-mostly memo cache.
+    impl_generic_cache: RwLock<HashMap<(DefId, TypeId), Option<(usize, Subst)>>>,
+}
+
+// `RwLock<T>` is not `Clone` (unlike `RefCell<T>`), so `Clone` is
+// implemented by hand.  This deep-copies the cache rather than sharing it,
+// which is exactly what `#[derive(Clone)]` on the old `RefCell` did —
+// keeping that behaviour avoids a subtle change where cloned environments
+// would otherwise start seeing each other's negative-cache entries.
+impl<'input> Clone for TraitEnv<'input> {
+    fn clone(&self) -> Self {
+        TraitEnv {
+            impls: self.impls.clone(),
+            inherent_methods: self.inherent_methods.clone(),
+            impl_generic_cache: RwLock::new(self.impl_generic_cache.read().clone()),
+        }
+    }
 }
 
 impl<'input> Default for TraitEnv<'input> {
@@ -95,7 +117,7 @@ impl<'input> TraitEnv<'input> {
         TraitEnv {
             impls: Vec::new(),
             inherent_methods: HashMap::default(),
-            impl_generic_cache: RefCell::new(HashMap::default()),
+            impl_generic_cache: RwLock::new(HashMap::default()),
         }
     }
 
@@ -219,18 +241,21 @@ impl<'input> TraitEnv<'input> {
         // Invalidate the generic impl cache: a new impl may change the
         // result of future lookups, and stale entries could produce
         // incorrect candidate matches.
-        self.impl_generic_cache.borrow_mut().clear();
+        self.impl_generic_cache.write().clear();
         Ok(())
     }
 }
 
-/// Collect all GenericParam indices appearing in a type.
+/// Collect all *free* GenericParam indices appearing in a type.
+/// Tracks bound variables introduced by Forall/Exists/Mu/Nu/Poly
+/// to avoid collecting variables that are bound by inner quantifiers.
 fn collect_generic_params<'input>(
     ty: TypeId,
     ctx: &TypeContext<'input>,
 ) -> std::collections::HashSet<usize> {
     let mut set = std::collections::HashSet::new();
-    collect_generic_params_rec(ty, ctx, &mut set);
+    let mut bound = std::collections::HashSet::new();
+    collect_generic_params_rec(ty, ctx, &mut set, &mut bound);
     set
 }
 
@@ -238,36 +263,87 @@ fn collect_generic_params_rec<'input>(
     ty: TypeId,
     ctx: &TypeContext<'input>,
     set: &mut std::collections::HashSet<usize>,
+    bound: &mut std::collections::HashSet<usize>,
 ) {
     match ctx.get(ty) {
         TypeData::GenericParam { index, .. } => {
-            set.insert(*index);
+            if !bound.contains(index) {
+                set.insert(*index);
+            }
         }
         TypeData::Adt { args, .. } => {
             for a in args {
-                collect_generic_params_rec(*a, ctx, set);
+                collect_generic_params_rec(*a, ctx, set, bound);
             }
         }
         TypeData::Tuple { elems } => {
             for e in elems {
-                collect_generic_params_rec(*e, ctx, set);
+                collect_generic_params_rec(*e, ctx, set, bound);
             }
         }
-        TypeData::Array { elem, .. } => collect_generic_params_rec(*elem, ctx, set),
-        TypeData::Slice { elem } => collect_generic_params_rec(*elem, ctx, set),
+        TypeData::Array { elem, .. } => collect_generic_params_rec(*elem, ctx, set, bound),
+        TypeData::Slice { elem } => collect_generic_params_rec(*elem, ctx, set, bound),
         TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
-            collect_generic_params_rec(*ty, ctx, set)
+            collect_generic_params_rec(*ty, ctx, set, bound)
         }
-        TypeData::Ptr { pointee, .. } => collect_generic_params_rec(*pointee, ctx, set),
+        TypeData::Ptr { pointee, .. } => collect_generic_params_rec(*pointee, ctx, set, bound),
         TypeData::Fn { params, ret } => {
             for p in params {
-                collect_generic_params_rec(*p, ctx, set);
+                collect_generic_params_rec(*p, ctx, set, bound);
             }
-            collect_generic_params_rec(*ret, ctx, set);
+            collect_generic_params_rec(*ret, ctx, set, bound);
         }
-        TypeData::AssociatedType { self_ty, .. } => collect_generic_params_rec(*self_ty, ctx, set),
-        TypeData::Exists { base, .. } => collect_generic_params_rec(*base, ctx, set),
-        TypeData::Poly { body, .. } => collect_generic_params_rec(*body, ctx, set),
+        TypeData::AssociatedType { self_ty, .. } => {
+            collect_generic_params_rec(*self_ty, ctx, set, bound)
+        }
+        TypeData::Forall {
+            param_index, body, ..
+        } => {
+            let inserted = bound.insert(*param_index);
+            collect_generic_params_rec(*body, ctx, set, bound);
+            if inserted {
+                bound.remove(param_index);
+            }
+        }
+        TypeData::Exists {
+            param_index, base, ..
+        } => {
+            let inserted = bound.insert(*param_index);
+            collect_generic_params_rec(*base, ctx, set, bound);
+            if inserted {
+                bound.remove(param_index);
+            }
+        }
+        TypeData::Mu {
+            param_index, body, ..
+        } => {
+            let inserted = bound.insert(*param_index);
+            collect_generic_params_rec(*body, ctx, set, bound);
+            if inserted {
+                bound.remove(param_index);
+            }
+        }
+        TypeData::Nu {
+            param_index, body, ..
+        } => {
+            let inserted = bound.insert(*param_index);
+            collect_generic_params_rec(*body, ctx, set, bound);
+            if inserted {
+                bound.remove(param_index);
+            }
+        }
+        TypeData::Poly { quantifiers, body } => {
+            let mut added = Vec::new();
+            for (idx, _) in quantifiers {
+                if bound.insert(*idx) {
+                    added.push(*idx);
+                }
+            }
+            collect_generic_params_rec(*body, ctx, set, bound);
+            for idx in added {
+                bound.remove(&idx);
+            }
+        }
         _ => {}
     }
 }
@@ -380,7 +456,7 @@ impl<'input> TraitEnv<'input> {
         // Negative cache check.
         if self
             .impl_generic_cache
-            .borrow()
+            .read()
             .get(&cache_key)
             .map_or(false, |v| v.is_none())
         {
@@ -390,7 +466,7 @@ impl<'input> TraitEnv<'input> {
         // the exact same candidate that produced the cached substitution,
         // avoiding mismatches when multiple impls share the same trait_id.
         if let Some(Some((cached_idx, cached_subst))) =
-            self.impl_generic_cache.borrow().get(&cache_key)
+            self.impl_generic_cache.read().get(&cache_key)
             && *cached_idx < self.impls.len()
         {
             return Some((&self.impls[*cached_idx], cached_subst.clone()));
@@ -413,7 +489,8 @@ impl<'input> TraitEnv<'input> {
             }
             // Generate fresh infer vars for each generic param
             let mut subst = Subst::new();
-            let mut fresh_args = Vec::with_capacity(binding.params.len());
+            let mut fresh_args: SmallVec<[TypeId; 4]> =
+                SmallVec::with_capacity(binding.params.len());
             for i in 0..binding.params.len() {
                 let id = GENERIC_MATCH_VAR_ID.fetch_add(1, Ordering::Relaxed);
                 let fresh = ctx.alloc_infer_var(id, 0);
@@ -437,12 +514,12 @@ impl<'input> TraitEnv<'input> {
             ctx.commit_transaction();
             // Cache the positive result with the candidate index.
             self.impl_generic_cache
-                .borrow_mut()
+                .write()
                 .insert(cache_key, Some((cand_idx, subst.clone())));
             return Some((&self.impls[cand_idx], subst));
         }
         // Negative cache: no match found for this (trait_id, resolved) pair.
-        self.impl_generic_cache.borrow_mut().insert(cache_key, None);
+        self.impl_generic_cache.write().insert(cache_key, None);
         None
     }
 
@@ -617,7 +694,7 @@ mod tests {
 
         let trait_id = symbols.allocate_def_id();
         let type_id = symbols.allocate_def_id();
-        let for_ty = ctx.struct_ty(type_id, vec![]);
+        let for_ty = ctx.struct_ty(type_id, smallvec![]);
 
         let candidate = ImplCandidate {
             trait_id,
@@ -686,7 +763,7 @@ mod tests {
         let method = MethodInfo {
             def_id: DefId(43),
             name: "foo".into(),
-            param_tys: vec![],
+            param_tys: smallvec![],
             ret_ty: ctx.int(32, true),
             span: crate::ast::Span::new(0, 0),
             attributes: vec![],
@@ -694,7 +771,7 @@ mod tests {
         };
         env.add_inherent_methods(def_id, vec![method]);
 
-        let ty = ctx.struct_ty(def_id, vec![]);
+        let ty = ctx.struct_ty(def_id, smallvec![]);
         let methods = env.lookup_inherent_methods(ty, &ctx);
         assert_eq!(methods.len(), 1);
         assert!(methods[0].name.eq_str("foo"));

@@ -6,12 +6,12 @@ use crate::diagnostics::Diagnostic;
 use crate::lexer::Token;
 use crate::symbol::Symbol;
 
-impl<'input> Parser<'input> {
+impl<'src, 'input> Parser<'src, 'input> {
     // -------------------------------------------------------------------------
     // Block parsing
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_block(&mut self) -> Result<Vec<Stmt<'input>>, Diagnostic> {
+    pub(super) fn parse_block(&mut self) -> Result<Vec<Stmt<'input>>, Diagnostic<'src>> {
         self.recursion_depth += 1;
         if self.recursion_depth > self.max_recursion_depth {
             self.recursion_depth -= 1;
@@ -26,7 +26,7 @@ impl<'input> Parser<'input> {
         result
     }
 
-    fn parse_block_inner(&mut self) -> Result<Vec<Stmt<'input>>, Diagnostic> {
+    fn parse_block_inner(&mut self) -> Result<Vec<Stmt<'input>>, Diagnostic<'src>> {
         self.without_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
             let mut stmts = Vec::new();
             loop {
@@ -51,7 +51,7 @@ impl<'input> Parser<'input> {
     // Statement dispatch
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic> {
+    pub(super) fn parse_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         self.recursion_depth += 1;
         if self.recursion_depth > self.max_recursion_depth {
             self.recursion_depth -= 1;
@@ -66,7 +66,7 @@ impl<'input> Parser<'input> {
         result
     }
 
-    fn parse_stmt_inner(&mut self) -> Result<Stmt<'input>, Diagnostic> {
+    fn parse_stmt_inner(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         // Collect leading @attributes — only valid before comptime inside
         // function bodies (e.g. @deprecated("use bar") comptime { ... }).
         // Use checkpoint/restore to avoid consuming `@` in expression-level
@@ -246,7 +246,7 @@ impl<'input> Parser<'input> {
     pub(super) fn parse_variable_def(
         &mut self,
         attributes: Vec<Attribute<'input>>,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         let kind = match self.advance().map_err(|_| {
             Diagnostic::error("unexpected token")
@@ -367,7 +367,7 @@ impl<'input> Parser<'input> {
     fn parse_comptime_block_stmt(
         &mut self,
         attributes: Vec<Attribute<'input>>,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let trusted = if matches!(self.peek(), Ok(Token::At)) {
@@ -456,7 +456,7 @@ impl<'input> Parser<'input> {
     // `generate` block as statement
     // -------------------------------------------------------------------------
 
-    fn parse_generate_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic> {
+    fn parse_generate_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         match self.advance() {
@@ -491,7 +491,7 @@ impl<'input> Parser<'input> {
     // If / if‑let
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_if_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic> {
+    pub(super) fn parse_if_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         if matches!(self.peek(), Ok(Token::Let)) {
@@ -562,7 +562,7 @@ impl<'input> Parser<'input> {
     pub(super) fn parse_while_stmt(
         &mut self,
         label: Option<Symbol>,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         if matches!(self.peek(), Ok(Token::Let)) {
@@ -657,7 +657,7 @@ impl<'input> Parser<'input> {
     pub(super) fn parse_for_stmt(
         &mut self,
         label: Option<Symbol>,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let pattern = self.parse_pattern()?;
@@ -710,7 +710,7 @@ impl<'input> Parser<'input> {
     pub(super) fn parse_loop_stmt(
         &mut self,
         label: Option<Symbol>,
-    ) -> Result<Stmt<'input>, Diagnostic> {
+    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         self.expect(Token::LBrace)?;
@@ -728,7 +728,7 @@ impl<'input> Parser<'input> {
     // Leave
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_leave_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic> {
+    pub(super) fn parse_leave_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         if matches!(self.peek(), Ok(Token::With)) {
@@ -769,7 +769,7 @@ impl<'input> Parser<'input> {
     // Continue
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_continue_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic> {
+    pub(super) fn parse_continue_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let label = match self.peek().clone() {
@@ -798,7 +798,7 @@ impl<'input> Parser<'input> {
     // Return
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_return_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic> {
+    pub(super) fn parse_return_stmt(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let mut labels = Vec::new();
@@ -845,7 +845,7 @@ impl<'input> Parser<'input> {
     // Scope cleanup
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_scope_cleanup(&mut self) -> Result<Stmt<'input>, Diagnostic> {
+    pub(super) fn parse_scope_cleanup(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         self.expect(Token::At)?;
@@ -901,7 +901,7 @@ impl<'input> Parser<'input> {
     // Trigger
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_trigger(&mut self) -> Result<Stmt<'input>, Diagnostic> {
+    pub(super) fn parse_trigger(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         self.expect(Token::At)?;
@@ -927,7 +927,7 @@ impl<'input> Parser<'input> {
     // Unsafe block
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_unsafe_block(&mut self) -> Result<Stmt<'input>, Diagnostic> {
+    pub(super) fn parse_unsafe_block(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         self.expect(Token::LBrace)?;
@@ -944,7 +944,7 @@ impl<'input> Parser<'input> {
     // Ghost variable
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_ghost_variable(&mut self) -> Result<Stmt<'input>, Diagnostic> {
+    pub(super) fn parse_ghost_variable(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let mut stmt = self.parse_variable_def(Vec::new())?;
@@ -970,7 +970,7 @@ impl<'input> Parser<'input> {
     // Isolate block
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_isolate_block(&mut self) -> Result<Stmt<'input>, Diagnostic> {
+    pub(super) fn parse_isolate_block(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         self.expect(Token::LBrace)?;

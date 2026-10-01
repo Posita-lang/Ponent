@@ -12,8 +12,8 @@ use crate::hir::types::{DefId, TypeId};
 /// - Holds the saved `RegionTree` snapshot so `Drop` can restore it
 ///   if a panic occurs during solving.
 /// - Restores saved fields (`current_function`, …) on drop.
-pub(crate) struct ScopeGuard<'a, 'tcx, 'input> {
-    pub(crate) checker: &'tcx mut TypeChecker<'a, 'input>,
+pub(crate) struct ScopeGuard<'a, 'tcx, 'src, 'input> {
+    pub(crate) checker: &'tcx mut TypeChecker<'a, 'src, 'input>,
     pub(crate) old_function: Option<DefId>,
     pub(crate) old_return: Option<TypeId>,
     pub(crate) old_trusted: bool,
@@ -26,8 +26,8 @@ pub(crate) struct ScopeGuard<'a, 'tcx, 'input> {
     saved_tree: Option<RegionTree>,
 }
 
-impl<'a, 'tcx, 'input> ScopeGuard<'a, 'tcx, 'input> {
-    pub(crate) fn new(checker: &'tcx mut TypeChecker<'a, 'input>) -> Self {
+impl<'a, 'tcx, 'src, 'input> ScopeGuard<'a, 'tcx, 'src, 'input> {
+    pub(crate) fn new(checker: &'tcx mut TypeChecker<'a, 'src, 'input>) -> Self {
         let old_function = checker.current_function;
         let old_return = checker.current_return_type;
         let old_trusted = checker.current_function_trusted;
@@ -51,7 +51,7 @@ impl<'a, 'tcx, 'input> ScopeGuard<'a, 'tcx, 'input> {
     /// 2. Store the snapshot in `self.saved_tree` so `Drop` can restore
     ///    the region tree if solving panics.
     /// 3. On success discard the snapshot; on error restore it.
-    pub(crate) fn commit(mut self) -> Result<(), DiagCtxt> {
+    pub(crate) fn commit(mut self) -> Result<(), DiagCtxt<'src>> {
         if !self.should_restore {
             return Ok(());
         }
@@ -101,7 +101,7 @@ impl<'a, 'tcx, 'input> ScopeGuard<'a, 'tcx, 'input> {
     }
 }
 
-impl<'a, 'tcx, 'input> Drop for ScopeGuard<'a, 'tcx, 'input> {
+impl<'a, 'tcx, 'src, 'input> Drop for ScopeGuard<'a, 'tcx, 'src, 'input> {
     fn drop(&mut self) {
         if self.should_restore {
             // Always roll back the transaction.
@@ -124,7 +124,7 @@ impl<'a, 'tcx, 'input> Drop for ScopeGuard<'a, 'tcx, 'input> {
     }
 }
 
-impl<'a, 'input> TypeChecker<'a, 'input> {
+impl<'a, 'src, 'input> TypeChecker<'a, 'src, 'input> {
     /// Save the current inference context and push a fresh one.
     pub(crate) fn enter_inference_scope(&mut self) {
         self.ctx.begin_transaction();
@@ -141,7 +141,7 @@ impl<'a, 'input> TypeChecker<'a, 'input> {
     pub(crate) fn solve_current_ctx(
         &mut self,
         current: &mut InferenceContext,
-    ) -> Result<(), DiagCtxt> {
+    ) -> Result<(), DiagCtxt<'src>> {
         // ── Dirty region propagation ─────────────────────────────
         current.region_tree.mark_current_dirty();
 
@@ -150,7 +150,7 @@ impl<'a, 'input> TypeChecker<'a, 'input> {
             let diag = Diagnostic::error(format!("type inference error: {:?}", err))
                 .with_span(Span::new(0, 0));
             self.diagnostics.push(diag);
-            return Err(mem::take(&mut self.diagnostics));
+            return Err(self.take_diagnostics());
         }
         let _solution = current.finalize(self.ctx);
 
@@ -165,7 +165,7 @@ impl<'a, 'input> TypeChecker<'a, 'input> {
                         .with_span(Span::new(0, 0)), // no span available from check_unresolved
                 );
             }
-            return Err(mem::take(&mut self.diagnostics));
+            return Err(self.take_diagnostics());
         }
 
         Ok(())
@@ -212,8 +212,10 @@ impl<'a, 'input> TypeChecker<'a, 'input> {
     /// Push a new scope frame for local variable bindings.
     /// Returns a guard that pops the frame on drop — safe even under `?`.
     pub(crate) fn enter_var_scope(&self) -> VarScopeGuard {
+        let (frames, rigidity_frames) = self.local_variable_types.rc_clone();
         VarScopeGuard::new(
-            self.local_variable_types.rc_clone(),
+            frames,
+            rigidity_frames,
             self.local_variable_spans.clone(),
             self.ghost_var_scopes.clone(),
             self.runtime_var_scopes.clone(),

@@ -6,28 +6,171 @@ impl<'input> TypeContext<'input> {
     /// or   `∀X. (X ⇒ A) ⇒ B⟨X⟩`    →    `B[X ↦ A]`  .
     /// Matches both explicit   `Forall`   nodes and implicit   `Fn`  -encoded patterns.
     ///
-    /// Uses iteration with convergence detection (max 10 rounds) to handle
-    /// chained reductions like Forall(X, Forall(Y, ...)) where reducing the
-    /// outer F orall exposes a new reducible inner Forall. This follows the
-    /// same convergence principle as Yen's KSP algorithm:
-    ///   "keep iterating until no more candidates can be generated  ".
+    /// ## Termination: quantifier-measure fuel (Pistone & Tranchini 2022 §3)
+    ///
+    /// Each ≡_X / ≡^X reduction eliminates exactly one `∀X`: the retained
+    /// `∀Y⃗` binders are re-wrapped 1:1 and the peeled `∀Z⃗ₖ` are re-introduced
+    /// as ∃/∀ binders with the same count.  The number of `Forall` nodes in
+    /// the tree is therefore a strictly decreasing measure — using it as
+    /// fuel gives guaranteed termination and replaces the previous
+    /// arbitrary `MAX_ITERATIONS = 10` safety cap.  (If the fuel is ever
+    /// exhausted mid-convergence — which the measure argument rules out —
+    /// we stop and return the current type: fail-closed.)
     pub fn try_yoneda_reduce(&mut self, ty: TypeId) -> TypeId {
-        // Limit iterations to prevent DoS from maliciously constructed types.
-        // In practice, Yoneda/co-Yoneda reduction converges in ≤3 iterations
-        // because each pass either  eliminates a Forall node or reaches a
-        // fixed point. 10 is a generous safety ceiling.
-        const MAX_ITERATIONS: usize = 10;
+        let mut fuel = self.count_foralls(ty);
 
         let mut result = ty;
-        for _iteration in 0..MAX_ITERATIONS {
+        loop {
             let before = result;
-            result = self.yoneda_reduce_once(result);
-            if result == before {
-                break; // converged
+            let head = self.yoneda_reduce_once(result);
+            result = self.yoneda_reduce_nested(head);
+            if result == before || fuel == 0 {
+                break;
             }
+            fuel -= 1;
         }
 
         result
+    }
+
+    /// Count the `Forall` nodes in a type tree (following `resolve_binding`).
+    /// This is the termination measure for Yoneda reduction: each reduction
+    /// eliminates exactly one ∀X (see `try_yoneda_reduce`).
+    fn count_foralls(&self, root: TypeId) -> usize {
+        let mut count = 0usize;
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![root];
+        while let Some(t) = stack.pop() {
+            if !visited.insert(t) {
+                continue;
+            }
+            if matches!(self.get(t), TypeData::Forall { .. }) {
+                count += 1;
+            }
+            visit_type_children(t, self, &mut |c| stack.push(c));
+        }
+        count
+    }
+
+    /// Recursively drive Yoneda reduction through the *whole* type tree, not
+    /// just the head redex.
+    ///
+    /// The root attempt (`yoneda_reduce_once`) handles the head redex and the
+    /// `∀Y⃗.F`-kernel currying permutation (the paper's `A⇒∀X.B ≡ ∀X.A⇒B`
+    /// fixpoint).  This traversal covers the remaining nested positions:
+    /// quantifiers inside Tuple / Coproduct elements, Fn parameter and return
+    /// positions, and Mu / Nu / Exists bodies.  `Forall` bodies are
+    /// deliberately not entered here (binder-capture risk; the head-redex
+    /// path already drives reduction through quantified spines), and
+    /// ADT / SkolemVar / GenericParam subtrees stay opaque — quantifiers do
+    /// not appear under a named type's arguments in HIR.
+    ///
+    /// Fail-closed discipline (Pistone & Tranchini 2022, "all-or-nothing"):
+    /// every position either fully matches a schema and reduces, or is
+    /// returned unchanged — partial matches never degrade silently.
+    fn yoneda_reduce_nested(&mut self, ty: TypeId) -> TypeId {
+        let data = self.get_arc(ty);
+        match &*data {
+            TypeData::Tuple { elems } => {
+                let mut changed = false;
+                let new_elems = elems
+                    .iter()
+                    .map(|&e| {
+                        let r = self.try_yoneda_reduce(e);
+                        changed |= r != e;
+                        r
+                    })
+                    .collect::<SmallVec<[TypeId; 4]>>();
+                if changed { self.tuple(new_elems) } else { ty }
+            }
+            TypeData::Coproduct { alternatives } => {
+                let mut changed = false;
+                let new_alts = alternatives
+                    .iter()
+                    .map(|&a| {
+                        let r = self.try_yoneda_reduce(a);
+                        changed |= r != a;
+                        r
+                    })
+                    .collect::<SmallVec<[TypeId; 4]>>();
+                if changed {
+                    self.coproduct(new_alts)
+                } else {
+                    ty
+                }
+            }
+            TypeData::Fn { params, ret } => {
+                let mut changed = false;
+                let new_params = params
+                    .iter()
+                    .map(|&p| {
+                        let r = self.try_yoneda_reduce(p);
+                        changed |= r != p;
+                        r
+                    })
+                    .collect::<SmallVec<[TypeId; 4]>>();
+                let new_ret = self.try_yoneda_reduce(*ret);
+                changed |= new_ret != *ret;
+                if changed {
+                    self.function(new_params, new_ret)
+                } else {
+                    ty
+                }
+            }
+            TypeData::Mu {
+                param_index,
+                param_name,
+                body,
+            } => {
+                let new_body = self.try_yoneda_reduce(*body);
+                if new_body != *body {
+                    self.alloc(TypeData::Mu {
+                        param_index: *param_index,
+                        param_name: *param_name,
+                        body: new_body,
+                    })
+                } else {
+                    ty
+                }
+            }
+            TypeData::Nu {
+                param_index,
+                param_name,
+                body,
+            } => {
+                let new_body = self.try_yoneda_reduce(*body);
+                if new_body != *body {
+                    self.alloc(TypeData::Nu {
+                        param_index: *param_index,
+                        param_name: *param_name,
+                        body: new_body,
+                    })
+                } else {
+                    ty
+                }
+            }
+            TypeData::Exists {
+                param_index,
+                name,
+                base,
+            } => {
+                let new_base = self.try_yoneda_reduce(*base);
+                if new_base != *base {
+                    self.exists(
+                        *param_index,
+                        *name,
+                        new_base,
+                        crate::ast::Expr::Literal(
+                            crate::ast::Literal::Bool(true),
+                            crate::ast::Span::new(0, 0),
+                        ),
+                    )
+                } else {
+                    ty
+                }
+            }
+            _ => ty,
+        }
     }
 
     /// Single-pass Yoneda reduction (used internally by `try_yoneda_reduce`).
@@ -279,7 +422,10 @@ impl<'input> TypeContext<'input> {
                             let replacement = if ips.len() <= 1 {
                                 *ir
                             } else {
-                                self.function(ips[1..].to_vec(), *ir)
+                                self.function(
+                                    ips[1..].iter().copied().collect::<SmallVec<[TypeId; 4]>>(),
+                                    *ir,
+                                )
                             };
                             let repl = if inner_quantifiers.is_empty() {
                                 replacement
@@ -314,7 +460,7 @@ impl<'input> TypeContext<'input> {
                 // ── Global Adjudication ─────────────────────────────────────
                 // Try Yoneda first. If it fails variance checks, fall through to co-Yoneda.
                 if all_yoneda {
-                    let branch_replacements: Vec<TypeId> =
+                    let branch_replacements: SmallVec<[TypeId; 4]> =
                         yoneda_candidates.iter().map(|c| c.unwrap()).collect();
 
                     // Yoneda (≡_X) requires B⟨X⟩ to be entirely positive, and each
@@ -349,7 +495,7 @@ impl<'input> TypeContext<'input> {
                 }
 
                 if all_coyoneda {
-                    let coyoneda_replacements: Vec<TypeId> =
+                    let coyoneda_replacements: SmallVec<[TypeId; 4]> =
                         coyoneda_candidates.iter().map(|c| c.unwrap()).collect();
 
                     // co-Yoneda (≡^X) requires B⟨X⟩ to be entirely negative, and each

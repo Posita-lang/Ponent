@@ -1,4 +1,7 @@
+pub mod doc_map;
 pub mod visit;
+pub use doc_map::{DocEntry, DocMap, TriviaEntry, TriviaKind};
+
 use num_bigint::{BigInt, Sign};
 
 use crate::symbol::Symbol;
@@ -50,7 +53,10 @@ impl IntLit {
             IntLit::Small(n) => match bits {
                 0 => false,
                 b if b >= 128 => true,
-                b => *n >= -(1i128 << (b - 1)) && *n < (1i128 << (b - 1)),
+                b => {
+                    let half = 1i128 << (b - 1);
+                    *n >= -half && *n < half
+                }
             },
             IntLit::Large(b) => {
                 let half = BigInt::from(1) << ((bits - 1) as usize); // 2^(N-1)
@@ -983,6 +989,12 @@ pub enum Pattern<'input> {
         inner: Option<&'input Pattern<'input>>,
         span: Span,
     },
+    /// Type-annotated pattern: `(pat : Type)`.
+    Annotated {
+        inner: &'input Pattern<'input>,
+        ty: &'input Type<'input>,
+        span: Span,
+    },
     Or(Vec<Pattern<'input>>, Span),
     Slice(
         Vec<Pattern<'input>>,
@@ -1031,6 +1043,8 @@ pub enum Contract<'input> {
 pub struct Program<'input> {
     pub items: Vec<Stmt<'input>>,
     pub span: Span,
+    /// Doc/trivia side channel (never part of any query fingerprint).
+    pub doc_map: DocMap,
 }
 
 impl fmt::Display for Span {
@@ -1144,12 +1158,52 @@ impl<'input> Expr<'input> {
     }
 }
 
+/// An exact-preallocation `join` — no intermediate `Vec`, and the preallocated
+/// capacity is exact.  The standard library `[&str]::join` can preallocate
+/// exactly because it receives a slice (which can be traversed twice);
+/// `itertools::join` receives an arbitrary iterator, so it can only preallocate
+/// roughly using `size_hint`.  Here the iterator is required to be `Clone`
+/// (slice iterators naturally satisfy this).  First clone and traverse once to
+/// count the total length and the number of elements, then concatenate in one
+/// pass with exact capacity.
+pub(crate) trait JoinExact: Iterator + Sized
+where
+    Self: Clone,
+    Self::Item: AsRef<str>,
+{
+    fn join_exact(self, sep: &str) -> String {
+        let (total_len, count) = self
+            .clone()
+            .fold((0usize, 0usize), |(len, n), s| {
+                (len + s.as_ref().len(), n + 1)
+            });
+        let capacity = total_len.saturating_add(
+            sep.len().saturating_mul(count.saturating_sub(1)),
+        );
+        let mut out = String::with_capacity(capacity);
+        for (i, s) in self.enumerate() {
+            if i > 0 {
+                out.push_str(sep);
+            }
+            out.push_str(s.as_ref());
+        }
+        out
+    }
+}
+
+impl<I> JoinExact for I
+where
+    I: Iterator + Clone,
+    I::Item: AsRef<str>,
+{
+}
+
 /// Display an AST type as a human-readable string (path/generic/literal
 /// recursion).  Single source of truth — previously duplicated verbatim in
 /// `checker::fn_ctxt::ast_type_display` and `resolver::ast_type_display`.
 pub(crate) fn ast_type_display(ty: &Type) -> String {
     match ty {
-        Type::Path(p, _) => p.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
+        Type::Path(p, _) => p.iter().map(|s| s.as_str()).join_exact("::"),
         Type::Generic(base, args, _) => {
             let args = args
                 .iter()
@@ -1163,8 +1217,7 @@ pub(crate) fn ast_type_display(ty: &Type) -> String {
                         e => format!("{:?}", e),
                     },
                 })
-                .collect::<Vec<_>>()
-                .join(", ");
+                .join_exact(", ");
             format!("{}<{}>", ast_type_display(base), args)
         }
         Type::Literal(e, _) => match e {
