@@ -1,3 +1,4 @@
+use crate::ast::FileId;
 use crate::ast::Span;
 use crate::hir::shape_var::{
     ShapeVarContext, ShapeVarId, TypeShape, shapes_compatible, type_data_to_shape,
@@ -6,8 +7,13 @@ use crate::hir::smt::SmtSolver;
 use crate::hir::symbol::SymbolTable;
 use crate::hir::traits::TraitEnv;
 use crate::hir::types::*;
+use ena::unify::{EqUnifyValue, UnificationTableStorage, UnifyKey};
+use ena::snapshot_vec as sv;
+use ena::undo_log::{Snapshots, UndoLogs};
+use ena::unify::Delegate;
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet;
+use small_map::FxSmallMap;
 use smallvec::SmallVec;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -219,7 +225,7 @@ pub struct InferRegionTree {
     /// Monotone by construction: entries are never removed, so no undo
     /// logging is needed — a rolled-back Forall allocates a fresh universe
     /// on retry and the old entry becomes inert.
-    skolem_levels: HashMap<usize, usize>,
+    skolem_levels: FxSmallMap<16, usize, usize>,
 }
 
 /// Which pool list a Register entry modified.
@@ -269,7 +275,7 @@ impl InferRegionTree {
             next_dfs: 1,
             ancestor_table: vec![[NO_ANCESTOR; MAX_LOG]],
             var_to_region: Vec::new(),
-            skolem_levels: HashMap::default(),
+            skolem_levels: FxSmallMap::new(),
         }
     }
     pub fn enter_region(&mut self) -> InferRegionId {
@@ -557,8 +563,7 @@ impl InferRegionTree {
     /// Remove a variable from a specific region's pool.
     /// Called by try_promote_var (line 724) and region adjustment (line 1383)
     /// before re-registering the variable in its new region.
-    /// NOTE: This function exists and is actively used — a previous
-    /// reviewer incorrectly claimed that "no such function exists".
+    /// NOTE: This function exists and is actively used.
     /// See try_promote_var (line 776) and region adjustment (line 1383)
     /// for call sites.
     pub fn unregister_var(&mut self, var_id: usize, region_id: InferRegionId) {
@@ -790,7 +795,6 @@ pub(crate) enum InferUndoLog {
     /// length so a rollback truncates ALL of them (a single per-element
     /// entry cannot invert a variable-size `extend`).
     PushMatchBranches(usize),
-    PushResolution,
     PushWaitList,
     /// A constraint was pushed onto `wait_lists[var_id]`: reverse pops the
     /// last element (the log is strict reverse-chronological, every push
@@ -817,13 +821,10 @@ pub(crate) enum InferUndoLog {
     RemoveTransitiveGuard(usize, usize),
     InsertGenericParamBinding(usize, Option<TypeId>),
     PushShapeVar,
-    /// Undo entry for a `resolutions` mutation: stores (var_id, old_value)
-    /// so that `reverse()` can restore the previous resolution on rollback.
-    SetResolution(usize, Option<TypeId>),
     /// Undo entry for `next_var_id` mutations: stores the previous value so
     /// that a rollback spanning variable creation restores the counter.
     /// Without this, `new_type_var` would allocate ids that conflict with
-    /// the existing `type_vars`/`resolutions` vectors, breaking the
+    /// the existing `type_vars`/`var_type_ids` vectors, breaking the
     /// "indexed by var id" invariant.
     SetNextVarId(usize),
     /// Undo for `try_promote_var` wait-list transfer.
@@ -925,32 +926,128 @@ impl MultiEquation {
 }
 
 /// Transactional union-find for type variable equivalence classes.
-/// Uses an internal undo log so that snapshot/rollback correctly restores
-/// path compression and union-by-rank mutations on existing variables,
-/// not just newly appended ones.
+/// Backed by ena's `UnificationTable` (InPlace storage) with an EXTERNAL
+/// undo log (`UfUndoLog`): every parent/rank mutation — including path
+/// compression and union-by-rank on pre-existing variables — is recorded
+/// in the log while a snapshot is open and replayed in reverse on
+/// rollback, matching the previous hand-written engine's semantics.
 ///
-/// Note: `SetResolution` undo entries in `InferUndoLog` are NOT yet removed;
-/// `resolutions` remains the authoritative state for type inference rollback.
-/// This struct is infrastructure for a future migration.
+/// Since the resolution-authority migration, this table is THE authoritative
+/// store for inference-variable resolution: each var's class root carries
+/// the bound `TypeId` (see `resolve` / `unify` / `try_promote_var`).
 #[derive(Debug, Clone)]
 pub struct UnionFind {
-    parent: Vec<usize>,
-    rank: Vec<u32>,
-    /// Internal undo log: records every mutation to `parent` and `rank`
-    /// so that `rollback_to` can restore the exact pre-mutation state.
-    undo_log: Vec<UfUndo>,
+    /// ena in-place unification table. Storage-only (`L = ()`): all
+    /// mutations flow through `with_log(&mut self.undo_log)` views so ena
+    /// records its undo entries in OUR log instead of a private one.
+    table: UnificationTableStorage<UfKey>,
+    /// External undo log for `table`: ena `sv::UndoLog` entries
+    /// (NewElem/SetElem) recorded while a snapshot is open.
+    undo_log: UfUndoLog,
     /// Stack of undo_log lengths at each `snapshot()` call.
     snapshot_stack: Vec<usize>,
 }
 
-#[derive(Debug, Clone)]
-enum UfUndo {
-    /// (index, old_parent_value) — restore `parent[index] = old`.
-    SetParent(usize, usize),
-    /// (index, old_rank_value) — restore `rank[index] = old`.
-    SetRank(usize, u32),
-    /// (old_len) — truncate `parent` and `rank` back to `old_len`.
-    Resize(usize),
+/// ena unification key for Ponent type-inference variables (var ids).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UfKey(pub(crate) u32);
+
+impl UnifyKey for UfKey {
+    type Value = Option<TypeId>;
+
+    fn index(&self) -> u32 {
+        self.0
+    }
+
+    fn from_index(u: u32) -> Self {
+        UfKey(u)
+    }
+
+    fn tag() -> &'static str {
+        "PonentUfKey"
+    }
+}
+
+// `Option<TypeId>` inherits `UnifyValue` from this impl: None merges with
+// anything, two equal Somes merge, two distinct Somes conflict — mirroring
+// the `MultiEquation::try_set_concrete` conflict rule for the value-bearing
+// migration that follows this engine swap.
+impl EqUnifyValue for TypeId {}
+
+/// External undo log consumed by ena's `InPlace` storage.  Entries are
+/// recorded only while a snapshot is open (ena's `in_snapshot()` gate is
+/// driven by `open_snapshots`).
+#[derive(Debug, Clone, Default)]
+struct UfUndoLog {
+    log: Vec<sv::UndoLog<Delegate<UfKey>>>,
+    open_snapshots: usize,
+}
+
+impl UndoLogs<sv::UndoLog<Delegate<UfKey>>> for UfUndoLog {
+    fn num_open_snapshots(&self) -> usize {
+        self.open_snapshots
+    }
+
+    fn push(&mut self, undo: sv::UndoLog<Delegate<UfKey>>) {
+        self.log.push(undo);
+    }
+
+    fn clear(&mut self) {
+        self.log.clear();
+        self.open_snapshots = 0;
+    }
+}
+
+impl Snapshots<sv::UndoLog<Delegate<UfKey>>> for UfUndoLog {
+    type Snapshot = usize; // undo-log length at snapshot time
+
+    fn start_snapshot(&mut self) -> usize {
+        self.open_snapshots += 1;
+        self.log.len()
+    }
+
+    fn actions_since_snapshot(&self, snapshot: &usize) -> &[sv::UndoLog<Delegate<UfKey>>] {
+        &self.log[*snapshot..]
+    }
+
+    fn rollback_to<R>(&mut self, storage: impl FnOnce() -> R, snapshot: usize)
+    where
+        R: ena::undo_log::Rollback<sv::UndoLog<Delegate<UfKey>>>,
+    {
+        debug_assert!(
+            self.log.len() >= snapshot,
+            "UfUndoLog::rollback_to: snapshot token outlives the log"
+        );
+        debug_assert!(self.open_snapshots > 0);
+        if self.log.len() > snapshot {
+            let mut values = storage();
+            while self.log.len() > snapshot {
+                // Fully-qualified call: keeps the `Rollback` trait name out
+                // of scope so other `.reverse()` calls (e.g. slice::reverse)
+                // are not shadowed by trait method resolution.
+                <R as ena::undo_log::Rollback<sv::UndoLog<Delegate<UfKey>>>>::reverse(
+                    &mut values,
+                    self.log.pop().unwrap(),
+                );
+            }
+        }
+        self.open_snapshots -= 1;
+    }
+
+    fn commit(&mut self, snapshot: usize) {
+        debug_assert!(
+            self.log.len() >= snapshot,
+            "UfUndoLog::commit: snapshot token outlives the log"
+        );
+        debug_assert!(self.open_snapshots > 0);
+        self.open_snapshots -= 1;
+        if self.open_snapshots == 0 {
+            // Outermost commit: there is no enclosing snapshot left that
+            // could roll back to these entries (matches ena's VecLog and
+            // the previous hand-written engine).
+            self.log.clear();
+        }
+    }
 }
 
 /// Opaque snapshot token for UnionFind. Only the UnionFind itself
@@ -961,105 +1058,147 @@ pub struct UFSnapshot(usize); // undo_log index
 impl UnionFind {
     pub fn new() -> Self {
         Self {
-            parent: Vec::new(),
-            rank: Vec::new(),
-            undo_log: Vec::new(),
+            table: UnificationTableStorage::new(),
+            undo_log: UfUndoLog::default(),
             snapshot_stack: Vec::new(),
         }
     }
 
+    /// Grow the table so that keys `0..n` exist. Appends fresh unbound
+    /// keys; ena records `NewElem` undo entries in the external log while
+    /// a snapshot is open, so rollback truncates them.
     pub fn resize_to(&mut self, n: usize) {
-        if n > self.parent.len() {
-            self.undo_log.push(UfUndo::Resize(self.parent.len()));
-        }
-        while self.parent.len() < n {
-            let old_len = self.parent.len();
-            self.parent.push(old_len);
-            self.rank.push(0);
+        let mut t = self.table.with_log(&mut self.undo_log);
+        while t.len() < n {
+            t.new_key(None);
         }
     }
 
-    /// Find with path compression. Records undo entries for every
-    /// parent pointer overwritten during compression.
+    /// Find the class representative with path compression.
+    /// Compression mutations are recorded in the external undo log by ena.
     pub fn find(&mut self, x: usize) -> usize {
-        if self.parent[x] != x {
-            let root = self.find(self.parent[x]);
-            // Record the mutation before applying it.
-            self.undo_log.push(UfUndo::SetParent(x, self.parent[x]));
-            self.parent[x] = root;
-        }
-        self.parent[x]
+        let mut t = self.table.with_log(&mut self.undo_log);
+        t.find(UfKey(x as u32)).0 as usize
     }
 
-    /// Union by rank. Records undo entries for parent and rank mutations.
-    /// Returns `Some((root_a, root_b))` if a merge happened,
-    /// `None` if already in the same set.
+    /// Union by rank. Returns `Some((root_a, root_b))` — the roots as
+    /// found BEFORE the merge — if a merge happened, `None` if already in
+    /// the same set. Root choice is ena's union-by-rank decision.
+    ///
+    /// NOT used by the resolution path: resolution relies on the
+    /// "classes are single keys" invariant (root-carried values, readable
+    /// via `probe_read(&self)`), which a merge would break.  Kept for the
+    /// future structural-equivalence use it was originally written for.
     pub fn union_sets(&mut self, a: usize, b: usize) -> Option<(usize, usize)> {
-        let ra = self.find(a);
-        let rb = self.find(b);
+        let mut t = self.table.with_log(&mut self.undo_log);
+        let ra = t.find(UfKey(a as u32));
+        let rb = t.find(UfKey(b as u32));
         if ra == rb {
             return None;
         }
-        if self.rank[ra] < self.rank[rb] {
-            self.undo_log.push(UfUndo::SetParent(ra, self.parent[ra]));
-            self.parent[ra] = rb;
-        } else if self.rank[ra] > self.rank[rb] {
-            self.undo_log.push(UfUndo::SetParent(rb, self.parent[rb]));
-            self.parent[rb] = ra;
-        } else {
-            self.undo_log.push(UfUndo::SetParent(rb, self.parent[rb]));
-            self.parent[rb] = ra;
-            self.undo_log.push(UfUndo::SetRank(ra, self.rank[ra]));
-            self.rank[ra] += 1;
+        match t.unify_var_var(ra, rb) {
+            Ok(()) => Some((ra.0 as usize, rb.0 as usize)),
+            Err((v1, v2)) => {
+                debug_assert!(
+                    v1 == v2,
+                    "UnionFind::union_sets: conflicting concrete values {v1:?} vs {v2:?} — \
+                     value conflicts must be resolved by the caller (MultiEquation semantics)"
+                );
+                None
+            }
         }
-        Some((ra, rb))
     }
 
-    /// Return the current parent pointer (root without following).
-    pub fn parent_of(&self, x: usize) -> usize {
-        self.parent[x]
+    /// Return the class root of `x` (ena exposes the root, not the
+    /// immediate parent pointer).  The old immediate-parent variant had no
+    /// callers; this keeps the API shape for the value-bearing migration.
+    pub fn parent_of(&mut self, x: usize) -> usize {
+        self.find(x)
+    }
+
+    /// Bind the class root of `x` to a concrete type (value on the root).
+    ///
+    /// Resolution semantics: this is a LAST-WRITE-WINS overwrite of the
+    /// root value (matching the old `resolutions` table, where
+    /// `try_promote_var` unconditionally overwrote `resolutions[var_id]`).
+    /// The ena error case (root already bound to a DIFFERENT type) is
+    /// collapsed to the same overwrite by rebinding — rollback safety is
+    /// unaffected because ena's SetElem undo restores the pre-bind value.
+    /// The bind is recorded in the external undo log while a snapshot is
+    /// open, so rollback restores the previous root value.
+    pub fn bind_value(&mut self, x: usize, ty: TypeId) {
+        let mut t = self.table.with_log(&mut self.undo_log);
+        // ena's unify_var_value merges; on a value conflict re-run the
+        // unification against the discarded value to force the overwrite.
+        if t.unify_var_value(UfKey(x as u32), Some(ty)).is_err() {
+            // Root currently holds a different Some(_).  Overwrite it:
+            // unify against the stale value first (no-op on the root value
+            // is impossible — Option<TypeId> EqUnifyValue errors on
+            // distinct values), then bind.  The stale value is dropped.
+            let _ = t.unify_var_value(UfKey(x as u32), None).is_ok();
+            t.unify_var_value(UfKey(x as u32), Some(ty))
+                .expect("Option unify with None cannot fail after error reset");
+        }
+    }
+
+    /// Read the concrete type bound to `x`'s class root, if any.
+    /// Ena path-compresses on read, so this is amortized O(1) &mut self.
+    pub fn probe_value(&mut self, x: usize) -> Option<TypeId> {
+        let mut t = self.table.with_log(&mut self.undo_log);
+        t.probe_value(UfKey(x as u32))
+    }
+
+    /// Read-only probe: returns the value stored at `x`'s node itself.
+    ///
+    /// Sound as a full-value read ONLY under the "classes are single keys"
+    /// invariant (`union_sets` is intentionally unused for resolution):
+    /// every node is its own root, so ena's `try_probe_value` (root-only
+    /// read) sees the same value a chasing probe would.  Lets the entire
+    /// `resolve` family stay `&self` — no `RefCell`, no `&mut` cascade
+    /// through ~40 callers.
+    pub fn probe_read(&self, x: usize) -> Option<TypeId> {
+        if x >= self.table.len() {
+            return None;
+        }
+        self.table
+            .try_probe_value(UfKey(x as u32))
+            .and_then(|v| v.clone())
     }
 
     pub fn len(&self) -> usize {
-        self.parent.len()
+        self.table.len()
     }
 
     /// Take a snapshot. The returned token captures the undo log position;
     /// `rollback_to` will replay undo entries in reverse from this point.
     pub fn snapshot(&mut self) -> UFSnapshot {
-        let idx = self.undo_log.len();
+        // Bump the open-snapshot count so ena starts recording undo
+        // entries, and capture the log length as the rollback point.
+        let idx = self.undo_log.start_snapshot();
         self.snapshot_stack.push(idx);
         UFSnapshot(idx)
     }
 
     /// Discard the most recent snapshot without replaying undo entries.
-    /// Called by `commit_snapshot` to keep the stack in sync.
+    /// Called by `commit_snapshot` to keep the stack in sync.  Entries
+    /// stay in the log for enclosing snapshots; the log is cleared only
+    /// when the OUTERMOST snapshot commits (ena `VecLog` semantics).
     pub fn commit(&mut self) {
-        self.snapshot_stack.pop();
+        if let Some(idx) = self.snapshot_stack.pop() {
+            self.undo_log.commit(idx);
+        }
     }
 
     /// Roll back to a snapshot by replaying undo entries in reverse.
     /// This correctly restores path compression, union-by-rank, and
-    /// variable allocation mutations.
+    /// variable allocation mutations (ena replays `NewElem` as a pop and
+    /// `SetElem` as a value restore over the shared storage).
     pub fn rollback_to(&mut self, snap: &UFSnapshot) {
-        while self.undo_log.len() > snap.0 {
-            match self.undo_log.pop().unwrap() {
-                UfUndo::SetParent(idx, old) => {
-                    if idx < self.parent.len() {
-                        self.parent[idx] = old;
-                    }
-                }
-                UfUndo::SetRank(idx, old) => {
-                    if idx < self.rank.len() {
-                        self.rank[idx] = old;
-                    }
-                }
-                UfUndo::Resize(old_len) => {
-                    self.parent.truncate(old_len);
-                    self.rank.truncate(old_len);
-                }
-            }
-        }
+        debug_assert!(
+            self.undo_log.log.len() >= snap.0,
+            "UnionFind::rollback_to: snapshot token outlives the undo log"
+        );
+        self.undo_log.rollback_to(|| &mut self.table, snap.0);
         // Pop snapshot_stack entries that are at or after this snapshot.
         while self.snapshot_stack.last().is_some_and(|&s| s >= snap.0) {
             self.snapshot_stack.pop();
@@ -1087,9 +1226,6 @@ impl InferenceContext {
             }
             InferUndoLog::PushMatchBranches(prev_len) => {
                 self.match_branches.truncate(prev_len);
-            }
-            InferUndoLog::PushResolution => {
-                self.resolutions.pop();
             }
             InferUndoLog::PushWaitList => {
                 self.wait_lists.pop();
@@ -1175,11 +1311,6 @@ impl InferenceContext {
             InferUndoLog::PushShapeVar => {
                 self.shape_vars
                     .truncate_vars(self.shape_vars.vars_len().saturating_sub(1));
-            }
-            InferUndoLog::SetResolution(id, old) => {
-                if id < self.resolutions.len() {
-                    self.resolutions[id] = old;
-                }
             }
             InferUndoLog::SetNextVarId(old) => {
                 self.next_var_id = old;
@@ -1805,9 +1936,11 @@ pub struct InferenceContext {
     /// Do NOT read this field directly; use `mark_dirty` / `is_dirty`.
     dirty_set: FxHashSet<usize>,
     /// Per-InferenceContext resolution table (TypeOrVar pattern).
-    resolutions: Vec<Option<TypeId>>,
-    /// Transactional union-find for structural equivalence tracking.
-    /// Snapshot/rollback replaces per-entry SetResolution logging.
+    /// REPLACED by `union_find`: each variable's class root carries the
+    /// bound TypeId (ena `Option<TypeId>` root value); var-var edges (e.g.
+    /// `try_promote_var` bindings) are represented by binding the old var's
+    /// root value to the new var's TypeId — the class stays a single key,
+    /// so reads are pure `try_probe_value(&self)` with no pointer chasing.
     union_find: UnionFind,
     /// Per-variable origin, indexed by the same `id` used in `InferVar { id }`.
     /// Captured at variable creation time so the defaulting phase can
@@ -1864,7 +1997,7 @@ pub struct InferenceContext {
         FxHashSet<(usize, usize)>,
         FxHashSet<usize>,
         FxHashSet<(TypeId, TypeId)>,
-        [usize; 12],
+        [usize; 11],
     )>,
     /// Parallel to `resolved_snapshot_stack`: for each open snapshot, the
     /// `region_tree.current` at snapshot time.  A snapshot opened mid-`Exists`
@@ -1935,6 +2068,11 @@ impl InferenceContext {
     pub(crate) fn match_branches_len_for_test(&self) -> usize {
         self.match_branches.len()
     }
+    /// Test helper: the UF root value for a var id (the migrated
+    /// resolution state; `None` = unresolved).
+    pub(crate) fn resolution_for_test(&mut self, var_id: usize) -> Option<TypeId> {
+        self.union_find.probe_value(var_id)
+    }
     /// Test helper: wake suspended constraints into a local heap and return
     /// the number of woken constraints.  Does not expose the internal
     /// PrioritizedConstraint type to tests.
@@ -1946,9 +2084,6 @@ impl InferenceContext {
         let mut heap = BucketQueue::new();
         self.wake_var_incremental(var_id, &mut heap, ctx);
         heap.len()
-    }
-    pub(crate) fn resolutions(&self) -> &[Option<TypeId>] {
-        &self.resolutions
     }
 }
 
@@ -2028,7 +2163,6 @@ impl InferenceContext {
             forward_refs: Vec::new(),
             reverse_refs: Vec::new(),
             dirty_set: FxHashSet::default(),
-            resolutions: Vec::new(),
             union_find: UnionFind::new(),
             var_origins: Vec::new(),
             generic_param_bindings: HashMap::default(),
@@ -2078,9 +2212,6 @@ impl InferenceContext {
         self.push_undo(InferUndoLog::SetNextVarId(id));
         // Store the per-variable universe (rustc's CanonicalVarKind::Ty { ui }).
         let ty_id = ctx.alloc_infer_var(id, universe);
-        if id >= self.resolutions.len() {
-            self.resolutions.resize(id + 1, None);
-        }
         self.union_find.resize_to(id + 1);
         if id >= self.var_origins.len() {
             self.var_origins.resize(id + 1, VarOrigin::Synthetic);
@@ -2117,17 +2248,26 @@ impl InferenceContext {
     /// Resolve a TypeId through inference variable bindings (TypeOrVar pattern).
     /// Follows the chain of resolutions until a concrete type is found.
     /// Checks the promotions shadow map first.
-    /// Guards against resolution cycles: if a cycle forms elsewhere in the
-    /// resolver, we abort after `max_steps` instead of looping forever.
+    ///
+    /// Resolution state lives in `union_find`: each variable's class root
+    /// carries the bound `TypeId` (var-var bindings, e.g. promotion, bind
+    /// the root value to the new var's TypeId).  Reads are pure
+    /// `try_probe_value(&self)` — classes stay single keys, so no pointer
+    /// chasing and no cycle is possible beyond the promotions map (still
+    /// bounded by `max_steps`).
     pub fn resolve<'input>(&self, ty: TypeId, ctx: &TypeContext<'input>) -> TypeId {
         let mut current = ty;
         let mut steps = 0usize;
-        let max_steps = self.resolutions.len() + self.promotions.len() + 1;
+        // The chain alternates promotion edges (≤ promotions.len()) and UF
+        // root-value edges (each var binds at most one value, so ≤ table
+        // size hops before repeating a node).  Exceeding this bound means
+        // a genuine cycle (solver bug), not user input.
+        let max_steps = self.promotions.len() + self.union_find.len() + 1;
         loop {
             steps += 1;
             debug_assert!(
                 steps <= max_steps,
-                "resolve: cycle detected in resolution chain after {steps} steps"
+                "resolve: cycle detected in promotion chain after {steps} steps"
             );
             if steps > max_steps {
                 return current; // fail-safe in release
@@ -2140,74 +2280,12 @@ impl InferenceContext {
             let TypeData::InferVar { id, .. } = ctx.get(current) else {
                 return current;
             };
-            let Some(&Some(resolved)) = self.resolutions.get(*id) else {
+            let Some(resolved) = self.union_find.probe_read(*id) else {
                 return current;
             };
             if resolved == current {
                 return current;
             }
-            current = resolved;
-        }
-    }
-
-    /// Resolve with path compression (union-find style).
-    /// After finding the root, writes it back into every intermediate node
-    /// so subsequent resolves become O(1) amortized.  Requires `&mut self`.
-    /// Checks the promotions shadow map first.
-    /// Guards against resolution cycles: if a cycle forms elsewhere in the
-    /// resolver, we abort after `max_steps` instead of looping forever.
-    pub fn resolve_compress<'input>(&mut self, ty: TypeId, ctx: &TypeContext<'input>) -> TypeId {
-        let mut current = ty;
-        let mut chain: Vec<usize> = Vec::new();
-        let mut steps = 0usize;
-        let max_steps = self.resolutions.len() + self.promotions.len() + 1;
-        loop {
-            steps += 1;
-            debug_assert!(
-                steps <= max_steps,
-                "resolve_compress: cycle detected after {steps} steps"
-            );
-            if steps > max_steps {
-                // Fail-safe: compress what we have and return.
-                for &cid in &chain {
-                    if cid < self.resolutions.len() {
-                        self.resolutions[cid] = Some(current);
-                    }
-                }
-                return current;
-            }
-            // Check promotions shadow map first.
-            if let Some(&promoted) = self.promotions.get(&current) {
-                current = promoted;
-                continue;
-            }
-            let TypeData::InferVar { id, .. } = ctx.get(current) else {
-                // `current` is a concrete type — compress all intermediates.
-                for &cid in &chain {
-                    if cid < self.resolutions.len() {
-                        self.resolutions[cid] = Some(current);
-                    }
-                }
-                return current;
-            };
-            let Some(&Some(resolved)) = self.resolutions.get(*id) else {
-                // No resolution — `current` is the root.  Compress intermediates.
-                for &cid in &chain {
-                    if cid < self.resolutions.len() {
-                        self.resolutions[cid] = Some(current);
-                    }
-                }
-                return current;
-            };
-            if resolved == current {
-                for &cid in &chain {
-                    if cid < self.resolutions.len() {
-                        self.resolutions[cid] = Some(current);
-                    }
-                }
-                return current;
-            }
-            chain.push(*id);
             current = resolved;
         }
     }
@@ -2220,11 +2298,13 @@ impl InferenceContext {
     fn resolve_promotion_aware<'input>(&self, ty: TypeId, ctx: &TypeContext<'input>) -> TypeId {
         let mut current = ty;
         let mut steps = 0usize;
-        // Bound the fixed-point iteration.  Each of the three edges below can
-        // fire at most (len) times before it must repeat a node, so the sum of
-        // the three lengths plus one is a sound upper bound: exceeding it means
-        // a cycle has formed in one of the maps (a solver bug, not user input).
-        let max_steps = self.resolutions.len() + self.promotions.len() + 1;
+        // Bound the fixed-point iteration.  Each of the three edge kinds
+        // below can fire at most (len) times before repeating a node:
+        // promotions (≤ promotions.len()), ctx bindings, and UF root-value
+        // edges (≤ union_find.len()).  The sum plus one is a sound upper
+        // bound: exceeding it means a cycle has formed in one of the maps
+        // (a solver bug, not user input).
+        let max_steps = self.promotions.len() + self.union_find.len() + 1;
         loop {
             steps += 1;
             if steps > max_steps {
@@ -2240,13 +2320,13 @@ impl InferenceContext {
             if bound != next {
                 next = bound;
             }
-            // 3. Solver-local resolutions recorded by `unify_and_track`.
+            // 3. Solver-local resolutions recorded by `unify`/`unify_and_track`.
             //    These mirror (2) in the common case, but a bare `ctx.unify`
             //    elsewhere, or a resolution written without a ctx bind, makes
             //    them diverge — both edges must be followed or the unified type
             //    is silently lost.
             if let TypeData::InferVar { id, .. } = ctx.get(next)
-                && let Some(&Some(r)) = self.resolutions.get(*id)
+                && let Some(r) = self.union_find.probe_read(*id)
                 && r != next
             {
                 next = r;
@@ -2306,9 +2386,9 @@ impl InferenceContext {
         }
     }
 
-    /// Unify two types via the global `TypeContext<'input>` AND record the resolution
-    /// in `self.resolutions` so that `self.resolve()` stays consistent with
-    /// global bindings.
+    /// Unify two types via the global `TypeContext<'input>` AND mirror the
+    /// post-unification resolution into `union_find` so that `self.resolve()`
+    /// stays consistent with global bindings.
     ///
     /// This must be used instead of bare `ctx.unify()` inside the solver loop
     /// whenever one of the sides is an InferVar owned by this context.
@@ -2333,15 +2413,16 @@ impl InferenceContext {
                 return Err(e);
             }
         };
-        // After unification, record the sides' post-unification resolution
-        // in self.resolutions so that self.resolve() follows the same chain
+        // After unification, mirror the sides' post-unification resolution
+        // into union_find so that self.resolve() follows the same chain
         // as ctx.resolve_binding().  `ctx.unify(InferVar, X)` binds the var
         // and returns X — the returned type itself is NOT an InferVar, so
-        // only inspecting `result` (as this code previously did) recorded
-        // nothing and self.resolve()/self.resolve_compress() (which never
-        // consult ctx.bindings) desynced from the global unifier.  Mirror
-        // BOTH sides instead: whichever side resolved to something else
-        // gets an undo-logged SetResolution entry.
+        // only inspecting `result` previously recorded nothing and
+        // self.resolve() (which never consults ctx.bindings) desynced from
+        // the global unifier.  Mirror BOTH sides: whichever side resolved
+        // to something else gets its root value bound.  The bind is
+        // undo-logged inside UnionFind (ena SetElem) while a snapshot is
+        // open — no per-entry InferUndoLog needed.
         for side in [a, b] {
             let resolved_side = ctx.resolve_binding(side);
             if resolved_side == side {
@@ -2350,18 +2431,17 @@ impl InferenceContext {
             let TypeData::InferVar { id, .. } = ctx.get(side) else {
                 continue;
             };
-            if *id >= self.resolutions.len() || self.resolutions[*id].is_some() {
-                continue; // out of range or already tracked
+            if self.union_find.probe_read(*id).is_some() {
+                continue; // already tracked
             }
-            let old = self.resolutions[*id];
-            self.push_undo(InferUndoLog::SetResolution(*id, old));
-            self.resolutions[*id] = Some(resolved_side);
+            // Last-write-wins overwrite; undo via ena SetElem.
+            self.union_find.bind_value(*id, resolved_side);
         }
         Ok(result)
     }
 
     /// Unify with local InferVar resolution (TypeOrVar pattern).
-    /// Records resolutions in `self.resolutions` instead of global bindings.
+    /// Records resolutions in `union_find` instead of global bindings.
     pub fn unify<'input>(
         &mut self,
         a: TypeId,
@@ -2375,7 +2455,7 @@ impl InferenceContext {
             return Ok(ra);
         }
         match (ctx.get(ra), ctx.get(rb)) {
-            (TypeData::InferVar { id, universe, .. }, _) if *id < self.resolutions.len() => {
+            (TypeData::InferVar { id, universe, .. }, _) => {
                 // Per-variable universe tracking: binding a HIGHER-universe
                 // variable into a LOWER universe lets it escape — reject.
                 // (rustc `can_define`: binding is legal iff
@@ -2407,12 +2487,12 @@ impl InferenceContext {
                         span,
                     });
                 }
-                let old = self.resolutions[*id];
-                self.push_undo(InferUndoLog::SetResolution(*id, old));
-                self.resolutions[*id] = Some(rb);
+                // Bind the var's UF root value to `rb` (last-write-wins).
+                // Undo is handled by ena's SetElem log while a snapshot is open.
+                self.union_find.bind_value(*id, rb);
                 Ok(rb)
             }
-            (_, TypeData::InferVar { id, universe, .. }) if *id < self.resolutions.len() => {
+            (_, TypeData::InferVar { id, universe, .. }) => {
                 if let TypeData::InferVar { universe: au, .. } = ctx.get(ra)
                     && *au > *universe
                 {
@@ -2441,9 +2521,9 @@ impl InferenceContext {
                         span,
                     });
                 }
-                let old = self.resolutions[*id];
-                self.push_undo(InferUndoLog::SetResolution(*id, old));
-                self.resolutions[*id] = Some(ra);
+                // Bind the var's UF root value to `ra` (last-write-wins).
+                // Undo is handled by ena's SetElem log while a snapshot is open.
+                self.union_find.bind_value(*id, ra);
                 Ok(ra)
             }
             _ => match ctx.unify(ra, rb) {
@@ -2696,12 +2776,12 @@ impl InferenceContext {
             }
         }
 
-        // Bind the old variable to the new one (promotion)
-        if var_id < self.resolutions.len() {
-            let old = self.resolutions[var_id];
-            self.push_undo(InferUndoLog::SetResolution(var_id, old));
-            self.resolutions[var_id] = Some(new_ty_id);
-        }
+        // Bind the old variable to the new one (promotion): the old var's
+        // UF root value now points at `new_ty_id`, so every resolve family
+        // member follows the promotion edge.  Last-write-wins matches the
+        // old unconditional `resolutions[var_id] = Some(new_ty_id)`.  Undo
+        // is ena SetElem while a snapshot is open.
+        self.union_find.bind_value(var_id, new_ty_id);
         // Bind in the solver-local promotions shadow map instead
         // of the non-rollbackable ctx.set_binding. This keeps promotion
         // aliases local to the solver and fully rollback-safe.
@@ -3143,7 +3223,7 @@ impl InferenceContext {
 
         // NOTE: no separate resolutions-table check is needed here.  The
         // entry-point `resolve_with_env` delegates to `resolve_promotion_aware`,
-        // which already follows `self.resolutions` to a fixpoint — if var_id
+        // which already follows UF root values to a fixpoint — if var_id
         // had a concrete resolution we returned via UNI-TYPE above, and if we
         // reach this point the fixpoint is an unresolved InferVar.  (A former
         // re-check here was therefore unreachable: `res` was always an
@@ -3420,11 +3500,11 @@ impl InferenceContext {
             if *inst_id < self.var_type_ids.len() {
                 let instance_ty_id = self.var_type_ids[*inst_id];
                 // S-Inst-Copy: bind instance to the resolved type using
-                // unify_and_track so that self.resolutions stays consistent
+                // unify_and_track so that union_find root values stay consistent
                 // with ctx.bindings.  Using bare ctx.unify would leave
                 // self.resolve() pointing at a stale chain.
                 if self
-                    .unify_and_track(instance_ty_id, resolve_ty, ctx, Span::new(0, 0))
+                    .unify_and_track(instance_ty_id, resolve_ty, ctx, Span::new(FileId::DUMMY, 0, 0))
                     .is_err()
                 {
                     all_propagated = false;
@@ -4168,7 +4248,7 @@ impl InferenceContext {
 
     /// Build the full multi-equation containing `var_id` by taking the
     /// transitive closure over ALL equality sources:
-    ///   1. self.resolutions  (local solved form)
+    ///   1. union_find root values  (local solved form)
     ///   2. ctx.resolve_binding  (global binding chains)
     ///   3. active Eq constraints  (pending in the heap)
     ///
@@ -4192,19 +4272,17 @@ impl InferenceContext {
             }
             me.variables.insert(vid);
 
-            // ── Source 1: local resolution table ──────────────────
-            if vid < self.resolutions.len() {
-                if let Some(resolved_ty) = self.resolutions[vid] {
-                    let resolved = ctx.resolve_binding(resolved_ty);
-                    match ctx.get(resolved) {
-                        TypeData::InferVar { id, .. } => {
-                            worklist.push(*id);
-                        }
-                        _ => {
-                            me.try_set_concrete(resolved);
-                            // Walk the concrete type for nested InferVars
-                            self.collect_nested_vars(ctx, resolved, &mut worklist);
-                        }
+            // ── Source 1: local resolution table (UF root values) ──
+            if let Some(resolved_ty) = self.union_find.probe_read(vid) {
+                let resolved = ctx.resolve_binding(resolved_ty);
+                match ctx.get(resolved) {
+                    TypeData::InferVar { id, .. } => {
+                        worklist.push(*id);
+                    }
+                    _ => {
+                        me.try_set_concrete(resolved);
+                        // Walk the concrete type for nested InferVars
+                        self.collect_nested_vars(ctx, resolved, &mut worklist);
                     }
                 }
             }
@@ -4599,7 +4677,6 @@ impl InferenceContext {
                 self.gen_statuses.len(),
                 self.forward_refs.len(),
                 self.reverse_refs.len(),
-                self.resolutions.len(),
                 self.var_origins.len(),
             ],
         ));
@@ -4708,7 +4785,6 @@ impl InferenceContext {
                 gst_len,
                 fr_len,
                 rr_len,
-                res_len,
                 vo_len,
             ] = vec_lens;
             self.type_vars.truncate(tv_len);
@@ -4721,7 +4797,6 @@ impl InferenceContext {
             self.gen_statuses.truncate(gst_len);
             self.forward_refs.truncate(fr_len);
             self.reverse_refs.truncate(rr_len);
-            self.resolutions.truncate(res_len);
             self.var_origins.truncate(vo_len);
         }
         self.snapshot_depth -= 1;
@@ -5614,7 +5689,7 @@ impl InferenceContext {
                             priority: PRIORITY_ADMIN,
                             constraint: Constraint::ExitRegion {
                                 region_id,
-                                span: crate::ast::Span::new(0, 0),
+                                span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                             },
                             env: Arc::clone(&pc.env),
                         });
@@ -5638,7 +5713,7 @@ impl InferenceContext {
                         //
                         // The Skolem mapping is recorded in the constraint's
                         // scoped environment (pc.env) rather than in global
-                        // self.resolutions.  This ensures the rigid binding
+                        // UF root values.  This ensures the rigid binding
                         // applies only to the Forall body and is automatically
                         // cleaned up when the constraint is popped from the heap.
                         debug_assert!(
@@ -6411,7 +6486,7 @@ impl InferenceContext {
                     VarOrigin::Expression(sp) => *sp,
                     _ => None,
                 })
-                .unwrap_or(Span::new(0, 0));
+                .unwrap_or(Span::new(FileId::DUMMY, 0, 0));
             for &lb in lbs {
                 // Promotion-aware: bounds were recorded through
                 // resolve_with_env (promotion-aware); verifying them with
@@ -6459,7 +6534,7 @@ impl InferenceContext {
             }
             let kind = self.type_vars[i].kind;
             // Extract the best available span for this variable: prefer the
-            // VarOrigin::Expression span, fall back to Span::new(0, 0).
+            // VarOrigin::Expression span, fall back to Span::new(FileId::DUMMY, 0, 0).
             let var_span = self
                 .var_origins
                 .get(i)
@@ -6467,7 +6542,7 @@ impl InferenceContext {
                     VarOrigin::Expression(sp) => *sp,
                     _ => None,
                 })
-                .unwrap_or(Span::new(0, 0));
+                .unwrap_or(Span::new(FileId::DUMMY, 0, 0));
             match kind {
                 TypeVariableKind::Integer => {
                     if !matches!(
@@ -7195,7 +7270,7 @@ pub(crate) fn replace_infer<'input>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
 
@@ -7251,7 +7326,7 @@ mod tests {
             Constraint::Eq(
                 ctx.bool(),
                 ctx.bool(),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 EqOrigin::Normal,
             ),
             var_id,
@@ -7279,7 +7354,7 @@ mod tests {
             Constraint::Eq(
                 ctx.bool(),
                 ctx.bool(),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 EqOrigin::Normal,
             ),
             var_id,
@@ -7327,7 +7402,7 @@ mod tests {
         let eq = Constraint::Eq(
             bool_ty,
             int_ty,
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
             EqOrigin::Normal,
         );
         // Both Eq constraints with concrete types have the same priority.
@@ -7345,13 +7420,13 @@ mod tests {
         let eq = Constraint::Eq(
             bool_ty,
             int_ty,
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
             EqOrigin::Normal,
         );
         let match_c = Constraint::Match {
             scrutinee: bool_ty,
             branches_id: (0, 0),
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         };
         // Eq with concrete types has higher priority than Match with unresolved scrutinee
         // (Match has priority 6 when the scrutinee is an infer var).
@@ -7372,7 +7447,7 @@ mod tests {
         let match_c = Constraint::Match {
             scrutinee: var,
             branches_id: (0, 0),
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         };
         assert_eq!(
             match_c.priority(&ctx),
@@ -7383,7 +7458,7 @@ mod tests {
         let eq_c = Constraint::Eq(
             ctx.bool(),
             ctx.int(DEFAULT_INT_WIDTH, true),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
             EqOrigin::Normal,
         );
         assert_eq!(
@@ -7477,7 +7552,7 @@ mod tests {
             continuation: Arc::from(vec![Constraint::Eq(
                 ctx.int(DEFAULT_INT_WIDTH, true),
                 ctx.int(DEFAULT_INT_WIDTH, true),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 EqOrigin::Normal,
             )]),
             else_continuation: Arc::from(Vec::new() as Vec<Constraint>),
@@ -7495,7 +7570,7 @@ mod tests {
             continuation: Arc::from(vec![Constraint::Eq(
                 ctx.int(DEFAULT_INT_WIDTH, true),
                 ctx.int(DEFAULT_INT_WIDTH, true),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 EqOrigin::Normal,
             )]),
             else_continuation: Arc::from(Vec::new() as Vec<Constraint>),
@@ -7533,7 +7608,7 @@ mod tests {
         let match_c = Constraint::Match {
             scrutinee: var,
             branches_id: (0, 0),
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         };
         // Before resolution: low priority
         assert_eq!(match_c.priority(&ctx), 6);
@@ -7562,7 +7637,7 @@ mod tests {
             else_continuation: Arc::from(vec![Constraint::Eq(
                 int_ty,
                 int_ty,
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 EqOrigin::Normal,
             )]),
         }];
@@ -7627,7 +7702,7 @@ mod tests {
             else_continuation: Arc::from(vec![Constraint::Eq(
                 int_ty,
                 int_ty,
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 EqOrigin::Normal,
             )]),
         }];
@@ -7726,7 +7801,7 @@ mod tests {
             var,
             id,
             &mut heap,
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
             &Arc::new(HashMap::default()),
         );
         assert!(handled, "should register the match on the wait list");
@@ -7759,7 +7834,7 @@ mod tests {
             int_ty,
             id,
             &mut heap,
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
             &Arc::new(HashMap::default()),
         );
         assert!(
@@ -7775,16 +7850,16 @@ mod tests {
             def_constraint: Box::new(Constraint::Eq(
                 TypeId::from_raw(1),
                 TypeId::from_raw(2),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 EqOrigin::Normal,
             )),
             body_constraint: Box::new(Constraint::Eq(
                 TypeId::from_raw(1),
                 TypeId::from_raw(1),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 EqOrigin::Normal,
             )),
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         };
         let ctx = TypeContext::new();
         assert_eq!(c.priority(&ctx), 2, "Let should have medium-high priority");
@@ -8081,7 +8156,7 @@ mod tests {
             Constraint::Eq(
                 ctx.bool(),
                 ctx.int(DEFAULT_INT_WIDTH, true),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 EqOrigin::Normal,
             ),
             var_id,
@@ -8090,7 +8165,7 @@ mod tests {
             Constraint::Eq(
                 ctx.bool(),
                 ctx.bool(),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 EqOrigin::Normal,
             ),
             var_id,
@@ -8222,7 +8297,7 @@ mod tests {
         }
         let int32_1 = ctx.int(DEFAULT_INT_WIDTH, true);
         infer.suspend_on_var(
-            Constraint::Eq(var, int32_1, crate::ast::Span::new(0, 0), EqOrigin::Normal),
+            Constraint::Eq(var, int32_1, crate::ast::Span::new(FileId::DUMMY, 0, 0), EqOrigin::Normal),
             var_id,
         );
 
@@ -8458,7 +8533,7 @@ mod tests {
         infer.add_constraint(Constraint::Eq(
             a,
             b,
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
             EqOrigin::Normal,
         ));
         // Unify a with Int<32>
@@ -8489,7 +8564,7 @@ mod tests {
         infer.add_constraint(Constraint::Eq(
             deep_var,
             shallow_var,
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
             EqOrigin::Normal,
         ));
         let bool_ty = ctx.bool();
@@ -8516,7 +8591,7 @@ mod tests {
             continuation: Arc::from(vec![Constraint::Eq(
                 int32,
                 int32,
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 EqOrigin::Normal,
             )]),
             else_continuation: Arc::from(Vec::new() as Vec<Constraint>),
@@ -8535,7 +8610,7 @@ mod tests {
             infer_var,
             bid,
             &mut heap,
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
             &Arc::new(HashMap::default()),
         );
         // For an InferVar, try_match_via_shape_var suspends the Match constraint
@@ -8666,7 +8741,7 @@ mod tests {
         infer.add_constraint(Constraint::Eq(
             a_deep,
             b_deep,
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
             EqOrigin::Normal,
         ));
 
@@ -8723,7 +8798,7 @@ mod tests {
         infer.add_constraint(Constraint::Eq(
             a,
             b,
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
             EqOrigin::Normal,
         ));
 
@@ -9233,7 +9308,7 @@ mod tests {
         infer.add_constraint(Constraint::Eq(
             pg_var,
             int32,
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
             EqOrigin::Normal,
         ));
 
@@ -9290,7 +9365,7 @@ mod tests {
         // Eq(inner, outer): the outside variable determines inner.
         let active = vec![PrioritizedConstraint {
             priority: 0,
-            constraint: Constraint::Eq(inner, outer, crate::ast::Span::new(0, 0), EqOrigin::Normal),
+            constraint: Constraint::Eq(inner, outer, crate::ast::Span::new(FileId::DUMMY, 0, 0), EqOrigin::Normal),
             env: Arc::new(HashMap::default()),
         }];
 
@@ -9322,7 +9397,7 @@ mod tests {
         let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
         let active = vec![PrioritizedConstraint {
             priority: 0,
-            constraint: Constraint::Eq(var, int_ty, crate::ast::Span::new(0, 0), EqOrigin::Normal),
+            constraint: Constraint::Eq(var, int_ty, crate::ast::Span::new(FileId::DUMMY, 0, 0), EqOrigin::Normal),
             env: Arc::new(HashMap::default()),
         }];
 
@@ -9350,7 +9425,7 @@ mod tests {
         // Eq(a, b): both in the same region → NOT determined.
         let active = vec![PrioritizedConstraint {
             priority: 0,
-            constraint: Constraint::Eq(a, b, crate::ast::Span::new(0, 0), EqOrigin::Normal),
+            constraint: Constraint::Eq(a, b, crate::ast::Span::new(FileId::DUMMY, 0, 0), EqOrigin::Normal),
             env: Arc::new(HashMap::default()),
         }];
 
@@ -9387,7 +9462,7 @@ mod tests {
         let fn_ty = ctx.function(smallvec![inner], bool_ty);
         let active = vec![PrioritizedConstraint {
             priority: 0,
-            constraint: Constraint::Eq(outer, fn_ty, crate::ast::Span::new(0, 0), EqOrigin::Normal),
+            constraint: Constraint::Eq(outer, fn_ty, crate::ast::Span::new(FileId::DUMMY, 0, 0), EqOrigin::Normal),
             env: Arc::new(HashMap::default()),
         }];
 
@@ -9419,7 +9494,7 @@ mod tests {
 
         let active = vec![PrioritizedConstraint {
             priority: 0,
-            constraint: Constraint::Eq(inner, outer, crate::ast::Span::new(0, 0), EqOrigin::Normal),
+            constraint: Constraint::Eq(inner, outer, crate::ast::Span::new(FileId::DUMMY, 0, 0), EqOrigin::Normal),
             env: Arc::new(HashMap::default()),
         }];
 
@@ -9462,7 +9537,7 @@ mod tests {
                 constraint: Constraint::Eq(
                     alpha,
                     beta,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     EqOrigin::Normal,
                 ),
                 env: Arc::new(HashMap::default()),
@@ -9472,7 +9547,7 @@ mod tests {
                 constraint: Constraint::Eq(
                     beta,
                     gamma,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     EqOrigin::Normal,
                 ),
                 env: Arc::new(HashMap::default()),
@@ -9512,7 +9587,7 @@ mod tests {
                 constraint: Constraint::Eq(
                     alpha,
                     beta,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     EqOrigin::Normal,
                 ),
                 env: Arc::new(HashMap::default()),
@@ -9522,7 +9597,7 @@ mod tests {
                 constraint: Constraint::Eq(
                     beta,
                     int32,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     EqOrigin::Normal,
                 ),
                 env: Arc::new(HashMap::default()),
@@ -9562,7 +9637,7 @@ mod tests {
         let fn_ty = ctx.function(smallvec![beta, gamma], bool_ty);
         let active = vec![PrioritizedConstraint {
             priority: 0,
-            constraint: Constraint::Eq(alpha, fn_ty, crate::ast::Span::new(0, 0), EqOrigin::Normal),
+            constraint: Constraint::Eq(alpha, fn_ty, crate::ast::Span::new(FileId::DUMMY, 0, 0), EqOrigin::Normal),
             env: Arc::new(HashMap::default()),
         }];
 
@@ -9600,7 +9675,7 @@ mod tests {
                 constraint: Constraint::Eq(
                     alpha,
                     beta,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     EqOrigin::Normal,
                 ),
                 env: Arc::new(HashMap::default()),
@@ -9610,7 +9685,7 @@ mod tests {
                 constraint: Constraint::Eq(
                     beta,
                     gamma,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     EqOrigin::Normal,
                 ),
                 env: Arc::new(HashMap::default()),

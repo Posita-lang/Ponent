@@ -2,8 +2,8 @@ use crate::ast::*;
 use crate::diagnostics::Diagnostic;
 use crate::hir::types::*;
 use crate::symbol::Symbol;
+use crate::sync::Mutex;
 use indexmap::IndexMap;
-use parking_lot::Mutex;
 use rustc_hash::FxBuildHasher;
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
@@ -661,7 +661,7 @@ impl<'input> SymbolTable<'input> {
 // of compiler state the provider borrows must be `Sync`, or `par_get`
 // cannot hand it to rayon.  Keeping them here means the compiler finds
 // any regression the moment someone reintroduces an `Rc` / `RefCell`.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod send_sync_audit {
     use super::*;
     use crate::hir::resolver::ResolutionMap;

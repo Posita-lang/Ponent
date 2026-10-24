@@ -4,6 +4,7 @@
 //! constraint solving, region management, guard sets, generalization,
 //! shape variables, and the full solve pipeline.
 
+use crate::ast::FileId;
 use crate::ast::Span;
 use crate::hir::infer::*;
 use crate::hir::shape_var::TypeShape;
@@ -36,7 +37,7 @@ fn infer_var_id<'input>(ctx: &TypeContext<'input>, ty: TypeId) -> usize {
 }
 
 fn span() -> Span {
-    Span::new(0, 0)
+    Span::new(FileId::DUMMY, 0, 0)
 }
 
 fn default_env<'input>() -> (SymbolTable<'input>, TraitEnv<'input>) {
@@ -1905,9 +1906,9 @@ fn test_try_promote_var_resolution_rollback() {
     let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let id = infer_var_id(&ctx, var);
 
-    // resolutions[id] should be None initially.
+    // Resolution state (UF root value) should be None initially.
     assert!(
-        infer.resolutions().get(id).copied().flatten().is_none(),
+        infer.resolution_for_test(id).is_none(),
         "resolution should be None before promotion",
     );
 
@@ -1916,14 +1917,14 @@ fn test_try_promote_var_resolution_rollback() {
     let promoted = infer.try_promote_var(&mut ctx, id, root);
     assert!(promoted.is_some(), "promotion should succeed");
     assert!(
-        infer.resolutions()[id].is_some(),
+        infer.resolution_for_test(id).is_some(),
         "resolution should be set after promotion",
     );
 
     // Rollback — resolution should revert to None.
     infer.rollback_to(snap);
     assert!(
-        infer.resolutions().get(id).copied().flatten().is_none(),
+        infer.resolution_for_test(id).is_none(),
         "resolution should be restored to None after rollback",
     );
 }
@@ -1979,22 +1980,22 @@ fn test_unify_resolution_undo() {
     let id_a = infer_var_id(&ctx, a);
     let id_b = infer_var_id(&ctx, b);
 
-    // resolutions should be None for both.
+    // Resolution state (UF root values) should be None for both.
     assert!(
-        infer.resolutions()[id_a].is_none(),
+        infer.resolution_for_test(id_a).is_none(),
         "resolution for a should be None initially",
     );
     assert!(
-        infer.resolutions()[id_b].is_none(),
+        infer.resolution_for_test(id_b).is_none(),
         "resolution for b should be None initially",
     );
 
     // Open a snapshot, unify a with Bool.
     let snap = infer.start_snapshot();
-    let result = infer.unify(a, ctx.bool(), &mut ctx, crate::ast::Span::new(0, 0));
+    let result = infer.unify(a, ctx.bool(), &mut ctx, crate::ast::Span::new(FileId::DUMMY, 0, 0));
     assert!(result.is_ok(), "unify a with Bool should succeed");
 
-    let resolved_id_a = infer.resolutions()[id_a];
+    let resolved_id_a = infer.resolution_for_test(id_a);
     assert!(
         resolved_id_a.is_some(),
         "resolution for a should be set after unify",
@@ -2003,11 +2004,11 @@ fn test_unify_resolution_undo() {
     // Rollback — resolution for a should revert to None.
     infer.rollback_to(snap);
     assert!(
-        infer.resolutions()[id_a].is_none(),
+        infer.resolution_for_test(id_a).is_none(),
         "resolution for a should be None after rollback",
     );
     assert!(
-        infer.resolutions()[id_b].is_none(),
+        infer.resolution_for_test(id_b).is_none(),
         "resolution for b should remain None after rollback",
     );
 
@@ -2029,33 +2030,31 @@ fn test_unify_and_track_resolution_undo() {
     let id = infer_var_id(&ctx, var);
     let int32 = ctx.int(32, true);
 
-    // resolutions should be None initially.
+    // Resolution state (UF root value) should be None initially.
     assert!(
-        infer.resolutions()[id].is_none(),
+        infer.resolution_for_test(id).is_none(),
         "resolution should be None initially",
     );
 
     // Open a snapshot, unify_and_track var with Int<32>.
     let snap = infer.start_snapshot();
-    let result = infer.unify_and_track(var, int32, &mut ctx, crate::ast::Span::new(0, 0));
+    let result = infer.unify_and_track(var, int32, &mut ctx, crate::ast::Span::new(FileId::DUMMY, 0, 0));
     assert!(result.is_ok(), "unify_and_track should succeed");
 
     let resolved = ctx.resolve_binding(result.unwrap());
     // The resolution points to the InferVar itself (since it stays an InferVar
     // but is now bound to Int<32> via the TypeContext<'input>).
     if let TypeData::InferVar { id: rid, .. } = ctx.get(resolved) {
-        if *rid < infer.resolutions().len() {
-            assert!(
-                infer.resolutions()[*rid].is_some(),
-                "resolution should be set after unify_and_track",
-            );
-        }
+        assert!(
+            infer.resolution_for_test(*rid).is_some(),
+            "resolution should be set after unify_and_track",
+        );
     }
 
     // Rollback — resolution should revert to None.
     infer.rollback_to(snap);
     assert!(
-        infer.resolutions()[id].is_none(),
+        infer.resolution_for_test(id).is_none(),
         "resolution should be None after rollback",
     );
     // Note: we do NOT check ctx.resolve_binding(var) here — the
@@ -2415,13 +2414,13 @@ fn test_universe_mismatch_rejected() {
     // Same universe → unifies.
     assert!(
         infer
-            .unify(a0, b0, &mut ctx, crate::ast::Span::new(0, 0))
+            .unify(a0, b0, &mut ctx, crate::ast::Span::new(FileId::DUMMY, 0, 0))
             .is_ok()
     );
     // Different universes (0 vs 1) → rejected.
     assert!(
         infer
-            .unify(a0, b1, &mut ctx, crate::ast::Span::new(0, 0))
+            .unify(a0, b1, &mut ctx, crate::ast::Span::new(FileId::DUMMY, 0, 0))
             .is_err()
     );
 }
@@ -2454,7 +2453,7 @@ fn test_solve_wakeup_wakes_suspended_constraint() {
         var,
         ctx.int(32, true),
         &mut ctx,
-        crate::ast::Span::new(0, 0),
+        crate::ast::Span::new(FileId::DUMMY, 0, 0),
     );
     assert!(res.is_ok(), "unify_and_track should succeed");
 

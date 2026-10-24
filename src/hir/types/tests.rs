@@ -1,3 +1,4 @@
+use crate::ast::FileId;
 use super::*;
 
 fn new_ctx() -> TypeContext<'static> {
@@ -48,7 +49,7 @@ fn test_find_type_skips_volatile() {
     );
 }
 
-/// Review-fix pin: `place_is_prefix_of` implements "target is a PREFIX
+/// Pin: `place_is_prefix_of` implements "target is a PREFIX
 /// of frozen" (target equals some ancestor along frozen's base chain) —
 /// NOT a structure-aligned match.  `a.b` is a prefix of `a.b.c`;
 /// `a.b` is NOT a prefix of `a.c` (sibling fields).  A proposed
@@ -117,7 +118,7 @@ fn test_place_is_prefix_of_const_index() {
     assert!(place_is_prefix_of(&ai, &ai));
 }
 
-/// Committee ruling: raw pointers (`Pointer`/`Ptr`) are Copy — a raw
+/// Raw pointers (`Pointer`/`Ptr`) are Copy — a raw
 /// pointer is a usize-sized integer that owns nothing and has no
 /// `Drop`; copying an address has no memory cost or ownership
 /// consequence.  The pointee does not matter.
@@ -128,7 +129,7 @@ fn test_type_is_copy_raw_pointer() {
     let ptr = ctx.alloc(TypeData::Pointer { ty: int_ty });
     assert!(
         ctx.type_is_copy(ptr),
-        "raw `Pointer` must be Copy (committee ruling)"
+        "raw `Pointer` must be Copy"
     );
     let usize_ty = ctx.alloc(TypeData::USize);
     let ptr2 = ctx.alloc(TypeData::Ptr {
@@ -137,7 +138,7 @@ fn test_type_is_copy_raw_pointer() {
     });
     assert!(
         ctx.type_is_copy(ptr2),
-        "raw `Ptr` must be Copy (committee ruling)"
+        "raw `Ptr` must be Copy"
     );
 }
 
@@ -359,6 +360,82 @@ fn test_characteristic_ksp_convergence() {
     );
 }
 
+// -- B5a: ADT recursion detection via variant-payload expansion --
+#[test]
+fn kappa_recursive_enum_covariant_infinite() {
+    // A monomorphic self-recursive enum with a covariant payload
+    // (shape: `type Tree = enum { Node(Tree, Tree) }`): the expansion
+    // back-edge makes a covariant cycle → InfiniteEnumerable (the
+    // pre-B5a verdict was FiniteExhaustible(usize::MAX) — recursion was
+    // invisible to the graph).
+    let mut ctx = TypeContext::new();
+    let tree = ctx.enum_ty(DefId(9001), smallvec![]);
+    let pair = ctx.tuple(smallvec![tree, tree]);
+    ctx.register_adt_expansion(tree, vec![pair]);
+    assert_eq!(
+        ctx.characteristic(tree),
+        Characteristic::InfiniteEnumerable,
+        "covariant self-referential enum must be InfiniteEnumerable"
+    );
+}
+
+#[test]
+fn kappa_recursive_enum_invariant_undecidable() {
+    // A self-reference under a contravariant position (shape:
+    // `type Evil = enum { E(Evil -> ()) }`): the cycle carries a
+    // contravariant edge → Undecidable.
+    let mut ctx = TypeContext::new();
+    let evil = ctx.enum_ty(DefId(9002), smallvec![]);
+    let fn_ty = ctx.function(smallvec![evil], ctx.unit());
+    ctx.register_adt_expansion(evil, vec![fn_ty]);
+    assert_eq!(
+        ctx.characteristic(evil),
+        Characteristic::Undecidable,
+        "contravariant self-referential enum must be Undecidable"
+    );
+}
+
+#[test]
+fn kappa_per_scc_refinement_covariant_root() {
+    // B5b: the root sits in a COVARIANT cycle while a DISJOINT
+    // non-covariant cycle is also reachable:
+    //   wrap = enum { V(wrap, evil) }   (covariant self-cycle)
+    //   evil = enum { E(evil -> ()) }   (contravariant self-cycle)
+    // The pre-B5b global-flag classifier reported the root
+    // `Undecidable` (worst SCC's verdict); per-SCC classification
+    // gives the root its own SCC's verdict — InfiniteEnumerable.
+    let mut ctx = TypeContext::new();
+    let evil = ctx.enum_ty(DefId(9003), smallvec![]);
+    let evil_fn = ctx.function(smallvec![evil], ctx.unit());
+    ctx.register_adt_expansion(evil, vec![evil_fn]);
+    let wrap = ctx.enum_ty(DefId(9004), smallvec![]);
+    let pair = ctx.tuple(smallvec![wrap, evil]);
+    ctx.register_adt_expansion(wrap, vec![pair]);
+    assert_eq!(
+        ctx.characteristic(wrap),
+        Characteristic::InfiniteEnumerable,
+        "per-SCC: covariant root SCC must not inherit the distant SCC's verdict"
+    );
+}
+
+#[test]
+fn kappa_generic_recursive_enum_instantiation() {
+    // The shape the resolver hook (B5a) registers for a generic
+    // self-recursive enum instantiation:
+    //   `type List<T> = enum { Cons(T, List<T>), Nil }` with T = Int<32>
+    //   → payloads [Tuple{Int<32>, List[Int<32>]}, Unit]
+    let mut ctx = TypeContext::new();
+    let arg = ctx.int(32, true);
+    let list = ctx.enum_ty(DefId(9005), smallvec![arg]);
+    let cons_payload = ctx.tuple(smallvec![arg, list]);
+    ctx.register_adt_expansion(list, vec![cons_payload, ctx.unit()]);
+    assert_eq!(
+        ctx.characteristic(list),
+        Characteristic::InfiniteEnumerable,
+        "self-referential generic enum instantiation must be InfiniteEnumerable"
+    );
+}
+
 // -- Transaction --
 #[test]
 fn test_transaction_commit() {
@@ -532,7 +609,7 @@ fn test_yoneda_no_reduction() {
 
 #[test]
 fn test_yoneda_partial_match_no_reduction() {
-    // Review-fix regression: a PARTIAL Yoneda match must NOT reduce.
+    // Regression: a PARTIAL Yoneda match must NOT reduce.
     // `∀X. (A → X) → Int → X` — `A → X` matches the schema but `Int`
     // does not; silently dropping `Int` would reduce the type to `A`
     // (mathematically it is `Int → A`).  The reduction must abort and
@@ -1312,7 +1389,7 @@ fn test_compression_does_not_relocate_generic_binding_origin() {
     let mid = ctx.alloc(TypeData::InferVar { id: 7, universe: 0 });
     let root = ctx.alloc(TypeData::InferVar { id: 8, universe: 0 });
 
-    let original_site = crate::ast::Span::new(10, 20);
+    let original_site = crate::ast::Span::new(FileId::DUMMY, 10, 20);
     ctx.current_unify_span = Some(original_site);
     ctx.set_binding(param, mid);
     ctx.current_unify_span = None;
@@ -1324,7 +1401,7 @@ fn test_compression_does_not_relocate_generic_binding_origin() {
 
     // A later span-carrying unification walks this chain.  Compression
     // must not record IT as the binding site.
-    let later_site = crate::ast::Span::new(900, 950);
+    let later_site = crate::ast::Span::new(FileId::DUMMY, 900, 950);
     ctx.current_unify_span = Some(later_site);
     assert_eq!(ctx.resolve_binding_mut(param), Some(root));
     ctx.current_unify_span = None;

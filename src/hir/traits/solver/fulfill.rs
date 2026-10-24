@@ -459,7 +459,7 @@ impl<'a, 'input, D: SolverDelegate<'input>> FulfillmentContext<'a, D> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::hir::traits::ImplCandidate;

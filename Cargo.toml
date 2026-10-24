@@ -2,13 +2,27 @@
 name = "ponent"
 version = "0.0.0"
 edition = "2024"
-# Feature-implied floor: let-chains (`if let ... && ...`) require 1.88,
-# edition 2024 requires 1.85, `Option::is_none_or` requires 1.82.  Set so
-# an older toolchain fails with cargo's "requires rustc X" message instead
-# of a confusing cascade of syntax errors.  Not probed on every release —
-# it is the floor the features demand, not a claim about the newest one.
+# MSRV surface actually used by this tree, with the version each feature
+# stabilized — the FLOOR is the max of these, so adding one of these to a
+# file must be reflected here:
+#   - let-chains (`if let ... && ...`)  1.88  ← the current floor
+#   - `Option::is_none_or`              1.82
+#   - inline `const` array init
+#     `[const { AtomicU64::new(0) }; N]` 1.79
+#   - `let ... else`                    1.65
+#   - edition 2024                      1.85
+# Set so an older toolchain fails with cargo's "requires rustc X" message
+# instead of a confusing cascade of syntax errors.  Enforced by the `msrv`
+# job in .github/workflows/ci.yml.  Not probed on every release — it is
+# the floor the features demand, not a claim about the newest one.
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
+
+# The root package is implicitly a member.  `tools/codegen` is the build
+# tooling crate driven by `cargo xtask` (registry/locale validation gate,
+# explain-site renderer) and reused by build.rs via a path dependency.
+[workspace]
+members = ["tools/codegen"]
 
 [features]
 default = []
@@ -17,38 +31,85 @@ omniml_pool = []
 # (`test_bitwise_bii_support3_converges`): run it explicitly with
 # `--features slow-tests`. NOT part of the default/release test run.
 slow-tests = []
+shuttle = ["dep:shuttle"]
 
 [package.metadata.cargo-machete]
 ignored = ["z3"]
 
 [dependencies]
-textwrap = "0.16"
+memchr = "2"
+unicode-linebreak = "0.1"
 smallvec = "1.13"
 bitflags = "2.13.0"
 clap = { version = "4.6.1", features = ["derive"] }
+crossbeam-channel = "0.5"
+ena = "0.14"
+arrayvec = "0.7"
 indexmap = "2.14.0"
 logos = "0.16.1"
-bumpalo = "3"
+bumpalo = { version = "3", features = ["collections"] }
 rustc-hash = "2"
 regex-syntax = "0.8"
 mimalloc = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rayon = "1.10"
-z3 = { version = "0.20.2", features = ["vendored"] }
+z3 = { version = "0.21", features = ["vendored"] }
 stacker = "0.1.25"
 num-bigint = "0.4"
+supports-hyperlinks = "3"
 num-traits = "0.2"
 sexp = "1.1.4"
 parking_lot = "0.12"
 arc-swap = "1.9.2"
 boxcar = "0.2.14"
+unicode-width = "0.2"
+unicode-segmentation = "1.12"
+shuttle = { version = "0.9.5", optional = true }
+# Fluent i18n (rustc's own message format): `fluent-templates` embeds
+# `locales/*.ftl` into the binary at compile time via `static_loader!`
+# (keeps the offline explain server self-contained); `fluent-bundle`
+# provides `FluentValue` for the argument maps `tr!` builds.
+fluent-templates = "0.15.1"
+fluent-bundle = "0.16.0"
+thread_local = "1.1.10"
+# `CompactString` stores short strings (≤24 bytes) inline with no heap
+# allocation — used for error codes (`ErrCode`) and JSON-escaped field
+# values (`escape_json`), both typically tiny.
+compact_str = "0.10.0"
+# Content fingerprints for source files (`source_map::Fingerprint`):
+# xxHash3-128, one 128-bit digest per file's text.  The `xxh3` feature is
+# required — the module is feature-gated and off by default.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Compile-time contract enforcement (zero runtime cost): `assert_impl_all!`
+# / `assert_not_impl_all!` pin the auto-trait surface of the `sync` module's
+# two backends (parking_lot re-exports vs `shuttle` newtypes) so backend
+# drift fails the build at the contract site, not at a feature-gated call
+# site.  Already in the tree as a transitive dep of `compact_str`, so this
+# adds zero packages.
+static_assertions = "1.1.0"
+
+# Logical trait expressions for `static_assertions::const_assert!`:
+# `impls!(T: Send & !Sync)` states an *exact* marker-trait surface —
+# "Send, and deliberately NOT Sync" — as one sentence, which
+# "implements-all-of" checks cannot.  Used for the arena's `Bump` pin.
+# Macro-only, no transitive dependencies.
+impls = "1.0.3"
+terminal_size = "0.4.4"
+covariant-vec = "0.1.0"
+small-map = "0.1.5"
 
 # The AUTHORITATIVE Polonius R1-R8 engine (rustc's own), used as a
 # differential oracle in tests: our `evaluate_rules` must agree with it
 # on accept/reject.  Pulled from crates.io (no hard-coded local path).
 [dev-dependencies]
 polonius-engine = "0.13"
+
+# Snapshot tests pinning the *rendered shape* of diagnostics (glyph/HTML/JSON
+# layout, numbering, column arithmetic) that `contains` assertions cannot see
+# drift in.  External `.snap` files live next to `src/diagnostics/`.
+insta = { version = "1", features = ["filters"] }
 
 # The runtime support for the flowlog-build-generated `DatalogBatchEngine`
 # (differential dataflow primitives) — library mode, crates.io.
@@ -63,6 +124,13 @@ criterion = "0.5"
 [build-dependencies]
 flowlog-build = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# Error-code registry (`error_codes/codes.toml`) parsing for the CODE_TABLE
+# codegen, shared with the `cargo xtask` CLI (tools/codegen). Its internal
+# `toml` dep uses `preserve_order` so [codes.*] document order keeps the
+# generated table (and `list_error_codes` output) stable.
+# default-features=false drops the site renderer (pulldown-cmark) from the
+# build-script dependency graph.
+ponent-codegen = { path = "tools/codegen", default-features = false }
 
 [profile.release]
 # Whole-program optimisation + a single codegen unit: better inlining
@@ -86,4 +154,13 @@ panic = "unwind"
 # lib, and octagon.rs is self-contained with no `crate::` references).
 [[bench]]
 name = "octagon"
+harness = false
+
+# Lexer micro-benchmarks. `#[path]`-includes `src/sync.rs`,
+# `src/symbol.rs`, and `src/lexer/` (same empty-lib workaround as
+# octagon). Carries frozen copies of the pre-change algorithms as
+# same-binary A/B references — see the module doc for why cross-build
+# comparisons are not trusted on this box.
+[[bench]]
+name = "lexer"
 harness = false

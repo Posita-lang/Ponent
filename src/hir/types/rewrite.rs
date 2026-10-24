@@ -19,6 +19,7 @@
 //! tree family small; `τ(E)` (Fig. 5) lowers a simple (P₀) polynomial
 //! tree back to a monomorphic type.
 
+use crate::ast::FileId;
 use super::coherence::{Color, OccNode, OccTree};
 use super::*;
 
@@ -290,6 +291,14 @@ fn replace_binder_subtree(t: &PolyTree, x: usize, theta: &PolyTree) -> Option<Po
     }
 }
 
+// P3d: depth cap for the recursive PolyTree walkers below.  Source-
+// derived trees are already bounded by the parser's
+// `max_recursion_depth` (256), and Yoneda reduction only reshuffles
+// subtrees (reduct depth ≤ original + O(1)); the cap is defense-
+// in-depth for API-constructed trees — a depth past any legitimate
+// one fails closed (None) instead of risking a stack overflow.
+const WALK_DEPTH_CAP: usize = 100_000;
+
 /// Collect one Σ-branch per modular X̄-terminal: (∃Z⃗ binders, Π factors =
 /// the terminal's sibling spine factors).  For a bare X̄ leaf the minimal
 /// branch is (its binders, empty product ≙ 1).
@@ -300,7 +309,7 @@ fn collect_sum_branches(t: &PolyTree, x: usize) -> Option<Vec<(Vec<usize>, Vec<P
 }
 
 fn walk_sum(t: &PolyTree, x: usize, out: &mut Vec<(Vec<usize>, Vec<PolyTree>)>) -> Option<()> {
-    walk_sum_in(t, x, out, false)
+    walk_sum_in(t, x, out, false, 0)
 }
 
 fn walk_sum_in(
@@ -308,7 +317,11 @@ fn walk_sum_in(
     x: usize,
     out: &mut Vec<(Vec<usize>, Vec<PolyTree>)>,
     in_scope: bool,
+    depth: usize,
 ) -> Option<()> {
+    if depth > WALK_DEPTH_CAP {
+        return None; // P3d: fail-closed past the depth cap
+    }
     // Fig. 6a geometric surgery: for the subtree rooted at r_X (the node
     // binding X), each X̄ terminal at path p contributes one branch
     // ∃(terminal binders). Π(path sibling factors ++ terminal args).
@@ -320,6 +333,7 @@ fn walk_sum_in(
         x: usize,
         prefix: &[PolyTree],
         out: &mut Vec<(Vec<usize>, Vec<PolyTree>)>,
+        depth: usize,
     ) -> Option<()> {
         // Is this node itself an X̄ site?
         let is_site = n.label == x && n.color == Color::Red;
@@ -355,12 +369,12 @@ fn walk_sum_in(
                 }
             }
             match k {
-                PolyTree::Occ(inner) => sink(inner, x, &pf, out)?,
+                PolyTree::Occ(inner) => sink(inner, x, &pf, out, depth + 1)?,
                 poly => {
                     // Σ/Π node under the scope: descend structurally,
                     // KEEPING the r_X scope (scope is carried by the
                     // ancestors, not by the constructor node itself).
-                    walk_sum_in(poly, x, out, true)?;
+                    walk_sum_in(poly, x, out, true, depth + 1)?;
                 }
             }
         }
@@ -370,15 +384,15 @@ fn walk_sum_in(
         Occ(n) => {
             if n.binders.contains(&x) {
                 // r_X: collect branches from this subtree only.
-                sink(n, x, &[], out)
+                sink(n, x, &[], out, depth)
             } else if in_scope && n.label == x && n.color == Color::Red {
                 // An X̄ leaf under a Σ/Π constructor branch below r_X:
                 // still a collection site (scope carried by ancestors).
-                sink(n, x, &[], out)
+                sink(n, x, &[], out, depth)
             } else {
                 let deeper = in_scope || n.binders.iter().any(|b| *b == x);
                 for ch in &n.children {
-                    walk_sum_in(ch, x, out, deeper)?;
+                    walk_sum_in(ch, x, out, deeper, depth + 1)?;
                 }
                 Some(())
             }
@@ -389,14 +403,14 @@ fn walk_sum_in(
         PolySum { parts, .. } => {
             for (_, ts) in parts {
                 for t2 in ts {
-                    walk_sum_in(t2, x, out, in_scope)?;
+                    walk_sum_in(t2, x, out, in_scope, depth + 1)?;
                 }
             }
             Some(())
         }
         PolyProd { parts, .. } => {
             for t2 in parts {
-                walk_sum_in(t2, x, out, in_scope)?;
+                walk_sum_in(t2, x, out, in_scope, depth + 1)?;
             }
             Some(())
         }
@@ -408,7 +422,7 @@ fn walk_sum_in(
 fn collect_prod_factors(t: &PolyTree, x: usize) -> Option<(Vec<usize>, Vec<PolyTree>)> {
     let mut binders = Vec::new();
     let mut parts = Vec::new();
-    walk_prod(t, x, &mut binders, &mut parts)?;
+    walk_prod(t, x, &mut binders, &mut parts, 0)?;
     Some((binders, parts))
 }
 
@@ -417,7 +431,11 @@ fn walk_prod(
     x: usize,
     binders: &mut Vec<usize>,
     parts: &mut Vec<PolyTree>,
+    depth: usize,
 ) -> Option<()> {
+    if depth > WALK_DEPTH_CAP {
+        return None; // P3d: fail-closed past the depth cap
+    }
     match t {
         Occ(n) => {
             if n.label == x && n.color == Color::Blue {
@@ -438,21 +456,21 @@ fn walk_prod(
                 return Some(());
             }
             for ch in &n.children {
-                walk_prod(ch, x, binders, parts)?;
+                walk_prod(ch, x, binders, parts, depth + 1)?;
             }
             Some(())
         }
         PolySum { parts: ps, .. } => {
             for (_, ts) in ps {
                 for t2 in ts {
-                    walk_prod(t2, x, binders, parts)?;
+                    walk_prod(t2, x, binders, parts, depth + 1)?;
                 }
             }
             Some(())
         }
         PolyProd { parts: ps, .. } => {
             for t2 in ps {
-                walk_prod(t2, x, binders, parts)?;
+                walk_prod(t2, x, binders, parts, depth + 1)?;
             }
             Some(())
         }
@@ -555,13 +573,22 @@ pub fn is_simple(t: &PolyTree) -> bool {
 
 /// Standard reduction to a simple polynomial tree (or fail-closed None).
 ///
-/// Deterministic order: lowest binder index first (least-canceling spirit
-/// — innermost binders have smaller subtrees; the paper's least-canceling
-/// strategy defers canceling variables until their scope is emptied).
+/// Candidate order — least-canceling (Def 5.6 + the Thm 5.6 proof): a
+/// c-canceling variable X is reduced only after all bound variables in
+/// r_X's subtree are eliminated (the paper's "variables above r_X" —
+/// proof-theoretic trees grow with the root at the bottom, so "above" =
+/// deeper).  Ordering candidates by the *depth of r_X, descending*
+/// (deepest binder first) realizes exactly that constraint and defers
+/// canceling reductions until their scope is emptied.  Ties break on the
+/// binder index for determinism.
 pub fn standard_reduce(tree: &PolyTree) -> Option<PolyTree> {
     let mut cur = tree.clone();
     for _step in 0..10_000 {
-        if is_simple(&cur) {
+        // P2: one walk per step — remaining_bound_vars is BOTH the
+        // simplicity test (empty ⇒ P₀) and the candidate list; the old
+        // is_simple precheck walked the tree a second time.
+        let mut vars = remaining_bound_vars(&cur);
+        if vars.is_empty() {
             return Some(cur);
         }
         // Rebuild the coherence view for the current tree: we go through
@@ -570,8 +597,15 @@ pub fn standard_reduce(tree: &PolyTree) -> Option<PolyTree> {
         let flat = flat_view(&cur)?;
         // Coherence valuation (Def 5.5) fixes each variable's color.
         let phi = flat.valuation()?;
-        // Pick the lowest bound variable whose φ-color step applies.
-        let vars = remaining_bound_vars(&cur);
+        // Least-canceling order: deepest r_X first (see fn docs).
+        vars.sort_by_key(|&x| {
+            let d = flat
+                .binder_scope
+                .get(&x)
+                .map(|&r| flat.depth[r])
+                .unwrap_or(usize::MAX);
+            (std::cmp::Reverse(d), x)
+        });
         let mut progressed = false;
         for &x in &vars {
             let Some(&c) = phi.get(&x) else { continue };
@@ -637,16 +671,18 @@ fn flat_view(t: &PolyTree) -> Option<super::coherence::FlatTree> {
                 // an index already bound upstream (θ reconstruction of the
                 // SAME ∀Z⃗ from the (Y⁺) LHS, not a fresh binder) — treat
                 // re-registration as a reference, not a collision.
-                if !scope.contains_key(head) {
-                    scope.insert(*head, id);
-                }
+                // B4: this must be `entry().or_insert` — the previous
+                // unconditional `scope.insert(*head, id)` CLOBBERED the
+                // upstream scope entry, so a re-used µ/ν head index got a
+                // wrong r_X and every modular-distance computed against it
+                // in later reduction rounds was off.
+                scope.entry(*head).or_insert(id);
                 nodes.push(super::coherence::FlatNode {
                     label: *head,
                     color: Color::Blue,
                     binders: Vec::new(),
                     children: Vec::new(),
                 });
-                scope.insert(*head, id);
                 for (_, ts) in parts {
                     for t2 in ts {
                         let cid = walk(t2, nodes, scope)?;
@@ -663,9 +699,10 @@ fn flat_view(t: &PolyTree) -> Option<super::coherence::FlatTree> {
                 // Symmetric with PolySum: θ's {νX.}∀Z⃗ reconstruction may
                 // re-use indices already bound upstream — treat
                 // re-registration as a reference, not a collision.
-                if !scope.contains_key(head) {
-                    scope.insert(*head, id);
-                }
+                // B4: `entry().or_insert` (see the PolySum note — the
+                // unconditional inserts clobbered upstream scopes; the
+                // `contains_key` pre-checks below them were dead code).
+                scope.entry(*head).or_insert(id);
                 for b in binders {
                     scope.entry(*b).or_insert(id);
                 }
@@ -675,10 +712,6 @@ fn flat_view(t: &PolyTree) -> Option<super::coherence::FlatTree> {
                     binders: binders.clone(),
                     children: Vec::new(),
                 });
-                scope.insert(*head, id);
-                for b in binders {
-                    scope.insert(*b, id);
-                }
                 for t2 in parts {
                     let cid = walk(t2, nodes, scope)?;
                     nodes[id].children.push(cid);
@@ -735,7 +768,7 @@ impl<'input> TypeContext<'input> {
                                 branch,
                                 crate::ast::Expr::Literal(
                                     crate::ast::Literal::Bool(true),
-                                    crate::ast::Span::new(0, 0),
+                                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                                 ),
                             );
                         }
@@ -788,8 +821,26 @@ impl<'input> TypeContext<'input> {
                 // Plain Λ2 skeleton: a spine `Π children → label` lowered
                 // positively as a tuple→param arrow, or a bare variable.
                 if n.children.is_empty() {
+                    if n.label >= super::coherence::ATOM_LABEL_FLOOR && n.label != usize::MAX {
+                        // An inert atom terminal.  τ-lowering an atom
+                        // leaf needs the label→TypeId reverse map (a later
+                        // slice) — fail-closed here rather than minting a
+                        // bogus GenericParam with a huge index.  (κ,
+                        // coherence, and standard reduction all handle
+                        // atoms; only the τ endpoint is pending.)
+                        return None;
+                    }
                     if n.label == usize::MAX {
-                        return None; // synthetic root — not simple
+                        // A bare leaf with the reserved label is the
+                        // Π-factor identity `unit_leaf()` ≙ 1 — lower it
+                        // to Unit (Fig. 5: ▲ ↦ 1).  An earlier fail-closed
+                        // here blocked Example 3.1's witness pipeline: its
+                        // reduct carries unit factors, and ≅1 is the type's
+                        // PAPER verdict.  (A spine node with the reserved
+                        // label — children non-empty — cannot arise from a
+                        // reduction; the branch below keeps that
+                        // impossible shape fail-closed.)
+                        return Some(self.unit());
                     }
                     Some(self.generic_param(n.label, Symbol::intern(&format!("T{}", n.label))))
                 } else {
@@ -807,7 +858,7 @@ impl<'input> TypeContext<'input> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::super::coherence::Color;
     use super::*;
@@ -873,9 +924,8 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod golden_tests {
-    use super::super::coherence::Color;
     use super::*;
 
     fn forall(ctx: &mut TypeContext, idx: usize, body: TypeId) -> TypeId {
@@ -888,10 +938,10 @@ mod golden_tests {
         standard_reduce(&poly)
     }
 
-    /// Paper Example 3.1 (§3):
-    /// ∀XYZW.((((X→Y)→X→Z)→(Y→Z)→W)→(Y→Z)→W) ≅_Y 1.
-    /// Golden: the type must be coherent with κ=0, standard-reduce to a
-    /// simple (P₀) tree, and τ of that tree is the unit type.
+    /// Paper Example 3.1 (§3, verbatim):
+    /// ∀XYZW.((((X→Y)→X→Z)→(Y→Z)→W)→(Y→W)→W) ≅ 1 (unique inhabitant).
+    /// Golden: the type must be coherent (κ≠∞) per the §5 machinery,
+    /// standard-reduce to a simple (P₀) tree, and τ of that tree lowers.
     #[test]
     fn golden_example_3_1_unique_inhabitant() {
         let mut ctx = TypeContext::new();
@@ -904,12 +954,13 @@ mod golden_tests {
         let xy = ctx.function(smallvec![x], y);
         let xz = ctx.function(smallvec![x], z);
         let inner = ctx.function(smallvec![xy], xz);
-        // yz = Y→Z
+        // yz = Y→Z, yw = Y→W
         let yz = ctx.function(smallvec![y], z);
+        let yw = ctx.function(smallvec![y], w);
         // mid = inner → (Y→Z) → W
         let mid = ctx.function(smallvec![inner, yz], w);
-        // A = mid → (Y→Z) → W
-        let a = ctx.function(smallvec![mid, yz], w);
+        // A = mid → (Y→W) → W   (paper Example 3.1 exact: second arg is Y→W)
+        let a = ctx.function(smallvec![mid, yw], w);
 
         let ty = forall(&mut ctx, 0, a);
         let ty = forall(&mut ctx, 1, ty);
@@ -918,19 +969,29 @@ mod golden_tests {
 
         let ct = ctx.build_coherence_tree(ty).expect("Λ2 golden type");
         let k = ct.flat().characteristic();
-        assert!(k == 0 || k == 1, "Example 3.1 is coherent, got κ={k}");
-
-        let simple =
-            reduce(&ctx, ty).expect("Example 3.1: ≅_Y 1 means standard reduction converges");
-        assert!(is_simple(&simple));
-        // τ endpoint: the paper's answer is 1.  Our declarative (Y⁺) step
-        // reconstructs branch factors only for the depth≤2 modular window
-        // (a documented subset of Fig. 6's four geometric cases), so the
-        // lowered tree is a *sibling* of 1 under the partial Fig. 4
-        // axiomatization rather than literally Unit.  Golden-pins here:
-        // coherence (κ≠∞), convergence to P₀, and τ-lowerability — the
-        // exact endpoint needs the full Fig. 6 surgery (see roadmap).
-        let _lowered = ctx.tau(&simple).expect("τ of simple tree");
+        // Corrected verdict: COHERENT (κ=1), matching Thm 5.6 — the paper
+        // proves this type ≅ 1 in §3 via direct Yoneda isomorphisms
+        // (≅_W, ≅_Z, ≅_X, ≅_Y, ≅_η), and Thm 5.6 (coherent ⟺ strong
+        // convergence) therefore REQUIRES the tree to be coherent.  The
+        // the earlier κ=∞ came from counting two same-label spine SIBLINGS
+        // (mid/YW, both W̄) as paper-parallel — but the paper's trees carry
+        // labels on LEAVES only (§4.1 L844), so leaves under different
+        // spines are not parallel (Notation 5.1: parallel = immediate
+        // successors of the same node).  κ=1 (not 0): our tree has a cyclic
+        // alternating path — consistent with the reduction keeping the
+        // {μX.} binder (non-canceling form; the canceling elision is
+        // deferred to the canonical layer, Fig. 4c), so the reduct carries
+        // fixpoint heads.  The paper does not exhibit κ for this exact
+        // type; what Thm 5.6 pins is coherence + convergence, which is
+        // what this golden asserts.
+        assert_eq!(
+            k, 1,
+            "Example 3.1 must be coherent (κ≠∞) per Thm 5.6; κ=1 with the non-canceling reduct"
+        );
+        // Thm 5.6 (⟸ direction): coherent ⟹ standard reduction converges.
+        let simple = reduce(&ctx, ty)
+            .expect("coherent ⟹ strong convergence under standard reduction");
+        assert!(is_simple(&simple), "convergence lands on a P₀ tree");
     }
 
     /// Paper Fig. 2 (§1.1) six-inhabitant chain — the INITIAL type:
@@ -968,18 +1029,20 @@ mod golden_tests {
 
         let ct = ctx.build_coherence_tree(ty).expect("Λ2 golden type");
         let ft = ct.flat();
-        // Coherence note: the Fig.2 chain's first step uses Fig.1 (★)
-        // `∀X.X→X→A ≅ A[X↦1+1]`, which relies on sum types (1+1) — OUTSIDE
-        // the paper's tree representation (§4.1 excludes 0,+).  The two
-        // parallel X̄ params at the root make X non-modular, so the honest
-        // verdict of our Λ2-tree machinery is "incoherent": the chain's
-        // justification lives in the (Y⁺) schema applied after βη moves
-        // the paper performs on types, not on our trees.  Golden-pins the
-        // boundary instead of a false positive.
+        // Refreshed rationale (verdict unchanged): the two X̄ params at
+        // the root are PAPER-PARALLEL bare leaves (same parent, same
+        // label+color — Notation 5.1), so X is non-eliminable in both
+        // colors and the 2-SAT is UNSAT: κ=∞.  This is genuine, not a
+        // representation artifact: eliminating X here needs the Fig.1 (★)
+        // instantiation X ↦ 1+1 (a SUM type), which the paper performs on
+        // Λ2p-types with sums — outside the Λ2 tree schemas (Y⁺)/(Y⁻).
+        // (Atoms per se are not the blocker — a closed atom is a fine Λ2
+        // type and lazy atom terminals feed them through; the (★)
+        // step is what the tree machinery cannot express.)
         assert_eq!(
             ft.characteristic(),
             u8::MAX,
-            "Fig.2 initial type: tree-level verdict is incoherent (sum types excluded)"
+            "Fig.2 initial type: two parallel X̄ leaves ⇒ incoherent (the (★) 1+1 step lives outside the tree schemas)"
         );
     }
 
@@ -1077,9 +1140,19 @@ pub struct YonedaCoercion {
 
 impl<'input> TypeContext<'input> {
     /// Produce the coercion witness `A ⇄ M` where M = τ(reduct) of A's
-    /// standard reduction.  `want` selects the direction; a direction is
-    /// certified only when the canonical-form equivalence holds AND the
-    /// parametricity gate is open (fail-closed otherwise).
+    /// standard reduction.  `want` selects the direction.
+    ///
+    /// B6 (certification semantics, doc/impl aligned): a direction is
+    /// CERTIFIED exactly when (a) the parametricity gate is open, (b) A
+    /// lowers to a coherent Λ2 tree, (c) the standard reduction succeeds,
+    /// and (d) τ lowers the reduct.  No separate equivalence check runs —
+    /// the isomorphism is NOT verified here but guaranteed by the paper:
+    /// Lemma 5.3 (`t(A) ↝* E ∈ P₀ ⟹ A ≅_ν τ(E)`) plus Thm 5.6 (coherent
+    /// ⟺ strongly converges under standard reduction).  The coercion is
+    /// ε-theoretic, not βη — which is exactly why the gate is consulted.
+    ///
+    /// Fail-closed: gate closed, no coherent tree, reduction stuck, or
+    /// τ not lowerable ⇒ `None`.
     pub fn yoneda_coercion(&mut self, a: TypeId, want: YonedaDirection) -> Option<YonedaCoercion> {
         // ε-theoretic isomorphism: equivalence-strength use ⇒ gated.
         self.parametricity.equivalence_allowed()?;
@@ -1091,12 +1164,6 @@ impl<'input> TypeContext<'input> {
             YonedaDirection::Elim => (a, m),
             YonedaDirection::Intro => (m, a),
         };
-        // Direction certification: source and target must be canonically
-        // equivalent (they are Yoneda-isomorphic, which is strictly
-        // stronger — but the βη-level check is the sound one-sided
-        // approximation we can verify cheaply; when it fails we still
-        // accept because Yoneda iso does not imply βη-equality, so this
-        // is a *documentation-level* note, not a gate).
         Some(YonedaCoercion {
             source,
             target,
@@ -1104,9 +1171,12 @@ impl<'input> TypeContext<'input> {
         })
     }
 
-    /// Round-trip check: both witnesses exist, are mutually inverse at
-    /// the type level (Elim target == Intro source and vice versa), and
-    /// the two endpoints are canonically equivalent.
+    /// Round-trip check: both witnesses exist and are mutually inverse at
+    /// the type level (Elim's source/target are Intro's target/source —
+    /// both directions reduce to the SAME M = τ(reduct)).  Same
+    /// certification semantics as `yoneda_coercion`: gate open + coherent
+    /// reduction + τ lowering; the isomorphism itself is guaranteed
+    /// paper-side (Lemma 5.3 + Thm 5.6), not re-checked here.
     pub fn yoneda_round_trip(&mut self, a: TypeId) -> Option<(YonedaCoercion, YonedaCoercion)> {
         let elim = self.yoneda_coercion(a, YonedaDirection::Elim)?;
         let intro = self.yoneda_coercion(a, YonedaDirection::Intro)?;
@@ -1117,7 +1187,7 @@ impl<'input> TypeContext<'input> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod witness_tests {
     use super::*;
 
@@ -1146,9 +1216,15 @@ mod witness_tests {
         assert!(ctx.yoneda_round_trip(ty).is_none());
     }
 
-    /// Example 3.1's type: both witnesses exist and agree on M.
+    /// Example 3.1's type is COHERENT per the corrected §5 2-SAT (κ=1,
+    /// see `golden_example_3_1_unique_inhabitant`), so its standard
+    /// reduction converges and the type-level witness pair exists — the
+    /// earlier "incoherent ⇒ no witness" premise was a mis-translation of
+    /// Notation 5.1 (paper-parallel = paper siblings; labels live on
+    /// leaves, so same-label spines under different parents are not
+    /// parallel).
     #[test]
-    fn witness_round_trip_example_3_1() {
+    fn witness_example_3_1_round_trip() {
         let mut ctx = TypeContext::new();
         let x = ctx.generic_param(0, "X".into());
         let y = ctx.generic_param(1, "Y".into());
@@ -1158,16 +1234,50 @@ mod witness_tests {
         let xz = ctx.function(smallvec![x], z);
         let inner = ctx.function(smallvec![xy], xz);
         let yz = ctx.function(smallvec![y], z);
+        let yw = ctx.function(smallvec![y], w);
         let mid = ctx.function(smallvec![inner, yz], w);
-        let a = ctx.function(smallvec![mid, yz], w);
+        let a = ctx.function(smallvec![mid, yw], w);
         let ty = ctx.forall(0, "X".into(), a);
         let ty = ctx.forall(1, "Y".into(), ty);
         let ty = ctx.forall(2, "Z".into(), ty);
         let ty = ctx.forall(3, "W".into(), ty);
 
-        let (elim, intro) = ctx.yoneda_round_trip(ty).expect("≅_Y 1 ⇒ round trip");
+        // Coherent (κ=1) ⇒ standard reduction converges ⇒ round-trip
+        // witness exists, mutually inverse at the type level.
+        let (elim, intro) = ctx
+            .yoneda_round_trip(ty)
+            .expect("coherent per Thm 5.6 ⇒ round-trip witness");
         assert_eq!(elim.source, intro.target);
         assert_eq!(elim.target, intro.source);
+    }
+
+    /// Probe (follow-up): pin WHERE the Example 3.1 witness pipeline
+    /// runs — build → reduce → τ — so a regression names the stage.
+    #[test]
+    fn witness_example_3_1_pipeline_stages() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let y = ctx.generic_param(1, "Y".into());
+        let z = ctx.generic_param(2, "Z".into());
+        let w = ctx.generic_param(3, "W".into());
+        let xy = ctx.function(smallvec![x], y);
+        let xz = ctx.function(smallvec![x], z);
+        let inner = ctx.function(smallvec![xy], xz);
+        let yz = ctx.function(smallvec![y], z);
+        let yw = ctx.function(smallvec![y], w);
+        let mid = ctx.function(smallvec![inner, yz], w);
+        let a = ctx.function(smallvec![mid, yw], w);
+        let ty = ctx.forall(0, "X".into(), a);
+        let ty = ctx.forall(1, "Y".into(), ty);
+        let ty = ctx.forall(2, "Z".into(), ty);
+        let ty = ctx.forall(3, "W".into(), ty);
+
+        let ct = ctx.build_coherence_tree(ty).expect("stage 1: Λ2 tree");
+        let poly = from_occ(ct.root_tree());
+        let simple = standard_reduce(&poly).expect("stage 2: standard reduction");
+        assert!(is_simple(&simple));
+        let m = ctx.tau(&simple).expect("stage 3: τ lowering");
+        assert_ne!(m, ty, "τ endpoint is the monomorphic reduct, not A");
     }
 
     /// An incoherent type admits no witness at all (κ=∞ ⇒ no reduction).

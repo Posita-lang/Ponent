@@ -1,3 +1,49 @@
+//! Yoneda reduction driver (Pistone & Tranchini 2020, §3/§5).
+//!
+//! `try_yoneda_reduce` peels `∀X. (A ⇒ X) ⇒ B⟨X⟩ → B[X↦A]` (and the (X ⇒ A)
+//! dual) using a strictly-decreasing `∀`-count fuel (guaranteed
+//! termination, §3 quantifier measure).
+//!
+//! ## Roadmap
+//!
+//! **Stage 4 — ε-theory-strength equivalence (the gate).**
+//! The canonical-form (βη) equivalence in `canonical.rs`
+//! (`neg_beta_eta_equiv`) is a *sound one-sided approximation* of the
+//! partial Fig. 4 axiomatization — it is **not** full ε-theory.  Consumers
+//! that need ε-theory-strength isomorphisms (the Yoneda schemas
+//! ≅_X / ≅_X̄) must gate on the compilation-unit parametricity flag
+//! (`mod.rs` `parametricity`, set by a `dyn Trait` reification): when a
+//! parametricity-breaking construct is present the ε-strength isomorphisms
+//! are refused (fail-closed).  This is the "Stage 4 note" referenced from
+//! `canonical.rs` and `mod.rs`.
+//!
+//! **P3 — performance & safety hardening (implemented).**
+//! All items below are implemented; none affect the fail-closed
+//! correctness of the tree machinery:
+//! - `is_coherent` (2-SAT, `coherence.rs`): `FlatTree` now precomputes a
+//!   (label, color) → [node] index (`labeled`) at construction;
+//!   `nodes_labeled` is an O(1) lookup — the O(n²) clause pass no longer
+//!   rescans the nodes (O(N + n²·avg) total).
+//! - `has_cyclic_alternating_path`: the up-move ancestor query (γ ⪯ β)
+//!   uses Euler entry/exit times (`tin`/`tout` on `FlatTree`, built in
+//!   one iterative pass) — an O(1) subtree-interval test instead of a
+//!   per-query parent walk.
+//! - `to_neg` / `to_pos` (`canonical.rs`): the FV pass is INCREMENTAL —
+//!   `to_neg_fv`/`to_pos_fv` return the subtree's free-variable set along
+//!   with the canonical tree in ONE structural pass; the vacuous-binder
+//!   test is an O(1) `contains` instead of a per-binder `fvs()` rescan.
+//! - The recursive walkers: `build_kappa_graph` (kappa.rs) is fully
+//!   iterative (explicit frame stack); `walk_sum`/`walk_prod`
+//!   (rewrite.rs) are depth-capped (`WALK_DEPTH_CAP`, fail-closed `None`).
+//!   The remaining recursive walkers (`to_neg_fv`/`to_pos_fv`,
+//!   `FlatTree::flat`, `PolyTree::subst`, `collect_fvs`) are bounded above
+//!   by the parser's `max_recursion_depth` (256): a type too deep to
+//!   parse can never reach them from source.
+//! - `FUNCTOR_ACTION_FUEL` (`polar_action.rs`): BASE of a size-scaled
+//!   budget — `functor_action_fuel` uses `max(BASE, 10  node_count)`;
+//!   the binder-shadow rule remains the real termination argument.
+
+use crate::ast::FileId;
 use super::*;
 
 impl<'input> TypeContext<'input> {
@@ -162,7 +208,7 @@ impl<'input> TypeContext<'input> {
                         new_base,
                         crate::ast::Expr::Literal(
                             crate::ast::Literal::Bool(true),
-                            crate::ast::Span::new(0, 0),
+                            crate::ast::Span::new(FileId::DUMMY, 0, 0),
                         ),
                     )
                 } else {
@@ -403,7 +449,7 @@ impl<'input> TypeContext<'input> {
                                         w,
                                         crate::ast::Expr::Literal(
                                             crate::ast::Literal::Bool(true),
-                                            crate::ast::Span::new(0, 0),
+                                            crate::ast::Span::new(FileId::DUMMY, 0, 0),
                                         ),
                                     );
 

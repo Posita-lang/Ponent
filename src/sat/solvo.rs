@@ -1149,7 +1149,7 @@ impl Default for Solver {
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
 

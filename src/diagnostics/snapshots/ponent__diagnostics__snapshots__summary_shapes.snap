@@ -1,0 +1,10 @@
+---
+source: src/diagnostics/snapshots.rs
+expression: out
+---
+
+\- aborting due to previous error
+\- aborting due to 2 previous errors
+\- 1 warning emitted
+\- 4 warnings emitted
+\- aborting due to 2 previous errors; 1 warning emitted

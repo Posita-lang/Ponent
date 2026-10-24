@@ -1,3 +1,4 @@
+use crate::ast::FileId;
 use crate::ast::{Attribute, BinOp, Expr, Literal, UnaryOp};
 use crate::diagnostics::{DiagCtxt, Diagnostic};
 use crate::hir::target::Target;
@@ -466,7 +467,7 @@ fn build_clauses_inner<'input>(
                             // So we collect each arg's negated clauses, then
                             // cross-product them into the final clause list.
                             let mut arg_clause_sets: Vec<Vec<Vec<i32>>> = Vec::new();
-                            for arg in args {
+                            for arg in *args {
                                 let mut sub_clauses = Vec::new();
                                 build_clauses_inner(
                                     arg,
@@ -538,7 +539,7 @@ fn build_clauses_inner<'input>(
                                 clauses.extend(merged);
                             }
                         } else {
-                            for arg in args {
+                            for arg in *args {
                                 build_clauses_inner(
                                     arg,
                                     var_map,
@@ -555,7 +556,7 @@ fn build_clauses_inner<'input>(
                         // any(a, b) → a ∨ b
                         if negated {
                             // ¬(a ∨ b) ≡ ¬a ∧ ¬b
-                            for arg in args {
+                            for arg in *args {
                                 build_clauses_inner(
                                     arg,
                                     var_map,
@@ -568,7 +569,7 @@ fn build_clauses_inner<'input>(
                             }
                         } else {
                             let mut clause = Vec::new();
-                            for arg in args {
+                            for arg in *args {
                                 push_literals(
                                     arg,
                                     var_map,
@@ -706,7 +707,7 @@ fn push_literals<'input>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::ast::Span;
@@ -725,11 +726,11 @@ mod tests {
                 .map(|(k, v)| {
                     (
                         Symbol::intern(k),
-                        Expr::Literal(Literal::String(v.into()), Span::new(0, 0)),
+                        Expr::Literal(Literal::String(v.into()), Span::new(FileId::DUMMY, 0, 0)),
                     )
                 })
                 .collect(),
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         }
     }
 
@@ -814,9 +815,9 @@ mod tests {
         let target = make_target();
         let attr = Attribute {
             name: Symbol::intern("cfg"),
-            args: vec![Expr::Ident(Symbol::intern("debug"), Span::new(0, 0))],
+            args: vec![Expr::Ident(Symbol::intern("debug"), Span::new(FileId::DUMMY, 0, 0))],
             named_args: Vec::new(),
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         assert!(eval_cfg(
             &attr,
@@ -833,9 +834,9 @@ mod tests {
         let target = make_target();
         let attr = Attribute {
             name: Symbol::intern("cfg"),
-            args: vec![Expr::Ident(Symbol::intern("debug"), Span::new(0, 0))],
+            args: vec![Expr::Ident(Symbol::intern("debug"), Span::new(FileId::DUMMY, 0, 0))],
             named_args: Vec::new(),
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         assert!(!eval_cfg(
             &attr,
@@ -853,7 +854,7 @@ mod tests {
             name: Symbol::intern("deprecated"),
             args: Vec::new(),
             named_args: Vec::new(),
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         assert!(eval_cfg(
             &attr,
@@ -879,41 +880,41 @@ mod tests {
     fn test_cfg_mutual_exclusion_with_underscores() {
         let callee: &'static Expr<'static> = Box::leak(Box::new(Expr::Ident(
             Symbol::intern("all"),
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )));
         let left1: &'static Expr<'static> = Box::leak(Box::new(Expr::Ident(
             Symbol::intern("target_arch"),
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )));
         let right1: &'static Expr<'static> = Box::leak(Box::new(Expr::Literal(
             Literal::String("x86_64".into()),
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )));
         let binop1 = Expr::BinaryOp {
             left: left1,
             op: BinOp::Eq,
             right: right1,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         let left2: &'static Expr<'static> = Box::leak(Box::new(Expr::Ident(
             Symbol::intern("target_arch"),
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )));
         let right2: &'static Expr<'static> = Box::leak(Box::new(Expr::Literal(
             Literal::String("aarch64".into()),
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )));
         let binop2 = Expr::BinaryOp {
             left: left2,
             op: BinOp::Eq,
             right: right2,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         let expr = Expr::Call {
             callee,
-            args: vec![binop1, binop2],
+            args: Box::leak(vec![binop1, binop2].into_boxed_slice()),
             comptime: false,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
 
         let mut var_map = std::collections::HashMap::new();

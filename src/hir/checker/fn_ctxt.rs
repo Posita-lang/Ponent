@@ -1,3 +1,4 @@
+use crate::ast::FileId;
 use super::{
     CtxKind, EffectSet, Expectation, ScopedVarMap, TypeChecker, TypingContext,
     did_you_mean_suggestion, typing_context_to_type_ctx,
@@ -13,6 +14,7 @@ use crate::hir::symbol::{FunctionSignature, TypeBinding, TypeKind};
 use crate::hir::types::{Characteristic, DefId, Rigidity, Subst, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
 use smallvec::{SmallVec, smallvec};
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 /// Default bit width for `Int` / `UInt` when no explicit width is given.
@@ -48,6 +50,45 @@ fn pattern_covers_variant(p: &crate::ast::Pattern, v: &str) -> bool {
 impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
     pub fn new(checker: &'tcx mut TypeChecker<'a, 'src, 'input>) -> Self {
         FnCtxt { checker }
+    }
+
+    /// B7: run `f` with the coercion-context flag set to `CallSite`,
+    /// restoring the previous value afterwards.  Sequential borrows —
+    /// swap, drop the borrow, hand the full `&mut self` to `f`, re-borrow
+    /// to store — need no unsafe pointer; `?` inside `f` cannot skip the
+    /// restore.  See `crate::hir::types::coercion` module doc.
+    pub(crate) fn with_call_site_coercion<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev = crate::hir::types::CoercionContext::from_u8(
+            self.checker
+                .ctx
+                .current_coercion_ctx
+                .swap(crate::hir::types::CoercionContext::CallSite.to_u8(), std::sync::atomic::Ordering::Relaxed),
+        );
+        let r = f(self);
+        self.checker
+            .ctx
+            .current_coercion_ctx
+            .store(prev.to_u8(), std::sync::atomic::Ordering::Relaxed);
+        r
+    }
+
+    /// B7: run `f` with the coercion-context flag set to `Structural`
+    /// (data-constructor positions: struct fields, ADT payloads, array
+    /// elements — `@auto_ro`'s freeze must NOT apply there).  Same
+    /// sequential-borrow discipline as `with_call_site_coercion`.
+    pub(crate) fn with_structural_coercion<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev = crate::hir::types::CoercionContext::from_u8(
+            self.checker
+                .ctx
+                .current_coercion_ctx
+                .swap(crate::hir::types::CoercionContext::Structural.to_u8(), std::sync::atomic::Ordering::Relaxed),
+        );
+        let r = f(self);
+        self.checker
+            .ctx
+            .current_coercion_ctx
+            .store(prev.to_u8(), std::sync::atomic::Ordering::Relaxed);
+        r
     }
 
     /// Whether a statement BLOCK diverges unconditionally (its
@@ -137,7 +178,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
     }
 
     /// Suggest a cast for common type mismatches (e.g. Int ↔ Float).
-    pub fn suggest_cast(&self, expected: TypeId, actual: TypeId) -> Option<Suggestion> {
+    pub fn suggest_cast(&self, expected: TypeId, actual: TypeId) -> Option<Suggestion<'src>> {
         let (e, a) = (self.checker.ctx.get(expected), self.checker.ctx.get(actual));
         let msg = match (e, a) {
             (TypeData::Int { .. }, TypeData::Float { .. })
@@ -160,6 +201,8 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             message: m.into(),
             applicability: Applicability::MaybeIncorrect,
             style: SuggestionStyle::ShowAlways,
+            span: None,
+            replacement: None,
         })
     }
 
@@ -187,7 +230,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
     /// Generate a human-readable reason for a type mismatch between two
     /// types, explaining *why* they are incompatible.
     /// Delegates to [`TypeChecker::type_mismatch_reason`].
-    fn type_mismatch_reason(&self, expected: TypeId, actual: TypeId) -> Option<String> {
+    fn type_mismatch_reason(&self, expected: TypeId, actual: TypeId) -> Option<Cow<'static, str>> {
         self.checker.type_mismatch_reason(expected, actual)
     }
 
@@ -208,14 +251,12 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                         .checker
                         .ctx
                         .get(expected)
-                        .display_with(self.checker.ctx, Some(self.checker.symbols))
-                        .into_owned(),
+                        .display_with(self.checker.ctx, Some(self.checker.symbols)),
                     found: self
                         .checker
                         .ctx
                         .get(actual)
-                        .display_with(self.checker.ctx, Some(self.checker.symbols))
-                        .into_owned(),
+                        .display_with(self.checker.ctx, Some(self.checker.symbols)),
                     span,
                     found_span: None,
                     reason,
@@ -250,14 +291,12 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                             .checker
                             .ctx
                             .get(expected)
-                            .display_with(self.checker.ctx, Some(self.checker.symbols))
-                            .into_owned(),
+                            .display_with(self.checker.ctx, Some(self.checker.symbols)),
                         found: self
                             .checker
                             .ctx
                             .get(actual)
-                            .display_with(self.checker.ctx, Some(self.checker.symbols))
-                            .into_owned(),
+                            .display_with(self.checker.ctx, Some(self.checker.symbols)),
                         span,
                         found_span: None,
                         reason,
@@ -466,13 +505,13 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
         payload: Option<&Expr<'input>>,
     ) -> bool {
         let ty_ast =
-            crate::ast::Type::Path(smallvec::SmallVec::from(path), crate::ast::Span::new(0, 0));
+            crate::ast::Type::Path(smallvec::SmallVec::from(path), crate::ast::Span::new(FileId::DUMMY, 0, 0));
         let Ok(enum_ty) = self.resolve_type(&ty_ast) else {
             return false;
         };
         let Ok((def_id, _)) = self
             .checker
-            .resolve_type_to_struct_or_enum(enum_ty, crate::ast::Span::new(0, 0))
+            .resolve_type_to_struct_or_enum(enum_ty, crate::ast::Span::new(FileId::DUMMY, 0, 0))
         else {
             return false;
         };
@@ -1129,23 +1168,23 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     // `@auto_ro`/`@auto_coerce` applies to method
                     // receivers too (SYNTAX.md: "at function call
                     // sites and method resolution").
-                    let _receiver_coercion =
-                        crate::hir::types::CallSiteCoercion::enter(&self.checker.ctx);
-                    // Try direct unification first (self = MyType, receiver = MyType)
-                    let unified = self
-                        .unify_with(self_param_ty, base_ty, *span, TypingContext::None)
-                        .is_ok();
-                    if !unified {
-                        // If self param is a ref and receiver is a value, auto-ref
-                        if let TypeData::Ref { ty: inner_ref, .. } =
-                            self.checker.ctx.get(self_param_ty)
-                        {
-                            let ref_base = self.checker.ctx.reference(base_ty, false);
-                            let _ = self
-                                .unify_with(self_param_ty, ref_base, *span, TypingContext::None)
-                                .is_ok();
+                    self.with_call_site_coercion(|this| {
+                        // Try direct unification first (self = MyType, receiver = MyType)
+                        let unified = this
+                            .unify_with(self_param_ty, base_ty, *span, TypingContext::None)
+                            .is_ok();
+                        if !unified {
+                            // If self param is a ref and receiver is a value, auto-ref
+                            if let TypeData::Ref { ty: inner_ref, .. } =
+                                this.checker.ctx.get(self_param_ty)
+                            {
+                                let ref_base = this.checker.ctx.reference(base_ty, false);
+                                let _ = this
+                                    .unify_with(self_param_ty, ref_base, *span, TypingContext::None)
+                                    .is_ok();
+                            }
                         }
-                    }
+                    });
                 }
                 let explicit_param_tys = if param_tys.len() > 1 {
                     &param_tys[1..] // skip self
@@ -1488,7 +1527,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
         // scrutinee's type is RIGID (user-annotated).  A wobbly (inferred)
         // scrutinee keeps the status-quo cross-arm accumulation.
         let scrut_rigid = self.scrut_is_rigid(scrutinee);
-        for arm in arms {
+        for arm in *arms {
             // GADT refinements are scoped to each arm via the
             // equality registry (see push_gadt_arm).
             // Each arm gets its own scope so that binding a type
@@ -1909,14 +1948,15 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                         .first()
                         .copied()
                         .unwrap_or(self.checker.ctx.error());
-                    let _enum_guard =
-                        crate::hir::types::StructuralCoercion::enter(&self.checker.ctx);
-                    let hir_arg = self.check_expr(
-                        p,
-                        Expectation::HasType(expected),
-                        TypingContext::Argument { index: 0, total: 1 },
-                    )?;
-                    hir_args.push(hir_arg);
+                    self.with_structural_coercion(|this| -> Result<(), Diagnostic<'src>> {
+                        let hir_arg = this.check_expr(
+                            p,
+                            Expectation::HasType(expected),
+                            TypingContext::Argument { index: 0, total: 1 },
+                        )?;
+                        hir_args.push(hir_arg);
+                        Ok(())
+                    })?;
                 }
                 let callee_hir = HirExpr::Ident(*variant, ret_ty, *span);
                 return Ok((
@@ -2066,7 +2106,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             // accepted for every T).  Reject the construction so the
             // GADT invariant is preserved — callers must pass
             // concrete type arguments.
-            // The committee ruling (solve → default → validate):
+            // Solve → default → validate:
             // unresolved type arguments at construction time are NO
             // longer rejected here — the construction is deferred to
             // the post-solve validation phase.
@@ -2129,7 +2169,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             // args must be rejected, not silently accepted after
             // rollback (which would forget the GADT constraint and
             // accept `mk<T>()` for every T).
-            // The committee ruling (solve → default → validate):
+            // Solve → default → validate:
             // unresolved type arguments at construction time are NO
             // longer rejected here — the construction is deferred to
             // the post-solve validation phase.
@@ -2604,7 +2644,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
         }
 
         let mut hir_branches = Vec::new();
-        for branch in branches {
+        for branch in *branches {
             let _scope = self.checker.enter_var_scope();
             let exist_depth = self.checker.ctx.gadt.exist_skolems.read().len();
             let pattern_hir = self.check_pattern(&branch.pattern, error_ty, exist_depth)?;
@@ -2817,7 +2857,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
         match expr {
             Expr::Literal(lit, span) => {
                 match lit {
-                    Literal::Int(_) => {
+                    Literal::Int(v) => {
                         let ty = self.new_infer_var(
                             TypeVariableKind::Integer,
                             crate::hir::infer::VarOrigin::Expression(Some(*span)),
@@ -2829,6 +2869,10 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                         if let Some(e) = expected {
                             if self.checker.ctx.is_integer(e) {
                                 self.unify_with(e, ty, *span, TypingContext::None)?;
+                                // Unification is width-blind: `300: Int<8>`
+                                // unifies cleanly, so enforce the literal's
+                                // value against the concrete width too.
+                                self.check_int_literal_fits(v, e, *span);
                             }
                         }
                         Ok((HirExpr::Literal(lit.clone(), ty, *span), ty))
@@ -2846,6 +2890,12 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     }
                     Literal::Char(_) => {
                         let ty = self.checker.ctx.char();
+                        Ok((HirExpr::Literal(lit.clone(), ty, *span), ty))
+                    }
+                    Literal::Byte(_) => {
+                        // Byte char literals `b'x'` have type `Byte` =
+                        // `UInt<8>` (SYNTAX.md).
+                        let ty = self.checker.ctx.byte();
                         Ok((HirExpr::Literal(lit.clone(), ty, *span), ty))
                     }
                     Literal::String(_) => {
@@ -2982,6 +3032,34 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 // incremented/decremented but never read).
                 let operand_res = self.infer_expr(expr, None);
                 let (hir, ty) = operand_res?;
+                // `-300: Int<8>` / `-1: UInt<8>`: the operand is inferred
+                // with NO expectation, so the literal value-fit check
+                // (`check_int_literal_fits`) never sees it — check the
+                // NEGATED value here.  Negating before the fit check is
+                // what keeps `-2^63: Int<64>` legal: the bare operand
+                // `2^63` does not fit `Int<64>`, the negated value does.
+                if let UnaryOp::Neg = op
+                    && let Some(e) = expected
+                    && self.checker.ctx.is_integer(e)
+                    && let Expr::Literal(Literal::Int(v), _) = expr
+                {
+                    // `Large` (a `u128`-range literal above `i128::MAX`)
+                    // negates to a negative BigInt; `to_i128` would drop
+                    // it and silently skip the check, letting e.g.
+                    // `-340282366920938463463374607431768211455: UInt<128>`
+                    // through.
+                    let neg = match v {
+                        crate::ast::IntLit::Small(n) => {
+                            n.checked_neg().map(crate::ast::IntLit::Small)
+                        }
+                        crate::ast::IntLit::Large(b) => Some(crate::ast::IntLit::Large(
+                            Box::new(-(&**b)),
+                        )),
+                    };
+                    if let Some(neg) = neg {
+                        self.check_int_literal_fits(&neg, e, *span);
+                    }
+                }
                 let result_ty = match op {
                     UnaryOp::Neg | UnaryOp::BitNot => ty,
                     UnaryOp::Not => self.checker.ctx.bool(),
@@ -3281,7 +3359,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     }
                 }
                 let mut hir_fields = Vec::new();
-                for (name, value) in fields {
+                for (name, value) in *fields {
                     let field_def =
                         binding
                             .fields
@@ -3290,10 +3368,10 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                             .ok_or_else(|| {
                                 let field_names: Vec<&'static str> =
                                     binding.fields.iter().map(|f| f.name.as_str()).collect();
-                                let type_name = format!("{:?}", def_id);
+                                let type_name = format!("{:?}", def_id).into();
                                 let mut diag =
                                     Diagnostic::error_kind(DiagnosticKind::NoSuchField {
-                                        field_name: name.to_string(),
+                                        field_name: name.to_string().into(),
                                         type_name,
                                         span: *span,
                                     })
@@ -3310,14 +3388,22 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                 diag
                             })?;
                     let field_ty = self.checker.ctx.subst(field_def.ty, &subst);
-                    let _struct_guard =
-                        crate::hir::types::StructuralCoercion::enter(&self.checker.ctx);
-                    let hir = self.check_expr(
-                        value,
-                        Expectation::HasType(field_ty),
-                        TypingContext::StructFieldInit,
+                    let hir = self.with_structural_coercion(
+                        |this| -> Result<HirExpr<'input>, Diagnostic<'src>> {
+                            let hir = this.check_expr(
+                                value,
+                                Expectation::HasType(field_ty),
+                                TypingContext::StructFieldInit,
+                            )?;
+                            this.unify_with(
+                                field_ty,
+                                hir.ty(),
+                                *span,
+                                TypingContext::StructFieldInit,
+                            )?;
+                            Ok(hir)
+                        },
                     )?;
-                    self.unify_with(field_ty, hir.ty(), *span, TypingContext::StructFieldInit)?;
                     hir_fields.push((*name, Box::new(hir)));
                 }
                 Ok((
@@ -3338,7 +3424,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             Expr::Tuple(exprs, span) => {
                 let mut hirs = Vec::new();
                 let mut types: SmallVec<[TypeId; 4]> = SmallVec::new();
-                for e in exprs {
+                for e in *exprs {
                     let (hir, ty) = self.infer_expr(e, None)?;
                     hirs.push(hir);
                     types.push(ty);
@@ -3349,16 +3435,18 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             Expr::Array(exprs, span) => {
                 let mut hirs = Vec::new();
                 let mut elem_ty = None;
-                let _array_guard = crate::hir::types::StructuralCoercion::enter(&self.checker.ctx);
-                for e in exprs {
-                    let (hir, ty) = self.infer_expr(e, None)?;
-                    if let Some(et) = elem_ty {
-                        self.unify_with(et, ty, *span, TypingContext::None)?;
-                    } else {
-                        elem_ty = Some(ty);
+                self.with_structural_coercion(|this| -> Result<(), Diagnostic<'src>> {
+                    for e in *exprs {
+                        let (hir, ty) = this.infer_expr(e, None)?;
+                        if let Some(et) = elem_ty {
+                            this.unify_with(et, ty, *span, TypingContext::None)?;
+                        } else {
+                            elem_ty = Some(ty);
+                        }
+                        hirs.push(hir);
                     }
-                    hirs.push(hir);
-                }
+                    Ok(())
+                })?;
                 let ty = self.checker.ctx.array(
                     elem_ty.unwrap_or(self.checker.ctx.error()),
                     exprs.len() as u64,
@@ -3374,7 +3462,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             } => {
                 let mut hir_params = Vec::new();
                 let mut param_tys: SmallVec<[TypeId; 4]> = SmallVec::new();
-                for param in params {
+                for param in *params {
                     let ty = param
                         .ty
                         .as_ref()
@@ -3422,7 +3510,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     HirExpr::Closure {
                         params: hir_params,
                         return_type: ret_ty,
-                        captures: captures.clone(),
+                        captures: captures.to_vec(),
                         body: body_hir,
                         ty,
                         span: *span,
@@ -3856,7 +3944,26 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
     /// positions — struct/array/ADT fields — must NOT inherit `@auto_ro`),
     /// then the top-level argument→parameter coercion happens under
     /// `CallSite` — the ONLY place `@auto_ro`'s implicit freeze may apply.
+    /// B7: scoped entry — the whole body runs under the `CallSite`
+    /// coercion context (the raw-pointer RAII guard is gone; see
+    /// `crate::hir::types::coercion` module doc for the sequential-borrow
+    /// discipline).
     fn check_call_argument(
+        &mut self,
+        arg: &crate::ast::Expr<'input>,
+        expected: TypeId,
+        index: usize,
+        total: usize,
+        span: crate::ast::Span,
+    ) -> Result<HirExpr<'input>, Diagnostic<'src>> {
+        self.with_call_site_coercion(|this| {
+            this.check_call_argument_impl(arg, expected, index, total, span)
+        })
+    }
+
+    /// The original body of `check_call_argument`, run under the
+    /// `CallSite` context installed by the wrapper above.
+    fn check_call_argument_impl(
         &mut self,
         arg: &crate::ast::Expr<'input>,
         expected: TypeId,
@@ -3871,7 +3978,6 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
         // losing the `@auto_ro` freeze (see `check_call_argument` doc).
         // Data-constructor positions (struct fields, ADT payloads, array
         // elements) inside `check_expr` set `Structural` temporarily.
-        let _coercion = crate::hir::types::CallSiteCoercion::enter(&self.checker.ctx);
         // Infer the argument type with the expected type hint (for context-
         // sensitive inference like `Expr::EnumLit` type-argument recovery),
         // but do NOT unify yet — the deref coercion (if `@auto_coerce` is
@@ -3999,8 +4105,8 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 }
             }
         }
-        // (committee ruling, 2026-08-05): the implicit `@auto_ro`/`@auto_coerce`
-        // downgrade (`&mut T` argument → `&T` parameter) registers NO loan
+        // The implicit `@auto_ro`/`@auto_coerce` downgrade (`&mut T`
+        // argument → `&T` parameter) registers NO loan
         // in the type checker (only `unify_with` runs — see the
         // `unify_internal_impl` Ref-arm comment: "does NOT register a
         // loan"); the source remains mutable here.  Any freeze for the
@@ -4042,8 +4148,8 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
         param_tys: &[TypeId],
         span: crate::ast::Span,
     ) -> Result<Vec<HirExpr<'input>>, Diagnostic<'src>> {
-        // (committee ruling, 2026-08-05): NO loan is registered for `@auto_ro`
-        // implicit downgrades (the freeze is unobservable in the current
+        // NO loan is registered for `@auto_ro` implicit downgrades (the
+        // freeze is unobservable in the current
         // grammar — see `check_call_argument`).  Explicit loans
         // (`&ro`/`.freeze!()`/`&mut`) created inside the argument
         // expressions survive the call and live until their borrow
@@ -4208,7 +4314,8 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     self.checker.ctx,
                     self.checker.symbols,
                     &mut self.checker.diagnostics,
-                );
+                )
+                .with_experimental(self.checker.enable_experimental);
                 for (fn_name, (fn_params, fn_body)) in
                     self.checker.shared.comptime_fn_registry.read().clone()
                 {
@@ -4283,7 +4390,8 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             self.checker.ctx,
             self.checker.symbols,
             &mut self.checker.diagnostics,
-        );
+        )
+        .with_experimental(self.checker.enable_experimental);
         for (fn_name, (fn_params, fn_body)) in
             self.checker.shared.comptime_fn_registry.read().clone()
         {
@@ -4401,6 +4509,79 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
     ) -> Result<(), Diagnostic<'src>> {
         self.checker
             .check_kind_compat(maybe_var, maybe_var_span, other, other_span, span)
+    }
+
+    /// Bit width for an `Int`/`UInt` type argument, clamped to the default
+    /// when the argument is not a valid width.
+    ///
+    /// The resolver's `resolve_int_width` resolves the same AST type first
+    /// and owns the out-of-range diagnostic (1..=64, or 1..=128 with
+    /// `--enable-experimental`); this arm must stay silent to avoid
+    /// duplicate diagnostics for one mistake.  The clamp also keeps
+    /// `Int<0>` away from `ctx.int`, whose debug assertion requires
+    /// `1..=128` (and `IntLit::fits_signed` underflows on width 0).
+    fn int_width_or_default(&self, args: &[GenericArg<'input>]) -> u32 {
+        match args
+            .get(0)
+            .and_then(|arg| self.checker.extract_int_from_type(&arg.ty()))
+        {
+            Some(w) if w >= 1 => w,
+            _ => DEFAULT_INT_WIDTH,
+        }
+    }
+
+    /// Value-fit enforcement for integer literals: SYNTAX.md §Literals —
+    /// "The suffix is syntactic sugar and the type is fully checked" — so
+    /// `300i8` and `300: Int<8>` must be rejected even though `Int<8>`
+    /// unifies with the literal's integer variable (that unification is
+    /// width-blind).  Only fires when the expected type is a concrete
+    /// `Int<N>`/`UInt<N>` at the literal's own check time; a literal that
+    /// reaches its concrete width only through later inference is not
+    /// tracked, and cast operands (checked with no expectation) are
+    /// deliberately unaffected.
+    fn check_int_literal_fits(&mut self, v: &crate::ast::IntLit, expected: TypeId, span: Span) {
+        let (bits, unsigned) = match self.checker.ctx.get(expected) {
+            TypeData::Int { bits, signed, .. } => (*bits, !*signed),
+            TypeData::UInt { bits, .. } => (*bits, true),
+            _ => return,
+        };
+        // `bits == 0` is unreachable (`ctx.int` asserts 1..=128) but
+        // `fits_signed` underflows on it — fail closed.
+        if bits == 0 {
+            return;
+        }
+        let fits = if unsigned {
+            v.fits_unsigned(bits as u64)
+        } else {
+            v.fits_signed(bits as u64)
+        };
+        if fits {
+            return;
+        }
+        let ty_name = if unsigned {
+            format!("UInt<{bits}>")
+        } else {
+            format!("Int<{bits}>")
+        };
+        // The general formulas overflow at `bits == 128` (`1u128 << 128`
+        // trips the shift-overflow check; `-i128::MIN` trips negation);
+        // the 128-bit ranges are exactly the primitive extremes.
+        let range = if unsigned {
+            if bits >= 128 {
+                format!("0..={}", u128::MAX)
+            } else {
+                format!("0..={}", (1u128 << bits) - 1)
+            }
+        } else if bits >= 128 {
+            format!("{}..={}", i128::MIN, i128::MAX)
+        } else {
+            format!("{}..={}", -(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+        };
+        self.checker.diagnostics.push(
+            Diagnostic::error(format!("integer literal `{v}` does not fit in `{ty_name}`"))
+                .with_span(span)
+                .with_help(format!("`{ty_name}` represents values in {range}")),
+        );
     }
 
     /// Resolve a syntactic type to a TypeId — actual implementation.
@@ -4547,16 +4728,10 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 if let Type::Path(path, _) = base {
                     if path.len() == 1 {
                         if path[0].eq_str("Int") {
-                            let width = args
-                                .get(0)
-                                .and_then(|arg| self.checker.extract_int_from_type(&arg.ty()))
-                                .unwrap_or(DEFAULT_INT_WIDTH);
+                            let width = self.int_width_or_default(args);
                             return Ok(self.checker.ctx.int(width, true));
                         } else if path[0].eq_str("UInt") {
-                            let width = args
-                                .get(0)
-                                .and_then(|arg| self.checker.extract_int_from_type(&arg.ty()))
-                                .unwrap_or(DEFAULT_INT_WIDTH);
+                            let width = self.int_width_or_default(args);
                             return Ok(self.checker.ctx.int(width, false));
                         } else if path[0].eq_str("Float") {
                             let width = args
@@ -4682,7 +4857,8 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                 self.checker.ctx,
                                 self.checker.symbols,
                                 &mut self.checker.diagnostics,
-                            );
+                            )
+                            .with_experimental(self.checker.enable_experimental);
                             for (name, (params, body)) in
                                 self.checker.shared.comptime_fn_registry.read().clone()
                             {
@@ -4802,9 +4978,14 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 // A `dyn Trait` in the compilation unit breaks parametricity
                 // (runtime type reification distinguishes instantiations) —
                 // close the parametricity gate regardless of strict-mode
-                // rejection.  Yoneda-reduction-as-equivalence consumers
-                // consult this via `neg_beta_eta_equiv_gated`; κ diagnostics
-                // are unaffected (see `hir::parametricity` docs).
+                // rejection.  NOTE: this fires on the CURRENT (possibly
+                // worker-local) context; the authoritative unit-level hook
+                // is the resolver's `resolve_type_expr` DynTrait scan
+                // (workers fork their own TypeContext, so a worker-local
+                // hook alone under-approximates the unit-wide guarantee).
+                // Yoneda-reduction-as-equivalence consumers consult the
+                // gate via `neg_beta_eta_equiv_gated`; κ diagnostics are
+                // unaffected (see `hir::parametricity` docs).
                 self.checker.ctx.parametricity.break_parametricity();
                 let trait_ids: Vec<_> = traits
                     .iter()
@@ -5176,7 +5357,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     self.checker.ctx.error()
                 };
                 let mut hir_before = Vec::new();
-                for pat in before {
+                for pat in *before {
                     hir_before.push(self.check_pattern(pat, elem_ty, exist_depth)?);
                 }
                 let hir_slice = slice
@@ -5189,7 +5370,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     })
                     .transpose()?;
                 let mut hir_after = Vec::new();
-                for pat in after {
+                for pat in *after {
                     hir_after.push(self.check_pattern(pat, elem_ty, exist_depth)?);
                 }
                 Ok(HirPattern::Slice(hir_before, hir_slice, hir_after, *span))
@@ -5253,16 +5434,16 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     subst.insert(i, type_args[i]);
                 }
                 let mut hir_fields = Vec::new();
-                for (name, pat) in fields {
+                for (name, pat) in *fields {
                     let field_def =
                         binding
                             .fields
                             .iter()
                             .find(|f| f.name == *name)
                             .ok_or_else(|| {
-                                let type_name = format!("{:?}", def_id);
+                                let type_name = format!("{:?}", def_id).into();
                                 Diagnostic::error_kind(DiagnosticKind::NoSuchField {
-                                    field_name: name.to_string(),
+                                    field_name: name.to_string().into(),
                                     type_name,
                                     span: *span,
                                 })
@@ -5539,7 +5720,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 // propagate (T stays abstract).
                 let mut alt_eqs: Vec<Vec<crate::hir::checker::PendingInnerGadtEq>> = Vec::new();
                 let mut alt_reachable: Vec<bool> = Vec::new();
-                for pat in patterns {
+                for pat in *patterns {
                     // Per-alternative reachability  : only Enum
                     // patterns can be GADT-unreachable under the scrutinee
                     // type; non-Enum alternatives are always reachable.

@@ -8,7 +8,7 @@
 use crate::hir::loop_infer::LoopInstr;
 use crate::symbol::Symbol;
 use num_bigint::BigInt;
-use num_traits::{One, Zero};
+use num_traits::{One, Signed, Zero};
 
 /// A scalar variable participating in BII synthesis (aligned with Posita's
 /// bit-width and signedness).
@@ -247,56 +247,9 @@ pub(crate) fn loop_instrs_to_loop_problem(
                 );
                 if trap && *c != 0 {
                     // Stay-in-range condition for `i := i + c`, at the
-                    // variable's OWN signedness: a signed
-                    // Int<N> traps outside [−2^(bw−1), 2^(bw−1)−1],
-                    // an unsigned UInt<N> outside [0, 2^bw−1]. The
-                    // previous code used the UNSIGNED range for both
-                    // — sound for c > 0 (the unsigned bound is WEAKER
-                    // than the signed one: more obligation states,
-                    // conservative), but UNSOUND for c < 0: `i ≥ |c|`
-                    // is STRONGER than the true signed `i ≥ MIN−c`
-                    // and EXCLUDES executing (non-trapping) states
-                    // from the inductive obligation — the synthesis
-                    // then legitimately collapses the BII to the init
-                    // (first exposed by a signed-pair test:
-                    // `y := y − 1` on Int<8> with def `y ≥ 1` omitted
-                    // every reachable state; all rows tightened to
-                    // [0,0], the BII lost its over-approximation
-                    // guarantee). The old "consistent with the
-                    // template rows" note referred to the earlier
-                    // unsigned-only rows; signed Interval rows now
-                    // carry TRUE signed tops, so
-                    // the def range follows the variable.
-                    let bw = bit_widths.get(*i).copied().unwrap_or(64) as u32;
-                    let is_signed = signed.get(*i).copied().unwrap_or(false);
-                    let c_big = BigInt::from(*c);
-                    let (min, max) = if is_signed {
-                        let half = BigInt::one() << (bw as usize - 1);
-                        (-half.clone(), half - 1)
-                    } else {
-                        (BigInt::zero(), (BigInt::one() << bw as usize) - 1)
-                    };
-                    if *c > 0 {
-                        // no-trap ⟺ pre + c ≤ max ⟺ pre ≤ max − c
-                        // (pre = the SSA value before this AddVar).
-                        def_parts.push(Cond::Cmp {
-                            op: CmpOp::Le,
-                            lhs: Box::new(pre.clone()),
-                            rhs: Box::new(ScalarExpr::Const(max - &c_big)),
-                            signed: is_signed,
-                        });
-                    } else {
-                        // no-trap ⟺ pre + c ≥ min ⟺ pre ≥ min − c
-                        // (= min + |c|; unsigned min = 0 reproduces
-                        // the old `i ≥ |c|` exactly — byte-identical
-                        // for unsigned variables).
-                        def_parts.push(Cond::Cmp {
-                            op: CmpOp::Ge,
-                            lhs: Box::new(pre.clone()),
-                            rhs: Box::new(ScalarExpr::Const(min - &c_big)),
-                            signed: is_signed,
-                        });
-                    }
+                    // variable's OWN signedness (see push_no_trap_def for
+                    // the signed/unsigned range rationale).
+                    push_no_trap_def(pre, *i, *c, bit_widths, signed, &mut def_parts);
                 }
             }
             LoopInstr::AddWrap(i, c) => {
@@ -309,17 +262,16 @@ pub(crate) fn loop_instrs_to_loop_problem(
                 );
             }
             LoopInstr::AddSat(i, c) => {
-                // Saturating assignment — the transfer
-                // is `x' = clamp(x + c)`; the clamp semantics live in the
-                // template's Clamp rows (the antecedent encodes the
-                // clamped successor). No trap definedness (saturate is
-                // total — never panics).
-                values[*i] = ScalarExpr::Add(
-                    Box::new(values[*i].clone()),
-                    Box::new(ScalarExpr::Const(BigInt::from(*c))),
-                    ArithSem::Saturate,
-                );
+                // The template layer still needs Clamp rows — collect them into `saturates` to drive
+                // `BiiTemplate::with_saturates`. No trap definedness
+                // (saturate is total — never panics).
                 saturates.push((*i, *c));
+                // SSA expansion into an Ite, ensuring `values[i]` does not carry Saturate into
+                // subsequent instructions (in `i := i +? 5; j := i + 1`, `values[j]`
+                // reads the clamped piecewise value).
+                let bw = bit_widths.get(*i).copied().unwrap_or(64);
+                let is_signed = signed.get(*i).copied().unwrap_or(false);
+                values[*i] = expand_sat_to_ite(values[*i].clone(), *c, bw, is_signed);
             }
             LoopInstr::ConstVar(i, c) => {
                 values[*i] = ScalarExpr::Const(BigInt::from(*c));
@@ -336,13 +288,19 @@ pub(crate) fn loop_instrs_to_loop_problem(
             }
             LoopInstr::CopyAddVar(i, j, c) => {
                 // `i := j + c` — copy with constant offset. Source may be
-                // a separated param (`j >= vars.len()`); no trap (wrap
-                // semantics are total).
+                // a separated param (`j >= vars.len()`).
                 let src = if *j < vars.len() {
                     values[*j].clone()
                 } else {
                     ScalarExpr::Var(*j)
                 };
+                // This traps exactly like AddVar when the read value is
+                // out of range after the shift (wrap semantics only make
+                // the *encoding* total; the machine add still panics).
+                // The def is evaluated on the SOURCE's pre-update value.
+                if trap && *c != 0 {
+                    push_no_trap_def(src.clone(), *i, *c, bit_widths, signed, &mut def_parts);
+                }
                 values[*i] = ScalarExpr::Add(
                     Box::new(src),
                     Box::new(ScalarExpr::Const(BigInt::from(*c))),
@@ -352,7 +310,7 @@ pub(crate) fn loop_instrs_to_loop_problem(
             LoopInstr::If(cond, then, else_) => {
                 let cond = fix_signed(cond, signed, vars.len());
 
-                // Generate trap definedness for AddVar inside each arm.
+                // Unified walker: SSA advancement + def collection, handling nested If internally.
                 // Each arm's no-trap condition is pushed UNCONDITIONALLY
                 // (no branch-condition guard): the edge's `definedness`
                 // is AND-folded from `def_parts` and must stay an
@@ -363,13 +321,12 @@ pub(crate) fn loop_instrs_to_loop_problem(
                 // unconditionally is a sound over-approximation
                 // (fail-closed), stronger than the branch-refined
                 // `(cond → then_def) ∧ (¬cond → else_def)`.
-                if trap {
-                    collect_arm_definedness(&values, then, bit_widths, signed, &mut def_parts);
-                    collect_arm_definedness(&values, else_, bit_widths, signed, &mut def_parts);
-                }
-
-                let then_vals = apply_block(&values, then, signed, vars.len())?;
-                let else_vals = apply_block(&values, else_, signed, vars.len())?;
+                let then_vals = apply_block_with_defs(
+                    &values, then, bit_widths, signed, vars.len(), trap, &mut def_parts,
+                )?;
+                let else_vals = apply_block_with_defs(
+                    &values, else_, bit_widths, signed, vars.len(), trap, &mut def_parts,
+                )?;
                 for i in 0..vars.len() {
                     if then_vals[i] != else_vals[i] {
                         values[i] = ScalarExpr::Ite(
@@ -379,14 +336,11 @@ pub(crate) fn loop_instrs_to_loop_problem(
                         );
                     }
                 }
-                // Collect saturates from both arms.
-                for arm in [then, else_] {
-                    for ins in arm {
-                        if let LoopInstr::AddSat(si, sc) = ins {
-                            saturates.push((*si, *sc));
-                        }
-                    }
-                }
+                // Recursively collect AddSat at any depth in both arms (the old code only scanned
+                // the top level; an AddSat inside a nested if would make the primed Interval row
+                // fall back to `xp_i`, losing clamp semantics — a precision loss, not a soundness issue).
+                collect_saturates(then, &mut saturates);
+                collect_saturates(else_, &mut saturates);
             }
         }
     }
@@ -601,20 +555,40 @@ pub(crate) fn separate_loop_params(
     })
 }
 
-/// Apply a straight-line instruction block to a copy of the expression
-/// state machine (SSA), returning the resulting state.
+/// Advance the SSA and collect stay-in-range trap defs. Returns the instruction block's exit SSA.
+///
+/// The SSA is advanced for **every** assignment form (`AddVar`, `AddWrap`, `AddSat`,
+/// `ConstVar`, `CopyVar`, `CopyAddVar`), so the pre-value used by a subsequent `AddVar`'s def
+/// and the SSA consumed by the transition are consistent by construction — SSA advancement
+/// and def generation have this single source; the two walkers cannot drift.
+///
+/// `AddSat` advances as `expand_sat_to_ite` (without `ArithSem::Saturate`),
+/// so `pre` never contains Saturate; `expr_to_smt_bw`'s `E::Ite` /
+/// `E::Add(Wrap)` branches handle it directly.
+///
+/// Only `AddVar` / `CopyAddVar` push a def (saturate / wrap are
+/// total, not trapping), and only when `trap = true` — with trap disabled there is no
+/// trap obligation; treating the stay-in-range condition as a check 2 antecedent would weaken the obligation
+/// and **lose soundness**.
+///
 /// `if` blocks merge both arms into `Ite` expressions per assigned
-/// variable; nested `if`s recurse.
-fn apply_block(
+/// variable; nested `if`s recurse (also collecting defs).
+fn apply_block_with_defs(
     base: &[ScalarExpr],
     stmts: &[LoopInstr],
+    bit_widths: &[u8],
     signed: &[bool],
     vars_len: usize,
+    trap: bool,
+    def_parts: &mut Vec<Cond>,
 ) -> Option<Vec<ScalarExpr>> {
     let mut v = base.to_vec();
     for ins in stmts {
         match ins {
             LoopInstr::AddVar(i, c) => {
+                if trap && *c != 0 {
+                    push_no_trap_def(v[*i].clone(), *i, *c, bit_widths, signed, def_parts);
+                }
                 v[*i] = ScalarExpr::Add(
                     Box::new(v[*i].clone()),
                     Box::new(ScalarExpr::Const(BigInt::from(*c))),
@@ -622,7 +596,8 @@ fn apply_block(
                 );
             }
             LoopInstr::AddWrap(i, c) => {
-                // Wrap inside an `if` arm — no trap, no saturates entry.
+                // Wrap inside an `if` arm — no trap (wrap is total),
+                // but the SSA MUST advance.
                 v[*i] = ScalarExpr::Add(
                     Box::new(v[*i].clone()),
                     Box::new(ScalarExpr::Const(BigInt::from(*c))),
@@ -636,6 +611,9 @@ fn apply_block(
                 } else {
                     ScalarExpr::Var(*j)
                 };
+                if trap && *c != 0 {
+                    push_no_trap_def(src.clone(), *i, *c, bit_widths, signed, def_parts);
+                }
                 v[*i] = ScalarExpr::Add(
                     Box::new(src),
                     Box::new(ScalarExpr::Const(BigInt::from(*c))),
@@ -643,15 +621,12 @@ fn apply_block(
                 );
             }
             LoopInstr::AddSat(i, c) => {
-                // Saturating assignment inside an `if`
-                // arm — the successor is `clamp(x + c)` (Clamp-row
-                // semantics; the saturates are collected by the caller's
-                // If-arm scan).
-                v[*i] = ScalarExpr::Add(
-                    Box::new(v[*i].clone()),
-                    Box::new(ScalarExpr::Const(BigInt::from(*c))),
-                    ArithSem::Saturate,
-                );
+                // No def (saturate is total); expand to Ite to advance the SSA,
+                // so a subsequent `AddVar` reading `v[*i]` uses the true
+                // post-clamp value. (saturates are collected by the caller's scan.)
+                let bw = bit_widths.get(*i).copied().unwrap_or(64);
+                let is_signed = signed.get(*i).copied().unwrap_or(false);
+                v[*i] = expand_sat_to_ite(v[*i].clone(), *c, bw, is_signed);
             }
             LoopInstr::ConstVar(i, c) => {
                 v[*i] = ScalarExpr::Const(BigInt::from(*c));
@@ -665,8 +640,12 @@ fn apply_block(
             }
             LoopInstr::If(cond, then, else_) => {
                 let cond = fix_signed(cond, signed, vars_len);
-                let then_vals = apply_block(&v, then, signed, vars_len)?;
-                let else_vals = apply_block(&v, else_, signed, vars_len)?;
+                let then_vals = apply_block_with_defs(
+                    &v, then, bit_widths, signed, vars_len, trap, def_parts,
+                )?;
+                let else_vals = apply_block_with_defs(
+                    &v, else_, bit_widths, signed, vars_len, trap, def_parts,
+                )?;
                 for k in 0..v.len() {
                     if then_vals[k] != else_vals[k] {
                         v[k] = ScalarExpr::Ite(
@@ -683,60 +662,146 @@ fn apply_block(
     Some(v)
 }
 
-/// Collect trap definedness for `AddVar` instructions inside an
-/// `if` arm. Each arm's no-trap condition is pushed UNCONDITIONALLY
-/// (no branch-condition guard): the edge's `definedness` is AND-folded
-/// from `def_parts` and must stay an And-chain of Cmps for the DBM
-/// proof path, which cannot represent the branch-refined disjunction
-/// `(cond ∧ then_def) ∨ (¬cond ∧ else_def)`. Requiring both arms'
-/// no-trap unconditionally is a sound over-approximation (fail-closed).
-fn collect_arm_definedness(
-    values: &[ScalarExpr],
-    stmts: &[LoopInstr],
-    bit_widths: &[u8],
-    signed: &[bool],
-    def_parts: &mut Vec<Cond>,
-) {
-    for ins in stmts {
+/// Recursively collect all saturating assignments `(i, c)` in the instruction tree (including `if` branches at any depth).
+///
+/// The template layer's `BiiTemplate::with_saturates` requires one `Clamp` row per distinct `(i, c)`
+/// so that the primed Interval row encodes the true
+/// `clamp(x_i + c)` successor. Missing a nested `AddSat` would make the primed row fall back to
+/// `xp_i`, making the SMT-side `xp_i = clamp(x_i + c)` inconsistent with `A(xp)`'s Interval
+/// row ⇒ the synthesis objective becomes looser (a precision loss, not a soundness issue).
+///
+/// The same `(i, c)` appearing in multiple branches is recorded only once — `clamp_of(i)` takes only the first
+/// matching `(c, signed)`; duplicate Clamp rows would only redundantly enlarge the query.
+fn collect_saturates(instrs: &[LoopInstr], out: &mut Vec<(usize, i128)>) {
+    for ins in instrs {
         match ins {
-            LoopInstr::AddVar(i, c) if *c != 0 => {
-                let bw = bit_widths.get(*i).copied().unwrap_or(64) as u32;
-                let is_signed = signed.get(*i).copied().unwrap_or(false);
-                let c_big = BigInt::from(*c);
-                let (min, max) = if is_signed {
-                    let half = BigInt::one() << (bw as usize - 1);
-                    (-half.clone(), half - 1)
-                } else {
-                    (BigInt::zero(), (BigInt::one() << bw as usize) - 1)
-                };
-                let no_trap = if *c > 0 {
-                    Cond::Cmp {
-                        op: CmpOp::Le,
-                        lhs: Box::new(values[*i].clone()),
-                        rhs: Box::new(ScalarExpr::Const(max - &c_big)),
-                        signed: is_signed,
-                    }
-                } else {
-                    Cond::Cmp {
-                        op: CmpOp::Ge,
-                        lhs: Box::new(values[*i].clone()),
-                        rhs: Box::new(ScalarExpr::Const(min - &c_big)),
-                        signed: is_signed,
-                    }
-                };
-                // Push the arm's no-trap condition unconditionally —
-                // see the function doc for why the branch guard is
-                // omitted (DBM-proof compatibility, fail-closed).
-                def_parts.push(no_trap);
+            LoopInstr::AddSat(i, c) => {
+                if !out.contains(&(*i, *c)) {
+                    out.push((*i, *c));
+                }
             }
-            LoopInstr::If(_, inner_then, inner_else) => {
-                // Recurse into nested ifs.
-                collect_arm_definedness(values, inner_then, bit_widths, signed, def_parts);
-                collect_arm_definedness(values, inner_else, bit_widths, signed, def_parts);
+            LoopInstr::If(_, then, else_) => {
+                collect_saturates(then, out);
+                collect_saturates(else_, out);
             }
             _ => {}
         }
     }
+}
+
+/// Expand `x := clamp(x + c)` into a piecewise `Ite`. The parameter `pre` is the assignment's
+/// **read** SSA expression (not `Var(i)`), so in the chained
+/// `i := i +? 5; i := i +? 10`, the second expansion's `pre` is the first expansion's
+/// Ite result; nested Ites are handled recursively by `expr_to_smt_bw`'s `E::Ite` branch.
+///
+/// Semantics (for `c > 0`): `pre + c > max` → `max`; `c < 0`:
+/// `pre + c < min` → `min`; otherwise `pre + c` (Wrap-semantics addition, because
+/// `pre + c` is already within `[min, max]` and will not actually wrap).
+///
+/// When `|c| > span`, the entire saturated addition degenerates to the constant `max` / `min` — this step avoids
+/// `max - c` or `min - c` falling outside `[min, max]` (in BV mode
+/// `bv_const` would mod-truncate and cause comparison misalignment).
+fn expand_sat_to_ite(pre: ScalarExpr, c: i128, bw: u8, signed: bool) -> ScalarExpr {
+    if c == 0 {
+        return pre; // clamp(x + 0) = x
+    }
+    let (min, max) = if signed {
+        let half = BigInt::one() << (bw as usize - 1);
+        (-half.clone(), half - 1)
+    } else {
+        (BigInt::zero(), (BigInt::one() << bw as usize) - 1)
+    };
+    let c_big = BigInt::from(c);
+    let span = &max - &min;
+    if c_big.abs() > span {
+        // c exceeds the entire value range: the saturated add degenerates to a constant (the Wrap branch is unreachable).
+        return ScalarExpr::Const(if c > 0 { max } else { min });
+    }
+    let clamp_up = Cond::Cmp {
+        op: CmpOp::Gt,
+        lhs: Box::new(pre.clone()),
+        rhs: Box::new(ScalarExpr::Const(&max - &c_big)),
+        signed,
+    };
+    let clamp_down = Cond::Cmp {
+        op: CmpOp::Lt,
+        lhs: Box::new(pre.clone()),
+        rhs: Box::new(ScalarExpr::Const(&min - &c_big)),
+        signed,
+    };
+    ScalarExpr::Ite(
+        Box::new(clamp_up),
+        Box::new(ScalarExpr::Const(max)),
+        Box::new(ScalarExpr::Ite(
+            Box::new(clamp_down),
+            Box::new(ScalarExpr::Const(min)),
+            Box::new(ScalarExpr::Add(
+                Box::new(pre),
+                Box::new(ScalarExpr::Const(c_big)),
+                ArithSem::Wrap,
+            )),
+        )),
+    )
+}
+
+/// Whether the expression contains `ArithSem::Saturate` (defensive check).
+fn contains_saturate(e: &ScalarExpr) -> bool {
+    match e {
+        ScalarExpr::Var(_) | ScalarExpr::Const(_) => false,
+        ScalarExpr::Add(l, r, sem) | ScalarExpr::Sub(l, r, sem) => {
+            *sem == ArithSem::Saturate || contains_saturate(l) || contains_saturate(r)
+        }
+        ScalarExpr::Ite(_, t, f) => contains_saturate(t) || contains_saturate(f),
+    }
+}
+
+/// Emit the stay-in-range trap definedness for one additive instruction
+/// (`i := i + c` or `i := j + c`), evaluated on `pre` — the SSA value
+/// the instruction READS. Shared by the top-level walker and the if-arm
+/// def walk so their def generation can never drift.
+fn push_no_trap_def(
+    pre: ScalarExpr,
+    i: usize,
+    c: i128,
+    bit_widths: &[u8],
+    signed: &[bool],
+    def_parts: &mut Vec<Cond>,
+) {
+    if contains_saturate(&pre) {
+        // Defensive: with Saturate in `pre` it cannot be encoded as a plain Cmp's lhs.
+        // Fail closed explicitly (Cond::False makes check 3 SAT → TrapUnproven),
+        // rather than letting cond_to_smt implicitly return None and sink the entire synthesis.
+        // The normal path never reaches here — `AddSat` is already expanded to Ite.
+        def_parts.push(Cond::False);
+        return;
+    }
+    let bw = bit_widths.get(i).copied().unwrap_or(64) as u32;
+    let is_signed = signed.get(i).copied().unwrap_or(false);
+    let c_big = BigInt::from(c);
+    let (min, max) = if is_signed {
+        let half = BigInt::one() << (bw as usize - 1);
+        (-half.clone(), half - 1)
+    } else {
+        (BigInt::zero(), (BigInt::one() << bw as usize) - 1)
+    };
+    let no_trap = if c > 0 {
+        // no-trap ⟺ pre + c ≤ max ⟺ pre ≤ max − c
+        Cond::Cmp {
+            op: CmpOp::Le,
+            lhs: Box::new(pre),
+            rhs: Box::new(ScalarExpr::Const(max - &c_big)),
+            signed: is_signed,
+        }
+    } else {
+        // no-trap ⟺ pre + c ≥ min ⟺ pre ≥ min − c
+        Cond::Cmp {
+            op: CmpOp::Ge,
+            lhs: Box::new(pre),
+            rhs: Box::new(ScalarExpr::Const(min - &c_big)),
+            signed: is_signed,
+        }
+    };
+    def_parts.push(no_trap);
 }
 
 /// Fill the comparison signedness of a `Cond` from the per-variable
@@ -774,7 +839,7 @@ fn var_signed(e: &ScalarExpr, signed: &[bool], vars_len: usize) -> Option<bool> 
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
 
@@ -1247,8 +1312,8 @@ mod tests {
         }
     }
 
-    /// `AddSat` lowers to a `Saturate` next value and
-    /// records the saturate spec; no trap definedness (saturate is total).
+    /// `AddSat` expands to a piecewise `Ite` (the SSA no longer contains `ArithSem::Saturate`)
+    /// and records the saturate spec; no trap definedness (saturate is total).
     #[test]
     fn test_loop_instrs_to_loop_problem_addsat() {
         let vars = vec![Symbol::intern("i")];
@@ -1256,16 +1321,310 @@ mod tests {
         let body = vec![LoopInstr::TestLe(0, 5), LoopInstr::AddSat(0, 1)];
         let problem = loop_instrs_to_loop_problem(&vars, &init, &body, &[8], &[false], &[], true)
             .expect("must lower");
+        // The template layer still needs Clamp rows.
         assert_eq!(problem.saturates, vec![(0, 1)]);
-        assert_eq!(problem.back_edges[0].definedness, None); // saturate: no def
-        assert_eq!(
-            problem.back_edges[0].next_values,
-            vec![ScalarExpr::Add(
-                Box::new(ScalarExpr::Var(0)),
-                Box::new(ScalarExpr::Const(BigInt::from(1))),
-                ArithSem::Saturate,
-            )]
+        // saturate is total: no trap def.
+        assert_eq!(problem.back_edges[0].definedness, None);
+        // The SSA expands to an Ite: the outer arm is clamp_up (`i > 254`), the inner is
+        // clamp_down (`i < 255`… for c=1 no underflow branch triggers), and the final arm is
+        // `i + 1` (Wrap). init is Const(0), so the condition holds the constant 0.
+        let nv = &problem.back_edges[0].next_values[0];
+        let ScalarExpr::Ite(up_cond, up_val, els) = nv else {
+            panic!("AddSat must expand to Ite, got {nv:?}");
+        };
+        assert!(matches!(**up_cond, Cond::Cmp { op: CmpOp::Gt, .. }));
+        assert!(matches!(**up_val, ScalarExpr::Const(_)));
+        let ScalarExpr::Ite(down_cond, down_val, add_wrap) = &**els else {
+            panic!("inner arm must be Ite");
+        };
+        assert!(matches!(**down_cond, Cond::Cmp { op: CmpOp::Lt, .. }));
+        assert!(matches!(**down_val, ScalarExpr::Const(_)));
+        assert!(matches!(
+            &**add_wrap,
+            ScalarExpr::Add(_, _, ArithSem::Wrap)
+        ));
+    }
+
+    /// Regression: `if c { i := 100; i := i + 200 }` on UInt<8> — the second addition
+    /// unconditionally traps (100 + 200 > 255). A stale-SSA def would read the entry `i`
+    /// (yielding a satisfiable `i ≤ 55`); the correct def must be the constant-constant `false`
+    /// obligation. After the stale-SSA fix, terms of the form `Var(i) ≤ Const(55)` must not appear.
+    #[test]
+    fn test_definedness_stale_ssa_after_constvar() {
+        let vars = vec![Symbol::intern("i")];
+        let init = vec![LoopInstr::ConstVar(0, 0)];
+        let body = vec![
+            LoopInstr::TestLe(0, 100),
+            LoopInstr::If(
+                Box::new(Cond::Cmp {
+                    op: CmpOp::Lt,
+                    lhs: Box::new(ScalarExpr::Var(0)),
+                    rhs: Box::new(ScalarExpr::Const(BigInt::from(1))),
+                    signed: false,
+                }),
+                vec![LoopInstr::ConstVar(0, 100), LoopInstr::AddVar(0, 200)],
+                vec![],
+            ),
+        ];
+        let problem = loop_instrs_to_loop_problem(&vars, &init, &body, &[8], &[false], &[], true)
+            .expect("must lower");
+        let def = problem.back_edges[0]
+            .definedness
+            .as_ref()
+            .expect("def present (the add unconditionally traps)");
+        let mut conjuncts = Vec::new();
+        split_and_for_test(def, &mut conjuncts);
+        for c in &conjuncts {
+            if let Cond::Cmp {
+                op: CmpOp::Le,
+                lhs,
+                rhs,
+                ..
+            } = c
+            {
+                // The stale-SSA def is `i ≤ 55` (Var-vs-Const); the correct term is
+                // `Const(100) ≤ Const(55)` (constant-constant, identically false).
+                assert!(
+                    !matches!(**lhs, ScalarExpr::Var(_))
+                        || !matches!(**rhs, ScalarExpr::Const(_)),
+                    "stale-SSA def `i ≤ 55` must not appear; got {c:?}",
+                );
+            }
+        }
+        // z3-gated end-to-end: A = `i ≤ 50` must not report Verified.
+        let solver = crate::hir::smt::SmtSolver::new("z3");
+        if solver.check_version() {
+            let mut tpl = crate::hir::bii::BiiTemplate::new(1, &[8], &[false]);
+            tpl.rows[0].lb = BigInt::zero();
+            tpl.rows[0].ub = BigInt::from(50);
+            assert!(
+                !matches!(
+                    crate::hir::bii::verify_template_against_problem(
+                        &solver, &problem, &tpl, false
+                    ),
+                    crate::hir::bii::VerifyOutcome::Verified
+                ),
+                "stale-SSA def would let `i ≤ 50` be Verified; correct \
+                 behaviour is TrapUnproven or Counterexample",
+            );
+        }
+    }
+
+    /// Precision value of the Ite expansion: for `i := i +? 5; i := i + 1` the def is
+    /// `clamp(i + 5) ≤ 254` (a Cmp whose lhs is a nested Ite). With the
+    /// `Cond::False` fallback, check 3 would always be SAT → the whole loop degrades to
+    /// TrapUnproven; after the Ite expansion, z3 can prove def under `A ∧ G`, yielding
+    /// end-to-end Verified.
+    #[test]
+    fn test_sat_chained_def_is_provable() {
+        let vars = vec![Symbol::intern("i")];
+        let init = vec![LoopInstr::ConstVar(0, 0)];
+        // while i < 250 { i := i +? 5; i := i + 1 }
+        let body = vec![
+            LoopInstr::TestLe(0, 249),
+            LoopInstr::AddSat(0, 5),
+            LoopInstr::AddVar(0, 1),
+        ];
+        let problem = loop_instrs_to_loop_problem(&vars, &init, &body, &[8], &[false], &[], true)
+            .expect("must lower");
+        // A def exists (j's AddVar's def), contains no Saturate, and is not the
+        // `Cond::False` fallback — the lhs must be the clamp's Ite expansion.
+        let def = problem.back_edges[0].definedness.as_ref().expect("def present");
+        assert!(!contains_saturate_expr_in_cond(def));
+        assert!(!matches!(def, Cond::False), "def must not degenerate to Cond::False");
+        let mut conjuncts = Vec::new();
+        split_and_for_test(def, &mut conjuncts);
+        assert!(
+            conjuncts.iter().any(|c| matches!(
+                c,
+                Cond::Cmp { lhs, .. } if matches!(**lhs, ScalarExpr::Ite(..))
+            )),
+            "def lhs must be the clamp Ite expansion; got {conjuncts:?}"
         );
+        let solver = crate::hir::smt::SmtSolver::new("z3");
+        if !solver.check_version() {
+            eprintln!("z3 unavailable — skipping test_sat_chained_def_is_provable");
+            return;
+        }
+        let tpl = crate::hir::bii::synthesize_problem_bii(&solver, &problem, 512, false)
+            .expect("must synthesize");
+        // BII: interval A must contain the reachable successor 251 (from 245, i′=251), hence
+        // contains 249; from 249, i′=255 must belong to A — i's row ub is 255 (within G
+        // def is always provable, the obligation is not further tightened; the key is that it did not degrade to TrapUnproven).
+        assert_eq!(tpl.rows[0].ub, BigInt::from(255));
+        // End-to-end Verified (not TrapUnproven).
+        assert!(matches!(
+            crate::hir::bii::verify_template_against_problem(&solver, &problem, &tpl, false),
+            crate::hir::bii::VerifyOutcome::Verified
+        ));
+    }
+
+    /// Regression: `if c { i := i +% 100; i := i + 200 }` /
+    /// `if c { j := 100; i := j; i := i + 200 }` — `AddWrap` / `CopyVar`
+    /// must also advance the SSA, otherwise a subsequent `AddVar`'s def reads the entry `i`.
+    #[test]
+    fn test_definedness_stale_ssa_after_addwrap_and_copyvar() {
+        for (name, arm) in [
+            (
+                "addwrap",
+                vec![
+                    LoopInstr::AddWrap(0, 100),
+                    LoopInstr::AddVar(0, 200),
+                ],
+            ),
+            (
+                "copyvar",
+                vec![
+                    LoopInstr::ConstVar(1, 100),
+                    LoopInstr::CopyVar(0, 1),
+                    LoopInstr::AddVar(0, 200),
+                ],
+            ),
+        ] {
+            // vars: i = 0, j = 0 (copyvar uses j)
+            let vars = vec![Symbol::intern("i"), Symbol::intern("j")];
+            let init = vec![LoopInstr::ConstVar(0, 0), LoopInstr::ConstVar(1, 0)];
+            let body = vec![
+                LoopInstr::TestLe(0, 100),
+                LoopInstr::If(
+                    Box::new(Cond::Cmp {
+                        op: CmpOp::Lt,
+                        lhs: Box::new(ScalarExpr::Var(0)),
+                        rhs: Box::new(ScalarExpr::Const(BigInt::from(1))),
+                        signed: false,
+                    }),
+                    arm,
+                    vec![],
+                ),
+            ];
+            let problem = loop_instrs_to_loop_problem(
+                &vars, &init, &body, &[8, 8], &[false, false], &[], true,
+            )
+            .expect("must lower");
+            let def = problem.back_edges[0]
+                .definedness
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: def present"));
+            let mut conjuncts = Vec::new();
+            split_and_for_test(def, &mut conjuncts);
+            for c in &conjuncts {
+                if let Cond::Cmp {
+                    op: CmpOp::Le,
+                    lhs,
+                    rhs,
+                    ..
+                } = c
+                {
+                    // The stale-SSA def is `i ≤ 55` (Var-vs-Const); the correct term's
+                    // lhs is the post-wrap/copy expression (containing constants or nested
+                    // Add), not a bare `Var(0)`.
+                    assert!(
+                        !matches!(**lhs, ScalarExpr::Var(0))
+                            || !matches!(**rhs, ScalarExpr::Const(_)),
+                        "{name}: stale-SSA def `i ≤ 55` must not appear; got {c:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Regression: an `AddSat` inside a nested `if` must be recursively collected into `saturates`,
+    /// otherwise the primed Interval row falls back to `xp_i` (no clamp) and the BII becomes looser.
+    #[test]
+    fn test_nested_if_addsat_saturates_collected() {
+        let vars = vec![Symbol::intern("i")];
+        let init = vec![LoopInstr::ConstVar(0, 0)];
+        // while i < 255 {
+        //   if i < 250 { if i < 245 { i := i +? 10 } else { i := i +? 5 } }
+        // }
+        let body = vec![
+            LoopInstr::TestLe(0, 254),
+            LoopInstr::If(
+                Box::new(Cond::Cmp {
+                    op: CmpOp::Lt,
+                    lhs: Box::new(ScalarExpr::Var(0)),
+                    rhs: Box::new(ScalarExpr::Const(BigInt::from(250))),
+                    signed: false,
+                }),
+                vec![LoopInstr::If(
+                    Box::new(Cond::Cmp {
+                        op: CmpOp::Lt,
+                        lhs: Box::new(ScalarExpr::Var(0)),
+                        rhs: Box::new(ScalarExpr::Const(BigInt::from(245))),
+                        signed: false,
+                    }),
+                    vec![LoopInstr::AddSat(0, 10)],
+                    vec![LoopInstr::AddSat(0, 5)],
+                )],
+                vec![],
+            ),
+        ];
+        let problem = loop_instrs_to_loop_problem(&vars, &init, &body, &[8], &[false], &[], true)
+            .expect("must lower");
+        // Both nested AddSats must enter saturates (empty before the fix).
+        assert!(
+            problem.saturates.contains(&(0, 10)),
+            "nested AddSat(0, 10) must be collected; got {:?}",
+            problem.saturates
+        );
+        assert!(
+            problem.saturates.contains(&(0, 5)),
+            "nested AddSat(0, 5) must be collected; got {:?}",
+            problem.saturates
+        );
+        // No duplicates (collect_saturates deduplicates).
+        assert_eq!(
+            problem
+                .saturates
+                .iter()
+                .filter(|(i, c)| *i == 0 && *c == 10)
+                .count(),
+            1,
+            "duplicate (0, 10) entries"
+        );
+
+        // End-to-end z3: the template must generate Clamp rows (BiiTemplate::with_saturates
+        // driven by problem.saturates).
+        let solver = crate::hir::smt::SmtSolver::new("z3");
+        if !solver.check_version() {
+            eprintln!("z3 unavailable — skipping test_nested_if_addsat_saturates_collected");
+            return;
+        }
+        let tpl = crate::hir::bii::synthesize_problem_bii(&solver, &problem, 512, false)
+            .expect("must synthesize");
+        let has_clamp = tpl
+            .rows
+            .iter()
+            .any(|r| matches!(r.kind, crate::hir::bii::RowKind::Clamp(_, _)));
+        assert!(
+            has_clamp,
+            "nested AddSat must produce at least one Clamp row in the template"
+        );
+    }
+
+    /// Test helper: split an And chain (not depending on the private split_and).
+    fn split_and_for_test(c: &Cond, out: &mut Vec<Cond>) {
+        match c {
+            Cond::And(a, b) => {
+                split_and_for_test(a, out);
+                split_and_for_test(b, out);
+            }
+            _ => out.push(c.clone()),
+        }
+    }
+
+    /// Test helper: whether a Cond contains a Saturate expression.
+    fn contains_saturate_expr_in_cond(c: &Cond) -> bool {
+        match c {
+            Cond::Cmp { lhs, rhs, .. } => {
+                contains_saturate(lhs) || contains_saturate(rhs)
+            }
+            Cond::And(a, b) | Cond::Or(a, b) => {
+                contains_saturate_expr_in_cond(a) || contains_saturate_expr_in_cond(b)
+            }
+            Cond::Not(a) => contains_saturate_expr_in_cond(a),
+            Cond::True | Cond::False => false,
+        }
     }
 
     /// A saturating loop synthesizes and verifies —

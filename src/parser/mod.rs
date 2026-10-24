@@ -41,13 +41,13 @@ mod stmt;
 mod ty;
 mod type_def;
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests;
 
 // -----------------------------------------------------------------------------
 // Public exports
 // -----------------------------------------------------------------------------
-pub(crate) use recovery::edit_distance_limited_into;
+pub(crate) use recovery::osa_distance_limited_into;
 pub use recovery::{
     KeywordContext, SuggestionBuffers, did_you_mean_keyword, did_you_mean_keyword_with_buffers,
 };
@@ -65,15 +65,15 @@ pub enum Recovery {
 
 /// A token that the parser expects, used for error recovery.
 #[derive(Debug, Clone)]
-pub struct ExpectedToken {
+pub struct ExpectedToken<'src> {
     /// The expected token kind.
-    pub tok: Token,
+    pub tok: Token<'src>,
     /// A human-readable description of what was expected.
     pub desc: &'static str,
 }
 
-impl ExpectedToken {
-    pub fn new(tok: Token, desc: &'static str) -> Self {
+impl<'src> ExpectedToken<'src> {
+    pub fn new(tok: Token<'src>, desc: &'static str) -> Self {
         ExpectedToken { tok, desc }
     }
 }
@@ -117,18 +117,18 @@ bitflags! {
 /// lookahead without cloning the lexer state. This mirrors the
 /// `TokenCursor` / `TokenStream` architecture used by rustc.
 #[derive(Debug, Clone)]
-struct SpannedToken {
-    token: Token,
+struct SpannedToken<'src> {
+    token: Token<'src>,
     span: Span,
 }
 
 /// A snapshot of the parser's token-stream state for backtracking.
 /// Created by [`Parser::checkpoint`] and restored by [`Parser::restore`].
 /// Inspired by rustc's `Parser::checkpoint` / `Parser::rewind`.
-struct Checkpoint {
+struct Checkpoint<'src> {
     cursor: usize,
-    peeked: Option<Result<Token, ()>>,
-    pending: Vec<Token>,
+    peeked: Option<Result<Token<'src>, ()>>,
+    pending: Vec<Token<'src>>,
     progress: u64,
     sync_stall: Option<u64>,
 }
@@ -145,11 +145,16 @@ pub struct Parser<'src, 'input> {
     arena: &'input crate::arena::SyncArena<'input>,
     /// The source text being parsed — attached to diagnostics so the emitter
     /// can render `^`-underline context without a later copy.
+    ///
+    /// INVARIANT: every `Span` this parser produces carries `file_id`, so
+    /// byte offsets in `source` and the span's file always correspond.
     source: &'src str,
-    tokens: Vec<SpannedToken>,
+    /// The file this source was registered as; stamped into every span.
+    file_id: FileId,
+    tokens: Vec<SpannedToken<'src>>,
     cursor: usize,
-    peeked: Option<Result<Token, ()>>,
-    pending: Vec<Token>,
+    peeked: Option<Result<Token<'src>, ()>>,
+    pending: Vec<Token<'src>>,
     pub diagnostics: Vec<Diagnostic<'src>>,
     recursion_depth: usize,
     max_recursion_depth: usize,
@@ -164,7 +169,7 @@ pub struct Parser<'src, 'input> {
     /// Span of the last unexpected token, used to detect infinite recovery loops.
     last_unexpected_token_span: Option<Span>,
     /// Stack of expected token types for better error messages.
-    expected_token_types: Vec<ExpectedToken>,
+    expected_token_types: Vec<ExpectedToken<'src>>,
     /// Monotonic count of tokens consumed by `advance` — detects
     /// zero-progress error-recovery loops (the stall detector).
     progress: u64,
@@ -178,7 +183,7 @@ pub struct Parser<'src, 'input> {
     /// `Vec`s per misspelled identifier.
     suggestion_buffers: SuggestionBuffers,
     /// Doc/trivia side channel captured during the upfront lex.
-    pub doc_map: DocMap,
+    pub doc_map: DocMap<'src>,
 }
 
 impl<'src, 'input> Parser<'src, 'input> {
@@ -186,13 +191,27 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Construction and token pipeline
     // -------------------------------------------------------------------------
 
-    pub fn new(source: &'src str, arena: &'input crate::arena::SyncArena<'input>) -> Self {
+    pub fn new(
+        source: &'src str,
+        file_id: FileId,
+        arena: &'input crate::arena::SyncArena<'input>,
+    ) -> Self {
         // Heuristic: on average, each token is ≈ 4 source bytes (identifier/keyword + delimiter).
         // Guessing wrong only means one extra allocation (freed along with the parser); guessing right saves log(n) reallocation copies.
         let token_cap = source.len() / 4 + 1;
         let mut tokens = Vec::with_capacity(token_cap);
         let mut doc_map = DocMap::default();
+        doc_map.file = file_id;
         doc_map.token_offsets.reserve(token_cap);
+        // Single usize→u32 conversion point for lexer byte ranges: spans store
+        // u32 offsets, saturating at the 4 GiB per-file limit.
+        let mk_span = |start: usize, end: usize| {
+            Span::new(
+                file_id,
+                u32::try_from(start).unwrap_or(u32::MAX),
+                u32::try_from(end).unwrap_or(u32::MAX),
+            )
+        };
         let mut lexer = Token::lexer(source);
         let mut diagnostics = Vec::new();
         loop {
@@ -217,7 +236,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                         // the item this doc documents.
                         anchor: tokens.len(),
                         is_module,
-                        span: Span::new(span_range.start, span_range.end),
+                        span: mk_span(span_range.start, span_range.end),
                     });
                     continue;
                 }
@@ -229,7 +248,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                             "unexpected character '{}'",
                             &source[bad_span.start..bad_span.end.min(source.len())]
                         ))
-                        .with_span(Span::new(bad_span.start, bad_span.end)),
+                        .with_span(mk_span(bad_span.start, bad_span.end)),
                     );
                     continue;
                 }
@@ -241,12 +260,12 @@ impl<'src, 'input> Parser<'src, 'input> {
             // runs from the span gaps.
             let prev_end: usize = tokens
                 .last()
-                .map(|t: &SpannedToken| t.span.end)
+                .map(|t: &SpannedToken| t.span.end as usize)
                 .unwrap_or(0);
             if span_range.start > prev_end {
                 let gap = &source[prev_end..span_range.start];
                 doc_map.trivia.push(TriviaEntry {
-                    span: Span::new(prev_end, span_range.start),
+                    span: mk_span(prev_end, span_range.start),
                     kind: if gap.contains("//") || gap.contains("/*") {
                         TriviaKind::Comment
                     } else {
@@ -254,20 +273,19 @@ impl<'src, 'input> Parser<'src, 'input> {
                     },
                 });
             }
-            tokens.push(SpannedToken {
-                token,
-                span: Span::new(span_range.start, span_range.end),
-            });
+            let span = mk_span(span_range.start, span_range.end);
+            tokens.push(SpannedToken { token, span });
             // #3 position-channel sidetable: parallel to `tokens`, so
             // token index (the doc-anchor index) → byte span.  Never
             // hashed (StableHash contract).
             doc_map
                 .token_offsets
-                .push((span_range.start, span_range.end));
+                .push((span.start, span.end));
         }
         Parser {
             arena,
             source,
+            file_id,
             tokens,
             cursor: 0,
             peeked: None,
@@ -287,18 +305,27 @@ impl<'src, 'input> Parser<'src, 'input> {
         }
     }
 
-    /// Allocate an AST node in the parser's arena, returning a SHARED
-    /// `&'input` reference (`SyncArena::alloc` returns `&mut T`; the AST
-    /// fields expect shared references).
-    fn alloc_shared<T>(arena: &'input crate::arena::SyncArena<'input>, val: T) -> &'input T {
-        arena.alloc(val)
+    /// Allocate an AST node in the parse arena, returning a SHARED `&'input`
+    /// reference.  `bump` is the raw arena bump obtained from
+    /// [`SyncArena::scope`](crate::arena::SyncArena::scope) for the duration
+    /// of the parse; it is threaded as a parameter (never stored) so that
+    /// `Parser` stays `Send + Sync`.
+    fn alloc_shared<T>(bump: &'input bumpalo::Bump, val: T) -> &'input T {
+        bump.alloc(val)
+    }
+
+    fn alloc_slice<T: Clone>(
+        bump: &'input bumpalo::Bump,
+        v: &[T],
+    ) -> &'input [T] {
+        bump.alloc_slice_clone(v)
     }
 
     /// The semantic token stream as seen by the parser (doc comments
     /// and trivia already diverted to the doc channel).  Exposed for
     /// the d8b two-channel invariance test.
-    pub fn semantic_tokens(&self) -> Vec<Token> {
-        self.tokens.iter().map(|st| st.token.clone()).collect()
+    pub fn semantic_tokens(&self) -> impl Iterator<Item = &Token<'src>> + '_ {
+        self.tokens.iter().map(|st| &st.token)
     }
 
     /// Pop every doc entry anchored exactly at `anchor` (the semantic
@@ -306,21 +333,32 @@ impl<'src, 'input> Parser<'src, 'input> {
     /// into one doc string.  Module-level docs (`//!`) are left in the
     /// channel — they are not item docs.
     fn take_doc_for_anchor(&mut self, anchor: usize) -> Option<String> {
-        let texts: Vec<String> = self
+        let mut iter = self
             .doc_map
             .docs
             .iter()
             .filter(|d| d.anchor == anchor && !d.is_module)
-            .map(|d| d.text.clone())
-            .collect();
-        if texts.is_empty() {
-            None
-        } else {
-            Some(texts.join("\n"))
+            .map(|d| d.text);
+        let first = match iter.next() {
+            None => return None,
+            Some(d) => d,
+        };
+        let second = match iter.next() {
+            None => return Some(first.to_owned()),
+            Some(d) => d,
+        };
+        let mut s = String::with_capacity(first.len() + second.len() + 1);
+        s.push_str(first);
+        s.push('\n');
+        s.push_str(second);
+        for d in iter {
+            s.push('\n');
+            s.push_str(d);
         }
+        Some(s)
     }
 
-    fn next_token(&mut self) -> Result<Token, ()> {
+    fn next_token(&mut self) -> Result<Token<'src>, ()> {
         // Check the pending stack first (e.g. Shr-split Gt).
         if let Some(tok) = self.pending.pop() {
             return Ok(tok);
@@ -334,14 +372,14 @@ impl<'src, 'input> Parser<'src, 'input> {
         }
     }
 
-    fn peek(&mut self) -> &Result<Token, ()> {
+    fn peek(&mut self) -> &Result<Token<'src>, ()> {
         if self.peeked.is_none() {
             self.peeked = Some(self.next_token());
         }
         self.peeked.as_ref().expect("peek called before next_token")
     }
 
-    fn advance(&mut self) -> Result<Token, ()> {
+    fn advance(&mut self) -> Result<Token<'src>, ()> {
         let tok = match self.peeked.take() {
             Some(tok) => tok,
             None => self.next_token(),
@@ -362,7 +400,7 @@ impl<'src, 'input> Parser<'src, 'input> {
     /// `peeked` caches the token `peek()` already consumed; once it is
     /// populated the pending stack is necessarily empty (a prior
     /// `next_token` drained it), so the two branches never overlap.
-    fn peek_next(&mut self) -> Option<Token> {
+    fn peek_next(&mut self) -> Option<&Token<'src>> {
         // Invariant: `pending` holds at most ONE token at any time — every
         // `pending.push` (`>>` split in `expect_gt`, `<<` split in the
         // nested-projection path) is immediately followed by consuming it
@@ -375,14 +413,14 @@ impl<'src, 'input> Parser<'src, 'input> {
             !(self.peeked.is_some() && !self.pending.is_empty()),
             "peek_next: peeked cache and pending stack cannot both be non-empty"
         );
-        if let Some(tok) = self.pending.last() {
+        if !self.pending.is_empty() {
             if self.pending.len() > 1 {
-                return Some(self.pending[self.pending.len() - 2].clone());
+                return Some(&self.pending[self.pending.len() - 2]);
             }
-            return self.tokens.get(self.cursor).map(|st| st.token.clone());
+            return self.tokens.get(self.cursor).map(|st| &st.token);
         }
         self.peek();
-        self.tokens.get(self.cursor).map(|st| st.token.clone())
+        self.tokens.get(self.cursor).map(|st| &st.token)
     }
 
     fn span(&self) -> Span {
@@ -393,7 +431,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         } else if !self.tokens.is_empty() {
             self.tokens[self.tokens.len() - 1].span
         } else {
-            Span::new(0, 0)
+            Span::new(self.file_id, 0, 0)
         }
     }
 
@@ -401,7 +439,7 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Expect / consume helpers
     // -------------------------------------------------------------------------
 
-    pub fn expect(&mut self, expected: Token) -> Result<Token, Diagnostic<'src>> {
+    pub fn expect(&mut self, expected: Token<'src>) -> Result<Token<'src>, Diagnostic<'src>> {
         if matches!(self.peek(), Ok(tok) if tok == &expected) {
             self.advance().ok();
             Ok(expected)
@@ -448,7 +486,11 @@ impl<'src, 'input> Parser<'src, 'input> {
         }
     }
 
-    fn expect_one_of(&mut self, edible: &[Token], inedible: &[Token]) -> Result<Recovered, ()> {
+    fn expect_one_of(
+        &mut self,
+        edible: &[Token<'src>],
+        inedible: &[Token<'src>],
+    ) -> Result<Recovered, ()> {
         for exp in edible {
             if matches!(self.peek(), Ok(tok) if tok == exp) {
                 self.advance().ok();
@@ -471,9 +513,15 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Checkpoint‑based backtracking
     // -------------------------------------------------------------------------
 
-    fn checkpoint(&self) -> Checkpoint {
+    fn checkpoint(&self) -> Checkpoint<'src> {
         Checkpoint {
             cursor: self.cursor,
+            // `None` is preserved as `None`: `restore` puts it back, and a
+            // later `peek` lazily re-reads the next token.  (The previous
+            // `unwrap_or(Ok(Token::WhitespaceOrComment))` fabricated a
+            // phantom token that `restore` would have handed to `peek` as
+            // if it came from the stream.  Unreachable today only because
+            // every live checkpoint site peeks first.)
             peeked: self.peeked.clone(),
             pending: self.pending.clone(),
             progress: self.progress,
@@ -481,10 +529,10 @@ impl<'src, 'input> Parser<'src, 'input> {
         }
     }
 
-    fn restore(&mut self, cp: &Checkpoint) {
+    fn restore(&mut self, cp: Checkpoint<'src>) {
         self.cursor = cp.cursor;
-        self.peeked = cp.peeked.clone();
-        self.pending = cp.pending.clone();
+        self.peeked = cp.peeked;
+        self.pending = cp.pending;
         self.progress = cp.progress;
         self.sync_stall = cp.sync_stall;
     }
@@ -500,7 +548,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         match f(self) {
             Ok(val) => Ok(val),
             Err(e) => {
-                self.restore(&cp);
+                self.restore(cp);
                 Err(e)
             }
         }
@@ -520,7 +568,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         match f(self) {
             Ok(val) => Ok(val),
             Err(_) => {
-                self.restore(&cp);
+                self.restore(cp);
                 fallback(self)
             }
         }
@@ -574,7 +622,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         result
     }
 
-    fn push_expected(&mut self, tok: Token, desc: &'static str) {
+    fn push_expected(&mut self, tok: Token<'src>, desc: &'static str) {
         self.expected_token_types
             .push(ExpectedToken::new(tok, desc));
     }
@@ -587,7 +635,7 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Keyword‑to‑ident conversion (path positions)
     // -------------------------------------------------------------------------
 
-    fn keyword_to_ident(&self, tok: &Token) -> Option<Symbol> {
+    fn keyword_to_ident(&self, tok: &Token<'src>) -> Option<Symbol> {
         tok.as_ident_symbol()
     }
 
@@ -603,13 +651,25 @@ impl<'src, 'input> Parser<'src, 'input> {
     /// source contains syntax errors.  The parser attempts to recover and
     /// continue after each error, so multiple diagnostics may be returned.
     #[must_use]
-    pub fn parse_program(&mut self) -> Result<Program<'input>, Vec<Diagnostic<'src>>> {
+    pub fn parse_program(&mut self) -> Result<Program<'input, 'src>, Vec<Diagnostic<'src>>> {
+        // Take exclusive allocation access for the whole parse: the raw
+        // `&Bump` threaded through the grammar is sound only while this scope
+        // holds `alloc_lock` (see `crate::arena`).  The scope drops at return,
+        // before any post-parse allocation, so it cannot deadlock the checker.
+        let scope = self.arena.scope();
+        self.parse_program_inner(scope.bump())
+    }
+
+    fn parse_program_inner(
+        &mut self,
+        bump: &'input bumpalo::Bump,
+    ) -> Result<Program<'input, 'src>, Vec<Diagnostic<'src>>> {
         let start = self.span().start;
         let mut items = Vec::new();
         loop {
             match self.peek() {
                 Err(()) => break,
-                _ => match self.parse_item() {
+                _ => match self.parse_item(bump) {
                     Ok(item) => {
                         if !matches!(item, Stmt::Error(_)) {
                             self.cascade_suppressed = false;
@@ -630,7 +690,7 @@ impl<'src, 'input> Parser<'src, 'input> {
             }
         }
         let end = self.span().end;
-        let span = Span::new(start, end);
+        let span = Span::new(self.file_id, start, end);
         if self.diagnostics.is_empty() {
             Ok(Program {
                 items,

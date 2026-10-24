@@ -9,7 +9,7 @@
 //! - [`QueryLatch`] — a thread synchronization primitive that allows
 //!   one thread to compute a query while others wait for the result.
 
-use parking_lot::{Condvar, Mutex};
+use crate::sync::{Condvar, Mutex};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
@@ -55,7 +55,7 @@ impl QueryJob {
     }
     // NOTE: there is deliberately no `signal_complete` convenience — the
     // completion order in `get_shared` must resolve the latch BEFORE the
-    // active-key entry is removed (F1), and the removed entry's `job.id`
+    // active-key entry is removed, and the removed entry's `job.id`
     // is still needed afterwards for `clear_waiters_of_me`, so callers
     // work on the latch and the entry separately.
 }
@@ -164,17 +164,33 @@ impl QueryLatch {
         // lost: the resolver either flips the state word before our
         // check (we see it and never park) or after (it then counts our
         // `waiters` increment and notifies the condvar).
+        //
+        // Tripwire registration BEFORE the lock (single rule: register,
+        // then acquire) — matches `resolve`'s shape.
+        let _tw = crate::hir::query::sync_order::Acquired::acquire(
+            crate::hir::query::sync_order::Fam::LatchPark,
+            "job.latch.wait_on",
+        );
         let mut park = self.inner.park.lock();
         park.waiters += 1;
-        let result = loop {
+        loop {
             match self.inner.state.load(Ordering::Acquire) {
-                LATCH_COMPLETED => break Ok(()),
-                LATCH_POISONED => break Err(()),
+                // Decrement on EVERY exit path: the count gates the
+                // notify_all in `resolve`, and a leaked increment makes
+                // every future `set`/`poison` take the notify path
+                // forever (perf-only, but the invariant must not depend
+                // on `Condvar::wait` never unwinding).
+                LATCH_COMPLETED => {
+                    park.waiters -= 1;
+                    return Ok(());
+                }
+                LATCH_POISONED => {
+                    park.waiters -= 1;
+                    return Err(());
+                }
                 _ => self.inner.cv.wait(&mut park),
             }
-        };
-        park.waiters -= 1;
-        result
+        }
     }
 
     /// Signal that the query is complete and resume all waiting threads.
@@ -208,10 +224,17 @@ impl QueryLatch {
         }
         // Skip the futex wake entirely when nobody is parked: every
         // waiter was still in its bounded spin and already observed the
-        // state word above.
-        if self.inner.park.lock().waiters > 0 {
+        // state word above.  Registration BEFORE the lock (single rule:
+        // register, then acquire) — the RAII guard drops at block end.
+        let _tw = crate::hir::query::sync_order::Acquired::acquire(
+            crate::hir::query::sync_order::Fam::LatchPark,
+            "job.latch.resolve",
+        );
+        let park = self.inner.park.lock();
+        if park.waiters > 0 {
             self.inner.cv.notify_all();
         }
+        drop(park);
     }
 
     /// Check whether the query has completed.
@@ -228,7 +251,7 @@ impl Default for QueryLatch {
 
 // ── Tests ─────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use std::sync::Arc;

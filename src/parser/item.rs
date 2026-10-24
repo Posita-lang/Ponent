@@ -3,6 +3,7 @@
 use super::*;
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
+use crate::lexer::literal::parse_string_literal;
 use crate::lexer::Token;
 use crate::symbol::Symbol;
 use smallvec::smallvec;
@@ -12,14 +13,14 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Item dispatch
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_item(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
+    pub(super) fn parse_item(&mut self, bump: &'input bumpalo::Bump) -> Result<Stmt<'input>, Diagnostic<'src>> {
         // Collect leading @attributes.  Doc comments are NOT in the
         // grammar stream (they live in the doc side channel); pull this
         // item's docs back from the channel by anchor position.
         let mut attributes = Vec::new();
         loop {
             match self.peek() {
-                Ok(Token::At) => attributes.push(self.parse_attribute()?),
+                Ok(Token::At) => attributes.push(self.parse_attribute(bump)?),
                 _ => break,
             }
         }
@@ -34,12 +35,12 @@ impl<'src, 'input> Parser<'src, 'input> {
         };
         let doc = self.take_doc_for_anchor(item_anchor);
         match self.peek() {
-            Ok(Token::Comptime) => self.parse_comptime_item(attributes, doc),
+            Ok(Token::Comptime) => self.parse_comptime_item(attributes, doc, bump),
             Ok(Token::Async) => {
                 self.advance().ok();
                 self.expect(Token::Def)?;
                 self.with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
-                    this.parse_function_def(attributes, doc, false, true)
+                    this.parse_function_def(attributes, doc, false, true, bump)
                 })
             }
             Ok(Token::Def) => {
@@ -48,12 +49,12 @@ impl<'src, 'input> Parser<'src, 'input> {
                 // and referenced, not rejected).
                 self.advance().ok();
                 self.with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
-                    this.parse_function_def(attributes, doc, false, false)
+                    this.parse_function_def(attributes, doc, false, false, bump)
                 })
             }
             Ok(Token::Edition) => self.parse_edition(),
-            Ok(Token::Import) | Ok(Token::From) => self.parse_import(),
-            Ok(Token::Extern) => self.parse_extern_function(attributes),
+            Ok(Token::Import) => self.parse_import(),
+            Ok(Token::Extern) => self.parse_extern_function(attributes, bump),
             Ok(Token::Type) => {
                 // Nested type definitions — blocks may contain items
                 // (rustc-style).  Before this arm existed, `type` fell
@@ -67,24 +68,24 @@ impl<'src, 'input> Parser<'src, 'input> {
                 // consumed), parse_type_def consumes the `type` keyword
                 // itself.
                 self.with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
-                    this.parse_type_def(attributes, doc)
+                    this.parse_type_def(attributes, doc, bump)
                 })
             }
-            Ok(Token::Trait) => self.parse_trait_def(attributes, doc),
+            Ok(Token::Trait) => self.parse_trait_def(attributes, doc, bump),
             Ok(Token::Impl) => self
                 .with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
-                    this.parse_impl_block(attributes)
+                    this.parse_impl_block(attributes, bump)
                 }),
-            Ok(Token::Constraint) => self.parse_constraint(),
-            Ok(Token::Set) | Ok(Token::Let) => self.parse_variable_def(attributes),
+            Ok(Token::Constraint) => self.parse_constraint(bump),
+            Ok(Token::Set) | Ok(Token::Let) => self.parse_variable_def(attributes, bump),
             Ok(Token::Layout) => {
                 self.advance().ok();
                 self.parse_layout_def(attributes)
             }
-            Ok(Token::Generate) => self.parse_generate_item(attributes),
+            Ok(Token::Generate) => self.parse_generate_item(attributes, bump),
             _ => {
                 let tok = self.advance().ok();
-                let mut diag = Diagnostic::error(format!("unexpected token at top level: {}", tok.as_ref().map(|t| t.to_user_string()).unwrap_or_else(|| "end of file".to_string())))
+                let mut diag = Diagnostic::error(format!("unexpected token at top level: {}", tok.as_ref().map(|t| t.to_user_string()).unwrap_or_else(|| "end of file".into())))
                     .with_code_str("E003")
                     .with_help("only items (`def`, `type`, `trait`, `import`, `edition`, `constraint`, `extern`, `impl`, `comptime`, `async`, `set`, `let`) are allowed at the top level")
                     .with_span(self.span());
@@ -105,7 +106,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                 }
                 if self.cascade_suppressed {
                     self.skip_to_next_top_level();
-                    return Ok(Stmt::Error(Span::new(0, 0)));
+                    return Ok(Stmt::Error(Span::new(self.file_id, 0, 0)));
                 }
                 self.cascade_suppressed = true;
                 Err(diag)
@@ -121,11 +122,12 @@ impl<'src, 'input> Parser<'src, 'input> {
         &mut self,
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
+        bump: &'input bumpalo::Bump,
     ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let trusted = if matches!(self.peek(), Ok(Token::At)) {
-            let attr = self.parse_attribute()?;
+            let attr = self.parse_attribute(bump)?;
             if !attr.name.eq_str("trusted") {
                 return Err(
                     Diagnostic::error("only `@trusted` is allowed after `comptime`")
@@ -150,13 +152,13 @@ impl<'src, 'input> Parser<'src, 'input> {
                 }
                 self.advance().ok();
                 self.with_restrictions(ParseRestrictions::ALLOW_TYPE_PARAMS, |this| {
-                    this.parse_function_def(attributes, doc, true, false)
+                    this.parse_function_def(attributes, doc, true, false, bump)
                 })
             }
             Ok(Token::LBracket) => {
                 let start = self.span().start;
                 self.advance().ok();
-                let mut captures = Vec::new();
+                let mut captures = bumpalo::collections::Vec::with_capacity_in(4, bump);
                 loop {
                     let name_span = self.span();
                     match self.peek() {
@@ -193,7 +195,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                     }
                 }
                 let trusted = if matches!(self.peek(), Ok(Token::At)) {
-                    let attr = self.parse_attribute()?;
+                    let attr = self.parse_attribute(bump)?;
                     if !attr.name.eq_str("trusted") {
                         return Err(Diagnostic::error("only `@trusted` is allowed after `comptime [captures]`")
                             .with_code_str("E004")
@@ -206,29 +208,29 @@ impl<'src, 'input> Parser<'src, 'input> {
                     trusted
                 };
                 self.expect(Token::LBrace)?;
-                let body = self.parse_block()?;
+                let body = self.parse_block(bump)?;
                 self.expect(Token::RBrace)?;
                 let end = self.span().end;
                 Ok(Stmt::ComptimeBlock {
-                    captures,
+                    captures: captures.into_bump_slice(),
                     trusted,
                     attributes,
                     body,
-                    span: Span::new(start, end),
+                    span: Span::new(self.file_id, start, end),
                 })
             }
             Ok(Token::LBrace) => {
                 let start = self.span().start;
                 self.expect(Token::LBrace)?;
-                let body = self.parse_block()?;
+                let body = self.parse_block(bump)?;
                 self.expect(Token::RBrace)?;
                 let end = self.span().end;
                 Ok(Stmt::ComptimeBlock {
-                    captures: Vec::new(),
+                    captures: &[],
                     trusted,
                     attributes,
                     body,
-                    span: Span::new(start, end),
+                    span: Span::new(self.file_id, start, end),
                 })
             }
             _ => {
@@ -252,6 +254,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         doc: Option<String>,
         is_comptime: bool,
         is_async: bool,
+        bump: &'input bumpalo::Bump,
     ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         let name = match self.advance() {
@@ -281,12 +284,12 @@ impl<'src, 'input> Parser<'src, 'input> {
             .contains(ParseRestrictions::ALLOW_TYPE_PARAMS)
             && matches!(self.peek(), Ok(Token::Lt))
         {
-            self.parse_type_params()?
+            self.parse_type_params(bump)?
         } else {
             Vec::new()
         };
         self.expect(Token::LParen)?;
-        let mut params = Vec::new();
+        let mut params = bumpalo::collections::Vec::with_capacity_in(4, bump);
         loop {
             match self.peek() {
                 Ok(Token::RParen) => {
@@ -294,7 +297,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                     break;
                 }
                 _ => {
-                    let param = self.parse_param()?;
+                    let param = self.parse_param(bump)?;
                     params.push(param);
                     if matches!(self.peek(), Ok(Token::Comma)) {
                         self.advance().ok();
@@ -307,7 +310,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         }
         let return_type = if matches!(self.peek(), Ok(Token::Arrow)) {
             self.advance().ok();
-            Some(self.parse_type()?)
+            Some(self.parse_type(bump)?)
         } else {
             None
         };
@@ -320,20 +323,20 @@ impl<'src, 'input> Parser<'src, 'input> {
                 | Ok(Token::Decreases)
                 | Ok(Token::Terminates)
         ) {
-            contracts.push(self.parse_contract()?);
+            contracts.push(self.parse_contract(bump)?);
         }
         let where_clause = if matches!(self.peek(), Ok(Token::Where)) {
-            Some(self.parse_where_clause()?)
+            Some(self.parse_where_clause(bump)?)
         } else {
             None
         };
         self.expect(Token::LBrace)?;
-        let body = self.parse_block()?;
+        let body = self.parse_block(bump)?;
         self.expect(Token::RBrace)?;
         let finally = if matches!(self.peek(), Ok(Token::Finally)) {
             self.advance().ok();
             self.expect(Token::LBrace)?;
-            let block = self.parse_block()?;
+            let block = self.parse_block(bump)?;
             self.expect(Token::RBrace)?;
             Some(block)
         } else {
@@ -341,12 +344,12 @@ impl<'src, 'input> Parser<'src, 'input> {
         };
         let end = self.span().end;
         Ok(Stmt::FunctionDef {
-            span: Span::new(start, end),
+            span: Span::new(self.file_id, start, end),
             attributes,
             contracts,
             doc,
             name,
-            params,
+            params: params.into_bump_slice(),
             return_type,
             body: Some(body),
             type_params,
@@ -365,6 +368,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         &mut self,
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
+        bump: &'input bumpalo::Bump,
     ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
@@ -381,14 +385,14 @@ impl<'src, 'input> Parser<'src, 'input> {
             };
         if matches!(self.peek(), Ok(Token::Lt)) {
             let lt_span = self.span();
-            let _type_params = self.parse_type_params()?;
+            let _type_params = self.parse_type_params(bump)?;
             return Err(Diagnostic::error("generic traits are not yet supported")
                 .with_code_str("E004")
                 .with_help("trait definitions cannot have type parameters yet")
                 .with_suggestion(
                     "remove the type parameters, or express constraints in the trait body",
                 )
-                .with_span(Span::new(lt_span.start, self.span().end)));
+                .with_span(Span::new(self.file_id, lt_span.start, self.span().end)));
         }
         let mut methods = Vec::new();
         let mut associated_types = Vec::new();
@@ -413,7 +417,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                         let lifetime_params = self.parse_associated_type_lifetime_params()?;
                         let default = if matches!(self.peek(), Ok(Token::Assign)) {
                             self.advance().ok();
-                            Some(self.parse_type()?)
+                            Some(self.parse_type(bump)?)
                         } else {
                             None
                         };
@@ -422,7 +426,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                             name: assoc_name,
                             lifetime_params,
                             default,
-                            span: Span::new(start, self.span().end),
+                            span: Span::new(self.file_id, start, self.span().end),
                         });
                     }
                     Ok(Token::Def) => {
@@ -436,20 +440,20 @@ impl<'src, 'input> Parser<'src, 'input> {
                                 .with_span(self.span())),
                         };
                         self.expect(Token::LParen)?;
-                        let mut params = Vec::new();
+                        let mut params = bumpalo::collections::Vec::with_capacity_in(4, bump);
                         loop {
                             match self.peek() {
                                 Ok(Token::RParen) => { self.advance().ok(); break; }
                                 Ok(Token::Ampersand) => {
-                                    let param = self.parse_self_param()?;
+                                    let param = self.parse_self_param(bump)?;
                                     params.push(param);
                                 }
                                 Ok(Token::Ident(s)) if s.eq_str("self") || s.eq_str("SelfKw") => {
-                                    let param = self.parse_self_param()?;
+                                    let param = self.parse_self_param(bump)?;
                                     params.push(param);
                                 }
                                 _ => {
-                                    let param = self.parse_param()?;
+                                    let param = self.parse_param(bump)?;
                                     params.push(param);
                                 }
                             }
@@ -462,16 +466,16 @@ impl<'src, 'input> Parser<'src, 'input> {
                         }
                         let return_type = if matches!(self.peek(), Ok(Token::Arrow)) {
                             self.advance().ok();
-                            self.parse_type()?
+                            self.parse_type(bump)?
                         } else {
                             Type::Never(self.span())
                         };
                         self.expect(Token::Semicolon)?;
                         methods.push(TraitMethod {
                             name: method_name,
-                            params,
+                            params: params.into_bump_slice(),
                             return_type,
-                            span: Span::new(start, self.span().end),
+                            span: Span::new(self.file_id, start, self.span().end),
                         });
                     }
                     _ => return Err(Diagnostic::error("expected 'type' or 'def' in trait body")
@@ -484,7 +488,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         }
         let end = self.span().end;
         Ok(Stmt::TraitDef {
-            span: Span::new(start, end),
+            span: Span::new(self.file_id, start, end),
             attributes,
             doc,
             name,
@@ -500,35 +504,36 @@ impl<'src, 'input> Parser<'src, 'input> {
     pub(super) fn parse_impl_block(
         &mut self,
         attributes: Vec<Attribute<'input>>,
+        bump: &'input bumpalo::Bump,
     ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let type_params = if matches!(self.peek(), Ok(Token::Lt)) {
-            self.parse_type_params()?
+            self.parse_type_params(bump)?
         } else {
             Vec::new()
         };
         let (trait_path, for_type) = if matches!(self.peek(), Ok(Token::For)) {
             self.advance().ok();
-            let for_ty = self.parse_type()?;
+            let for_ty = self.parse_type(bump)?;
             (None, for_ty)
         } else {
-            let first_type = self.parse_type()?;
+            let first_type = self.parse_type(bump)?;
             if matches!(self.peek(), Ok(Token::For)) {
                 self.advance().ok();
-                let for_ty = self.parse_type()?;
-                (Some(Self::alloc_shared(self.arena, first_type)), for_ty)
+                let for_ty = self.parse_type(bump)?;
+                (Some(Self::alloc_shared(bump, first_type)), for_ty)
             } else {
                 (None, first_type)
             }
         };
         let where_clause = if matches!(self.peek(), Ok(Token::Where)) {
-            Some(self.parse_where_clause()?)
+            Some(self.parse_where_clause(bump)?)
         } else {
             None
         };
         self.expect(Token::LBrace)?;
-        let mut methods = Vec::new();
+        let mut methods = bumpalo::collections::Vec::with_capacity_in(4, bump);
         let mut associated_types = Vec::new();
         loop {
             if matches!(self.peek(), Ok(Token::RBrace)) {
@@ -545,36 +550,36 @@ impl<'src, 'input> Parser<'src, 'input> {
                 };
                 let lifetime_params = self.parse_associated_type_lifetime_params()?;
                 self.expect(Token::Assign)?;
-                let assoc_ty = self.parse_type()?;
+                let assoc_ty = self.parse_type(bump)?;
                 self.expect(Token::Semicolon)?;
                 associated_types.push(AssociatedType {
                     name: assoc_name,
                     lifetime_params,
                     default: Some(assoc_ty),
-                    span: Span::new(start, self.span().end),
+                    span: Span::new(self.file_id, start, self.span().end),
                 });
             } else {
-                methods.push(self.parse_impl_method()?);
+                methods.push(self.parse_impl_method(bump)?);
             }
         }
         self.expect(Token::RBrace)?;
         let end = self.span().end;
         Ok(Stmt::ImplBlock {
-            span: Span::new(start, end),
+            span: Span::new(self.file_id, start, end),
             attributes,
             trait_path,
             for_type,
-            methods,
+            methods: methods.into_bump_slice(),
             associated_types,
             where_clause,
             type_params,
         })
     }
 
-    pub(super) fn parse_impl_method(&mut self) -> Result<ImplMethod<'input>, Diagnostic<'src>> {
+    pub(super) fn parse_impl_method(&mut self, bump: &'input bumpalo::Bump) -> Result<ImplMethod<'input>, Diagnostic<'src>> {
         let mut attributes = Vec::new();
         while matches!(self.peek(), Ok(Token::At)) {
-            attributes.push(self.parse_attribute()?);
+            attributes.push(self.parse_attribute(bump)?);
         }
         if matches!(self.peek(), Ok(Token::Def)) {
             self.advance().ok();
@@ -604,7 +609,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                 .with_span(self.span())),
             };
         self.expect(Token::LParen)?;
-        let mut params = Vec::new();
+        let mut params = bumpalo::collections::Vec::with_capacity_in(4, bump);
         loop {
             match self.peek() {
                 Ok(Token::RParen) => {
@@ -612,15 +617,15 @@ impl<'src, 'input> Parser<'src, 'input> {
                     break;
                 }
                 Ok(Token::Ampersand) => {
-                    let param = self.parse_self_param()?;
+                    let param = self.parse_self_param(bump)?;
                     params.push(param);
                 }
                 Ok(Token::Ident(s)) if s.eq_str("self") || s.eq_str("SelfKw") => {
-                    let param = self.parse_self_param()?;
+                    let param = self.parse_self_param(bump)?;
                     params.push(param);
                 }
                 _ => {
-                    let param = self.parse_param()?;
+                    let param = self.parse_param(bump)?;
                     params.push(param);
                 }
             }
@@ -633,13 +638,13 @@ impl<'src, 'input> Parser<'src, 'input> {
         }
         let return_type = if matches!(self.peek(), Ok(Token::Arrow)) {
             self.advance().ok();
-            self.parse_type()?
+            self.parse_type(bump)?
         } else {
             Type::Never(self.span())
         };
         let body = if matches!(self.peek(), Ok(Token::LBrace)) {
             self.advance().ok();
-            let block = self.parse_block()?;
+            let block = self.parse_block(bump)?;
             self.expect(Token::RBrace)?;
             Some(block)
         } else {
@@ -649,10 +654,10 @@ impl<'src, 'input> Parser<'src, 'input> {
         Ok(ImplMethod {
             name,
             attributes,
-            params,
+            params: params.into_bump_slice(),
             return_type,
             body,
-            span: Span::new(start, end),
+            span: Span::new(self.file_id, start, end),
         })
     }
 
@@ -660,7 +665,7 @@ impl<'src, 'input> Parser<'src, 'input> {
     // `self` parameter
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_self_param(&mut self) -> Result<Param<'input>, Diagnostic<'src>> {
+    pub(super) fn parse_self_param(&mut self, bump: &'input bumpalo::Bump) -> Result<Param<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         let has_ampersand = matches!(self.peek(), Ok(Token::Ampersand));
         let mutable = if has_ampersand {
@@ -679,21 +684,21 @@ impl<'src, 'input> Parser<'src, 'input> {
                 let ty: Type<'input> = if has_ampersand {
                     Type::Reference {
                         inner: Self::alloc_shared(
-                            self.arena,
-                            Type::Path(smallvec!["Self".into()], Span::new(start, end)),
+                            bump,
+                            Type::Path(smallvec!["Self".into()], Span::new(self.file_id, start, end)),
                         ),
                         mutable,
                         lifetime: None,
-                        span: Span::new(start, end),
+                        span: Span::new(self.file_id, start, end),
                     }
                 } else {
-                    Type::Path(smallvec!["Self".into()], Span::new(start, end))
+                    Type::Path(smallvec!["Self".into()], Span::new(self.file_id, start, end))
                 };
                 Ok(Param {
                     name: "self".into(),
                     ty: Some(ty),
                     default: None,
-                    span: Span::new(start, end),
+                    span: Span::new(self.file_id, start, end),
                 })
             }
             Ok(Token::SelfKw) => {
@@ -701,21 +706,21 @@ impl<'src, 'input> Parser<'src, 'input> {
                 let ty: Type<'input> = if has_ampersand {
                     Type::Reference {
                         inner: Self::alloc_shared(
-                            self.arena,
-                            Type::Path(smallvec!["Self".into()], Span::new(start, end)),
+                            bump,
+                            Type::Path(smallvec!["Self".into()], Span::new(self.file_id, start, end)),
                         ),
                         mutable,
                         lifetime: None,
-                        span: Span::new(start, end),
+                        span: Span::new(self.file_id, start, end),
                     }
                 } else {
-                    Type::Path(smallvec!["Self".into()], Span::new(start, end))
+                    Type::Path(smallvec!["Self".into()], Span::new(self.file_id, start, end))
                 };
                 Ok(Param {
                     name: "self".into(),
                     ty: Some(ty),
                     default: None,
-                    span: Span::new(start, end),
+                    span: Span::new(self.file_id, start, end),
                 })
             }
             _ => Err(Diagnostic::error("expected 'self'")
@@ -730,7 +735,7 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Function / closure parameter
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_param(&mut self) -> Result<Param<'input>, Diagnostic<'src>> {
+    pub(super) fn parse_param(&mut self, bump: &'input bumpalo::Bump) -> Result<Param<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
@@ -759,13 +764,13 @@ impl<'src, 'input> Parser<'src, 'input> {
         };
         let ty = if matches!(self.peek(), Ok(Token::Colon)) {
             self.advance().ok();
-            Some(self.parse_type()?)
+            Some(self.parse_type(bump)?)
         } else {
             None
         };
         let default = if matches!(self.peek(), Ok(Token::Assign)) {
             self.advance().ok();
-            Some(self.parse_expr()?)
+            Some(self.parse_expr(bump)?)
         } else {
             None
         };
@@ -774,7 +779,7 @@ impl<'src, 'input> Parser<'src, 'input> {
             name,
             ty,
             default,
-            span: Span::new(start, end),
+            span: Span::new(self.file_id, start, end),
         })
     }
 
@@ -782,22 +787,25 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Contracts (requires / ensures / invariant / decreases / terminates)
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_contract(&mut self) -> Result<Contract<'input>, Diagnostic<'src>> {
+    pub(super) fn parse_contract(&mut self, bump: &'input bumpalo::Bump) -> Result<Contract<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         match self.advance().map_err(|_| Diagnostic::error("unexpected token")
             .with_code_str("E003")
             .with_help("unexpected syntax in contract — expected `requires`, `ensures`, `invariant`, `decreases`, or `terminates`")
-            .with_span(Span::new(0, 0)))?
+            .with_span(Span::new(self.file_id, 0, 0)))?
         {
             Token::Requires => {
-                let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
+                let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr(bump))?;
                 let end = self.span().end;
-                Ok(Contract::Requires(expr, Span::new(start, end)))
+                Ok(Contract::Requires(expr, Span::new(self.file_id, start, end)))
             }
             Token::Ensures => {
                 let mut target = EnsuresTarget::Unconditional;
                 match self.peek() {
-                    Ok(Token::OnTimeout) => {
+                    // `on_timeout` / `on_cancel` / `on` are contextual
+                    // keywords (not in SYNTAX.md's keyword list) — matched
+                    // on the identifier, never globally reserved.
+                    Ok(Token::Ident(s)) if s.eq_str("on_timeout") => {
                         self.advance().ok();
                         if !matches!(self.peek(), Ok(Token::FatArrow)) {
                             return Err(Diagnostic::error("expected '=>' after on_timeout")
@@ -809,7 +817,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                         self.advance().ok();
                         target = EnsuresTarget::OnTimeout;
                     }
-                    Ok(Token::OnCancel) => {
+                    Ok(Token::Ident(s)) if s.eq_str("on_cancel") => {
                         self.advance().ok();
                         if !matches!(self.peek(), Ok(Token::FatArrow)) {
                             return Err(Diagnostic::error("expected '=>' after on_cancel")
@@ -821,14 +829,14 @@ impl<'src, 'input> Parser<'src, 'input> {
                         self.advance().ok();
                         target = EnsuresTarget::OnCancel;
                     }
-                    Ok(Token::On) => {
+                    Ok(Token::Ident(s)) if s.eq_str("on") => {
                         self.advance().ok();
                         match self.peek() {
                             Ok(Token::Ident(s)) if s.eq_str("Ok") => {
                                 self.advance().ok();
                                 self.expect(Token::LParen)?;
                                 let pat = if !matches!(self.peek(), Ok(Token::RParen)) {
-                                    Some(self.parse_pattern()?)
+                                    Some(self.parse_pattern(bump)?)
                                 } else {
                                     None
                                 };
@@ -847,7 +855,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                                 self.advance().ok();
                                 self.expect(Token::LParen)?;
                                 let pat = if !matches!(self.peek(), Ok(Token::RParen)) {
-                                    Some(self.parse_pattern()?)
+                                    Some(self.parse_pattern(bump)?)
                                 } else {
                                     None
                                 };
@@ -871,25 +879,25 @@ impl<'src, 'input> Parser<'src, 'input> {
                     }
                     _ => {}
                 }
-                let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
+                let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr(bump))?;
                 let labels = Vec::new(); // @label support not yet in lexer
                 let end = self.span().end;
-                Ok(Contract::Ensures { expr, span: Span::new(start, end), target, labels })
+                Ok(Contract::Ensures { expr, span: Span::new(self.file_id, start, end), target, labels })
             }
             Token::Invariant => {
-                let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
+                let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr(bump))?;
                 let end = self.span().end;
-                Ok(Contract::Invariant(expr, Span::new(start, end)))
+                Ok(Contract::Invariant(expr, Span::new(self.file_id, start, end)))
             }
             Token::Decreases => {
-                let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
+                let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr(bump))?;
                 let end = self.span().end;
-                Ok(Contract::Decreases(expr, Span::new(start, end)))
+                Ok(Contract::Decreases(expr, Span::new(self.file_id, start, end)))
             }
             Token::Terminates => {
-                let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr())?;
+                let expr = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| this.parse_expr(bump))?;
                 let end = self.span().end;
-                Ok(Contract::Terminates(expr, Span::new(start, end)))
+                Ok(Contract::Terminates(expr, Span::new(self.file_id, start, end)))
             }
             _ => unreachable!(),
         }
@@ -899,7 +907,7 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Where clause
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_where_clause(&mut self) -> Result<WhereClause<'input>, Diagnostic<'src>> {
+    pub(super) fn parse_where_clause(&mut self, bump: &'input bumpalo::Bump) -> Result<WhereClause<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let mut predicates = Vec::new();
@@ -947,20 +955,20 @@ impl<'src, 'input> Parser<'src, 'input> {
                 }
                 lifetime_outlives.push((lt, outlives));
             } else {
-                let ty = self.parse_type()?;
+                let ty = self.parse_type(bump)?;
                 if matches!(self.peek(), Ok(Token::EqEq)) {
                     self.advance().ok();
-                    let right = self.parse_type()?;
+                    let right = self.parse_type(bump)?;
                     equalities.push(WhereEquality {
                         left: ty,
                         right,
-                        span: Span::new(start, self.span().end),
+                        span: Span::new(self.file_id, start, self.span().end),
                     });
                 } else {
                     self.expect(Token::Colon)?;
                     let mut bounds = Vec::new();
                     loop {
-                        bounds.push(self.parse_type()?);
+                        bounds.push(self.parse_type(bump)?);
                         if !matches!(self.peek(), Ok(Token::Plus)) {
                             break;
                         }
@@ -970,7 +978,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                     predicates.push(WherePredicate {
                         ty,
                         bounds,
-                        span: Span::new(start, end),
+                        span: Span::new(self.file_id, start, end),
                     });
                 }
             }
@@ -993,11 +1001,22 @@ impl<'src, 'input> Parser<'src, 'input> {
     pub(super) fn parse_extern_function(
         &mut self,
         attributes: Vec<Attribute<'input>>,
+        bump: &'input bumpalo::Bump,
     ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let abi = match self.advance() {
-            Ok(Token::StringLiteral(Ok(s))) => s,
+            Ok(Token::StringLiteral(s)) => match parse_string_literal(s) {
+                Ok(c) => c.into_owned(),
+                Err(e) => {
+                    return Err(Diagnostic::error(format!(
+                        "invalid ABI string literal after 'extern': {}",
+                        e
+                    ))
+                    .with_code_str("E004")
+                    .with_span(self.span()))
+                }
+            },
             _ => {
                 return Err(Diagnostic::error("expected ABI string after 'extern'")
                     .with_code_str("E004")
@@ -1019,7 +1038,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                     .with_span(self.span())),
             };
         self.expect(Token::LParen)?;
-        let mut params = Vec::new();
+        let mut params = bumpalo::collections::Vec::with_capacity_in(4, bump);
         loop {
             match self.peek() {
                 Ok(Token::RParen) => {
@@ -1027,7 +1046,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                     break;
                 }
                 _ => {
-                    let param = self.parse_param()?;
+                    let param = self.parse_param(bump)?;
                     params.push(param);
                     if matches!(self.peek(), Ok(Token::Comma)) {
                         self.advance().ok();
@@ -1040,7 +1059,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         }
         let return_type = if matches!(self.peek(), Ok(Token::Arrow)) {
             self.advance().ok();
-            self.parse_type()?
+            self.parse_type(bump)?
         } else {
             Type::Never(self.span())
         };
@@ -1049,9 +1068,9 @@ impl<'src, 'input> Parser<'src, 'input> {
         Ok(Stmt::ExternFunction {
             abi,
             name,
-            params,
+            params: params.into_bump_slice(),
             return_type,
-            span: Span::new(start, end),
+            span: Span::new(self.file_id, start, end),
             attributes,
         })
     }
@@ -1065,7 +1084,12 @@ impl<'src, 'input> Parser<'src, 'input> {
         self.advance().ok();
         self.expect(Token::Assign)?;
         let edition = match self.advance() {
-            Ok(Token::StringLiteral(Ok(s))) => s,
+            Ok(Token::StringLiteral(s)) => match parse_string_literal(s) {
+                Ok(c) => c.into_owned(),
+                Err(e) => return Err(Diagnostic::error(format!("invalid edition string: {}", e))
+                    .with_code_str("E004")
+                    .with_span(self.span())),
+            },
             Ok(tok) => return Err(Diagnostic::error(format!("expected edition string, found {:?}", tok))
                 .with_code_str("E004")
                 .with_help("`edition = \"<version>\"` expects a string literal — e.g. `edition = \"2024\"`")
@@ -1079,7 +1103,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         };
         self.expect(Token::Semicolon)?;
         let end = self.span().end;
-        Ok(Stmt::Edition(edition, Span::new(start, end)))
+        Ok(Stmt::Edition(edition, Span::new(self.file_id, start, end)))
     }
 
     // -------------------------------------------------------------------------
@@ -1088,8 +1112,10 @@ impl<'src, 'input> Parser<'src, 'input> {
 
     pub(super) fn parse_import(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
-        let is_from = matches!(self.peek(), Ok(Token::From));
-        if is_from {
+        // Consume the leading `import` keyword (the item dispatcher
+        // matches `Token::Import` by peek only) — this arm is the
+        // single place that consumes it.
+        if matches!(self.peek(), Ok(Token::Import)) {
             self.advance().ok();
         }
         let mut path = Vec::new();
@@ -1097,12 +1123,14 @@ impl<'src, 'input> Parser<'src, 'input> {
             Ok(Token::Star) => return Err(Diagnostic::error("wildcard import is prohibited: `import *` is illegal")
                 .with_code_str("E005")
                 .with_help("explicit imports improve clarity and maintainability — list the items you need, or use `import path` for the module itself")
-                .with_suggestion("use named imports: `import path::Item` or `from path import { Item1, Item2 }`")
+                .with_suggestion("use named imports: `import path::Item` or `import path::{Item1, Item2}`")
                 .with_span(self.span())),
-            Ok(Token::Ident(part)) => path.push(part),
+            // Path position accepts any keyword (Track-A: keywords are
+            // not reserved in path position — `import std::io;`).
+            Ok(tok) if tok.as_ident_symbol().is_some() => path.push(tok.as_ident_symbol().unwrap()),
             _ => return Err(Diagnostic::error("expected module path")
                 .with_code_str("E004")
-                .with_help("after `import` or `from`, provide a module path — e.g. `import std::collections`")
+                .with_help("after `import`, provide a module path — e.g. `import std::collections`")
                 .with_suggestion("add a module path like `std::collections` or `my_module`")
                 .with_span(self.span())),
         }
@@ -1119,7 +1147,10 @@ impl<'src, 'input> Parser<'src, 'input> {
                         .with_suggestion("use named imports: `import path::Item`")
                         .with_span(self.span()));
                 }
-                Ok(Token::Ident(part)) => path.push(part),
+                // Keyword in path position (`std::io`) — Track-A.
+                Ok(tok) if tok.as_ident_symbol().is_some() => {
+                    path.push(tok.as_ident_symbol().unwrap())
+                }
                 _ => return Err(Diagnostic::error("expected identifier after '::'")
                     .with_code_str("E004")
                     .with_help(
@@ -1143,7 +1174,8 @@ impl<'src, 'input> Parser<'src, 'input> {
                         .with_help("explicit imports improve clarity and maintainability")
                         .with_suggestion("use named imports: `import path::Item`")
                         .with_span(self.span())),
-                    Ok(Token::Ident(item)) => item,
+                    // Item names accept keywords too (`import m::{io}`).
+                    Ok(tok) if tok.as_ident_symbol().is_some() => tok.as_ident_symbol().unwrap(),
                     _ => return Err(Diagnostic::error("expected import item name")
                         .with_code_str("E004")
                         .with_help("import items must be identifiers — e.g. `import std::{HashMap, HashSet}`")
@@ -1180,46 +1212,12 @@ impl<'src, 'input> Parser<'src, 'input> {
                 path,
                 items: Some(items),
                 alias,
-                span: Span::new(start, end),
+                span: Span::new(self.file_id, start, end),
             });
         }
-        let items = if is_from && matches!(self.peek(), Ok(Token::Import)) {
-            self.advance().ok();
-            self.expect(Token::LBrace)?;
-            let mut items = Vec::new();
-            loop {
-                match self.advance() {
-                    Ok(Token::Star) => {
-                        return Err(Diagnostic::error("wildcard import is prohibited")
-                            .with_code_str("E005")
-                            .with_span(self.span()));
-                    }
-                    Ok(Token::Ident(item)) => items.push(item),
-                    _ => {
-                        return Err(Diagnostic::error("expected import item name")
-                            .with_code_str("E004")
-                            .with_span(self.span()));
-                    }
-                }
-                match self.peek() {
-                    Ok(Token::Comma) => {
-                        self.advance().ok();
-                    }
-                    Ok(Token::RBrace) => {
-                        self.advance().ok();
-                        break;
-                    }
-                    _ => {
-                        return Err(Diagnostic::error("expected ',' or '}' in import list")
-                            .with_code_str("E004")
-                            .with_span(self.span()));
-                    }
-                }
-            }
-            Some(items)
-        } else {
-            None
-        };
+        // `import path::{a, b}` above is the only brace form; a bare
+        // `import path` imports the module itself (items = None).
+        let items = None;
         let alias =
             if matches!(self.peek(), Ok(Token::As)) {
                 self.advance().ok();
@@ -1244,7 +1242,7 @@ impl<'src, 'input> Parser<'src, 'input> {
             path,
             items,
             alias,
-            span: Span::new(start, end),
+            span: Span::new(self.file_id, start, end),
         })
     }
 
@@ -1252,7 +1250,7 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Constraint definition
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_constraint(&mut self) -> Result<Stmt<'input>, Diagnostic<'src>> {
+    pub(super) fn parse_constraint(&mut self, bump: &'input bumpalo::Bump) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
         let name = match self.advance() {
@@ -1264,7 +1262,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                 .with_span(self.span())),
         };
         let params = if matches!(self.peek(), Ok(Token::Lt)) {
-            self.parse_type_params()?
+            self.parse_type_params(bump)?
         } else {
             Vec::new()
         };
@@ -1276,7 +1274,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                 break;
             }
             let pred_start = self.span().start;
-            let subject = self.parse_type()?;
+            let subject = self.parse_type(bump)?;
             if !matches!(self.peek(), Ok(Token::Colon)) {
                 return Err(Diagnostic::error(
                     "expected `:` after subject type in constraint predicate",
@@ -1287,15 +1285,15 @@ impl<'src, 'input> Parser<'src, 'input> {
                 .with_span(self.span()));
             }
             self.advance().ok();
-            let mut bs = vec![self.parse_type()?];
+            let mut bs = vec![self.parse_type(bump)?];
             while matches!(self.peek(), Ok(Token::Plus)) {
                 self.advance().ok();
-                bs.push(self.parse_type()?);
+                bs.push(self.parse_type(bump)?);
             }
             predicates.push(WherePredicate {
                 ty: subject,
                 bounds: bs,
-                span: Span::new(pred_start, self.span().end),
+                span: Span::new(self.file_id, pred_start, self.span().end),
             });
             if !matches!(self.peek(), Ok(Token::Comma)) {
                 break;
@@ -1308,7 +1306,7 @@ impl<'src, 'input> Parser<'src, 'input> {
             name,
             params,
             predicates: smallvec::SmallVec::from(predicates),
-            span: Span::new(start, end),
+            span: Span::new(self.file_id, start, end),
         })
     }
 
@@ -1319,6 +1317,7 @@ impl<'src, 'input> Parser<'src, 'input> {
     fn parse_generate_item(
         &mut self,
         attributes: Vec<Attribute<'input>>,
+        bump: &'input bumpalo::Bump,
     ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
@@ -1341,16 +1340,16 @@ impl<'src, 'input> Parser<'src, 'input> {
                 .with_span(self.span()));
             }
         }
-        let for_type = Self::alloc_shared(self.arena, self.parse_type()?);
+        let for_type = Self::alloc_shared(bump, self.parse_type(bump)?);
         self.expect(Token::LBrace)?;
-        let body = self.parse_block()?;
+        let body = self.parse_block(bump)?;
         self.expect(Token::RBrace)?;
         let end = self.span().end;
         Ok(Stmt::Generate {
             attributes,
             for_type,
             body,
-            span: Span::new(start, end),
+            span: Span::new(self.file_id, start, end),
         })
     }
 }

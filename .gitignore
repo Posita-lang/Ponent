@@ -3,5 +3,6 @@
 Cargo.lock
 .cargo/
 *.tmp
+schedule*.txt
 src/.vscode/
 *.dl

@@ -1,4 +1,4 @@
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -107,9 +107,14 @@ impl TypeId {
     const TAG_MASK: usize = (1 << Self::TAG_BITS) - 1;
     /// The last valid discriminant value (not the mask — those differ when
     /// reserved variants fill the gap to the bit boundary).  Set to the
-    /// highest *real* variant; `Reserved31` exists only to make every 5-bit
-    /// pattern a valid `TypeTag` for transmute safety.
-    const TAG_LAST_VARIANT: usize = TypeTag::Regex as usize;
+    /// highest *real* variant.  B2: `TypeKind = 31` is a REAL variant
+    /// (`TypeData::Type` / `TypeData::Opaque` map to it), so the bound is
+    /// TypeKind, not Regex — the old `Regex` bound fired the `tag()`
+    /// debug assert on every `Type`/`Opaque`-tagged `TypeId` (TAITs are a
+    /// real code path).  All 32 five-bit patterns are real variants now;
+    /// there is no padding tag left, so the NEXT variant must bump
+    /// `TAG_BITS` to 6.
+    const TAG_LAST_VARIANT: usize = TypeTag::TypeKind as usize;
     /// Bounds check: every valid tag must be ≤ `TAG_LAST_VARIANT`.
     const TAG_MAX: usize = Self::TAG_LAST_VARIANT;
 
@@ -120,9 +125,9 @@ impl TypeId {
     ///
     /// Chosen as `usize::MAX` so that a stray call to `tag()` or `index()`
     /// on this sentinel produces an obviously-wrong value: `tag()` returns
-    /// discriminant 31 (past the last real variant `SkolemVar = 29`, but
-    /// within the reserved range `Reserved31 = 31`), and `index()` returns
-    /// `usize::MAX >> 5 - 1`, an unreachable index.
+    /// discriminant 31 (`TypeKind` — a nonsense tag for a sentinel; the
+    /// `debug_assert!` at the top of `tag()` fires first anyway), and
+    /// `index()` returns `usize::MAX >> 5 - 1`, an unreachable index.
     /// Both paths are guarded by `debug_assert!` checks that fire before
     /// any unsound action.
     pub const NONE: TypeId = TypeId(unsafe {

@@ -490,7 +490,7 @@ fn resolved_args_hash<'input>(ctx: &TypeContext<'input>, args: &[TypeId]) -> u64
     hasher.finish()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::hir::traits::solver::obligation::{ObligationCause, ObligationCauseCode};

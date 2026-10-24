@@ -1,6 +1,6 @@
-use crate::ast::Span;
-use crate::diagnostics::byte_to_linecol;
-use std::fmt;
+use crate::ast::{FileId, Span};
+use crate::sourcemap::SourceMap;
+use std::borrow::Cow;
 
 /// Kind of annotation underline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,15 +16,21 @@ pub enum AnnotationKind {
 }
 
 /// A labeled annotation pointing to a span of source code.
+///
+/// The message is [`Cow<'a, str>`]: static text (`"duplicate definition"`)
+/// borrows a `&'static str` with no allocation, while computed text (e.g.
+/// `format!("expected {ty}")`) owns a `String`.  When `'a` is tied to a
+/// source buffer's lifetime the borrow checker guarantees a source-slice
+/// label cannot outlive the buffer it was cut from.
 #[derive(Debug, Clone)]
-pub struct Label {
+pub struct Label<'a> {
     pub span: Span,
-    pub message: String,
+    pub message: Cow<'a, str>,
     pub kind: AnnotationKind,
 }
 
-impl Label {
-    pub fn new(span: Span, message: impl Into<String>) -> Self {
+impl<'a> Label<'a> {
+    pub fn new(span: Span, message: impl Into<Cow<'a, str>>) -> Self {
         Label {
             span,
             message: message.into(),
@@ -32,7 +38,7 @@ impl Label {
         }
     }
 
-    pub fn secondary(span: Span, message: impl Into<String>) -> Self {
+    pub fn secondary(span: Span, message: impl Into<Cow<'a, str>>) -> Self {
         Label {
             span,
             message: message.into(),
@@ -40,7 +46,7 @@ impl Label {
         }
     }
 
-    pub fn note(span: Span, message: impl Into<String>) -> Self {
+    pub fn note(span: Span, message: impl Into<Cow<'a, str>>) -> Self {
         Label {
             span,
             message: message.into(),
@@ -48,7 +54,7 @@ impl Label {
         }
     }
 
-    pub fn help(span: Span, message: impl Into<String>) -> Self {
+    pub fn help(span: Span, message: impl Into<Cow<'a, str>>) -> Self {
         Label {
             span,
             message: message.into(),
@@ -63,7 +69,16 @@ impl Label {
 
     /// The underline character for this annotation kind.
     pub fn underline_char(&self) -> char {
-        match self.kind {
+        self.kind.underline_char()
+    }
+}
+
+impl AnnotationKind {
+    /// The underline character for this annotation kind. Exposed on the kind
+    /// itself so callers that synthesize an annotation (e.g. the renderer's
+    /// primary span) do not need to build a throwaway [`Label`].
+    pub fn underline_char(self) -> char {
+        match self {
             AnnotationKind::Primary => '^',
             AnnotationKind::Secondary => '~',
             AnnotationKind::Note => '-',
@@ -75,7 +90,11 @@ impl Label {
 // ── Byte-offset → line:column conversion ──────────────────────
 
 /// A (line, column) position in source code.
-/// `line` and `col` are 0-based internally.
+///
+/// Both fields are 0-based.  `col` is a **byte** offset from the start of the
+/// line, *not* a display column: on lines containing tabs or wide characters
+/// (CJK/emoji) the visual column is smaller.  Emitters that need display
+/// columns must use the grapheme/width helpers instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourcePos {
     /// 0-based line index.
@@ -85,8 +104,11 @@ pub struct SourcePos {
 }
 
 /// Convert byte offset to human-readable "line:col" string (1-based).
-pub fn byte_offset_to_string(source: &str, byte_offset: usize) -> String {
-    let pos = byte_to_linecol(source, byte_offset);
+///
+/// Delegates to the [`SourceMap`]'s precomputed line table for `file`
+/// rather than rescanning text, so offsets must be into that file.
+pub fn byte_offset_to_string(map: &SourceMap, file: FileId, byte_offset: u32) -> String {
+    let pos = map.file(file).line_col(byte_offset);
     format!("{}:{}", pos.line + 1, pos.col + 1)
 }
 
@@ -98,42 +120,51 @@ pub fn byte_offset_to_string(source: &str, byte_offset: usize) -> String {
 /// Each `Snippet` represents one continuous region of source text (e.g. a
 /// function body, a type definition) together with the labels / underlines
 /// that should be drawn over it.
+///
+/// The source text is borrowed (`&'a str`) rather than owned: this forces the
+/// caller to prove that the underlying source buffer outlives every snippet
+/// constructed from it, preventing silent stale reads when incremental
+/// compilation rewrites the buffer.
 #[derive(Debug, Clone)]
-pub struct Snippet {
+pub struct Snippet<'a> {
     /// Display name / file path of the source (e.g. `"src/main.pn"`).
-    pub origin: String,
+    pub origin: Cow<'a, str>,
     /// 1‑based line number of the first line in `source`.
     pub line_start: usize,
     /// The raw source text (may span multiple lines).
-    pub source: String,
+    pub source: &'a str,
     /// Annotations (labels) attached to this snippet.
-    pub annotations: Vec<Label>,
+    pub annotations: Vec<Label<'a>>,
     /// Whether to fold long runs of unannotated lines into `…`.
     pub fold: bool,
 }
 
-impl Snippet {
-    pub fn new(origin: impl Into<String>, source: impl Into<String>) -> Self {
+impl<'a> Snippet<'a> {
+    pub fn new(origin: impl Into<Cow<'a, str>>, source: &'a str) -> Self {
         Snippet {
             origin: origin.into(),
             line_start: 1,
-            source: source.into(),
+            source,
             annotations: Vec::new(),
             fold: false,
         }
     }
 
     pub fn with_line_start(mut self, line_start: usize) -> Self {
+        assert!(
+            line_start >= 1,
+            "Snippet::with_line_start is 1-based; got {line_start}"
+        );
         self.line_start = line_start;
         self
     }
 
-    pub fn with_annotation(mut self, label: Label) -> Self {
+    pub fn with_annotation(mut self, label: Label<'a>) -> Self {
         self.annotations.push(label);
         self
     }
 
-    pub fn with_annotations(mut self, labels: impl IntoIterator<Item = Label>) -> Self {
+    pub fn with_annotations(mut self, labels: impl IntoIterator<Item = Label<'a>>) -> Self {
         self.annotations.extend(labels);
         self
     }

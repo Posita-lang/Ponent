@@ -1,3 +1,4 @@
+use crate::ast::FileId;
 use crate::ast::{EnumVariant, Span, Type, TypeParam, TypeParamKind};
 use crate::hir::symbol::{SymbolTable, TraitBinding, TypeBinding, TypeKind};
 use crate::hir::traits::{ImplCandidate, TraitEnv};
@@ -13,11 +14,11 @@ fn insert_trait<'input>(symbols: &mut SymbolTable<'input>, name: &str, def_id: &
         methods: vec![],
         associated_types: vec![],
         super_traits: vec![],
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
         attributes: vec![],
         crate_id: symbols.local_crate_id,
     };
-    if let Err(e) = symbols.insert_trait(Symbol::intern(name), binding, Span::new(0, 0)) {
+    if let Err(e) = symbols.insert_trait(Symbol::intern(name), binding, Span::new(FileId::DUMMY, 0, 0)) {
         panic!("duplicate builtin registration: {:?}", e);
     }
 }
@@ -53,6 +54,7 @@ pub fn register_builtins<'input>(
     symbols: &mut SymbolTable<'input>,
     trait_env: &mut TraitEnv<'input>,
     ctx: &mut TypeContext<'input>,
+    enable_experimental: bool,
 ) {
     let mut add_id = DefId(0);
     let mut sub_id = DefId(0);
@@ -107,8 +109,17 @@ pub fn register_builtins<'input>(
     // admits e.g. `Int<17>` / `Int<23>`), so a hardcoded {8,16,32,64} set
     // left those legal types WITHOUT any Add/Sub/... impl — arithmetic on
     // them failed with E030 "no trait implementation found for `Add`".
-    // Signed: Int<N>; Unsigned: UInt<N> for every N in 1..=64.
-    let all_widths: Vec<(u32, bool)> = (1..=64)
+    // Signed: Int<N>; Unsigned: UInt<N> for every N in 1..=64, extended to
+    // 1..=128 only under `--enable-experimental` (SYNTAX.md §Types: bit
+    // widths above 64 require the flag).  The flag-off subset cannot be
+    // *written* — `resolve_int_width` rejects it — so registering the
+    // wider impls unconditionally would be unreachable dead weight: the
+    // trait env is deep-cloned per function-body check
+    // (`TraitEnv::clone_for_worker`, query/queries.rs), so every extra
+    // impl is paid on every body checked.  Gate the bound to match the
+    // widths the resolver will actually admit.
+    let max_width: u32 = if enable_experimental { 128 } else { 64 };
+    let all_widths: Vec<(u32, bool)> = (1..=max_width)
         .flat_map(|bits| [(bits, true), (bits, false)])
         .collect();
     for &(bits, signed) in &all_widths {
@@ -126,11 +137,11 @@ pub fn register_builtins<'input>(
                     arity: 0,
                     trait_args: vec![],
                     where_clause_bounds: vec![],
-                    span: Span::new(0, 0),
+                    span: Span::new(FileId::DUMMY, 0, 0),
                 },
                 symbols,
                 ctx,
-                false,
+                true, // trusted — built-in impl
             ) {
                 // Orphan (CoverageViolation) is EXPECTED for the compiler's
                 // own built-in impls — the orphan rule does not apply to
@@ -153,11 +164,11 @@ pub fn register_builtins<'input>(
                     arity: 0,
                     trait_args: vec![],
                     where_clause_bounds: vec![],
-                    span: Span::new(0, 0),
+                    span: Span::new(FileId::DUMMY, 0, 0),
                 },
                 symbols,
                 ctx,
-                false,
+                true, // trusted — built-in impl
             ) {
                 // Orphan (CoverageViolation) is EXPECTED for the compiler's
                 // own built-in impls — the orphan rule does not apply to
@@ -196,11 +207,11 @@ pub fn register_builtins<'input>(
                         arity: 0,
                         trait_args: vec![],
                         where_clause_bounds: vec![],
-                        span: Span::new(0, 0),
+                        span: Span::new(FileId::DUMMY, 0, 0),
                     },
                     symbols,
                     ctx,
-                    false,
+                    true, // trusted — built-in impl
                 ) {
                     // Orphan (CoverageViolation) is EXPECTED for the
                     // compiler's own built-in impls — the orphan rule
@@ -222,11 +233,11 @@ pub fn register_builtins<'input>(
                         arity: 0,
                         trait_args: vec![],
                         where_clause_bounds: vec![],
-                        span: Span::new(0, 0),
+                        span: Span::new(FileId::DUMMY, 0, 0),
                     },
                     symbols,
                     ctx,
-                    false,
+                    true, // trusted — built-in impl
                 ) {
                     let _ = e;
                 }
@@ -254,11 +265,11 @@ pub fn register_builtins<'input>(
                 arity: 0,
                 trait_args: vec![],
                 where_clause_bounds: vec![],
-                span: Span::new(0, 0),
+                span: Span::new(FileId::DUMMY, 0, 0),
             },
             symbols,
             ctx,
-            false,
+            true, // trusted — built-in impl
         ) {
             // Orphan (CoverageViolation) is EXPECTED for the compiler's
             // own built-in impls — the orphan rule does not apply to
@@ -284,11 +295,11 @@ pub fn register_builtins<'input>(
                 arity: 0,
                 trait_args: vec![],
                 where_clause_bounds: vec![],
-                span: Span::new(0, 0),
+                span: Span::new(FileId::DUMMY, 0, 0),
             },
             symbols,
             ctx,
-            false,
+            true, // trusted — built-in impl
         ) {
             // Orphan (CoverageViolation) is EXPECTED for the compiler's
             // own built-in impls — the orphan rule does not apply to
@@ -314,11 +325,11 @@ pub fn register_builtins<'input>(
                 arity: 0,
                 trait_args: vec![],
                 where_clause_bounds: vec![],
-                span: Span::new(0, 0),
+                span: Span::new(FileId::DUMMY, 0, 0),
             },
             symbols,
             ctx,
-            false,
+            true, // trusted — built-in impl
         ) {
             // Orphan (CoverageViolation) is EXPECTED for the compiler's
             // own built-in impls — the orphan rule does not apply to
@@ -347,11 +358,11 @@ pub fn register_builtins<'input>(
                     arity: 0,
                     trait_args: vec![],
                     where_clause_bounds: vec![],
-                    span: Span::new(0, 0),
+                    span: Span::new(FileId::DUMMY, 0, 0),
                 },
                 symbols,
                 ctx,
-                false,
+                true, // trusted — built-in impl
             ) {
                 // Orphan (CoverageViolation) is EXPECTED for the compiler's
                 // own built-in impls — the orphan rule does not apply to
@@ -371,39 +382,39 @@ pub fn register_builtins<'input>(
             name: Symbol::intern("T"),
             bounds: vec![],
             kind: TypeParamKind::Type,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         let result_e = TypeParam {
             name: Symbol::intern("E"),
             bounds: vec![],
             kind: TypeParamKind::Type,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         let ok_variant = EnumVariant {
             name: Symbol::intern("Ok"),
             payload: Some(Type::Path(
                 smallvec::smallvec![Symbol::intern("T")],
-                Span::new(0, 0),
+                Span::new(FileId::DUMMY, 0, 0),
             )),
             eq_spec: Vec::new(),
             exists_params: Vec::new(),
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         let err_variant = EnumVariant {
             name: Symbol::intern("Err"),
             payload: Some(Type::Path(
                 smallvec::smallvec![Symbol::intern("E")],
-                Span::new(0, 0),
+                Span::new(FileId::DUMMY, 0, 0),
             )),
             eq_spec: Vec::new(),
             exists_params: Vec::new(),
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         let binding = TypeBinding {
             def_id,
             params: vec![result_t, result_e],
             kind: TypeKind::Enum,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
             alias_ast: None,
             attributes: vec![],
             fields: vec![],
@@ -423,7 +434,7 @@ pub fn register_builtins<'input>(
             align: None,
             pad: None,
         };
-        if let Err(e) = symbols.insert_type(Symbol::intern("Result"), binding, Span::new(0, 0)) {
+        if let Err(e) = symbols.insert_type(Symbol::intern("Result"), binding, Span::new(FileId::DUMMY, 0, 0)) {
             panic!("duplicate builtin registration: {:?}", e);
         }
     }
@@ -435,30 +446,30 @@ pub fn register_builtins<'input>(
             name: Symbol::intern("T"),
             bounds: vec![],
             kind: TypeParamKind::Type,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         let none_variant = EnumVariant {
             name: Symbol::intern("None"),
             payload: None,
             eq_spec: Vec::new(),
             exists_params: Vec::new(),
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         let some_variant = EnumVariant {
             name: Symbol::intern("Some"),
             payload: Some(Type::Path(
                 smallvec::smallvec![Symbol::intern("T")],
-                Span::new(0, 0),
+                Span::new(FileId::DUMMY, 0, 0),
             )),
             eq_spec: Vec::new(),
             exists_params: Vec::new(),
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         let binding = TypeBinding {
             def_id,
             params: vec![option_t],
             kind: TypeKind::Enum,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
             alias_ast: None,
             attributes: vec![],
             fields: vec![],
@@ -478,7 +489,7 @@ pub fn register_builtins<'input>(
             align: None,
             pad: None,
         };
-        if let Err(e) = symbols.insert_type(Symbol::intern("Option"), binding, Span::new(0, 0)) {
+        if let Err(e) = symbols.insert_type(Symbol::intern("Option"), binding, Span::new(FileId::DUMMY, 0, 0)) {
             panic!("duplicate builtin registration: {:?}", e);
         }
     }
@@ -505,23 +516,23 @@ pub fn register_builtins<'input>(
             name: Symbol::intern("T"),
             bounds: vec![],
             kind: TypeParamKind::Type,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         let output_variant = EnumVariant {
             name: Symbol::intern("Output"),
             payload: Some(Type::Path(
                 smallvec::smallvec![Symbol::intern("T")],
-                Span::new(0, 0),
+                Span::new(FileId::DUMMY, 0, 0),
             )),
             eq_spec: Vec::new(),
             exists_params: Vec::new(),
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         let binding = TypeBinding {
             def_id: future_enum_def_id,
             params: vec![future_t],
             kind: TypeKind::Enum,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
             alias_ast: None,
             attributes: vec![],
             fields: vec![],
@@ -541,7 +552,7 @@ pub fn register_builtins<'input>(
             align: None,
             pad: None,
         };
-        if let Err(e) = symbols.insert_type(Symbol::intern("Future"), binding, Span::new(0, 0)) {
+        if let Err(e) = symbols.insert_type(Symbol::intern("Future"), binding, Span::new(FileId::DUMMY, 0, 0)) {
             panic!("duplicate builtin registration: {:?}", e);
         }
     }
@@ -556,7 +567,7 @@ pub fn register_builtins<'input>(
         "Future",
         &mut future_trait_id,
         vec![(Symbol::intern("Output"), None)],
-        Span::new(0, 0),
+        Span::new(FileId::DUMMY, 0, 0),
     );
 
     // 3) Register `impl Future for Future<T>` where `Output = T`.
@@ -578,7 +589,7 @@ pub fn register_builtins<'input>(
             arity: 1, // Future<T> has one generic param T
             trait_args: vec![],
             where_clause_bounds: vec![],
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         },
         symbols,
         ctx,
@@ -614,13 +625,13 @@ pub fn register_builtins<'input>(
             name: Symbol::intern("T"),
             bounds: vec![],
             kind: TypeParamKind::Type,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         let binding = TypeBinding {
             def_id: symbols.allocate_def_id(),
             params: vec![channel_t],
             kind: TypeKind::Enum,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
             alias_ast: None,
             attributes: vec![],
             fields: vec![],
@@ -640,7 +651,7 @@ pub fn register_builtins<'input>(
             align: None,
             pad: None,
         };
-        if let Err(e) = symbols.insert_type(Symbol::intern("Channel"), binding, Span::new(0, 0)) {
+        if let Err(e) = symbols.insert_type(Symbol::intern("Channel"), binding, Span::new(FileId::DUMMY, 0, 0)) {
             panic!("duplicate builtin registration: {:?}", e);
         }
     }

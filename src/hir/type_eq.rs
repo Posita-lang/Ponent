@@ -5,6 +5,7 @@
 //! checker from reaching back into the resolver (layering), giving the
 //! comparison family a single authoritative home.
 
+use crate::ast::FileId;
 use crate::hir::octagon::Dbm;
 use crate::hir::symbol::*;
 use crate::hir::types::DefId;
@@ -787,16 +788,16 @@ fn linear_cmp<'a, 'b>(
 /// equality; `max_iter` bounds the iterations defensively.
 ///
 /// The result is the loop-invariant CANDIDATE (a sound over-approximation).
-/// Per the 2026-08-13 committee ruling it must NOT discharge obligations by
-/// itself — it is only a `@hint` for the SMT solver.
+/// It must NOT discharge obligations by itself — it is only a `@hint`
+/// for the SMT solver.
 
 /// The inference kernel of the `@hint(assertion)` injection pipeline —
 /// the initial state and loop-body instructions drive the widened fixpoint,
 /// and the converged matrix is turned into invariant candidate
 /// expressions. The checker translates a HIR loop to `LoopInstr`s and
-/// submits the result as a `@hint` (committee 2026-08-13: the candidates
-/// never discharge obligations by themselves — the SMT solver stays the
-/// authority). Guards (`TestLe`/`TestDiffLe`) are part of the body: the
+/// submits the result as a `@hint` (the candidates never discharge
+/// obligations by themselves — the SMT solver stays the authority).
+/// Guards (`TestLe`/`TestDiffLe`) are part of the body: the
 /// fixpoint absorbs them, so the guard bound is NOT reported as an
 /// invariant (it only holds inside the loop).
 
@@ -969,8 +970,8 @@ pub(crate) fn dbm_encode_negated(
 /// The entailment check `a ⟹ b` on INTEGER bases — EXACT within the
 /// difference-constraint sub-language: for every conclusion clause `bᵢ`,
 /// the premise together with `¬bᵢ` must be unsatisfiable (a negative
-/// cycle in the closed DBM). Per the founder's bifurcation, an exact
-/// decision like this is self-verifying (may discharge directly); a
+/// cycle in the closed DBM). An exact decision like this is
+/// self-verifying (may discharge directly); a
 /// `None` result (non-linear shapes, `E == 0` negated to `E ≠ 0`, dense
 /// bases, a contradictory premise) falls back (fail-closed).
 pub(crate) fn expr_entails_typed(
@@ -1404,7 +1405,7 @@ fn expr_eq_ignoring_spans_renamed_int<'a, 'b: 'a, 'c, 'd: 'c>(
                 && a1.len() == a2.len()
                 && a1
                     .iter()
-                    .zip(a2)
+                    .zip(*a2)
                     .all(|(x, y)| expr_eq_ignoring_spans_renamed_int(x, y, rename, is_int))
         }
         _ => false,
@@ -1884,7 +1885,7 @@ pub(crate) fn type_args_eq_ignoring_spans<'input>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::hir::loop_infer::{
@@ -1897,7 +1898,7 @@ mod tests {
     fn path<'a>(arena: &'a bumpalo::Bump, seg: &str) -> &'a crate::ast::Type<'a> {
         arena.alloc(crate::ast::Type::Path(
             smallvec::smallvec![Symbol::intern(seg)],
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ))
     }
 
@@ -1909,7 +1910,7 @@ mod tests {
         arena.alloc(crate::ast::Type::Generic(
             base,
             args,
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ))
     }
 
@@ -1921,13 +1922,13 @@ mod tests {
     ) -> &'a crate::ast::Type<'a> {
         let inv = arena.alloc(crate::ast::Expr::Ident(
             Symbol::intern("_dummy"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         arena.alloc(crate::ast::Type::Exists {
             name: Symbol::intern(name),
             base,
             invariant: inv,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     }
 
@@ -1942,7 +1943,7 @@ mod tests {
             name: Symbol::intern(name),
             base,
             invariant: inv,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     }
 
@@ -1951,14 +1952,14 @@ mod tests {
         arena.alloc(crate::ast::Expr::BinaryOp {
             left: arena.alloc(crate::ast::Expr::Ident(
                 Symbol::intern(binder),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
             op: crate::ast::BinOp::Gt,
             right: arena.alloc(crate::ast::Expr::Literal(
                 crate::ast::Literal::Int(crate::ast::IntLit::Small(0)),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     }
 
@@ -1967,14 +1968,14 @@ mod tests {
         arena.alloc(crate::ast::Expr::BinaryOp {
             left: arena.alloc(crate::ast::Expr::Ident(
                 Symbol::intern(binder),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
             op: crate::ast::BinOp::Lt,
             right: arena.alloc(crate::ast::Expr::Literal(
                 crate::ast::Literal::Int(crate::ast::IntLit::Small(0)),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     }
 
@@ -1983,14 +1984,14 @@ mod tests {
         arena.alloc(crate::ast::Expr::BinaryOp {
             left: arena.alloc(crate::ast::Expr::Ident(
                 Symbol::intern(binder),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
             op: crate::ast::BinOp::Ge,
             right: arena.alloc(crate::ast::Expr::Literal(
                 crate::ast::Literal::Int(crate::ast::IntLit::Small(1)),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     }
 
@@ -1999,14 +2000,14 @@ mod tests {
         arena.alloc(crate::ast::Expr::BinaryOp {
             left: arena.alloc(crate::ast::Expr::Literal(
                 crate::ast::Literal::Int(crate::ast::IntLit::Small(0)),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
             op: crate::ast::BinOp::Lt,
             right: arena.alloc(crate::ast::Expr::Ident(
                 Symbol::intern(binder),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     }
 
@@ -2021,9 +2022,9 @@ mod tests {
             op: crate::ast::BinOp::Add,
             right: arena.alloc(crate::ast::Expr::Literal(
                 crate::ast::Literal::Int(crate::ast::IntLit::Small(c)),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     }
 
@@ -2038,9 +2039,9 @@ mod tests {
             op: crate::ast::BinOp::Sub,
             right: arena.alloc(crate::ast::Expr::Literal(
                 crate::ast::Literal::Int(crate::ast::IntLit::Small(c)),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     }
 
@@ -2053,11 +2054,11 @@ mod tests {
         arena.alloc(crate::ast::Expr::BinaryOp {
             left: arena.alloc(crate::ast::Expr::Literal(
                 crate::ast::Literal::Int(crate::ast::IntLit::Small(c)),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
             op: crate::ast::BinOp::Mul,
             right: inner,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     }
 
@@ -2069,7 +2070,7 @@ mod tests {
         arena.alloc(crate::ast::Expr::UnaryOp {
             op: crate::ast::UnaryOp::Neg,
             expr: inner,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     }
 
@@ -2085,9 +2086,9 @@ mod tests {
             op,
             right: arena.alloc(crate::ast::Expr::Literal(
                 crate::ast::Literal::Int(crate::ast::IntLit::Small(c)),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     }
 
@@ -2101,7 +2102,7 @@ mod tests {
             left: a,
             op: crate::ast::BinOp::And,
             right: b,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     }
 
@@ -2110,23 +2111,23 @@ mod tests {
         let add = arena.alloc(crate::ast::Expr::BinaryOp {
             left: arena.alloc(crate::ast::Expr::Literal(
                 crate::ast::Literal::Int(crate::ast::IntLit::Small(0)),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
             op: crate::ast::BinOp::Add,
             right: arena.alloc(crate::ast::Expr::Ident(
                 Symbol::intern(binder),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         });
         arena.alloc(crate::ast::Expr::BinaryOp {
             left: add,
             op: crate::ast::BinOp::Gt,
             right: arena.alloc(crate::ast::Expr::Literal(
                 crate::ast::Literal::Int(crate::ast::IntLit::Small(0)),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     }
 
@@ -2483,7 +2484,7 @@ mod tests {
         let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let x = arena.alloc(crate::ast::Expr::Ident(
             Symbol::intern("X"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         // Offset folding: `X + 1 > 1` ≡ `X > 0`.
         assert!(
@@ -2558,19 +2559,19 @@ mod tests {
         // to the same coefficient table `{X: 1, Y: 1}`).
         let y = arena.alloc(crate::ast::Expr::Ident(
             Symbol::intern("Y"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let xpy = arena.alloc(crate::ast::Expr::BinaryOp {
             left: x,
             op: crate::ast::BinOp::Add,
             right: y,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         });
         let x_gt_neg_y = arena.alloc(crate::ast::Expr::BinaryOp {
             left: x,
             op: crate::ast::BinOp::Gt,
             right: neg(&arena, y),
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         });
         assert!(
             expr_eq_ignoring_spans_typed(
@@ -2593,11 +2594,11 @@ mod tests {
         let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let x = arena.alloc(crate::ast::Expr::Ident(
             Symbol::intern("X"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let y = arena.alloc(crate::ast::Expr::Ident(
             Symbol::intern("Y"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let bin = |op: crate::ast::BinOp,
                    l: &'static crate::ast::Expr<'static>,
@@ -2606,7 +2607,7 @@ mod tests {
                 left: l,
                 op,
                 right: r,
-                span: crate::ast::Span::new(0, 0),
+                span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
             })
         };
         let xmy = bin(crate::ast::BinOp::Sub, x, y);
@@ -2698,15 +2699,15 @@ mod tests {
         let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let x = arena.alloc(crate::ast::Expr::Ident(
             Symbol::intern("X"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let y = arena.alloc(crate::ast::Expr::Ident(
             Symbol::intern("Y"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let z = arena.alloc(crate::ast::Expr::Ident(
             Symbol::intern("Z"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let bin = |op: crate::ast::BinOp,
                    l: &'static crate::ast::Expr<'static>,
@@ -2715,7 +2716,7 @@ mod tests {
                 left: l,
                 op,
                 right: r,
-                span: crate::ast::Span::new(0, 0),
+                span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
             })
         };
         let x_gt_0 = cmp_lit(&arena, crate::ast::BinOp::Gt, x, 0);
@@ -2827,7 +2828,7 @@ mod tests {
         );
     }
 
-    /// Review-fix regression: alpha-renaming must survive the DBM
+    /// Regression: alpha-renaming must survive the DBM
     /// encoding — `(X > 0) and (X < 10)` vs `(Y < 10) and (Y > 0)`
     /// (renamed binder + REORDERED clauses) are equal via the octagon
     /// closure. Before the fix the encode phase looked up UN-renamed
@@ -2838,11 +2839,11 @@ mod tests {
         let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let x = arena.alloc(crate::ast::Expr::Ident(
             Symbol::intern("X"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let y = arena.alloc(crate::ast::Expr::Ident(
             Symbol::intern("Y"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let rename = [(Symbol::intern("X"), Symbol::intern("Y"))];
         // Expression level: renamed binder, clauses reordered on the right.
@@ -2889,7 +2890,7 @@ mod tests {
         );
     }
 
-    /// Review-fix regression: extreme `i128` literals must not panic or
+    /// Regression: extreme `i128` literals must not panic or
     /// wrap during the discreteness normalization — `X >= i128::MIN`
     /// cannot be adjusted to `X > i128::MIN - 1`, so the comparison falls
     /// back to structural equality (fail-closed). Before the fix this
@@ -2900,7 +2901,7 @@ mod tests {
         let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let x = arena.alloc(crate::ast::Expr::Ident(
             Symbol::intern("X"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         // `X >= i128::MIN` — the `c - 1` discreteness adjustment overflows.
         let ge_min = cmp_lit(&arena, crate::ast::BinOp::Ge, x, i128::MIN);
@@ -2923,7 +2924,7 @@ mod tests {
         );
     }
 
-    /// Review-fix regression: the capture-avoidance guard must scan
+    /// Regression: the capture-avoidance guard must scan
     /// NESTED exists invariants — `binder_free_in` previously discarded
     /// the invariant field (`..`), so a free occurrence of the other
     /// side's binder inside a nested exists invariant was invisible to
@@ -2953,7 +2954,7 @@ mod tests {
         );
     }
 
-    /// Review-fix regression: `expr_free_in` must be FAIL-CLOSED on
+    /// Regression: `expr_free_in` must be FAIL-CLOSED on
     /// unenumerated expression shapes — a name inside an `if` expression is
     /// reported as "possibly free" (`true`), so the capture-avoidance guard
     /// blocks the renaming. Before the fix the `_ => false` wildcard
@@ -2961,7 +2962,7 @@ mod tests {
     #[test]
     fn test_expr_free_in_fail_closed() {
         let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
-        let span = crate::ast::Span::new(0, 0);
+        let span = crate::ast::Span::new(FileId::DUMMY, 0, 0);
         let x = arena.alloc(crate::ast::Expr::Ident(Symbol::intern("X"), span));
         let gt0 = arena.alloc(crate::ast::Expr::BinaryOp {
             left: x,
@@ -2988,7 +2989,7 @@ mod tests {
         // as possibly free — the guard must NOT allow the rename.
         let if_expr = arena.alloc(crate::ast::Expr::If {
             cond: gt0,
-            then_branch: vec![crate::ast::Stmt::Expression(inv5.clone())],
+            then_branch: arena.alloc_slice_clone(&[crate::ast::Stmt::Expression(inv5.clone())]),
             else_branch: None,
             is_expression: true,
             span,
@@ -2999,7 +3000,7 @@ mod tests {
         );
     }
 
-    /// Founder's-bifurcation test: the entailment check `a ⟹ b` is EXACT
+    /// Exact-decision test: the entailment check `a ⟹ b` is EXACT
     /// within the difference-constraint sub-language (self-verifying, may
     /// discharge directly); non-expressible shapes (non-linear premises
     /// or conclusions, `E == 0` negated to `E ≠ 0`, dense bases) fall
@@ -3009,11 +3010,11 @@ mod tests {
         let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let x = arena.alloc(crate::ast::Expr::Ident(
             Symbol::intern("X"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let y = arena.alloc(crate::ast::Expr::Ident(
             Symbol::intern("Y"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let bin = |op: crate::ast::BinOp,
                    l: &'static crate::ast::Expr<'static>,
@@ -3023,7 +3024,7 @@ mod tests {
                 left: l,
                 op,
                 right: r,
-                span: crate::ast::Span::new(0, 0),
+                span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
             })
         };
         let x_gt_0 = cmp_lit(&arena, crate::ast::BinOp::Gt, x, 0);
@@ -3219,7 +3220,7 @@ mod tests {
         let exprs = dbm_to_invariant_exprs(arena, &d, &vars, None);
         let x = bump.alloc(crate::ast::Expr::Ident(
             Symbol::intern("X"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let le10 = cmp_lit(&bump, crate::ast::BinOp::Le, x, 10);
         let ge1 = cmp_lit(&bump, crate::ast::BinOp::Ge, x, 1);
@@ -3259,7 +3260,7 @@ mod tests {
         );
         let i = bump.alloc(crate::ast::Expr::Ident(
             Symbol::intern("i"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let ge0 = cmp_lit(&bump, crate::ast::BinOp::Ge, i, 0);
         let le9 = cmp_lit(&bump, crate::ast::BinOp::Le, i, 9);
@@ -3287,17 +3288,17 @@ mod tests {
         assert!(dec.is_some(), "a decreasing measure exists");
         let i = bump.alloc(crate::ast::Expr::Ident(
             Symbol::intern("i"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let lit9 = bump.alloc(crate::ast::Expr::Literal(
             crate::ast::Literal::Int(crate::ast::IntLit::Small(9)),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let expected = bump.alloc(crate::ast::Expr::BinaryOp {
             left: lit9,
             op: crate::ast::BinOp::Sub,
             right: i,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         });
         assert!(
             expr_eq_ignoring_spans(dec.unwrap(), expected),
@@ -3328,17 +3329,17 @@ mod tests {
         assert!(dec.is_some(), "a decreasing measure exists for `i < j`");
         let i = bump.alloc(crate::ast::Expr::Ident(
             Symbol::intern("i"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let j = bump.alloc(crate::ast::Expr::Ident(
             Symbol::intern("j"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let expected = bump.alloc(crate::ast::Expr::BinaryOp {
             left: j,
             op: crate::ast::BinOp::Sub,
             right: i,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         });
         assert!(
             expr_eq_ignoring_spans(dec.unwrap(), expected),

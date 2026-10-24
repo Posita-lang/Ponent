@@ -1,8 +1,10 @@
+use crate::ast::FileId;
 use crate::hir::infer::PrincipalShape;
 use crate::hir::types::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use small_map::FxSmallMap;
 use std::fmt::Write as _;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -85,7 +87,7 @@ pub(crate) const Z3_TIMEOUT_MS: u64 = 5_000;
 /// Longer timeout for the independent BII template verifier
 /// (`verify_template_against_problem`): verification is the last line of
 /// defense after synthesis, so it gets a longer budget than synthesis
-/// queries (committee ruling on the verifier-overhead decision point).
+/// queries.
 pub(crate) const VERIFY_TIMEOUT_MS: u64 = 60_000;
 /// Timeout for BII synthesis refinement queries. These are exists/forall
 /// bit-vector formulas (existential template bounds, universal inductiveness)
@@ -949,7 +951,7 @@ pub(crate) fn expr_uses_wrap(
 pub(crate) fn expr_to_smt_bv(
     e: &crate::ast::Expr,
     out: &mut String,
-    widths: &HashMap<crate::symbol::Symbol, u8>,
+    widths: &FxSmallMap<32, crate::symbol::Symbol, u8>,
     signed: Option<&std::collections::HashSet<&'static str>>,
 ) -> bool {
     expr_to_smt_bv_at(e, out, None, widths, signed)
@@ -960,7 +962,7 @@ pub(crate) fn expr_to_smt_bv(
 /// (fail closed).  A variable missing from `widths` counts as 64 bits.
 fn expr_var_width(
     e: &crate::ast::Expr,
-    widths: &HashMap<crate::symbol::Symbol, u8>,
+    widths: &FxSmallMap<32, crate::symbol::Symbol, u8>,
 ) -> Result<Option<u8>, ()> {
     match e {
         crate::ast::Expr::Ident(s, _) => Ok(Some(widths.get(s).copied().unwrap_or(64))),
@@ -985,7 +987,7 @@ fn expr_to_smt_bv_at(
     e: &crate::ast::Expr,
     out: &mut String,
     ctx_w: Option<u8>,
-    widths: &HashMap<crate::symbol::Symbol, u8>,
+    widths: &FxSmallMap<32, crate::symbol::Symbol, u8>,
     signed: Option<&std::collections::HashSet<&'static str>>,
 ) -> bool {
     match e {
@@ -1146,8 +1148,8 @@ impl SmtSolver {
     /// candidate assertions are CONSISTENT (Z3 sat).  `true` means the
     /// candidates can be seeded into the solver context as hints; `false`
     /// (unsat / timeout / solver error / untranslatable expression) means
-    /// the candidates are dropped.  Per the 2026-08-13 committee ruling,
-    /// this check NEVER discharges obligations by itself — the solver
+    /// the candidates are dropped.  This check NEVER discharges obligations
+    /// by itself — the solver
     /// remains the authority.
     pub fn check_hints<'input>(&self, assertions: &[&crate::ast::Expr<'input>]) -> bool {
         let mut smt = String::new();
@@ -1296,7 +1298,7 @@ impl SmtSolver {
         &self,
         hints: &[&crate::ast::Expr<'input>],
         obligation: &crate::ast::Expr<'input>,
-        widths: &HashMap<crate::symbol::Symbol, u8>,
+        widths: &FxSmallMap<32, crate::symbol::Symbol, u8>,
         signed: Option<&std::collections::HashSet<&'static str>>,
         hints_unsigned: bool,
     ) -> bool {
@@ -1479,20 +1481,20 @@ impl SmtSolver {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::ast::{BinOp, Expr, Literal, Span};
     use crate::symbol::Symbol;
 
     fn ident<'a>(arena: &'a bumpalo::Bump, name: &str) -> &'a Expr<'a> {
-        arena.alloc(Expr::Ident(Symbol::intern(name), Span::new(0, 0)))
+        arena.alloc(Expr::Ident(Symbol::intern(name), Span::new(FileId::DUMMY, 0, 0)))
     }
 
     fn lit<'a>(arena: &'a bumpalo::Bump, v: i128) -> &'a Expr<'a> {
         arena.alloc(Expr::Literal(
             Literal::Int(crate::ast::IntLit::Small(v)),
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         ))
     }
 
@@ -1506,7 +1508,7 @@ mod tests {
             left: l,
             op,
             right: r,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         })
     }
 
@@ -1579,9 +1581,9 @@ mod tests {
         let f = ident(&arena, "f");
         let call = arena.alloc(Expr::Call {
             callee: f,
-            args: vec![Expr::Ident(Symbol::intern("x"), Span::new(0, 0))],
+            args: arena.alloc_slice_clone(&[Expr::Ident(Symbol::intern("x"), Span::new(FileId::DUMMY, 0, 0))]),
             comptime: false,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         });
         assert!(
             expr_uses_wrap(call, &|callee| matches!(
@@ -1593,9 +1595,9 @@ mod tests {
         // A call to a NON-wrap function is not wrap.
         let call_plain = arena.alloc(Expr::Call {
             callee: f,
-            args: vec![Expr::Ident(Symbol::intern("x"), Span::new(0, 0))],
+            args: arena.alloc_slice_clone(&[Expr::Ident(Symbol::intern("x"), Span::new(FileId::DUMMY, 0, 0))]),
             comptime: false,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         });
         assert!(
             !expr_uses_wrap(call_plain, &|_| false),
@@ -1609,13 +1611,13 @@ mod tests {
         let field = arena.alloc(Expr::FieldAccess {
             base: r,
             field: Symbol::intern("foo"),
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         });
         let method_call = arena.alloc(Expr::Call {
             callee: field,
-            args: vec![Expr::Ident(Symbol::intern("x"), Span::new(0, 0))],
+            args: arena.alloc_slice_clone(&[Expr::Ident(Symbol::intern("x"), Span::new(FileId::DUMMY, 0, 0))]),
             comptime: false,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         });
         assert!(
             expr_uses_wrap(method_call, &|callee| matches!(
@@ -1643,7 +1645,7 @@ mod tests {
         assert!(expr_to_smt_bv(
             wrap,
             &mut s,
-            &HashMap::from([(Symbol::intern("x"), 8u8)]),
+            &FxSmallMap::<32, _, _>::from_iter([(Symbol::intern("x"), 8u8)]),
             None
         ));
         assert_eq!(s, "(bvadd x (_ bv1 8))");
@@ -1652,7 +1654,7 @@ mod tests {
         assert!(expr_to_smt_bv(
             lit(&arena, -5),
             &mut neg,
-            &HashMap::new(),
+            &FxSmallMap::new(),
             None
         ));
         assert_eq!(neg, "(bvneg (_ bv5 64))");
@@ -1663,7 +1665,7 @@ mod tests {
         assert!(expr_to_smt_bv(
             sub_expr,
             &mut sub,
-            &HashMap::from([(Symbol::intern("x"), 8u8)]),
+            &FxSmallMap::<32, _, _>::from_iter([(Symbol::intern("x"), 8u8)]),
             None
         ));
         assert_eq!(sub, "(bvsub x (_ bv5 8))");
@@ -1689,7 +1691,7 @@ mod tests {
             !expr_to_smt_bv(
                 out,
                 &mut s,
-                &HashMap::from([(Symbol::intern("x"), 8u8), (Symbol::intern("y"), 8u8)]),
+                &FxSmallMap::<32, _, _>::from_iter([(Symbol::intern("x"), 8u8), (Symbol::intern("y"), 8u8)]),
                 None
             ),
             "literal Diff bound |c| ≥ 2^(W-1) must fail closed"
@@ -1705,7 +1707,7 @@ mod tests {
         assert!(expr_to_smt_bv(
             inside,
             &mut s2,
-            &HashMap::from([(Symbol::intern("x"), 8u8), (Symbol::intern("y"), 8u8)]),
+            &FxSmallMap::<32, _, _>::from_iter([(Symbol::intern("x"), 8u8), (Symbol::intern("y"), 8u8)]),
             None
         ));
         assert!(s2.contains("bvsub"), "in-range Diff bound uses bvsub");
@@ -1739,7 +1741,7 @@ mod tests {
             solver.discharge_bv(
                 &hints,
                 obligation,
-                &HashMap::from([(Symbol::intern("x"), 8u8)]),
+                &FxSmallMap::<32, _, _>::from_iter([(Symbol::intern("x"), 8u8)]),
                 None,
                 false
             ),
@@ -1763,7 +1765,7 @@ mod tests {
         assert!(expr_to_smt_bv(
             le,
             &mut s,
-            &HashMap::from([(Symbol::intern("x"), 8u8)]),
+            &FxSmallMap::<32, _, _>::from_iter([(Symbol::intern("x"), 8u8)]),
             Some(&signed)
         ));
         assert!(
@@ -1810,7 +1812,7 @@ mod tests {
         assert!(expr_to_smt_bv(
             ge,
             &mut signed_out,
-            &HashMap::from([(Symbol::intern("x"), 8u8)]),
+            &FxSmallMap::<32, _, _>::from_iter([(Symbol::intern("x"), 8u8)]),
             Some(&signed)
         ));
         assert!(
@@ -1833,7 +1835,7 @@ mod tests {
         assert!(expr_to_smt_bv(
             ge,
             &mut unsigned_out,
-            &HashMap::from([(Symbol::intern("x"), 8u8)]),
+            &FxSmallMap::<32, _, _>::from_iter([(Symbol::intern("x"), 8u8)]),
             None
         ));
         assert!(

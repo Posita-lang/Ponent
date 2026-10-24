@@ -1,11 +1,12 @@
 pub mod solver;
 
+use crate::ast::FileId;
 use crate::ast::Span;
 use crate::hir::symbol::{SymbolTable, TypeKind};
 use crate::hir::traits::solver::coherence::check_overlap;
 use crate::hir::types::{DefId, Subst, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
-use parking_lot::RwLock;
+use crate::sync::RwLock;
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::{SmallVec, smallvec};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -102,6 +103,25 @@ impl<'input> Clone for TraitEnv<'input> {
             impls: self.impls.clone(),
             inherent_methods: self.inherent_methods.clone(),
             impl_generic_cache: RwLock::new(self.impl_generic_cache.read().clone()),
+        }
+    }
+}
+
+impl<'input> TraitEnv<'input> {
+    /// Clone for a short-lived worker that only LOOKS UP methods (the
+    /// per-compute clones in the query layer).  Identical to `clone`
+    /// except the lookup memo starts EMPTY: it is a read-mostly cache
+    /// (see the field doc), so a fresh worker simply re-fills its own
+    /// entries — no semantic difference (cloned entries were already
+    /// isolated per clone), and the O(cache) deep copy under the read
+    /// lock disappears from the per-function compute path.  The
+    /// `impls`/`inherent_methods` data — what lookups actually consult
+    /// — is copied in full, exactly as `clone` does.
+    pub fn clone_for_worker(&self) -> Self {
+        TraitEnv {
+            impls: self.impls.clone(),
+            inherent_methods: self.inherent_methods.clone(),
+            impl_generic_cache: RwLock::new(HashMap::default()),
         }
     }
 }
@@ -674,7 +694,7 @@ impl<'input> std::fmt::Display for TraitError<'input> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::hir::types::{CrateId, DefId};
@@ -702,7 +722,7 @@ mod tests {
             methods: vec![],
             resolved_methods: vec![],
             assoc_tys: vec![],
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
             has_auto_deref: false,
             context: vec![],
             arity: 0,
@@ -715,7 +735,7 @@ mod tests {
             def_id: type_id,
             params: vec![],
             kind: crate::hir::symbol::TypeKind::Struct,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
             alias_ast: None,
             attributes: vec![],
             fields: vec![],
@@ -736,7 +756,7 @@ mod tests {
             pad: None,
         };
         symbols
-            .insert_type("TestType".into(), binding, crate::ast::Span::new(0, 0))
+            .insert_type("TestType".into(), binding, crate::ast::Span::new(FileId::DUMMY, 0, 0))
             .ok();
 
         // Register the def_id → type_id mapping so the orphan rule check
@@ -765,7 +785,7 @@ mod tests {
             name: "foo".into(),
             param_tys: smallvec![],
             ret_ty: ctx.int(32, true),
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
             attributes: vec![],
             has_auto_deref: false,
         };

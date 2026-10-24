@@ -4,6 +4,7 @@
 //! identical impls (including those with GenericParam inside composite types)
 //! while correctly allowing non-overlapping impls.
 
+use crate::ast::FileId;
 use crate::ast::Span;
 use crate::hir::infer::TypeVariableKind;
 use crate::hir::traits::ImplCandidate;
@@ -30,7 +31,7 @@ fn make_candidate(
         methods: vec![],
         resolved_methods: vec![],
         assoc_tys: vec![],
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
         has_auto_deref: false,
         context: vec![],
         where_clause_bounds: vec![],
@@ -57,7 +58,7 @@ fn make_candidate_with_bounds(
         methods: vec![],
         resolved_methods: vec![],
         assoc_tys: vec![],
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
         has_auto_deref: false,
         context: vec![],
         where_clause_bounds,
@@ -549,7 +550,7 @@ fn test_canonicalize_goal_key_caches_concrete_goals() {
     let sized = Predicate::Sized { ty: int_ty };
     let obligation = Obligation {
         cause: ObligationCause {
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
             code: ObligationCauseCode::Misc,
         },
         predicate: sized,
@@ -571,7 +572,7 @@ fn test_same_goal_same_canonical_key() {
     let sized1 = Predicate::Sized { ty: int_ty };
     let ob1 = Obligation {
         cause: ObligationCause {
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
             code: ObligationCauseCode::Misc,
         },
         predicate: sized1,
@@ -582,7 +583,7 @@ fn test_same_goal_same_canonical_key() {
     let sized2 = Predicate::Sized { ty: int_ty2 };
     let ob2 = Obligation {
         cause: ObligationCause {
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
             code: ObligationCauseCode::Misc,
         },
         predicate: sized2,
@@ -607,7 +608,7 @@ fn test_different_goal_different_canonical_key() {
     let sized32 = Predicate::Sized { ty: int32 };
     let ob32 = Obligation {
         cause: ObligationCause {
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
             code: ObligationCauseCode::Misc,
         },
         predicate: sized32,
@@ -617,7 +618,7 @@ fn test_different_goal_different_canonical_key() {
     let sized64 = Predicate::Sized { ty: int64 };
     let ob64 = Obligation {
         cause: ObligationCause {
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
             code: ObligationCauseCode::Misc,
         },
         predicate: sized64,

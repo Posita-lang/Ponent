@@ -1,3 +1,4 @@
+use crate::ast::FileId;
 use crate::ast::Span;
 use crate::hir::types::{DefId, Subst, TypeContext, TypeId};
 use crate::symbol::Symbol;
@@ -412,7 +413,7 @@ impl Predicate {
                     resolved_self,
                     resolved_args,
                     ambiguous,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 )
             }
             Predicate::AutoTrait { trait_id, self_ty } => {
@@ -423,7 +424,7 @@ impl Predicate {
                     resolved_self,
                     vec![],
                     ambiguous,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 )
             }
             Predicate::Sized { ty } => {
@@ -434,14 +435,14 @@ impl Predicate {
                     resolved_ty,
                     vec![],
                     ambiguous,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 )
             }
             Predicate::Eq { a, b } => {
                 let ra = ctx.resolve_binding(*a);
                 let rb = ctx.resolve_binding(*b);
                 let ambiguous = ctx.is_infer_var(ra) || ctx.is_infer_var(rb);
-                Self::make_obligation(None, ra, vec![rb], ambiguous, crate::ast::Span::new(0, 0))
+                Self::make_obligation(None, ra, vec![rb], ambiguous, crate::ast::Span::new(FileId::DUMMY, 0, 0))
             }
             Predicate::Sub { sub, sup } => {
                 let rsub = ctx.resolve_binding(*sub);
@@ -452,7 +453,7 @@ impl Predicate {
                     rsub,
                     vec![rsup],
                     ambiguous,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 )
             }
             Predicate::Match { scrutinee, .. } => {
@@ -463,13 +464,13 @@ impl Predicate {
                     resolved,
                     vec![],
                     ambiguous,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 )
             }
             Predicate::Forall { body } | Predicate::Exists { body } => body.resolve(ctx),
             Predicate::Instance { scheme_ty, .. } => {
                 let resolved = ctx.resolve_binding(*scheme_ty);
-                Self::make_obligation(None, resolved, vec![], false, crate::ast::Span::new(0, 0))
+                Self::make_obligation(None, resolved, vec![], false, crate::ast::Span::new(FileId::DUMMY, 0, 0))
             }
             // Quantifier/let wrappers recurse into their inner predicate
             // (unified through `inner_predicate`).
@@ -480,7 +481,7 @@ impl Predicate {
                     ctx.error(),
                     vec![],
                     false,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 ),
             },
             // Explicit arms for the remaining variants — a newly added
@@ -494,7 +495,7 @@ impl Predicate {
                     resolved,
                     vec![],
                     ambiguous,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 )
             }
             Predicate::ProjectionEq { self_ty, .. } => {
@@ -505,7 +506,7 @@ impl Predicate {
                     resolved,
                     vec![],
                     ambiguous,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 )
             }
             Predicate::ProjectionNormalize { projection, .. } => {
@@ -516,7 +517,7 @@ impl Predicate {
                     resolved,
                     vec![],
                     ambiguous,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 )
             }
             Predicate::NormalizesTo { projection, .. } => {
@@ -527,7 +528,7 @@ impl Predicate {
                     resolved,
                     vec![],
                     ambiguous,
-                    crate::ast::Span::new(0, 0),
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 )
             }
         }
@@ -606,7 +607,7 @@ impl SolveError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use smallvec::smallvec;

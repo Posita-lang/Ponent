@@ -102,7 +102,7 @@ fn form_end(s: &str, start: usize) -> Result<usize, Box<sexp::Error>> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
 

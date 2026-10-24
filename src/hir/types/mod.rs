@@ -1,6 +1,5 @@
-use parking_lot::RwLock;
+use crate::sync::RwLock;
 use rustc_hash::FxHashMap as HashMap;
-use std::cell::Cell;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -85,6 +84,8 @@ pub use transaction::*;
 mod canonical;
 mod coherence;
 pub mod predicativity;
+pub mod polar_action;
+pub mod typed_witness;
 mod rewrite;
 pub mod witness;
 mod yoneda;
@@ -257,7 +258,11 @@ fn is_type_volatile_inner(data: &TypeData, types: Option<&boxcar::Vec<Arc<TypeDa
             .any(|a| is_type_volatile_inner_by_id(*a, types)),
         TypeData::Mu { body, .. } => is_type_volatile_inner_by_id(*body, types),
         TypeData::Nu { body, .. } => is_type_volatile_inner_by_id(*body, types),
-        TypeData::AssociatedType { .. } => false,
+        // Recurse into self_ty: a `T::Assoc` whose self type is still
+        // being inferred is itself volatile (mirrors `type_is_volatile`).
+        TypeData::AssociatedType { self_ty, .. } => {
+            is_type_volatile_inner_by_id(*self_ty, types)
+        }
     }
 }
 
@@ -292,7 +297,11 @@ fn is_type_volatile_inner_by_id(ty: TypeId, types: Option<&boxcar::Vec<Arc<TypeD
                     hidden: Some(ty), ..
                 } => is_type_volatile_inner_by_id(*ty, Some(types)),
                 TypeData::DynTrait { .. } => false,
-                TypeData::AssociatedType { .. } => false,
+                // Recurse into self_ty (mirrors `type_is_volatile` at the
+                // method level and every other composite arm below).
+                TypeData::AssociatedType { self_ty, .. } => {
+                    is_type_volatile_inner_by_id(*self_ty, Some(types))
+                }
                 // Composite types: recurse into children.
                 TypeData::Adt { args, .. } => args
                     .iter()
@@ -468,6 +477,17 @@ pub struct TypeContext<'input> {
     /// self-referential types.  Keyed by (a, b, variance_tag) where
     /// variance_tag = 0 for Invariant, 1 for Covariant, 2 for Contravariant.
     unify_seen: HashSet<(TypeId, TypeId, u8)>,
+    /// ADT variant-payload expansions for κ recursion detection (B5a):
+    /// Adt `TypeId` → per-variant payload `TypeId`s (nullary variant = unit).
+    /// Registered by the checker at enum USE sites (the resolver cannot
+    /// resolve self-referential payloads at definition time — the binding
+    /// is not in the symbol table yet, so the definition-time payload
+    /// would be the error type).  A self-referential enum then produces a
+    /// back-edge in the κ graph, which the Phase-2 SCC classifier
+    /// (`kappa.rs::solve_kappa`) classifies by the cycle's variance.
+    /// Fail-closed: an unregistered expansion means "recursion not
+    /// detected" (the pre-B5a behavior), never a spurious cycle.
+    adt_expansions: HashMap<TypeId, Vec<TypeId>>,
     /// Current "operation span" hint: set by `unify_tracked` so that
     /// `set_binding` can record WHERE a GenericParam got bound (precise
     /// E104 error location).  `None` outside span-carrying unifications,
@@ -581,6 +601,7 @@ impl<'input> TypeContext<'input> {
             opaque_hidden_undo: Vec::new(),
             transaction_stack: Vec::new(),
             unify_seen: HashSet::default(),
+            adt_expansions: HashMap::default(),
             current_unify_span: None,
             current_coercion_ctx: std::sync::atomic::AtomicU8::new(
                 CoercionContext::Structural.to_u8(),
@@ -658,6 +679,10 @@ impl<'input> TypeContext<'input> {
             opaque_hidden_undo: Vec::new(),
             transaction_stack: Vec::new(),
             unify_seen: HashSet::default(),
+            // Copied (not fresh): the expansion table is keyed by shared
+            // TypeIds from the shared arena, so a per-query context must
+            // see the same registrations the unit-level context made.
+            adt_expansions: other.adt_expansions.clone(),
             current_unify_span: None,
             current_coercion_ctx: std::sync::atomic::AtomicU8::new(
                 CoercionContext::Structural.to_u8(),
@@ -694,6 +719,16 @@ impl<'input> TypeContext<'input> {
         self.interner
             .next_param_index
             .store(idx + 1, AtomicOrdering::Relaxed);
+        // Disjointness: param indices (binder identity, Notation 5.1)
+        // must never collide with the atom-label band [ATOM_LABEL_FLOOR,
+        // ATOM_BASE] — the binder_scope design assumes the two spaces are
+        // disjoint.  Param indices are a small upward counter; atom labels
+        // live just under usize::MAX.  The assert documents the invariant
+        // the encoding relies on.
+        debug_assert!(
+            idx < coherence::ATOM_LABEL_FLOOR,
+            "param index space collided with the atom-label band"
+        );
         idx
     }
 
@@ -844,7 +879,7 @@ impl<'input> TypeContext<'input> {
             // Raw pointers (`Pointer`/`Ptr`) are Copy: a raw pointer is
             // essentially a usize-sized integer — it owns nothing and has
             // no `Drop`; copying an address has no memory cost and no
-            // ownership consequence (committee ruling).  The pointee does
+            // ownership consequence.  The pointee does
             // not matter — the pointer does not own it.
             | TypeData::Never
             | TypeData::Pointer { .. }
@@ -948,7 +983,15 @@ impl<'input> TypeContext<'input> {
     }
 
     /// Get cached type flags, computing lazily on first access.
+    ///
+    /// Resolves first and keys the cache on the RESOLVED type: an entry
+    /// stored under an unresolved InferVar would go stale the moment that
+    /// variable is bound (a lingering `IS_INFER_VAR`). Keying on the
+    /// resolved type (whose `TypeData` is immutable) keeps the entry valid;
+    /// a later binding just routes lookups to a fresh key and the old entry
+    /// becomes dead.
     pub fn get_type_flags(&mut self, ty: TypeId) -> TypeFlags {
+        let ty = self.resolve_binding_compressed(ty);
         if let Some(flags) = self.type_flags.get(&ty) {
             return *flags;
         }
@@ -1474,8 +1517,8 @@ impl<'input> TypeContext<'input> {
 
     pub fn int(&mut self, bits: u32, signed: bool) -> TypeId {
         debug_assert!(
-            bits >= 1 && bits <= 64,
-            "Int<{}> out of range (SYNTAX.md: bits 1..64)",
+            bits >= 1 && bits <= 128,
+            "Int<{}> out of range (SYNTAX.md: bits 1..64, up to 128 with --enable-experimental)",
             bits,
         );
         self.alloc(TypeData::Int {
@@ -1487,8 +1530,8 @@ impl<'input> TypeContext<'input> {
 
     pub fn uint(&mut self, bits: u32) -> TypeId {
         debug_assert!(
-            bits >= 1 && bits <= 64,
-            "UInt<{}> out of range (SYNTAX.md: bits 1..64)",
+            bits >= 1 && bits <= 128,
+            "UInt<{}> out of range (SYNTAX.md: bits 1..64, up to 128 with --enable-experimental)",
             bits,
         );
         self.alloc(TypeData::UInt {
@@ -2094,6 +2137,12 @@ impl<'input> TypeContext<'input> {
     /// undo log if one is active.  Always use this instead of
     /// `self.bindings.insert(...)` so that transactions can
     /// correctly roll back.
+    ///
+    /// P3: `#[must_use]`-shaped discipline is enforced at the CALL side —
+    /// the return value is the seal-the-wall verdict (whether the insert
+    /// was admitted); ignoring it silently admits a contamination the
+    /// GADT guard exists to prevent.
+    #[must_use = "the boolean verdict gates whether the binding was admitted; ignoring it hides GADT seal-the-wall contamination"]
     pub(crate) fn set_binding(&mut self, key: TypeId, value: TypeId) -> bool {
         // ── Seal-the-wall guard ─────────────────────────────────────
         // GADT arm processing must never bind a GenericParam into the
@@ -2143,6 +2192,15 @@ impl<'input> TypeContext<'input> {
             log.push((key, old));
         }
         self.bindings.insert(key, value);
+        // B3: κ cache keys are *resolved* TypeIds, so a LATER binding can
+        // change a key's κ (e.g. an Adt whose argument InferVar gets bound
+        // to a recursive type keeps its stale verdict).  The doc above
+        // promises invalidation on binding changes, but only the
+        // transaction-boundary clears existed.  Clear here — the cache
+        // holds at most the types `characteristic()` has seen (small) and
+        // `clear()` on an empty map is trivial: the lightweight fix, no
+        // epoch counter needed.
+        self.kappa_cache.clear();
         true
     }
 
@@ -2842,6 +2900,9 @@ impl<'input> TypeContext<'input> {
             TypeData::Coproduct { alternatives } => {
                 alternatives.iter().any(|a| self.contains_error(*a))
             }
+            // B7: an opaque type with a revealed hidden type can still carry
+            // an error inside — recurse (hidden: None falls to `_ => false`).
+            TypeData::Opaque { hidden: Some(h), .. } => self.contains_error(*h),
             _ => false,
         }
     }
@@ -3003,6 +3064,9 @@ impl<'input> TypeContext<'input> {
             | TypeData::Mu { body, .. }
             | TypeData::Nu { body, .. } => self.contains_regex(*body),
             TypeData::AssociatedType { self_ty, .. } => self.contains_regex(*self_ty),
+            // B7: an opaque type with a revealed hidden type can carry a
+            // Regex inside — recurse (hidden: None falls to the leaf list).
+            TypeData::Opaque { hidden: Some(h), .. } => self.contains_regex(*h),
             // Leaf types — no children, no Regex.
             TypeData::Int { .. }
             | TypeData::UInt { .. }
@@ -3418,7 +3482,7 @@ impl TypeError {
 /// These tests exist so that adding an `Rc`/`RefCell` field (or making an
 /// existing one hold a non-`Send` type) fails at compile time here rather
 /// than silently removing the option of sharing the context.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod send_sync_audit {
     use super::TypeContext;
     use super::TypeData;
@@ -3432,8 +3496,8 @@ mod send_sync_audit {
         // `Mutex`/`RwLock` are `Sync` iff their contents are `Send`, so
         // these three lines are what the session's design rests on.
         assert_send::<TypeContext<'static>>();
-        assert_send::<parking_lot::Mutex<TypeContext<'static>>>();
-        assert_send::<parking_lot::RwLock<TypeContext<'static>>>();
+        assert_send::<crate::sync::Mutex<TypeContext<'static>>>();
+        assert_send::<crate::sync::RwLock<TypeContext<'static>>>();
     }
 
     /// The interner half of `TypeContext` must be shareable by reference:
@@ -3492,5 +3556,5 @@ mod send_sync_audit {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests;

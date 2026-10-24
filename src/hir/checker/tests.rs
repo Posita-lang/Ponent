@@ -10,24 +10,29 @@ use crate::parser::Parser;
 /// the program (the borrow-check post-pass's diagnostics) — the Polonius
 /// equivalence tests inspect the bodies of REJECTED programs (the error
 /// direction).
-pub(crate) fn check_source_keep_hir(source: &str) -> (HirProgram<'static>, Vec<String>) {
+pub(crate) fn check_source_keep_hir(source: &'static str) -> (HirProgram<'static>, Vec<String>) {
     let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
-    let mut parser = Parser::new(source, arena);
+    let mut parser = Parser::new(source, FileId::DUMMY, arena);
     let program = parser.parse_program().unwrap_or_else(|diags| {
         panic!(
             "parse errors: {:?}",
             diags
                 .into_iter()
-                .map(|d| d.message().to_string())
+                .map(|mut d| {
+                    // `*_kind` diagnostics derive `message` lazily; the
+                    // emitter humanizes at its render boundary.
+                    d.humanize();
+                    d.message().to_string()
+                })
                 .collect::<Vec<_>>()
         )
     });
     let mut ctx = TypeContext::new();
     ctx.arena = Some(arena);
     let local_crate_id = CrateId(DefId(0));
-    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
     let (mut symbols, mut trait_env, _res_diags, resolution_map) =
         resolver.resolve_program(&program);
     let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, resolution_map);
@@ -40,7 +45,12 @@ pub(crate) fn check_source_keep_hir(source: &str) -> (HirProgram<'static>, Vec<S
                 .diagnostics
                 .into_inner()
                 .into_iter()
-                .map(|d| d.message().to_string())
+                .map(|mut d| {
+                    // `*_kind` diagnostics derive `message` lazily; the
+                    // emitter humanizes at its render boundary.
+                    d.humanize();
+                    d.message().to_string()
+                })
                 .collect::<Vec<_>>();
             (prog, warns)
         }
@@ -52,7 +62,12 @@ pub(crate) fn check_source_keep_hir(source: &str) -> (HirProgram<'static>, Vec<S
             let msgs = diags
                 .into_inner()
                 .into_iter()
-                .map(|d| d.message().to_string())
+                .map(|mut d| {
+                    // `*_kind` diagnostics derive `message` lazily; the
+                    // emitter humanizes at its render boundary.
+                    d.humanize();
+                    d.message().to_string()
+                })
                 .collect::<Vec<_>>();
             (prog, msgs)
         }
@@ -60,7 +75,24 @@ pub(crate) fn check_source_keep_hir(source: &str) -> (HirProgram<'static>, Vec<S
 }
 
 /// Run the full pipeline (parse → resolve → builtins → type-check) on Posita source.
-pub(crate) fn check_source(source: &str) -> Result<HirProgram<'static>, Vec<String>> {
+pub(crate) fn check_source(source: &'static str) -> Result<HirProgram<'static>, Vec<String>> {
+    check_source_with(source, false)
+}
+
+/// `check_source` with `--enable-experimental` set on BOTH the resolver and
+/// the checker: the flag gates `Int<bits>` widths 65..=128 (SYNTAX.md
+/// §Types: "1..64 (up to 128 with `--enable-experimental`)") and
+/// `@experimental` items.
+pub(crate) fn check_source_experimental(
+    source: &'static str,
+) -> Result<HirProgram<'static>, Vec<String>> {
+    check_source_with(source, true)
+}
+
+fn check_source_with(
+    source: &'static str,
+    enable_experimental: bool,
+) -> Result<HirProgram<'static>, Vec<String>> {
     // NOTE: Do NOT reset the global DefId allocator here.  Tests run in
     // parallel by default, and reset_def_id_allocator() is not thread-safe.
     // The overlap check in add_impl compares DefId values within the same
@@ -71,25 +103,35 @@ pub(crate) fn check_source(source: &str) -> Result<HirProgram<'static>, Vec<Stri
     let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
-    let mut parser = Parser::new(source, arena);
+    let mut parser = Parser::new(source, FileId::DUMMY, arena);
     let program = parser.parse_program().map_err(|diags| {
         diags
             .into_iter()
-            .map(|d| d.message().to_string())
+            .map(|mut d| {
+                    // `*_kind` diagnostics derive `message` lazily; the
+                    // emitter humanizes at its render boundary.
+                    d.humanize();
+                    d.message().to_string()
+                })
             .collect::<Vec<_>>()
     })?;
 
     let mut ctx = TypeContext::new();
     ctx.arena = Some(arena);
     let local_crate_id = CrateId(DefId(0));
-    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, enable_experimental);
     let (mut symbols, mut trait_env, res_diags, resolution_map) =
         resolver.resolve_program(&program);
     if res_diags.has_errors() {
         return Err(res_diags
             .into_inner()
             .into_iter()
-            .map(|d| d.message().to_string())
+            .map(|mut d| {
+                    // `*_kind` diagnostics derive `message` lazily; the
+                    // emitter humanizes at its render boundary.
+                    d.humanize();
+                    d.message().to_string()
+                })
             .collect::<Vec<_>>());
     }
 
@@ -100,42 +142,148 @@ pub(crate) fn check_source(source: &str) -> Result<HirProgram<'static>, Vec<Stri
     // in add_impl to detect false positives.
     // builtins::register_builtins(&mut symbols, &mut trait_env, &mut ctx);
 
-    let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, resolution_map);
+    let mut checker = if enable_experimental {
+        make_checker_experimental(&mut ctx, &symbols, &mut trait_env, resolution_map)
+    } else {
+        make_checker(&mut ctx, &symbols, &mut trait_env, resolution_map)
+    };
     checker.check_program(&program).map_err(|diags| {
         diags
             .into_inner()
             .into_iter()
-            .map(|d| d.message().to_string())
+            .map(|mut d| {
+                    // `*_kind` diagnostics derive `message` lazily; the
+                    // emitter humanizes at its render boundary.
+                    d.humanize();
+                    d.message().to_string()
+                })
             .collect::<Vec<_>>()
     })
+}
+
+/// B5a end-to-end: the resolver hook registers the variant-payload
+/// expansion for a self-referential enum at its first USE site (a
+/// signature annotation), producing the back-edge the κ graph solver
+/// classifies by cycle variance.
+#[test]
+fn b5a_recursive_enum_expansion_via_resolver() {
+    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let arena: &'static crate::arena::SyncArena<'static> =
+        Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
+    // Multi-field variant payloads are TUPLES in Posita: `Node((Tree, Tree))`.
+    let source = "type Tree = enum { Leaf, Node((Tree, Tree)) }\ndef f(t: Tree) -> Tree { t }\n";
+    let mut parser = Parser::new(source, FileId::DUMMY, arena);
+    let program = parser.parse_program().expect("parse");
+    let mut ctx = TypeContext::new();
+    ctx.arena = Some(arena);
+    let local_crate_id = CrateId(DefId(0));
+    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
+    let (_symbols, _trait_env, _diags, resolution_map) =
+        resolver.resolve_program(&program);
+    let tree_def = *resolution_map
+        .type_def_ids
+        .get(&Symbol::intern("Tree"))
+        .expect("Tree must be resolved");
+    let tree_ty = ctx.enum_ty(tree_def, smallvec![]);
+    // Copy the payloads out: the assertion below calls `ctx` mutably.
+    let payloads: Vec<_> = ctx
+        .adt_expansion(tree_ty)
+        .expect("B5a: recursive enum expansion must be registered at use sites")
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(payloads.len(), 2, "one payload per variant");
+    assert_eq!(payloads[0], ctx.unit(), "Leaf → unit");
+    assert_eq!(
+        payloads[1],
+        ctx.tuple(smallvec![tree_ty, tree_ty]),
+        "Node(Tree, Tree) → the self-referential tuple (the back-edge)"
+    );
+    // End-to-end κ verdict: covariant cycle → InfiniteEnumerable
+    // (pre-B5a: FiniteExhaustible(usize::MAX) — recursion was invisible).
+    assert_eq!(
+        ctx.characteristic(tree_ty),
+        crate::hir::types::Characteristic::InfiniteEnumerable
+    );
+}
+
+/// Stage 4 e2e: a `dyn Trait` in the compilation unit closes the
+/// parametricity gate (the DynTrait resolution hook in `fn_ctxt.rs`
+/// fires during type resolution, regardless of the final check verdict),
+/// so equivalence-strength queries fail closed — while the κ diagnostic
+/// is ungated by design and still answers (the `hir::parametricity`
+/// boundary: "κ diagnostics are NOT gated").
+#[test]
+fn stage4_dyn_trait_closes_parametricity_gate() {
+    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let arena: &'static crate::arena::SyncArena<'static> =
+        Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
+    let source = "def f(x: dyn Foo) -> Int<32> { return 0; }\ndef main() -> Int<32> { return 0; }";
+    let mut parser = Parser::new(source, FileId::DUMMY, arena);
+    let program = parser.parse_program().expect("parse");
+    let mut ctx = TypeContext::new();
+    ctx.arena = Some(arena);
+    let local_crate_id = CrateId(DefId(0));
+    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
+    let (mut symbols, mut trait_env, _res_diags, resolution_map) =
+        resolver.resolve_program(&program);
+    let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, resolution_map);
+    // The hook fires during `dyn` type resolution; the final verdict is
+    // irrelevant to the gate (non-strict mode: the check passes anyway).
+    let _ = checker.check_program(&program);
+    assert!(
+        ctx.parametricity.broken,
+        "a `dyn Trait` in the unit must close the parametricity gate"
+    );
+    // Equivalence-strength query fails closed…
+    let i = ctx.int(32, true);
+    let u = ctx.unit();
+    let f1 = ctx.function(smallvec![i], u);
+    let f2 = ctx.function(smallvec![i], u);
+    assert_eq!(ctx.yoneda_equiv_check(f1, f2), None);
+    // …while the κ diagnostic (ungated by design) still answers.
+    assert_eq!(
+        ctx.characteristic(ctx.bool()),
+        crate::hir::types::Characteristic::FiniteExhaustible(2)
+    );
 }
 
 /// Run the full pipeline in STRICT mode (the verification-failure
 /// diagnostics become compile-time errors).  Mirrors `check_source` with
 /// `strict_mode = true` on the checker.
-pub(crate) fn check_strict(source: &str) -> Result<HirProgram<'static>, Vec<String>> {
+pub(crate) fn check_strict(source: &'static str) -> Result<HirProgram<'static>, Vec<String>> {
     let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
-    let mut parser = Parser::new(source, arena);
+    let mut parser = Parser::new(source, FileId::DUMMY, arena);
     let program = parser.parse_program().map_err(|diags| {
         diags
             .into_iter()
-            .map(|d| d.message().to_string())
+            .map(|mut d| {
+                    // `*_kind` diagnostics derive `message` lazily; the
+                    // emitter humanizes at its render boundary.
+                    d.humanize();
+                    d.message().to_string()
+                })
             .collect::<Vec<_>>()
     })?;
 
     let mut ctx = TypeContext::new();
     ctx.arena = Some(arena);
     let local_crate_id = CrateId(DefId(0));
-    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
     let (mut symbols, mut trait_env, res_diags, resolution_map) =
         resolver.resolve_program(&program);
     if res_diags.has_errors() {
         return Err(res_diags
             .into_inner()
             .into_iter()
-            .map(|d| d.message().to_string())
+            .map(|mut d| {
+                    // `*_kind` diagnostics derive `message` lazily; the
+                    // emitter humanizes at its render boundary.
+                    d.humanize();
+                    d.message().to_string()
+                })
             .collect::<Vec<_>>());
     }
 
@@ -153,7 +301,12 @@ pub(crate) fn check_strict(source: &str) -> Result<HirProgram<'static>, Vec<Stri
         diags
             .into_inner()
             .into_iter()
-            .map(|d| d.message().to_string())
+            .map(|mut d| {
+                    // `*_kind` diagnostics derive `message` lazily; the
+                    // emitter humanizes at its render boundary.
+                    d.humanize();
+                    d.message().to_string()
+                })
             .collect::<Vec<_>>()
     })
 }
@@ -414,6 +567,26 @@ fn make_checker<'a, 'src, 'input>(
         resolution_map,
         false,
         false,
+        vec![],
+        false,
+    )
+}
+
+/// `make_checker` with `--enable-experimental` set (see
+/// [`check_source_experimental`]).
+fn make_checker_experimental<'a, 'src, 'input>(
+    ctx: &'a mut TypeContext<'input>,
+    symbols: &'a SymbolTable<'input>,
+    trait_env: &'a mut TraitEnv<'input>,
+    resolution_map: ResolutionMap<'input>,
+) -> TypeChecker<'a, 'src, 'input> {
+    TypeChecker::new(
+        ctx,
+        symbols,
+        trait_env,
+        resolution_map,
+        false,
+        true,
         vec![],
         false,
     )
@@ -1224,7 +1397,7 @@ fn test_polymorphic_pair() {
     );
 }
 
-// ── Issue-1 semantics: check_expr's Call pre-inference path ────────
+// ── Call pre-inference path: check_expr's Expr::Call special case ──
 // These tests pin the observable behavior of the `Expr::Call` special
 // case at the top of `check_expr`: type-argument synthesis errors must
 // still surface as diagnostics (not be silently swallowed), successful
@@ -1787,7 +1960,7 @@ fn test_region_tree_basic_ops() {
     // Push a frame
     rt.push_frame(CtxFrame {
         kind: CtxKind::Function,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
         label: None,
         comptime_reason: None,
     });
@@ -1808,22 +1981,22 @@ fn test_if_expression_type_inference() {
     // if true { 42 } else { 0 }
     let cond: &'static Expr<'static> = Box::leak(Box::new(Expr::Literal(
         Literal::Bool(true),
-        Span::new(0, 1),
+        Span::new(FileId::DUMMY, 0, 1),
     )));
     let then_block = vec![Stmt::Expression(Expr::Literal(
         Literal::Int(ast::IntLit::Small(42)),
-        Span::new(2, 4),
+        Span::new(FileId::DUMMY, 2, 4),
     ))];
     let else_block = vec![Stmt::Expression(Expr::Literal(
         Literal::Int(ast::IntLit::Small(0)),
-        Span::new(5, 6),
+        Span::new(FileId::DUMMY, 5, 6),
     ))];
     let if_expr = Expr::If {
         cond,
-        then_branch: then_block,
-        else_branch: Some(else_block),
+        then_branch: Box::leak(then_block.into_boxed_slice()),
+        else_branch: Some(Box::leak(else_block.into_boxed_slice())),
         is_expression: true,
-        span: Span::new(0, 6),
+        span: Span::new(FileId::DUMMY, 0, 6),
     };
 
     let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
@@ -1843,30 +2016,30 @@ fn test_if_statement_with_return() {
     // if true { return 42 } else { return 0 }  — both diverge → never
     let cond: &'static Expr<'static> = Box::leak(Box::new(Expr::Literal(
         Literal::Bool(true),
-        Span::new(0, 1),
+        Span::new(FileId::DUMMY, 0, 1),
     )));
     let then_stmt = Stmt::Return {
         value: Some(Expr::Literal(
             Literal::Int(ast::IntLit::Small(42)),
-            Span::new(2, 4),
+            Span::new(FileId::DUMMY, 2, 4),
         )),
         labels: Vec::new(),
-        span: Span::new(2, 4),
+        span: Span::new(FileId::DUMMY, 2, 4),
     };
     let else_stmt = Stmt::Return {
         value: Some(Expr::Literal(
             Literal::Int(ast::IntLit::Small(0)),
-            Span::new(5, 6),
+            Span::new(FileId::DUMMY, 5, 6),
         )),
         labels: Vec::new(),
-        span: Span::new(5, 6),
+        span: Span::new(FileId::DUMMY, 5, 6),
     };
     let if_expr = Expr::If {
         cond,
-        then_branch: vec![then_stmt],
-        else_branch: Some(vec![else_stmt]),
+        then_branch: Box::leak(vec![then_stmt].into_boxed_slice()),
+        else_branch: Some(Box::leak(vec![else_stmt].into_boxed_slice())),
         is_expression: true,
-        span: Span::new(0, 6),
+        span: Span::new(FileId::DUMMY, 0, 6),
     };
 
     let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
@@ -1884,22 +2057,22 @@ fn test_if_expression_branch_type_match() {
     // if true { 42 } else { false } — should still succeed via unification
     let cond: &'static Expr<'static> = Box::leak(Box::new(Expr::Literal(
         Literal::Bool(true),
-        Span::new(0, 1),
+        Span::new(FileId::DUMMY, 0, 1),
     )));
     let then_block = vec![Stmt::Expression(Expr::Literal(
         Literal::Int(ast::IntLit::Small(42)),
-        Span::new(2, 4),
+        Span::new(FileId::DUMMY, 2, 4),
     ))];
     let else_block = vec![Stmt::Expression(Expr::Literal(
         Literal::Bool(false),
-        Span::new(5, 10),
+        Span::new(FileId::DUMMY, 5, 10),
     ))];
     let if_expr = Expr::If {
         cond,
-        then_branch: then_block,
-        else_branch: Some(else_block),
+        then_branch: Box::leak(then_block.into_boxed_slice()),
+        else_branch: Some(Box::leak(else_block.into_boxed_slice())),
         is_expression: true,
-        span: Span::new(0, 10),
+        span: Span::new(FileId::DUMMY, 0, 10),
     };
 
     let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
@@ -1916,20 +2089,20 @@ fn test_if_expression_tuple() {
     // if true { 1 } else { 2 } inside tuple context
     let cond: &'static Expr<'static> = Box::leak(Box::new(Expr::Literal(
         Literal::Bool(true),
-        Span::new(0, 1),
+        Span::new(FileId::DUMMY, 0, 1),
     )));
     let if_expr = Expr::If {
         cond,
-        then_branch: vec![Stmt::Expression(Expr::Literal(
+        then_branch: Box::leak(vec![Stmt::Expression(Expr::Literal(
             Literal::Int(ast::IntLit::Small(1)),
-            Span::new(2, 3),
-        ))],
-        else_branch: Some(vec![Stmt::Expression(Expr::Literal(
+            Span::new(FileId::DUMMY, 2, 3),
+        ))].into_boxed_slice()),
+        else_branch: Some(Box::leak(vec![Stmt::Expression(Expr::Literal(
             Literal::Int(ast::IntLit::Small(2)),
-            Span::new(4, 5),
-        ))]),
+            Span::new(FileId::DUMMY, 4, 5),
+        ))].into_boxed_slice())),
         is_expression: true,
-        span: Span::new(0, 5),
+        span: Span::new(FileId::DUMMY, 0, 5),
     };
     let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, ResolutionMap::default());
     let result = checker.infer_expr(&if_expr, None);
@@ -3513,7 +3686,7 @@ fn test_no_panic_rejects_call_to_non_no_panic() {
 
 /// IEEE float semantics (`+%` — the explicit opt-in) never trap: it
 /// returns special values instead of panicking, so it is ALLOWED inside
-/// `@no_panic` (the committee ruling's float `+%` ≡ IEEE).
+/// `@no_panic` (float `+%` ≡ IEEE).
 #[test]
 fn test_no_panic_allows_ieee_float() {
     let result = check_strict(
@@ -3560,7 +3733,7 @@ fn test_channel_type_parses() {
         crate::hir::types::DefId(0),
     ));
     let mut trait_env = crate::hir::traits::TraitEnv::new();
-    crate::hir::builtins::register_builtins(&mut symbols, &mut trait_env, &mut ctx);
+    crate::hir::builtins::register_builtins(&mut symbols, &mut trait_env, &mut ctx, false);
     let binding = symbols.lookup_type(Symbol::intern("Channel"));
     assert!(
         binding.is_some(),
@@ -3711,7 +3884,7 @@ fn test_where_tuple_subject_direct_trait_rejected() {
         result
     );
 }
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod test_infer_return {
     use super::*;
 
@@ -3753,7 +3926,7 @@ mod test_infer_return {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod test_regex {
     use super::*;
 
@@ -3906,8 +4079,9 @@ mod test_regex {
         // Exercise the parser directly, skipping type-check (100KB would
         // trigger other paths).
         let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
-        let sync_arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
-        let mut parser = crate::parser::Parser::new(&source, sync_arena);
+        let sync_arena: &'static crate::arena::SyncArena<'static> =
+            Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
+        let mut parser = crate::parser::Parser::new(&source, FileId::DUMMY, sync_arena);
         let program = parser.parse_program();
         assert!(
             program.is_ok(),
@@ -3959,12 +4133,14 @@ mod test_regex {
          def unsafe_fn() -> Int<32> { return 42; }
          def main() -> Int<32> { return 0; }";
         let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
-        let sync_arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
-        let mut parser = Parser::new(source, sync_arena);
+        let sync_arena: &'static crate::arena::SyncArena<'static> =
+            Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
+        let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
         let program = parser.parse_program().expect("parse should succeed");
         let mut ctx = TypeContext::new();
+        ctx.arena = Some(sync_arena);
         let local_crate_id = CrateId(DefId(0));
-        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
         let (symbols, mut trait_env, _res_diags, resolution_map) =
             resolver.resolve_program(&program);
         let mut checker = TypeChecker::new(
@@ -3992,12 +4168,14 @@ mod test_regex {
         let source = "def f(x: dyn Foo) -> Int<32> { return 0; }
          def main() -> Int<32> { return 0; }";
         let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
-        let sync_arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
-        let mut parser = Parser::new(source, sync_arena);
+        let sync_arena: &'static crate::arena::SyncArena<'static> =
+            Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
+        let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
         let program = parser.parse_program().expect("parse should succeed");
         let mut ctx = TypeContext::new();
+        ctx.arena = Some(sync_arena);
         let local_crate_id = CrateId(DefId(0));
-        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
         let (symbols, mut trait_env, _res_diags, resolution_map) =
             resolver.resolve_program(&program);
         let mut checker = TypeChecker::new(
@@ -4052,12 +4230,14 @@ mod test_regex {
          def unsafe_fn() -> Int<32> { return 42; }
          def main() -> Int<32> { return 0; }";
         let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
-        let sync_arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
-        let mut parser = Parser::new(source, sync_arena);
+        let sync_arena: &'static crate::arena::SyncArena<'static> =
+            Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
+        let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
         let program = parser.parse_program().expect("parse should succeed");
         let mut ctx = TypeContext::new();
+        ctx.arena = Some(sync_arena);
         let local_crate_id = CrateId(DefId(0));
-        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
         let (symbols, mut trait_env, _res_diags, resolution_map) =
             resolver.resolve_program(&program);
         let mut checker = TypeChecker::new(
@@ -4259,12 +4439,14 @@ mod test_regex {
         let source = "@experimental
          def main() -> Int<32> { return 0; }";
         let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
-        let sync_arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
-        let mut parser = Parser::new(source, sync_arena);
+        let sync_arena: &'static crate::arena::SyncArena<'static> =
+            Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
+        let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
         let program = parser.parse_program().expect("parse should succeed");
         let mut ctx = TypeContext::new();
+        ctx.arena = Some(sync_arena);
         let local_crate_id = CrateId(DefId(0));
-        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
         let (symbols, mut trait_env, _res_diags, resolution_map) =
             resolver.resolve_program(&program);
         let mut checker = TypeChecker::new(
@@ -4292,12 +4474,14 @@ mod test_regex {
          def f() -> Int<32> { return 0; }
          def main() -> Int<32> { return 0; }";
         let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
-        let sync_arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
-        let mut parser = Parser::new(source, sync_arena);
+        let sync_arena: &'static crate::arena::SyncArena<'static> =
+            Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
+        let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
         let program = parser.parse_program().expect("parse should succeed");
         let mut ctx = TypeContext::new();
+        ctx.arena = Some(sync_arena);
         let local_crate_id = CrateId(DefId(0));
-        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
         let (symbols, mut trait_env, _res_diags, resolution_map) =
             resolver.resolve_program(&program);
         let mut checker = TypeChecker::new(
@@ -4323,12 +4507,14 @@ mod test_regex {
          def f() -> Int<32> { return 0; }
          def main() -> Int<32> { return 0; }";
         let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
-        let sync_arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
-        let mut parser = Parser::new(source, sync_arena);
+        let sync_arena: &'static crate::arena::SyncArena<'static> =
+            Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
+        let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
         let program = parser.parse_program().expect("parse should succeed");
         let mut ctx = TypeContext::new();
+        ctx.arena = Some(sync_arena);
         let local_crate_id = CrateId(DefId(0));
-        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
         let (symbols, mut trait_env, _res_diags, resolution_map) =
             resolver.resolve_program(&program);
         let mut checker = TypeChecker::new(
@@ -4357,12 +4543,14 @@ mod test_regex {
              comptime { return unsafe_fn(); }
          }";
         let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
-        let sync_arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
-        let mut parser = Parser::new(source, sync_arena);
+        let sync_arena: &'static crate::arena::SyncArena<'static> =
+            Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
+        let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
         let program = parser.parse_program().expect("parse should succeed");
         let mut ctx = TypeContext::new();
+        ctx.arena = Some(sync_arena);
         let local_crate_id = CrateId(DefId(0));
-        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
         let (symbols, mut trait_env, _res_diags, resolution_map) =
             resolver.resolve_program(&program);
         let mut checker = TypeChecker::new(
@@ -4585,7 +4773,7 @@ def main() -> Int<32> {
 
     #[test]
     fn test_gadt_polymorphic_scrutinee_refines_return_type() {
-        // The reviewer's critical concern: GADT refinement with a polymorphic
+        // The critical concern: GADT refinement with a polymorphic
         // scrutinee whose type argument is a GenericParam (not concrete).
         //
         // In `unwrap<T>(x: Wrap<T>) -> Int<32>`, the match scrutinee has type
@@ -4654,13 +4842,13 @@ def main() -> Int<32> {
         );
     }
 
-    /// The reviewer's exact critical scenario: a generic function whose
+    /// The exact critical scenario: a generic function whose
     /// return type IS the refined type parameter (T, not Int<32>).
     ///
     /// `eval<T>(x: Expr<T>) -> T` — the when-clause refines T to Int<32>
     /// in the Lit arm.  After the arm, the match result type is Int<32>.
     /// The return-type check unifies Int<32> with GenericParam{T}.
-    /// The reviewer claims this fails ("the unifier has no rule").
+    /// This was claimed to fail ("the unifier has no rule").
     ///
     /// This test proves it works: `unify_internal_impl` at the
     /// `(_, TypeData::GenericParam{..})` arm binds GenericParam→Concrete
@@ -6272,12 +6460,14 @@ def main() -> Int<32> { return 0; }",
         // error, so we assert on codes rather than on success).
         let run = |strict: bool| -> Vec<String> {
             let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
-            let sync_arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
-            let mut parser = Parser::new(source, sync_arena);
+            let sync_arena: &'static crate::arena::SyncArena<'static> =
+                Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
+            let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
             let program = parser.parse_program().unwrap();
             let mut ctx = TypeContext::new();
+            ctx.arena = Some(sync_arena);
             let local_crate_id = CrateId(DefId(0));
-            let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+            let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
             let (mut symbols, mut trait_env, res_diags, resolution_map) =
                 resolver.resolve_program(&program);
             assert!(
@@ -6505,8 +6695,8 @@ def main() -> Int<32> { return 0; }",
     }
 
     // ── Defensive suite: existential refinement ──
-    // Language-designer ruling (2026-08-04): `when X == ConcreteType` on
-    // an existential variable refines the skolem (ParamRefinement) + emit
+    // `when X == ConcreteType` on an existential variable refines the
+    // skolem (ParamRefinement) + emit
     // a warning (the syntax is unusual).  RHS containing unresolved vars
     // (skolems, GenericParams, InferVars) stays inert (ExistentialEquation).
 
@@ -7213,14 +7403,14 @@ def main() -> Int<32> { return 0; }",
         );
     }
 
-    // ── `@auto_ro` implicit downgrade loans suite (committee 2026-08-05) ──
+    // ── `@auto_ro` implicit downgrade loans suite ──
     // The implicit `&mut T → &T` downgrade at a call site registers a
     // READ-ONLY loan on the argument's place, scoped to the CALL EXPRESSION:
     // the source is frozen during the call and becomes writable again after
     // it (unlike the explicit `&ro`/`.freeze!()` forms, which freeze until
     // the enclosing block ends).
 
-    /// The committee's ruling example: after `takes_shared(r)`, the source
+    /// The canonical example: after `takes_shared(r)`, the source
     /// `r` is writable again (`*r = 42` accepted), and a second implicit
     /// downgrade works — the implicit loan died at the call's end.
     #[test]
@@ -7248,7 +7438,7 @@ def main() -> Int<32> { return 0; }",
     }
 
     /// Control: without `@auto_ro`, the `&mut T → &T` argument pass is still
-    /// rejected (the gate is unchanged — the implicit-downgrade ruling only
+    /// rejected (the gate is unchanged — the implicit-downgrade change only
     /// adds the loan bookkeeping).
     #[test]
     fn test_auto_ro_implicit_loan_gate_control() {
@@ -7296,14 +7486,13 @@ def main() -> Int<32> { return 0; }",
         );
     }
 
-    // ── E0499 acceptance probe (committee 2026-08-05: Polonius/LLBC#
-    // level as the acceptance bar) ──
+    // ── E0499 acceptance probe (Polonius/LLBC# level as the acceptance
+    // bar) ──
     // `get_suffix_at_x` (LLBC# paper §6): a `while let` loop that walks a
     // mutable list by REBORROWING the tail (`ls = tl`) each iteration.
     // rustc's NLL rejects it (E0499: cannot borrow `*ls` as mutable more
-    // than once); Polonius and LLBC# accept it.  Per the committee ruling,
-    // Posita must
-    // stand on the Polonius side.  This probe records the CURRENT
+    // than once); Polonius and LLBC# accept it.  Posita must stand on the
+    // Polonius side.  This probe records the CURRENT
     // behavior; if it fails, the loop-precision work is required.
 
     /// E0499 probe: the while-let tail-reborrow loop must be ACCEPTED.
@@ -7361,8 +7550,8 @@ def main() -> Int<32> { return 0; }",
         );
     }
 
-    // ── `&mut` read-side freeze suite (committee 2026-08-05: strict
-    // "neither readable nor writable" per SYNTAX.md §References) ──
+    // ── `&mut` read-side freeze suite (strict "neither readable nor
+    // writable" per SYNTAX.md §References) ──
     // Constructed BEFORE the change: at BASELINE the read-side
     // freeze is NOT enforced, so test_loan_mut_read_frozen_rejected is
     // expected to FAIL — the divergence the read-side-freeze change closes.
@@ -7455,8 +7644,8 @@ def main() -> Int<32> { return 0; }",
 
     // ── Flow-sensitive liveness suite (constructed for the
     // block-level post-pass, later reverted) ──
-    // (committee 2026-08-05): the precise "last use" liveness is the
-    // point-level refinement.  The block-level post-pass could not deliver the
+    // The precise "last use" liveness is the point-level refinement.  The
+    // block-level post-pass could not deliver the
     // SAME-BLOCK last-use precision (block granularity cannot represent
     // intra-block ordering) and was reverted (fundamentally
     // incompatible with the block granularity).  Point-level liveness
@@ -7507,8 +7696,8 @@ def main() -> Int<32> { return 0; }",
     }
 
     /// W114: `&ro` on an already-immutable reference is redundant — allow
-    /// but warn (the committee's "looks strange -> assume the program is
-    /// wrong" tradition).
+    /// but warn (the "looks strange -> assume the program is wrong"
+    /// heuristic).
     #[test]
     fn test_ro_on_immutable_reference_warns() {
         let (prog, warns) = check_source_keep_hir(
@@ -7743,7 +7932,7 @@ fn test_e0499_loop_back_edge_loan() {
 /// borrows allow the `&mut` receiver/arg to coexist with the reads of the
 /// same place in the OTHER arguments (the activation is deferred until
 
-/// Two-phase borrows (committee-approved — the feasibility finding): the
+/// Two-phase borrows (the feasibility finding): the
 /// METHOD-receiver pattern `lst.push(lst.data)` is ALREADY accepted — the
 /// receiver's `&mut self` borrow is IMPLICIT in the HIR (no explicit
 /// UnaryOp — the post-pass sees no loan — the same "unobservable" pattern
@@ -7785,7 +7974,7 @@ fn test_two_phase_method_receiver_accepted() {
     );
 }
 
-/// The committee member's explicit-&ro entry: `v.push((&ro v).len())` —
+/// The explicit-&ro entry: `v.push((&ro v).len())` —
 /// the temporary `&ro v` read-only loan should die at the `len()` return
 
 /// Probe: the path-insensitive kill — the ELSE-branch's strict-
@@ -9168,7 +9357,7 @@ fn test_generic_adt_drop_is_non_copy() {
 /// `Vec<String>` returned by the checker exposes messages only.)
 #[test]
 fn test_gadt_unconstrained_defaulting() {
-    // The committee ruling (solve → default → validate): an unconstrained
+    // Solve → default → validate: an unconstrained
     // generic-enum construction WITHOUT call-site context is accepted —
     // `defaulting` determines `T` (Int<32>) — previously E060.
     let result = check_source(
@@ -9185,7 +9374,7 @@ fn test_gadt_unconstrained_defaulting() {
     );
 }
 
-/// The committee ruling (solve → default → validate): a GADT construction
+/// Solve → default → validate: a GADT construction
 /// with unresolved type arguments is deferred — the call-site context
 /// flows back during `solve` (here `big + x` constrains `T` to `Int<64>`),
 /// so the construction is ACCEPTED (previously E060).
@@ -9210,7 +9399,7 @@ fn test_gadt_call_site_flow_back() {
     );
 }
 
-/// The committee ruling: the `when` constraint takes priority over
+/// The `when` constraint takes priority over
 /// the surrounding context — `Expr<T>` requires `T == Int<32>`, so an
 /// explicit `Expr<Int<64>>` annotation is NOT honored (the when-constrained
 /// construction keeps `T = Int<32>`), and the assignment is a type
@@ -9267,12 +9456,14 @@ fn test_strict_mode_rejects_unsafe_block() {
          unsafe { return 0; }
      }";
     let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
-    let sync_arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
-    let mut parser = Parser::new(source, sync_arena);
+    let sync_arena: &'static crate::arena::SyncArena<'static> =
+        Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
+    let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
     let program = parser.parse_program().expect("parse should succeed");
     let mut ctx = TypeContext::new();
+    ctx.arena = Some(sync_arena);
     let local_crate_id = CrateId(DefId(0));
-    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
     let (symbols, mut trait_env, _res_diags, resolution_map) = resolver.resolve_program(&program);
     let mut checker = TypeChecker::new(
         &mut ctx,
@@ -9296,12 +9487,14 @@ fn test_strict_mode_rejects_runtime_check() {
     let source = "@runtime_check
      def main() -> Int<32> { return 0; }";
     let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
-    let sync_arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
-    let mut parser = Parser::new(source, sync_arena);
+    let sync_arena: &'static crate::arena::SyncArena<'static> =
+        Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
+    let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
     let program = parser.parse_program().expect("parse should succeed");
     let mut ctx = TypeContext::new();
+    ctx.arena = Some(sync_arena);
     let local_crate_id = CrateId(DefId(0));
-    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
     let (symbols, mut trait_env, _res_diags, resolution_map) = resolver.resolve_program(&program);
     let mut checker = TypeChecker::new(
         &mut ctx,
@@ -9359,7 +9552,7 @@ fn test_compound_assign_after_move() {
     );
 }
 
-/// Rule 3 (the committee ruling): a `when X == Y` equality between TWO
+/// Rule 3: a `when X == Y` equality between TWO
 /// existential variables (`exists X, Y: T` — comma-separated names, one
 /// type) registers an equivalence (ExistentialEquation) deterministically.
 #[test]
@@ -9424,11 +9617,209 @@ fn test_int_literal_overflow_and_underscores() {
         "0xffffffffffffffffffffffffffffffff",
         "0b11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
     ] {
-        let src = format!("def main() -> Int<32> {{ return {lit}; }}");
+        let src: &'static str =
+            Box::leak(format!("def main() -> Int<32> {{ return {lit}; }}").into_boxed_str());
         assert!(
-            check_source(&src).is_err(),
+            check_source(src).is_err(),
             "overflow literal must be rejected: {lit}"
         );
+    }
+}
+
+/// SYNTAX.md §Literals — "Integer suffixes for explicit bit-width:
+/// `42i32` (equivalent to `42: Int<32>`) ... The suffix is syntactic
+/// sugar and the type is fully checked."  The desugared annotation must
+/// be load-bearing: `42i32` really has type `Int<32>`, not a width-blind
+/// integer variable.
+#[test]
+fn test_suffixed_literal_desugars_to_checked_width() {
+    assert!(check_source("def main() -> Int<32> { set x: Int<32> = 42i32; return 0; }").is_ok());
+    // The desugared width participates in unification: `Int<64>` ≠ `Int<32>`.
+    match check_source("def main() -> Int<32> { set x: Int<64> = 42i32; return 0; }") {
+        Err(errs) => assert!(
+            errs.iter().any(|e| e.contains("Int<64>") && e.contains("Int<32>")),
+            "expected a width mismatch, got {errs:?}"
+        ),
+        Ok(_) => panic!("`42i32` must not satisfy `Int<64>`"),
+    }
+    // Unsigned variants desugar to `UInt<w>`.
+    assert!(check_source("def main() -> Int<32> { set x: UInt<8> = 0xFFu8; return 0; }").is_ok());
+    assert!(
+        check_source("def main() -> Int<32> { set x: UInt<16> = 0xFFu8; return 0; }").is_err(),
+        "`0xFFu8` must not satisfy `UInt<16>`"
+    );
+}
+
+/// Out-of-range `Int`/`UInt` widths are compile errors — for the suffix
+/// (`42i999`, `42i0`) and the hand-written annotation (`Int<999>`,
+/// `Int<0>`) alike, since the suffix desugars to the annotation.
+/// `Int<0>` used to PANIC in debug builds (the width passed straight
+/// through to `ctx.int`'s 1..=64 debug assertion).
+#[test]
+fn test_out_of_range_int_widths_are_rejected() {
+    for src in [
+        "def main() -> Int<32> { set x = 42i999; return 0; }",
+        "def main() -> Int<32> { set x = 42i0; return 0; }",
+        "def main() -> Int<32> { set x: Int<999> = 0; return 0; }",
+        "def main() -> Int<32> { set x: Int<0> = 0; return 0; }",
+        "def main() -> Int<32> { set x: UInt<0> = 0; return 0; }",
+        "def f(x: Int<999>) { } def main() -> Int<32> { return 0; }",
+    ] {
+        match check_source(src) {
+            Err(errs) => assert!(
+                errs.iter().any(|e| e.contains("bit width must be in 1..=64")),
+                "expected a width diagnostic for {src:?}, got {errs:?}"
+            ),
+            Ok(_) => panic!("out-of-range width must be rejected: {src:?}"),
+        }
+    }
+}
+
+/// The literal's VALUE must fit the concrete width (`IntLit::fits_signed`
+/// / `fits_unsigned`): `Int<8>` unifies with any integer literal's type,
+/// so the value fit needs its own check (SYNTAX.md §Literals: the type
+/// is "fully checked").  Negated literals are checked on the NEGATED
+/// value, which keeps `-2^63: Int<64>` legal (the bare operand `2^63`
+/// does not fit `Int<64>`).
+#[test]
+fn test_integer_literal_values_must_fit_their_width() {
+    for src in [
+        "def main() -> Int<32> { set x: Int<8> = 100; return 0; }",
+        "def main() -> Int<32> { set x: Int<8> = -128; return 0; }",
+        "def main() -> Int<32> { set x: Int<64> = -9223372036854775808; return 0; }",
+        "def main() -> Int<32> { set x: UInt<8> = 255; return 0; }",
+        "def main() -> Int<32> { set x: UInt<64> = 18446744073709551615; return 0; }",
+        "def main() -> Int<32> { set x = 42i32; return 0; }",
+    ] {
+        assert!(check_source(src).is_ok(), "must be accepted: {src:?}");
+    }
+    for (src, needle) in [
+        (
+            "def main() -> Int<32> { set x: Int<8> = 300; return 0; }",
+            "`300` does not fit in `Int<8>`",
+        ),
+        (
+            "def main() -> Int<32> { set x: Int<8> = -129; return 0; }",
+            "`-129` does not fit in `Int<8>`",
+        ),
+        (
+            "def main() -> Int<32> { set x: UInt<8> = 256; return 0; }",
+            "`256` does not fit in `UInt<8>`",
+        ),
+        (
+            "def main() -> Int<32> { set x: UInt<8> = -1; return 0; }",
+            "`-1` does not fit in `UInt<8>`",
+        ),
+        (
+            "def main() -> Int<32> { set x = 300i8; return 0; }",
+            "`300` does not fit in `Int<8>`",
+        ),
+        (
+            "def f(v: Int<8>) { } def main() -> Int<32> { f(300); return 0; }",
+            "`300` does not fit in `Int<8>`",
+        ),
+        (
+            "def f(v: Int<8>) { } def main() -> Int<32> { f(-300); return 0; }",
+            "`-300` does not fit in `Int<8>`",
+        ),
+    ] {
+        match check_source(src) {
+            Err(errs) => assert!(
+                errs.iter().any(|e| e.contains(needle)),
+                "expected {needle:?} for {src:?}, got {errs:?}"
+            ),
+            Ok(_) => panic!("out-of-range literal must be rejected: {src:?}"),
+        }
+    }
+}
+
+/// SYNTAX.md §Types: `Int<bits>` — "bits must be compile-time constant,
+/// 1..64 (up to 128 with `--enable-experimental`)".  The flag widens the
+/// resolver's accepted range AND the checker's construction; without it,
+/// 65..=128 is rejected with a help pointing at the flag.
+#[test]
+fn test_int_128_requires_experimental_flag() {
+    for src in [
+        "def main() -> Int<32> { set x: Int<128> = 0; return 0; }",
+        "def main() -> Int<32> { set x: Int<65> = 0; return 0; }",
+        "def main() -> Int<32> { set x = 42i128; return 0; }",
+    ] {
+        match check_source(src) {
+            Err(errs) => assert!(
+                errs.iter()
+                    .any(|e| e.contains("bit width must be in 1..=64")),
+                "expected a width diagnostic for {src:?}, got {errs:?}"
+            ),
+            Ok(_) => panic!("Int<65..=128> must require --enable-experimental: {src:?}"),
+        }
+    }
+    for src in [
+        "def main() -> Int<32> { set x: Int<128> = 0; return 0; }",
+        "def main() -> Int<32> { set x: Int<65> = 0; return 0; }",
+        "def main() -> Int<32> { set x: UInt<128> = 0; return 0; }",
+        "def main() -> Int<32> { set x = 42i128; return 0; }",
+    ] {
+        assert!(
+            check_source_experimental(src).is_ok(),
+            "must be accepted with --enable-experimental: {src:?}"
+        );
+    }
+    // 129 is out of range even with the flag.
+    match check_source_experimental("def main() -> Int<32> { set x: Int<129> = 0; return 0; }") {
+        Err(errs) => assert!(
+            errs.iter()
+                .any(|e| e.contains("bit width must be in 1..=128")),
+            "expected the 128-bit width diagnostic, got {errs:?}"
+        ),
+        Ok(_) => panic!("Int<129> must be rejected even with the flag"),
+    }
+}
+
+/// The 128-bit literal-fit boundaries: `Int<128>` is exactly the `i128`
+/// range and `UInt<128>` the `u128` range — the latter reachable only
+/// through `IntLit::Large` (the lexer admits up to `u128::MAX`).
+#[test]
+fn test_int_128_literal_fit_boundaries() {
+    for src in [
+        // i128::MAX / i128::MIN are the signed extremes.
+        "def main() -> Int<32> { set x: Int<128> = 170141183460469231731687303715884105727; return 0; }",
+        "def main() -> Int<32> { set x: Int<128> = -170141183460469231731687303715884105728; return 0; }",
+        // u128::MAX — a `Large` literal — fits UInt<128>, both spellings.
+        "def main() -> Int<32> { set x: UInt<128> = 340282366920938463463374607431768211455; return 0; }",
+        "def main() -> Int<32> { set x = 340282366920938463463374607431768211455u128; return 0; }",
+    ] {
+        assert!(
+            check_source_experimental(src).is_ok(),
+            "must be accepted with the flag: {src:?}"
+        );
+    }
+    for (src, needle) in [
+        (
+            // i128::MAX + 1 fits UInt<128> but not Int<128>.
+            "def main() -> Int<32> { set x: Int<128> = 170141183460469231731687303715884105728; return 0; }",
+            "does not fit in `Int<128>`",
+        ),
+        (
+            "def main() -> Int<32> { set x: Int<128> = 340282366920938463463374607431768211455; return 0; }",
+            "does not fit in `Int<128>`",
+        ),
+        (
+            "def main() -> Int<32> { set x: UInt<128> = -1; return 0; }",
+            "does not fit in `UInt<128>`",
+        ),
+        (
+            // Negating a `Large` literal must not skip the fit check.
+            "def main() -> Int<32> { set x: UInt<128> = -340282366920938463463374607431768211455; return 0; }",
+            "does not fit in `UInt<128>`",
+        ),
+    ] {
+        match check_source_experimental(src) {
+            Err(errs) => assert!(
+                errs.iter().any(|e| e.contains(needle)),
+                "expected {needle:?} for {src:?}, got {errs:?}"
+            ),
+            Ok(_) => panic!("out-of-range literal must be rejected: {src:?}"),
+        }
     }
 }
 
@@ -9527,7 +9918,7 @@ fn test_float_literal_fast_path() {
     // fast path + underscore fallback both parse correctly).
 }
 
-/// The committee ruling (float default `trap` — aligned with integers):
+/// Float default `trap` (aligned with integers):
 /// a compile-time float-literal overflow (`1e999` → ±inf) is a COMPILE
 /// ERROR (the parser propagates the lexer's error — it is no longer
 /// swallowed into Expr::Error).
@@ -9546,7 +9937,7 @@ fn test_float_literal_overflow_is_compile_error() {
     }
 }
 
-/// The committee ruling (float default `trap` — IEEE is explicit opt-in):
+/// Float default `trap` (IEEE is explicit opt-in):
 /// `with overflow = ieee` on a float type must parse and type-check
 /// (the OverflowPolicy::Ieee variant — ast + target spec).
 #[test]
@@ -9578,14 +9969,14 @@ fn test_unicode_escape_stack_buf() {
     // stack-buf optimization (cf. the float-literal Err propagation).
 }
 
-/// The committee ruling (float default `trap` — explicit IEEE opt-in via
-/// the `+%` suffix on floats): overflow-suffixed operators accept BOTH
+/// Float default `trap` (explicit IEEE opt-in via the `+%` suffix on
+/// floats): overflow-suffixed operators accept BOTH
 /// integer and float operands.
 #[test]
 fn test_overflow_suffix_float_semantics() {
     // Integer +% (wrap) — already accepted.
     assert!(check_source("def main() -> Int<32> { set x = 1 +% 2; return x; }").is_ok());
-    // Float +% — now accepted (IEEE opt-in per the ruling).
+    // Float +% — accepted (IEEE opt-in).
     assert!(check_source("def main() -> Int<32> { set x = 1.5 +% 2.5; return 0; }").is_ok());
     // Float +? (saturate) and +! (trap) — accepted.
     assert!(check_source("def main() -> Int<32> { set x = 1.5 +? 2.5; return 0; }").is_ok());
@@ -10136,8 +10527,8 @@ fn test_nested_calls_ok_on_default_stack() {
 /// Integration: a `.ps` while loop runs the loop-invariant inference
 /// pipeline inside the REAL checker — the HIR loop is translated, the
 /// widened fixpoint produces candidates, and the SMT consistency gate
-/// emits the "inferred loop invariant" note (hint-only per the 2026-08-13
-/// ruling).  The note is skipped when Z3 is unavailable or the loop is not
+/// emits the "inferred loop invariant" note (hint-only).  The note is
+/// skipped when Z3 is unavailable or the loop is not
 /// translatable (fail-closed — never an obligation).
 ///
 /// Regression: the hint channel used to be INERT in the checker — it
@@ -10202,8 +10593,8 @@ fn test_m3_ro_field_operand_freezes_referent() {
     );
 }
 
-/// A declared `while` loop `invariant` clause must be VERIFIED (per
-/// the language-owner ruling — the clause is an obligation, not a
+/// A declared `while` loop `invariant` clause must be VERIFIED (the
+/// clause is an obligation, not a
 /// decorative annotation).  A provable invariant (entailed by the inferred
 /// BII candidates) type-checks.
 #[test]
@@ -10346,7 +10737,7 @@ fn test_user_hint_assertion_unprovable_rejected() {
     );
 }
 
-/// Issue-1 regression (per-variable bit-widths): a wrap-loop whose FIRST
+/// Per-variable bit-width regression: a wrap-loop whose FIRST
 /// variable is 8-bit and whose SECOND variable is 16-bit must verify its
 /// declared `invariant` at the variable's OWN width.  The old uniform-width
 /// BV discharge declared every variable at the first variable's 8 bits, so
@@ -10383,7 +10774,7 @@ fn test_mixed_width_wrap_invariant_no_false_proof() {
     );
 }
 
-/// Issue-1 regression (per-variable bit-widths): `verify_loop_decreases`
+/// Per-variable bit-width regression: `verify_loop_decreases`
 /// declares the loop variables at their OWN bit-widths.  The old
 /// uniform-width encoding declared every variable at the FIRST variable's
 /// 8 bits, so a 16-bit `b := 255` was read as an 8-bit `255` and
@@ -10697,12 +11088,13 @@ fn test_set_in_loop_body_is_assignment() {
 fn with_live_checker(f: impl for<'a, 's, 'i, 'r> FnOnce(&'r mut TypeChecker<'a, 's, 'i>)) {
     let source = "def main() -> Int<32> { return 0; }";
     let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
-    let sync_arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
-    let mut parser = Parser::new(source, sync_arena);
+    let sync_arena: &'static crate::arena::SyncArena<'static> =
+        Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
+    let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
     let program = parser.parse_program().expect("parse should succeed");
     let mut ctx = TypeContext::new();
     let local_crate_id = CrateId(DefId(0));
-    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
     let (symbols, mut trait_env, _res_diags, resolution_map) = resolver.resolve_program(&program);
     let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, resolution_map);
     f(&mut checker);
@@ -10929,13 +11321,14 @@ fn test_lookup_method_generic_match_probe() {
          }
          def main() -> Int<32> { return 0; }";
     let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
-    let sync_arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
-    let mut parser = Parser::new(source, sync_arena);
+    let sync_arena: &'static crate::arena::SyncArena<'static> =
+        Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
+    let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
     let program = parser.parse_program().expect("parse should succeed");
     let mut ctx = TypeContext::new();
     ctx.arena = Some(&sync_arena);
     let local_crate_id = CrateId(DefId(0));
-    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
     let (symbols, mut trait_env, _res_diags, resolution_map) = resolver.resolve_program(&program);
     let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, resolution_map);
     // Impl registration happens during checking (`check_program`), not in
@@ -11027,7 +11420,7 @@ fn test_infer_origin_trace() {
     let mut infer = InferenceContext::new();
 
     // Create an InferVar with Expression origin at span (10, 20).
-    let span = Span::new(10, 20);
+    let span = Span::new(FileId::DUMMY, 10, 20);
     let var_ty = infer.new_type_var(
         &mut ctx,
         TypeVariableKind::Integer,
@@ -11409,8 +11802,7 @@ fn test_gadt_scrut_field_access_method() {
 /// one function" payoff.
 #[test]
 fn test_digest_gate_recomputes_only_changed_function() {
-    use crate::hir::query::queries::FN_BODY_COMPUTES;
-    use std::sync::atomic::Ordering;
+    use crate::hir::query::queries::{fn_body_compute_count_for, fn_body_compute_mark};
 
     let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let arena: &'static crate::arena::SyncArena<'static> =
@@ -11423,13 +11815,18 @@ fn test_digest_gate_recomputes_only_changed_function() {
     let src2 = "edition = \"2026\";\n\ndef f0() -> Int<32> {\n    return 1;\n}\n\ndef f1() -> Int<32> {\n    return 20;\n}\n\ndef main() -> Int<32> {\n    return 0;\n}\n";
 
     let program1 = {
-        let mut parser = Parser::new(src1, arena);
+        let mut parser = Parser::new(src1, FileId::DUMMY, arena);
         parser.parse_program().unwrap_or_else(|diags| {
             panic!(
                 "iter-1 parse errors: {:?}",
                 diags
                     .into_iter()
-                    .map(|d| d.message().to_string())
+                    .map(|mut d| {
+                    // `*_kind` diagnostics derive `message` lazily; the
+                    // emitter humanizes at its render boundary.
+                    d.humanize();
+                    d.message().to_string()
+                })
                     .collect::<Vec<_>>()
             )
         })
@@ -11437,7 +11834,7 @@ fn test_digest_gate_recomputes_only_changed_function() {
     let mut ctx = TypeContext::new();
     ctx.arena = Some(arena);
     let local_crate_id = CrateId(DefId(0));
-    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None);
+    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
     let (mut symbols, mut trait_env, _res_diags, resolution_map) =
         resolver.resolve_program(&program1);
     // The checker is built WITH source (the digest gate needs it) and is
@@ -11448,19 +11845,23 @@ fn test_digest_gate_recomputes_only_changed_function() {
         &symbols,
         &mut trait_env,
         resolution_map,
-        false, // strict_mode
-        false, // enable_experimental
+        false,  // strict_mode
+        false,  // enable_experimental
         vec![], // features
-        false, // debug
+        false,  // debug
         Some(src1),
     );
 
     // Iteration 1: f0, f1 and main all compute (cold query system).
-    FN_BODY_COMPUTES.store(0, Ordering::SeqCst);
+    // NOTE: FN_BODY computes are also triggered by OTHER tests running in
+    // parallel in the same process (the counter/log is process-global), so
+    // this test filters the compute log by its own query-system address.
+    let system = &checker.query_system as *const _ as usize;
+    let mark1 = fn_body_compute_mark();
     checker
         .check_program(&program1)
         .expect("iteration 1 must check");
-    let after_iter1 = FN_BODY_COMPUTES.load(Ordering::SeqCst);
+    let after_iter1 = fn_body_compute_count_for(system, mark1);
     assert!(
         after_iter1 >= 3,
         "iteration 1 must compute all three bodies, got {after_iter1}"
@@ -11472,13 +11873,18 @@ fn test_digest_gate_recomputes_only_changed_function() {
     // source would mis-slice every span after the edit.
     checker.set_source(Some(src2));
     let program2 = {
-        let mut parser = Parser::new(src2, arena);
+        let mut parser = Parser::new(src2, FileId::DUMMY, arena);
         parser.parse_program().unwrap_or_else(|diags| {
             panic!(
                 "iter-2 parse errors: {:?}",
                 diags
                     .into_iter()
-                    .map(|d| d.message().to_string())
+                    .map(|mut d| {
+                    // `*_kind` diagnostics derive `message` lazily; the
+                    // emitter humanizes at its render boundary.
+                    d.humanize();
+                    d.message().to_string()
+                })
                     .collect::<Vec<_>>()
             )
         })
@@ -11486,7 +11892,7 @@ fn test_digest_gate_recomputes_only_changed_function() {
     checker
         .check_program(&program2)
         .expect("iteration 2 must check");
-    let after_iter2 = FN_BODY_COMPUTES.load(Ordering::SeqCst);
+    let after_iter2 = fn_body_compute_count_for(system, mark1);
     assert_eq!(
         after_iter2,
         after_iter1 + 1,
@@ -11494,4 +11900,160 @@ fn test_digest_gate_recomputes_only_changed_function() {
          f0 and main must be served from cache (digest gate skipped \
          their invalidation entirely), got {after_iter1} -> {after_iter2}"
     );
+}
+
+/// `CheckFnBody` must answer a MISMATCHED key with a VALUE, not a
+/// panic — a panic inside `compute` poisons the latch and surfaces as a
+/// bogus cycle error (the module's totality doctrine).  A stale/mis-minted
+/// FnId pointing at an impl block, a comptime free function (they never
+/// exist at runtime), or an out-of-range index folds to the rejected-body
+/// shape (`HirStmt::Error`, no diagnostics) — the same doctrine
+/// CheckFnSignature's shape match follows.
+#[test]
+fn test_check_fn_body_mismatched_key_folds_to_error_value() {
+    use crate::hir::hir::HirStmt;
+    use crate::hir::query::queries::{CheckFnBody, FnId};
+
+    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let arena: &'static crate::arena::SyncArena<'static> =
+        Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
+
+    let src = "edition = \"2026\";\n\ntype MyType = struct { val: Int<32> }\n\nimpl for MyType {\n    def get_val(&self) -> Int<32> {\n        return self.val;\n    }\n}\n\ncomptime def cf() -> Int<32> {\n    return 42;\n}\n\ndef free_fn() -> Int<32> {\n    return 1;\n}\n";
+    let program = {
+        let mut parser = Parser::new(src, FileId::DUMMY, arena);
+        parser.parse_program().unwrap_or_else(|diags| {
+            panic!(
+                "parse errors: {:?}",
+                diags
+                    .into_iter()
+                    .map(|mut d| {
+                    // `*_kind` diagnostics derive `message` lazily; the
+                    // emitter humanizes at its render boundary.
+                    d.humanize();
+                    d.message().to_string()
+                })
+                    .collect::<Vec<_>>()
+            )
+        })
+    };
+    let impl_idx = program
+        .items
+        .iter()
+        .position(|i| matches!(i, crate::ast::Stmt::ImplBlock { .. }))
+        .expect("fixture must contain an impl block");
+    let comptime_idx = program
+        .items
+        .iter()
+        .position(|i| {
+            matches!(
+                i,
+                crate::ast::Stmt::FunctionDef {
+                    is_comptime: true,
+                    ..
+                }
+            )
+        })
+        .expect("fixture must contain a comptime function");
+    let free_idx = program
+        .items
+        .iter()
+        .position(|i| {
+            matches!(
+                i,
+                crate::ast::Stmt::FunctionDef {
+                    is_comptime: false,
+                    ..
+                }
+            )
+        })
+        .expect("fixture must contain a runtime free function");
+
+    let mut ctx = TypeContext::new();
+    ctx.arena = Some(arena);
+    let local_crate_id = CrateId(DefId(0));
+    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
+    let (mut symbols, mut trait_env, _res_diags, resolution_map) =
+        resolver.resolve_program(&program);
+    let mut checker = make_checker(&mut ctx, &symbols, &mut trait_env, resolution_map);
+
+    let harness = crate::session::BodyCheckHarness {
+        shared: std::sync::Arc::new(SharedCheckState::default()),
+        session_stamp: &*checker.ctx as *const _ as usize,
+        strict_mode: false,
+        enable_experimental: false,
+        features: vec![],
+        debug: false,
+        source: Some(src),
+    };
+    let provider = crate::session::SessionQueryProvider::new(
+        &checker.query_system,
+        checker.symbols,
+        &*checker.trait_env,
+        &checker.resolution_map,
+        &program,
+    )
+    .with_arena(arena)
+    .with_body_check(&*checker.ctx, harness);
+
+    // Positive control: a real free-function key checks normally (guards
+    // against the kind guard being accidentally too broad).
+    let ok = checker
+        .query_system
+        .get_shared::<CheckFnBody>(
+            FnId {
+                item: free_idx,
+                method: None,
+            },
+            &provider,
+        )
+        .expect("free-function key must check normally");
+    assert!(
+        !matches!(ok.hir, HirStmt::Error),
+        "positive control must produce a checked body, got {:?}",
+        ok.hir
+    );
+
+    // Mismatched key #1: an impl-block index with method = None.
+    let folded = checker
+        .query_system
+        .get_shared::<CheckFnBody>(
+            FnId {
+                item: impl_idx,
+                method: None,
+            },
+            &provider,
+        )
+        .expect("impl-block key must return a VALUE, not poison the latch");
+    assert!(matches!(folded.hir, HirStmt::Error));
+    assert!(
+        folded.diagnostics.is_empty(),
+        "folded value carries no diagnostics: {:?}",
+        folded.diagnostics
+    );
+
+    // Mismatched key #2: a comptime free function (never exists at runtime).
+    let folded = checker
+        .query_system
+        .get_shared::<CheckFnBody>(
+            FnId {
+                item: comptime_idx,
+                method: None,
+            },
+            &provider,
+        )
+        .expect("comptime key must return a VALUE, not poison the latch");
+    assert!(matches!(folded.hir, HirStmt::Error));
+
+    // Out-of-range index.
+    let oob = checker
+        .query_system
+        .get_shared::<CheckFnBody>(
+            FnId {
+                item: program.items.len() + 100,
+                method: None,
+            },
+            &provider,
+        )
+        .expect("out-of-range key must return a VALUE, not poison the latch");
+    assert!(matches!(oob.hir, HirStmt::Error));
 }

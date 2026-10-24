@@ -1,31 +1,141 @@
+use compact_str::CompactString;
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::OnceLock;
 
 /// The port number of the local explain server, if running.
 static EXPLAIN_PORT: OnceLock<u16> = OnceLock::new();
 
-/// Cached index for fast error-code lookups. Built once on first `lookup` call.
-static CODE_INDEX: OnceLock<HashMap<&'static str, &'static CodeEntry>> = OnceLock::new();
+/// Direct-address index over [`CODE_TABLE`], built at compile time.
+///
+/// The registry is validated at build time against `^[EW]\d{3}$`, so every
+/// code is exactly one prefix byte plus three digits: slot
+/// `prefix * 1000 + number`, with `u16::MAX` marking an absent code.  A
+/// lookup is then a shape check + one array read — no lazy `OnceLock` init,
+/// no SipHash, no lock, and the table is shared read-only across threads.
+const CODE_INDEX_SLOTS: usize = 2 * 1000;
+static CODE_INDEX: [u16; CODE_INDEX_SLOTS] = build_code_index();
+/// The index stores table positions as `u16`; fail the build, not a lookup,
+/// if the registry ever outgrows that.
+const _: () = assert!(CODE_TABLE.len() < u16::MAX as usize);
 
+/// Slot for a code matching the registry's `^[EW]\d{3}$` shape, or `None`.
+const fn code_slot(code: &str) -> Option<usize> {
+    let b = code.as_bytes();
+    if b.len() != 4 {
+        return None;
+    }
+    let prefix = match b[0] {
+        b'E' => 0,
+        b'W' => 1,
+        _ => return None,
+    };
+    let mut n = 0usize;
+    let mut i = 1;
+    while i < 4 {
+        let d = b[i];
+        if !d.is_ascii_digit() {
+            return None;
+        }
+        n = n * 10 + (d - b'0') as usize;
+        i += 1;
+    }
+    Some(prefix * 1000 + n)
+}
+
+const fn build_code_index() -> [u16; CODE_INDEX_SLOTS] {
+    let mut idx = [u16::MAX; CODE_INDEX_SLOTS];
+    let mut i = 0;
+    while i < CODE_TABLE.len() {
+        if let Some(slot) = code_slot(CODE_TABLE[i].code) {
+            idx[slot] = i as u16;
+        }
+        i += 1;
+    }
+    idx
+}
 /// Set the port for the local explain server.  Called by the CLI before
 /// displaying error code URLs.
-pub fn set_explain_port(port: u16) {
-    let _ = EXPLAIN_PORT.set(port);
+///
+/// Returns `Err(previous)` when a port was already set, so a second caller can
+/// observe that its value was ignored instead of silently assuming it took
+/// effect.  Callers that intentionally re-set the port (e.g. tests) should
+/// discard the result explicitly with `let _ = …`.
+pub fn set_explain_port(port: u16) -> Result<(), u16> {
+    EXPLAIN_PORT
+        .set(port)
+        .map_err(|_| *EXPLAIN_PORT.get().unwrap_or(&port))
 }
 
 /// The URL for the `--explain` feature.  Returns a `localhost` URL when
 /// the local explain server is running, otherwise the canonical doc URL.
+///
+/// The code is percent-encoded as a single path segment in both branches, so
+/// an untrusted code (CLI argument, `Diagnostic::with_code_str`) cannot escape
+/// the segment or smuggle control characters into the URL.
 fn explain_url(code: &str) -> String {
-    if let Some(&port) = EXPLAIN_PORT.get() {
-        format!("http://127.0.0.1:{port}/{code}")
+    explain_url_with_port(code, EXPLAIN_PORT.get().copied())
+}
+
+/// Build the explanation URL for a code, given an explicit port.
+///
+/// This is the pure, testable core of `explain_url`; callers that need the
+/// process-global port (the production path) pass `EXPLAIN_PORT.get().copied()`.
+///
+/// No memoization: the only production caller is the explain server, which
+/// builds one URL per served page, so a process-global mutex + hash + clone
+/// would cost more than the `format!` it caches (and the port is read on
+/// every call, so a later [`set_explain_port`] can never return a stale URL).
+pub(crate) fn explain_url_with_port(code: &str, port: Option<u16>) -> String {
+    if let Some(port) = port {
+        explain_server_url(port, code)
     } else {
         // We will register this domain and set up a proper documentation
         // website in the future.  For now, the local explain server is the
         // primary way to view error explanations in a browser.
-        format!("https://doc.posita-lang.org/error_codes/{code}.html")
+        format!(
+            "https://doc.posita-lang.org/error_codes/{}.html",
+            encode_url_path_segment(code)
+        )
     }
+}
+
+/// Build the local explain-server URL for a raw (possibly unknown) code.
+///
+/// Single source of truth for the `http://127.0.0.1:<port>/<code>` form, used
+/// by [`ErrCode::url`] and by the CLI when opening the browser.  The code is
+/// percent-encoded as one path segment so untrusted input cannot escape the
+/// segment or smuggle control characters into the URL.
+pub(crate) fn explain_server_url(port: u16, code: &str) -> String {
+    format!("http://127.0.0.1:{port}/{}", encode_url_path_segment(code))
+}
+
+/// Percent-encode a single URL path segment per RFC 3986.  Unreserved
+/// characters pass through; everything else — including `/`, `:`, `%`,
+/// control characters, and non-ASCII bytes — becomes `%XX`.  Stricter than
+/// [`glyph::encode_file_url_path`](crate::diagnostics::glyph) because a code
+/// is *one* segment, and a raw `\x1b` here would terminate the enclosing
+/// OSC 8 hyperlink early.
+fn encode_url_path_segment(s: &str) -> Cow<'_, str> {
+    use std::fmt::Write as _;
+    // Fast path: unreserved ASCII chars pass through byte-for-byte.
+    if s.bytes()
+        .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~'))
+    {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// Categorization of compiler error codes.
@@ -42,6 +152,8 @@ pub enum ErrorCategory {
 }
 
 impl ErrorCategory {
+    /// Stable machine-readable key (JSON `"category"` field).  Never
+    /// localized — consumers depend on a fixed vocabulary.
     pub fn as_str(&self) -> &'static str {
         match self {
             ErrorCategory::Parse => "Parse Error",
@@ -54,101 +166,199 @@ impl ErrorCategory {
             ErrorCategory::Generic => "Error",
         }
     }
+
+    /// i18n slug for [`Self::as_str`], resolved through Fluent so the
+    /// human-readable category follows the active
+    /// [`Lang`](super::i18n::Lang).
+    pub fn label(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            ErrorCategory::Parse => crate::tr!("category-parse"),
+            ErrorCategory::Resolution => crate::tr!("category-resolution"),
+            ErrorCategory::Type => crate::tr!("category-type"),
+            ErrorCategory::Contract => crate::tr!("category-contract"),
+            ErrorCategory::Trait => crate::tr!("category-trait"),
+            ErrorCategory::Inference => crate::tr!("category-inference"),
+            ErrorCategory::Internal => crate::tr!("category-internal"),
+            ErrorCategory::Generic => crate::tr!("category-generic"),
+        }
+    }
 }
 
 /// A compiler error or warning code (e.g. "E030", "W113").
 ///
-/// Stored as a [`Cow<'static, str>`]: codes are declared in [`CODE_TABLE`], so
-/// a known code borrows its `&'static` entry instead of allocating.  Metadata
-/// (title, category, explanation) is resolved through the same lookup table,
-/// removing the need for exhaustive match arms on enum variants.
+/// Stored as a [`CompactString`]: codes are short (`E030`), so a known or
+/// unknown code stays inline with no heap allocation.  Metadata (title,
+/// category, explanation) is resolved through the same lookup table, removing
+/// the need for exhaustive match arms on enum variants.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ErrCode(Cow<'static, str>);
+pub struct ErrCode(CompactString);
 
 /// Error returned when an unknown error code string is used.
 #[derive(Debug, Clone)]
-pub struct UnknownCode(pub String);
+pub struct UnknownCode<'a>(pub Cow<'a, str>);
 
-impl fmt::Display for UnknownCode {
+/// Fallback metadata for error codes not present in [`CODE_TABLE`].
+pub(crate) static UNKNOWN_CODE_ENTRY: CodeEntry = CodeEntry {
+    code: "",
+    title: "unknown error",
+    category: ErrorCategory::Generic,
+    explain: "No detailed explanation is available for this error code yet.",
+};
+
+impl fmt::Display for UnknownCode<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown error code: `{}`", self.0)
+        // `self.0` is the untrusted code string that failed lookup.  It is
+        // surfaced verbatim in the message (e.g. via the explain server's
+        // `io::Error` → `eprintln!` path), so neutralize control characters
+        // that could inject terminal escapes.
+        write!(
+            f,
+            "unknown error code: `{}`",
+            super::sanitize_for_terminal(&self.0)
+        )
     }
 }
 
-impl std::error::Error for UnknownCode {}
+impl std::error::Error for UnknownCode<'_> {}
 
 impl ErrCode {
-    /// Create a new `ErrCode` without validation.
+    /// Create a new `ErrCode`, accepting an unknown code as-is (it will
+    /// fall back to "unknown error" for `title()` / `category()` /
+    /// `explain()`).
     ///
-    /// In debug builds, a `debug_assert!` panics if the code is not in the
-    /// lookup table.  In release builds the code is accepted as-is and will
-    /// silently fall back to "unknown error" for `title()` / `category()` /
-    /// `explain()`.
+    /// This never panics in **any** profile.  The `debug_assert!` this
+    /// constructor used to carry made a typo'd literal panic debug builds
+    /// while silently degrading release ones — a divergence that hid bugs
+    /// from CI.  `literal_codes_are_all_in_code_table` in the test module
+    /// is the guard that catches such typos instead.
     ///
-    /// A code present in [`CODE_TABLE`] borrows its `&'static` entry, so the
-    /// common (literal) path allocates nothing.
+    /// A short code (e.g. `E030`) stays inline with no heap allocation.
     ///
     /// Prefer [`Self::try_new`] when the input comes from an external source
     /// (user input, CLI arguments, etc.).
     pub fn new(code: impl AsRef<str>) -> Self {
         let code = code.as_ref();
+        // Fast path: an already-canonical code (the overwhelmingly common
+        // case) hits the table with no allocation.
+        if let Some(e) = lookup(code) {
+            return ErrCode(CompactString::from(e.code));
+        }
+        // Retry case-insensitively (`e030` → `E030`), matching
+        // `suggest_code`'s case-insensitive comparison — a lowercase code
+        // must resolve to its entry, not degrade to unknown-code metadata.
+        // The retry is allocation-free for real codes (see
+        // [`lookup_uppercased`]).
+        if let Some(e) = lookup_uppercased(code) {
+            return ErrCode(CompactString::from(e.code));
+        }
+        // Unknown: stored verbatim — never invent case for arbitrary
+        // strings that are not error codes.
+        ErrCode(CompactString::from(code))
+    }
+
+    /// Build an `ErrCode` from a code expected to be in the table, keeping a
+    /// `debug_assert!` so a typo still panics debug builds; release behaves
+    /// exactly like [`Self::new`].
+    ///
+    /// Production code must not depend on the panic: it only marks "this is
+    /// a programming error" for developers.
+    pub(crate) fn new_unchecked(code: impl AsRef<str>) -> Self {
+        let code = code.as_ref();
         let entry = lookup(code);
         debug_assert!(
             entry.is_some(),
-            "unknown error code: {code:?} — must be added to CODE_TABLE in error_code.rs",
+            "unknown error code: {code:?} — must be added to error_codes/codes.toml",
         );
         match entry {
-            Some(e) => ErrCode(Cow::Borrowed(e.code)),
-            None => ErrCode(Cow::Owned(code.to_owned())),
+            Some(e) => ErrCode(CompactString::from(e.code)),
+            None => ErrCode(CompactString::from(code)),
         }
     }
 
     /// Validate that `code` exists in the lookup table, returning
     /// [`UnknownCode`] if it does not.  This check runs in **all** build
-    /// profiles (unlike the `debug_assert!` in [`Self::new`]).
+    /// profiles (unlike the `debug_assert!` in [`Self::new_unchecked`]).
     ///
-    /// On success the canonical `&'static` entry is borrowed; only the
-    /// unknown-code error owns a `String`.
-    pub fn try_new(code: impl AsRef<str>) -> Result<Self, UnknownCode> {
-        let code = code.as_ref();
-        match lookup(code) {
-            Some(e) => Ok(ErrCode(Cow::Borrowed(e.code))),
-            None => Err(UnknownCode(code.to_owned())),
+    /// On success the canonical entry is copied inline; only the
+    /// unknown-code error borrows the rejected input.
+    pub fn try_new<'a>(code: &'a str) -> Result<Self, UnknownCode<'a>> {
+        // Same case-insensitive resolution as [`Self::new`]: a known code
+        // in any case is accepted and stored canonically; the error keeps
+        // the input verbatim so the user sees what they typed.
+        match lookup(code).or_else(|| lookup_uppercased(code)) {
+            Some(e) => Ok(ErrCode(CompactString::from(e.code))),
+            None => Err(UnknownCode(Cow::Borrowed(code))),
         }
+    }
+
+    /// Build an `ErrCode` from a raw string **without** validating it against
+    /// [`CODE_TABLE`].  Unlike [`Self::new`], this never panics; `title()`,
+    /// `category()`, and `explain()` fall back to their generic "unknown"
+    /// values.
+    ///
+    /// This is the escape hatch for callers that may receive untrusted or
+    /// dynamically-constructed code strings (e.g. `Diagnostic::with_code_str`).
+    pub(crate) fn unknown(code: impl Into<CompactString>) -> Self {
+        ErrCode(code.into())
     }
 
     /// The code string, e.g. "E030" or "W113".
     pub fn code(&self) -> &str {
-        &self.0
+        self.0.as_str()
+    }
+
+    /// Resolve this error code to its table entry, if present.
+    ///
+    /// Callers that need multiple fields (`title`, `category`, `explain`)
+    /// should use this once and derive each from the returned entry, avoiding
+    /// repeated hash lookups.
+    pub fn entry(&self) -> Option<&'static CodeEntry> {
+        lookup(&self.0)
+    }
+
+    /// Return the resolved entry or the static unknown-code fallback.
+    ///
+    /// Equivalent to a single `lookup` call followed by `.unwrap_or(...)`,
+    /// so callers can gather `title` / `category` / `explain` in one lookup.
+    pub(crate) fn entry_or_unknown(&self) -> &'static CodeEntry {
+        lookup(&self.0).unwrap_or(&UNKNOWN_CODE_ENTRY)
     }
 
     /// Short title, e.g. "type mismatch" or "duplicate definition".
     pub fn title(&self) -> &'static str {
-        lookup(&self.0).map(|e| e.title).unwrap_or("unknown error")
+        self.entry_or_unknown().title
     }
 
     /// The error category, e.g. `ErrorCategory::Type`.
     pub fn category(&self) -> ErrorCategory {
-        lookup(&self.0)
-            .map(|e| e.category)
-            .unwrap_or(ErrorCategory::Generic)
+        self.entry_or_unknown().category
     }
 
     /// Full explanation text, displayed by `ponent --explain E030`.
     pub fn explain(&self) -> &'static str {
-        lookup(&self.0)
-            .map(|e| e.explain)
-            .unwrap_or("No detailed explanation is available for this error code yet.")
+        self.entry_or_unknown().explain
     }
 
     /// The diagnostic URL for the `--explain` feature.
+    ///
+    /// [`explain_url`] percent-encodes the code as a single path segment, so an
+    /// unknown code holding arbitrary bytes (see [`Self::unknown`]) cannot
+    /// escape the segment or the enclosing link.
     pub fn url(&self) -> String {
         explain_url(&self.0)
     }
 
     /// The diagnostic URL, formatted as an ANSI hyperlink if the terminal supports it.
+    ///
+    /// The visible text is sanitized (control characters become U+FFFD) so an
+    /// untrusted code cannot terminate the OSC 8 link early and inject further
+    /// terminal escapes.
     pub fn url_ansi(&self) -> String {
-        format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", self.url(), self.0)
+        format!(
+            "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\",
+            self.url(),
+            super::sanitize_for_terminal(&self.0),
+        )
     }
 }
 
@@ -160,549 +370,530 @@ pub(crate) struct CodeEntry {
     explain: &'static str,
 }
 
-/// Lookup table for error/warning code metadata.
-/// Maps code strings to their title, category, and explanation.
-pub(crate) const CODE_TABLE: &[CodeEntry] = &[
-    CodeEntry {
-        code: "E001",
-        title: "expected token",
-        category: ErrorCategory::Parse,
-        explain: "A specific token was expected at the current parse position but not found.\n\nThis typically occurs due to:\n  - Missing closing delimiters: `)`, `}`, `]`\n  - Missing semicolons at end of statements\n  - Incomplete syntax in type or expression\n\nExample of invalid code:\n  def foo(x: Int<32 {\n    return x;\n  }\n\nFix: add the missing token at the indicated position.",
-    },
-    CodeEntry {
-        code: "E002",
-        title: "unexpected end of input",
-        category: ErrorCategory::Parse,
-        explain: "The parser reached the end of the input while still expecting more tokens.\n\nThis usually means the code is incomplete.",
-    },
-    CodeEntry {
-        code: "E003",
-        title: "unexpected token",
-        category: ErrorCategory::Parse,
-        explain: "An unexpected token was encountered at the current parse position.\n\nThis typically indicates a syntax error such as missing punctuation, extra characters, or incorrect ordering of keywords.\n\nExample:\n  def foo(x: Int<32) { return; } }  // extra `}`\n\nFix: review the syntax at the indicated position and remove or correct the unexpected token.",
-    },
-    CodeEntry {
-        code: "E004",
-        title: "parse error",
-        category: ErrorCategory::Parse,
-        explain: "A general parse error occurred.",
-    },
-    CodeEntry {
-        code: "E005",
-        title: "expected identifier",
-        category: ErrorCategory::Parse,
-        explain: "An identifier (name) was expected but not found.\n\nIdentifiers are used for variable names, function names, type names, etc.\n\nExample:\n  def 123() { }  // error: expected identifier, found number\n\nFix: use a valid identifier name instead.",
-    },
-    CodeEntry {
-        code: "E006",
-        title: "recursion limit exceeded",
-        category: ErrorCategory::Parse,
-        explain: "The parser exceeded the recursion limit.\n\nThis may indicate deeply nested expressions or a bug in the parser.",
-    },
-    CodeEntry {
-        code: "E007",
-        title: "expected expression",
-        category: ErrorCategory::Parse,
-        explain: "An expression was expected at the current position but not found.\n\nExpressions are values, variables, function calls, operators, etc. This typically occurs after an operator or assignment that expects a value.\n\nExample:\n  set x = ;  // error: expected expression after `=`\n\nFix: provide a valid expression at the indicated position.",
-    },
-    CodeEntry {
-        code: "E008",
-        title: "return Err is not valid; use leave with",
-        category: ErrorCategory::Parse,
-        explain: "`return Err(...)` is not a valid error exit in Posita.\n\n`leave with` is the only valid error exit (SYNTAX.md §Error Handling); it\nis recorded as an `ErrorExit` in the control-flow graph for audit.\n\nFix: replace `return Err(x)` with `leave with x`.",
-    },
-    CodeEntry {
-        code: "E009",
-        title: "invalid character literal",
-        category: ErrorCategory::Parse,
-        explain: "Invalid character literal.",
-    },
-    CodeEntry {
-        code: "E010",
-        title: "no such field",
-        category: ErrorCategory::Resolution,
-        explain: "A field access refers to a field that does not exist on the given type.",
-    },
-    CodeEntry {
-        code: "E011",
-        title: "type not found",
-        category: ErrorCategory::Resolution,
-        explain: "A type name could not be resolved in the current scope.",
-    },
-    CodeEntry {
-        code: "E012",
-        title: "name not found",
-        category: ErrorCategory::Resolution,
-        explain: "A name could not be resolved in the current scope.",
-    },
-    CodeEntry {
-        code: "E013",
-        title: "undefined type",
-        category: ErrorCategory::Resolution,
-        explain: "The type has not been defined in the current scope.",
-    },
-    CodeEntry {
-        code: "E014",
-        title: "generic args on non-generic",
-        category: ErrorCategory::Resolution,
-        explain: "Generic type arguments were provided for a non-generic type.",
-    },
-    CodeEntry {
-        code: "E015",
-        title: "cannot resolve import",
-        category: ErrorCategory::Resolution,
-        explain: "An import could not be resolved.",
-    },
-    CodeEntry {
-        code: "E016",
-        title: "no default value",
-        category: ErrorCategory::Resolution,
-        explain: "A type has no default value and no initializer was provided.",
-    },
-    CodeEntry {
-        code: "E017",
-        title: "array size not constant",
-        category: ErrorCategory::Resolution,
-        explain: "Array size must be a constant expression.",
-    },
-    CodeEntry {
-        code: "E018",
-        title: "unexpected top-level item",
-        category: ErrorCategory::Resolution,
-        explain: "`set` and `let` statements are not allowed at the top level; only declarations (`def`, `type`, `trait`, `import`, `impl`, `constraint`, `comptime`, `extern`, `edition`) are permitted here.",
-    },
-    CodeEntry {
-        code: "E019",
-        title: "duplicate definition",
-        category: ErrorCategory::Resolution,
-        explain: "A variable, function, or type has been defined more than once in the same scope.\n\nThis is not allowed because the second definition would shadow the first without\nany way to refer to the original binding.\n\nExample of invalid code:\n  set x = 1;\n  set x = 2;  // error: duplicate definition of `x`\n\nFix: use a different name for the second definition, or remove the first one.",
-    },
-    CodeEntry {
-        code: "E020",
-        title: "contract condition must be boolean",
-        category: ErrorCategory::Contract,
-        explain: "A contract condition (`requires` or `invariant`) must evaluate to a boolean\nvalue (`Bool`), but a non-boolean expression was provided.\n\nExample:\n  def foo(x: Int<32>) -> Int<32>\n    requires x + 1  // error: `x + 1` is Int<32>, not Bool\n\nFix: ensure the condition evaluates to a boolean value.",
-    },
-    CodeEntry {
-        code: "E021",
-        title: "ensures clause must be boolean",
-        category: ErrorCategory::Contract,
-        explain: "An `ensures` clause must evaluate to a boolean value (`Bool`).",
-    },
-    CodeEntry {
-        code: "E022",
-        title: "decreases expression must be integer",
-        category: ErrorCategory::Contract,
-        explain: "A `decreases`/`terminates` expression must be an integer type.",
-    },
-    CodeEntry {
-        code: "E023",
-        title: "contract boolean at return",
-        category: ErrorCategory::Contract,
-        explain: "A contract condition must be boolean.",
-    },
-    CodeEntry {
-        code: "E030",
-        title: "type mismatch",
-        category: ErrorCategory::Type,
-        explain: "The type of an expression does not match the expected type.\n\nThis error occurs when a value is assigned to a variable, passed as an argument,\nor returned from a function with a different type than expected.\n\nExample:\n  def foo() -> Int<32> {\n    return \"hello\";  // error: expected Int<32>, found &Str\n  }\n\nFix: ensure the expression has the correct type, or add an explicit cast.",
-    },
-    CodeEntry {
-        code: "E031",
-        title: "kind mismatch",
-        category: ErrorCategory::Type,
-        explain: "The kind of a type does not match the expected kind.\n\nThis occurs when a type inference variable has a kind constraint (e.g. Integer,\nBool, Float) that conflicts with the resolved concrete type.  For example, using\na string variable where an integer is expected.\n\nExample:\n  set j = \"hello\";\n  set i = j + 1;  // error: expected integer type, found &Str\n\nFix: ensure the value has the correct type kind for the operation.",
-    },
-    CodeEntry {
-        code: "E032",
-        title: "operator type error",
-        category: ErrorCategory::Type,
-        explain: "An operator is applied to incompatible operand types.\n\nThis occurs when binary or unary operators are used with types that do not\nsupport the operation.  For example, adding a string to an integer.\n\nExample:\n  set j = \"hello\";\n  set i = j + 1;  // error: cannot add &Str and Int\n\nFix: ensure both operands have compatible types for the operator.",
-    },
-    CodeEntry {
-        code: "E033",
-        title: "cannot infer type",
-        category: ErrorCategory::Type,
-        explain: "The type of an expression could not be inferred.",
-    },
-    CodeEntry {
-        code: "E034",
-        title: "infinite type",
-        category: ErrorCategory::Type,
-        explain: "Infinite type detected during unification.",
-    },
-    CodeEntry {
-        code: "E035",
-        title: "type annotation needed",
-        category: ErrorCategory::Type,
-        explain: "A type annotation is needed for this expression.",
-    },
-    CodeEntry {
-        code: "E036",
-        title: "return type mismatch",
-        category: ErrorCategory::Type,
-        explain: "The return value type does not match the function's declared return type.\n\nExample:\n  def foo() -> Int<32> {\n    return true;  // error: expected Int<32>, found Bool\n  }\n\nFix: ensure the return value has the correct type, or change the function's\nreturn type annotation.",
-    },
-    CodeEntry {
-        code: "E037",
-        title: "argument type mismatch",
-        category: ErrorCategory::Type,
-        explain: "A function argument's type does not match the parameter type.\n\nExample:\n  def foo(x: Int<32>) { }\n  def main() { foo(true); }  // error: expected Int<32>, found Bool\n\nFix: pass an argument of the correct type, or change the parameter type.",
-    },
-    CodeEntry {
-        code: "E038",
-        title: "condition must be boolean",
-        category: ErrorCategory::Type,
-        explain: "A condition expression (in `if`, `while`, `requires`, `ensures`, etc.) must\nbe of type `Bool`, but a non-boolean expression was provided.\n\nExample:\n  if 42 { }  // error: condition must be Bool, found Int<32>\n\nFix: use a boolean expression as the condition.",
-    },
-    CodeEntry {
-        code: "E039",
-        title: "index must be integer",
-        category: ErrorCategory::Type,
-        explain: "An index expression must be an integer type, but a non-integer type was\nprovided.\n\nExample:\n  arr[\"hello\"]  // error: index must be integer, found &Str\n\nFix: use an integer expression as the index.",
-    },
-    CodeEntry {
-        code: "E040",
-        title: "trait not found",
-        category: ErrorCategory::Trait,
-        explain: "The specified trait could not be found.",
-    },
-    CodeEntry {
-        code: "E041",
-        title: "trait not implemented",
-        category: ErrorCategory::Trait,
-        explain: "A required trait is not implemented for the given type.",
-    },
-    CodeEntry {
-        code: "E042",
-        title: "orphan impl",
-        category: ErrorCategory::Trait,
-        explain: "An `impl` block violates the orphan rule: the type and trait must be\ndefined in the current crate, or the trait must be from the current crate.\n\nThis restriction prevents conflicting implementations across crates.",
-    },
-    CodeEntry {
-        code: "E043",
-        title: "conflicting impl",
-        category: ErrorCategory::Trait,
-        explain: "Conflicting implementations of a trait for the same type.",
-    },
-    CodeEntry {
-        code: "E044",
-        title: "return type mismatch",
-        category: ErrorCategory::Inference,
-        explain: "A function with no `return` statements inferred a return type incompatible with `!`. Add an explicit return type or a `return` statement.",
-    },
-    CodeEntry {
-        code: "E050",
-        title: "inference error",
-        category: ErrorCategory::Inference,
-        explain: "A type inference error occurred.",
-    },
-    CodeEntry {
-        code: "E051",
-        title: "cannot infer type",
-        category: ErrorCategory::Inference,
-        explain: "The type of an expression could not be inferred. Try adding a type annotation.",
-    },
-    CodeEntry {
-        code: "E052",
-        title: "interrupt must satisfy @no_alloc",
-        category: ErrorCategory::Resolution,
-        explain: "An @interrupt handler must satisfy the @no_alloc capability.\n\nInterrupt handlers run in a constrained context where memory allocation\nis not available. The function must be annotated with @no_alloc or be\nin a scope where @no_alloc is already in effect.\n\nFix: add `@no_alloc` to this function (or remove it if redundant with\n`@no_panic`).",
-    },
-    CodeEntry {
-        code: "E053",
-        title: "interrupt must satisfy @no_panic",
-        category: ErrorCategory::Resolution,
-        explain: "An @interrupt handler must satisfy the @no_panic capability.\n\nInterrupt handlers must not panic because there is no unwind mechanism\navailable. The function must be annotated with @no_panic.\n\nFix: add `@no_panic` to this function.",
-    },
-    CodeEntry {
-        code: "E054",
-        title: "interrupt cannot have @alloc",
-        category: ErrorCategory::Resolution,
-        explain: "An @interrupt handler cannot have the @alloc capability.\n\nInterrupt handlers must not allocate memory. The @alloc annotation is\nincompatible with @interrupt.\n\nFix: remove the `@alloc` annotation from this function.",
-    },
-    CodeEntry {
-        code: "E055",
-        title: "interrupt cannot have @io",
-        category: ErrorCategory::Resolution,
-        explain: "An @interrupt handler cannot have the @io capability.\n\nInterrupt handlers must not perform I/O operations. The @io annotation\nis incompatible with @interrupt.\n\nFix: remove the `@io` annotation from this function.",
-    },
-    CodeEntry {
-        code: "E060",
-        title: "GADT variant constraint violation",
-        category: ErrorCategory::Type,
-        explain: "A GADT variant's `when` constraint is not satisfied after solving\nand defaulting, or cannot be verified because a type argument is\nstill unresolved (fail-closed).\n\nFix: make the type arguments satisfy the variant's `when` constraint,\nor provide concrete type arguments at the construction site.",
-    },
-    CodeEntry {
-        code: "E061",
-        title: "unreachable code",
-        category: ErrorCategory::Internal,
-        explain: "The compiler reached an unreachable code path. This is a bug.",
-    },
-    CodeEntry {
-        code: "E062",
-        title: "main function not found",
-        category: ErrorCategory::Resolution,
-        explain: "The crate does not define a `main` function, which is required for executable output.\n\nEvery executable crate must have a `main` function that serves as the entry\npoint for the program.  The `main` function takes no arguments and returns\nan integer type (e.g. `Int<32>`).\n\nFix: add a `def main() { ... }` function to the crate.",
-    },
-    CodeEntry {
-        code: "E063",
-        title: "existential variable shadows enum type parameter",
-        category: ErrorCategory::Resolution,
-        explain: "An `exists` variable in a GADT variant cannot have the same name as an enum type parameter.\n\nFor example, the following is invalid because `X` is already an enum parameter:\n  type Wrap<X> = enum { Bad(exists X: &[X]) when T == [X] }\n\nFix: rename the `exists` variable or the enum type parameter.",
-    },
-    CodeEntry {
-        code: "E064",
-        title: "GADT `when` constraint right-hand side references a same-enum type parameter",
-        category: ErrorCategory::Resolution,
-        explain: "The right-hand side of a GADT `when` constraint cannot reference another type parameter of the SAME enum.\n\nFor example, the following is invalid because `U` is a type parameter of `Bad`:\n  type Bad<T, U> = enum { Mk(T) when T == U }\n\nA mutual constraint (`when T == U and U == T`) would register a refinement cycle (A → B, B → A) that type resolution would chase until the chain-depth limit.\n\nFix: use a concrete type on the right-hand side, or an `exists` variable scoped to the variant (the witness stays opaque).",
-    },
-    CodeEntry {
-        code: "E065",
-        title: "conflicting GADT `when` constraints in variant",
-        category: ErrorCategory::Resolution,
-        explain: "A GADT variant's `when` constraints force the same type parameter to two different concrete types (e.g. `when T == Int<32> and T == Bool`). The constraint set is unsatisfiable, so the variant cannot be constructed at any instantiation — a logical contradiction, not a style concern.\n\nFix: make the constraints consistent (e.g. `when T == Int<32>`), or drop the redundant one.",
-    },
-    CodeEntry {
-        code: "E066",
-        title: "conflicting GADT refinements in or-pattern",
-        category: ErrorCategory::Resolution,
-        explain: "An or-pattern (`pattern1 | pattern2`) refines the same enum type parameter to DIFFERENT types in different alternatives.\n\nFor example, the following is invalid because `Add` refines `T == Int<32>` while `Eq` refines `T == Bool`:\n  type Expr<T> = enum { Add(...) when T == Int<32>, Eq(...) when T == Bool }\n  match e { Add(_, _) | Eq(_, _) => ... }\n\nA branch guarded by a disjunction may only assume facts true in ALL alternatives. Conflicting refinements are a contradiction.\n\nFix: split the or-pattern into separate match arms, or make the alternatives refine the type parameter consistently.",
-    },
-    CodeEntry {
-        code: "E070",
-        title: "unknown edition",
-        category: ErrorCategory::Resolution,
-        explain: "The `--edition` / `@edition` value is not one of the supported editions (e.g. `\"2024\"` or `\"2026\"`).  The edition selects the language defaults (reserved keywords, overflow policy, …) for the compilation unit.\n\nFix: use a valid edition string.",
-    },
-    CodeEntry {
-        code: "E100",
-        title: "trait not found",
-        category: ErrorCategory::Trait,
-        explain: "A trait referenced in an `impl` or a bound could not be resolved.\n\nFix: check the trait name and ensure it is defined or imported in scope.",
-    },
-    CodeEntry {
-        code: "E101",
-        title: "trait impl missing method",
-        category: ErrorCategory::Trait,
-        explain: "A trait implementation is missing a required method.\n\nEvery trait method must be implemented in the impl block. This error\noccurs when a method declared in the trait is not defined in the impl.\n\nFix: add a `def` for the missing method in this impl block.",
-    },
-    CodeEntry {
-        code: "E102",
-        title: "orphan impl or bare type variable",
-        category: ErrorCategory::Trait,
-        explain: "A trait impl could not be registered: either it violates the orphan rule\n(a type/trait from another crate), or a bare type variable appeared\nwithout sufficient context to determine its kind.\n\nFix: ensure the impl follows the orphan rule, or provide a type\nannotation for the bare type variable.",
-    },
-    CodeEntry {
-        code: "E103",
-        title: "trait impl wrong parameter count",
-        category: ErrorCategory::Trait,
-        explain: "A trait method implementation has a different number of parameters than\nthe trait declaration.\n\nEvery method in a trait impl must have the same number of parameters as\nthe corresponding trait method signature.\n\nFix: adjust the parameter count to match the trait declaration.",
-    },
-    CodeEntry {
-        code: "E104",
-        title: "generic parameter constrained by function body",
-        category: ErrorCategory::Resolution,
-        explain: "The body of a generic function constrains a type parameter to a concrete type (or to another type parameter), so the definition does not type-check for ALL instantiations.\n\nFor example, the following is invalid because the body only works when `T` is `Int<32>`:\n  def add(a: Int<32>, b: Int<32>) -> Int<32> { return a + b; }\n  def g<T>(x: T) -> Int<32> { return add(x, 1); }\n\nBinding one parameter to another is likewise invalid (`T := U`), since the body must be parametric in each distinct parameter:\n  def f<T, U>(x: T, y: U) -> U { return x; }\n\nA generic definition must be valid for every type argument; a body that forces `T = Int<32>` would make `g<Bool>` ill-typed.  Rust (rigid `TyKind::Param`), GHC and OCaml (skolems) all reject such definitions at definition time.\n\nFix: change the signature so the constraint is explicit (e.g. a where-clause), or make the body parametric in `T`.",
-    },
-    CodeEntry {
-        code: "E105",
-        title: "or-pattern alternatives must bind the same variables",
-        category: ErrorCategory::Resolution,
-        explain: "Every alternative of an or-pattern (`pattern1 | pattern2`) must bind the SAME set of variables (SYNTAX.md: \"Both patterns must bind the same set of variables with compatible types\").  A variable bound in one alternative but not another cannot be given a consistent type in the branch body (OCaml reports this as `Orpat_vars`).\n\nFix: bind the same variables in every alternative, or use `_` for alternatives that should not bind.",
-    },
-    CodeEntry {
-        code: "E106",
-        title: "or-pattern binding type mismatch",
-        category: ErrorCategory::Resolution,
-        explain: "A variable bound by an or-pattern has INCOMPATIBLE types in different alternatives (OCaml reports this as `Or_pattern_type_clash`).  The branch body must be able to assume ONE type for each bound variable, so the alternatives' types must unify.\n\nFix: make the alternatives bind the variable at compatible types, or split the or-pattern into separate arms.",
-    },
-    CodeEntry {
-        code: "E107",
-        title: "contradictory where equality",
-        category: ErrorCategory::Resolution,
-        explain: "Two `where` equalities constrain the same type parameter to incompatible types (e.g. `where T == Int<32>, T == Bool`).  The constraints cannot hold simultaneously, so the specification is contradictory — the body cannot be checked under both, and any contract proofs would proceed under an incomplete axiom set.\n\nFix: remove the contradictory equality, or split into separate functions.",
-    },
-    CodeEntry {
-        code: "E108",
-        title: "strict mode must_handle violation",
-        category: ErrorCategory::Resolution,
-        explain: "In strict mode, a call to an `@must_handle` function must handle every marked error variant locally (via `catch`) before propagating.  Propagating a must_handle'd result via `?`, or leaving a marked variant uncaught, is an error in strict mode (a warning otherwise).\n\nFix: add explicit `catch` branches for each `@must_handle` variant, or add `@delegates_must_handle` to this function.",
-    },
-    CodeEntry {
-        code: "E109",
-        title: "read of a variable frozen by an active `&mut` borrow",
-        category: ErrorCategory::Type,
-        explain: "SYNTAX.md §References: an exclusive borrow (`&mut T`) freezes the original variable — neither readable nor writable — while it is live (committee ruling, 2026-08-05).  Reading the source place while the exclusive borrow is live is rejected.\n\nFix: read through the borrow itself (`*r`), or end the borrow's scope before reading the source.",
-    },
-    CodeEntry {
-        code: "E110",
-        title: "mutation of a variable frozen by an active borrow",
-        category: ErrorCategory::Type,
-        explain: "SYNTAX.md §References / §Reference Coercion: the source of an active borrow (`&mut` exclusive, `&ro` / `.freeze!()` read-only) is frozen against mutation while the borrow is live.\n\nFix: mutate through the borrow (for `&mut`), end the borrow's scope first, or use the explicit `&ro`/`.freeze!()` forms deliberately.",
-    },
-    CodeEntry {
-        code: "E111",
-        title: "read-only borrow requires a reference operand",
-        category: ErrorCategory::Type,
-        explain: "The `&ro` operator (and `.freeze!()`) freezes a `&mut T` reference into a `&T` view.  The operand must itself be a reference; borrowing a non-reference value with `&ro` is not meaningful.\n\nFix: apply `&ro` to a reference-typed operand (`&ro r`, `&ro r.f` where the field is a reference).",
-    },
-    CodeEntry {
-        code: "E112",
-        title: "overlapping exclusive borrows",
-        category: ErrorCategory::Type,
-        explain: "SYNTAX.md §References: `&mut T` is exclusive — while it is live, no other borrow (read-only or exclusive) of an overlapping place may exist.\n\nFix: end the first borrow's scope (its borrow variable's last use) before creating the second, or restructure the code to avoid the overlapping exclusive borrows.",
-    },
-    CodeEntry {
-        code: "E113",
-        title: "the function's CFG exceeds the point-encoding capacity",
-        category: ErrorCategory::Type,
-        explain: "The Polonius fact extraction encodes each CFG point as an integer (block << 36 | stmt << 16 | expr).  A function with more than 1,048,575 CFG blocks, more than 1,048,575 statements in a single block, or more than 65,535 expressions in a single statement exceeds this internal encoding capacity — an internal compiler limitation, not a program error.\n\nFix: split the function into smaller functions, or report the issue if the function is not unusually large.",
-    },
-    CodeEntry {
-        code: "E114",
-        title: "use of moved value",
-        category: ErrorCategory::Type,
-        explain: "SYNTAX.md §Move Semantics: after a move, the source is invalidated — a subsequent use is a compile-time error (affine: a non-Copy value is used at most once).\n\nFix: use the value before moving it, or re-initialize the source (assign a new value) before the later use.",
-    },
-    CodeEntry {
-        code: "E115",
-        title: "region subset not declared in signature",
-        category: ErrorCategory::Type,
-        explain: "The Polonius R9 (placeholder-subset rejection) rule: a subset relation between two placeholder (signature-region) origins derived inside the function body must be declared in the signature (`known_placeholder_subset`) — the caller needs the declared relationship to reason about the returned borrows.  An undeclared region subset is rejected.\n\nFix: declare the region relationship in the signature (e.g. `def f<'a, 'b>(...) -> ...` with the regions ordered so the subset holds), or restructure the function so the derived relationship is not required.",
-    },
-    CodeEntry {
-        code: "E116",
-        title: "cannot drop a value while its borrow is still live",
-        category: ErrorCategory::Type,
-        explain: "The Polonius drop rule (`evaluate_drop_errors`): a dropped value whose loan is still live at the drop point — the borrow outlives the value (rustc E0505).  The drop destroys the value while a borrow of it is still live, so the borrow would dangle.\n\nFix: end the borrow's scope (its borrow variable's last use) before the value is dropped, or reorder the code so the drop happens after the borrow is no longer needed.",
-    },
-    CodeEntry {
-        code: "E117",
-        title: "side effect in a @pure function",
-        category: ErrorCategory::Resolution,
-        explain: "A `@pure` function must have no side effects — transitively: it may only call functions/methods whose own `effect_of` labels are empty (no write, no allocation, no panic, no unsafe, no comptime, no mutable-global read, no input/output).  A forbidden effect anywhere in the call chain violates the annotation.\n\nFix: remove the offending call or read, or drop `@pure` from the function.",
-    },
-    CodeEntry {
-        code: "W004",
-        title: "must_handle error propagated via `?`",
-        category: ErrorCategory::Generic,
-        explain: "A call to an `@must_handle` function is propagated via `?`, which does not count as handling the marked error variants.  In strict mode this is an error (E108).\n\nFix: use `catch` to explicitly handle `@must_handle` variants before `?`, or add `@delegates_must_handle` to this function.",
-    },
-    CodeEntry {
-        code: "W005",
-        title: "must_handle variant not explicitly caught",
-        category: ErrorCategory::Generic,
-        explain: "A call to an `@must_handle` function does not have explicit `catch` branches for every marked error variant.  In strict mode this is an error (E108).\n\nFix: add explicit `catch` branches for each `@must_handle` variant.",
-    },
-    CodeEntry {
-        code: "W006",
-        title: "must_handle with wildcard-only catch",
-        category: ErrorCategory::Generic,
-        explain: "A bare `@must_handle` (no specific variants listed) is used with a `catch` that only has a wildcard arm.  A wildcard catch does not make the handled variants explicit.\n\nFix: use specific catch arms like `|Variant| { ... }` instead of `|_| { ... }`.",
-    },
-    CodeEntry {
-        code: "W090",
-        title: "use of deprecated function",
-        category: ErrorCategory::Generic,
-        explain: "A function annotated `@deprecated(\"reason\")` is called.  The annotation marks it for removal; new code should not rely on it.\n\nFix: migrate to the replacement function named in the deprecation reason.",
-    },
-    CodeEntry {
-        code: "W091",
-        title: "@cfg condition too complex for precise satisfiability checking",
-        category: ErrorCategory::Generic,
-        explain: "The SAT-based @cfg reachability checker skipped some constraints because the condition exceeded the complexity budget — the result may be a false positive (the code may be kept even when unsatisfiable).\n\nFix: simplify the condition so every constraint can be checked.",
-    },
-    CodeEntry {
-        code: "W092",
-        title: "conservative reachability treatment",
-        category: ErrorCategory::Generic,
-        explain: "A @cfg condition (or attribute-resolution check) could not be fully verified, so the code is conservatively treated as reachable rather than silently eliminated.\n\nFix: simplify the condition or resolve the incomplete check to suppress the warning.",
-    },
-    CodeEntry {
-        code: "W113",
-        title: "variable shadowing",
-        category: ErrorCategory::Generic,
-        explain: "A variable in the current scope has the same name as a variable in an\nouter scope, which shadows (hides) the outer one.\n\nThis is allowed in Posita, but may indicate a bug if the outer variable was\nstill needed.  Consider renaming one of the variables to avoid confusion.\n\nExample:\n  def f() {\n    set x = 1;\n    if true {\n      set x = 2;  // warning: shadows the outer `x`\n    }\n  }\n\nFix: use a different name for the inner variable, or remove the outer one.",
-    },
-    CodeEntry {
-        code: "W114",
-        title: "redundant &ro on immutable reference",
-        category: ErrorCategory::Generic,
-        explain: "`&ro`'s core purpose is the `&mut T` → `&T` coercion.  Applying it to an\nalready-immutable reference is harmless but redundant — the operand is\nalready `&T`.\n\nThis is allowed in Posita (a warning, not an error), but may indicate that\nthe `&ro` is unnecessary.  Consider removing it and using the plain `&T`\nreference directly.",
-    },
-    CodeEntry {
-        code: "E091",
-        title: "strict mode violation",
-        category: ErrorCategory::Generic,
-        explain: "In strict mode, @trusted functions must have @link_proof or\n@comptime_test evidence linking them to a formal proof.\n\nWithout such evidence, the compiler cannot verify that the function\nmeets its safety guarantees.  Add @link_proof or use @comptime_test\nto provide the required proof linkage.",
-    },
-    CodeEntry {
-        code: "E080",
-        title: "comptime evaluation error",
-        category: ErrorCategory::Generic,
-        explain: "A comptime block or comptime function failed during evaluation.\n\nThe evaluator's error message is attached and is the specific cause.\nCommon causes include:\n- A comptime block containing an item declaration (`type`, `def`, `impl`,\n  `trait`, ...) — comptime blocks only allow expressions, variable\n  definitions, and assignments.  Use a `generate` block for\n  declaration-level code generation.\n- A comptime function or block referencing a value that is not computable\n  at compile time.\nFix the comptime code so it evaluates successfully.",
-    },
-    CodeEntry {
-        code: "E081",
-        title: "comptime sandbox violation",
-        category: ErrorCategory::Generic,
-        explain: "A comptime block attempted to call a @trusted or @io function, which\nis prohibited because comptime code is sandboxed.\n\nComptime blocks can only call comptime functions (declared with\n`comptime def`) or safe built-in operations.  To call a @trusted\nfunction at compile time, use `comptime @trusted { ... }` instead.",
-    },
-    CodeEntry {
-        code: "E082",
-        title: "comptime block accesses mutable or unknown state",
-        category: ErrorCategory::Generic,
-        explain: "A comptime block cannot touch mutable state: assigning to a mutable global, capturing a mutable variable, or naming an unknown variable in the capture list are all rejected — comptime evaluation is sandboxed to compile-time-known values.\n\nFix: only capture comptime-known values, or read the state outside the comptime block.",
-    },
-    CodeEntry {
-        code: "E090",
-        title: "invalid @comptime_test function",
-        category: ErrorCategory::Resolution,
-        explain: "A `@comptime_test` function must have no parameters, must have a body, and must evaluate successfully — it is executed at compile time with no arguments to demonstrate the property.\n\nFix: remove the parameters, provide a body, or fix the failing assertion.",
-    },
-    CodeEntry {
-        code: "E092",
-        title: "cfg condition unreachable in strict mode",
-        category: ErrorCategory::Generic,
-        explain: "In strict mode, the SAT-based cfg reachability checker determined that\na `@cfg(condition)` is unsatisfiable under any target configuration.\n\nThis likely indicates contradictory conditions (e.g.\n`all(target_os == \"linux\", target_os == \"windows\")`).\n\nFix the @cfg condition to be satisfiable under at least one target.",
-    },
-    CodeEntry {
-        code: "E093",
-        title: "isolate block accesses external mutable state",
-        category: ErrorCategory::Generic,
-        explain: "An isolate block must not access or mutate external mutable state\n(SYNTAX.md §Task Isolation — \"does not access any external mutable\nstate\").  Reading or writing a mutable global, or assigning to a\ncaptured outer mutable variable, inside an isolate block is rejected.\n\nDeclare the variable inside the block if it is meant to be internal\nstate, or restructure the code so the isolate block only touches its\nown state.",
-    },
-    CodeEntry {
-        code: "E094",
-        title: "use of experimental trait",
-        category: ErrorCategory::Trait,
-        explain: "The trait is marked experimental — it is not part of the stable language surface and requires the experimental feature flag.\n\nFix: enable experimental features (`--enable-experimental`), or avoid the trait.",
-    },
-    CodeEntry {
-        code: "E099",
-        title: "`@compile_error` triggered",
-        category: ErrorCategory::Generic,
-        explain: "A `@compile_error(\"message\")` expression was evaluated during compilation — it halts compilation unconditionally with the attached message.  This is the intended mechanism for `#error`-style compile-time diagnostics.\n\nFix: remove or guard the `@compile_error` invocation.",
-    },
-    CodeEntry {
-        code: "E601",
-        title: "invalid safe cast",
-        category: ErrorCategory::Type,
-        explain: "A `as` (safe cast) between incompatible types: a reference type requires an explicit dereference or an unsafe `as!` bitcast; safe casts are only allowed between numeric and boolean types; casting a reference to an integer is not yet supported; an unsafe cast requires compatible types (numeric↔numeric, ref↔ptr, ptr↔ptr).\n\nFix: dereference the value first (`*expr as TargetType`), use `as!` for an explicit bitcast, or cast between compatible types.",
-    },
-];
+include!(concat!(env!("OUT_DIR"), "/error_codes_gen.rs"));
 
 /// Look up a code string in the table.
 pub(crate) fn lookup(code: &str) -> Option<&'static CodeEntry> {
-    let idx = CODE_INDEX.get_or_init(|| {
-        CODE_TABLE.iter().map(|e| (e.code, e)).collect()
-    });
-    idx.get(code).copied()
+    let slot = code_slot(code)?;
+    let idx = CODE_INDEX[slot];
+    if idx == u16::MAX {
+        return None;
+    }
+    CODE_TABLE.get(idx as usize)
+}
+
+/// [`lookup`] on the ASCII-uppercased form of `code`, without allocating for
+/// the common short-code case (`e030` → `E030`).
+///
+/// Table codes are at most a few bytes, so a stack buffer covers every real
+/// retry; only longer inputs fall back to a temporary `String`.
+fn lookup_uppercased(code: &str) -> Option<&'static CodeEntry> {
+    const STACK: usize = 8;
+    let bytes = code.as_bytes();
+    if bytes.len() > STACK {
+        return lookup(&code.to_ascii_uppercase());
+    }
+    let mut buf = [0u8; STACK];
+    for (dst, src) in buf.iter_mut().zip(bytes) {
+        *dst = src.to_ascii_uppercase();
+    }
+    // ASCII case folding preserves UTF-8 structure.
+    let upper = std::str::from_utf8(&buf[..bytes.len()]).ok()?;
+    lookup(upper)
 }
 
 impl fmt::Display for ErrorCategory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+#[cfg(all(test, not(feature = "shuttle")))]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// A second `set_explain_port` must be observable rather than silently
+    /// discarded.  `EXPLAIN_PORT` is a process-global `OnceLock`, so this test
+    /// deliberately owns it (no other test sets it).
+    #[test]
+    fn set_explain_port_reports_second_set() {
+        assert!(set_explain_port(12345).is_ok());
+        assert_eq!(set_explain_port(54321), Err(12345));
+    }
+
+    /// `unknown` is the untrusted-input path; an ESC in the code must reach
+    /// neither the URI nor the visible link text.
+    ///
+    /// The only ESC bytes in the result are the four that frame the OSC 8
+    /// sequence (`\x1b]8;;` … `\x1b\\` … `\x1b]8;;` … `\x1b\\`).  This holds
+    /// regardless of whether `EXPLAIN_PORT` was set by another test.
+    #[test]
+    fn url_ansi_cannot_inject_osc() {
+        let ec = ErrCode::unknown("E0\x1b]8;;evil\x07");
+        let out = ec.url_ansi();
+        assert_eq!(out.matches('\x1b').count(), 4, "extra ESC in {out:?}");
+        assert!(!out.contains('\x07'), "BEL leaked: {out:?}");
+        assert!(out.contains("%1B"), "ESC not encoded in URL: {out:?}");
+        assert!(out.contains("%07"), "BEL not encoded in URL: {out:?}");
+        assert!(
+            out.contains('\u{FFFD}'),
+            "control char not replaced in text: {out:?}"
+        );
+    }
+
+    /// The code is one path segment: a newline or `/` must be percent-encoded
+    /// so it cannot escape the segment.  Host/suffix vary with `EXPLAIN_PORT`,
+    /// so assert on the encoded segment rather than the whole URL.
+    #[test]
+    fn url_percent_encodes_unknown_codes() {
+        let ec = ErrCode::unknown("E030\n../admin");
+        let u = ec.url();
+        assert!(u.contains("E030%0A..%2Fadmin"), "got: {u}");
+        assert!(!u.contains('\n'), "newline leaked: {u:?}");
+        assert!(!u.contains("../"), "path traversal not encoded: {u}");
+    }
+
+    /// Regression guard: encoding must not alter canonical codes.
+    #[test]
+    fn known_codes_are_unchanged() {
+        let ec = ErrCode::new("E030");
+        assert!(ec.url().contains("/E030"), "got: {}", ec.url());
+        assert!(!ec.url().contains('%'), "got: {}", ec.url());
+        assert!(ec.url_ansi().contains("E030"));
+    }
+
+    /// Pin the single-segment RFC 3986 contract now that the CLI builds its
+    /// browser URL through this encoder: unreserved bytes pass through,
+    /// reserved (`/`, `:`, `%`), whitespace, control, and non-ASCII bytes do
+    /// not.
+    #[test]
+    fn encode_url_path_segment_contract() {
+        assert_eq!(encode_url_path_segment("E030"), "E030");
+        assert_eq!(encode_url_path_segment("a/b:c%d e"), "a%2Fb%3Ac%25d%20e");
+        assert_eq!(encode_url_path_segment("\x1b\x07"), "%1B%07");
+        assert_eq!(encode_url_path_segment("é"), "%C3%A9");
+    }
+
+    /// The shared localhost-URL builder (used by the CLI's browser open and by
+    /// `ErrCode::url`) encodes the code as a single segment.
+    #[test]
+    fn explain_server_url_encodes_code() {
+        assert_eq!(
+            explain_server_url(1234, "E030"),
+            "http://127.0.0.1:1234/E030"
+        );
+        assert_eq!(
+            explain_server_url(1234, "E030\n../admin"),
+            "http://127.0.0.1:1234/E030%0A..%2Fadmin"
+        );
+    }
+
+    /// The untrusted code is echoed in `UnknownCode`'s `Display` (surfaced by
+    /// the explain server as an `io::Error` and printed to the terminal), so
+    /// control characters must not survive.
+    #[test]
+    fn unknown_code_display_is_sanitized() {
+        let err = ErrCode::try_new("E0\x1b]8;;evil\x07").unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains('\x1b'), "ESC leaked: {msg:?}");
+        assert!(!msg.contains('\x07'), "BEL leaked: {msg:?}");
+        assert!(
+            msg.contains('\u{FFFD}'),
+            "control char not replaced: {msg:?}"
+        );
+    }
+
+    /// Collect every `.rs` file under `dir` (recursively).
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Return the argument text of the parenthesised call whose `(` is at
+    /// `open_idx`, skipping nested parens, string literals, and comments.
+    fn argument_span(source: &str, open_idx: usize) -> Option<&str> {
+        let bytes = source.as_bytes();
+        let mut depth = 0i32;
+        let mut i = open_idx;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&source[open_idx + 1..i]);
+                    }
+                }
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// All `"..."` literals inside `arg` that look like a code (`E123`/`W123`),
+    /// ignoring those inside line/block comments.
+    ///
+    /// Escaped quotes (`\"`) inside a literal are skipped so the scanner
+    /// cannot end the literal early and resume inside the string body.
+    fn code_literals(arg: &str) -> Vec<&str> {
+        let bytes = arg.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => {
+                    let start = i + 1;
+                    let mut j = start;
+                    while j < bytes.len() && bytes[j] != b'"' {
+                        if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                            j += 1;
+                        }
+                        j += 1;
+                    }
+                    let lit = &arg[start..j];
+                    let code_shaped = lit.len() == 4
+                        && matches!(lit.as_bytes()[0], b'E' | b'W')
+                        && lit.as_bytes()[1..].iter().all(u8::is_ascii_digit);
+                    if code_shaped {
+                        out.push(lit);
+                    }
+                    i = j + 1;
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    /// Blank out comments and string/char literals (including raw strings),
+    /// preserving byte offsets, so the outer scan never matches a callee name
+    /// that only appears in a comment or a literal.  The result has the same
+    /// byte length as `src`; offsets index both.
+    fn strip_non_code(src: &str) -> String {
+        let bytes = src.as_bytes();
+        let mut out = vec![b' '; bytes.len()];
+        let mut i = 0;
+        while i < bytes.len() {
+            // Raw string: r"...", r#"..."#; byte raw string: br#"..."#.
+            let raw_start = if bytes[i] == b'r' {
+                Some(i)
+            } else if bytes[i] == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'r' {
+                Some(i + 1)
+            } else {
+                None
+            };
+            if let Some(r) = raw_start {
+                let mut h = r + 1;
+                while h < bytes.len() && bytes[h] == b'#' {
+                    h += 1;
+                }
+                if h < bytes.len() && bytes[h] == b'"' {
+                    let hashes = h - (r + 1);
+                    let mut j = h + 1;
+                    loop {
+                        if j >= bytes.len() {
+                            j = bytes.len();
+                            break;
+                        }
+                        if bytes[j] == b'"' {
+                            let mut k = j + 1;
+                            let mut cnt = 0;
+                            while cnt < hashes && k < bytes.len() && bytes[k] == b'#' {
+                                k += 1;
+                                cnt += 1;
+                            }
+                            if cnt == hashes {
+                                j = k;
+                                break;
+                            }
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+
+            // String literal: "..." or byte string b"...".
+            let str_quote = if bytes[i] == b'"' {
+                Some(i)
+            } else if bytes[i] == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                Some(i + 1)
+            } else {
+                None
+            };
+            if let Some(q) = str_quote {
+                let mut j = q + 1;
+                while j < bytes.len() && bytes[j] != b'"' {
+                    if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                i = (j + 1).min(bytes.len());
+                continue;
+            }
+
+            // Char literal: 'x', '\n', '\u{...}'; byte char: b'x'.
+            // Lifetimes ('src) are not char literals and are copied as-is.
+            let ch_quote = if bytes[i] == b'\'' {
+                Some(i)
+            } else if bytes[i] == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                Some(i + 1)
+            } else {
+                None
+            };
+            if let Some(q) = ch_quote {
+                let mut j = q + 1;
+                if j < bytes.len() && bytes[j] == b'\\' {
+                    j += 2;
+                    if j - 1 < bytes.len()
+                        && bytes[j - 1] == b'u'
+                        && j < bytes.len()
+                        && bytes[j] == b'{'
+                    {
+                        while j < bytes.len() && bytes[j] != b'}' {
+                            j += 1;
+                        }
+                        j += 1;
+                    }
+                } else if j < bytes.len() {
+                    let c = src[j..].chars().next().unwrap();
+                    j += c.len_utf8();
+                }
+                if j < bytes.len() && bytes[j] == b'\'' {
+                    i = j + 1;
+                    continue;
+                }
+                // Lifetime or malformed — copy the quote and move on.
+                out[i] = bytes[i];
+                i += 1;
+                continue;
+            }
+
+            // Comments.
+            if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+
+            // Ordinary byte.
+            out[i] = bytes[i];
+            i += 1;
+        }
+        String::from_utf8(out).expect("stripping preserved UTF-8")
+    }
+
+    /// Every literal code passed to `ErrCode::new` / `with_code_str` must be
+    /// present in [`CODE_TABLE`].  A missing entry would `debug_assert!`-panic
+    /// (`ErrCode::new`) or silently degrade to "unknown error"
+    /// (`with_code_str`).  Scans the crate source, including the conditional
+    /// forms like `with_code_str(if … { "E109" } else { "E110" })`.
+    #[test]
+    fn literal_codes_are_all_in_code_table() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&root, &mut files);
+
+        let mut offenders = Vec::new();
+        for file in &files {
+            let Ok(src) = fs::read_to_string(file) else {
+                continue;
+            };
+            // Scan the code-only view so callee names mentioned in comments or
+            // literals (e.g. doc examples) are not treated as real call sites;
+            // argument text is still extracted from the original `src`.
+            let stripped = strip_non_code(&src);
+            for callee in ["with_code_str", "ErrCode::new"] {
+                let mut from = 0;
+                while let Some(pos) = stripped[from..].find(callee) {
+                    let after = from + pos + callee.len();
+                    let tail = &src[after..];
+                    let ws = tail.len() - tail.trim_start().len();
+                    if tail.trim_start().starts_with('(') {
+                        let open = after + ws;
+                        if let Some(arg) = argument_span(&src, open) {
+                            for lit in code_literals(arg) {
+                                if lookup(lit).is_none() {
+                                    offenders.push(format!("{}: {lit}", file.display()));
+                                }
+                            }
+                        }
+                    }
+                    from = after;
+                }
+            }
+        }
+
+        offenders.sort();
+        offenders.dedup();
+        assert!(
+            offenders.is_empty(),
+            "codes passed to `ErrCode::new`/`with_code_str` but missing from CODE_TABLE:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    #[test]
+    fn scanner_extracts_nested_and_conditional_literals() {
+        let src = r#"
+            Diagnostic::error(m).with_code_str("E030");
+            let d = Diagnostic::error(m)
+                .with_code_str(if x { "E109" } else if y { "E112" } else { "E110" });
+            let e = ErrCode::new("E067");
+            let f = ErrCode::new(some_var);
+            let g = ErrCode::new(/* "E998" */ "E001"); // "E999"
+        "#;
+        let mut found = Vec::new();
+        for callee in ["with_code_str", "ErrCode::new"] {
+            let mut from = 0;
+            while let Some(pos) = src[from..].find(callee) {
+                let after = from + pos + callee.len();
+                let tail = &src[after..];
+                let ws = tail.len() - tail.trim_start().len();
+                if tail.trim_start().starts_with('(') {
+                    let open = after + ws;
+                    if let Some(arg) = argument_span(src, open) {
+                        found.extend(code_literals(arg));
+                    }
+                }
+                from = after;
+            }
+        }
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            vec!["E001", "E030", "E067", "E109", "E110", "E112"],
+            "scanner missed or over-matched literals"
+        );
+    }
+
+    #[test]
+    fn code_literals_skip_escaped_quotes() {
+        // The `\"` must not terminate the first literal: without escape
+        // handling the scanner resumes inside the string body and
+        // mis-delimits the following literal as empty.
+        let arg = r#""E0\"30" + "E030""#;
+        assert_eq!(code_literals(arg), vec!["E030"]);
+    }
+
+    #[test]
+    fn strip_non_code_blanks_comments_and_literals() {
+        let src = r##"
+            // with_code_str("E901")
+            /* ErrCode::new("E902") */
+            let s = "with_code_str(\"E903\")";
+            let r = r#"ErrCode::new("E904")"#;
+            let c = '"';
+            let lt: &'static str = "ok";
+            let real = Diagnostic::error(m).with_code_str("E030");
+        "##;
+        let stripped = strip_non_code(src);
+        assert_eq!(stripped.len(), src.len(), "offsets must be preserved");
+        // Only the real call site survives; comments, normal strings, raw
+        // strings, and char literals are blanked.
+        assert_eq!(stripped.matches("with_code_str").count(), 1);
+        assert_eq!(stripped.matches("ErrCode::new").count(), 0);
+    }
+
+    /// `ErrCode::new` never panics — not even in debug builds — for codes
+    /// missing from the table; the unknown code is kept verbatim so
+    /// `title()`/`category()` can fall back to "unknown error".
+    #[test]
+    fn new_accepts_unknown_code_without_panicking() {
+        // Built at runtime so the code-literal scanner in
+        // `literal_codes_are_all_in_code_table` does not flag it.
+        let unknown = format!("E{}", 999);
+        let code = ErrCode::new(unknown.clone());
+        assert_eq!(code.code(), "E999");
+        assert_eq!(code.category(), ErrorCategory::Generic);
+        assert_eq!(code.title(), "unknown error");
+        // The validating constructor still rejects the same input.
+        assert!(ErrCode::try_new(&unknown).is_err());
+    }
+
+    /// `new_unchecked` round-trips a table code.  Also the guard keeping
+    /// `new_unchecked` alive: production has no call sites yet, but the
+    /// escape hatch must stay ready and behaviour-identical for dev builds.
+    #[test]
+    fn new_unchecked_round_trips_table_code() {
+        assert_eq!(ErrCode::new_unchecked("E030").code(), "E030");
+    }
+
+    /// The compile-time direct-address index must agree with a linear scan
+    /// of the table for every entry, and must reject codes outside the
+    /// registry's `^[EW]\d{3}$` shape (and well-shaped codes that are absent)
+    /// without ever landing on a wrong slot.
+    #[test]
+    fn direct_address_index_matches_table() {
+        for e in CODE_TABLE {
+            assert_eq!(
+                lookup(e.code).map(|x| x.code),
+                Some(e.code),
+                "index missing {}",
+                e.code
+            );
+        }
+        for code in ["E000", "E999", "W000", "W999"] {
+            assert!(lookup(code).is_none(), "{code} unexpectedly present");
+        }
+        for code in ["", "E", "E03", "E0300", "e030", "X030", "E0a0", "E030 "] {
+            assert!(lookup(code).is_none(), "{code:?} unexpectedly present");
+        }
     }
 }

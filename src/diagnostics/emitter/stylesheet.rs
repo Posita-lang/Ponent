@@ -83,6 +83,11 @@ impl Stylesheet {
     }
 
     /// Render the stylesheet as a CSS string for the HTML emitter.
+    ///
+    /// The receiver supplies the `:root` (default) theme; the `.light`
+    /// override is always generated from [`Self::light`].  Callers that want
+    /// dark-by-default (with a light toggle) must pass a dark theme, e.g.
+    /// `Stylesheet::dark().to_html_css()`.
     pub fn to_html_css(&self) -> String {
         let light = Self::light();
         format!(

@@ -11,17 +11,17 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Type parameter list (including const parameters)
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_type_params(&mut self) -> Result<Vec<TypeParam<'input>>, Diagnostic<'src>> {
+    pub(super) fn parse_type_params(&mut self, bump: &'input bumpalo::Bump) -> Result<Vec<TypeParam<'input>>, Diagnostic<'src>> {
         self.advance().ok(); // consume <
         let mut p = Vec::new();
         loop {
             if matches!(self.peek(), Ok(Token::Const)) {
-                p.push(self.parse_const_param()?);
+                p.push(self.parse_const_param(bump)?);
             } else {
                 let (name, is_lifetime) = if matches!(self.peek(), Ok(Token::Apostrophe)) {
                     self.advance().ok();
                     match self.advance() {
-                        Ok(Token::Ident(name)) => (Symbol::intern(&format!("'{}", name)), true),
+                        Ok(Token::Ident(name)) => (Symbol::intern_prefixed('\'', name.as_str()), true),
                         _ => {
                             return Err(Diagnostic::error("expected lifetime name after `'`")
                                 .with_code_str("E004")
@@ -50,7 +50,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                 if !is_lifetime && matches!(self.peek(), Ok(Token::Colon)) {
                     self.advance().ok();
                     loop {
-                        bounds.push(self.parse_type()?);
+                        bounds.push(self.parse_type(bump)?);
                         if !matches!(self.peek(), Ok(Token::Plus)) {
                             break;
                         }
@@ -87,7 +87,7 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Const generic parameter: `const N: Type = default`
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_const_param(&mut self) -> Result<TypeParam<'input>, Diagnostic<'src>> {
+    pub(super) fn parse_const_param(&mut self, bump: &'input bumpalo::Bump) -> Result<TypeParam<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok(); // consume `const`
         let name = match self.advance() {
@@ -111,10 +111,10 @@ impl<'src, 'input> Parser<'src, 'input> {
             }
         };
         self.expect(Token::Colon)?;
-        let ty = self.parse_type()?;
+        let ty = self.parse_type(bump)?;
         let default = if matches!(self.peek(), Ok(Token::Assign)) {
             self.advance().ok();
-            Some(Self::alloc_shared(self.arena, self.parse_expr()?))
+            Some(Self::alloc_shared(bump, self.parse_expr(bump)?))
         } else {
             None
         };
@@ -123,7 +123,7 @@ impl<'src, 'input> Parser<'src, 'input> {
             name,
             bounds: Vec::new(),
             kind: TypeParamKind::Const { ty, default },
-            span: Span::new(start, end),
+            span: Span::new(self.file_id, start, end),
         })
     }
 

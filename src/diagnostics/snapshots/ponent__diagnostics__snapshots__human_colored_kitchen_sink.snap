@@ -1,0 +1,36 @@
+---
+source: src/diagnostics/snapshots.rs
+expression: out
+---
+\e[2m┌─\e[0m \e[1;91m\e[1merror\e[0m[\e[1mE030,E019\e[0m]: 1. \e[1mreturn\e[22m\e[39m \e[1mtype\e[22m\e[39m mismatch
+│                       2. duplicate definition of `i`
+\e[2m│  ┌─\e[0m \e[94mexample.ps:3:2\e[0m
+\e[2m│  │\e[0m
+\e[2m│\e[0m\e[2m1\e[0m \e[2m│\e[0m def foo(x\e[48;5;236m: Bool) -> Int<32> {\e[49m
+\e[2m│  │\e[0m \e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[1;91m \e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m
+\e[2m│\e[0m  \e[2m│\e[0m \e[1;91mdeclared to \e[1mreturn\e[22m\e[39m \e[94m`Int<32>`\e[22m\e[39m\e[0m
+\e[2m│\e[0m\e[2m2\e[0m \e[2m│\e[0m \e[48;5;236m    set j = x;\e[49m
+\e[2m│  │\e[0m \e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m
+\e[2m│\e[0m  \e[2m│\e[0m \e[1;91m|\e[0m
+\e[2m│\e[0m\e[2m3\e[0m \e[2m│\e[0m \e[48;5;236m    set i = j + 1; // 中\e[49m
+\e[2m│  │\e[0m \e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m
+\e[2m│  │\e[0m \e[92m \e[0m\e[92m \e[0m\e[92m \e[0m\e[92m \e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m\e[92m~\e[0m
+\e[2m│  │\e[0m \e[1;91m \e[0m\e[1;91m \e[0m\e[1;91m \e[0m\e[1;91m \e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m
+\e[2m│\e[0m  \e[2m│\e[0m \e[1;91mduplicate definition of `i` [E019]\e[0m
+\e[2m│\e[0m  \e[2m│\e[0m \e[1;91m|\e[0m
+\e[2m│\e[0m\e[2m4\e[0m \e[2m│\e[0m \e[48;5;236m    ret\e[49murn \e[48;5;236mi\e[49m;
+\e[2m│  │\e[0m \e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m \e[0m\e[1;91m \e[0m\e[1;91m \e[0m\e[1;91m \e[0m\e[1;91m \e[0m\e[1;91m^\e[0m
+\e[2m│  │\e[0m \e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m\e[1;91m^\e[0m
+\e[2m│\e[0m  \e[2m│\e[0m \e[1;91m|\e[0m
+\e[2m│\e[0m  \e[2m│\e[0m \e[1;91m| \e[0m\e[1;91mthis \e[1mis\e[22m\e[39m\e[1;91m \e[94m`Bool`\e[22m\e[39m\e[1;91m\e[0m
+\e[2m│\e[0m  \e[2m│\e[0m \e[1;91m|\e[0m
+\e[2m│\e[0m  \e[2m│\e[0m \e[1;91m| \e[0m\e[1;91mspans four lines\e[0m
+\e[2m│\e[0m  \e[2m│\e[0m \e[1;91m|\e[0m
+\e[2m│\e[0m  \e[2m│\e[0m \e[1;91m|\e[0m
+\e[2m│\e[0m\e[2m5\e[0m \e[2m│\e[0m }
+\e[2m│  └─\e[0m
+│  \e[92m= \e[1mnote\e[0m: expected \e[94mInt<32>\e[0m
+│  \e[94m= \e[1mnote\e[0m: \e[92mcast with `as`\e[0m
+│  \e[94m= \e[1mhelp\e[0m: \e[94mchange the return type\e[0m
+\e[36mreferenced by:\e[0m
+    \e[34mmain\e[0m: example.ps:1:1

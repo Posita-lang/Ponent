@@ -133,8 +133,7 @@ impl<'input> TypeContext<'input> {
             }
             (TypeData::Pointer { ty: t1 }, TypeData::Pointer { ty: t2 }) => {
                 // Invariant — exact equality required after resolving bindings.
-                self.resolve_binding_compressed(*t1)
-                    == self.resolve_binding_compressed(*t2)
+                self.resolve_binding_compressed(*t1) == self.resolve_binding_compressed(*t2)
             }
             (
                 TypeData::Fn {
@@ -220,10 +219,8 @@ impl<'input> TypeContext<'input> {
                     pointee: p2,
                 },
             ) => {
-                self.resolve_binding_compressed(*s1)
-                    == self.resolve_binding_compressed(*s2)
-                    && self.resolve_binding_compressed(*p1)
-                        == self.resolve_binding_compressed(*p2)
+                self.resolve_binding_compressed(*s1) == self.resolve_binding_compressed(*s2)
+                    && self.resolve_binding_compressed(*p1) == self.resolve_binding_compressed(*p2)
             }
             // Poly: α-convert quantifiers → covariant body
             (

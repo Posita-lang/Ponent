@@ -34,8 +34,10 @@ impl<'input> TypeContext<'input> {
         {
             parent_log.extend(committed_opaque_log);
         }
-        // κ cache may be invalidated by binding changes across transaction boundaries.
+        // κ cache and type_flags may be invalidated by binding changes
+        // across transaction boundaries.
         self.kappa_cache.clear();
+        self.type_flags.clear();
         self.interner.variance_cache.write().clear();
     }
 
@@ -75,6 +77,7 @@ impl<'input> TypeContext<'input> {
         }
         self.unify_seen.clear();
         self.kappa_cache.clear();
+        self.type_flags.clear();
         self.interner.variance_cache.write().clear();
     }
 }

@@ -12,15 +12,15 @@
 //! takes part in `StableHash` fingerprints — see the `StableHash`
 //! contract in `hir::query`.
 
-use crate::ast::Span;
+use crate::ast::{FileId, Span};
 
 /// Doc-channel + trivia-channel contents of one source file, captured
 /// during the parser's upfront lex.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct DocMap {
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocMap<'src> {
     /// Doc comments (`///`, `//!`) in source order, anchored to the
     /// index of the next semantic token in the parser's stream.
-    pub docs: Vec<DocEntry>,
+    pub docs: Vec<DocEntry<'src>>,
     /// Skipped trivia runs (whitespace / comments), in source order.
     pub trivia: Vec<TriviaEntry>,
     /// POSITION-CHANNEL SIDETABLE (#3): byte span of every semantic
@@ -29,14 +29,32 @@ pub struct DocMap {
     /// on the position side of the two-channel design and, like
     /// `trivia`, NEVER takes part in `StableHash` — fingerprinted
     /// values must not embed positions (stable-hash audit).
-    pub token_offsets: Vec<(usize, usize)>,
+    ///
+    /// Offsets are `(start, end)` in the file identified by `file`,
+    /// mirroring [`Span`]'s `u32` byte-offset representation.
+    pub token_offsets: Vec<(u32, u32)>,
+    /// The file this doc map was captured from; stamped into every
+    /// span built from the position sidetable so `token_span` can
+    /// reconstruct a `Span` without carrying the id per offset.
+    pub file: FileId,
+}
+
+impl<'src> Default for DocMap<'src> {
+    fn default() -> Self {
+        Self {
+            docs: Vec::new(),
+            trivia: Vec::new(),
+            token_offsets: Vec::new(),
+            file: FileId::DUMMY,
+        }
+    }
 }
 
 /// One doc comment captured into the doc channel.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DocEntry {
+pub struct DocEntry<'src> {
     /// Trimmed comment body (`/// @spec foo` → `@spec foo`).
-    pub text: String,
+    pub text: &'src str,
     /// Index of the next semantic token in the parser's token stream
     /// at the time this comment was seen — the item it documents.
     pub anchor: usize,
@@ -60,22 +78,20 @@ pub enum TriviaKind {
     Comment,
 }
 
-impl DocMap {
+impl<'src> DocMap<'src> {
     /// POSITION CHANNEL: byte span of semantic token `index`
     /// (the same index used for doc anchors).  `None` if out of range.
     pub fn token_span(&self, index: usize) -> Option<Span> {
-        self.token_offsets
-            .get(index)
-            .map(|&(s, e)| Span::new(s, e))
+        self.token_offsets.get(index).map(|&(s, e)| Span::new(self.file, s, e))
     }
 
     /// Doc lines anchored strictly inside `start..end` (an item's
     /// span).  Text only — spans stay behind.
-    pub fn doc_lines_between(&self, start: usize, end: usize) -> impl Iterator<Item = &str> + '_ {
+    pub fn doc_lines_between(&self, start: u32, end: u32) -> impl Iterator<Item = &str> + '_ {
         self.docs
             .iter()
             .filter(move |d| d.span.start >= start && d.span.end <= end)
-            .map(|d| d.text.as_str())
+            .map(|d| d.text)
     }
 
     /// Doc lines whose ANCHOR token lies inside `start..end` (an item's
@@ -86,8 +102,8 @@ impl DocMap {
     /// excluded.  This is the lookup the `DocTokens` query uses.
     pub fn doc_lines_anchored_in(
         &self,
-        start: usize,
-        end: usize,
+        start: u32,
+        end: u32,
     ) -> impl Iterator<Item = &str> + '_ {
         self.docs
             .iter()
@@ -96,11 +112,11 @@ impl DocMap {
                 self.token_span(d.anchor)
                     .is_some_and(|s| s.start >= start && s.end <= end)
             })
-            .map(|d| d.text.as_str())
+            .map(|d| d.text)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
 
@@ -113,7 +129,7 @@ mod tests {
         let source = "/// doc\nlet x = 1;\n  // trivia\nlet y = 2;";
         let bump = bumpalo::Bump::new();
         let arena = crate::arena::SyncArena::new(&bump);
-        let program = crate::parser::Parser::new(source, &arena)
+        let program = crate::parser::Parser::new(source, FileId::DUMMY, &arena)
             .parse_program()
             .expect("parse must succeed");
         let dm = &program.doc_map;
@@ -129,11 +145,11 @@ mod tests {
 
         // Anchor 0 (the `/// doc`'s anchor) is the first `let`.
         let first_let = dm.token_span(0).expect("anchor 0 must resolve");
-        assert_eq!(&source[first_let.start..first_let.end], "let");
+        assert_eq!(&source[first_let.start as usize..first_let.end as usize], "let");
 
         // The second `let` sits after the trivia run (index 5).
         let second_let = dm.token_span(5).expect("anchor 5 must resolve");
-        assert_eq!(&source[second_let.start..second_let.end], "let");
+        assert_eq!(&source[second_let.start as usize..second_let.end as usize], "let");
 
         // Out of range → None.
         assert!(dm.token_span(10).is_none());

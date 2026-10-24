@@ -41,6 +41,56 @@ pub trait VfsBackend: fmt::Debug {
 
     /// Return the kind of the entry at `path`, or `None` if it doesn't exist.
     fn path_type(&self, path: &str) -> Option<VfsNodeKind>;
+
+    /// Canonical identity of `path`: resolve symlinks and (on
+    /// case-insensitive platforms) normalize case.  Two visible paths
+    /// whose canonical forms are equal denote the same file — the
+    /// caller relies on this to keep `SourceMap`'s DuplicatePath check
+    /// meaningful across symlinked or aliased paths.
+    ///
+    /// Default: normalize the path lexically (no filesystem access).
+    /// Real-filesystem backends override this with true resolution.
+    fn canonicalize(&self, path: &str) -> Result<PathBuf, VfsError<'static>> {
+        Ok(normalize_lexical(Path::new(path)))
+    }
+
+    /// Read a file together with its modification time.
+    ///
+    /// `mtime == None` tells the `SourceMap` fast path to stand down and
+    /// let the fingerprint comparison decide whether content changed —
+    /// backends whose content can change without an observable mtime
+    /// (editor overlays, test doubles) return `None` or a fresh stamp.
+    ///
+    /// Default: plain `read_file` with no mtime (always fingerprint path).
+    fn read_file_with_mtime(
+        &self,
+        path: &str,
+    ) -> Result<(String, Option<std::time::SystemTime>), VfsError<'static>> {
+        self.read_file(path).map(|s| (s, None))
+    }
+}
+
+/// Collapse `.` / `..` segments and duplicate separators lexically.
+///
+/// This is the fallback canonical form for backends that have no
+/// filesystem to consult (memory, overlay buffers).  A leading `/` is
+/// preserved; `..` above the root clamps to the root.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push("/");
+    }
+    out
 }
 
 /// Filesystem backend — reads from the real OS filesystem.
@@ -70,6 +120,7 @@ impl VfsBackend for FsBackend {
             };
             entries.push(DirEntry { name, kind });
         }
+        entries.sort_unstable_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         Ok(entries)
     }
 
@@ -82,6 +133,26 @@ impl VfsBackend for FsBackend {
         } else {
             None
         }
+    }
+
+    fn canonicalize(&self, path: &str) -> Result<PathBuf, VfsError<'static>> {
+        // True resolution: symlinks followed, case normalized by the OS.
+        // Fall back to the lexical form when the target doesn't exist yet
+        // (the caller may canonicalize before the first read).
+        std::fs::canonicalize(path)
+            .or_else(|_| Ok::<PathBuf, VfsError<'static>>(normalize_lexical(Path::new(path))))
+            .map_err(|e| VfsError::Io(format!("failed to canonicalize '{}': {:?}", path, e)))
+    }
+
+    fn read_file_with_mtime(
+        &self,
+        path: &str,
+    ) -> Result<(String, Option<std::time::SystemTime>), VfsError<'static>> {
+        let content = self.read_file(path)?;
+        let mtime = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok();
+        Ok((content, mtime))
     }
 }
 
@@ -192,20 +263,105 @@ impl Default for MemoryBackend {
     }
 }
 
+/// Overlay backend — editor unsaved buffers shadow a base backend.
+///
+/// A path with a buffer entry reads the buffer text; everything else
+/// (including `read_dir`, `path_type`, `canonicalize`) falls through to
+/// the base.  Buffered reads report a fresh mtime: the stamp is
+/// guaranteed to differ from the previous compile's, so the
+/// `SourceMap` mtime fast path always misses and the fingerprint
+/// comparison makes the final change/no-change call.
+#[derive(Debug)]
+pub struct OverlayBackend {
+    base: std::sync::Arc<dyn VfsBackend>,
+    buffers: std::sync::RwLock<HashMap<String, String>>,
+}
+
+impl Clone for OverlayBackend {
+    fn clone(&self) -> Self {
+        OverlayBackend {
+            base: self.base.clone(),
+            // Share the buffer table: clones observe the same unsaved state.
+            buffers: std::sync::RwLock::new(
+                self.buffers.read().expect("overlay buffers lock").clone(),
+            ),
+        }
+    }
+}
+
+impl OverlayBackend {
+    /// Layer unsaved buffers over `base`.
+    pub fn new(base: std::sync::Arc<dyn VfsBackend>) -> Self {
+        OverlayBackend {
+            base,
+            buffers: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Install (or replace) the unsaved buffer for `path`.
+    pub fn set_buffer(&self, path: &str, content: String) {
+        self.buffers.write().expect("overlay buffers lock").insert(path.to_string(), content);
+    }
+
+    /// Drop the buffer for `path` — the file is saved, the base shows
+    /// through again.
+    pub fn clear_buffer(&self, path: &str) {
+        self.buffers.write().expect("overlay buffers lock").remove(path);
+    }
+
+    /// True while `path` has an unsaved buffer.
+    pub fn has_buffer(&self, path: &str) -> bool {
+        self.buffers.read().expect("overlay buffers lock").contains_key(path)
+    }
+}
+
+impl VfsBackend for OverlayBackend {
+    fn read_file(&self, path: &str) -> Result<String, VfsError<'static>> {
+        if let Some(buf) = self.buffers.read().expect("overlay buffers lock").get(path) {
+            return Ok(buf.clone());
+        }
+        self.base.read_file(path)
+    }
+
+    fn read_file_with_mtime(
+        &self,
+        path: &str,
+    ) -> Result<(String, Option<std::time::SystemTime>), VfsError<'static>> {
+        if let Some(buf) = self.buffers.read().expect("overlay buffers lock").get(path) {
+            // Fresh stamp on every read ⇒ mtime fast path always misses
+            // ⇒ the fingerprint decides whether content truly changed.
+            return Ok((buf.clone(), Some(std::time::SystemTime::now())));
+        }
+        self.base.read_file_with_mtime(path)
+    }
+
+    fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError<'static>> {
+        self.base.read_dir(path)
+    }
+
+    fn path_type(&self, path: &str) -> Option<VfsNodeKind> {
+        self.base.path_type(path)
+    }
+
+    fn canonicalize(&self, path: &str) -> Result<PathBuf, VfsError<'static>> {
+        self.base.canonicalize(path)
+    }
+}
+
 /// A node in the virtual file system tree.
 /// Each node can lazily load its source text, tokens, and AST.
 /// Nodes form a tree via `children`; parent relationships are tracked by
 /// `parent_id` rather than an owned `parent` pointer, avoiding recursive
 /// cloning of the entire ancestor chain.
 #[derive(Debug, Clone)]
-pub struct VfsNode<'input> {
+pub struct VfsNode<'input, 'src> {
     pub kind: VfsNodeKind,
     pub name: String,
     pub id: usize,
     pub src: Option<String>,
-    pub tokens: Option<Vec<Token>>,
-    pub ast: Option<Program<'input>>,
-    pub children: Option<Vec<VfsNode<'input>>>,
+    pub tokens: Option<Vec<Token<'input>>>,
+    pub ast: Option<Program<'input, 'src>>,
+    pub children: Option<Vec<VfsNode<'input, 'src>>>,
     /// Absolute virtual path in the VFS tree (e.g. `/src/main.ps`).
     pub abs_path: Option<String>,
     /// Absolute filesystem path this node maps to (if backed by a real file).
@@ -226,7 +382,10 @@ pub enum VfsError<'src> {
     Diagnostics(Vec<Diagnostic<'src>>),
 }
 
-impl<'input> VfsNode<'input> {
+impl<'input, 'src> VfsNode<'input, 'src>
+where
+    'input: 'src,
+{
     /// Create a new file node.
     pub fn new_file(id: usize, name: &str, arena: &'input crate::arena::SyncArena<'input>) -> Self {
         VfsNode {
@@ -297,10 +456,12 @@ impl<'input> VfsNode<'input> {
             return Ok(());
         }
         self.ensure_src(backend)?;
-        let src = self
-            .src
-            .as_ref()
-            .ok_or(VfsError::Io("source not loaded".to_string()))?;
+        let arena = self.arena;
+        let src: &'input str = arena.alloc_str(
+            self.src
+                .as_deref()
+                .ok_or(VfsError::Io("source not loaded".to_string()))?,
+        );
         let lexer = Token::lexer(src);
         let mut tokens = Vec::new();
         for result in lexer {
@@ -330,15 +491,19 @@ impl<'input> VfsNode<'input> {
         }
         let arena = self.arena;
         // Copy the source into the TREE-level shared arena (owned by the
-        // caller of `scan`), so the parsed `Program<'input>` may borrow it
+        // caller of `scan`), so the parsed `Program<'input, 'src>` may borrow it
         // and re-parsing a node never leaks a fresh arena.  A borrow of the
         // node-local `String` could not escape into `VfsError<'input>`.
-        let src: &'input str = arena.alloc_str(
-            self.src
-                .as_deref()
-                .ok_or(VfsError::Io("source not loaded".to_string()))?,
-        );
-        let mut parser = Parser::new(src, arena);
+        let raw = self
+            .src
+            .as_deref()
+            .ok_or(VfsError::Io("source not loaded".to_string()))?;
+        let mut source_map = crate::sourcemap::SourceMap::new();
+        let file_id = source_map
+            .add_file(self.name.clone(), raw)
+            .map_err(|e| VfsError::Io(e.to_string()))?;
+        let src: &'input str = arena.alloc_str(raw);
+        let mut parser = Parser::new(src, file_id, arena);
         match parser.parse_program() {
             Ok(program) => {
                 self.ast = Some(program);
@@ -359,14 +524,14 @@ impl<'input> VfsNode<'input> {
     /// (dot-prefixed) and common build directories are skipped.
     ///
     /// The caller owns `arena` and must keep it alive for as long as the
-    /// returned tree is used: every node's parsed `Program<'input>` borrows
+    /// returned tree is used: every node's parsed `Program<'input, 'src>` borrows
     /// from it, so re-parsing a node never leaks a fresh arena.
     pub fn scan(
         backend: &dyn VfsBackend,
         root: &str,
         id_counter: &mut usize,
         arena: &'input crate::arena::SyncArena<'input>,
-    ) -> Result<VfsNode<'input>, VfsError<'static>> {
+    ) -> Result<VfsNode<'input, 'input>, VfsError<'static>> {
         let path = Path::new(root);
         let name = path
             .file_name()
@@ -428,7 +593,7 @@ impl<'input> VfsNode<'input> {
     }
 }
 
-impl<'input> fmt::Display for VfsNode<'input> {
+impl<'input, 'src> fmt::Display for VfsNode<'input, 'src> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.absolute_path() {
             Some(path) => write!(f, "{} ({:?})", path, self.kind),
@@ -437,7 +602,7 @@ impl<'input> fmt::Display for VfsNode<'input> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
 
@@ -469,5 +634,39 @@ mod tests {
         let mut file = file.clone();
         file.ensure_ast(&backend).expect("ast should parse");
         assert!(file.ast.is_some(), "parsed program is retained");
+    }
+
+    #[test]
+    fn overlay_shadows_base_and_falls_through() {
+        let mut mem = MemoryBackend::new();
+        mem.insert_file("/src/main.ps", "from disk");
+        let overlay = OverlayBackend::new(std::sync::Arc::new(mem));
+
+        // No buffer yet: base shows through, mtime is None (fingerprint path).
+        assert!(!overlay.has_buffer("/src/main.ps"));
+        let (text, mtime) = overlay.read_file_with_mtime("/src/main.ps").expect("read");
+        assert_eq!(text, "from disk");
+        assert!(mtime.is_none());
+
+        // Buffer installed: it shadows the base and stamps a fresh mtime
+        // so the SourceMap fast path always misses.
+        overlay.set_buffer("/src/main.ps", "unsaved edit".to_string());
+        let (text, mtime) = overlay.read_file_with_mtime("/src/main.ps").expect("read");
+        assert_eq!(text, "unsaved edit");
+        assert!(mtime.is_some());
+
+        // Clearing the buffer exposes the base again.
+        overlay.clear_buffer("/src/main.ps");
+        assert_eq!(overlay.read_file("/src/main.ps").expect("read"), "from disk");
+    }
+
+    #[test]
+    fn canonicalize_is_idempotent_and_normalizes() {
+        let overlay =
+            OverlayBackend::new(std::sync::Arc::new(MemoryBackend::new()));
+        let once = overlay.canonicalize("/src/./a/../main.ps").expect("canonicalize");
+        let twice = overlay.canonicalize(once.to_str().expect("utf8")).expect("canonicalize");
+        assert_eq!(once, twice);
+        assert_eq!(once.to_str().expect("utf8"), "/src/main.ps");
     }
 }

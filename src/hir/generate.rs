@@ -153,7 +153,7 @@ impl<'a, 'input> GenerateExpander<'a, 'input> {
     fn expand_generate_block(
         &mut self,
         for_type: &Type<'input>,
-        body: Vec<Stmt<'input>>,
+        body: &[Stmt<'input>],
         _span: Span,
         result: &mut Vec<Stmt<'input>>,
     ) {
@@ -161,7 +161,7 @@ impl<'a, 'input> GenerateExpander<'a, 'input> {
             Some(s) => s,
             None => {
                 // Phase 1 fallback: just pass through.
-                result.extend(body);
+                result.extend(body.iter().cloned());
                 return;
             }
         };
@@ -172,7 +172,7 @@ impl<'a, 'input> GenerateExpander<'a, 'input> {
         let for_type_id = self.resolve_type_for_generate(&for_type, symbols);
 
         // Walk the body, evaluating @typeInfo! expressions and conditions.
-        let expanded = self.expand_generate_body(&body, for_type_id, symbols);
+        let expanded = self.expand_generate_body(body, for_type_id, symbols);
         result.extend(expanded);
     }
 

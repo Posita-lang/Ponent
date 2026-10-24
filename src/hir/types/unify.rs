@@ -1,3 +1,4 @@
+use crate::ast::FileId;
 use super::*;
 
 impl<'input> TypeContext<'input> {
@@ -249,7 +250,7 @@ impl<'input> TypeContext<'input> {
         if self.occurs_check(var, target) {
             return Err(TypeError::RecursiveType {
                 ty: var,
-                span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
             });
         }
         // GADT skolem escape guard: don't bind a variable to a type
@@ -259,7 +260,7 @@ impl<'input> TypeContext<'input> {
                 var_id: usize::MAX,
                 var_level: Self::GADT_SKOLEM_UNIVERSE,
                 current_level: 0,
-                span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
             });
         }
         // Structural bias: walk into compound types to bind nested
@@ -399,7 +400,7 @@ impl<'input> TypeContext<'input> {
                 return Err(TypeError::Mismatch {
                     expected: var,
                     found: target,
-                    span: crate::ast::Span::new(0, 0),
+                    span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 });
             }
         }
@@ -653,7 +654,7 @@ impl<'input> TypeContext<'input> {
                     var_id: usize::MAX,
                     var_level: *u1,
                     current_level: 0,
-                    span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                    span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                 });
             }
             (
@@ -666,7 +667,7 @@ impl<'input> TypeContext<'input> {
                     var_id: usize::MAX,
                     var_level: *u2,
                     current_level: 0,
-                    span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                    span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                 });
             }
             (TypeData::GenericParam { index, .. }, _) => {
@@ -676,7 +677,7 @@ impl<'input> TypeContext<'input> {
                 if self.binder_stack.contains(index) {
                     return Err(TypeError::ScopeEscape {
                         index: *index,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                     });
                 }
                 // A GADT skolem must not be bound into a variable through a
@@ -688,20 +689,20 @@ impl<'input> TypeContext<'input> {
                         var_id: usize::MAX,
                         var_level: Self::GADT_SKOLEM_UNIVERSE,
                         current_level: 0,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                     });
                 }
                 if self.occurs_check(a, b) {
                     return Err(TypeError::RecursiveType {
                         ty: a,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                     });
                 }
                 if !self.set_binding(a, b) {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -711,7 +712,7 @@ impl<'input> TypeContext<'input> {
                 if self.binder_stack.contains(index) {
                     return Err(TypeError::ScopeEscape {
                         index: *index,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                     });
                 }
                 if self.contains_gadt_skolem(a) {
@@ -719,20 +720,20 @@ impl<'input> TypeContext<'input> {
                         var_id: usize::MAX,
                         var_level: Self::GADT_SKOLEM_UNIVERSE,
                         current_level: 0,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                     });
                 }
                 if self.occurs_check(b, a) {
                     return Err(TypeError::RecursiveType {
                         ty: b,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                     });
                 }
                 if !self.set_binding(b, a) {
                     return Err(TypeError::Mismatch {
                         expected: b,
                         found: a,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(a)
@@ -765,14 +766,14 @@ impl<'input> TypeContext<'input> {
                             var_level,
                             current_level: cur_level,
                             span: (*&self.current_unify_span)
-                                .unwrap_or(crate::ast::Span::new(0, 0)),
+                                .unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                         });
                     }
                 }
                 if self.occurs_check(a, b) {
                     return Err(TypeError::RecursiveType {
                         ty: a,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                     });
                 }
                 // A GADT skolem must not be bound into an InferVar through
@@ -782,7 +783,7 @@ impl<'input> TypeContext<'input> {
                         var_id: usize::MAX,
                         var_level: Self::GADT_SKOLEM_UNIVERSE,
                         current_level: 0,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                     });
                 }
                 // Per-variable universe escape check (rustc `can_define`):
@@ -798,14 +799,14 @@ impl<'input> TypeContext<'input> {
                         var_id: usize::MAX,
                         var_level: *universe,
                         current_level: 0,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                     });
                 }
                 if !self.set_binding(a, b) {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -828,14 +829,14 @@ impl<'input> TypeContext<'input> {
                             var_level,
                             current_level: cur_level,
                             span: (*&self.current_unify_span)
-                                .unwrap_or(crate::ast::Span::new(0, 0)),
+                                .unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                         });
                     }
                 }
                 if self.occurs_check(b, a) {
                     return Err(TypeError::RecursiveType {
                         ty: b,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                     });
                 }
                 // The FOREIGN-UNIVERSE guard (mirrors the `(InferVar, _)`
@@ -860,14 +861,14 @@ impl<'input> TypeContext<'input> {
                         var_id: usize::MAX,
                         var_level: *universe,
                         current_level: 0,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                     });
                 }
                 if !self.set_binding(b, a) {
                     return Err(TypeError::Mismatch {
                         expected: b,
                         found: a,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(a)
@@ -901,7 +902,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -919,7 +920,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -946,7 +947,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -962,7 +963,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -976,7 +977,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -1035,7 +1036,7 @@ impl<'input> TypeContext<'input> {
                             expected: b,
                             found: a,
                             span: (*&self.current_unify_span)
-                                .unwrap_or(crate::ast::Span::new(0, 0)),
+                                .unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                         });
                     }
                 }
@@ -1051,7 +1052,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: b,
                         found: a,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                     });
                 }
                 let ty_variance = variance.xform(Variance::Invariant);
@@ -1060,7 +1061,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -1076,7 +1077,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -1111,7 +1112,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -1130,7 +1131,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -1185,7 +1186,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -1238,7 +1239,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -1293,7 +1294,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -1346,7 +1347,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -1399,7 +1400,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -1420,7 +1421,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -1432,7 +1433,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -1457,7 +1458,7 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: a,
                         found: b,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
                 Ok(b)
@@ -1475,7 +1476,7 @@ impl<'input> TypeContext<'input> {
                         return Err(TypeError::Mismatch {
                             expected: a,
                             found: b,
-                            span: crate::ast::Span::new(0, 0),
+                            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                         });
                     }
                     Ok(b)
@@ -1483,7 +1484,7 @@ impl<'input> TypeContext<'input> {
                     Err(TypeError::Mismatch {
                         expected: b,
                         found: a,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
                     })
                 }
             }
@@ -1491,7 +1492,7 @@ impl<'input> TypeContext<'input> {
             _ => Err(TypeError::Mismatch {
                 expected: b,
                 found: a,
-                span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(0, 0)),
+                span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
             }),
         }
     }

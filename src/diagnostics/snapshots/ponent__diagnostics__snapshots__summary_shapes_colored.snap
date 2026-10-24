@@ -1,0 +1,11 @@
+---
+source: src/diagnostics/snapshots.rs
+assertion_line: 190
+expression: out
+---
+
+[2m└─[0m [1;91maborting due to previous error[0m
+[2m└─[0m [1;91maborting due to 2 previous errors[0m
+[2m└─[0m [93m1 warning emitted[0m
+[2m└─[0m [93m4 warnings emitted[0m
+[2m└─[0m [1;91maborting due to 2 previous errors; 1 warning emitted[0m

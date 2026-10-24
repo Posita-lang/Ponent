@@ -19,10 +19,32 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace
       - run: cargo check --workspace --all-features
-      - run: cargo test --workspace --all-features
+      - run: cargo xtask codegen --check
+      - run: cargo xtask site --out target/error_codes_site
+      - run: cargo test --workspace --features omniml_pool,slow-tests
+      - run: cargo test --features shuttle
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-features
+
+  msrv:
+    name: MSRV (rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pins the `rust-version` floor in Cargo.toml.  The floor is set by
+      # the newest feature the tree actually uses, not by preference, so
+      # this job is what makes an accidental MSRV-raising edit visible
+      # (cargo refuses the toolchain with "requires rustc X").  It does
+      # NOT try to run the whole suite: `slow-tests` needs ~17 min and
+      # `shuttle` needs a scheduler-aware build.  `cargo check` is enough
+      # to prove the syntax/library floor.
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check --workspace
 
   security:
     name: Security Audit

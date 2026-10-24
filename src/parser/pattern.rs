@@ -11,7 +11,7 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Pattern entry
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_pattern(&mut self) -> Result<Pattern<'input>, Diagnostic<'src>> {
+    pub(super) fn parse_pattern(&mut self, bump: &'input bumpalo::Bump) -> Result<Pattern<'input>, Diagnostic<'src>> {
         self.recursion_depth += 1;
         if self.recursion_depth > self.max_recursion_depth {
             self.recursion_depth -= 1;
@@ -21,7 +21,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                 .with_suggestion("try breaking up deeply nested structures, or use less complex type expressions")
                 .with_span(self.span()));
         }
-        let result = self.parse_pattern_inner();
+        let result = self.parse_pattern_inner(bump);
         self.recursion_depth -= 1;
         result
     }
@@ -30,16 +30,17 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Or‑pattern (used in match arms and catch)
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_or_pattern(&mut self) -> Result<Pattern<'input>, Diagnostic<'src>> {
+    pub(super) fn parse_or_pattern(&mut self, bump: &'input bumpalo::Bump) -> Result<Pattern<'input>, Diagnostic<'src>> {
         let start = self.span().start;
-        let first = self.parse_pattern()?;
+        let first = self.parse_pattern(bump)?;
         if matches!(self.peek(), Ok(Token::Pipe)) {
-            let mut patterns = vec![first];
+            let mut patterns = bumpalo::collections::Vec::with_capacity_in(4, bump);
+            patterns.push(first);
             while matches!(self.peek(), Ok(Token::Pipe)) {
                 self.advance().ok();
-                patterns.push(self.parse_pattern()?);
+                patterns.push(self.parse_pattern(bump)?);
             }
-            Ok(Pattern::Or(patterns, Span::new(start, self.span().end)))
+            Ok(Pattern::Or(patterns.into_bump_slice(), Span::new(self.file_id, start, self.span().end)))
         } else {
             Ok(first)
         }
@@ -49,7 +50,7 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Inner pattern parser
     // -------------------------------------------------------------------------
 
-    fn parse_pattern_inner(&mut self) -> Result<Pattern<'input>, Diagnostic<'src>> {
+    fn parse_pattern_inner(&mut self, bump: &'input bumpalo::Bump) -> Result<Pattern<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         let tok = match self.peek() {
             Ok(t) => t.clone(),
@@ -61,13 +62,14 @@ impl<'src, 'input> Parser<'src, 'input> {
         };
         match tok {
             Token::IntLiteral(_) | Token::FloatLiteral(_) | Token::StringLiteral(_)
-            | Token::ByteStringLiteral(_) | Token::CharLiteral(_) | Token::True | Token::False => {
+            | Token::ByteStringLiteral(_) | Token::CharLiteral(_)
+            | Token::ByteCharLiteral(_) | Token::True | Token::False => {
                 let lit = self.parse_literal()?;
-                Ok(Pattern::Literal(Self::alloc_shared(self.arena, lit), Span::new(start, self.span().end)))
+                Ok(Pattern::Literal(Self::alloc_shared(bump, lit), Span::new(self.file_id, start, self.span().end)))
             }
             Token::Ident(s) if s.eq_str("_") => {
                 self.advance().ok();
-                Ok(Pattern::Wildcard(Span::new(start, self.span().end)))
+                Ok(Pattern::Wildcard(Span::new(self.file_id, start, self.span().end)))
             }
             Token::Ident(_) => {
                 let name = match self.advance() {
@@ -75,27 +77,27 @@ impl<'src, 'input> Parser<'src, 'input> {
                     _ => unreachable!(),
                 };
                 if matches!(self.peek(), Ok(Token::LBrace)) {
-                    let (fields, rest, _) = self.parse_struct_pattern_fields()?;
+                    let (fields, rest, _) = self.parse_struct_pattern_fields(bump)?;
                     let end = self.span().end;
-                    Ok(Pattern::Struct { path: vec![name], fields, rest, span: Span::new(start, end) })
+                    Ok(Pattern::Struct { path: vec![name], fields, rest, span: Span::new(self.file_id, start, end) })
                 } else if matches!(self.peek(), Ok(Token::LParen)) {
                     self.advance().ok();
-                    let inner = self.parse_pattern()?;
+                    let inner = self.parse_pattern(bump)?;
                     if matches!(self.peek(), Ok(Token::Colon)) {
                         self.advance().ok();
-                        let ty = self.parse_type()?;
+                        let ty = self.parse_type(bump)?;
                         self.expect(Token::RParen)?;
                         let end = self.span().end;
                         let annotated = Pattern::Annotated {
-                            inner: Self::alloc_shared(self.arena, inner),
-                            ty: Self::alloc_shared(self.arena, ty),
-                            span: Span::new(start, end),
+                            inner: Self::alloc_shared(bump, inner),
+                            ty: Self::alloc_shared(bump, ty),
+                            span: Span::new(self.file_id, start, end),
                         };
-                        Ok(Pattern::Enum { path: vec![], variant: name, inner: Some(Self::alloc_shared(self.arena, annotated)), span: Span::new(start, end) })
+                        Ok(Pattern::Enum { path: vec![], variant: name, inner: Some(Self::alloc_shared(bump, annotated)), span: Span::new(self.file_id, start, end) })
                     } else {
                         self.expect(Token::RParen)?;
                         let end = self.span().end;
-                        Ok(Pattern::Enum { path: vec![], variant: name, inner: Some(Self::alloc_shared(self.arena, inner)), span: Span::new(start, end) })
+                        Ok(Pattern::Enum { path: vec![], variant: name, inner: Some(Self::alloc_shared(bump, inner)), span: Span::new(self.file_id, start, end) })
                     }
                 } else if matches!(self.peek(), Ok(Token::ColonColon)) {
                     let mut path = vec![name];
@@ -109,61 +111,62 @@ impl<'src, 'input> Parser<'src, 'input> {
                             .with_span(self.span())),
                     };
                     if matches!(self.peek(), Ok(Token::LBrace)) {
-                        let (fields, rest, _) = self.parse_struct_pattern_fields()?;
+                        let (fields, rest, _) = self.parse_struct_pattern_fields(bump)?;
                         path.push(variant_sym);
                         let end = self.span().end;
-                        Ok(Pattern::Struct { path, fields, rest, span: Span::new(start, end) })
+                        Ok(Pattern::Struct { path, fields, rest, span: Span::new(self.file_id, start, end) })
                     } else if matches!(self.peek(), Ok(Token::LParen)) {
                         self.advance().ok();
-                        let p = self.parse_pattern()?;
+                        let p = self.parse_pattern(bump)?;
                         if matches!(self.peek(), Ok(Token::Colon)) {
                             self.advance().ok();
-                            let ty = self.parse_type()?;
+                            let ty = self.parse_type(bump)?;
                             self.expect(Token::RParen)?;
                             let end = self.span().end;
                             let annotated = Pattern::Annotated {
-                                inner: Self::alloc_shared(self.arena, p),
-                                ty: Self::alloc_shared(self.arena, ty),
-                                span: Span::new(start, end),
+                                inner: Self::alloc_shared(bump, p),
+                                ty: Self::alloc_shared(bump, ty),
+                                span: Span::new(self.file_id, start, end),
                             };
-                            Ok(Pattern::Enum { path, variant: variant_sym, inner: Some(Self::alloc_shared(self.arena, annotated)), span: Span::new(start, end) })
+                            Ok(Pattern::Enum { path, variant: variant_sym, inner: Some(Self::alloc_shared(bump, annotated)), span: Span::new(self.file_id, start, end) })
                         } else {
                             self.expect(Token::RParen)?;
                             let end = self.span().end;
-                            Ok(Pattern::Enum { path, variant: variant_sym, inner: Some(Self::alloc_shared(self.arena, p)), span: Span::new(start, end) })
+                            Ok(Pattern::Enum { path, variant: variant_sym, inner: Some(Self::alloc_shared(bump, p)), span: Span::new(self.file_id, start, end) })
                         }
                     } else {
                         let end = self.span().end;
-                        Ok(Pattern::Enum { path, variant: variant_sym, inner: None, span: Span::new(start, end) })
+                        Ok(Pattern::Enum { path, variant: variant_sym, inner: None, span: Span::new(self.file_id, start, end) })
                     }
                 } else {
-                    Ok(Pattern::Ident(name, Span::new(start, self.span().end)))
+                    Ok(Pattern::Ident(name, Span::new(self.file_id, start, self.span().end)))
                 }
             }
             Token::LParen => {
                 self.advance().ok();
-                let first = self.parse_pattern()?;
+                let first = self.parse_pattern(bump)?;
                 if matches!(self.peek(), Ok(Token::Colon)) {
                     self.advance().ok();
-                    let ty = self.parse_type()?;
+                    let ty = self.parse_type(bump)?;
                     self.expect(Token::RParen)?;
                     let end = self.span().end;
                     Ok(Pattern::Annotated {
-                        inner: Self::alloc_shared(self.arena, first),
-                        ty: Self::alloc_shared(self.arena, ty),
-                        span: Span::new(start, end),
+                        inner: Self::alloc_shared(bump, first),
+                        ty: Self::alloc_shared(bump, ty),
+                        span: Span::new(self.file_id, start, end),
                     })
                 } else if matches!(self.peek(), Ok(Token::Comma)) {
-                    let mut patterns = vec![first];
+                    let mut patterns = bumpalo::collections::Vec::with_capacity_in(4, bump);
+                    patterns.push(first);
                     while matches!(self.peek(), Ok(Token::Comma)) {
                         self.advance().ok();
-                        patterns.push(self.parse_pattern()?);
+                        patterns.push(self.parse_pattern(bump)?);
                     }
                     self.expect(Token::RParen)?;
-                    Ok(Pattern::Tuple(patterns, Span::new(start, self.span().end)))
+                    Ok(Pattern::Tuple(patterns.into_bump_slice(), Span::new(self.file_id, start, self.span().end)))
                 } else {
                     self.expect(Token::RParen)?;
-                    Ok(Pattern::Tuple(vec![first], Span::new(start, self.span().end)))
+                    Ok(Pattern::Tuple(Self::alloc_slice(bump, std::slice::from_ref(&first)), Span::new(self.file_id, start, self.span().end)))
                 }
             }
             _ => Err(Diagnostic::error("expected pattern")
@@ -180,10 +183,11 @@ impl<'src, 'input> Parser<'src, 'input> {
 
     pub(super) fn parse_struct_pattern_fields(
         &mut self,
-    ) -> Result<(Vec<(Symbol, Pattern<'input>)>, bool, Span), Diagnostic<'src>> {
+        bump: &'input bumpalo::Bump,
+    ) -> Result<(&'input [(Symbol, Pattern<'input>)], bool, Span), Diagnostic<'src>> {
         let start = self.span().start;
         self.expect(Token::LBrace)?;
-        let mut fields = Vec::new();
+        let mut fields = bumpalo::collections::Vec::with_capacity_in(4, bump);
         let mut rest = false;
         loop {
             if matches!(self.peek(), Ok(Token::RBrace)) {
@@ -204,7 +208,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                     let field_name = tok.as_ident_symbol().expect("guarded by is_some() above");
                     let field_pattern = if matches!(self.peek(), Ok(Token::Colon)) {
                         self.advance().ok();
-                        self.parse_pattern()?
+                        self.parse_pattern(bump)?
                     } else {
                         Pattern::Ident(field_name, self.span())
                     };
@@ -224,6 +228,6 @@ impl<'src, 'input> Parser<'src, 'input> {
             }
         }
         let end = self.span().end;
-        Ok((fields, rest, Span::new(start, end)))
+        Ok((fields.into_bump_slice(), rest, Span::new(self.file_id, start, end)))
     }
 }

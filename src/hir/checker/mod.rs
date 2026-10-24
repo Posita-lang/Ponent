@@ -1,14 +1,16 @@
+use crate::ast::FileId;
 use crate::ast::{
     Attribute, BinOp, Contract, Expr, GenericArg, Literal, Pattern, Program, Span, Stmt, Type,
     UnaryOp, VariableKind,
 };
 use crate::diagnostics::{
-    Applicability, ComptimeReason, DiagCtxt, Diagnostic, DiagnosticKind, Label, Suggestion,
-    SuggestionStyle, TypeCtx,
+    Applicability, ComptimeReason, DiagCtxt, Diagnostic, DiagnosticKind, DisplayArg, Label,
+    Suggestion, SuggestionStyle, TypeCtx,
 };
 use crate::hir::comptime::value::ComptimeValue;
 use crate::hir::hir::{HirCatchBranch, HirMatchArm, HirParam, HirPattern, HirProgram};
 use crate::hir::infer::{Constraint, InferenceContext, TypeVariableKind, VarOrigin};
+use crate::hir::query::NoOpScheduler;
 use crate::hir::resolver::ResolutionMap;
 use crate::hir::symbol::{SymbolTable, TypeBinding, TypeKind};
 use crate::hir::traits::TraitEnv;
@@ -26,11 +28,14 @@ use crate::hir::types::{
 use crate::symbol::Symbol;
 use num_bigint::BigInt;
 use num_traits::Zero;
+use arrayvec::ArrayVec;
 use smallvec::{SmallVec, smallvec};
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use small_map::FxSmallMap;
 use std::mem;
 use std::rc::Rc;
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -46,7 +51,7 @@ pub mod types;
 use self::autoderef::{AutoderefIter, DEFAULT_MAX_DEREF_DEPTH};
 use self::context::ScopeGuard;
 use self::helpers::{
-    did_you_mean_suggestion, find_similar_names, is_valid_lvalue, levenshtein_distance,
+    did_you_mean_suggestion, find_similar_names, is_valid_lvalue, osa_distance,
 };
 use self::types::{Expectation, TypingContext, typing_context_to_type_ctx};
 pub use contract::{Guarantee, GuaranteeChain, Predicate};
@@ -348,7 +353,7 @@ pub struct SharedCheckState<'input> {
     /// write, so it needs the lock — bodies run in parallel, and the
     /// `retain`+`push` pair must not interleave.  Read (unlocked) only in
     /// Phase B, after every body is done.
-    pub signature_facts: parking_lot::RwLock<
+    pub signature_facts: crate::sync::RwLock<
         Vec<(
             Symbol,
             bool,
@@ -368,29 +373,29 @@ pub struct SharedCheckState<'input> {
     /// Pass 3.  It used to be filled in as Pass 3 walked the top-level
     /// `set mut` items, which made a body's view of it depend on whether
     /// the item had been reached yet.
-    pub mutable_globals: parking_lot::RwLock<HashSet<Symbol>>,
+    pub mutable_globals: crate::sync::RwLock<HashSet<Symbol>>,
     /// Registry of comptime functions: name → (param_names, body).
     /// Populated in Pass 1/2 (both serial, before Pass 3), read-only
     /// thereafter.
     pub comptime_fn_registry:
-        parking_lot::RwLock<HashMap<Symbol, (Vec<Symbol>, Vec<HirStmt<'input>>)>>,
+        crate::sync::RwLock<HashMap<Symbol, (Vec<Symbol>, Vec<HirStmt<'input>>)>>,
     /// Functions whose body accessed a mutable global, discovered during
     /// the body checks themselves (order-independent: membership is a
     /// monotone union, and readers only take it during Pass 3 body
     /// checks, which run after this set is populated for any function
     /// whose access they can observe — see the isolate check).
-    pub functions_accessing_mutables: parking_lot::RwLock<HashSet<DefId>>,
+    pub functions_accessing_mutables: crate::sync::RwLock<HashSet<DefId>>,
 }
 
 impl<'input> Default for SharedCheckState<'input> {
     fn default() -> Self {
         SharedCheckState {
-            signature_facts: parking_lot::RwLock::new(Vec::new()),
+            signature_facts: crate::sync::RwLock::new(Vec::new()),
             effect_of: HashMap::new(),
             method_effect_of: HashMap::new(),
-            mutable_globals: parking_lot::RwLock::new(HashSet::new()),
-            comptime_fn_registry: parking_lot::RwLock::new(HashMap::new()),
-            functions_accessing_mutables: parking_lot::RwLock::new(HashSet::new()),
+            mutable_globals: crate::sync::RwLock::new(HashSet::new()),
+            comptime_fn_registry: crate::sync::RwLock::new(HashMap::new()),
+            functions_accessing_mutables: crate::sync::RwLock::new(HashSet::new()),
         }
     }
 }
@@ -422,7 +427,7 @@ pub struct TypeChecker<'a, 'src, 'input> {
     /// `TypeChecker::new*` call sites — most of them tests — need no
     /// extra argument; `QuerySystem::new()` is a few empty maps, so the
     /// cost of one per checker is negligible.
-    query_system: crate::hir::query::QuerySystem,
+    query_system: crate::hir::query::QuerySystem<'input, 'input, NoOpScheduler>,
     /// Two-phase refactor: function bodies whose HIR is fully checked
     /// and whose signature facts are finalized — the flow-sensitive
     /// borrow-check + move post-passes run over ALL of them in Phase B,
@@ -437,7 +442,7 @@ pub struct TypeChecker<'a, 'src, 'input> {
     /// the block runs on every function-exit edge).
     function_finally: HashMap<Symbol, Vec<HirStmt<'input>>>,
     /// GADT constructions deferred to the post-solve validation phase
-    /// (the committee ruling — solve → default → validate).
+    /// (solve → default → validate).
     pub(crate) pending_gadt_constructs: Vec<PendingGadtConstruct>,
     /// Method-lookup cache (the rustc tcx-query pattern): (ty, name) →
     /// resolved (param_tys, ret_ty, method_def_id) or None.  Cleared
@@ -502,7 +507,7 @@ pub struct TypeChecker<'a, 'src, 'input> {
     /// themselves via `local_type_param_cache.remove(name)`, so any stale
     /// `auto<T>` entry is overwritten when a later function declares its own
     /// `T` as a generic parameter.  The leak is real but unexploitable.
-    local_type_param_cache: HashMap<Symbol, TypeId>,
+    local_type_param_cache: FxSmallMap<16, Symbol, TypeId>,
     /// SCAP-style guarantee chain: tracks outstanding postconditions that must
     /// be discharged on function return (Feng & Shao 2006 §4).
     guarantee_chain: GuaranteeChain<'input>,
@@ -899,7 +904,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             region_tree: RegionTree::new(),
             local_variable_types: ScopedVarMap::new(),
             local_variable_spans: Rc::new(RefCell::new(vec![HashMap::new()])),
-            local_type_param_cache: HashMap::new(),
+            local_type_param_cache: FxSmallMap::new(),
             resolution_map,
             guarantee_chain: GuaranteeChain::new(),
             ghost_var_scopes: Rc::new(RefCell::new(Vec::new())),
@@ -989,16 +994,18 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
     #[must_use]
     pub fn check_program(
         &mut self,
-        program: &Program<'input>,
+        program: &Program<'input, 'src>,
     ) -> Result<HirProgram<'input>, DiagCtxt<'src>>
     where
-        // Pass 3 now fans body checks out through the `CheckFnBody` query,
-        // whose values (`FnBodyCheck<'input>`) must be `'static`-eligible —
-        // the whole pipeline already satisfies this (main.rs leaks the
-        // parse arena; the `check_source` fixtures leak theirs) — and the
-        // harness builder must coerce `self.source: Option<&'src str>`
-        // to `Option<&'input str>`.
-        'input: 'static,
+        // Pass 3 fans body checks out through the `CheckFnBody` query,
+        // whose values (`FnBodyCheck<'input>`) borrow the session for
+        // exactly `'input` — no `'static` bridge is needed (see
+        // `queries::CheckFnBody::compute`).  Merging a worker's
+        // `FnBodyCheck<'input>` diagnostics into `DiagCtxt<'src>` needs
+        // `'input: 'src`; the harness builder (below) needs the reverse,
+        // so the two lifetimes coincide in practice — the driver allocates
+        // the source *in* the arena (`sync_arena.alloc_str`).
+        'input: 'src,
         'src: 'input,
     {
         let mut items = Vec::new();
@@ -1093,7 +1100,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 &mut self.diagnostics,
                 traceback.clone(),
                 self.source,
-            );
+            )
+            .with_experimental(self.enable_experimental);
             // Inject captured variable values (from pre-collected literals).
             for (capture, val) in &captured_literals {
                 if let Some(val) = val {
@@ -1116,29 +1124,13 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         Ok(_) => Ok(()),
                         Err(e) => {
                             let msg = if traceback.is_empty() {
-                                crate::tr!("comptime error: {e}", e = e)
+                                crate::tr!("comptime-error", e = DisplayArg(&e))
                             } else {
                                 let tb_str: Vec<String> = traceback
                                     .iter()
                                     .map(|(reason, span)| {
-                                        let r = match reason {
-                                            ComptimeReason::ComptimeBlock => {
-                                                "comptime { ... } block"
-                                            }
-                                            ComptimeReason::ComptimeFnDef => {
-                                                "comptime def function body"
-                                            }
-                                            ComptimeReason::ComptimeFnCall => {
-                                                "comptime function call"
-                                            }
-                                            ComptimeReason::ComptimeTest => {
-                                                "@comptime_test function"
-                                            }
-                                            ComptimeReason::Assertion => "assert!()",
-                                            ComptimeReason::TypeInfo => "@typeInfo!()",
-                                            ComptimeReason::LayoutOf => "layout_of!()",
-                                        };
-                                        if span.start != 0 || span.end != 0 {
+                                        let r = reason.as_str();
+                                        if let Some(span) = span {
                                             format!("  · {r} at offset {}", span.start)
                                         } else {
                                             format!("  · {r}")
@@ -1150,6 +1142,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                     e,
                                     tb_str.join("\n"),
                                 )
+                                .into()
                             };
                             // Push once; adorn_with_span will add span/source.
                             // Dispatch the error code by the cause: a
@@ -1250,6 +1243,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         // run below (barrier items register methods into the main env).
         let body_harness = crate::session::BodyCheckHarness {
             shared: self.shared.clone(),
+            session_stamp: &*self.ctx as *const _ as usize,
             strict_mode: self.strict_mode,
             enable_experimental: self.enable_experimental,
             features: self.features.clone(),
@@ -1304,7 +1298,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     .map(|&i| {
                         let span = program.items[i].span();
                         let mut h = rustc_hash::FxHasher::default();
-                        src.get(span.start..span.end)
+                        src.get(span.start as usize..span.end as usize)
                             .unwrap_or("")
                             .hash(&mut h);
                         h.finish()
@@ -1330,6 +1324,11 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 &*self.trait_env,
                 &self.resolution_map,
                 program,
+            )
+            .with_arena(
+                self.ctx
+                    .arena
+                    .expect("check_program requires a session arena on the TypeContext"),
             )
             .with_body_check(&*self.ctx, body_harness.clone());
             let outcomes = self.query_system.par_get::<CheckFnBody>(&keys, &provider);
@@ -1511,9 +1510,9 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 let span = errors
                     .first()
                     .and_then(|e| e.span())
-                    .unwrap_or(crate::ast::Span::new(0, 0));
+                    .unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0));
                 self.diagnostics.push(
-                    Diagnostic::error(crate::tr!("trait solver error: {msg}", msg = msg))
+                    Diagnostic::error(crate::tr!("trait-solver-error", msg = msg))
                         .with_code_str("E030")
                         .with_span(span),
                 );
@@ -1535,8 +1534,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         match result {
             Ok(()) => {
                 self.ctx.commit_transaction();
-                // The post-solve GADT validation phase (the committee
-                // ruling — solve → default → validate): constructions
+                // The post-solve GADT validation phase
+                // (solve → default → validate): constructions
                 // deferred during inference are validated now that the
                 // type arguments are concrete.
                 self.validate_pending_gadt_constructs();
@@ -1603,7 +1602,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     }
                     for msg in move_errors {
                         self.diagnostics
-                            .push(Diagnostic::error(&msg).with_code_str("E114"));
+                            .push(Diagnostic::error(msg).with_code_str("E114"));
                     }
                 }
                 // ── Retry deferred top-level trait obligations ──
@@ -1659,7 +1658,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         let span = errors
                             .first()
                             .and_then(|e| e.span())
-                            .unwrap_or(crate::ast::Span::new(0, 0));
+                            .unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0));
                         self.diagnostics.push(
                             Diagnostic::error(format!("trait solver error: {}", msg))
                                 .with_code_str("E030")
@@ -1704,20 +1703,19 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         }
     }
 
-    /// Loop-invariant inference (integration, hint-only per the
-    /// 2026-08-13 committee ruling): translate the HIR loop, run the
+    /// Loop-invariant inference (integration, hint-only): translate the
+    /// HIR loop, run the
     /// widened fixpoint, gate the candidates through the SMT consistency
     /// check, and report the survivors as a note.  Candidates NEVER
     /// discharge obligations by themselves — the solver stays the
     /// authority.  Non-translatable loops are skipped silently
     /// (fail-closed).
     ///
-    /// Note (2026-08-13/14 rulings, INVARIANT VERIFICATION WIRED): the
-    /// declared `while` loop `invariant` clause is an OBLIGATION — per the
-    /// language-owner ruling, the clause is verified, not decorative.  The
-    /// inferred BII candidates are the premise; the check is exact
-    /// difference-constraint self-discharge first (`expr_entails_typed`,
-    /// founder bifurcation), SMT discharge fallback (`SmtSolver::discharge`),
+    /// Note (INVARIANT VERIFICATION WIRED): the declared `while` loop
+    /// `invariant` clause is an OBLIGATION — the clause is verified, not
+    /// decorative.  The inferred BII candidates are the premise; the check
+    /// is exact difference-constraint self-discharge first
+    /// (`expr_entails_typed`), SMT discharge fallback (`SmtSolver::discharge`),
     /// and a compile error when the invariant cannot be proven.  The
     /// `decreases` clause and `@hint(assertion)` wiring follow separately.
     /// The BII candidates themselves stay advisory notes (the solver stays
@@ -1928,7 +1926,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         // Computed BEFORE `smt` is borrowed (both touch `self` —
         // `hir_uses_wrap` needs `&self`).
         //
-        // D7: wrap semantics also follow from the TYPE-LEVEL overflow
+        // Wrap semantics also follow from the TYPE-LEVEL overflow
         // policy, not just from an explicit `+%` operator (ArithSem
         // resolution order: operator suffix > type policy > default
         // trap). A `UInt<8> with overflow = wrap` loop using plain `+`
@@ -2014,8 +2012,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         // obligation_provable); DBM-fallback candidates are
         // difference-constraint expressions over the same variables.
 
-        // Independent verification gets a LONGER budget than synthesis
-        // (committee ruling on the verifier-overhead decision point):
+        // Independent verification gets a LONGER budget than synthesis:
         // re-tune the shared solver instance in place, then restore.
         // Counterexample → report an error (synthesis-layer bug); the
         // report is deferred until the `smt` borrow ends (see below).
@@ -2178,7 +2175,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         }
         // Independent verification found a counterexample: the synthesized
         // template is NOT inductive — a synthesis-layer bug. Report an
-        // error (committee ruling on the verifier-overhead decision point).
+        // error.
         if verify_counterexample {
             self.diagnostics.push(
                 crate::diagnostics::Diagnostic::error(
@@ -2193,8 +2190,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         }
         // The DECLARED loop `invariant` is an obligation — verify it
         // against the inferred candidates (exact self-discharge first,
-        // SMT discharge fallback, error when unprovable).  Per the
-        // language-owner ruling the clause must be verified, not decorative.
+        // SMT discharge fallback, error when unprovable).  The clause must
+        // be verified, not decorative.
         if let Some(inv) = invariant {
             self.verify_loop_invariant(inv, &candidates, &vars, span, use_bv);
         }
@@ -2233,10 +2230,9 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         }
     }
 
-    /// Verify a DECLARED loop `invariant` clause — an obligation per
-    /// the language-owner ruling, not decoration.  Exact
-    /// difference-constraint self-discharge first (`expr_entails_typed`,
-    /// founder bifurcation: an exact decision is self-verifying), then SMT
+    /// Verify a DECLARED loop `invariant` clause — an obligation, not
+    /// decoration.  Exact difference-constraint self-discharge first
+    /// (`expr_entails_typed`, an exact decision is self-verifying), then SMT
     /// discharge (`SmtSolver::discharge`, `∧candidates ⟹ invariant` =
     /// unsat), and finally a compile error when unprovable (fail-closed).
     fn verify_loop_invariant(
@@ -2254,7 +2250,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
 
     /// Is `obligation` entailed by `∧candidates`?  Exact
     /// difference-constraint self-discharge first (`expr_entails_typed` —
-    /// the founder-bifurcation exact decision), then SMT discharge
+    /// the exact decision), then SMT discharge
     /// (`SmtSolver::discharge`, unsat = entailed).  Fail-closed: `false`
     /// on unknown/unavailable/untranslatable — the caller rejects.
     fn obligation_provable(
@@ -2274,7 +2270,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         });
         // Exact path: `∧candidates ⟹ obligation` inside the
         // difference-constraint sub-language. BV gate (explicit
-        // contract, committee ruling boundary): a wrap-semantics loop
+        // contract boundary): a wrap-semantics loop
         // (use_bv) skips the LIA exact channel entirely — its
         // candidates/obligations belong to the BV discharge below (the
         // same routing as the synthesis side). LIA order relations
@@ -2291,7 +2287,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     left: conj,
                     op: crate::ast::BinOp::And,
                     right: *c,
-                    span: crate::ast::Span::new(0, 0),
+                    span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 });
             }
             match crate::hir::type_eq::expr_entails_typed(conj, obligation, is_int) {
@@ -2358,7 +2354,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             // uniform width would truncate mixed-width loops (an `Int<8>`
             // loop with an `Int<16>` variable) and falsely discharge —
             // or falsely reject — their obligations.
-            let widths: std::collections::HashMap<Symbol, u8> = vars
+            let widths: FxSmallMap<32, Symbol, u8> = vars
                 .iter()
                 .filter_map(|sym| {
                     let ty = self.local_variable_types.get(*sym)?;
@@ -2443,8 +2439,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
     /// decrease on every iteration.  Query:
     /// `∀X,X'. (∧candidates(X) ∧ G(X) ∧ T(X,X')) → dec(X') < dec(X)`; the
     /// SMT text asserts the NEGATION and expects `unsat`.  Unprovable /
-    /// unavailable / unknown → reject (fail-closed, per the
-    /// language-owner ruling).
+    /// unavailable / unknown → reject (fail-closed).
     #[allow(clippy::too_many_arguments)] // full verification context — grouped by the caller
     fn verify_loop_decreases(
         &mut self,
@@ -2496,7 +2491,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             // the sort mismatch, and every compound `decreases` on a
             // non-64-bit loop fails closed.  The primed entry mirrors
             // the declared `_p` constant (same width).
-            let widths_map: std::collections::HashMap<Symbol, u8> = vars
+            let widths_map: FxSmallMap<32, Symbol, u8> = vars
                 .iter()
                 .copied()
                 .zip(widths.iter().copied())
@@ -3460,7 +3455,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             } => {
                 let ret_ty = self.resolve_type(return_type)?;
                 let mut hir_params = Vec::new();
-                for p in params {
+                for p in *params {
                     let p_ty = if let Some(ref ty) = p.ty {
                         self.resolve_type(ty)?
                     } else {
@@ -3826,7 +3821,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     // defined later in the source are available at evaluation time.
                     // After Pass 2 completes, all deferred blocks are evaluated.
                     self.deferred_comptime_blocks
-                        .push((captures.clone(), hir.clone(), ty, *span));
+                        .push((captures.to_vec(), hir.clone(), ty, *span));
                 } else {
                     // Evaluate the comptime block at compile time.
                     // Pre-collect literal values for captures before any mutable borrow of self.
@@ -3854,7 +3849,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         }
                         if let Some(binding) = self
                             .symbols
-                            .lookup_variable(*capture, crate::ast::Span::new(0, 0))
+                            .lookup_variable(*capture, crate::ast::Span::new(FileId::DUMMY, 0, 0))
                         {
                             if binding.mutable {
                                 self.diagnostics.push(
@@ -3902,7 +3897,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         &mut self.diagnostics,
                         outer_tb,
                         self.source,
-                    );
+                    )
+                    .with_experimental(self.enable_experimental);
                     eval.set_trusted(*trusted);
                     // Inject captured literal values into eval context.
                     for (capture, val) in &captured_literals {
@@ -3925,7 +3921,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     }
                 }
                 Ok(HirStmt::ComptimeBlock {
-                    captures: captures.clone(),
+                    captures: captures.to_vec(),
                     trusted: *trusted,
                     body: hir,
                     ty,
@@ -4024,7 +4020,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 let prev_span = self.span_get(var_name).unwrap_or(*span);
                 dup_diag = Some(
                     Diagnostic::error_kind(DiagnosticKind::DuplicateDefinition {
-                        name: var_name.to_string(),
+                        name: var_name.to_string().into(),
                         this_span: *span,
                         original_span: prev_span,
                     })
@@ -4035,8 +4031,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 let prev_span = self.span_get(var_name).unwrap_or(*span);
                 self.diagnostics.push(
                     Diagnostic::warning(crate::tr!(
-                        "shadowing definition of `{name}`",
-                        name = var_name.as_str()
+                        "shadowing-definition",
+                        name = DisplayArg(var_name.as_str())
                     ))
                     .with_code_str("W113")
                     .with_span(*span)
@@ -4144,7 +4140,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 // dead bookkeeping).
                 let res = (|| {
                     let mut stmts = Vec::new();
-                    for s in else_branch {
+                    for s in *else_branch {
                         stmts.push(self.check_stmt(s)?);
                     }
                     Ok(stmts)
@@ -4162,7 +4158,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     d.related_errors_mut()
                         .push(crate::diagnostics::RelatedError {
                             code: rhs_err.code().cloned(),
-                            message: rhs_err.message().to_string(),
+                            message: rhs_err.message().to_string().into(),
                             span: rhs_err.spans().first(),
                             label: None,
                         });
@@ -4280,7 +4276,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                 self.ctx,
                                 self.symbols,
                                 &mut self.diagnostics,
-                            );
+                            )
+                            .with_experimental(self.enable_experimental);
                             // Register comptime functions so that
                             // pure comptime function calls in the
                             // initializer resolve correctly.
@@ -4433,7 +4430,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             _ => {
                 let msg = format!("check_stmt: expected ImplBlock, got {:?}", stmt);
                 self.diagnostics
-                    .push(Diagnostic::error(&msg).with_span(stmt.span()));
+                    .push(Diagnostic::error(msg).with_span(stmt.span()));
                 return Ok(HirStmt::Error);
             }
         };
@@ -4452,8 +4449,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             .filter(|tp| matches!(tp.kind, crate::ast::TypeParamKind::Const { .. }))
             .map(|tp| tp.name)
             .collect();
-        let mut const_param_value_types: std::collections::HashMap<Symbol, TypeId> =
-            std::collections::HashMap::default();
+        let mut const_param_value_types: FxSmallMap<16, Symbol, TypeId> = FxSmallMap::new();
         for tp in type_params.iter() {
             if let crate::ast::TypeParamKind::Const { ty, .. } = &tp.kind {
                 if let Ok(value_ty) = self.resolve_type(ty) {
@@ -4554,8 +4550,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 if !impl_method_names.contains(tm_name) {
                     self.diagnostics.push(
                         Diagnostic::error_kind(DiagnosticKind::ImplMissingMethod {
-                            trait_name: Self::type_to_string(tp),
-                            method_name: tm_name.to_string(),
+                            trait_name: Self::type_to_string(tp).into(),
+                            method_name: tm_name.to_string().into(),
                             impl_span: span,
                             trait_span: trait_binding.span,
                         })
@@ -4574,9 +4570,9 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
 
             // Resolve method param/return types and register the impl
             let mut method_infos = Vec::new();
-            for m in methods {
+            for m in *methods {
                 let mut param_tys: SmallVec<[TypeId; 4]> = SmallVec::new();
-                for p in &m.params {
+                for p in m.params {
                     let ty = if let Some(ty) = &p.ty {
                         let resolved = self.resolve_self_ty(ty, self_ty);
                         self.resolve_type(&resolved)?
@@ -4648,7 +4644,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             let candidate = crate::hir::traits::ImplCandidate {
                 trait_id,
                 for_type: for_ty,
-                methods: methods.clone(),
+                methods: methods.to_vec(),
                 resolved_methods: method_infos.clone(),
                 assoc_tys,
                 span,
@@ -4783,7 +4779,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             // Type-check each method body AFTER registration (the
             // impl is visible via add_impl/add_inherent_methods now,
             // so a body may call a sibling method `self.b()`).
-            for m in methods {
+            for m in *methods {
                 self.check_method_body(
                     m,
                     &for_type,
@@ -4808,7 +4804,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 attributes: attributes.clone(),
                 trait_path: Some(trait_id),
                 for_type: for_ty,
-                methods: methods.clone(),
+                methods: methods.to_vec(),
                 associated_types: Vec::new(),
             })
         } else {
@@ -4827,9 +4823,9 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             let self_ty = &for_type; // The original AST type for Self
             let auto_deref = attributes.iter().any(|a| a.name.eq_str("auto_deref"));
             let mut method_infos = Vec::new();
-            for m in methods {
+            for m in *methods {
                 let mut param_tys: SmallVec<[TypeId; 4]> = SmallVec::new();
-                for p in &m.params {
+                for p in m.params {
                     let ty = if let Some(ty) = &p.ty {
                         let resolved = self.resolve_self_ty(ty, self_ty);
                         self.resolve_type(&resolved)?
@@ -4872,7 +4868,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             // The new methods invalidate the method-lookup cache.
             self.method_cache.clear();
             // Type-check each method body AFTER registration.
-            for m in methods {
+            for m in *methods {
                 // Type-check the method body (methods are
                 // functions — same gating and body checking).
                 self.check_method_body(
@@ -4894,7 +4890,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 attributes: attributes.clone(),
                 trait_path: None,
                 for_type: for_ty,
-                methods: methods.clone(),
+                methods: methods.to_vec(),
                 associated_types: Vec::new(),
             })
         }
@@ -4903,8 +4899,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
     /// `@no_panic` body verification (SYNTAX.md §Effect Annotations): the
     /// function must never panic.  Scan the HIR body for
     /// - default-trap floating-point arithmetic (the float default
-    ///   overflow policy is `trap`, aligned with integers — the
-    ///   2026-08-08 committee ruling);
+    ///   overflow policy is `trap`, aligned with integers);
     /// - explicit trap operators (`+!` / `-!` / `*!`);
     /// - `panic` calls;
     /// - calls to functions that are not themselves `@no_panic`.
@@ -4915,8 +4910,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
     /// `@no_panic` body verification (SYNTAX.md §Effect Annotations): the
     /// function must never panic.  Scan the HIR body for
     /// - default-trap floating-point arithmetic (the float default
-    ///   overflow policy is `trap`, aligned with integers — the
-    ///   2026-08-08 committee ruling);
+    ///   overflow policy is `trap`, aligned with integers);
     /// - explicit trap operators (`+!` / `-!` / `*!`);
     /// - `panic` calls;
     /// - calls to functions that are not themselves `@no_panic`.
@@ -5116,8 +5110,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         // allows a const param to be bound only to a type consistent
         // with its value type (the monomorphization) — an unrelated
         // concrete type (e.g. N := Bool) is a generality violation.
-        let mut const_param_value_types: std::collections::HashMap<Symbol, TypeId> =
-            std::collections::HashMap::default();
+        let mut const_param_value_types: FxSmallMap<16, Symbol, TypeId> = FxSmallMap::new();
         for tp in type_params.iter() {
             if let crate::ast::TypeParamKind::Const { ty, .. } = &tp.kind {
                 if let Ok(value_ty) = self.resolve_type(ty) {
@@ -5128,18 +5121,17 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
 
         // ── Where-equality given constraints ────────────
         // `where T == U` / `where T == Int<32>` establish a given
-        // equivalence within the function body (committee ruling):
+        // equivalence within the function body:
         // unify the two sides so T and U become interchangeable,
         // and a concrete RHS resolves T.  Plain unification has
         // union-find semantics — circular equalities are harmless
         // (already-equivalent types unify trivially), NOT a rewrite
         // chain (so E064's cycle concern does not apply).
         //
-        // Founder's ruling: cycles are ACCEPTED (union-find), but a
-        // redundant closing edge (the two sides already equivalent)
-        // is flagged with a WARNING — the committee's "looks odd ⇒
-        // likely a programmer error" tradition, minus the overly
-        // aggressive compile error.
+        // Cycles are ACCEPTED (union-find), but a redundant closing edge
+        // (the two sides already equivalent) is flagged with a WARNING —
+        // the "looks odd ⇒ likely a programmer error" heuristic, minus
+        // the overly aggressive compile error.
         if let Some(wc) = where_clause.as_ref() {
             for eq in &wc.equalities {
                 if let (Ok(l), Ok(r)) = (self.resolve_type(&eq.left), self.resolve_type(&eq.right))
@@ -5175,7 +5167,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         }
 
         let mut hir_params = Vec::new();
-        for param in params {
+        for param in *params {
             let param_ty = if let Some(ty) = &param.ty {
                 self.resolve_type(ty)?
             } else {
@@ -5758,7 +5750,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         let body_result = if let Some(body) = body {
             let mut stmts = Vec::new();
             let mut body_err = None;
-            for s in body {
+            for s in *body {
                 match guard.checker.check_stmt(s) {
                     Ok(hir) => stmts.push(hir),
                     Err(e) => {
@@ -5895,8 +5887,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     let resolved = guard.checker.ctx.resolve_binding(return_ty);
                     guard.checker.diagnostics.push(
                         Diagnostic::error_kind(DiagnosticKind::TypeMismatch {
-                            expected: format!("{:?}", guard.checker.ctx.get(guard.checker.ctx.never())),
-                            found: format!("{:?}", guard.checker.ctx.get(resolved)),
+                            expected: format!("{:?}", guard.checker.ctx.get(guard.checker.ctx.never())).into(),
+                            found: format!("{:?}", guard.checker.ctx.get(resolved)).into(),
                             span: *span,
                             found_span: None,
                             reason: Some(
@@ -6498,7 +6490,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
 
         let finally_hir = if let Some(finally) = finally {
             let mut stmts = Vec::new();
-            for s in finally {
+            for s in *finally {
                 stmts.push(self.check_stmt(s)?);
             }
             // The Infallible constraint (SYNTAX.md §Structured
@@ -6566,7 +6558,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         // violation) — but a BODY-driven concrete
                         // binding of the equivalence class must
                         // still fire E104.
-                        let mut out = Vec::new();
+                        let mut out: ArrayVec<Symbol, 2> = ArrayVec::new();
                         if !is_param(&eq.right)
                             && let crate::ast::Type::Path(p, _) = &eq.left
                             && fn_param_names.contains(&p[0])
@@ -6595,7 +6587,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 wc.equalities
                     .iter()
                     .flat_map(|eq| {
-                        let mut out = Vec::new();
+                        let mut out: ArrayVec<Symbol, 2> = ArrayVec::new();
                         let is_param = |ty: &crate::ast::Type| {
                             matches!(
                                 ty,
@@ -6755,7 +6747,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         &mut self.diagnostics,
                         outer_tb,
                         self.source,
-                    );
+                    )
+                    .with_experimental(self.enable_experimental);
                     for (fn_name, (fn_params, fn_body)) in
                         self.shared.comptime_fn_registry.read().clone()
                     {
@@ -6823,7 +6816,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 && eff.intersects(forbidden)
             {
                 let what = {
-                    let mut parts = Vec::new();
+                    let mut parts: ArrayVec<&'static str, 5> = ArrayVec::new();
                     if eff.contains(EffectSet::MUTABLE_GLOBAL) {
                         parts.push("reads or writes a mutable global");
                     }
@@ -6964,7 +6957,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         self_ty: &crate::ast::Type<'input>,
         impl_param_names: &[Symbol],
         const_param_names: &[Symbol],
-        const_param_value_types: &std::collections::HashMap<Symbol, TypeId>,
+        const_param_value_types: &FxSmallMap<16, Symbol, TypeId>,
     ) -> Result<(), Diagnostic<'src>> {
         let Some(body) = &m.body else {
             return Ok(());
@@ -7000,7 +6993,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         self.push_ctx(CtxKind::Function, m.span, None);
         let _scope = self.enter_var_scope();
         let mut hir_params: Vec<HirParam<'input>> = Vec::new();
-        for p in &m.params {
+        for p in m.params {
             let ty = match &p.ty {
                 Some(t) => {
                     let resolved = self.resolve_self_ty(t, self_ty);
@@ -7149,8 +7142,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         fc.check_pattern(pattern, expected_ty, exist_depth)
     }
 
-    /// The post-solve GADT validation phase (the committee ruling —
-    /// solve → default → validate): constructions deferred during
+    /// The post-solve GADT validation phase (solve → default → validate):
+    /// constructions deferred during
     /// inference are validated now that the type arguments are concrete.
     /// The new E060 trigger: after solve + defaulting, a `when` constraint
     /// is not satisfied.
@@ -7453,7 +7446,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
 
     fn resolve_def_id(&self, path: &[Symbol]) -> Result<DefId, Diagnostic<'src>> {
         if path.is_empty() {
-            return Err(Diagnostic::error("empty path").with_span(Span::new(0, 0)));
+            return Err(Diagnostic::error("empty path").with_span(Span::new(FileId::DUMMY, 0, 0)));
         }
         // Check the resolution map first (populated by NameResolver)
         if path.len() == 1
@@ -7473,12 +7466,12 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             .or_else(|| self.symbols.lookup_trait(path[0]).map(|b| b.def_id))
             .ok_or_else(|| {
                 Diagnostic::error(format!("'{}' not found", path[0].as_str()))
-                    .with_span(Span::new(0, 0))
+                    .with_span(Span::new(FileId::DUMMY, 0, 0))
             })
     }
 
     /// Suggest a cast for common type mismatches (e.g. Int ↔ Float).
-    fn suggest_cast(&self, expected: TypeId, actual: TypeId) -> Option<Suggestion> {
+    fn suggest_cast(&self, expected: TypeId, actual: TypeId) -> Option<Suggestion<'src>> {
         let (e, a) = (self.ctx.get(expected), self.ctx.get(actual));
         let msg = match (e, a) {
             (TypeData::Int { .. }, TypeData::Float { .. })
@@ -7495,13 +7488,19 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             message: m.into(),
             applicability: Applicability::MaybeIncorrect,
             style: SuggestionStyle::ShowAlways,
+            span: None,
+            replacement: None,
         })
     }
 
     /// Generate a human-readable reason for a type mismatch between two
     /// types, explaining *why* they are incompatible.  Returns `None` when
     /// no specific reason can be determined (the types are simply different).
-    pub(crate) fn type_mismatch_reason(&self, expected: TypeId, actual: TypeId) -> Option<String> {
+    pub(crate) fn type_mismatch_reason(
+        &self,
+        expected: TypeId,
+        actual: TypeId,
+    ) -> Option<Cow<'static, str>> {
         let (e, a) = (self.ctx.get(expected), self.ctx.get(actual));
         match (e, a) {
             (
@@ -7517,31 +7516,29 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 },
             ) => {
                 if eb != ab {
-                    Some(format!("Int<{eb}> is not the same width as Int<{ab}>"))
+                    Some(format!("Int<{eb}> is not the same width as Int<{ab}>").into())
                 } else if es != as_ {
-                    Some(format!(
-                        "signed Int<{eb}> is not the same as unsigned Int<{eb}>"
-                    ))
+                    Some(format!("signed Int<{eb}> is not the same as unsigned Int<{eb}>").into())
                 } else {
                     None
                 }
             }
-            (TypeData::Int { .. }, TypeData::UInt { bits: ab, .. }) => Some(format!(
-                "signed integer is not the same as unsigned UInt<{ab}>"
-            )),
-            (TypeData::UInt { bits: eb, .. }, TypeData::Int { .. }) => Some(format!(
-                "unsigned UInt<{eb}> is not the same as signed integer"
-            )),
+            (TypeData::Int { .. }, TypeData::UInt { bits: ab, .. }) => {
+                Some(format!("signed integer is not the same as unsigned UInt<{ab}>").into())
+            }
+            (TypeData::UInt { bits: eb, .. }, TypeData::Int { .. }) => {
+                Some(format!("unsigned UInt<{eb}> is not the same as signed integer").into())
+            }
             (TypeData::UInt { bits: eb, .. }, TypeData::UInt { bits: ab, .. }) => {
                 if eb != ab {
-                    Some(format!("UInt<{eb}> is not the same width as UInt<{ab}>"))
+                    Some(format!("UInt<{eb}> is not the same width as UInt<{ab}>").into())
                 } else {
                     None
                 }
             }
             (TypeData::Float { bits: eb }, TypeData::Float { bits: ab }) => {
                 if eb != ab {
-                    Some(format!("Float<{eb}> is not the same width as Float<{ab}>"))
+                    Some(format!("Float<{eb}> is not the same width as Float<{ab}>").into())
                 } else {
                     None
                 }
@@ -7570,8 +7567,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             .map_err(|_err| {
                 let reason = self.type_mismatch_reason(expected, actual);
                 let mut diag = Diagnostic::error_kind(DiagnosticKind::TypeMismatch {
-                    expected: format!("{:?}", self.ctx.get(expected)),
-                    found: format!("{:?}", self.ctx.get(actual)),
+                    expected: format!("{:?}", self.ctx.get(expected)).into(),
+                    found: format!("{:?}", self.ctx.get(actual)).into(),
                     span,
                     found_span: None,
                     reason,
@@ -7729,8 +7726,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 | BinOp::SubTrap
                 | BinOp::MulTrap
         ) {
-            // The committee ruling (float default `trap` — aligned with
-            // integers): overflow-suffixed operators accept BOTH integer
+            // Float default `trap` (aligned with integers): overflow-
+            // suffixed operators accept BOTH integer
             // (wrap/saturate/trap) and float operands (float `+%` is IEEE
             // semantics — an explicit opt-in; `+?` saturates; `+!` traps).
             let is_num = self.ctx.is_integer(left)
@@ -8807,9 +8804,9 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         }
 
         // Build an informative error message
-        let type_name = format!("{:?}", self.ctx.get(ty));
+        let type_name = format!("{:?}", self.ctx.get(ty)).into();
         let mut diag = Diagnostic::error_kind(DiagnosticKind::NoSuchField {
-            field_name: name.to_string(),
+            field_name: name.to_string().into(),
             type_name,
             span,
         })
@@ -9096,7 +9093,11 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             && let Expr::Literal(Literal::Int(val), _) = expr
         {
             match val.to_u64() {
-                Some(n) if n <= 64 => Some(n as u32),
+                // 1..=128 is the widest this can be (with the flag); the
+                // resolver's `resolve_int_width` owns the range diagnostic,
+                // so this stays silent and permissive.  The `FnCtxt` call
+                // sites clamp `0` to the default width.
+                Some(n) if n <= 128 => Some(n as u32),
                 _ => None, // reject out-of-range or negative bit widths silently
             }
         } else {
@@ -10046,7 +10047,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             .position(|p| p == param_name)
             .and_then(|i| skolems.get(i))
         {
-            // Rule 3 (the committee ruling — the reserved extension point): a
+            // Rule 3 (the reserved extension point): a
             // `when X == Y` equality where the RHS references ANOTHER
             // existential variable.  The two witnesses are equivalent and
             // interchangeable.  Register the equivalence deterministically
@@ -10073,9 +10074,9 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             // `when X == Int<32>` where X is an `exists` param).
             //
             // Witness solving: when the RHS is CLOSED (no unresolved vars),
-            // the language-designer ruling (2026-08-04) permits refinement
-            // via `register_gadt_eq_directional` (which handles the skolem
-            // branch with `ParamRefinement` + warn).  An open RHS stays
+            // refinement is permitted via `register_gadt_eq_directional`
+            // (which handles the skolem branch with `ParamRefinement` +
+            // warn).  An open RHS stays
             // inert as an `ExistentialEquation` — the witness remains
             // opaque (opacity is the DEFAULT, solving is opt-in per
             // consumer — GHC-style explicit coercion / OCaml's GADT
@@ -10216,8 +10217,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             }
             // GADT existential skolem on the SCRUTINEE side: the equality
             // involves an opaque witness.  When the RHS is CLOSED (no
-            // unresolved vars), the language-designer ruling (2026-08-04)
-            // permits refinement: register a `ParamRefinement` + emit a
+            // unresolved vars), refinement is permitted: register a
+            // `ParamRefinement` + emit a
             // warning (the syntax is unusual).  An open RHS (containing
             // another skolem, GenericParam, or InferVar) stays inert as
             // an `ExistentialEquation` — the witness remains opaque.
@@ -10853,7 +10854,7 @@ fn extract_labels_from_expr<'input>(e: &Expr<'input>) -> Vec<Symbol> {
         }
         Expr::Call { callee, args, .. } => {
             labels.extend(extract_labels_from_expr(callee));
-            for arg in args {
+            for arg in *args {
                 labels.extend(extract_labels_from_expr(arg));
             }
         }
@@ -10864,11 +10865,11 @@ fn extract_labels_from_expr<'input>(e: &Expr<'input>) -> Vec<Symbol> {
             ..
         } => {
             labels.extend(extract_labels_from_expr(cond));
-            for stmt in then_branch {
+            for stmt in *then_branch {
                 labels.extend(extract_labels_from_stmt(stmt));
             }
             if let Some(stmts) = else_branch {
-                for stmt in stmts {
+                for stmt in *stmts {
                     labels.extend(extract_labels_from_stmt(stmt));
                 }
             }
@@ -10988,8 +10989,8 @@ impl<'me, 'a, 'src, 'input> crate::hir::visit::HirVisitor<'input>
             } => {
                 let explicit_trap = matches!(op, BinOp::AddTrap | BinOp::SubTrap | BinOp::MulTrap);
                 // Default float arithmetic traps: the float default
-                // overflow policy is `trap` (aligned with integers —
-                // committee ruling), so a plain `+`/`-`/`*`/`/`/`%` on
+                // overflow policy is `trap` (aligned with integers), so a
+                // plain `+`/`-`/`*`/`/`/`%` on
                 // floats can panic (NaN/∞/div-by-zero).  `+%` (AddWrap)
                 // is IEEE — allowed; `+?` (saturate) — allowed;
                 // `+!` (trap) — caught above.
@@ -11288,10 +11289,12 @@ fn replace_codomain<'input>(
             span,
         } => arena.alloc(Expr::Call {
             callee: replace_codomain(arena, callee, replacement),
-            args: args
-                .iter()
-                .map(|a| replace_codomain(arena, a, replacement).clone())
-                .collect(),
+            args: arena.alloc_slice_clone(
+                &args
+                    .iter()
+                    .map(|a| replace_codomain(arena, a, replacement).clone())
+                    .collect::<Vec<_>>(),
+            ),
             comptime: *comptime,
             span: *span,
         }),
@@ -11310,14 +11313,19 @@ fn replace_codomain<'input>(
 }
 
 /// Collect a comptime traceback from a slice of comptime frames.
-/// Returns structured (ComptimeReason, Span) pairs for flexible rendering.
+/// Returns structured (ComptimeReason, Option<Span>) pairs for flexible
+/// rendering (`None` = no source position, the old `(0,0)` sentinel).
 fn format_comptime_traceback_inner(
     frames: &[&CtxFrame],
     _source: Option<&str>,
-) -> Vec<(ComptimeReason, Span)> {
+) -> Vec<(ComptimeReason, Option<Span>)> {
     frames
         .iter()
-        .filter_map(|frame| frame.comptime_reason.map(|reason| (reason, frame.span)))
+        .filter_map(|frame| {
+            frame
+                .comptime_reason
+                .map(|reason| (reason, crate::diagnostics::kind::maybe_span(frame.span)))
+        })
         .collect()
 }
 
@@ -11340,7 +11348,7 @@ fn contains_runtime_ident<'input>(
     expr: &HirExpr<'input>,
     ghost_var_scopes: &[HashSet<Symbol>],
     runtime_var_scopes: &[HashSet<Symbol>],
-    local_params: &HashMap<Symbol, TypeId>,
+    local_params: &FxSmallMap<16, Symbol, TypeId>,
 ) -> bool {
     match expr {
         HirExpr::Ident(name, _, _) => {
@@ -11491,7 +11499,7 @@ fn contains_stmt_runtime_ident<'input>(
     stmt: &HirStmt<'input>,
     ghost_var_scopes: &[HashSet<Symbol>],
     runtime_var_scopes: &[HashSet<Symbol>],
-    local_params: &HashMap<Symbol, TypeId>,
+    local_params: &FxSmallMap<16, Symbol, TypeId>,
 ) -> bool {
     match stmt {
         HirStmt::VariableDef { value, .. } => value.as_ref().map_or(false, |v| {
@@ -11671,7 +11679,7 @@ fn scalar_uses_signed(e: &crate::hir::loop_ir::ScalarExpr, signed: &[bool]) -> b
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 pub mod tests;
 
 /// Collect the non-Copy variable roots for the static move check —
@@ -11782,10 +11790,13 @@ fn collect_expr_non_copy_roots<'input>(
 /// need `&mut TypeContext`, so they are resolved once per impl block
 /// rather than once per method).
 
-pub(crate) fn pre_register_signatures<'src, 'input: 'a, 'a>(
+pub(crate) fn pre_register_signatures<'src, 'input, 'a>(
     checker: &mut TypeChecker<'a, 'src, 'input>,
-    program: &crate::ast::Program<'input>,
-) {
+    program: &crate::ast::Program<'input, 'src>,
+) where
+    'src: 'input,
+    'input: 'a,
+{
     use crate::hir::query::queries::{CheckFnSignature, FnId};
 
     /// One registry slot, before its facts have been computed.
@@ -11862,19 +11873,29 @@ pub(crate) fn pre_register_signatures<'src, 'input: 'a, 'a>(
     //
     // The provider borrows the checker immutably; it is dropped before the
     // registry is mutated below.
-    let facts: Vec<Result<_, crate::hir::query::QueryCycleError>> = {
+    let facts: Vec<Result<_, crate::hir::query::QueryError>> = {
         let provider = crate::session::SessionQueryProvider::new(
             &checker.query_system,
             checker.symbols,
             &*checker.trait_env,
             &checker.resolution_map,
             program,
+        )
+        .with_arena(
+            checker
+                .ctx
+                .arena
+                .expect("pre_register_signatures requires a session arena on the TypeContext"),
         );
         slots
             .iter()
             .map(|s| {
                 checker
                     .query_system
+                    // Arena storage: `get` now returns `&'q FnSignatureFacts`
+                    // (a Copy borrow into the session arena) — no `Arc`, no
+                    // clone.  Pass C clones the two fields it publishes into
+                    // the owned registry.
                     .get::<CheckFnSignature>(s.key, &provider)
             })
             .collect()
@@ -11887,12 +11908,16 @@ pub(crate) fn pre_register_signatures<'src, 'input: 'a, 'a>(
         // broke, and dropping the entry is the safe direction (a missing
         // A(ρ) entry under-freezes; a wrong one over-freezes).
         if let Ok(f) = computed {
+            // `f` is `&'q FnSignatureFacts` (arena storage): the registry
+            // owns its entries, so publish clones of the borrowed fields.
+            // This is the one explicit clone the arena conversion adds —
+            // the cache hit path itself is a bare pointer copy.
             checker.shared.signature_facts.write().push((
                 slot.name,
                 slot.is_method,
                 slot.receiver,
-                f.input_positions,
-                f.facts,
+                f.input_positions.clone(),
+                f.facts.clone(),
             ));
         }
     }
@@ -12151,7 +12176,7 @@ impl<'ast, 'src, 'input: 'a, 'a> crate::ast::visit::Visitor<'ast, 'input>
 /// the isolate and `@pure` checks consult this map.
 pub(crate) fn collect_function_effects<'src, 'input: 'a, 'a>(
     checker: &mut TypeChecker<'a, 'src, 'input>,
-    program: &crate::ast::Program<'input>,
+    program: &crate::ast::Program<'input, 'src>,
 ) {
     // 1. Top-level mutable globals: `set mut x = ...` at module scope.
     let mut globals: HashSet<Symbol> = HashSet::new();
@@ -12262,7 +12287,7 @@ pub(crate) fn collect_function_effects<'src, 'input: 'a, 'a>(
             let Some(receiver_def) = checker.ctx.get_def_id_for_type(receiver_ty) else {
                 continue;
             };
-            for m in methods {
+            for m in *methods {
                 // The method's OWN DefId — the resolver allocated and
                 // registered it under (receiver DefId, name); look it back
                 // up (fallback: allocate fresh, defensive — resolver runs
@@ -12277,7 +12302,7 @@ pub(crate) fn collect_function_effects<'src, 'input: 'a, 'a>(
                 // their declared type's DefId (pointee for `&T`).
                 let mut receivers: HashMap<Symbol, DefId> = HashMap::new();
                 receivers.insert(Symbol::intern("self"), receiver_def);
-                for p in &m.params {
+                for p in m.params {
                     if p.name.eq_str("self") {
                         continue;
                     }

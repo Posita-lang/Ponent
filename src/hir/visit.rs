@@ -523,7 +523,7 @@ pub fn walk_hir_param<'hir, V: HirVisitor<'hir>>(visitor: &mut V, param: &HirPar
     visitor.visit_type_id(param.ty)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod smoke_tests {
     use super::*;
 

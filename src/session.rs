@@ -20,7 +20,7 @@
 
 use crate::ast::Program;
 use crate::hir::checker::SharedCheckState;
-use crate::hir::query::{CompilerSessionView, QueryProvider, QuerySystem};
+use crate::hir::query::{CompilerSessionView, NoOpScheduler, QueryProvider, QuerySystem};
 use crate::hir::resolver::ResolutionMap;
 use crate::hir::symbol::SymbolTable;
 use crate::hir::target::Target;
@@ -47,6 +47,13 @@ use crate::hir::types::TypeContext;
 #[derive(Clone)]
 pub struct BodyCheckHarness<'input> {
     pub shared: std::sync::Arc<SharedCheckState<'input>>,
+    /// Session-lifetime tripwire: the identity (address) of the
+    /// `TypeContext` this harness was built against.  `CheckFnBody::compute`
+    /// asserts that the provider's `ctx_sharing` borrow carries the SAME
+    /// address — a harness paired with a context from another session (the
+    /// "shorter session lifetime drives CheckFnBody" UB mode) fails the
+    /// assert loudly in debug builds instead of silently transmuting.
+    pub session_stamp: usize,
     pub strict_mode: bool,
     pub enable_experimental: bool,
     pub features: Vec<String>,
@@ -55,8 +62,8 @@ pub struct BodyCheckHarness<'input> {
 }
 
 /// All the state one compilation needs, in one place.
-pub struct CompilerSession<'input> {
-    pub system: QuerySystem,
+pub struct CompilerSession<'input, 'src> {
+    pub system: QuerySystem<'input, 'src, NoOpScheduler>,
     pub ctx: TypeContext<'input>,
     pub symbols: SymbolTable<'input>,
     pub trait_env: TraitEnv<'input>,
@@ -64,7 +71,7 @@ pub struct CompilerSession<'input> {
     pub target: Target,
 }
 
-impl<'input> CompilerSession<'input> {
+impl<'input, 'src> CompilerSession<'input, 'src> {
     pub fn new(
         ctx: TypeContext<'input>,
         symbols: SymbolTable<'input>,
@@ -91,12 +98,12 @@ impl<'input> CompilerSession<'input> {
 ///
 /// This is the type that forced `SymbolTable` and `TraitEnv` to become
 /// `Sync`: `QueryProvider: Sync`, so everything it borrows must be too.
-pub struct SessionQueryProvider<'a, 'input> {
-    system: &'a QuerySystem,
+pub struct SessionQueryProvider<'a, 'input, 'src> {
+    system: &'a QuerySystem<'input, 'src, NoOpScheduler>,
     symbols: &'a SymbolTable<'input>,
     trait_env: &'a TraitEnv<'input>,
     resolution_map: &'a ResolutionMap<'input>,
-    program: &'a Program<'input>,
+    program: &'a Program<'input, 'src>,
     /// Read-only borrow of the session's `TypeContext`, opt-in via
     /// [`SessionQueryProvider::with_body_check`]: a body-check compute
     /// derives its OWN worker context with `TypeContext::new_sharing`
@@ -106,15 +113,20 @@ pub struct SessionQueryProvider<'a, 'input> {
     /// Checker config + cross-function tables for body-check workers,
     /// opt-in via [`SessionQueryProvider::with_body_check`].
     body_check: Option<BodyCheckHarness<'input>>,
+    /// The session's allocation arena, opt-in via
+    /// [`SessionQueryProvider::with_arena`]: an [`crate::hir::query::Arena`]
+    /// query's `compute` allocates its value here and the cache stores the
+    /// bare reference (`&'q V`) — no `Arc`, no clone on the hit path.
+    arena: Option<&'a crate::arena::SyncArena<'input>>,
 }
 
-impl<'a, 'input> SessionQueryProvider<'a, 'input> {
+impl<'a, 'input, 'src> SessionQueryProvider<'a, 'input, 'src> {
     pub fn new(
-        system: &'a QuerySystem,
+        system: &'a QuerySystem<'input, 'src, NoOpScheduler>,
         symbols: &'a SymbolTable<'input>,
         trait_env: &'a TraitEnv<'input>,
         resolution_map: &'a ResolutionMap<'input>,
-        program: &'a Program<'input>,
+        program: &'a Program<'input, 'src>,
     ) -> Self {
         SessionQueryProvider {
             system,
@@ -124,6 +136,7 @@ impl<'a, 'input> SessionQueryProvider<'a, 'input> {
             program,
             ctx: None,
             body_check: None,
+            arena: None,
         }
     }
 
@@ -142,19 +155,36 @@ impl<'a, 'input> SessionQueryProvider<'a, 'input> {
         self.body_check = Some(harness);
         self
     }
+
+    /// Opt in to arena-backed query values: attach the session's
+    /// allocation arena so an [`crate::hir::query::Arena`] query's compute
+    /// can allocate its value there.  Builder on top of
+    /// [`SessionQueryProvider::new`] so every existing `new` call site
+    /// keeps its exact shape.
+    pub fn with_arena(mut self, arena: &'a crate::arena::SyncArena<'input>) -> Self {
+        self.arena = Some(arena);
+        self
+    }
 }
 
-impl<'a, 'input> QueryProvider<'input> for SessionQueryProvider<'a, 'input> {
-    fn query_system(&self) -> &QuerySystem {
+impl<'a, 'input, 'src> QueryProvider<'input, 'src, NoOpScheduler>
+    for SessionQueryProvider<'a, 'input, 'src>
+where
+    'input: 'src,
+    'src: 'input,
+{
+    fn query_system(&self) -> &QuerySystem<'input, 'src, NoOpScheduler> {
         self.system
     }
 
-    fn session(&self) -> Option<&dyn CompilerSessionView<'input>> {
+    fn session(&self) -> Option<&dyn CompilerSessionView<'input, 'src>> {
         Some(self)
     }
 }
 
-impl<'a, 'input> CompilerSessionView<'input> for SessionQueryProvider<'a, 'input> {
+impl<'a, 'input, 'src> CompilerSessionView<'input, 'src>
+    for SessionQueryProvider<'a, 'input, 'src>
+{
     fn symbols(&self) -> &SymbolTable<'input> {
         self.symbols
     }
@@ -167,7 +197,7 @@ impl<'a, 'input> CompilerSessionView<'input> for SessionQueryProvider<'a, 'input
         self.resolution_map
     }
 
-    fn program(&self) -> &Program<'input> {
+    fn program(&self) -> &Program<'input, 'src> {
         self.program
     }
 
@@ -177,5 +207,9 @@ impl<'a, 'input> CompilerSessionView<'input> for SessionQueryProvider<'a, 'input
 
     fn body_check_harness(&self) -> Option<&BodyCheckHarness<'input>> {
         self.body_check.as_ref()
+    }
+
+    fn arena(&self) -> Option<&crate::arena::SyncArena<'input>> {
+        self.arena
     }
 }

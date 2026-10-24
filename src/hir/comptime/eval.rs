@@ -1,6 +1,7 @@
+use crate::ast::FileId;
 use crate::ast::IntLit;
 use crate::diagnostics::DiagCtxt;
-use crate::diagnostics::kind::{ComptimeErrorKind, ComptimeReason, DiagnosticKind};
+use crate::diagnostics::kind::{ComptimeErrorKind, ComptimeReason, DiagnosticKind, maybe_span};
 use crate::hir::hir::{HirExpr, HirMatchArm, HirPattern, HirProgram, HirStmt};
 use crate::hir::symbol::SymbolTable;
 use crate::hir::types::{TypeContext, TypeData, TypeId};
@@ -9,12 +10,12 @@ use crate::symbol::Symbol;
 use super::error::ComptimeError;
 use super::value::{ComptimeValue, SlotId};
 
+use crate::ast::JoinExact;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use crate::ast::JoinExact;
 
 /// A registered comptime function: (parameter_names, body_statements).
 /// The body is wrapped in `Arc` to avoid deep-cloning the AST on every call.
@@ -286,9 +287,14 @@ pub struct ComptimeEvalContext<'a, 'src, 'input> {
     call_stack: Vec<(Symbol, ComptimeReason, crate::ast::Span)>,
     /// Outer context traceback from the checker's region_tree.
     /// Populated at creation time with comptime block/fn context.
-    outer_traceback: Vec<(ComptimeReason, crate::ast::Span)>,
+    outer_traceback: Vec<(ComptimeReason, Option<crate::ast::Span>)>,
     /// Source text for converting byte offsets to line:column in tracebacks.
     source: Option<&'src str>,
+    /// `--enable-experimental`: when set, `layout_of!(Int<N>)` /
+    /// `layout_of!(UInt<N>)` accept widths up to 128 (SYNTAX.md §Types:
+    /// "1..64 (up to 128 with `--enable-experimental`)").  Set by the
+    /// checker via [`Self::with_experimental`].
+    pub enable_experimental: bool,
     /// Whether the current comptime block is `@trusted`, granting access to
     /// `@trusted` functions and `unsafe` operations during comptime evaluation.
     allow_trusted: bool,
@@ -315,7 +321,7 @@ impl<'a, 'src, 'input> ComptimeEvalContext<'a, 'src, 'input> {
         ctx: &'a mut TypeContext<'input>,
         symbols: &'a SymbolTable<'input>,
         diag: &'a mut DiagCtxt<'src>,
-        outer_traceback: Vec<(ComptimeReason, crate::ast::Span)>,
+        outer_traceback: Vec<(ComptimeReason, Option<crate::ast::Span>)>,
         source: Option<&'src str>,
     ) -> Self {
         ComptimeEvalContext {
@@ -334,9 +340,17 @@ impl<'a, 'src, 'input> ComptimeEvalContext<'a, 'src, 'input> {
             call_stack: Vec::new(),
             outer_traceback,
             source,
+            enable_experimental: false,
             allow_trusted: false,
             scope_shadows: Vec::new(),
         }
+    }
+
+    /// `--enable-experimental` (see the field docs).  Chainable so the
+    /// checker's construction sites stay one expression.
+    pub fn with_experimental(mut self, enabled: bool) -> Self {
+        self.enable_experimental = enabled;
+        self
     }
 
     /// Set whether the current comptime block is `@trusted`.
@@ -529,12 +543,13 @@ impl<'a, 'src, 'input> ComptimeEvalContext<'a, 'src, 'input> {
                             bits_u64, name,
                         ))
                     })?;
+                    let max_bits: u32 = if self.enable_experimental { 128 } else { 64 };
                     match name {
                         "Int" => {
-                            if bits < 1 || bits > 64 {
+                            if bits < 1 || bits > max_bits {
                                 return Err(ComptimeError::type_error(format!(
-                                    "Int<{}> is out of range; bits must be 1..64",
-                                    bits,
+                                    "Int<{}> is out of range; bits must be 1..{}",
+                                    bits, max_bits,
                                 )));
                             }
                             return Ok(self.ctx.alloc(TypeData::Int {
@@ -544,10 +559,10 @@ impl<'a, 'src, 'input> ComptimeEvalContext<'a, 'src, 'input> {
                             }));
                         }
                         "UInt" => {
-                            if bits < 1 || bits > 64 {
+                            if bits < 1 || bits > max_bits {
                                 return Err(ComptimeError::type_error(format!(
-                                    "UInt<{}> is out of range; bits must be 1..64",
-                                    bits,
+                                    "UInt<{}> is out of range; bits must be 1..{}",
+                                    bits, max_bits,
                                 )));
                             }
                             return Ok(self.ctx.alloc(TypeData::UInt {
@@ -584,12 +599,13 @@ impl<'a, 'src, 'input> ComptimeEvalContext<'a, 'src, 'input> {
     }
 
     /// Collect the call stack traceback entries.
-    /// Returns structured (ComptimeReason, Span) pairs for flexible rendering.
-    fn format_call_stack_traceback(&self) -> Vec<(ComptimeReason, crate::ast::Span)> {
+    /// Returns structured (ComptimeReason, Option<Span>) pairs for flexible
+    /// rendering (`None` = no source position).
+    fn format_call_stack_traceback(&self) -> Vec<(ComptimeReason, Option<crate::ast::Span>)> {
         self.call_stack
             .iter()
             .rev()
-            .map(|(_, reason, span)| (*reason, *span))
+            .map(|(_, reason, span)| (*reason, maybe_span(*span)))
             .collect()
     }
 
@@ -856,6 +872,7 @@ impl<'a, 'src, 'input> ComptimeEvalContext<'a, 'src, 'input> {
                 )),
                 crate::ast::Literal::Float(f) => Ok(ComptimeValue::Float(*f)),
                 crate::ast::Literal::Char(c) => Ok(ComptimeValue::Int(*c as i128)),
+                crate::ast::Literal::Byte(b) => Ok(ComptimeValue::Int(*b as i128)),
                 crate::ast::Literal::Bool(b) => Ok(ComptimeValue::Bool(*b)),
                 crate::ast::Literal::String(s) => Ok(ComptimeValue::String(Arc::from(s.as_str()))),
                 crate::ast::Literal::ByteString(b) => Ok(ComptimeValue::String(Arc::from(
@@ -1152,7 +1169,7 @@ impl<'a, 'src, 'input> ComptimeEvalContext<'a, 'src, 'input> {
                 //    of silently returning the type.
                 if let Some(binding) = self
                     .symbols
-                    .lookup_variable(*name, crate::ast::Span::new(0, 0))
+                    .lookup_variable(*name, crate::ast::Span::new(FileId::DUMMY, 0, 0))
                 {
                     let mutability = if binding.mutable {
                         "mutable"

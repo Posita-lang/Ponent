@@ -1,5 +1,10 @@
 use crate::ast::Span;
+use crate::diagnostics::DiagMessage;
+use crate::diagnostics::i18n::DisplayArg;
+use crate::diagnostics::i18n::LiftCow;
 use crate::diagnostics::label::{AnnotationKind, Label};
+use crate::smallvec::{SmallVec, smallvec};
+use std::borrow::Cow;
 
 /// Describes the context in which a type was expected.
 /// Inspired by Elm's `Expected` type which carries `Context` — knowing
@@ -53,6 +58,12 @@ impl std::fmt::Display for TypeCtx {
 /// [`Humanizer`] can use to produce precise, context-aware error messages
 /// and annotations.
 ///
+/// The `'src` lifetime binds all borrowed string data (type names,
+/// identifiers, field names, etc.) to the source session so that names
+/// originating from the AST/interner can be stored without cloning into
+/// a `String`.  Constructed values may still own dynamic text via
+/// `Cow::Owned`.
+///
 /// # Example
 ///
 /// ```ignore
@@ -64,59 +75,59 @@ impl std::fmt::Display for TypeCtx {
 /// })
 /// .with_code(ErrCode::new("E030"));
 /// ```
-pub enum DiagnosticKind {
+pub enum DiagnosticKind<'src> {
     /// A value of one type was used where another type was expected.
     TypeMismatch {
-        expected: String,
-        found: String,
+        expected: Cow<'src, str>,
+        found: Cow<'src, str>,
         /// The span of the expression with the wrong type.
         span: Span,
         /// Optional span of the value that produced the found type.
         found_span: Option<Span>,
         /// Optional explanation of WHY the types don't match
         /// (e.g. "Int<16> is not a subtype of Int<23>").
-        reason: Option<String>,
+        reason: Option<Cow<'src, str>>,
         /// The context in which the expected type was determined
         /// (e.g. from a type annotation, a function return type, etc.).
         context: Option<TypeCtx>,
     },
     /// A field access referred to a field that doesn't exist on the type.
     NoSuchField {
-        field_name: String,
-        type_name: String,
+        field_name: Cow<'src, str>,
+        type_name: Cow<'src, str>,
         span: Span,
     },
     /// A function/method call had argument type mismatches.
     ArgumentTypeMismatch {
-        callee: String,
-        param_name: String,
-        expected: String,
-        found: String,
+        callee: Cow<'src, str>,
+        param_name: Cow<'src, str>,
+        expected: Cow<'src, str>,
+        found: Cow<'src, str>,
         span: Span,
         param_span: Option<Span>,
     },
     /// A name could not be resolved in the current scope.
     NameNotFound {
-        name: String,
+        name: Cow<'src, str>,
         span: Span,
         suggestions: Vec<String>,
     },
     /// A duplicate definition (variable, function, type).
     DuplicateDefinition {
-        name: String,
+        name: Cow<'src, str>,
         this_span: Span,
         original_span: Span,
     },
     /// A contract condition (`requires` / `ensures`) was not boolean.
     ContractNonBool {
-        clause: String,
-        found: String,
+        clause: Cow<'src, str>,
+        found: Cow<'src, str>,
         span: Span,
     },
     /// A trait implementation is missing a required method.
     ImplMissingMethod {
-        trait_name: String,
-        method_name: String,
+        trait_name: Cow<'src, str>,
+        method_name: Cow<'src, str>,
         impl_span: Span,
         trait_span: Span,
     },
@@ -124,7 +135,11 @@ pub enum DiagnosticKind {
     Comptime {
         kind: ComptimeErrorKind,
         span: Span,
-        traceback: Vec<(ComptimeReason, Span)>,
+        /// Call stack, most recent first.  `None` marks a frame with no
+        /// source position (the abandoned `(0,0)` sentinel — a real
+        /// zero-length span at offset 0 stays distinguishable as
+        /// `Some`).
+        traceback: Vec<(ComptimeReason, Option<Span>)>,
     },
 }
 
@@ -146,6 +161,23 @@ pub enum ComptimeReason {
     TypeInfo,
     /// Evaluating `layout_of!()`.
     LayoutOf,
+}
+
+impl ComptimeReason {
+    /// Human-readable description of this comptime context frame, resolved
+    /// through Fluent so it follows the active
+    /// [`Lang`](super::i18n::Lang).
+    pub fn as_str(&self) -> Cow<'static, str> {
+        match self {
+            ComptimeReason::ComptimeBlock => crate::tr!("comptime-reason-block"),
+            ComptimeReason::ComptimeFnDef => crate::tr!("comptime-reason-fndef"),
+            ComptimeReason::ComptimeFnCall => crate::tr!("comptime-reason-fncall"),
+            ComptimeReason::ComptimeTest => crate::tr!("comptime-reason-test"),
+            ComptimeReason::Assertion => crate::tr!("comptime-reason-assert"),
+            ComptimeReason::TypeInfo => crate::tr!("comptime-reason-typeinfo"),
+            ComptimeReason::LayoutOf => crate::tr!("comptime-reason-layoutof"),
+        }
+    }
 }
 
 /// Specific kinds of comptime evaluation errors.
@@ -175,31 +207,42 @@ pub enum ComptimeErrorKind {
     Internal(String),
 }
 
+/// Map a frame span to the traceback's `Option<Span>`: the abandoned
+/// `(0,0)` sentinel becomes `None` (a frame with no source position),
+/// while a real zero-length span at offset 0 stays `Some` — same
+/// conversion `ChainEntry` made when it moved off the sentinel.
+pub fn maybe_span(span: Span) -> Option<Span> {
+    (span.start != 0 || span.end != 0).then_some(span)
+}
+
 /// Converts a [`DiagnosticKind`] into a human-readable message and a set of
 /// labels/annotations for source-context rendering.
 ///
 /// This is the Ponent equivalent of Vale's `*ErrorHumanizer` objects — each
 /// variant knows how to format itself precisely.
-pub trait Humanizer {
-    /// Produce the primary error message.
-    fn message(&self) -> String;
+pub trait Humanizer<'src> {
+    /// Produce the primary error message — as DATA (`DiagMessage`):
+    /// static text is borrowed, parameterized text is a Fluent slug.
+    /// The string is materialized only at the rendering boundary
+    /// (`Diagnostic::humanize` / renderers), never at construction.
+    fn message(&self) -> DiagMessage<'src>;
 
     /// Produce labels (annotations) for source-context rendering.
-    fn labels(&self) -> Vec<Label>;
+    fn labels(&self) -> Vec<Label<'src>>;
 
     /// Optional help text.
-    fn help(&self) -> Option<String> {
+    fn help(&self) -> Option<Cow<'src, str>> {
         None
     }
 
     /// Optional suggestions.
-    fn suggestions(&self) -> Vec<String> {
+    fn suggestions(&self) -> Vec<Cow<'src, str>> {
         vec![]
     }
 }
 
-impl Humanizer for DiagnosticKind {
-    fn message(&self) -> String {
+impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
+    fn message(&self) -> DiagMessage<'src> {
         match self {
             DiagnosticKind::TypeMismatch {
                 expected,
@@ -208,85 +251,110 @@ impl Humanizer for DiagnosticKind {
                 context,
                 ..
             } => {
-                let mut msg = format!("type mismatch: expected `{expected}`, found `{found}`");
-                if let Some(ctx) = context
-                    && !matches!(ctx, TypeCtx::Unspecified)
-                {
-                    use std::fmt::Write;
-                    let _ = write!(msg, " ({ctx})");
+                // Fluent slug for the base sentence (word order lives in
+                // locales/*.ftl; the en entry is verbatim the old
+                // format! template).  The context/reason suffixes are
+                // NOT part of the .ftl pattern, and Fluent silently
+                // drops arguments its template never mentions — so a
+                // suffixed message composes the owned form to stay
+                // byte-identical with the old output.
+                let has_suffix =
+                    reason.is_some() || context.is_some_and(|c| !matches!(c, TypeCtx::Unspecified));
+                if has_suffix {
+                    let mut msg = format!("type mismatch: expected `{expected}`, found `{found}`");
+                    if let Some(ctx) = context
+                        && !matches!(ctx, TypeCtx::Unspecified)
+                    {
+                        use std::fmt::Write;
+                        let _ = write!(msg, " ({ctx})");
+                    }
+                    if let Some(r) = reason {
+                        use std::fmt::Write;
+                        let _ = write!(msg, " — {r}");
+                    }
+                    msg.into()
+                } else {
+                    DiagMessage::Slug {
+                        slug: "type-mismatch",
+                        pairs: smallvec![("expected", expected.clone()), ("found", found.clone()),],
+                    }
                 }
-                if let Some(r) = reason {
-                    use std::fmt::Write;
-                    let _ = write!(msg, " — {r}");
-                }
-                msg
             }
             DiagnosticKind::NoSuchField {
                 field_name,
                 type_name,
                 ..
-            } => {
-                format!("no field `{field_name}` on type `{type_name}`")
-            }
+            } => format!("no field `{field_name}` on type `{type_name}`").into(),
             DiagnosticKind::ArgumentTypeMismatch {
                 callee,
                 param_name,
                 expected,
                 found,
                 ..
-            } => {
-                format!(
-                    "argument type mismatch in call to `{callee}`: \
-                     parameter `{param_name}` expected `{expected}`, found `{found}`"
-                )
-            }
-            DiagnosticKind::NameNotFound { name, .. } => {
-                format!("name not found: `{name}`")
-            }
-            DiagnosticKind::DuplicateDefinition { name, .. } => {
-                format!("duplicate definition of `{name}`")
-            }
-            DiagnosticKind::ContractNonBool { clause, found, .. } => {
-                format!("`{clause}` clause must be boolean, found `{found}`")
-            }
+            } => DiagMessage::Slug {
+                slug: "argument-type-mismatch",
+                pairs: smallvec![
+                    ("callee", callee.clone()),
+                    ("param", param_name.clone()),
+                    ("expected", expected.clone()),
+                    ("found", found.clone()),
+                ],
+            },
+            DiagnosticKind::NameNotFound { name, .. } => format!("name not found: `{name}`").into(),
+            DiagnosticKind::DuplicateDefinition { name, .. } => DiagMessage::Slug {
+                slug: "duplicate-definition",
+                pairs: smallvec![("name", name.clone())],
+            },
+            DiagnosticKind::ContractNonBool { clause, found, .. } => DiagMessage::Slug {
+                slug: "contract-non-bool",
+                pairs: smallvec![("clause", clause.clone()), ("found", found.clone())],
+            },
             DiagnosticKind::ImplMissingMethod {
                 trait_name,
                 method_name,
                 ..
-            } => {
-                format!("impl of `{trait_name}` is missing method `{method_name}`")
-            }
+            } => DiagMessage::Slug {
+                slug: "impl-missing-method",
+                pairs: smallvec![
+                    ("trait", trait_name.clone()),
+                    ("method", method_name.clone()),
+                ],
+            },
             DiagnosticKind::Comptime {
                 kind, traceback, ..
             } => {
                 let msg = match kind {
-                    ComptimeErrorKind::StepLimitExceeded => {
-                        "comptime step limit exceeded (possible infinite loop)".into()
-                    }
+                    ComptimeErrorKind::StepLimitExceeded => DiagMessage::static_str(
+                        "comptime step limit exceeded (possible infinite loop)",
+                    ),
                     ComptimeErrorKind::DivisionByZero => {
-                        "division by zero in comptime expression".into()
+                        DiagMessage::static_str("division by zero in comptime expression")
                     }
-                    ComptimeErrorKind::Overflow => "integer overflow in comptime expression".into(),
-                    ComptimeErrorKind::TypeError(s) => format!("comptime type error: {s}"),
+                    ComptimeErrorKind::Overflow => {
+                        DiagMessage::static_str("integer overflow in comptime expression")
+                    }
+                    ComptimeErrorKind::TypeError(s) => format!("comptime type error: {s}").into(),
                     ComptimeErrorKind::AssertionFailed(s) => {
-                        format!("comptime assertion failed: {s}")
+                        format!("comptime assertion failed: {s}").into()
                     }
                     ComptimeErrorKind::UnknownIdentifier(s) => {
-                        format!("unknown identifier in comptime: {s}")
+                        format!("unknown identifier in comptime: {s}").into()
                     }
                     ComptimeErrorKind::NotComptimeAllowed(s) => {
-                        format!("not allowed in comptime: {s}")
+                        format!("not allowed in comptime: {s}").into()
                     }
                     ComptimeErrorKind::Deferred => {
-                        "expression cannot be evaluated at compile time".into()
+                        DiagMessage::static_str("expression cannot be evaluated at compile time")
                     }
                     ComptimeErrorKind::SandboxViolation(s) => {
-                        format!("comptime sandbox violation: {s}")
+                        format!("comptime sandbox violation: {s}").into()
                     }
                     ComptimeErrorKind::MemoryLimitExceeded(s) => {
-                        format!("comptime memory limit exceeded: {s}")
+                        format!("comptime memory limit exceeded: {s}").into()
                     }
-                    ComptimeErrorKind::Internal(s) => format!("internal comptime error: {s}"),
+                    ComptimeErrorKind::Internal(s) => {
+                        format!("internal comptime error: {s}").into()
+                    }
                 };
                 if traceback.is_empty() {
                     msg
@@ -294,19 +362,12 @@ impl Humanizer for DiagnosticKind {
                     let tb_lines: Vec<String> = traceback
                         .iter()
                         .map(|(reason, span)| {
-                            let reason_str = match reason {
-                                ComptimeReason::ComptimeBlock => "comptime { ... } block",
-                                ComptimeReason::ComptimeFnDef => "comptime def function body",
-                                ComptimeReason::ComptimeFnCall => "comptime function call",
-                                ComptimeReason::ComptimeTest => "@comptime_test function",
-                                ComptimeReason::Assertion => "assert!()",
-                                ComptimeReason::TypeInfo => "@typeInfo!()",
-                                ComptimeReason::LayoutOf => "layout_of!()",
-                            };
-                            if span.start != 0 || span.end != 0 {
-                                format!("  · {reason_str} at offset {}", span.start)
-                            } else {
-                                format!("  · {reason_str}")
+                            let reason_str = reason.as_str();
+                            match span {
+                                Some(span) => {
+                                    format!("  · {reason_str} at offset {}", span.start)
+                                }
+                                None => format!("  · {reason_str}"),
                             }
                         })
                         .collect();
@@ -314,12 +375,13 @@ impl Humanizer for DiagnosticKind {
                         "{msg}\n\ncomptime call stack (most recent first):\n{}",
                         tb_lines.join("\n")
                     )
+                    .into()
                 }
             }
         }
     }
 
-    fn labels(&self) -> Vec<Label> {
+    fn labels(&self) -> Vec<Label<'src>> {
         match self {
             DiagnosticKind::TypeMismatch {
                 span,
@@ -328,14 +390,20 @@ impl Humanizer for DiagnosticKind {
                 found,
                 ..
             } => {
-                let mut labels = vec![Label::new(*span, format!("expected {expected}"))];
+                let mut labels = vec![Label::new(
+                    *span,
+                    crate::tr!("label-expected", expected = DisplayArg(expected)).lift(),
+                )];
                 if let Some(fs) = found_span {
                     labels.push(Label::secondary(*fs, format!("{found}")));
                 }
                 labels
             }
             DiagnosticKind::NoSuchField { span, .. } => {
-                vec![Label::new(*span, "field not found")]
+                vec![Label::new(
+                    *span,
+                    crate::tr!("label-field-not-found").lift(),
+                )]
             }
             DiagnosticKind::ArgumentTypeMismatch {
                 span,
@@ -346,15 +414,27 @@ impl Humanizer for DiagnosticKind {
             } => {
                 let mut labels = vec![Label::new(
                     *span,
-                    format!("expected `{expected}`, found `{found}`"),
+                    crate::tr!(
+                        "label-expected-found",
+                        expected = DisplayArg(expected),
+                        found = DisplayArg(found)
+                    )
+                    .lift(),
                 )];
                 if let Some(ps) = param_span {
-                    labels.push(Label::secondary(*ps, format!("`{expected}` declared here")));
+                    labels.push(Label::secondary(
+                        *ps,
+                        crate::tr!("label-declared-here", expected = DisplayArg(expected))
+                            .lift(),
+                    ));
                 }
                 labels
             }
             DiagnosticKind::NameNotFound { span, .. } => {
-                vec![Label::new(*span, "not found in this scope")]
+                vec![Label::new(
+                    *span,
+                    crate::tr!("label-not-in-scope").lift(),
+                )]
             }
             DiagnosticKind::DuplicateDefinition {
                 this_span,
@@ -362,12 +442,21 @@ impl Humanizer for DiagnosticKind {
                 ..
             } => {
                 vec![
-                    Label::new(*this_span, "duplicate definition"),
-                    Label::secondary(*original_span, "first defined here"),
+                    Label::new(
+                        *this_span,
+                        crate::tr!("label-duplicate-definition").lift(),
+                    ),
+                    Label::secondary(
+                        *original_span,
+                        crate::tr!("label-first-defined-here").lift(),
+                    ),
                 ]
             }
             DiagnosticKind::ContractNonBool { span, .. } => {
-                vec![Label::new(*span, "expected bool")]
+                vec![Label::new(
+                    *span,
+                    crate::tr!("label-expected-bool").lift(),
+                )]
             }
             DiagnosticKind::ImplMissingMethod {
                 impl_span,
@@ -375,47 +464,65 @@ impl Humanizer for DiagnosticKind {
                 ..
             } => {
                 vec![
-                    Label::new(*impl_span, "method missing here"),
-                    Label::secondary(*trait_span, "required by trait declaration here"),
+                    Label::new(
+                        *impl_span,
+                        crate::tr!("label-method-missing").lift(),
+                    ),
+                    Label::secondary(
+                        *trait_span,
+                        crate::tr!("label-required-by-trait").lift(),
+                    ),
                 ]
             }
-            DiagnosticKind::Comptime { span, .. } => {
-                vec![Label::new(*span, "comptime evaluation error")]
+            DiagnosticKind::Comptime {
+                span, traceback, ..
+            } => {
+                let mut labels = vec![Label::new(
+                    *span,
+                    crate::tr!("label-comptime-eval-error").lift(),
+                )];
+                // Surface each positioned traceback frame as a secondary
+                // annotation so the comptime call stack is visible in the
+                // source area, not just in the message text.  `None`
+                // frames (the old `(0,0)` sentinel) have no position to
+                // point at and are message-only.
+                for (reason, tb_span) in traceback {
+                    let Some(tb) = tb_span else {
+                        continue;
+                    };
+                    if *tb == *span {
+                        continue;
+                    }
+                    labels.push(Label::secondary(*tb, reason.as_str().lift()));
+                }
+                labels
             }
         }
     }
 
-    fn help(&self) -> Option<String> {
+    fn help(&self) -> Option<Cow<'src, str>> {
         match self {
             DiagnosticKind::TypeMismatch { .. } => {
-                Some("try using `as` to cast, or change the expression type".into())
+                Some(crate::tr!("help-cast-or-change").lift())
             }
             DiagnosticKind::NameNotFound { suggestions, .. } => {
                 if suggestions.is_empty() {
                     None
                 } else {
-                    Some(format!("did you mean `{}`?", suggestions.join("` or `")))
+                    Some(
+                        crate::tr!(
+                            "did-you-mean",
+                            candidates = DisplayArg(suggestions.join("` or `"))
+                        )
+                        .lift(),
+                    )
                 }
             }
             _ => None,
         }
     }
-}
 
-// ── Private helpers ──────────────────────────────────────────────
-
-impl DiagnosticKind {
-    fn expected_str(&self) -> String {
-        match self {
-            DiagnosticKind::TypeMismatch { expected, .. } => expected.clone(),
-            _ => String::new(),
-        }
-    }
-
-    fn found_str(&self) -> String {
-        match self {
-            DiagnosticKind::TypeMismatch { found, .. } => found.clone(),
-            _ => String::new(),
-        }
+    fn suggestions(&self) -> Vec<Cow<'src, str>> {
+        vec![]
     }
 }

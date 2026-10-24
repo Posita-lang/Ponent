@@ -238,6 +238,21 @@ impl std::fmt::Debug for ShapeVar {
 pub struct ShapeVarContext {
     vars: Vec<ShapeVar>,
     next_id: usize,
+    /// O(1) unresolved count: incremented in `new_var`, decremented at the
+    /// single `None → Some` transition site in `try_set`, and repaired in
+    /// `truncate_vars` for truncated variables.
+    unresolved_count: usize,
+    /// Unresolved (canonical, non-alias) shape vars grouped by level.
+    /// Query for `unresolved_above_level` walks buckets with level >
+    /// `max_level` instead of scanning the whole var table.  Buckets are
+    /// indexed by level; `vars.len()` bounds the highest level in practice
+    /// (levels come from the region tree, which is small).
+    unresolved_by_level: Vec<Vec<ShapeVarId>>,
+    /// Position of each shape var id inside its `unresolved_by_level` bucket,
+    /// for O(1) swap-remove.  An entry only exists while the var is
+    /// unresolved AND canonical (aliases are removed from buckets when
+    /// created in `unify`).
+    bucket_pos: HashMap<usize, usize>,
 }
 
 impl ShapeVarContext {
@@ -245,6 +260,9 @@ impl ShapeVarContext {
         ShapeVarContext {
             vars: Vec::new(),
             next_id: 0,
+            unresolved_count: 0,
+            unresolved_by_level: Vec::new(),
+            bucket_pos: HashMap::new(),
         }
     }
 
@@ -259,6 +277,13 @@ impl ShapeVarContext {
             wait_list: Vec::new(),
             alias: None,
         });
+        // Index maintenance: this var is unresolved and canonical.
+        self.unresolved_count += 1;
+        if self.unresolved_by_level.len() <= level {
+            self.unresolved_by_level.resize(level + 1, Vec::new());
+        }
+        self.unresolved_by_level[level].push(id);
+        self.bucket_pos.insert(id.0, self.unresolved_by_level[level].len() - 1);
         id
     }
 
@@ -345,6 +370,16 @@ impl ShapeVarContext {
 
         // Mark source as alias of target.
         self.vars[source.0].alias = Some(target);
+        // Index maintenance: the source is no longer a canonical variable —
+        // remove it from its level bucket so queries report canonical vars
+        // only.  If the source was still unresolved, the merged class is now
+        // counted exactly once (via the target), so the counter drops too.
+        // (The target keeps its bucket entry; if it later resolves,
+        // `try_set` removes it.)
+        if self.vars[source.0].resolved.is_none() {
+            self.unresolved_count -= 1;
+        }
+        self.remove_from_bucket(source);
 
         // If target is already resolved and source wasn't, fire source's waiters.
         if !fired && let Some(shape) = self.vars[target.0].resolved {
@@ -372,6 +407,11 @@ impl ShapeVarContext {
         }
         sv.resolved = Some(shape);
         let pending = std::mem::take(&mut sv.wait_list);
+        // Index maintenance: the single `None → Some` transition site.
+        // The var was unresolved (it is canonical by `resolve`), so it must
+        // have a bucket entry.
+        self.unresolved_count -= 1;
+        self.remove_from_bucket(canonical);
         for cb in pending {
             cb(shape);
         }
@@ -383,18 +423,55 @@ impl ShapeVarContext {
         self.get(id).is_some()
     }
 
-    /// Number of unresolved shape variables.
+    /// Number of unresolved canonical shape variables (O(1) counter).
+    ///
+    /// Counts equivalence CLASSES whose canonical var is unresolved — an
+    /// alias never counts separately.  Invariant: the counter equals the
+    /// size of the union of ALL per-level buckets (verified by
+    /// `test_shape_var_unresolved_index_consistency`).
     pub fn num_unresolved(&self) -> usize {
-        self.vars.iter().filter(|sv| sv.resolved.is_none()).count()
+        self.unresolved_count
     }
 
-    /// Collect all unresolved shape variable IDs at levels above `max_level`.
+    /// Collect all unresolved (canonical) shape variable IDs at all levels.
+    /// Exposed for tests/debug; equivalent to summing every bucket.
+    #[cfg(test)]
+    pub(crate) fn unresolved_all(&self) -> Vec<ShapeVarId> {
+        self.unresolved_by_level.iter().flatten().copied().collect()
+    }
+
+    /// Collect all unresolved (canonical) shape variable IDs at levels
+    /// above `max_level`.  Walks only the per-level buckets above the
+    /// threshold instead of scanning the whole var table.
     pub fn unresolved_above_level(&self, max_level: usize) -> Vec<ShapeVarId> {
-        self.vars
-            .iter()
-            .filter(|sv| sv.resolved.is_none() && sv.level > max_level)
-            .map(|sv| sv.id)
-            .collect()
+        let mut out = Vec::new();
+        for (level, bucket) in self.unresolved_by_level.iter().enumerate() {
+            if level > max_level {
+                out.extend_from_slice(bucket);
+            }
+        }
+        out
+    }
+
+    /// O(1) bucket removal via swap-remove, using `bucket_pos` for the
+    /// index.  A no-op if the var has no bucket entry (already removed,
+    /// or removed as truncated — see `truncate_vars`).
+    fn remove_from_bucket(&mut self, id: ShapeVarId) {
+        if let Some(pos) = self.bucket_pos.remove(&id.0) {
+            let level = self.vars[id.0].level;
+            let bucket = &mut self.unresolved_by_level[level];
+            debug_assert!(
+                pos < bucket.len() && bucket[pos] == id,
+                "bucket_pos desync for shape var {id:?}"
+            );
+            let last = bucket.len() - 1;
+            if pos != last {
+                let moved = bucket[last];
+                bucket[pos] = moved;
+                self.bucket_pos.insert(moved.0, pos);
+            }
+            bucket.pop();
+        }
     }
 
     /// Number of shape variables allocated (for snapshot truncation).
@@ -408,8 +485,38 @@ impl ShapeVarContext {
     }
 
     /// Truncate shape variables to a saved length (rollback).
+    ///
+    /// Repairs the unresolved-count/level-bucket index: truncated tail
+    /// variables may be resolved (their resolution is NOT individually
+    /// undo-logged — the whole var is dropped) or unresolved-canonical
+    /// (their bucket entries must go).  Cost is O(truncated tail), i.e.
+    /// amortized O(1) per rolled-back variable.
     pub(crate) fn truncate_vars(&mut self, len: usize) {
+        if len >= self.vars.len() {
+            return;
+        }
+        // Repair the index for the truncated tail: a tail var with a
+        // bucket entry was canonical AND unresolved — its counter
+        // contribution goes away with it.  (Resolved or alias tail vars
+        // were never counted, so they only need their bucket_pos entry
+        // dropped, which remove_from_bucket's no-op path handles.)
+        let tail: Vec<ShapeVarId> = self.vars[len..].iter().map(|sv| sv.id).collect();
+        for id in tail {
+            if self.bucket_pos.remove(&id.0).is_some() {
+                self.unresolved_count -= 1;
+            }
+        }
+        // Drop bucket entries pointing into the truncated tail.
+        for bucket in self.unresolved_by_level.iter_mut() {
+            bucket.retain(|id| (id.0 as usize) < len);
+        }
+        while matches!(self.unresolved_by_level.last(), Some(b) if b.is_empty()) {
+            self.unresolved_by_level.pop();
+        }
         self.vars.truncate(len);
+        if self.next_id > len {
+            self.next_id = len;
+        }
     }
 
     /// Restore the next_id counter (rollback).
@@ -448,7 +555,7 @@ pub fn type_data_to_shape(data: &TypeData) -> TypeShape {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -530,6 +637,84 @@ mod tests {
         svc.new_var(0);
         svc.new_var(0);
         assert_eq!(svc.num_unresolved(), 2);
+    }
+
+    #[test]
+    fn test_shape_var_unresolved_index_consistency() {
+        // Counter + bucket index must stay consistent across the three
+        // mutation paths: try_set (resolution), unify (aliasing), and
+        // truncate_vars (rollback).
+        let mut svc = ShapeVarContext::new();
+        let a = svc.new_var(0);
+        let b = svc.new_var(1);
+        let c = svc.new_var(2);
+        assert_eq!(svc.num_unresolved(), 3);
+        assert_eq!(svc.unresolved_above_level(0).len(), 2);
+        assert_eq!(svc.unresolved_above_level(1).len(), 1);
+
+        // Resolve one — counter and bucket drop together.
+        assert!(svc.try_set(b, TypeShape::Arrow));
+        assert_eq!(svc.num_unresolved(), 2);
+        assert_eq!(svc.unresolved_above_level(1).len(), 1); // only c
+        // Re-set is a no-op for the counter.
+        assert!(svc.try_set(b, TypeShape::Arrow));
+        assert_eq!(svc.num_unresolved(), 2);
+
+        // Alias the pair: unify merges the HIGHER id into the lower, so
+        // c becomes an alias of a (canonical = a, level 0).  c leaves its
+        // level-2 bucket; the merged class counts ONCE via a.
+        svc.unify(a, c);
+        let canonical = svc.resolve(a);
+        assert_eq!(canonical, a);
+        assert_eq!(svc.resolve(c), a);
+        // Nothing above level 1 anymore: b is resolved, c is an alias.
+        assert!(svc.unresolved_above_level(1).is_empty());
+        // The full bucket union still holds exactly the canonical pair.
+        assert_eq!(svc.unresolved_all(), vec![a]);
+        assert_eq!(svc.num_unresolved(), 1);
+
+        // Rollback truncation: cut back to just `a`'s slot.  a is
+        // unresolved-canonical, so exactly one class survives.
+        svc.truncate_vars(1);
+        assert_eq!(svc.num_unresolved(), 1); // only a (unresolved)
+        assert!(!svc.is_resolved(a));
+        assert_eq!(svc.unresolved_above_level(0).len(), 0);
+        assert_eq!(svc.unresolved_all(), vec![a]);
+        // After truncation, new ids must not collide.
+        let d = svc.new_var(0);
+        assert_eq!(d.0, 1);
+        assert_eq!(svc.num_unresolved(), 2);
+        // Full truncation resets to empty.
+        svc.truncate_vars(0);
+        assert_eq!(svc.num_unresolved(), 0);
+        assert!(svc.unresolved_above_level(0).is_empty());
+        let e = svc.new_var(3);
+        assert_eq!(e.0, 0);
+        assert_eq!(svc.unresolved_above_level(2), vec![e]);
+        assert_eq!(svc.unresolved_all(), vec![e]);
+    }
+
+    #[test]
+    fn test_shape_var_callback_reentrancy_keeps_counter_sane() {
+        // A wait-list callback that re-enters try_set/unify during the
+        // resolution transition must not corrupt the counter or buckets.
+        // (Raw-pointer re-entry stands in for the solver's callback path,
+        // which reaches the same context through its own handle.)
+        let mut svc = ShapeVarContext::new();
+        let target = svc.new_var(0);
+        let other = svc.new_var(1);
+        let svc_ptr = &mut svc as *mut ShapeVarContext as usize;
+        svc.on_resolve(target, move |shape| {
+            let inner = unsafe { &mut *(svc_ptr as *mut ShapeVarContext) };
+            let _ = inner.try_set(other, shape);
+        });
+        unsafe {
+            let svc = &mut *(svc_ptr as *mut ShapeVarContext);
+            assert!(svc.try_set(target, TypeShape::Poly));
+            assert_eq!(svc.num_unresolved(), 0);
+            assert!(svc.unresolved_all().is_empty());
+            assert!(svc.unresolved_above_level(0).is_empty());
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use super::*;
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
+use crate::lexer::literal::parse_string_literal;
 use crate::lexer::Token;
 use crate::symbol::Symbol;
 use smallvec::smallvec;
@@ -12,7 +13,7 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Type entry with recursion guard
     // -------------------------------------------------------------------------
 
-    pub fn parse_type(&mut self) -> Result<Type<'input>, Diagnostic<'src>> {
+    pub fn parse_type(&mut self, bump: &'input bumpalo::Bump) -> Result<Type<'input>, Diagnostic<'src>> {
         self.recursion_depth += 1;
         if self.recursion_depth > self.max_recursion_depth {
             self.recursion_depth -= 1;
@@ -22,7 +23,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                 .with_suggestion("try breaking up deeply nested structures, or use less complex type expressions")
                 .with_span(self.span()));
         }
-        let result = self.parse_type_inner();
+        let result = self.parse_type_inner(bump);
         self.recursion_depth -= 1;
         result
     }
@@ -31,7 +32,7 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Inner type parser (Pratt‑style)
     // -------------------------------------------------------------------------
 
-    fn parse_type_inner(&mut self) -> Result<Type<'input>, Diagnostic<'src>> {
+    fn parse_type_inner(&mut self, bump: &'input bumpalo::Bump) -> Result<Type<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         match self.peek() {
             Ok(Token::For) => {
@@ -51,16 +52,16 @@ impl<'src, 'input> Parser<'src, 'input> {
                         .with_span(self.span())),
                 };
                 self.expect_gt()?;
-                let body = Self::alloc_shared(self.arena, self.parse_type()?);
+                let body = Self::alloc_shared(bump, self.parse_type(bump)?);
                 let end = self.span().end;
-                Ok(Type::Forall { lifetime, body, span: Span::new(start, end) })
+                Ok(Type::Forall { lifetime, body, span: Span::new(self.file_id, start, end) })
             }
             Ok(Token::Lt) => {
                 // Qualified path / projection: `<ImplType as TraitPath>::AssocName`
                 self.advance().ok();
-                let impl_type = Self::alloc_shared(self.arena, self.parse_type()?);
+                let impl_type = Self::alloc_shared(bump, self.parse_type(bump)?);
                 self.expect(Token::As)?;
-                let trait_path = Self::alloc_shared(self.arena, self.parse_type()?);
+                let trait_path = Self::alloc_shared(bump, self.parse_type(bump)?);
                 self.expect_gt()?;
                 self.expect(Token::ColonColon)?;
                 let assoc_name = match self.advance() {
@@ -72,16 +73,16 @@ impl<'src, 'input> Parser<'src, 'input> {
                         .with_span(self.span())),
                 };
                 let end = self.span().end;
-                Ok(Type::Projection { impl_type, trait_path, assoc_name, span: Span::new(start, end) })
+                Ok(Type::Projection { impl_type, trait_path, assoc_name, span: Span::new(self.file_id, start, end) })
             }
             Ok(Token::Shl) => {
                 // Nested projection starts with `<<`: `<<A as Trait1>::X as Trait2>::Y`
                 // The lexer merged `<<` into Shl; push one `Lt` back and treat as `<`.
                 self.advance().ok();
                 self.pending.push(Token::Lt);
-                let impl_type = Self::alloc_shared(self.arena, self.parse_type()?);
+                let impl_type = Self::alloc_shared(bump, self.parse_type(bump)?);
                 self.expect(Token::As)?;
-                let trait_path = Self::alloc_shared(self.arena, self.parse_type()?);
+                let trait_path = Self::alloc_shared(bump, self.parse_type(bump)?);
                 self.expect_gt()?;
                 self.expect(Token::ColonColon)?;
                 let assoc_name = match self.advance() {
@@ -93,7 +94,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                         .with_span(self.span())),
                 };
                 let end = self.span().end;
-                Ok(Type::Projection { impl_type, trait_path, assoc_name, span: Span::new(start, end) })
+                Ok(Type::Projection { impl_type, trait_path, assoc_name, span: Span::new(self.file_id, start, end) })
             }
             Ok(Token::Ampersand) => {
                 self.advance().ok();
@@ -110,41 +111,41 @@ impl<'src, 'input> Parser<'src, 'input> {
                 } else { None };
                 let mutable = matches!(self.peek(), Ok(Token::Mut));
                 if mutable { self.advance().ok(); }
-                let ty = self.parse_type()?;
+                let ty = self.parse_type(bump)?;
                 let end = self.span().end;
-                Ok(Type::Reference { inner: Self::alloc_shared(self.arena, ty), mutable, lifetime, span: Span::new(start, end) })
+                Ok(Type::Reference { inner: Self::alloc_shared(bump, ty), mutable, lifetime, span: Span::new(self.file_id, start, end) })
             }
             Ok(Token::Star) => {
                 self.advance().ok();
-                let ty = self.parse_type()?;
+                let ty = self.parse_type(bump)?;
                 let end = self.span().end;
-                Ok(Type::Pointer(Self::alloc_shared(self.arena, ty), Span::new(start, end)))
+                Ok(Type::Pointer(Self::alloc_shared(bump, ty), Span::new(self.file_id, start, end)))
             }
             Ok(Token::LBracket) => {
                 self.advance().ok();
-                let ty = self.parse_type()?;
+                let ty = self.parse_type(bump)?;
                 if matches!(self.peek(), Ok(Token::Semicolon)) {
                     self.advance().ok();
-                    let size = self.parse_expr()?;
+                    let size = self.parse_expr(bump)?;
                     self.expect(Token::RBracket)?;
                     let end = self.span().end;
-                    Ok(Type::Array(Self::alloc_shared(self.arena, ty), Self::alloc_shared(self.arena, size), Span::new(start, end)))
+                    Ok(Type::Array(Self::alloc_shared(bump, ty), Self::alloc_shared(bump, size), Span::new(self.file_id, start, end)))
                 } else {
                     self.expect(Token::RBracket)?;
                     let end = self.span().end;
-                    Ok(Type::Slice(Self::alloc_shared(self.arena, ty), Span::new(start, end)))
+                    Ok(Type::Slice(Self::alloc_shared(bump, ty), Span::new(self.file_id, start, end)))
                 }
             }
             Ok(Token::Dyn) => {
                 self.advance().ok();
                 let mut traits = Vec::new();
                 loop {
-                    traits.push(self.parse_type()?);
+                    traits.push(self.parse_type(bump)?);
                     if !matches!(self.peek(), Ok(Token::Plus)) { break; }
                     self.advance().ok();
                 }
                 let end = self.span().end;
-                Ok(Type::DynTrait(traits, Span::new(start, end)))
+                Ok(Type::DynTrait(traits, Span::new(self.file_id, start, end)))
             }
             Ok(Token::Exists) => {
                 self.advance().ok();
@@ -157,21 +158,21 @@ impl<'src, 'input> Parser<'src, 'input> {
                         .with_span(self.span())),
                 };
                 self.expect(Token::Colon)?;
-                let base = self.parse_type()?;
+                let base = self.parse_type(bump)?;
                 self.expect(Token::Invariant)?;
-                let invariant = Self::alloc_shared(self.arena, self.parse_expr()?);
+                let invariant = Self::alloc_shared(bump, self.parse_expr(bump)?);
                 let end = self.span().end;
-                Ok(Type::Exists { name, base: Self::alloc_shared(self.arena, base), invariant, span: Span::new(start, end) })
+                Ok(Type::Exists { name, base: Self::alloc_shared(bump, base), invariant, span: Span::new(self.file_id, start, end) })
             }
             Ok(Token::IntLiteral(_)) | Ok(Token::HexLiteral(_)) | Ok(Token::BinLiteral(_)) => {
                 let expr = self.parse_literal()?;
                 let end = self.span().end;
-                Ok(Type::Literal(Self::alloc_shared(self.arena, expr), Span::new(start, end)))
+                Ok(Type::Literal(Self::alloc_shared(bump, expr), Span::new(self.file_id, start, end)))
             }
             Ok(Token::Type) => {
                 self.advance().ok();
                 let end = self.span().end;
-                Ok(Type::Path(smallvec![Symbol::intern("type")], Span::new(start, end)))
+                Ok(Type::Path(smallvec![Symbol::intern("type")], Span::new(self.file_id, start, end)))
             }
             _ => match self.advance() {
                 Ok(Token::Ident(name)) => {
@@ -179,11 +180,13 @@ impl<'src, 'input> Parser<'src, 'input> {
                     // (SYNTAX.md §Compile-Time Regular Expressions)
                     if name.eq_str("Regex") && matches!(self.peek(), Ok(Token::Lt)) {
                         self.advance().ok();
-                        let pattern = match self.advance() {
-                            Ok(Token::StringLiteral(Ok(s))) => s,
-                            Ok(Token::StringLiteral(Err(e))) => return Err(Diagnostic::error(format!("invalid string literal in regex pattern: {}", e))
-                                .with_code_str("E004")
-                                .with_span(self.span())),
+                        let pattern: String = match self.advance() {
+                            Ok(Token::StringLiteral(s)) => match parse_string_literal(s) {
+                                Ok(c) => c.into_owned(),
+                                Err(e) => return Err(Diagnostic::error(format!("invalid string literal in regex pattern: {}", e))
+                                    .with_code_str("E004")
+                                    .with_span(self.span())),
+                            },
                             Ok(tok) => return Err(Diagnostic::error(format!("expected string literal as regex pattern, found {:?}", tok))
                                 .with_code_str("E004")
                                 .with_help("`Regex<\"...\">` requires a string literal pattern — e.g. `Regex<\"[0-9]+\">`")
@@ -204,7 +207,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                         }
                         self.expect(Token::Gt)?;
                         let end = self.span().end;
-                        return Ok(Type::Regex(pattern, Span::new(start, end)));
+                        return Ok(Type::Regex(pattern, Span::new(self.file_id, start, end)));
                     }
 
                     // Named function type: `Fn(T1, T2) -> R` (SYNTAX.md
@@ -216,7 +219,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                         let mut params = Vec::new();
                         if !matches!(self.peek(), Ok(Token::RParen)) {
                             loop {
-                                params.push(self.parse_type()?);
+                                params.push(self.parse_type(bump)?);
                                 match self.peek() {
                                     Ok(Token::Comma) => { self.advance().ok(); }
                                     Ok(Token::RParen) => { self.advance().ok(); break; }
@@ -229,9 +232,9 @@ impl<'src, 'input> Parser<'src, 'input> {
                             self.advance().ok();
                         }
                         self.expect(Token::Arrow)?;
-                        let ret = Self::alloc_shared(self.arena, self.parse_type()?);
+                        let ret = Self::alloc_shared(bump, self.parse_type(bump)?);
                         let end = self.span().end;
-                        return Ok(Type::Function { params, ret, span: Span::new(start, end) });
+                        return Ok(Type::Function { params, ret, span: Span::new(self.file_id, start, end) });
                     }
 
                     let mut path = vec![name];
@@ -258,23 +261,23 @@ impl<'src, 'input> Parser<'src, 'input> {
                                 };
                                 self.advance().ok(); // consume =
                                 let value = if self.check_const_arg() {
-                                    let expr = self.with_restrictions(ParseRestrictions::NO_COMPARISON, |this| this.parse_expr())?;
+                                    let expr = self.with_restrictions(ParseRestrictions::NO_COMPARISON, |this| this.parse_expr(bump))?;
                                     let span = expr.span();
-                                    Type::Expr(Self::alloc_shared(self.arena, expr), span)
+                                    Type::Expr(Self::alloc_shared(bump, expr), span)
                                 } else {
-                                    self.parse_type()?
+                                    self.parse_type(bump)?
                                 };
                                 GenericArg::Named(name, value)
                             } else if self.check_const_arg() {
-                                let anon = self.parse_const_arg()?;
+                                let anon = self.parse_const_arg(bump)?;
                                 GenericArg::Const(anon)
                             } else {
                                 let cp = self.checkpoint();
-                                match self.parse_type() {
+                                match self.parse_type(bump) {
                                     Ok(ty) => {
                                         let next_is_shr = matches!(self.peek(), Ok(Token::Shr)) && matches!(self.peek_next(),
                                             Some(Token::IntLiteral(_)) | Some(Token::FloatLiteral(_)) | Some(Token::True) | Some(Token::False)
-                                            | Some(Token::CharLiteral(_)) | Some(Token::StringLiteral(_)) | Some(Token::ByteStringLiteral(_))
+                                            | Some(Token::CharLiteral(_)) | Some(Token::ByteCharLiteral(_)) | Some(Token::StringLiteral(_)) | Some(Token::ByteStringLiteral(_))
                                             | Some(Token::Ident(_)) | Some(Token::LParen) | Some(Token::LBracket)
                                             | Some(Token::Minus) | Some(Token::Plus) | Some(Token::Bang) | Some(Token::Tilde));
                                         if next_is_shr || matches!(self.peek(),
@@ -282,8 +285,8 @@ impl<'src, 'input> Parser<'src, 'input> {
                                             | Ok(Token::Shl) | Ok(Token::Ampersand) | Ok(Token::Pipe) | Ok(Token::Caret)
                                             | Ok(Token::LParen) | Ok(Token::LBracket) | Ok(Token::Dot) | Ok(Token::Apostrophe) | Ok(Token::Bang))
                                         {
-                                            self.restore(&cp);
-                                            let expr = self.with_restrictions(ParseRestrictions::NO_COMPARISON, |this| this.parse_expr())?;
+                                            self.restore(cp);
+                                            let expr = self.with_restrictions(ParseRestrictions::NO_COMPARISON, |this| this.parse_expr(bump))?;
                                             if !Self::is_simple_const_expr(&expr) {
                                                 let span = expr.span();
                                                 return Err(Diagnostic::error("complex const generic argument must be wrapped in `{ }`")
@@ -293,14 +296,14 @@ impl<'src, 'input> Parser<'src, 'input> {
                                                     .with_span(span));
                                             }
                                             let span = expr.span();
-                                            GenericArg::Const(AnonConst { value: Self::alloc_shared(self.arena, expr), span })
+                                            GenericArg::Const(AnonConst { value: Self::alloc_shared(bump, expr), span })
                                         } else {
                                             GenericArg::Positional(ty)
                                         }
                                     }
                                     Err(_) => {
-                                        self.restore(&cp);
-                                        let expr = self.with_restrictions(ParseRestrictions::NO_COMPARISON, |this| this.parse_expr())?;
+                                        self.restore(cp);
+                                        let expr = self.with_restrictions(ParseRestrictions::NO_COMPARISON, |this| this.parse_expr(bump))?;
                                         if !Self::is_simple_const_expr(&expr) {
                                             let span = expr.span();
                                             return Err(Diagnostic::error("complex const generic argument must be wrapped in `{ }`")
@@ -310,7 +313,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                                                 .with_span(span));
                                         }
                                         let span = expr.span();
-                                        GenericArg::Const(AnonConst { value: Self::alloc_shared(self.arena, expr), span })
+                                        GenericArg::Const(AnonConst { value: Self::alloc_shared(bump, expr), span })
                                     }
                                 }
                             };
@@ -320,7 +323,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                                 Ok(Token::Gt) | Ok(Token::Shr) => { self.expect_gt()?; break; }
                                 Ok(Token::Assign) => {
                                     self.advance().ok();
-                                    let _eq_ty = self.parse_type()?;
+                                    let _eq_ty = self.parse_type(bump)?;
                                     self.expect_gt()?;
                                     break;
                                 }
@@ -332,10 +335,10 @@ impl<'src, 'input> Parser<'src, 'input> {
                             }
                         }
                         let end = self.span().end;
-                        Ok(Type::Generic(Self::alloc_shared(self.arena, Type::Path(smallvec::SmallVec::from(path), Span::new(start, end))), args, Span::new(start, end)))
+                        Ok(Type::Generic(Self::alloc_shared(bump, Type::Path(smallvec::SmallVec::from(path), Span::new(self.file_id, start, end))), args, Span::new(self.file_id, start, end)))
                     } else {
                         let end = self.span().end;
-                        Ok(Type::Path(smallvec::SmallVec::from(path), Span::new(start, end)))
+                        Ok(Type::Path(smallvec::SmallVec::from(path), Span::new(self.file_id, start, end)))
                     }
                 }
                 Ok(Token::LParen) => {
@@ -345,7 +348,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                     } else {
                         let mut types = Vec::new();
                         loop {
-                            types.push(self.parse_type()?);
+                            types.push(self.parse_type(bump)?);
                             match self.peek() {
                                 Ok(Token::Comma) => { self.advance().ok(); }
                                 Ok(Token::RParen) => { self.advance().ok(); break; }
@@ -360,23 +363,23 @@ impl<'src, 'input> Parser<'src, 'input> {
                     };
                     if matches!(self.peek(), Ok(Token::Arrow)) {
                         self.advance().ok();
-                        let ret = Self::alloc_shared(self.arena, self.parse_type()?);
+                        let ret = Self::alloc_shared(bump, self.parse_type(bump)?);
                         let end = self.span().end;
-                        Ok(Type::Function { params, ret, span: Span::new(start, end) })
+                        Ok(Type::Function { params, ret, span: Span::new(self.file_id, start, end) })
                     } else {
                         let end = self.span().end;
-                        Ok(Type::Tuple(params, Span::new(start, end)))
+                        Ok(Type::Tuple(params, Span::new(self.file_id, start, end)))
                     }
                 }
                 Ok(Token::Bang) => {
                     let end = self.span().end;
-                    Ok(Type::Never(Span::new(start, end)))
+                    Ok(Type::Never(Span::new(self.file_id, start, end)))
                 }
                 Ok(Token::Apostrophe) => {
                     match self.advance() {
                         Ok(Token::Ident(name)) => {
                             let end = self.span().end;
-                            Ok(Type::Path(smallvec![Symbol::intern(&format!("'{}", name))], Span::new(start, end)))
+                            Ok(Type::Path(smallvec![Symbol::intern_prefixed('\'', name.as_str())], Span::new(self.file_id, start, end)))
                         }
                         _ => Err(Diagnostic::error("expected lifetime name after `'`")
                             .with_code_str("E004")

@@ -1,0 +1,29 @@
+---
+source: src/diagnostics/snapshots.rs
+assertion_line: 150
+expression: out
+---
+{
+  "level": "error",
+  "message": "return type mismatch",
+  "code": "E030",
+  "title": "type mismatch",
+  "category": "Type Error",
+  "file": "example.ps",
+  "span": {"start": 43, "end": 68, "line": 3, "column": 2},
+  "labels": [
+    {"start": 43, "end": 68, "message": "this is Bool", "kind": "Primary"},
+    {"start": 0, "end": 8, "message": "declared to return Int<32>", "kind": "Secondary"},
+    {"start": 9, "end": 69, "message": "spans four lines", "kind": "Primary"}
+  ],
+  "relatedErrors": [
+    {"code": "E019", "message": "duplicate definition of `i`", "span": {"start": 43, "end": 56}}
+  ],
+  "help": "change the return type",
+  "suggestions": [
+    {"message": "cast with `as`", "applicability": "Unspecified", "style": "ShowAlways"}
+  ],
+  "callChain": [
+    {"label": "main", "kind": "Call", "location": "example.ps:1:1"}
+  ]
+  }

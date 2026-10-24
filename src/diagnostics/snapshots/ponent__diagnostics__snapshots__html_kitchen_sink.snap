@@ -1,0 +1,46 @@
+---
+source: src/diagnostics/snapshots.rs
+expression: out
+---
+<details class='diag error' open role='alert'>
+<summary><span class='code'>error</span>: <span class='message'>return type mismatch</span></summary>
+<div><span class='code'>E030</span> <span class='message'>return type mismatch</span></div>
+<div class='span'>at example.ps:3:2</div>
+<pre class='source-line'><span class='line-num' data-location='example.ps:1' aria-label='Line 1'>1 │ </span>def foo(x<span class='highlight'>: Bool) -&gt; Int&lt;32&gt; {</span>
+<span class='line-num'>   │ </span><span class='underline'>~~~~~~~~ ^^^^^^^^^^^^^^^^^^^^</span>
+<span class='line-num'>   │ </span><span class='label'>| declared to return Int&lt;32&gt;</span>
+<span class='line-num' data-location='example.ps:2' aria-label='Line 2'>2 │ </span><span class='highlight'>    set j = x;</span>
+<span class='line-num'>   │ </span><span class='underline'>^^^^^^^^^^^^^^</span>
+<span class='line-num' data-location='example.ps:3:2' aria-label='Line 3'>3 │ </span><span class='highlight'>    set i = j + 1; // 中</span>
+<span class='line-num'>   │ </span><span class='underline'>^^^^^^^^^^^^^^^^^^^^^^^^</span>
+<span class='line-num'>   │ </span><span class='underline'>    ^^^^^^^^^^^^^^^^^^^^</span>
+<span class='line-num' data-location='example.ps:4' aria-label='Line 4'>4 │ </span><span class='highlight'>    ret</span>urn i;
+<span class='line-num'>   │ </span><span class='underline'>^^^^^^</span>
+<span class='line-num'>   │ </span><span class='underline'>^^^^^^^</span>
+<span class='line-num'>   │ </span><span class='label'>| this is Bool</span>
+<span class='line-num'>   │ </span><span class='label'>| spans four lines</span>
+<span class='line-num' data-location='example.ps:5' aria-label='Line 5'>5 │ </span>}
+</pre>
+<ul class='related'>
+<li class='related-entry'><span class='code'>E019</span> <span class='message'>duplicate definition of `i`</span> <span class='span'>at 43..56</span></li>
+</ul>
+<div class='suggestion'>suggestion: cast with `as`</div>
+<div class='help-text'>help: change the return type</div>
+<div class='chain'>referenced by:
+<div class='entry'><span class='label'>main</span>: called from here at example.ps:1:1</div>
+</div>
+<details class='explain'>
+<summary>Explain E030</summary>
+<pre>The type of an expression does not match the expected type.
+
+This error occurs when a value is assigned to a variable, passed as an argument,
+or returned from a function with a different type than expected.
+
+Example:
+  def foo() -&gt; Int&lt;32&gt; {
+    return &quot;hello&quot;;  // error: expected Int&lt;32&gt;, found &amp;Str
+  }
+
+Fix: ensure the expression has the correct type, or add an explicit cast.</pre>
+</details>
+</details>

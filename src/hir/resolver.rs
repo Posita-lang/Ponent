@@ -252,6 +252,12 @@ pub struct NameResolver<'a, 'src, 'input> {
     /// Temporary mapping of type parameter names to GenericParam TypeIds
     /// used when resolving types inside an `impl<T>` block.
     current_impl_type_params: Option<HashMap<Symbol, TypeId>>,
+    /// B5a: the Adt `TypeId` currently having its variant-payload expansion
+    /// registered (re-entrancy guard: resolving a self-referential payload
+    /// re-enters `resolve_type_expr` for the same enum — a second
+    /// registration attempt would recurse; the guard makes the inner call a
+    /// no-op and the outer registration completes the cycle).
+    adt_expansion_guard: Option<TypeId>,
     /// The resolved `for_type` of the current `impl` block, used to resolve
     /// `Self` in method bodies and associated type defaults.
     current_impl_for_type: Option<TypeId>,
@@ -261,6 +267,10 @@ pub struct NameResolver<'a, 'src, 'input> {
     module_path: Vec<Symbol>,
     /// Layout aliases defined with `layout Name { ... }`.
     layout_aliases: HashMap<Symbol, Vec<Attribute<'input>>>,
+    /// `--enable-experimental`: when set, `Int<bits>` / `UInt<bits>`
+    /// accept widths up to 128 (SYNTAX.md §Types: "1..64 (up to 128
+    /// with `--enable-experimental`)").
+    enable_experimental: bool,
     /// The builtin `Drop` trait's DefId — LAZILY resolved on the first
     /// `is_drop` check and cached (the builtin traits may not all be
     /// registered by `register_builtins` at `NameResolver::new` time;
@@ -282,13 +292,14 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
         ctx: &'a mut TypeContext<'input>,
         local_crate_id: CrateId,
         source: Option<&'src str>,
+        enable_experimental: bool,
     ) -> Self {
         let mut symbols = SymbolTable::new(local_crate_id);
         let mut trait_env = TraitEnv::new();
         // Register built-in types (Result, Option, Channel, etc.) so that
         // the resolver can resolve them in type annotations like
         // `fn f() -> Result<(), Int<32>>`.
-        builtins::register_builtins(&mut symbols, &mut trait_env, ctx);
+        builtins::register_builtins(&mut symbols, &mut trait_env, ctx, enable_experimental);
         NameResolver {
             ctx,
             symbols,
@@ -302,17 +313,19 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
             local_crate_id,
             has_main: false,
             current_impl_type_params: None,
+            adt_expansion_guard: None,
             current_impl_for_type: None,
             resolution_map: ResolutionMap::default(),
             module_path: Vec::new(),
             layout_aliases: HashMap::default(),
+            enable_experimental,
             builtin_drop_def_id: None,
         }
     }
 
     pub fn resolve_program(
         &mut self,
-        program: &Program<'input>,
+        program: &Program<'input, 'src>,
     ) -> (
         SymbolTable<'input>,
         TraitEnv<'input>,
@@ -460,7 +473,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 self.enter_scope();
                 self.current_function = Some(def_id);
 
-                for param in params {
+                for param in *params {
                     let ty = if let Some(ty) = &param.ty {
                         self.resolve_type_expr(ty)
                     } else {
@@ -481,7 +494,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 }
 
                 if let Some(body) = body {
-                    for stmt in body {
+                    for stmt in *body {
                         self.resolve_stmt(stmt);
                     }
                 }
@@ -1094,7 +1107,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 self.enter_scope();
                 let binding = ImplBinding {
                     def_id: self.allocate_def_id(),
-                    methods: methods.clone(),
+                    methods: methods.to_vec(),
                     span: *span,
                 };
                 self.symbols.insert_impl(binding, *span);
@@ -1114,7 +1127,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 // method's identity even before the impl is registered.
                 let receiver_def = self.ctx.get_def_id_for_type(resolved_for);
                 let mut resolved_methods = Vec::new();
-                for method in methods {
+                for method in *methods {
                     let method_def = self.allocate_def_id();
                     if let Some(receiver_def) = receiver_def {
                         self.symbols
@@ -1122,7 +1135,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                     }
                     let mut param_tys: SmallVec<[TypeId; 4]> =
                         SmallVec::with_capacity(method.params.len());
-                    for p in &method.params {
+                    for p in method.params {
                         if let Some(ref param_ty) = p.ty {
                             let resolved_ty = self.resolve_self_in_type(param_ty, for_type);
                             param_tys.push(self.resolve_type_expr(&resolved_ty));
@@ -1156,7 +1169,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                     let candidate = ImplCandidate {
                         trait_id,
                         for_type: resolved_for,
-                        methods: methods.clone(),
+                        methods: methods.to_vec(),
                         resolved_methods,
                         assoc_tys,
                         has_auto_deref,
@@ -1223,7 +1236,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 if self.layout_aliases.contains_key(name) {
                     self.diagnostics.push(
                         Diagnostic::error(format!("duplicate layout alias `{}`", name))
-                            .with_span(Span::new(0, 0)),
+                            .with_span(Span::new(FileId::DUMMY, 0, 0)),
                     );
                 } else {
                     self.layout_aliases.insert(*name, attributes.clone());
@@ -1419,7 +1432,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
 
                 if let Some(else_branch) = else_branch {
                     self.enter_scope();
-                    for stmt in else_branch {
+                    for stmt in *else_branch {
                         self.resolve_stmt(stmt);
                     }
                     self.exit_scope();
@@ -1436,14 +1449,14 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
             } => {
                 self.resolve_expr(cond);
                 self.enter_scope();
-                for stmt in then_branch {
+                for stmt in *then_branch {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
 
                 if let Some(else_branch) = else_branch {
                     self.enter_scope();
-                    for stmt in else_branch {
+                    for stmt in *else_branch {
                         self.resolve_stmt(stmt);
                     }
                     self.exit_scope();
@@ -1459,14 +1472,14 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 self.resolve_expr(scrutinee);
                 self.resolve_pattern(pattern);
                 self.enter_scope();
-                for stmt in then_branch {
+                for stmt in *then_branch {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
 
                 if let Some(else_branch) = else_branch {
                     self.enter_scope();
-                    for stmt in else_branch {
+                    for stmt in *else_branch {
                         self.resolve_stmt(stmt);
                     }
                     self.exit_scope();
@@ -1487,7 +1500,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                     self.resolve_expr(dec);
                 }
                 self.enter_scope();
-                for stmt in body {
+                for stmt in *body {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
@@ -1509,7 +1522,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                     self.resolve_expr(dec);
                 }
                 self.enter_scope();
-                for stmt in body {
+                for stmt in *body {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
@@ -1531,14 +1544,14 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                     self.resolve_expr(dec);
                 }
                 self.enter_scope();
-                for stmt in body {
+                for stmt in *body {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
             }
             Stmt::Loop { body, .. } => {
                 self.enter_scope();
-                for stmt in body {
+                for stmt in *body {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
@@ -1556,21 +1569,21 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
             }
             Stmt::ComptimeBlock { body, .. } => {
                 self.enter_scope();
-                for stmt in body {
+                for stmt in *body {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
             }
             Stmt::ScopeCleanup { body, .. } => {
                 self.enter_scope();
-                for stmt in body {
+                for stmt in *body {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
             }
             Stmt::Unsafe { body, .. } => {
                 self.enter_scope();
-                for stmt in body {
+                for stmt in *body {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
@@ -1580,7 +1593,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
             }
             Stmt::Isolate { body, .. } => {
                 self.enter_scope();
-                for stmt in body {
+                for stmt in *body {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
@@ -1633,7 +1646,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
             }
             Expr::Call { callee, args, .. } => {
                 self.resolve_expr(callee);
-                for arg in args {
+                for arg in *args {
                     self.resolve_expr(arg);
                 }
                 None
@@ -1667,7 +1680,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
             }
             Expr::StructLit { path, fields, .. } => {
                 let def_id = self.resolve_type_path(path);
-                for (_, value) in fields {
+                for (_, value) in *fields {
                     self.resolve_expr(value);
                 }
                 if let Some(def_id) = def_id
@@ -1701,7 +1714,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
             }
             Expr::Tuple(exprs, ..) => {
                 let mut elems: SmallVec<[TypeId; 4]> = SmallVec::new();
-                for e in exprs {
+                for e in *exprs {
                     if let Some(ty) = self.resolve_expr(e) {
                         elems.push(ty);
                     } else {
@@ -1712,7 +1725,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
             }
             Expr::Array(exprs, ..) => {
                 let mut elem_ty = None;
-                for e in exprs {
+                for e in *exprs {
                     if let Some(ty) = self.resolve_expr(e)
                         && elem_ty.is_none()
                     {
@@ -1731,7 +1744,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 ..
             } => {
                 self.enter_scope();
-                for param in params {
+                for param in *params {
                     let ty = if let Some(ty) = &param.ty {
                         self.resolve_type_expr(ty)
                     } else {
@@ -1750,7 +1763,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                         self.diagnostics.push(diag);
                     }
                 }
-                for stmt in body {
+                for stmt in *body {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
@@ -1778,7 +1791,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
             }
             Expr::UnsafeBlock { body, .. } => {
                 self.enter_scope();
-                for stmt in body {
+                for stmt in *body {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
@@ -1786,7 +1799,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
             }
             Expr::Catch { expr, branches, .. } => {
                 self.resolve_expr(expr);
-                for branch in branches {
+                for branch in *branches {
                     self.resolve_pattern(&branch.pattern);
                     if let Some(bind) = &branch.bind {
                         let binding = VariableBinding {
@@ -1801,7 +1814,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                         }
                     }
                     self.enter_scope();
-                    for stmt in &branch.body {
+                    for stmt in branch.body {
                         self.resolve_stmt(stmt);
                     }
                     self.exit_scope();
@@ -1824,14 +1837,14 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
             } => {
                 self.resolve_expr(cond);
                 self.enter_scope();
-                for stmt in then_branch {
+                for stmt in *then_branch {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
 
                 if let Some(else_branch) = else_branch {
                     self.enter_scope();
-                    for stmt in else_branch {
+                    for stmt in *else_branch {
                         self.resolve_stmt(stmt);
                     }
                     self.exit_scope();
@@ -1848,14 +1861,14 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 self.resolve_expr(scrutinee);
                 self.resolve_pattern(pattern);
                 self.enter_scope();
-                for stmt in then_branch {
+                for stmt in *then_branch {
                     self.resolve_stmt(stmt);
                 }
                 self.exit_scope();
 
                 if let Some(else_branch) = else_branch {
                     self.enter_scope();
-                    for stmt in else_branch {
+                    for stmt in *else_branch {
                         self.resolve_stmt(stmt);
                     }
                     self.exit_scope();
@@ -1866,7 +1879,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 scrutinee, arms, ..
             } => {
                 self.resolve_expr(scrutinee);
-                for arm in arms {
+                for arm in *arms {
                     self.resolve_pattern(&arm.pattern);
                     if let Some(guard) = &arm.guard {
                         self.resolve_expr(guard);
@@ -1878,7 +1891,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
             Expr::Block(stmts, ..) => {
                 self.enter_scope();
                 let mut last_ty = None;
-                for stmt in stmts {
+                for stmt in *stmts {
                     if let Stmt::Expression(expr) = stmt {
                         last_ty = self.resolve_expr(expr);
                     } else {
@@ -1914,7 +1927,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                             .collect::<Vec<_>>()
                             .join("::")
                     ))
-                    .with_span(Span::new(0, 0)),
+                    .with_span(Span::new(FileId::DUMMY, 0, 0)),
                 );
                 Some(self.ctx.error())
             }
@@ -1936,7 +1949,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 Some(self.ctx.error())
             }
             Expr::Task { body, .. } => {
-                for s in body {
+                for s in *body {
                     self.resolve_stmt(s);
                 }
                 Some(self.ctx.unit())
@@ -1962,12 +1975,12 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 self.resolve_expr(expr);
             }
             Pattern::Tuple(patterns, ..) => {
-                for p in patterns {
+                for p in *patterns {
                     self.resolve_pattern(p);
                 }
             }
             Pattern::Struct { fields, .. } => {
-                for (_, p) in fields {
+                for (_, p) in *fields {
                     self.resolve_pattern(p);
                 }
             }
@@ -1981,18 +1994,18 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 self.resolve_type_expr(ty);
             }
             Pattern::Or(patterns, ..) => {
-                for p in patterns {
+                for p in *patterns {
                     self.resolve_pattern(p);
                 }
             }
             Pattern::Slice(before, slice, after, ..) => {
-                for p in before {
+                for p in *before {
                     self.resolve_pattern(p);
                 }
                 if let Some(slice) = slice {
                     self.resolve_pattern(slice);
                 }
-                for p in after {
+                for p in *after {
                     self.resolve_pattern(p);
                 }
             }
@@ -2000,7 +2013,101 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
         }
     }
 
+    /// B5a: register the κ variant-payload expansion for the enum
+    /// instantiation `(def_id, args)` if not yet registered (see
+    /// `TypeContext::adt_expansions`).
+    ///
+    /// The payload ASTs are resolved with the enum's own type parameters
+    /// temporarily bound to the instantiation's arguments (installed into
+    /// `current_impl_type_params`), so a self-referential payload
+    /// (`List<T>` in `type List<T> = enum { Cons(T, List<T>), Nil }`)
+    /// resolves to the very same Adt `TypeId` — producing the back-edge
+    /// that the κ graph solver (`kappa.rs`) classifies by cycle variance.
+    ///
+    /// Fail-closed boundaries (no registration, the pre-B5a behavior):
+    /// - existential variants (payloads need fresh skolems per use site),
+    /// - payload resolution pushing any diagnostic (genuine error — the
+    ///   diagnostics are truncated and the registration is skipped),
+    /// - re-entrant self-reference (the guard: the outer registration
+    ///   completes first and covers the cycle).
+    ///
+    /// Called from the two enum `Path` resolution branches below; the
+    /// re-entrancy guard makes payload-driven re-entry a no-op.
+    fn register_adt_expansion(&mut self, def_id: DefId, args: &SmallVec<[TypeId; 4]>) {
+        if self.adt_expansion_guard.is_some() {
+            return; // re-entrant: the outer call covers this instantiation
+        }
+        let adt_ty = self.ctx.enum_ty(def_id, args.clone());
+        if self.ctx.adt_expansion_known(adt_ty) {
+            return;
+        }
+        let binding = match self.symbols.lookup_type_by_def_id(def_id).cloned() {
+            Some(b) => b,
+            None => return,
+        };
+        if !matches!(binding.kind, TypeKind::Enum) {
+            return;
+        }
+        // Existential variants: payloads reference `exists` parameters that
+        // need fresh skolems at every use site — not expressible as one
+        // static expansion.  Skip (fail-closed).
+        if binding.variants.iter().any(|v| !v.exists_params.is_empty()) {
+            return;
+        }
+        self.adt_expansion_guard = Some(adt_ty);
+        // Bind the enum's type parameters to the instantiation's args.
+        let mut param_map = HashMap::default();
+        for (i, tp) in binding.params.iter().enumerate() {
+            if let Some(&arg) = args.get(i) {
+                param_map.insert(tp.name, arg);
+            }
+        }
+        let prev = self.current_impl_type_params.take();
+        self.current_impl_type_params = Some(param_map);
+        let mut payloads: Vec<TypeId> = Vec::with_capacity(binding.variants.len());
+        let mut ok = true;
+        for v in &binding.variants {
+            let pt = match &v.payload {
+                None => self.ctx.unit(),
+                Some(p) => {
+                    let before = self.diagnostics.unreported_len();
+                    let pt = self.resolve_type_expr(p);
+                    // A payload referencing an undefined type (genuine
+                    // error) truncates its diagnostic and skips the whole
+                    // registration.
+                    if self.diagnostics.unreported_len() > before {
+                        self.diagnostics.truncate_unreported(before);
+                        ok = false;
+                        break;
+                    }
+                    pt
+                }
+            };
+            payloads.push(pt);
+        }
+        self.current_impl_type_params = prev;
+        self.adt_expansion_guard = None;
+        if !ok {
+            return;
+        }
+        self.ctx.register_adt_expansion(adt_ty, payloads);
+    }
+
     fn resolve_type_expr(&mut self, ty: &Type<'input>) -> TypeId {
+        // Stage 4: a `dyn Trait` anywhere in the unit breaks parametricity
+        // (runtime type reification distinguishes instantiations).  The
+        // resolver is the single-threaded, UNIT-LEVEL chokepoint: the
+        // parallel checker pass gives each rayon worker its own
+        // `TypeContext`, so a hook that fires only on a worker's context
+        // under-approximates the unit-wide guarantee.  Setting the gate
+        // here — on the unit's context, which every worker is forked
+        // from — is the authoritative site.  (The checker's FnCtxt
+        // DynTrait hook remains as defense-in-depth for worker-local
+        // queries.)  Nested positions are covered: this method recurses
+        // into all type sub-expressions.
+        if let Type::DynTrait(..) = ty {
+            self.ctx.parametricity.break_parametricity();
+        }
         match ty {
             Type::Path(path, span) => {
                 // Check if this name refers to `Self` in an impl block.
@@ -2027,7 +2134,12 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                     } else if let Some(binding) = self.symbols.lookup_type_by_def_id(def_id) {
                         match binding.kind {
                             TypeKind::Struct => self.ctx.struct_ty(def_id, smallvec![]),
-                            TypeKind::Enum => self.ctx.enum_ty(def_id, smallvec![]),
+                            TypeKind::Enum => {
+                                let args: SmallVec<[TypeId; 4]> = smallvec![];
+                                let ty = self.ctx.enum_ty(def_id, args.clone());
+                                self.register_adt_expansion(def_id, &args);
+                                ty
+                            }
                             _ => self.ctx.error(),
                         }
                     } else {
@@ -2084,15 +2196,15 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                     && path.len() == 1
                 {
                     if path[0].eq_str("Int") {
-                        let bits = self
-                            .extract_int_from_type(args[0].ty().as_ref())
-                            .unwrap_or(32);
-                        return self.ctx.int(bits, true);
+                        return match self.resolve_int_width(args.get(0)) {
+                            Some(bits) => self.ctx.int(bits, true),
+                            None => self.ctx.error(),
+                        };
                     } else if path[0].eq_str("UInt") {
-                        let bits = self
-                            .extract_int_from_type(args[0].ty().as_ref())
-                            .unwrap_or(32);
-                        return self.ctx.int(bits, false);
+                        return match self.resolve_int_width(args.get(0)) {
+                            Some(bits) => self.ctx.int(bits, false),
+                            None => self.ctx.error(),
+                        };
                     } else if path[0].eq_str("Float") {
                         let bits = self
                             .extract_int_from_type(args[0].ty().as_ref())
@@ -2130,7 +2242,11 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                             .collect();
                         match binding.kind {
                             TypeKind::Struct => self.ctx.struct_ty(def_id, arg_tys),
-                            TypeKind::Enum => self.ctx.enum_ty(def_id, arg_tys),
+                            TypeKind::Enum => {
+                                let ty = self.ctx.enum_ty(def_id, arg_tys.clone());
+                                self.register_adt_expansion(def_id, &arg_tys);
+                                ty
+                            }
                             _ => {
                                 self.diagnostics.push(
                                     Diagnostic::error("generic type arguments on non-generic type")
@@ -2310,6 +2426,56 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
         }
     }
 
+    /// Bit width of an `Int<..>` / `UInt<..>` type argument.
+    ///
+    /// * a literal width in `1..=64` — or `1..=128` with
+    ///   `--enable-experimental` (SYNTAX.md §Types: "1..64 (up to 128
+    ///   with `--enable-experimental`)") — resolves to that width;
+    /// * a literal width outside the range — `Int<0>`, `Int<999>`, a
+    ///   negative or beyond-`u64` literal — reports a diagnostic on the
+    ///   width and resolves to `None` (the caller substitutes the error
+    ///   type);
+    /// * a non-literal argument (generic parameter, const expression)
+    ///   keeps the historical default width.
+    ///
+    /// The suffix desugaring (`42i999` → `42: Int<999>`) routes through
+    /// here, so a bad suffix width reports exactly like the hand-written
+    /// annotation.  The checker's `FnCtxt::resolve_type` resolves the
+    /// same AST again and must stay silent for invalid widths — this
+    /// function owns the diagnostic (the resolver runs first).
+    fn resolve_int_width(&mut self, arg: Option<&GenericArg<'input>>) -> Option<u32> {
+        const DEFAULT_INT_WIDTH: u32 = 32;
+        let Some(arg) = arg else {
+            return Some(DEFAULT_INT_WIDTH);
+        };
+        let max_bits: u64 = if self.enable_experimental { 128 } else { 64 };
+        let ty = arg.ty();
+        if let Type::Literal(Expr::Literal(Literal::Int(val), _), lit_span) = ty.as_ref() {
+            if let Some(n) = val.to_u64()
+                && (1..=max_bits).contains(&n)
+            {
+                return Some(n as u32);
+            }
+            // A width in 65..=128 without the flag is the one failure
+            // with a fix the user can act on — point at it directly.
+            let help = if !self.enable_experimental && matches!(val.to_u64(), Some(65..=128)) {
+                "bit widths above 64 require `--enable-experimental`".to_string()
+            } else {
+                format!(
+                    "SYNTAX.md §Types: `bits` must be a compile-time \
+                     constant in 1..={max_bits}, e.g. `Int<32>`"
+                )
+            };
+            self.diagnostics.push(
+                Diagnostic::error(format!("integer bit width must be in 1..={max_bits}"))
+                    .with_span(*lit_span)
+                    .with_help(help),
+            );
+            return None;
+        }
+        Some(DEFAULT_INT_WIDTH)
+    }
+
     fn enter_scope(&mut self) {
         self.current_scope = self.symbols.push_scope();
     }
@@ -2359,6 +2525,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
             Literal::Int(_) => self.ctx.int(32, true),
             Literal::Float(_) => self.ctx.float(64),
             Literal::Char(_) => self.ctx.char(),
+            Literal::Byte(_) => self.ctx.byte(),
             Literal::String(_) => self.ctx.slice(self.ctx.byte()),
             Literal::ByteString(_) => self.ctx.slice(self.ctx.byte()),
             Literal::Bool(_) => self.ctx.bool(),
@@ -2554,7 +2721,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
     /// in the current scope.  Supports:
     ///   `import path::to::item;`           → alias = last segment
     ///   `import path::to::item as alias;`  → alias = explicit name
-    ///   `from path::to import { a, b };`   → each item by explicit name
+    ///   `import path::to::{a, b};`         → each item by explicit name
     fn resolve_import_path(
         &mut self,
         path: &[Symbol],
@@ -2581,7 +2748,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 );
                 self.symbols.register_full_path(full_path, def_id);
             }
-            // `from path import { items }`
+            // `import path::{ items }`
             if let Some(item_list) = items {
                 for item in item_list {
                     let item_path = [*item];
@@ -2616,7 +2783,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
             if let Some(name) = &import_name {
                 self.symbols.insert_trait(*name, trait_binding, span).ok();
             }
-            // `from path import { items }` — also import traits
+            // `import path::{ items }` — also import traits
             if let Some(item_list) = items {
                 for item in item_list {
                     let item_path = [*item];
@@ -2655,7 +2822,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::parser::Parser;
@@ -2676,21 +2843,31 @@ mod tests {
         let arena: &'static crate::arena::SyncArena<'static> =
             Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
         let mut ctx = TypeContext::new();
-        let mut parser = Parser::new(source, arena);
+        let mut parser = Parser::new(source, FileId::DUMMY, arena);
         let program = parser.parse_program().map_err(|diags| {
             diags
                 .into_iter()
-                .map(|d| d.message().to_string())
+                .map(|mut d| {
+                    // `*_kind` diagnostics derive `message` lazily; the
+                    // emitter humanizes at its render boundary.
+                    d.humanize();
+                    d.message().to_string()
+                })
                 .collect::<Vec<_>>()
         })?;
         let local_crate_id = CrateId(DefId(0));
-        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, Some(source));
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id, Some(source), false);
         let (symbols, trait_env, diags, resolution_map) = resolver.resolve_program(&program);
         if diags.has_errors() {
             return Err(diags
                 .into_inner()
                 .into_iter()
-                .map(|d| d.message().to_string())
+                .map(|mut d| {
+                    // `*_kind` diagnostics derive `message` lazily; the
+                    // emitter humanizes at its render boundary.
+                    d.humanize();
+                    d.message().to_string()
+                })
                 .collect::<Vec<_>>());
         }
         Ok((symbols, trait_env, resolution_map, ctx))

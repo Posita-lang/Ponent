@@ -1,5 +1,4 @@
-//! The Polonius cross-validation pipeline (the committee two-solver
-//! comparison).
+//! The Polonius cross-validation pipeline (two-solver comparison).
 //!
 //! Extracts the loan / liveness facts from a function body (the CFG + the
 //! borrow sites + the access events) into the Polonius input schema and
@@ -43,6 +42,7 @@
 //! `var_dropped_at` and path-level facts (child_path/path_is_var) for
 //! full `AllFacts` parity.
 
+use crate::ast::FileId;
 use crate::ast::UnaryOp;
 use crate::hir::cfg_graph::{BlockId, CfgGraph, Point, collect_borrow_data};
 use crate::hir::hir::{HirExpr, HirStmt};
@@ -1870,7 +1870,7 @@ pub fn borrow_check_function<'input>(
                 is_drop: false,
                 loan_kind: None,
                 span1: None,
-                span: crate::ast::Span::new(0, 0),
+                span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
             }];
         }
     };
@@ -1899,7 +1899,7 @@ pub fn borrow_check_function<'input>(
                 is_drop: false,
                 loan_kind: None,
                 span1: None,
-                span: crate::ast::Span::new(0, 0),
+                span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
             }]
         }
     }
@@ -2126,7 +2126,7 @@ pub fn rules_to_borrow_errors(
             is_drop: false,
             loan_kind: None,
             span1: None,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         });
     }
     // E116: the drop-while-borrowed errors — a dropped value whose loan
@@ -2185,7 +2185,7 @@ pub fn rules_to_borrow_errors(
     Ok(deduped)
 }
 
-/// R9 (the placeholder-subset rejection — the committee ruling): the
+/// R9 (the placeholder-subset rejection): the
 /// placeholder subset
 /// errors — a subset relation between two placeholder origins NOT
 /// declared in the signature (`known_placeholder_subset`) is rejected.
@@ -2194,13 +2194,13 @@ pub fn evaluate_subset_errors(facts: &PoloniusFacts) -> Vec<(u32, u32, u64)> {
     Analysis::new(facts).subset_errors(facts)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::hir::checker::tests::check_source;
     use smallvec::smallvec;
 
-    fn first_body(src: &str) -> Vec<HirStmt<'static>> {
+    fn first_body(src: &'static str) -> Vec<HirStmt<'static>> {
         let prog = check_source(src).expect("program must check");
         let HirStmt::FunctionDef { body, .. } = &prog.items[0] else {
             panic!("expected a function def");
@@ -2758,7 +2758,8 @@ mod tests {
             src.push_str(&format!("v{} = {};\n", i % loans, i));
         }
         src.push_str("return 0;\n}");
-        let (prog, _) = crate::hir::checker::tests::check_source_keep_hir(&src);
+        let src: &'static str = Box::leak(src.into_boxed_str());
+        let (prog, _) = crate::hir::checker::tests::check_source_keep_hir(src);
         let item = prog
             .items
             .iter()
@@ -3507,21 +3508,21 @@ mod tests {
     #[test]
     fn test_count_return_refs_recursive() {
         use crate::ast::{Span, Type};
-        let path = Type::Path(smallvec::smallvec![], Span::new(0, 1));
+        let path = Type::Path(smallvec::smallvec![], Span::new(FileId::DUMMY, 0, 1));
         let r1 = Type::Reference {
             inner: &path,
             mutable: true,
             lifetime: None,
-            span: Span::new(0, 1),
+            span: Span::new(FileId::DUMMY, 0, 1),
         };
         assert_eq!(count_return_refs_ast(&r1), 1);
         let r2 = Type::Reference {
             inner: &path,
             mutable: false,
             lifetime: None,
-            span: Span::new(0, 1),
+            span: Span::new(FileId::DUMMY, 0, 1),
         };
-        let tup = Type::Tuple(vec![r1, r2], Span::new(0, 1));
+        let tup = Type::Tuple(vec![r1, r2], Span::new(FileId::DUMMY, 0, 1));
         assert_eq!(
             count_return_refs_ast(&tup),
             2,
@@ -3651,7 +3652,7 @@ mod tests {
             stmt: 0,
             expr: 0,
         };
-        let span = crate::ast::Span::new(0, 1);
+        let span = crate::ast::Span::new(FileId::DUMMY, 0, 1);
         let facts = PoloniusFacts {
             cfg_edge: vec![(0, 1)],
             loan_issued_at: vec![(0, 0, 0)],
@@ -3889,7 +3890,7 @@ mod tests {
                 stmt: 0,
                 expr: 16,
             },
-            span: crate::ast::Span::new(10, 20),
+            span: crate::ast::Span::new(FileId::DUMMY, 10, 20),
             two_phase: false,
         }];
         let errs = rules_to_borrow_errors(&facts, &infos, &[])
@@ -3931,7 +3932,7 @@ mod tests {
                 stmt: 0,
                 expr: 16,
             },
-            span: crate::ast::Span::new(10, 20),
+            span: crate::ast::Span::new(FileId::DUMMY, 10, 20),
             two_phase: false,
         }];
         let errs = rules_to_borrow_errors(&facts, &infos, &[])

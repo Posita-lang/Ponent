@@ -11,10 +11,9 @@
 //!   permutation + vacuous binder removal + quantifier hoisting make this
 //!   canonical; parameter order is sorted for the permutation law).
 //! - **§5.1**: modular nodes (Def 5.1), eliminality (Def 5.2, Lemma 5.1).
-//! - **§5.2**: coherence as 2-SAT (Remark 5.1) — implemented directly as
-//!   its satisfying-valuation semantics (Def 5.5), not via a generic
-//!   2-SAT solver, because the clause set is tiny and the direct check is
-//!   the same polytime.
+//! - **§5.2**: coherence as 2-SAT (Remark 5.1) — implication graph over the
+//!   literals "φ(X) = Blue/Red" (eliminability + parallel-modular-pair
+//!   clauses), solved by iterative Tarjan SCC in linear time.
 //! - **§5.3**: κ(E) ∈ {0, 1, ∞} via cyclic alternating paths (Def 5.7–5.8).
 //!
 //! ## Deliberate scope limits (fail-closed)
@@ -80,12 +79,9 @@ pub(crate) struct CoherenceTree {
     pub nodes: Vec<OccNode>,
     pub parent: Vec<Option<NodeId>>,
     pub root: NodeId,
-    /// Bound variables: index → (root node of its binder scope r_X, color
-    /// of its head occurrence).
-    pub binder_root: HashMap<usize, NodeId>,
-    /// Nodes carrying binder sets that mention each variable: for X ∈ Y⃗ at
-    /// node n, X's binder-scope root r_X is that node (Notation 5.1).
-    pub binder_owner: HashMap<usize, NodeId>,
+    // B8: the binder-scope maps were stored here but never read after
+    // construction — the shadowing check (Notation 5.1) uses the LOCAL maps
+    // inside `build_coherence_tree`, so the struct fields were dead state.
 }
 
 /// A `bool`-like colored variable occurrence collected during lowering.
@@ -95,6 +91,59 @@ struct Pending {
     color: Color,
     children: Vec<Pending>,
     binders: Vec<usize>,
+}
+
+// ── Lazy atom terminals ─────────────────────────────────────────────
+//
+// §4.1 defines Λ2 as atoms + →: the paper's Fig. 1 isomorphisms
+// instantiate CLOSED ATOMS (e.g. (★) takes A closed), so a nominal type
+// (primitive, ADT, ref/ptr/array/slice, dyn, opaque, Unit, Type) is a
+// legitimate Λ2 ground atom — NOT outside the machinery.  Such a type
+// lowers to a bare leaf labeled by an injective encoding of its TypeId:
+//
+//     atom label = ATOM_BASE - ty.index()
+//
+// Properties (all load-bearing):
+// - bijective per context (arena indices are unique), so equal TypeIds
+//   share a label and distinct TypeIds never collide;
+// - disjoint from `param_index` space by magnitude: atom labels live in
+//   [ATOM_LABEL_FLOOR, ATOM_BASE] (~2^63.97), param indices are a small
+//   upward counter — `fresh_param_index` debug-asserts the boundary;
+// - ≠ `usize::MAX`, which stays reserved for the Π-identity `unit_leaf`
+//   in rewrite.rs;
+// - never binder-governed: atom labels never enter `binder_scope`, so
+//   `is_modular` refuses them (never a modular site / reduction target),
+//   the 2-SAT never allocates them a variable, and `place_binders` never
+//   sinks a binder onto them.  They are pure inert terminals.
+const ATOM_BASE: usize = usize::MAX - 1;
+/// Lowest possible atom label = ATOM_BASE - max arena index.
+pub(crate) const ATOM_LABEL_FLOOR: usize = usize::MAX - (usize::MAX >> TypeId::TAG_BITS);
+
+/// The lazy atom label for a nominal type (see the block above).
+fn atom_label(ty: TypeId) -> usize {
+    let l = ATOM_BASE - ty.index();
+    debug_assert!(l >= ATOM_LABEL_FLOOR, "atom label underflowed its range");
+    l
+}
+
+/// Does `ty` contain NO GenericParam anywhere?  Only GROUND nominal
+/// types lower to lazy atom leaves; a nominal carrying a parameter (e.g.
+/// `Vec<T>` with T a param) is not a Λ2 ground atom — treating it as one
+/// would silently drop the param occurrence, so it stays fail-closed.
+fn is_ground<'input>(ctx: &TypeContext<'input>, ty: TypeId) -> bool {
+    fn go<'input>(ctx: &TypeContext<'input>, ty: TypeId, ok: &mut bool) {
+        if !*ok {
+            return;
+        }
+        if matches!(ctx.get(ty), TypeData::GenericParam { .. }) {
+            *ok = false;
+            return;
+        }
+        visit_type_children(ty, ctx, &mut |c| go(ctx, c, ok));
+    }
+    let mut ok = true;
+    go(ctx, ty, &mut ok);
+    ok
 }
 
 impl<'input> TypeContext<'input> {
@@ -107,9 +156,14 @@ impl<'input> TypeContext<'input> {
     ///
     /// The whole closed type A maps to the *positive* tree `t(A)`.
     ///
-    /// Fails (returns `None`) for anything outside Λ2: `Coproduct`
-    /// (user sums), `Never` (0), `Mu`/`Nu`, `Exists`, `Poly`, ADTs,
-    /// `InferVar`, `Opaque` — fail-closed, as tp(·) is defined only for Λ2.
+    /// Λ2 = atoms + → (§4.1).  GROUND nominal types (primitives,
+    /// ground ADTs, refs/ptrs/arrays/slices, dyn, opaque, Unit, Type)
+    /// lower to INERT atom leaves labeled by an injective TypeId encoding
+    /// (see `atom_label`).  Still outside Λ2 (fail-closed): `Coproduct`
+    /// (user sums), `Never` (0), `Mu`/`Nu`, `Exists`, `Poly`,
+    /// `InferVar`/`SkolemVar`/`Error`, return-position `Tuple`, and
+    /// nominals CARRYING a parameter (`Vec<T>` — not a ground atom;
+    /// treating it as one would drop the param occurrence).
     ///
     /// Binder identity is `param_index` (globally unique per the
     /// `fresh_param_index` allocator discipline, see canonical.rs).
@@ -117,7 +171,12 @@ impl<'input> TypeContext<'input> {
         let pending = place_binders(self.lower_type(root, Color::Blue)?);
 
         // Single-pass: build the owned node tree, collecting parent links
-        // and binder scopes as we go.
+        // and binder scopes as we go.  Binders sit at the LCA of their
+        // occurrences (place_binders) — this is NOT an accommodation of the
+        // window: per Lemma 4.1(i) the hoisting iso `A⇒∀X.B ≡ ∀X.A⇒B`
+        // (X∉FV(A)) pulls a binder up exactly as far as its occurrences
+        // allow, so the NF-canonical position IS the LCA.  See the
+        // place_binders doc and the fig7 duel goldens below.
         let mut nodes: Vec<OccNode> = Vec::new();
         let mut parent: Vec<Option<NodeId>> = Vec::new();
         let mut binder_root: HashMap<usize, NodeId> = HashMap::default();
@@ -194,8 +253,6 @@ impl<'input> TypeContext<'input> {
             nodes: vec![root_owned],
             parent: vec![None],
             root: 0,
-            binder_root,
-            binder_owner,
         })
     }
 
@@ -268,7 +325,17 @@ impl Pending {
                 // args' polarity, so merge them into this spine (currying
                 // flattening, Lemma 4.1).
                 children.extend(ret_pending.children);
-                children.sort_by(|a, b| pending_cmp(a, b));
+                // P2: decorate-sort-undecorate — pending_cmp recomputed the
+                // structural key on EVERY comparison (O(key) each, quadratic
+                // in the number of comparisons); compute each child's key
+                // once instead.
+                let mut decorated: Vec<(Vec<u8>, Pending)> = children
+                    .into_iter()
+                    .map(|c| (pending_sort_key(&c), c))
+                    .collect();
+                decorated.sort_by(|a, b| a.0.cmp(&b.0));
+                let children: Vec<Pending> =
+                    decorated.into_iter().map(|(_, c)| c).collect();
                 Some(Pending {
                     label: ret_pending.label,
                     color,
@@ -282,16 +349,61 @@ impl Pending {
                 children: Vec::new(),
                 binders: Vec::new(),
             }),
+            // GROUND nominal types are Λ2 atoms (§4.1: Λ2 = atoms + →;
+            // Fig. 1 instantiates closed atoms, so Int/Bool/ground ADTs/
+            // refs/… are legitimate).  They lower to inert bare leaves
+            // labeled by an injective TypeId encoding (see ATOM_BASE):
+            // never binder-governed, never modular, never 2-SAT variables.
+            // A nominal CARRYING a parameter (Vec<T>) is not a ground atom
+            // — treating it as one would drop the param occurrence — so it
+            // stays fail-closed.
+            TypeData::Int { .. }
+            | TypeData::UInt { .. }
+            | TypeData::Float { .. }
+            | TypeData::Bool
+            | TypeData::Char
+            | TypeData::Byte
+            | TypeData::USize
+            | TypeData::Rational { .. }
+            | TypeData::Unit
+            | TypeData::Adt { .. }
+            | TypeData::Array { .. }
+            | TypeData::Slice { .. }
+            | TypeData::Ref { .. }
+            | TypeData::Pointer { .. }
+            | TypeData::Ptr { .. }
+            | TypeData::DynTrait { .. }
+            | TypeData::Type
+            | TypeData::Opaque { .. } => {
+                if is_ground(ctx, resolved) {
+                    Some(Pending {
+                        label: atom_label(resolved),
+                        color,
+                        children: Vec::new(),
+                        binders: Vec::new(),
+                    })
+                } else {
+                    None // parameterized nominal: not a Λ2 ground atom
+                }
+            }
             // ∀ in argument position: hoist (A→∀X.B ≡ ∀X.A→B) — the binder
             // travels to the enclosing spine node.  Handled in lower_type
             // via the Forall arm only at top level; here a ∀ return of an
             // inner spine was already lifted by recursion through `ret`.
-            _ => None, // outside Λ2 (base types like Int/Bool/ADT…)
+            _ => None, // outside Λ2: sums (Coproduct), 0 (Never), μ/ν, ∃,
+                       // Poly, inference state (InferVar/SkolemVar/Error),
+                       // products in return position (Tuple)
         }
     }
 }
 
 /// Does this pending tree mention `var` free (ignoring its own binders)?
+///
+/// P2 boundary: called once per ∀ binder during lowering (L277), each call
+/// an early-exiting walk of the just-lowered subtree — O(k·n) over a type
+/// with k binders, k small in practice.  An incremental FV undo-log would
+/// restructure `lower_type`'s bottom-up construction for a marginal win;
+/// deliberately not taken.
 fn pending_contains_var(p: &Pending, var: usize) -> bool {
     if p.binders.contains(&var) {
         return false;
@@ -322,6 +434,63 @@ pub(crate) struct FlatTree {
     /// Bound variable → r_X (the node whose binder set contains X;
     /// Notation 5.1 gives uniqueness).
     pub(crate) binder_scope: HashMap<usize, NodeId>,
+    /// P3a: (label, color) → node ids, built ONCE at construction.
+    /// `nodes_labeled` is an O(1) index lookup instead of an O(N)
+    /// rescan — the 2-SAT clause scan in `is_coherent` calls it O(n²)
+    /// times, so the precomputed index drops the clause pass from
+    /// O(n²·N) to O(n²·avg) + one O(N) build.
+    pub(crate) labeled: HashMap<(usize, Color), Vec<NodeId>>,
+    /// P3b: Euler tour entry time (`tin[v]` is assigned on discovery,
+    /// `tout[v]` after all descendants).  Standard subtree-interval
+    /// test: `g` is an ancestor-OR-EQUAL of `id` ⇔
+    /// `tin[g] ≤ tin[id] ∧ tout[id] ≤ tout[g]` — O(1) instead of an
+    /// O(depth) parent-pointer climb in `has_cyclic_alternating_path`'s
+    /// up-move scan (which runs it O(leaves · nodes) times).
+    pub(crate) tin: Vec<usize>,
+    pub(crate) tout: Vec<usize>,
+}
+
+/// P3b: iterative Euler tour of the rooted tree (node 0 = root in both
+/// construction paths).  `tin` on discovery, `tout` after the whole
+/// subtree — gives the `g ⪯ id` interval test above.  Iterative (stack)
+/// by the P3d no-recursion discipline: pathologically deep spines must
+/// not recurse.
+fn build_euler_times(nodes: &[FlatNode]) -> (Vec<usize>, Vec<usize>) {
+    let n = nodes.len();
+    let mut tin = vec![0usize; n];
+    let mut tout = vec![0usize; n];
+    if n == 0 {
+        return (tin, tout);
+    }
+    let mut t = 0usize;
+    // (node, next-child-slot)
+    let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+    tin[0] = t;
+    t += 1;
+    while let Some(top) = stack.last_mut() {
+        let v = top.0;
+        if top.1 < nodes[v].children.len() {
+            let w = nodes[v].children[top.1];
+            top.1 += 1;
+            tin[w] = t;
+            t += 1;
+            stack.push((w, 0));
+        } else {
+            tout[v] = t;
+            t += 1;
+            stack.pop();
+        }
+    }
+    (tin, tout)
+}
+
+/// P3a: build the (label, color) → [node] index in one O(N) pass.
+fn build_labeled_index(nodes: &[FlatNode]) -> HashMap<(usize, Color), Vec<NodeId>> {
+    let mut idx: HashMap<(usize, Color), Vec<NodeId>> = HashMap::default();
+    for (i, n) in nodes.iter().enumerate() {
+        idx.entry((n.label, n.color)).or_default().push(i);
+    }
+    idx
 }
 
 impl FlatTree {
@@ -331,6 +500,15 @@ impl FlatTree {
         nodes: Vec<FlatNode>,
         binder_scope: HashMap<usize, NodeId>,
     ) -> FlatTree {
+        // P3: structural invariants the whole coherence machinery rests
+        // on — a non-empty node list, every registered binder pointing at
+        // a live node, and (after the parent links below) exactly one
+        // root.  Fail loudly in debug if a construction path breaks them.
+        debug_assert!(!nodes.is_empty(), "from_parts: empty node list");
+        debug_assert!(
+            binder_scope.values().all(|&id| id < nodes.len()),
+            "from_parts: binder_scope entry out of range"
+        );
         let mut parent = vec![None; nodes.len()];
         let mut depth = vec![0usize; nodes.len()];
         for (i, n) in nodes.iter().enumerate() {
@@ -339,11 +517,21 @@ impl FlatTree {
                 depth[c] = depth[i] + 1;
             }
         }
+        debug_assert_eq!(
+            parent.iter().filter(|p| p.is_none()).count(),
+            1,
+            "from_parts: exactly one root expected"
+        );
+        let labeled = build_labeled_index(&nodes);
+        let (tin, tout) = build_euler_times(&nodes);
         FlatTree {
             nodes,
             parent,
             depth,
             binder_scope,
+            labeled,
+            tin,
+            tout,
         }
     }
 
@@ -372,6 +560,9 @@ impl CoherenceTree {
             parent: Vec::new(),
             depth: Vec::new(),
             binder_scope: HashMap::default(),
+            labeled: HashMap::default(),
+            tin: Vec::new(),
+            tout: Vec::new(),
         };
         fn walk(n: &OccNode, par: Option<NodeId>, dep: usize, ft: &mut FlatTree) -> NodeId {
             let id = ft.nodes.len();
@@ -395,6 +586,8 @@ impl CoherenceTree {
             id
         }
         walk(&self.nodes[self.root], None, 0, &mut ft);
+        ft.labeled = build_labeled_index(&ft.nodes);
+        (ft.tin, ft.tout) = build_euler_times(&ft.nodes);
         ft
     }
 }
@@ -413,6 +606,14 @@ impl FlatTree {
 
     /// Tree distance d(α, β) (number of edges on the unique path).
     fn dist(&self, mut a: NodeId, mut b: NodeId) -> usize {
+        // P2: O(1) fast path when one endpoint is an ancestor of the
+        // other — the is_modular window case dist(α, r_X) with r_X above.
+        if self.tin[b] <= self.tin[a] && self.tout[a] <= self.tout[b] {
+            return self.depth[a] - self.depth[b];
+        }
+        if self.tin[a] <= self.tin[b] && self.tout[b] <= self.tout[a] {
+            return self.depth[b] - self.depth[a];
+        }
         let mut d = 0;
         while self.depth[a] > self.depth[b] {
             a = self.parent[a].unwrap();
@@ -430,17 +631,43 @@ impl FlatTree {
         d
     }
 
-    /// All nodes labeled `v` with color `c`.
-    fn nodes_labeled(&self, v: usize, c: Color) -> Vec<NodeId> {
-        (0..self.nodes.len())
-            .filter(|&i| self.nodes[i].label == v && self.nodes[i].color == c)
-            .collect()
+    /// All nodes labeled `v` with color `c` (P3a: O(1) index lookup
+    /// against the precomputed `labeled` map, not an O(N) rescan).
+    fn nodes_labeled(&self, v: usize, c: Color) -> &[NodeId] {
+        self.labeled
+            .get(&(v, c))
+            .map(|s| s.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Def 5.1: is terminal node `a` modular?
     /// modular ⇔ a ≠ h_X ∧ 1 ≤ d(a, r_X) ≤ 2 ∧ no parallel node of the
     /// same label X^c.  Here r_X is the node binding X and h_X is the head
     /// of r_X's subtree — i.e. node r_X itself.
+    ///
+    /// Representation mapping (arXiv:1907.03481v3 §4.1, L844 verbatim:
+    /// "rooted trees whose **leaves** are labeled by colored variables"):
+    /// the paper's tree carries variable labels on LEAVES only; spine
+    /// nodes are unlabeled.  Our FlatTree merges each spine's head
+    /// variable into the spine node, so:
+    /// - a code node WITH children ≙ the paper's head-leaf of that spine.
+    ///   Its paper distance is the code distance + 1 (one extra edge to
+    ///   the head-leaf), so the d(α, r_X) ≤ 2 window admits code d ≤ 1
+    ///   (Lemma 5.5's proof, L1987, confirms the negative case: a modular
+    ///   candidate "whose distance from r_X is greater than 2" — paper
+    ///   distance, i.e. code d ≥ 2 for a spine).
+    /// - a code BARE LEAF ≙ the paper leaf itself: window 1..=2 unchanged.
+    /// "Parallel" (Notation 5.1, verbatim: "immediate successors of the
+    /// same node") is a PAPER-tree relation, so in code terms:
+    /// - the head-leaf of spine v is parallel to v's bare-leaf children
+    ///   only (head-leaves of spine children live under THEIR spines);
+    /// - a bare leaf is parallel to its bare-leaf siblings and to its
+    ///   parent spine's head-leaf (the X̄⇒X̄ shape — both non-modular,
+    ///   which is what keeps the κ=∞ probe `∀XY.(X→(Y→X))→X→Y` incoherent).
+    /// Two same-label spine SIBLINGS (e.g. Example 3.1's `mid`/`YW` W̄
+    /// spines under the root) are NOT paper-parallel — they are leaves
+    /// under different paper parents — which is what makes Example 3.1
+    /// coherent, matching §3's ≅1 proof via Thm 5.6.
     fn is_modular(&self, a: NodeId) -> bool {
         let n = &self.nodes[a];
         let x = n.label;
@@ -451,13 +678,42 @@ impl FlatTree {
             return false; // α ≠ h_X
         }
         let d = self.dist(a, r);
-        if !(1..=2).contains(&d) {
+        let is_terminal = n.children.is_empty();
+        // Distance window, per the representation mapping above.
+        let in_window = if is_terminal {
+            (1..=2).contains(&d)
+        } else {
+            d <= 1 // paper d = code d + 1 ≤ 2
+        };
+        if !in_window {
             return false;
         }
-        // No parallel node of label X^c: no sibling with same label+color.
-        if let Some(p) = self.parent[a] {
-            for &s in &self.nodes[p].children {
-                if s != a && self.nodes[s].label == x && self.nodes[s].color == n.color {
+        // "no parallel node of label X^c" — paper siblings, per the
+        // mapping above.
+        if is_terminal {
+            if let Some(p) = self.parent[a] {
+                for &s in &self.nodes[p].children {
+                    // bare-leaf sibling with same label+color
+                    if s != a
+                        && self.nodes[s].children.is_empty()
+                        && self.nodes[s].label == x
+                        && self.nodes[s].color == n.color
+                    {
+                        return false;
+                    }
+                }
+                // parent spine's head-leaf with same label+color
+                let pn = &self.nodes[p];
+                if pn.label == x && pn.color == n.color {
+                    return false;
+                }
+            }
+        } else {
+            // head-leaf of this spine: parallel = bare-leaf children
+            // with the same label+color.
+            for &s in &n.children {
+                let sc = &self.nodes[s];
+                if sc.children.is_empty() && sc.label == x && sc.color == n.color {
                     return false;
                 }
             }
@@ -482,20 +738,26 @@ impl FlatTree {
 
     // ── Def 5.5: coherence ──────────────────────────────────────────────
 
-    /// Def 5.4: X^c and Y^d are coherent iff there are no parallel modular
-    /// nodes α : X^c, β : Y^d (siblings with those labels/colors).
+    /// Raw parallel-modular-pair existence check: are there parallel
+    /// modular nodes α : x^c, β : y^d?  NOT Def 5.4's coherence itself —
+    /// Def 5.4 (verbatim, L1955) says X^c and Y^d are coherent iff there
+    /// is no parallel modular pair α : X^c̄, β : Y^d̄ in the COMPLEMENTED
+    /// colors; hence coherence of (X^c, Y^d) is
+    /// `pair_coherent(x, c̄, y, d̄)`, and 2-SAT clause (2) uses the
+    /// equivalent form: a pair (x^c, y^d) forbids the complemented
+    /// valuation (φ(x)=c̄, φ(y)=d̄), yielding clause (a_x^c ∨ a_y^d).
     fn pair_coherent(&self, x: usize, c: Color, y: usize, d: Color) -> bool {
         if x == y {
             return true; // same variable, no pair (α:X, β:Y) with Y ≠ X
         }
         let xs = self.nodes_labeled(x, c);
         let ys = self.nodes_labeled(y, d);
-        for &a in &xs {
+        for &a in xs {
             if !self.is_modular(a) {
                 continue;
             }
             let Some(p) = self.parent[a] else { continue };
-            for &b in &ys {
+            for &b in ys {
                 if b != a && self.parent[b] == Some(p) && self.is_modular(b) {
                     return false; // parallel modular pair
                 }
@@ -504,58 +766,136 @@ impl FlatTree {
         true
     }
 
-    /// Def 5.5 (Remark 5.1 semantics, checked directly): does a valuation
-    /// φ : bV → Colors exist s.t. every X is φ(X)-eliminable and every
-    /// pair X^{φ(X)}, Y^{φ(Y)} (X≠Y) is coherent?
-    ///
-    /// Small clause sets ⇒ brute force over 2^n valuations with memoized
-    /// eliminability; the paper's 2-SAT would scale further but n is tiny
-    /// for real types.  Fail-closed: no valuation ⇒ not coherent.
+    /// Def 5.5 (Remark 5.1) via 2-SAT: X ↦ b_X, b_X ⇔ φ(X) = Blue.
+    /// Clauses:
+    ///  (1) φ(X)=Blue ⇒ X blue-eliminable, φ(X)=Red ⇒ X red-eliminable
+    ///      (Def 5.2 semantics as implemented by `color_eliminable`);
+    ///  (2) for every X ≠ Y and colors (c,d) with a parallel modular pair
+    ///      α : X^c, β : Y^d (Def 5.4): the forbidden valuation is the
+    ///      COMPLEMENT — ¬(φ(X)=c̄ ∧ φ(Y)=d̄), i.e. clause (a_X^c ∨ a_Y^d).
+    ///      (Def 5.4: X^c coherent with Y^d ⇔ no parallel modular
+    ///      α:X^c̄, β:Y^d̄; so a sibling pair of colors (c,d) rules out the
+    ///      valuation (c̄,d̄), not (c,d).)
+    /// Implication graph + Tarjan SCC (iterative): O(n²) clauses, linear
+    /// solve.  Fail-closed: UNSAT ⇒ not coherent (κ = ∞).
     pub fn is_coherent(&self) -> Option<HashMap<usize, Color>> {
         let vars: Vec<usize> = {
             let mut v: Vec<usize> = self.binder_scope.keys().copied().collect();
             v.sort();
             v
         };
-        // Precompute per-variable, per-color eliminability.
-        let elim: HashMap<(usize, Color), bool> = vars
-            .iter()
-            .flat_map(|&x| [(x, Color::Blue), (x, Color::Red)])
-            .map(|k| (k, self.color_eliminable(k.0, k.1)))
-            .collect();
-
-        // Brute force over valuations (n ≤ 20 guard: beyond that, fail
-        // closed rather than blow up; a real 2-SAT/SCC pass can replace
-        // this later).
-        if vars.len() > 20 {
-            return None;
+        let n = vars.len();
+        if n == 0 {
+            return Some(HashMap::default());
         }
-        for mask in 0u64..(1u64 << vars.len()) {
-            let val: HashMap<usize, Color> = vars
-                .iter()
-                .enumerate()
-                .map(|(i, &x)| {
-                    (
-                        x,
-                        if mask & (1 << i) != 0 {
-                            Color::Red
-                        } else {
-                            Color::Blue
-                        },
-                    )
-                })
-                .collect();
-            let ok = vars.iter().all(|&x| {
-                elim[&(x, val[&x])]
-                    && vars
-                        .iter()
-                        .all(|&y| y == x || self.pair_coherent(x, val[&x], y, val[&y]))
-            });
-            if ok {
-                return Some(val);
+        // literal 2i = "φ(vars[i]) = Blue", 2i+1 = "φ(vars[i]) = Red".
+        let blue = |i: usize| 2 * i;
+        let red = |i: usize| 2 * i + 1;
+        // clause (a ∨ b) as implications ¬a → b, ¬b → a (xor-1 negation).
+        let mut imp: Vec<Vec<usize>> = vec![Vec::new(); 2 * n];
+        fn add(imp: &mut [Vec<usize>], a: usize, b: usize) {
+            imp[a ^ 1].push(b);
+            imp[b ^ 1].push(a);
+        }
+        // (1) eliminability.
+        for (i, &x) in vars.iter().enumerate() {
+            let eb = self.color_eliminable(x, Color::Blue);
+            let er = self.color_eliminable(x, Color::Red);
+            if !eb {
+                add(&mut imp, red(i), red(i)); // forces φ(X) ≠ Blue
+            }
+            if !er {
+                add(&mut imp, blue(i), blue(i)); // forces φ(X) ≠ Red
             }
         }
-        None
+        // (2) parallel modular pairs (Def 5.4).
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let (x, y) = (vars[i], vars[j]);
+                for &(c, d) in &[
+                    (Color::Blue, Color::Blue),
+                    (Color::Blue, Color::Red),
+                    (Color::Red, Color::Blue),
+                    (Color::Red, Color::Red),
+                ] {
+                    if !self.pair_coherent(x, c, y, d) {
+                        // Sibling modular pair (x^c, y^d) forbids the
+                        // COMPLEMENTED valuation (φ(x)=c̄, φ(y)=d̄): clause
+                        // (a_x^c ∨ a_y^d), where a_x^c = "φ(x)=c".
+                        let l1 = if c == Color::Blue { blue(i) } else { red(i) };
+                        let l2 = if d == Color::Blue { blue(j) } else { red(j) };
+                        add(&mut imp, l1, l2);
+                    }
+                }
+            }
+        }
+        // Tarjan SCC (iterative); ids assigned in reverse topological order.
+        let m = 2 * n;
+        let mut index = vec![usize::MAX; m];
+        let mut low = vec![0usize; m];
+        let mut comp = vec![usize::MAX; m];
+        let mut on_stack = vec![false; m];
+        let mut stack: Vec<usize> = Vec::new();
+        let mut next_index = 0usize;
+        let mut n_comp = 0usize;
+        for root in 0..m {
+            if index[root] != usize::MAX {
+                continue;
+            }
+            index[root] = next_index;
+            low[root] = next_index;
+            next_index += 1;
+            stack.push(root);
+            on_stack[root] = true;
+            let mut frames: Vec<(usize, usize)> = vec![(root, 0)];
+            loop {
+                let Some(&(v, ci)) = frames.last() else { break };
+                if ci < imp[v].len() {
+                    let w = imp[v][ci];
+                    frames.last_mut().unwrap().1 += 1;
+                    if index[w] == usize::MAX {
+                        index[w] = next_index;
+                        low[w] = next_index;
+                        next_index += 1;
+                        stack.push(w);
+                        on_stack[w] = true;
+                        frames.push((w, 0));
+                    } else if on_stack[w] {
+                        low[v] = low[v].min(index[w]);
+                    }
+                } else {
+                    frames.pop();
+                    if let Some((p, _)) = frames.last() {
+                        let p = *p;
+                        low[p] = low[p].min(low[v]);
+                    }
+                    if low[v] == index[v] {
+                        loop {
+                            let w = stack.pop().unwrap();
+                            on_stack[w] = false;
+                            comp[w] = n_comp;
+                            if w == v {
+                                break;
+                            }
+                        }
+                        n_comp += 1;
+                    }
+                }
+            }
+        }
+        let mut val = HashMap::default();
+        for (i, &x) in vars.iter().enumerate() {
+            if comp[blue(i)] == comp[red(i)] {
+                return None; // UNSAT: X^Blue and X^Red forced equal ⇒ incoherent
+            }
+            // Tarjan ids are in reverse topological order, so the standard
+            // rule applies: literal true iff its component id is smaller.
+            val.insert(
+                x,
+                if comp[blue(i)] < comp[red(i)] { Color::Blue } else { Color::Red },
+            );
+        }
+        Some(val)
     }
 
     // ── Def 5.7–5.8: alternating paths and κ ────────────────────────────
@@ -580,20 +920,42 @@ impl FlatTree {
     /// Detect a cyclic alternating path: down-move followed by up-move
     /// chains.  We build the directed edge set (down ∪ up) over nodes and
     /// look for a cycle via DFS.
+    ///
+    /// Def 5.7 (arXiv:1907.03481v3, verbatim clauses):
+    /// - *down-move* α ⊳ β: (α,β) is an X-pair (same label, opposite
+    ///   colors) and β is modular.  NO ancestor constraint — α and β are
+    ///   terminal nodes, so the tree order is vacuous between them.
+    /// - *up-move* α ⊳ β: α ≠ β, α is a modular node with immediate
+    ///   predecessor γ, β : X for some X ∈ bv(E), and γ ⪯ β (γ is an
+    ///   ancestor-or-equal of β).
+    /// Alternation is enforced structurally: the (node, parity) two-layer
+    /// graph only admits down edges at even parity and up edges at odd.
     fn has_cyclic_alternating_path(&self) -> bool {
-        use std::collections::HashSet;
         let leaves = self.leaves();
 
-        // down-moves: α → β where (α,β) is an X-pair and β modular.
+        // down-moves: α ⊳ β where (α,β) is an X-pair and β modular.
+        // An X-pair is (α : X^blue, β : X^red) (Def 5.1 ordering); only β
+        // must be modular (hence terminal, Def 5.1). α may be ANY node —
+        // an internal spine head and the binder node r_X itself included:
+        // Def 5.7 (verbatim, L2033) puts NO constraint on the source, and
+        // the paper's own construction (L2037: "down-move from an
+        // occurrence of X in A to the modular node labeled X̄, then
+        // up-move back to X") yields κ=1 for ∀X.X⇒X — confirmed by §7.3,
+        // which classifies ∀X.X⇒X into Λ2^{κ≤1} (a μν-type, not κ=0).
+        // (A former r_X-source exclusion here produced κ=0 for ∀X.X⇒X,
+        // contradicting both the verbatim definition and §7.3.)
         let mut down: Vec<(NodeId, NodeId)> = Vec::new();
-        for &a in &leaves {
-            for &b in &leaves {
-                if a == b {
-                    continue;
-                }
-                let (la, lb) = (&self.nodes[a].label, &self.nodes[b].label);
-                let (ca, cb) = (&self.nodes[a].color, &self.nodes[b].color);
-                if la == lb && ca != cb && self.is_modular(b) {
+        for a in 0..self.nodes.len() {
+            let na = &self.nodes[a];
+            if na.color != Color::Blue {
+                continue;
+            }
+            // P2: group by label via the labeled index — a down-move's
+            // target is a same-label Red terminal, so only nodes_labeled
+            // candidates need the modular test (the old loop scanned
+            // every leaf for every Blue node).
+            for &b in self.nodes_labeled(na.label, Color::Red) {
+                if self.nodes[b].children.is_empty() && self.is_modular(b) {
                     down.push((a, b));
                 }
             }
@@ -611,17 +973,12 @@ impl FlatTree {
                 if !self.is_bound(n.label) {
                     continue;
                 }
-                // γ ≤ β: g is ancestor-or-equal of id.
-                let mut cur = Some(id);
-                let mut anc = false;
-                while let Some(c) = cur {
-                    if c == g {
-                        anc = true;
-                        break;
-                    }
-                    cur = self.parent[c];
-                }
-                if anc && id != a {
+                // γ ≤ β: g is ancestor-or-equal of id — P3b Euler
+                // subtree-interval test (O(1) instead of a parent climb).
+                if self.tin[g] <= self.tin[id]
+                    && self.tout[id] <= self.tout[g]
+                    && id != a
+                {
                     up.push((a, id));
                 }
             }
@@ -671,28 +1028,30 @@ impl FlatTree {
     }
 }
 
-/// Total order on pending spines for the child permutation (Lemma 4.1 ii:
-/// `A ∼ B` up to argument permutation).  Deterministic structural key.
-fn pending_cmp(a: &Pending, b: &Pending) -> std::cmp::Ordering {
-    fn key(p: &Pending) -> Vec<u8> {
-        let mut k = vec![p.label as u8, (p.label >> 8) as u8];
-        match p.color {
-            Color::Blue => k.push(0),
-            Color::Red => k.push(1),
-        }
-        for &b in &p.binders {
-            k.extend_from_slice(&b.to_le_bytes());
-        }
-        k.push(0xFF); // separator
-        for c in &p.children {
-            k.extend(key(c));
-        }
-        k
+/// Structural sort key of a pending spine (P2: extracted from the old
+/// comparison closure so the decorate-sort site computes each key once).
+/// Total order for the child permutation (Lemma 4.1 ii: `A ∼ B` up to
+/// argument permutation).  Deterministic.
+fn pending_sort_key(p: &Pending) -> Vec<u8> {
+    // Full 64-bit label (little-endian): a 16-bit encoding would collide
+    // once labels exceed 65535, making the child permutation (Lemma 4.1
+    // ii) non-deterministic. Mirrors the binder encoding below.
+    let mut k = p.label.to_le_bytes().to_vec();
+    match p.color {
+        Color::Blue => k.push(0),
+        Color::Red => k.push(1),
     }
-    key(a).cmp(&key(b))
+    for &b in &p.binders {
+        k.extend_from_slice(&b.to_le_bytes());
+    }
+    k.push(0xFF); // separator
+    for c in &p.children {
+        k.extend(pending_sort_key(c));
+    }
+    k
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
 
@@ -703,7 +1062,13 @@ mod tests {
 
     #[test]
     fn kappa_identity_type_is_coherent() {
-        // ∀X. X → X — the identity type.  Balanced ⇒ κ = 0 (Prop 3.1).
+        // ∀X. X → X — the identity type.  Balanced ⇒ coherent (Prop 3.1).
+        // κ = 1, NOT 0: Def 5.7's verbatim down-move admits the source
+        // r_X itself, giving the alternating cycle r_X ⊳ X̄ ⊳ r_X — and
+        // §7.3 explicitly classifies ∀X.X⇒X into Λ2^{κ≤1} (it reduces to
+        // a μ-type, here μX.1, not to a plain finite type).  The
+        // reduction still converges: coherent ⟺ strongly converges
+        // (Thm 5.6), which is all the reduction pipeline needs.
         let mut ctx = TypeContext::new();
         let x = ctx.generic_param(0, "X".into());
         let id_fn = ctx.function(smallvec![x], x);
@@ -713,7 +1078,7 @@ mod tests {
         let ft = tree.flat();
         // X is bound, both colors present (X⁺ return, X̄ param).
         assert!(ft.eliminable(0), "X should be eliminable in ∀X.X→X");
-        assert_eq!(ft.characteristic(), 0, "balanced type ⇒ κ=0");
+        assert_eq!(ft.characteristic(), 1, "§7.3: ∀X.X⇒X ∈ Λ2^{{κ≤1}}");
     }
 
     #[test]
@@ -739,11 +1104,72 @@ mod tests {
 
     #[test]
     fn kappa_outside_lambda2_fails_closed() {
-        // Base types (Int) are not Λ2 — build_coherence_tree must refuse.
+        // Refined boundary: GROUND atoms (Int) are now Λ2 atoms and
+        // lower fine (`kappa_ground_atom_builds_tree`).  What stays
+        // outside Λ2: sums (Coproduct), 0 (Never), μ/ν, ∃, Poly,
+        // inference state, and nominals CARRYING a parameter — a param
+        // under a nominal head is not a ground atom (treating it as one
+        // would silently drop the param occurrence).
         let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let bad = ctx.enum_ty(DefId(7777), smallvec![x]); // parameterized nominal
+        let f = ctx.function(smallvec![bad], bad);
+        assert!(
+            ctx.build_coherence_tree(f).is_none(),
+            "parameterized nominal is not a Λ2 ground atom"
+        );
+        // Sums stay outside the tree representation (§4.1 excludes +).
+        let i32ty = ctx.int(32, true);
+        let b = ctx.bool();
+        let c = ctx.coproduct(smallvec![i32ty, b]);
+        let fc = ctx.function(smallvec![c], c);
+        assert!(ctx.build_coherence_tree(fc).is_none(), "sums stay outside Λ2");
+    }
+
+    #[test]
+    fn kappa_ground_atom_builds_tree() {
+        // Int is a Λ2 ground atom — atom-bearing spines build, and
+        // the atom is INERT: exactly one bound variable (X, via ∀) in the
+        // 2-SAT, the atom label never enters binder_scope.  ∀X.X→Int→Int
+        // is moreover coherent with κ=0: X's single X̄ leaf is modular
+        // (d=1, no parallel sibling) and the atom head spawns no X-pairs.
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
         let i = ctx.int(32, true);
-        let f = ctx.function(smallvec![i], i);
-        assert!(ctx.build_coherence_tree(f).is_none());
+        let f = ctx.function(smallvec![x, i], i);
+        let ty = ctx.forall(0, "X".into(), f);
+        let ct = ctx.build_coherence_tree(ty).expect("ground atoms are Λ2");
+        let ft = ct.flat();
+        assert_eq!(
+            ft.binder_scope.len(),
+            1,
+            "atom labels never enter binder_scope"
+        );
+        assert_eq!(
+            ft.characteristic(),
+            0,
+            "single param occurrence with inert atoms: coherent, no alternating cycles"
+        );
+    }
+
+    #[test]
+    fn kappa_yoneda_with_ground_atom_instantiation() {
+        // The Yoneda shape (1) with a CLOSED-ATOM A: ∀X.(X→Int)→X ≅_Y Int.
+        // The atom terminal is visible to the machinery; the type
+        // must be coherent (κ≠∞) — the earlier machinery refused the whole
+        // type because Int had no lowering at all.
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let i = ctx.int(32, true);
+        let xi = ctx.function(smallvec![x], i);
+        let body = ctx.function(smallvec![xi], x);
+        let ty = ctx.forall(0, "X".into(), body);
+        let k = ctx
+            .build_coherence_tree(ty)
+            .expect("Λ2 with a ground atom")
+            .flat()
+            .characteristic();
+        assert_ne!(k, u8::MAX, "Yoneda-with-atom shape must be coherent");
     }
 
     #[test]
@@ -810,14 +1236,198 @@ mod tests {
         let k = ft.characteristic();
         assert!(k == 0 || k == u8::MAX, "expected 0 or ∞, got {}", k);
     }
+
+    /// Paper Fig. 7(a) verdict (Example 5.1): "X is eliminable but not
+    /// c-eliminable" — exactly one of the two colors is eliminable
+    /// (Lemma 5.1).
+    ///
+    /// BOUNDARY: the exact Fig. 7(a) tree is an SVG diagram in the paper
+    /// that does not reliably extract to text — the text caption
+    /// `∀X.(X→X→X)→X→(Y→X)→X` puts the X's inside `(X→X→X)` beyond the
+    /// modular window (distance > 2 from `r_X`), so *neither* color is
+    /// eliminable there, contradicting the paper.  We therefore pin the
+    /// VERDICT on a hand-verifiable type: `∀X.(X→Y)→X` — X occurs once as
+    /// the head `h_X` (never modular) and once as a modular argument
+    /// (distance 2 from `r_X`), so exactly one color is eliminable.
+    #[test]
+    fn fig7_verdict_a_eliminable_not_c_elim() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let y = ctx.generic_param(1, "Y".into()); // free
+        let xy = ctx.function(smallvec![x], y);
+        let body = ctx.function(smallvec![xy], x); // (X→Y)→X
+        let ty = ctx.forall(0, "X".into(), body);
+
+        let ft = ctx.build_coherence_tree(ty).expect("Λ2").flat();
+        let eb = ft.color_eliminable(0, Color::Blue);
+        let er = ft.color_eliminable(0, Color::Red);
+        assert!(
+            eb != er,
+            "Fig 7(a) verdict: X eliminable but not c-eliminable ⇒ exactly one color (blue={} red={})",
+            eb,
+            er
+        );
+    }
+
+    /// Paper Fig. 7(b) verdict (Example 5.1): "X is both c-eliminable and
+    /// c̄-eliminable".  (Same SVG-extraction boundary as Fig. 7(a).)
+    ///
+    /// Hand-verifiable type: `∀X.(X→Y)→(X→Z)→W` — X occurs in two distinct
+    /// argument subtrees (not parallel), each at distance 2 from `r_X`, and
+    /// `r_X`'s head is `W` (≠ X), so every X node is modular ⇒ both colors
+    /// eliminable.
+    #[test]
+    fn fig7_verdict_b_both_c_elim() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let y = ctx.generic_param(1, "Y".into());
+        let z = ctx.generic_param(2, "Z".into());
+        let w = ctx.generic_param(3, "W".into());
+        let xy = ctx.function(smallvec![x], y);
+        let xz = ctx.function(smallvec![x], z);
+        let body = ctx.function(smallvec![xy, xz], w); // (X→Y)→(X→Z)→W
+        let ty = ctx.forall(0, "X".into(), body);
+
+        let ft = ctx.build_coherence_tree(ty).expect("Λ2").flat();
+        let eb = ft.color_eliminable(0, Color::Blue);
+        let er = ft.color_eliminable(0, Color::Red);
+        assert!(
+            eb && er,
+            "Fig 7(b) verdict: X both c-eliminable and c̄-eliminable (blue={} red={})",
+            eb,
+            er
+        );
+    }
+
+    /// Duel golden #1 (paper Fig 7(b), verbatim): the two βη-equivalent
+    /// types
+    ///   ∀XY.(X⇒X̄)⇒(∀Z.X⇒Z̄)⇒(Y⇒X̄)⇒Y   and
+    ///   ∀X.(X⇒X̄)⇒∀Y.(Y⇒X̄)⇒(X⇒∀Z.Z̄)⇒Y
+    /// must translate into the SAME tree (Lemma 4.1.ii).  Under root-stacked
+    /// binder placement the nested writings of Y and Z would get different
+    /// binder scopes and different trees — this test fails on root-stacking.
+    #[test]
+    fn d3_fig7b_duel_same_tree() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let y = ctx.generic_param(1, "Y".into());
+        let z = ctx.generic_param(2, "Z".into());
+        // Shared subtrees.
+        let xx = ctx.function(smallvec![x], x); // X⇒X̄
+        let xz = ctx.function(smallvec![x], z); // X⇒Z̄  (codomain Z̄)
+        let yx = ctx.function(smallvec![y], x); // Y⇒X̄
+        // t1 = ∀XY.(X⇒X̄)⇒(∀Z.X⇒Z̄)⇒(Y⇒X̄)⇒Y
+        let a2 = ctx.forall(2, "Z".into(), xz);
+        let body1 = ctx.function(smallvec![xx, a2, yx], y);
+        let forall_y = ctx.forall(1, "Y".into(), body1);
+        let t1 = ctx.forall(0, "X".into(), forall_y);
+        // t2 = ∀X.(X⇒X̄)⇒∀Y.(Y⇒X̄)⇒(X⇒∀Z.Z̄)⇒Y
+        let zcod = ctx.forall(2, "Z".into(), z); // ∀Z.Z̄  (binder nested in a codomain)
+        let b2 = ctx.function(smallvec![x], zcod); // X⇒∀Z.Z̄
+        let inner2 = ctx.function(smallvec![yx, b2], y);
+        let fy = ctx.forall(1, "Y".into(), inner2); // ∀Y.(…) nested after the first arg
+        let body2 = ctx.function(smallvec![xx], fy);
+        let t2 = ctx.forall(0, "X".into(), body2);
+
+        let f1 = ctx.build_coherence_tree(t1).expect("Λ2 t1").flat();
+        let f2 = ctx.build_coherence_tree(t2).expect("Λ2 t2").flat();
+        assert_eq!(
+            format!("{:?}", f1.nodes),
+            format!("{:?}", f2.nodes),
+            "βη-equivalent writings must give identical trees (Lemma 4.1.ii)"
+        );
+        assert_eq!(f1.characteristic(), f2.characteristic());
+    }
+
+    /// Duel golden #2 (single-holder descent): a binder whose
+    /// occurrences ALL live inside one argument sinks BELOW the syntactic
+    /// root to its LCA.  Type: ∀X.((X⇒Y)⇒X)⇒Z — X occurs at the inner
+    /// spine head and inside (X⇒Y); the LCA is the inner spine, a direct
+    /// child of the root (whose head is Z, free).  Root-stacking would
+    /// leave binder_scope[X] at the root node — this test fails there.
+    #[test]
+    fn d3_single_holder_binder_sinks_to_lca() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let y = ctx.generic_param(1, "Y".into());
+        let z = ctx.generic_param(2, "Z".into());
+        let xy = ctx.function(smallvec![x], y); // X⇒Y
+        let inner = ctx.function(smallvec![xy], x); // (X⇒Y)⇒X
+        let body = ctx.function(smallvec![inner], z); // ((X⇒Y)⇒X)⇒Z
+        let ty = ctx.forall(0, "X".into(), body);
+
+        let ft = ctx.build_coherence_tree(ty).expect("Λ2").flat();
+        let r = ft.binder_scope.get(&0).copied().expect("X registered");
+        assert_ne!(r, 0, "binder must sink below the syntactic root");
+        assert_eq!(
+            ft.parent[r],
+            Some(0),
+            "LCA is the inner spine — a direct child of the root"
+        );
+    }
+
+    /// Golden: a non-coherence verdict decided by the parallel-pair
+    /// POLARITY of 2-SAT clause (2).  Type (X=0, Y=1, A=2, B=3, H=4 free):
+    ///
+    ///   ∀XY. body, body = (X, Y, C3) ⇒ X, C3 = ((X,Y)⇒H) ⇒ A
+    ///
+    /// gives, under the binder placement (r_X = r_Y = the body spine):
+    /// - a parallel MODULAR pair (X̄, Ȳ): the two bare Red arg leaves at
+    ///   d=1, same parent, both modular ⇒ clause (a_X^red ∨ a_Y^red);
+    /// - deep X̄/Ȳ leaves at d=3 under C3 — NOT modular ⇒ X and Y are
+    ///   each NOT Red-eliminable ⇒ clause (1) forces φ(X)=φ(Y)=Blue.
+    /// Combined: (red∨red) ∧ blue(X) ∧ blue(Y) ⇒ UNSAT ⇒ κ=∞.  With the
+    /// polarity WRITTEN BACKWARDS (pair (x^c,y^d) forbidding (φ=c,φ=d),
+    /// i.e. clause (blue∨blue)) the same tree would be SAT — this test
+    /// pins the complemented-color reading of Def 5.4 (verbatim L1955).
+    #[test]
+    fn d5_pair_polarity_decides_incoherence() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let y = ctx.generic_param(1, "Y".into());
+        let h = ctx.generic_param(4, "H".into());
+        let a = ctx.generic_param(2, "A".into());
+        let deep = ctx.function(smallvec![x, y], h);
+        let c3 = ctx.function(smallvec![deep], a);
+        let body = ctx.function(smallvec![x, y, c3], x);
+        let forall_y = ctx.forall(1, "Y".into(), body);
+        let ty = ctx.forall(0, "X".into(), forall_y);
+
+        let ft = ctx.build_coherence_tree(ty).expect("Λ2").flat();
+        assert_eq!(
+            ft.characteristic(),
+            u8::MAX,
+            "parallel modular (X̄,Ȳ) pair + forced-Blue valuations ⇒ UNSAT (κ=∞)"
+        );
+    }
 }
 
 /// §4.1 NF binder placement: a binder ∀X lives at the *lowest common
-/// ancestor* of all X's occurrences (Lemma 4.1 pushes quantifiers
-/// leftmost; the NF spine node closest to the occurrences is the LCA).
-/// Lowering naively stacks every binder at the root (the syntactic
-/// ∀-prefix), which breaks modular-window distances.  This pass sinks
-/// each binder from the root to the LCA of its variable's occurrence
+/// ancestor* of all X's occurrences.
+///
+/// Paper-side derivation (Def 4.1's NF + Lemma 4.1's proof, verbatim):
+/// NF(A) = ∀Ȳ.A₁⇒…⇒Aₙ⇒X with each Y∈Ȳ occurring in the body, and the
+/// proof of Lemma 4.1(i) canonicalizes using exactly two binder-mobility
+/// isomorphisms: (a) vacuous elimination ∀X.A ≡_η A (X∉FV), and (b) the
+/// hoisting iso `A ⇒ ∀X.B ≡_βη ∀X.A ⇒ B` (X∉FV(A)).  Iso (b) pulls a
+/// binder up past subtrees NOT containing X and must stop at the first
+/// spine whose body still holds all occurrences — pulling higher would
+/// require crossing an X-bearing argument, which (b) forbids.  Hence the
+/// canonical position is exactly the LCA of the occurrences, and stacking
+/// binders at the syntactic root is the NON-canonical choice.
+///
+/// This is not just theory: the paper's own duel pair (the two
+/// βη-equivalent types of Fig 7(b), "∀XY.(X⇒X̄)⇒(∀Z.X⇒Z̄)⇒(Y⇒X̄)⇒Y" vs
+/// "∀X.(X⇒X̄)⇒∀Y.(Y⇒X̄)⇒(X⇒∀Z.Z̄)⇒Y") must translate into the SAME tree
+/// (Lemma 4.1.ii); with root-stacked binders the two writings would get
+/// different binder scopes and different trees.  `d3_fig7b_duel_same_tree`
+/// pins this verbatim pair.
+///
+/// (The single-holder descent of `sink` goes one spine further than a
+/// literal NF reading when ALL occurrences live inside one argument —
+/// semantically the canceling eliminations that root placement would
+/// refuse; the refusals are fail-closed, the eliminations are pinned by
+/// the convergence goldens.)
 fn place_binders(p: Pending) -> Pending {
     /// Collect occurrence paths (child-index chains) for `x` in `pt`.
     fn occurrences(pt: &Pending, x: usize, path: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {

@@ -35,6 +35,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub debug: bool,
 
+    /// Colour output policy: `auto` (default, off when piped), `always`, or `never`.
+    #[arg(long, global = true, value_name = "WHEN", default_value = "auto")]
+    pub color: String,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -63,5 +67,12 @@ pub enum Command {
     Explain {
         /// Error code to explain, e.g. "E030" or "W113".
         code: Option<String>,
+    },
+    /// Parse, resolve, and type-check a file, then dump the MIR for every
+    /// function body to stdout (debug aid for the lowering).
+    Mir {
+        file: String,
+        #[arg(long, help = "Output diagnostics as JSON (instead of colored text)")]
+        json: bool,
     },
 }

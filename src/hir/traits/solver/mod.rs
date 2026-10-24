@@ -34,7 +34,7 @@ pub mod project;
 pub mod search_graph;
 pub mod select;
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 pub mod test;
 
 // Re-export the most commonly used types at the solver level.

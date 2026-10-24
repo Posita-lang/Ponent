@@ -1,0 +1,27 @@
+---
+source: src/diagnostics/snapshots.rs
+expression: out
+---
+<details class='diag error' open role='alert'>
+<summary><span class='code'>error</span>: <span class='message'>wide char</span></summary>
+<div><span class='code'>E030</span> <span class='message'>wide char</span></div>
+<div class='span'>at &lt;input&gt;:1:10</div>
+<pre class='source-line'><span class='line-num' data-location='&lt;input&gt;:1:10' aria-label='Line 1'>1 │ </span>set a = &quot;<span class='highlight'>中</span>&quot; + b;
+<span class='line-num'>   │ </span><span class='underline'>         ^^    ~</span>
+<span class='line-num'>   │ </span><span class='label'>               | after CJK</span>
+</pre>
+<details class='explain'>
+<summary>Explain E030</summary>
+<pre>The type of an expression does not match the expected type.
+
+This error occurs when a value is assigned to a variable, passed as an argument,
+or returned from a function with a different type than expected.
+
+Example:
+  def foo() -&gt; Int&lt;32&gt; {
+    return &quot;hello&quot;;  // error: expected Int&lt;32&gt;, found &amp;Str
+  }
+
+Fix: ensure the expression has the correct type, or add an explicit cast.</pre>
+</details>
+</details>

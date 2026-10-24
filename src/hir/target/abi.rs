@@ -132,7 +132,7 @@ pub fn align_up(offset: u64, alignment: u64) -> u64 {
     addend & !mask
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::hir::target::Target;

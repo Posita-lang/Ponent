@@ -4,6 +4,16 @@
 use crate::ast::*;
 use crate::symbol::Symbol;
 
+/// Allocate a slice in the arena from a temporary Vec.
+/// Used by the `replace_ident_*` functions to rebuild AST subtrees.
+#[inline]
+fn alloc_slice<'input, T: Clone>(
+    arena: &crate::arena::SyncArena<'input>,
+    v: Vec<T>,
+) -> &'input [T] {
+    arena.alloc_slice_clone(&v)
+}
+
 /// Trait for visitor result types that can be "output" (no-op continuation).
 pub trait VisitorResult {
     fn output() -> Self;
@@ -47,8 +57,8 @@ pub trait Visitor<'ast, 'input>: Sized {
     fn visit_contract(&mut self, contract: &'ast Contract<'input>) -> Self::Result {
         walk_contract(self, contract)
     }
-    fn visit_attribute(&mut self, _attr: &'ast Attribute<'input>) -> Self::Result {
-        Self::Result::output()
+    fn visit_attribute(&mut self, attr: &'ast Attribute<'input>) -> Self::Result {
+        walk_attribute(self, attr)
     }
 }
 
@@ -72,7 +82,7 @@ pub fn walk_expr<'ast, 'input, V: Visitor<'ast, 'input>>(
         Expr::UnaryOp { expr: e, .. } => visitor.visit_expr(e),
         Expr::Call { callee, args, .. } => {
             visitor.visit_expr(callee);
-            for arg in args {
+            for arg in *args {
                 visitor.visit_expr(arg);
             }
             V::Result::output()
@@ -89,7 +99,10 @@ pub fn walk_expr<'ast, 'input, V: Visitor<'ast, 'input>>(
             visitor.visit_expr(base);
             visitor.visit_ident(*attr, span)
         }
-        Expr::Cast { expr: base, .. } => visitor.visit_expr(base),
+        Expr::Cast { expr: base, ty, .. } => {
+            visitor.visit_expr(base);
+            visitor.visit_ty(ty)
+        }
         Expr::Range { start, end, .. } => {
             if let Some(e) = start {
                 visitor.visit_expr(e);
@@ -100,7 +113,7 @@ pub fn walk_expr<'ast, 'input, V: Visitor<'ast, 'input>>(
             V::Result::output()
         }
         Expr::StructLit { fields, .. } => {
-            for (_, e) in fields {
+            for (_, e) in *fields {
                 visitor.visit_expr(e);
             }
             V::Result::output()
@@ -122,21 +135,39 @@ pub fn walk_expr<'ast, 'input, V: Visitor<'ast, 'input>>(
         | Expr::Await { expr: e, .. }
         | Expr::Try { expr: e, .. }
         | Expr::LeaveWith { expr: e, .. }
-        | Expr::PolyBox { expr: e, .. }
-        | Expr::PolyUnbox { expr: e, .. }
         | Expr::Old(e, _) => visitor.visit_expr(e),
-        Expr::Task { .. } | Expr::Path(_, _) => V::Result::output(),
+        Expr::PolyBox { expr, scheme, .. } | Expr::PolyUnbox { expr, scheme, .. } => {
+            if let Some(sc) = scheme {
+                walk_type_scheme(visitor, sc);
+            }
+            visitor.visit_expr(expr)
+        }
+        Expr::Task { body, .. } => {
+            for s in *body {
+                visitor.visit_stmt(s);
+            }
+            V::Result::output()
+        }
+        Expr::Path(_, _) => V::Result::output(),
         Expr::Tuple(exprs, _) | Expr::Array(exprs, _) => {
-            for e in exprs {
+            for e in *exprs {
                 visitor.visit_expr(e);
             }
             V::Result::output()
         }
-        Expr::Closure { params, body, .. } => {
-            for p in params {
+        Expr::Closure {
+            params,
+            return_type,
+            body,
+            ..
+        } => {
+            for p in *params {
                 visitor.visit_param(p);
             }
-            for s in body {
+            if let Some(rt) = return_type {
+                visitor.visit_ty(rt);
+            }
+            for s in *body {
                 visitor.visit_stmt(s);
             }
             V::Result::output()
@@ -148,11 +179,11 @@ pub fn walk_expr<'ast, 'input, V: Visitor<'ast, 'input>>(
             ..
         } => {
             visitor.visit_expr(cond);
-            for s in then_branch {
+            for s in *then_branch {
                 visitor.visit_stmt(s);
             }
             if let Some(else_b) = else_branch {
-                for s in else_b {
+                for s in *else_b {
                     visitor.visit_stmt(s);
                 }
             }
@@ -167,11 +198,11 @@ pub fn walk_expr<'ast, 'input, V: Visitor<'ast, 'input>>(
         } => {
             visitor.visit_expr(scrutinee);
             visitor.visit_pattern(pattern);
-            for s in then_branch {
+            for s in *then_branch {
                 visitor.visit_stmt(s);
             }
             if let Some(else_b) = else_branch {
-                for s in else_b {
+                for s in *else_b {
                     visitor.visit_stmt(s);
                 }
             }
@@ -181,7 +212,7 @@ pub fn walk_expr<'ast, 'input, V: Visitor<'ast, 'input>>(
             scrutinee, arms, ..
         } => {
             visitor.visit_expr(scrutinee);
-            for arm in arms {
+            for arm in *arms {
                 visitor.visit_pattern(&arm.pattern);
                 if let Some(g) = &arm.guard {
                     visitor.visit_expr(g);
@@ -191,7 +222,7 @@ pub fn walk_expr<'ast, 'input, V: Visitor<'ast, 'input>>(
             V::Result::output()
         }
         Expr::Block(stmts, _) | Expr::UnsafeBlock { body: stmts, .. } => {
-            for s in stmts {
+            for s in *stmts {
                 visitor.visit_stmt(s);
             }
             V::Result::output()
@@ -200,8 +231,8 @@ pub fn walk_expr<'ast, 'input, V: Visitor<'ast, 'input>>(
             expr: e, branches, ..
         } => {
             visitor.visit_expr(e);
-            for b in branches {
-                for s in &b.body {
+            for b in *branches {
+                for s in b.body {
                     visitor.visit_stmt(s);
                 }
             }
@@ -224,44 +255,123 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
 ) -> V::Result {
     match stmt {
         Stmt::VariableDef {
-            value,
+            name,
             pattern,
+            ty,
+            value,
             else_branch,
+            attributes,
+            type_captures,
+            type_modifiers,
+            span,
             ..
         } => {
+            if let Some(n) = name {
+                visitor.visit_ident(*n, span);
+            }
             if let Some(e) = value {
                 visitor.visit_expr(e);
             }
             if let Some(p) = pattern {
                 visitor.visit_pattern(p);
             }
+            if let Some(t) = ty {
+                visitor.visit_ty(t);
+            }
             if let Some(else_b) = else_branch {
-                for s in else_b {
+                for s in *else_b {
                     visitor.visit_stmt(s);
+                }
+            }
+            for attr in attributes {
+                visitor.visit_attribute(attr);
+            }
+            for tp in type_captures {
+                visitor.visit_ident(tp.name, &tp.span);
+                for b in &tp.bounds {
+                    visitor.visit_ty(b);
+                }
+                match tp.kind {
+                    TypeParamKind::Const { ref ty, default } => {
+                        visitor.visit_ty(&ty);
+                        if let Some(d) = default {
+                            visitor.visit_expr(d);
+                        }
+                    }
+                    TypeParamKind::Type | TypeParamKind::Lifetime => {}
+                }
+            }
+            for m in type_modifiers {
+                match m {
+                    TypeModifier::Default(e) | TypeModifier::Validate(e) => {
+                        visitor.visit_expr(e);
+                    }
+                    TypeModifier::Overflow(_) | TypeModifier::NoDefault => {}
                 }
             }
             V::Result::output()
         }
         Stmt::FunctionDef {
+            span,
+            attributes,
+            contracts,
             name,
             params,
+            return_type,
             body,
+            type_params,
+            where_clause,
             finally,
-            span,
             ..
         } => {
             visitor.visit_ident(*name, span);
-            for p in params {
+            for attr in attributes {
+                visitor.visit_attribute(attr);
+            }
+            for c in contracts {
+                visitor.visit_contract(c);
+            }
+            for p in *params {
                 visitor.visit_param(p);
             }
+            if let Some(rt) = return_type {
+                visitor.visit_ty(rt);
+            }
             if let Some(b) = body {
-                for s in b {
+                for s in *b {
                     visitor.visit_stmt(s);
                 }
             }
             if let Some(f) = finally {
-                for s in f {
+                for s in *f {
                     visitor.visit_stmt(s);
+                }
+            }
+            for tp in type_params {
+                visitor.visit_ident(tp.name, &tp.span);
+                for b in &tp.bounds {
+                    visitor.visit_ty(b);
+                }
+                match tp.kind {
+                    TypeParamKind::Const { ref ty, default } => {
+                        visitor.visit_ty(&ty);
+                        if let Some(d) = default {
+                            visitor.visit_expr(d);
+                        }
+                    }
+                    TypeParamKind::Type | TypeParamKind::Lifetime => {}
+                }
+            }
+            if let Some(wc) = where_clause {
+                for p in &wc.predicates {
+                    visitor.visit_ty(&p.ty);
+                    for b in &p.bounds {
+                        visitor.visit_ty(b);
+                    }
+                }
+                for eq in &wc.equalities {
+                    visitor.visit_ty(&eq.left);
+                    visitor.visit_ty(&eq.right);
                 }
             }
             V::Result::output()
@@ -274,11 +384,11 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
             ..
         } => {
             visitor.visit_expr(cond);
-            for s in then_branch {
+            for s in *then_branch {
                 visitor.visit_stmt(s);
             }
             if let Some(else_b) = else_branch {
-                for s in else_b {
+                for s in *else_b {
                     visitor.visit_stmt(s);
                 }
             }
@@ -293,19 +403,31 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
         } => {
             visitor.visit_expr(scrutinee);
             visitor.visit_pattern(pattern);
-            for s in then_branch {
+            for s in *then_branch {
                 visitor.visit_stmt(s);
             }
             if let Some(else_b) = else_branch {
-                for s in else_b {
+                for s in *else_b {
                     visitor.visit_stmt(s);
                 }
             }
             V::Result::output()
         }
-        Stmt::While { cond, body, .. } => {
+        Stmt::While {
+            cond,
+            body,
+            invariant,
+            decreases,
+            ..
+        } => {
             visitor.visit_expr(cond);
-            for s in body {
+            if let Some(inv) = invariant {
+                visitor.visit_expr(inv);
+            }
+            if let Some(dec) = decreases {
+                visitor.visit_expr(dec);
+            }
+            for s in *body {
                 visitor.visit_stmt(s);
             }
             V::Result::output()
@@ -314,17 +436,25 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
             pattern,
             scrutinee,
             body,
+            invariant,
+            decreases,
             ..
         } => {
             visitor.visit_expr(scrutinee);
             visitor.visit_pattern(pattern);
-            for s in body {
+            if let Some(inv) = invariant {
+                visitor.visit_expr(inv);
+            }
+            if let Some(dec) = decreases {
+                visitor.visit_expr(dec);
+            }
+            for s in *body {
                 visitor.visit_stmt(s);
             }
             V::Result::output()
         }
         Stmt::Loop { body, .. } => {
-            for s in body {
+            for s in *body {
                 visitor.visit_stmt(s);
             }
             V::Result::output()
@@ -333,11 +463,19 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
             pattern,
             iterable,
             body,
+            invariant,
+            decreases,
             ..
         } => {
             visitor.visit_expr(iterable);
             visitor.visit_pattern(pattern);
-            for s in body {
+            if let Some(inv) = invariant {
+                visitor.visit_expr(inv);
+            }
+            if let Some(dec) = decreases {
+                visitor.visit_expr(dec);
+            }
+            for s in *body {
                 visitor.visit_stmt(s);
             }
             V::Result::output()
@@ -353,11 +491,54 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
             visitor.visit_expr(target);
             visitor.visit_expr(value)
         }
-        Stmt::ComptimeBlock { body, .. }
-        | Stmt::ScopeCleanup { body, .. }
-        | Stmt::Unsafe { body, .. }
-        | Stmt::Isolate { body, .. } => {
-            for s in body {
+        Stmt::ComptimeBlock {
+            captures,
+            attributes,
+            body,
+            ..
+        } => {
+            for attr in attributes {
+                visitor.visit_attribute(attr);
+            }
+            for (sym, span) in *captures {
+                visitor.visit_ident(*sym, span);
+            }
+            for s in *body {
+                visitor.visit_stmt(s);
+            }
+            V::Result::output()
+        }
+        Stmt::Isolate {
+            attributes,
+            body,
+            ..
+        } => {
+            for attr in attributes {
+                visitor.visit_attribute(attr);
+            }
+            for s in *body {
+                visitor.visit_stmt(s);
+            }
+            V::Result::output()
+        }
+        Stmt::ScopeCleanup {
+            name,
+            when_condition,
+            body,
+            span,
+            ..
+        } => {
+            visitor.visit_ident(*name, span);
+            if let Some(e) = when_condition {
+                visitor.visit_expr(e);
+            }
+            for s in *body {
+                visitor.visit_stmt(s);
+            }
+            V::Result::output()
+        }
+        Stmt::Unsafe { body, .. } => {
+            for s in *body {
                 visitor.visit_stmt(s);
             }
             V::Result::output()
@@ -367,27 +548,398 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
         | Stmt::Continue { .. }
         | Stmt::Trigger { .. }
         | Stmt::Edition(..)
-        | Stmt::LayoutDef { .. }
-        | Stmt::Error(_) => V::Result::output(),
-        Stmt::Generate { body, .. } => {
-            for s in body {
+        | Stmt::Import { .. } => V::Result::output(),
+        Stmt::Generate {
+            attributes,
+            for_type,
+            body,
+            ..
+        } => {
+            for attr in attributes {
+                visitor.visit_attribute(attr);
+            }
+            visitor.visit_ty(for_type);
+            for s in *body {
                 visitor.visit_stmt(s);
             }
             V::Result::output()
         }
-        Stmt::TypeDef { .. }
-        | Stmt::TraitDef { .. }
-        | Stmt::ImplBlock { .. }
-        | Stmt::Import { .. }
-        | Stmt::ExternFunction { .. }
-        | Stmt::Constraint { .. } => V::Result::output(),
+        Stmt::LayoutDef { name, span, attributes } => {
+            visitor.visit_ident(*name, span);
+            for attr in attributes {
+                visitor.visit_attribute(attr);
+            }
+            V::Result::output()
+        }
+        Stmt::Error(_) => V::Result::output(),
+        Stmt::TypeDef {
+            name,
+            params,
+            definition,
+            contracts,
+            span,
+            attributes,
+            ..
+        } => {
+            visitor.visit_ident(*name, span);
+            for attr in attributes {
+                visitor.visit_attribute(attr);
+            }
+            for tp in params {
+                visitor.visit_ident(tp.name, &tp.span);
+                for b in &tp.bounds {
+                    visitor.visit_ty(b);
+                }
+                match tp.kind {
+                    TypeParamKind::Const { ref ty, default } => {
+                        visitor.visit_ty(&ty);
+                        if let Some(d) = default {
+                            visitor.visit_expr(d);
+                        }
+                    }
+                    TypeParamKind::Type | TypeParamKind::Lifetime => {}
+                }
+            }
+            walk_ty_definition(visitor, definition);
+            for c in contracts {
+                visitor.visit_contract(c);
+            }
+            V::Result::output()
+        }
+        Stmt::TraitDef {
+            name,
+            methods,
+            associated_types,
+            span,
+            attributes,
+            ..
+        } => {
+            visitor.visit_ident(*name, span);
+            for attr in attributes {
+                visitor.visit_attribute(attr);
+            }
+            for m in methods {
+                visitor.visit_ident(m.name, &m.span);
+                for p in m.params {
+                    visitor.visit_param(p);
+                }
+                visitor.visit_ty(&m.return_type);
+            }
+            for at in associated_types {
+                visitor.visit_ident(at.name, &at.span);
+                if let Some(d) = &at.default {
+                    visitor.visit_ty(d);
+                }
+            }
+            V::Result::output()
+        }
+        Stmt::ImplBlock {
+            span,
+            attributes,
+            trait_path,
+            for_type,
+            methods,
+            associated_types,
+            where_clause,
+            type_params,
+        } => {
+            for attr in attributes {
+                visitor.visit_attribute(attr);
+            }
+            if let Some(t) = trait_path {
+                visitor.visit_ty(t);
+            }
+            visitor.visit_ty(for_type);
+            for m in *methods {
+                visitor.visit_ident(m.name, &m.span);
+                for attr in &m.attributes {
+                    visitor.visit_attribute(attr);
+                }
+                for p in m.params {
+                    visitor.visit_param(p);
+                }
+                visitor.visit_ty(&m.return_type);
+                if let Some(b) = m.body {
+                    for s in b {
+                        visitor.visit_stmt(s);
+                    }
+                }
+            }
+            for at in associated_types {
+                visitor.visit_ident(at.name, &at.span);
+                if let Some(d) = &at.default {
+                    visitor.visit_ty(d);
+                }
+            }
+            for tp in type_params {
+                visitor.visit_ident(tp.name, &tp.span);
+                for b in &tp.bounds {
+                    visitor.visit_ty(b);
+                }
+                match tp.kind {
+                    TypeParamKind::Const { ref ty, default } => {
+                        visitor.visit_ty(&ty);
+                        if let Some(d) = default {
+                            visitor.visit_expr(d);
+                        }
+                    }
+                    TypeParamKind::Type | TypeParamKind::Lifetime => {}
+                }
+            }
+            if let Some(wc) = where_clause {
+                for p in &wc.predicates {
+                    visitor.visit_ty(&p.ty);
+                    for b in &p.bounds {
+                        visitor.visit_ty(b);
+                    }
+                }
+                for eq in &wc.equalities {
+                    visitor.visit_ty(&eq.left);
+                    visitor.visit_ty(&eq.right);
+                }
+            }
+            V::Result::output()
+        }
+        Stmt::ExternFunction {
+            name,
+            params,
+            return_type,
+            span,
+            attributes,
+            ..
+        } => {
+            visitor.visit_ident(*name, span);
+            for attr in attributes {
+                visitor.visit_attribute(attr);
+            }
+            for p in *params {
+                visitor.visit_param(p);
+            }
+            visitor.visit_ty(return_type)
+        }
+        Stmt::Constraint {
+            name,
+            params,
+            predicates,
+            span,
+        } => {
+            visitor.visit_ident(*name, span);
+            for tp in params {
+                visitor.visit_ident(tp.name, &tp.span);
+                for b in &tp.bounds {
+                    visitor.visit_ty(b);
+                }
+                match tp.kind {
+                    TypeParamKind::Const { ref ty, default } => {
+                        visitor.visit_ty(&ty);
+                        if let Some(d) = default {
+                            visitor.visit_expr(d);
+                        }
+                    }
+                    TypeParamKind::Type | TypeParamKind::Lifetime => {}
+                }
+            }
+            for p in predicates {
+                visitor.visit_ty(&p.ty);
+                for b in &p.bounds {
+                    visitor.visit_ty(b);
+                }
+            }
+            V::Result::output()
+        }
     }
 }
 
 pub fn walk_ty<'ast, 'input, V: Visitor<'ast, 'input>>(
-    _visitor: &mut V,
-    _ty: &'ast Type<'input>,
+    visitor: &mut V,
+    ty: &'ast Type<'input>,
 ) -> V::Result {
+    match ty {
+        Type::Path(_, _)
+        | Type::Never(_)
+        | Type::Regex(_, _)
+        | Type::Error(_) => V::Result::output(),
+        Type::Generic(base, args, _) => {
+            visitor.visit_ty(base);
+            for arg in args {
+                match arg {
+                    GenericArg::Positional(t) | GenericArg::Named(_, t) => {
+                        visitor.visit_ty(t);
+                    }
+                    GenericArg::Const(ac) => {
+                        visitor.visit_expr(ac.value);
+                    }
+                }
+            }
+            V::Result::output()
+        }
+        Type::Reference { inner, .. }
+        | Type::Pointer(inner, _)
+        | Type::Slice(inner, _) => visitor.visit_ty(inner),
+        Type::Array(elem, size, _) => {
+            visitor.visit_ty(elem);
+            visitor.visit_expr(size)
+        }
+        Type::Tuple(ts, _) | Type::Union(ts, _) | Type::DynTrait(ts, _) => {
+            for t in ts {
+                visitor.visit_ty(t);
+            }
+            V::Result::output()
+        }
+        Type::Function { params, ret, .. } => {
+            for p in params {
+                visitor.visit_ty(p);
+            }
+            visitor.visit_ty(ret)
+        }
+        Type::Projection {
+            impl_type,
+            trait_path,
+            ..
+        } => {
+            visitor.visit_ty(impl_type);
+            visitor.visit_ty(trait_path)
+        }
+        Type::Forall { body, .. } => visitor.visit_ty(body),
+        Type::Exists { base, invariant, .. } | Type::WhereShorthand { base, invariant, .. } => {
+            visitor.visit_ty(base);
+            visitor.visit_expr(invariant)
+        }
+        Type::Literal(e, _) | Type::Expr(e, _) => visitor.visit_expr(e),
+    }
+}
+
+/// Walk a `TypeDefinition` (the `definition` field of `Stmt::TypeDef`).
+/// `TraitDef` and `ImplBlock` definitions share the walker's `Stmt::TraitDef`
+/// / `Stmt::ImplBlock` arm logic for methods and associated types.
+pub fn walk_ty_definition<'ast, 'input, V: Visitor<'ast, 'input>>(
+    visitor: &mut V,
+    definition: &'ast TypeDefinition<'input>,
+) -> V::Result {
+    match definition {
+        TypeDefinition::Struct(fields, modifiers) => {
+            for f in fields {
+                visitor.visit_ident(f.name, &f.span);
+                visitor.visit_ty(&f.ty);
+                if let Some(d) = &f.default {
+                    visitor.visit_expr(d);
+                }
+            }
+            for m in modifiers {
+                walk_type_modifier(visitor, m);
+            }
+            V::Result::output()
+        }
+        TypeDefinition::Enum(variants, _, modifiers) => {
+            for v in variants {
+                visitor.visit_ident(v.name, &v.span);
+                if let Some(p) = &v.payload {
+                    visitor.visit_ty(p);
+                }
+                for (_, bound_ty) in &v.eq_spec {
+                    visitor.visit_ty(bound_ty);
+                }
+            }
+            for m in modifiers {
+                walk_type_modifier(visitor, m);
+            }
+            V::Result::output()
+        }
+        TypeDefinition::TraitDef {
+            methods,
+            associated_types,
+        } => {
+            for m in *methods {
+                visitor.visit_ident(m.name, &m.span);
+                for p in m.params {
+                    visitor.visit_param(p);
+                }
+                visitor.visit_ty(&m.return_type);
+            }
+            for at in associated_types {
+                visitor.visit_ident(at.name, &at.span);
+                if let Some(d) = &at.default {
+                    visitor.visit_ty(d);
+                }
+            }
+            V::Result::output()
+        }
+        TypeDefinition::ImplBlock {
+            trait_path: _,
+            for_type,
+            methods,
+        } => {
+            visitor.visit_ty(for_type);
+            for m in *methods {
+                visitor.visit_ident(m.name, &m.span);
+                for attr in &m.attributes {
+                    visitor.visit_attribute(attr);
+                }
+                for p in m.params {
+                    visitor.visit_param(p);
+                }
+                visitor.visit_ty(&m.return_type);
+                if let Some(b) = m.body {
+                    for s in b {
+                        visitor.visit_stmt(s);
+                    }
+                }
+            }
+            V::Result::output()
+        }
+        TypeDefinition::Constraint(preds) => {
+            for p in preds {
+                visitor.visit_ty(p);
+            }
+            V::Result::output()
+        }
+        TypeDefinition::Alias(t, modifiers)
+        | TypeDefinition::Opaque(t, modifiers) => {
+            visitor.visit_ty(t);
+            for m in modifiers {
+                walk_type_modifier(visitor, m);
+            }
+            V::Result::output()
+        }
+    }
+}
+
+/// Walk a single `TypeModifier` — `Default(e)` / `Validate(e)` carry
+/// expressions that may reference identifiers.
+pub fn walk_type_modifier<'ast, 'input, V: Visitor<'ast, 'input>>(
+    visitor: &mut V,
+    m: &'ast TypeModifier<'input>,
+) -> V::Result {
+    match m {
+        TypeModifier::Default(e) | TypeModifier::Validate(e) => visitor.visit_expr(e),
+        TypeModifier::Overflow(_) | TypeModifier::NoDefault => V::Result::output(),
+    }
+}
+
+/// Walk a `TypeScheme` — the `forall T1, T2, ... . body` payload of
+/// `PolyBox` / `PolyUnbox`.
+pub fn walk_type_scheme<'ast, 'input, V: Visitor<'ast, 'input>>(
+    visitor: &mut V,
+    scheme: &'ast TypeScheme<'input>,
+) -> V::Result {
+    for (span, sym) in &scheme.quantifiers {
+        visitor.visit_ident(*sym, span);
+    }
+    visitor.visit_ty(scheme.body)
+}
+
+/// Walk an `Attribute` — `args` and `named_args` carry expressions
+/// (e.g. `@hint(forall i in 0..len: arr[i] > 0)`).
+pub fn walk_attribute<'ast, 'input, V: Visitor<'ast, 'input>>(
+    visitor: &mut V,
+    attr: &'ast Attribute<'input>,
+) -> V::Result {
+    for e in &attr.args {
+        visitor.visit_expr(e);
+    }
+    for (_, e) in &attr.named_args {
+        visitor.visit_expr(e);
+    }
     V::Result::output()
 }
 
@@ -400,25 +952,25 @@ pub fn walk_pattern<'ast, 'input, V: Visitor<'ast, 'input>>(
         Pattern::Ident(name, span) => visitor.visit_ident(*name, span),
         Pattern::Literal(expr, _) => visitor.visit_expr(expr),
         Pattern::Tuple(patterns, _) => {
-            for p in patterns {
+            for p in *patterns {
                 visitor.visit_pattern(p);
             }
             V::Result::output()
         }
         Pattern::Slice(before, rest, after, _) => {
-            for p in before {
+            for p in *before {
                 visitor.visit_pattern(p);
             }
             if let Some(r) = rest {
                 visitor.visit_pattern(r);
             }
-            for p in after {
+            for p in *after {
                 visitor.visit_pattern(p);
             }
             V::Result::output()
         }
         Pattern::Struct { fields, .. } => {
-            for (_, p) in fields {
+            for (_, p) in *fields {
                 visitor.visit_pattern(p);
             }
             V::Result::output()
@@ -431,12 +983,15 @@ pub fn walk_pattern<'ast, 'input, V: Visitor<'ast, 'input>>(
             }
         }
         Pattern::Or(patterns, _) => {
-            for p in patterns {
+            for p in *patterns {
                 visitor.visit_pattern(p);
             }
             V::Result::output()
         }
-        Pattern::Annotated { inner, .. } => visitor.visit_pattern(inner),
+        Pattern::Annotated { inner, ty, .. } => {
+            visitor.visit_ty(ty);
+            visitor.visit_pattern(inner)
+        }
     }
 }
 
@@ -446,10 +1001,12 @@ pub fn walk_param<'ast, 'input, V: Visitor<'ast, 'input>>(
 ) -> V::Result {
     visitor.visit_ident(param.name, &param.span);
     if let Some(ty) = &param.ty {
-        visitor.visit_ty(ty)
-    } else {
-        V::Result::output()
+        visitor.visit_ty(ty);
     }
+    if let Some(d) = &param.default {
+        visitor.visit_expr(d);
+    }
+    V::Result::output()
 }
 
 pub fn walk_contract<'ast, 'input, V: Visitor<'ast, 'input>>(
@@ -478,23 +1035,23 @@ fn bound_vars<'input>(p: &Pattern<'input>, out: &mut Vec<Symbol>) {
     match p {
         Pattern::Ident(name, _) => out.push(*name),
         Pattern::Tuple(ps, _) | Pattern::Or(ps, _) => {
-            for sub in ps {
+            for sub in *ps {
                 bound_vars(sub, out);
             }
         }
         Pattern::Slice(pre, mid, post, _) => {
-            for sub in pre {
+            for sub in *pre {
                 bound_vars(sub, out);
             }
             if let Some(m) = mid {
                 bound_vars(m, out);
             }
-            for sub in post {
+            for sub in *post {
                 bound_vars(sub, out);
             }
         }
         Pattern::Struct { fields, .. } => {
-            for (_, sub) in fields {
+            for (_, sub) in *fields {
                 bound_vars(sub, out);
             }
         }
@@ -565,10 +1122,8 @@ pub fn replace_ident_in_expr<'input>(
                 span,
             } => arena.alloc(Expr::Call {
                 callee: go(arena, callee, old, new),
-                args: args
-                    .iter()
-                    .map(|a| (*go(arena, a, old, new)).clone())
-                    .collect(),
+                args: alloc_slice(arena,
+                    args.iter().map(|a| (*go(arena, a, old, new)).clone()).collect()),
                 comptime: *comptime,
                 span: *span,
             }),
@@ -613,10 +1168,8 @@ pub fn replace_ident_in_expr<'input>(
             }),
             Expr::StructLit { path, fields, span } => arena.alloc(Expr::StructLit {
                 path: path.clone(),
-                fields: fields
-                    .iter()
-                    .map(|(n, e)| (*n, (*go(arena, e, old, new)).clone()))
-                    .collect(),
+                fields: alloc_slice(arena,
+                    fields.iter().map(|(n, e)| (*n, (*go(arena, e, old, new)).clone())).collect()),
                 span: *span,
             }),
             Expr::EnumLit {
@@ -633,15 +1186,11 @@ pub fn replace_ident_in_expr<'input>(
             Expr::Move(e, s) => arena.alloc(Expr::Move(go(arena, e, old, new), *s)),
             Expr::Path(p, s) => arena.alloc(Expr::Path(p.clone(), *s)),
             Expr::Tuple(es, s) => arena.alloc(Expr::Tuple(
-                es.iter()
-                    .map(|x| (*go(arena, x, old, new)).clone())
-                    .collect(),
+                alloc_slice(arena, es.iter().map(|x| (*go(arena, x, old, new)).clone()).collect()),
                 *s,
             )),
             Expr::Array(es, s) => arena.alloc(Expr::Array(
-                es.iter()
-                    .map(|x| (*go(arena, x, old, new)).clone())
-                    .collect(),
+                alloc_slice(arena, es.iter().map(|x| (*go(arena, x, old, new)).clone()).collect()),
                 *s,
             )),
             Expr::Closure {
@@ -660,13 +1209,13 @@ pub fn replace_ident_in_expr<'input>(
                     params: params.clone(),
                     return_type: return_type.clone(),
                     captures: captures.clone(),
-                    body: if shadowed {
+                    body: alloc_slice(arena, if shadowed {
                         body.iter().map(|s| (*s).clone()).collect()
                     } else {
                         body.iter()
                             .map(|s| replace_ident_in_stmt(arena, s, old, new))
                             .collect()
-                    },
+                    }),
                     span: *span,
                 })
             }
@@ -675,10 +1224,7 @@ pub fn replace_ident_in_expr<'input>(
                 span: *span,
             }),
             Expr::UnsafeBlock { body, span } => arena.alloc(Expr::UnsafeBlock {
-                body: body
-                    .iter()
-                    .map(|s| replace_ident_in_stmt(arena, s, old, new))
-                    .collect(),
+                body: alloc_slice(arena, body.iter().map(|s| replace_ident_in_stmt(arena, s, old, new)).collect()),
                 span: *span,
             }),
             Expr::Catch {
@@ -687,7 +1233,7 @@ pub fn replace_ident_in_expr<'input>(
                 span,
             } => arena.alloc(Expr::Catch {
                 expr: go(arena, expr, old, new),
-                branches: branches
+                branches: alloc_slice(arena, branches
                     .iter()
                     .map(|b| {
                         // Capture avoidance (same as Match/IfLet): a branch
@@ -697,18 +1243,18 @@ pub fn replace_ident_in_expr<'input>(
                         CatchBranch {
                             pattern: b.pattern.clone(),
                             bind: b.bind,
-                            body: if shadowed {
+                            body: alloc_slice(arena, if shadowed {
                                 b.body.iter().map(|s| (*s).clone()).collect()
                             } else {
                                 b.body
                                     .iter()
                                     .map(|s| replace_ident_in_stmt(arena, s, old, new))
                                     .collect()
-                            },
+                            }),
                             span: b.span,
                         }
                     })
-                    .collect(),
+                    .collect()),
                 span: *span,
             }),
             Expr::LeaveWith {
@@ -732,15 +1278,8 @@ pub fn replace_ident_in_expr<'input>(
                 span,
             } => arena.alloc(Expr::If {
                 cond: go(arena, cond, old, new),
-                then_branch: then_branch
-                    .iter()
-                    .map(|s| replace_ident_in_stmt(arena, s, old, new))
-                    .collect(),
-                else_branch: else_branch.as_ref().map(|eb| {
-                    eb.iter()
-                        .map(|s| replace_ident_in_stmt(arena, s, old, new))
-                        .collect()
-                }),
+                then_branch: alloc_slice(arena, then_branch.iter().map(|s| replace_ident_in_stmt(arena, s, old, new)).collect()),
+                else_branch: else_branch.as_ref().map(|eb| alloc_slice(arena, eb.iter().map(|s| replace_ident_in_stmt(arena, s, old, new)).collect())),
                 is_expression: *is_expression,
                 span: *span,
             }),
@@ -754,24 +1293,17 @@ pub fn replace_ident_in_expr<'input>(
             } => arena.alloc(Expr::IfLet {
                 pattern: pattern.clone(),
                 scrutinee: go(arena, scrutinee, old, new),
-                then_branch: if pattern_binds(pattern, old) {
-                    then_branch.clone()
+                then_branch: alloc_slice(arena, if pattern_binds(pattern, old) {
+                    then_branch.iter().map(|s| (*s).clone()).collect()
                 } else {
-                    then_branch
-                        .iter()
-                        .map(|s| replace_ident_in_stmt(arena, s, old, new))
-                        .collect()
-                },
+                    then_branch.iter().map(|s| replace_ident_in_stmt(arena, s, old, new)).collect()
+                }),
                 // The pattern's bindings are scoped to the THEN branch
                 // only (checked after the `with_gadt_arm` scope pops in
                 // the checker) — the else branch is in the OUTER scope,
                 // so references to `old` there refer to the rename target
                 // and MUST be renamed regardless of what the pattern binds.
-                else_branch: else_branch.as_ref().map(|eb| {
-                    eb.iter()
-                        .map(|s| replace_ident_in_stmt(arena, s, old, new))
-                        .collect()
-                }),
+                else_branch: else_branch.as_ref().map(|eb| alloc_slice(arena, eb.iter().map(|s| replace_ident_in_stmt(arena, s, old, new)).collect())),
                 is_expression: *is_expression,
                 span: *span,
             }),
@@ -781,7 +1313,7 @@ pub fn replace_ident_in_expr<'input>(
                 span,
             } => arena.alloc(Expr::Match {
                 scrutinee: go(arena, scrutinee, old, new),
-                arms: arms
+                arms: alloc_slice(arena, arms
                     .iter()
                     .map(|arm| {
                         // Capture avoidance: a pattern that binds `old`
@@ -808,14 +1340,11 @@ pub fn replace_ident_in_expr<'input>(
                             span: arm.span,
                         }
                     })
-                    .collect(),
+                    .collect()),
                 span: *span,
             }),
             Expr::Block(stmts, s) => arena.alloc(Expr::Block(
-                stmts
-                    .iter()
-                    .map(|x| replace_ident_in_stmt(arena, x, old, new))
-                    .collect(),
+                alloc_slice(arena, stmts.iter().map(|x| replace_ident_in_stmt(arena, x, old, new)).collect()),
                 *s,
             )),
             Expr::PolyBox { expr, scheme, span } => arena.alloc(Expr::PolyBox {
@@ -855,10 +1384,7 @@ pub fn replace_ident_in_expr<'input>(
             }
             Expr::Old(e, s) => arena.alloc(Expr::Old(go(arena, e, old, new), *s)),
             Expr::Task { body, span } => arena.alloc(Expr::Task {
-                body: body
-                    .iter()
-                    .map(|s| replace_ident_in_stmt(arena, s, old, new))
-                    .collect(),
+                body: alloc_slice(arena, body.iter().map(|s| replace_ident_in_stmt(arena, s, old, new)).collect()),
                 span: *span,
             }),
             Expr::TypeInfo(t, s) => arena.alloc(Expr::TypeInfo(*t, *s)),
@@ -891,14 +1417,14 @@ pub fn replace_ident_in_stmt<'input>(
         ss: &[Stmt<'a>],
         old: Symbol,
         new: Symbol,
-    ) -> Vec<Stmt<'a>> {
+    ) -> &'a [Stmt<'a>] {
         // Lexical scoping: a binding introduced by one statement shadows
         // the rename target for SUBSEQUENT statements in the block — once
         // `old` is bound locally, later references point at the local
         // binder and must NOT be renamed (a stateless map would sever
         // them, leaving dangling references).
         let mut shadowed = false;
-        ss.iter()
+        let v: Vec<Stmt<'a>> = ss.iter()
             .map(|s| {
                 if shadowed {
                     return (*s).clone();
@@ -922,7 +1448,8 @@ pub fn replace_ident_in_stmt<'input>(
                 }
                 r
             })
-            .collect()
+            .collect();
+        alloc_slice(arena, v)
     }
     fn go_contract<'a>(
         arena: &crate::arena::SyncArena<'a>,
@@ -1186,7 +1713,7 @@ pub fn replace_ident_in_stmt<'input>(
                 pattern: pattern.clone(),
                 scrutinee: go_expr(arena, scrutinee, old_name, new_name),
                 body: if shadowed {
-                    body.clone()
+                    *body
                 } else {
                     go_stmts(arena, body, old_name, new_name)
                 },
@@ -1217,7 +1744,7 @@ pub fn replace_ident_in_stmt<'input>(
                 pattern: pattern.clone(),
                 iterable: go_expr(arena, iterable, old_name, new_name),
                 body: if shadowed {
-                    body.clone()
+                    *body
                 } else {
                     go_stmts(arena, body, old_name, new_name)
                 },
@@ -1359,7 +1886,7 @@ pub fn replace_ident_in_stmt<'input>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::parser::Parser;
@@ -1413,12 +1940,15 @@ mod tests {
     }
 
     fn parse_program(
-        source: &str,
-    ) -> (Program<'static>, &'static crate::arena::SyncArena<'static>) {
+        source: &'static str,
+    ) -> (
+        Program<'static, 'static>,
+        &'static crate::arena::SyncArena<'static>,
+    ) {
         let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let arena: &'static crate::arena::SyncArena<'static> =
             Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
-        let mut parser = Parser::new(source, arena);
+        let mut parser = Parser::new(source, FileId::DUMMY, arena);
         let prog = parser
             .parse_program()
             .expect("parse should succeed for test source");
@@ -1427,7 +1957,7 @@ mod tests {
 
     /// Parse a function body and return its first statement.  Top level
     /// only accepts items, so test statements live inside `def f() { ... }`.
-    fn first_fn_stmt(source: &str) -> (Stmt<'static>, &'static crate::arena::SyncArena<'static>) {
+    fn first_fn_stmt(source: &'static str) -> (Stmt<'static>, &'static crate::arena::SyncArena<'static>) {
         let (prog, arena) = parse_program(source);
         let Stmt::FunctionDef {
             body: Some(body), ..
@@ -1578,5 +2108,165 @@ mod tests {
             !stmts_has_ident(eb, old),
             "else branch must not keep `value`"
         );
+    }
+
+    // ── Option-3 completeness tests: kitchen-sink counting + set equality ──
+
+    /// Counts every node the walker reaches.  Any field the walker
+    /// silently skips (a swallowed `..` or a degenerate `output()`
+    /// branch) drops these counts relative to the hand-written
+    /// expectations, which is the regression guardrail for Option 1.
+    #[derive(Default)]
+    struct CountVisitor {
+        idents: std::collections::HashSet<Symbol>,
+        exprs: usize,
+        stmts: usize,
+        tys: usize,
+        contracts: usize,
+        attrs: usize,
+    }
+
+    impl<'ast, 'input> Visitor<'ast, 'input> for CountVisitor {
+        type Result = ();
+        fn visit_ident(&mut self, name: Symbol, _: &'ast Span) {
+            self.idents.insert(name);
+        }
+        fn visit_expr(&mut self, e: &'ast Expr<'input>) {
+            self.exprs += 1;
+            walk_expr(self, e);
+        }
+        fn visit_stmt(&mut self, s: &'ast Stmt<'input>) {
+            self.stmts += 1;
+            walk_stmt(self, s);
+        }
+        fn visit_ty(&mut self, t: &'ast Type<'input>) {
+            self.tys += 1;
+            walk_ty(self, t);
+        }
+        fn visit_contract(&mut self, c: &'ast Contract<'input>) {
+            self.contracts += 1;
+            walk_contract(self, c);
+        }
+        fn visit_attribute(&mut self, a: &'ast Attribute<'input>) {
+            self.attrs += 1;
+            walk_attribute(self, a);
+        }
+    }
+
+    /// The walker must reach every identifier, expression, type, and
+    /// contract in the kitchen-sink.  The counts are pinned; if a new
+    /// field is swallowed by a `..` or a branch degrades to `output()`,
+    /// one of these drops.
+    #[test]
+    fn walker_reaches_every_construct_in_kitchen_sink() {
+        let source = r#"
+def f(x: Int<32> = 1) -> Int<32> requires x > 0 ensures result > 0 {
+    let y: Int<32> = x + 1;
+    while y > 0 invariant y >= 0 decreases y {
+        y -= 1;
+    }
+    return y;
+}
+"#;
+        let (prog, _) = parse_program(source);
+        let mut v = CountVisitor::default();
+        for item in &prog.items {
+            walk_stmt(&mut v, item);
+        }
+        // Identifiers: f, x, y, result — 4 unique symbols.
+        assert!(v.idents.contains(&Symbol::intern("f")));
+        assert!(v.idents.contains(&Symbol::intern("x")));
+        assert!(v.idents.contains(&Symbol::intern("y")));
+        assert!(v.idents.contains(&Symbol::intern("result")));
+        assert_eq!(v.idents.len(), 4);
+        // Contracts: the fn's `requires` + `ensures` = 2.  Loop
+        // `invariant`/`decreases` are bare `Option<Expr>` fields on
+        // `Stmt::While` (NOT `Contract` nodes — only fn/type-def
+        // pre/post conditions use the `Contract` type), so they count
+        // toward `exprs`, not `contracts`.
+        assert_eq!(v.contracts, 2, "contracts invisible");
+        // Types: 3 × `Int<32>` occurrences (param, return, let y).  Each
+        // Generic counts itself + its Path base + its Const arg (a
+        // `Literal` Expr) = 3 per occurrence, so 3 × 3 = 9.
+        assert_eq!(v.tys, 9, "types invisible");
+        // Statements: VariableDef (let y), While, y -= 1, return y = 4.
+        assert_eq!(v.stmts, 4, "stmts invisible");
+        // Expressions (23 total):
+        //   9 × the `32` const-generic arg of each `Int<32>` (param,
+        //       return, let y) — walked via `walk_ty` → `GenericArg::Const`
+        //   requires `x > 0`      : 3  (node + x + 0)
+        //   ensures `result > 0`  : 3  (node + result + 0)
+        //   let y = `x + 1`       : 3  (node + x + 1)
+        //   while cond `y > 0`    : 3  (node + y + 0)
+        //   invariant `y >= 0`   : 3  (node + y + 0)
+        //   decreases `y`          : 1
+        //   `y -= 1` → Assign     : 2  (target y + value 1)
+        //   return `y`            : 1
+        assert_eq!(v.exprs, 23, "exprs invisible");
+    }
+
+    /// Regression: the walker must descend into `ImplBlock` method
+    /// bodies (the most severe "invisible method bodies" case).
+    #[test]
+    fn walker_descends_into_impl_method_bodies() {
+        let source = r#"
+impl Int<32> {
+    def double(self) -> Int<32> {
+        set x = self + self;
+        x
+    }
+}
+"#;
+        let (prog, _) = parse_program(source);
+        let mut v = CountVisitor::default();
+        for item in &prog.items {
+            walk_stmt(&mut v, item);
+        }
+        // `double`'s body must be reachable.
+        assert!(v.idents.contains(&Symbol::intern("double")));
+        assert!(v.idents.contains(&Symbol::intern("self")));
+        assert!(v.idents.contains(&Symbol::intern("x")));
+    }
+
+    /// Regression: contracts on a function must be walked —
+    /// `walk_contract` was previously unreachable via
+    /// `walk_stmt::FunctionDef`.
+    #[test]
+    fn walker_descends_into_function_contracts() {
+        let source = r#"
+def f(x: Int<32>) -> Int<32> requires x > 0 ensures result > x {
+    x
+}
+"#;
+        let (prog, _) = parse_program(source);
+        let mut v = CountVisitor::default();
+        for item in &prog.items {
+            walk_stmt(&mut v, item);
+        }
+        assert!(v.contracts >= 2, "contracts not walked: {}", v.contracts);
+        assert!(v.exprs >= 3);
+    }
+
+    /// Regression: `Expr::Task` bodies must be walked — they were
+    /// previously merged with `Expr::Path` into a no-op arm.  The
+    /// implicit `poly(expr)` (the only form the parser produces) also
+    /// requires the inner `expr` to be reachable through the walker,
+    /// which this source exercises in one pass.
+    #[test]
+    fn walker_reaches_task_and_poly_bodies() {
+        let source = r#"
+def f(x: Int<32>) -> Int<32> {
+    poly(x)
+}
+"#;
+        let (prog, _) = parse_program(source);
+        let mut v = CountVisitor::default();
+        for item in &prog.items {
+            walk_stmt(&mut v, item);
+        }
+        // The `x` inside the poly box must be visited — before the fix
+        // `PolyBox` shared its arm with `Task`/`Path` and both were no-ops.
+        assert!(v.idents.contains(&Symbol::intern("x")), "poly inner expr invisible");
+        assert!(v.exprs >= 2, "poly inner expr invisible: {}", v.exprs);
     }
 }

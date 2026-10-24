@@ -34,8 +34,8 @@
 //! LIA (linear integer arithmetic) and BV (fixed-width bit-vectors with
 //! modular wrap-around semantics; quantified queries use `(set-logic BV)`).
 //!
-//! Per the 2026-08-13/14 rulings the synthesized bounds are submitted
-//! through the `@hint` channel (the solver stays the authority); bounds
+//! The synthesized bounds are submitted through the `@hint` channel
+//! (the solver stays the authority); bounds
 //! inside the exact difference-constraint sub-language may additionally
 //! self-discharge via `expr_entails_typed` (wired in the checker's
 //! `obligation_provable`; wrap-semantics loops gate to the BV discharge).
@@ -46,7 +46,7 @@
 //! wrap-around semantics — is also AVAILABLE via
 //! `synthesize_*_bii(.., use_bv: true)` (and exercised by the wrap-around
 //! defensive tests). The loop-level obligation point that was missing
-//! ([L3], Layer S) has since landed: while `invariant`/`decreases`/`@hint`
+//! has since landed: while `invariant`/`decreases`/`@hint`
 //! clauses are VERIFIED (see `verify_loop_invariant`/
 //! `verify_loop_decreases`/`verify_loop_hint` in the checker), so a
 //! BV-synthesized candidate now feeds a real verification path, not just
@@ -113,6 +113,7 @@
 //!   SIGN-extend (a two's-complement negative value zero-extended
 //!   inflates by 2^bw and corrupts the offset-domain comparison).
 
+use crate::ast::FileId;
 use crate::ast::{self, IntLit};
 use crate::hir::loop_infer::LoopInstr;
 use crate::hir::octagon::{ClosureMode, Dbm};
@@ -1132,7 +1133,7 @@ pub(crate) fn synthesize_bitwise_bii(
                                     apply_bounds(&mut cur, &bounds);
                                     limits.tighten_sat(&bounds);
                                     adopted = true;
-                                    // D5 (Algorithm 4's `A = A_last` test):
+                                    // Algorithm 4's `A = A_last` test:
                                     // the witness CHANGED `cur`, so the
                                     // pointers must NOT advance — the bits of
                                     // the changed rows must be re-examined.
@@ -1145,7 +1146,7 @@ pub(crate) fn synthesize_bitwise_bii(
                             }
                         }
                         RawQueryOutcome::Unknown | RawQueryOutcome::Error(_) => {
-                            // D6: the solver struggles on the leap query —
+                            // The solver struggles on the leap query —
                             // back off to the bitwise search for a few
                             // iterations instead of abandoning the whole
                             // synthesis (same semantics as
@@ -1391,6 +1392,7 @@ fn template_formula(
     bv: bool,
     bws: &[u8],
     signed: &[bool],
+    raw_saturate: &[bool],
 ) -> String {
     let var = |i: usize| -> String {
         // The first `vars_len` indices are loop variables (x_i / xp_i
@@ -1435,7 +1437,17 @@ fn template_formula(
                 // A saturating variable's PRIMED successor is the clamped
                 // value `clamp(x_i + c)` (the true transfer), not the raw
                 // `x_i + c`. The clamp uses the CURRENT `x_i`.
-                if primed {
+                //
+                // ONLY when the transition is still the RAW `Saturate`
+                // add (`raw_saturate[i]`) — then the transfer encoder
+                // substitutes the same `clamp_expr`, and the two agree.
+                // When the lowering has already expanded the saturate to
+                // a piecewise `Ite` (chained `i := i +? 5; i := i + 1`),
+                // `xp_i` is bound to the FULL successor expression by the
+                // transition; substituting `clamp(x_i + c)` here would
+                // under-approximate the obligation and let non-inductive
+                // candidates through.
+                if primed && raw_saturate.get(i).copied().unwrap_or(true) {
                     if let Some((c, signed)) = clamp_of(i) {
                         clamp_expr(&format!("x_{i}"), c, bv, bws[i], signed)
                     } else {
@@ -1543,6 +1555,7 @@ fn template_formula_concrete(
     bv: bool,
     bws: &[u8],
     signed: &[bool],
+    raw_saturate: &[bool],
 ) -> String {
     let var = |i: usize| -> String {
         if i < vars_len {
@@ -1577,7 +1590,10 @@ fn template_formula_concrete(
     for row in rows {
         let f = match row.kind {
             RowKind::Interval(i) => {
-                if primed {
+                // See template_formula: the primed clamp substitution is
+                // only consistent with the transfer when the transition
+                // is still the RAW `Saturate` add.
+                if primed && raw_saturate.get(i).copied().unwrap_or(true) {
                     if let Some((c, signed)) = clamp_of(i) {
                         clamp_expr(&format!("x_{i}"), c, bv, bws[i], signed)
                     } else {
@@ -1773,8 +1789,8 @@ fn build_refine_query_skeleton(
     smt.push_str(")\n");
 
     // A'(X): the template rows over the current-state variables.
-    let a_x = template_formula(rows, n, false, bv, bws, signed);
-    let a_xp = template_formula(rows, n, true, bv, bws, signed);
+    let a_x = template_formula(rows, n, false, bv, bws, signed, &[]);
+    let a_xp = template_formula(rows, n, true, bv, bws, signed, &[]);
 
     // Pre(X): the seeded pre-state (`i = c`). Any non-constant init
     // instruction cannot be encoded as a plain seed — fail closed rather
@@ -2295,7 +2311,17 @@ fn lift_cmp_operand(
             }
         }
         E::Const(c) => {
-            if c.abs().bits() > 126 {
+            // `i128`-representable constants need at most `bits + 1 = 129`
+            // width. The prior `> 126` cutoff was defensive but rejected
+            // exactly the `bw = 128` clamp bounds that `expand_sat_to_ite`
+            // generates for top-level `AddSat` (BV mode): with
+            // `max − c = 2^128 − 1` the constant needs 128 bits →
+            // `w = 129`, which `bv_const` / `sext_term` encode correctly.
+            // Failure here made `bw = 128 + BV + AddSat` fail closed in
+            // `encode_edge_inductiveness`, discarding any partial
+            // invariant already adopted. The ceiling now matches the
+            // maximum bit-width the clamp bounds can require.
+            if c.abs().bits() > 128 {
                 return None; // absurdly wide guard constant — fail closed
             }
             let w = (c.abs().bits() + 1) as u32;
@@ -2462,22 +2488,39 @@ fn encode_edge_inductiveness(
     // Synthesis uses the witness-constant version (l_r/u_r constrained by
     // the candidate disjunction); the verifier uses the concrete-bound
     // version (checks tpl's actual bound values directly).
+    // Primed-clamp gating: the template's primed Interval row may
+    // substitute `clamp(x_i + c)` ONLY when the transition for variable
+    // i is still the RAW `Saturate` add (then the transfer encoder
+    // substitutes the same clamp — the two agree). When the lowering
+    // already expanded the saturate into a piecewise `Ite` (chained
+    // assignments), `xp_i` is bound to the full successor expression and
+    // the substitution would under-approximate the obligation.
+    let raw_saturate: Vec<bool> = edge
+        .next_values
+        .iter()
+        .map(|e| {
+            matches!(
+                e,
+                crate::hir::loop_ir::ScalarExpr::Add(_, _, crate::hir::loop_ir::ArithSem::Saturate)
+            )
+        })
+        .collect();
     let a_x = if concrete {
-        template_formula_concrete(rows, n, false, bv, bws, &signed_all)
+        template_formula_concrete(rows, n, false, bv, bws, &signed_all, &raw_saturate)
     } else {
-        template_formula(rows, n, false, bv, bws, &signed_all)
+        template_formula(rows, n, false, bv, bws, &signed_all, &raw_saturate)
     };
     let a_xp = if concrete {
-        template_formula_concrete(rows, n, true, bv, bws, &signed_all)
+        template_formula_concrete(rows, n, true, bv, bws, &signed_all, &raw_saturate)
     } else {
-        template_formula(rows, n, true, bv, bws, &signed_all)
+        template_formula(rows, n, true, bv, bws, &signed_all, &raw_saturate)
     };
     let g = cond_to_smt(&problem.loop_guard, bv, bws, &signed_all, n)?;
     let mut ante = vec![a_x, g];
     // Param AND loop-variable type-range conditions are spliced into the
     // quantified antecedent — both are quantifier-scoped, and the loop
     // variables' declared type domains are exactly the reachable states
-    // under trap semantics (D8: the LIA counterpart of `apply_type_bounds`).
+    // under trap semantics (the LIA counterpart of `apply_type_bounds`).
     ante.push(param_range_conds(&problem.params, bv));
     ante.push(var_range_conds(&problem.vars, bv));
     if let Some(guard) = &edge.guard {
@@ -2534,7 +2577,7 @@ fn encode_edge_inductiveness(
 /// ∀ per back-edge implication. Returns None on an encoding failure
 /// (fail-closed).
 ///
-/// NOTE (Property Strengthening, D11): when `problem.post` is `Some`, both
+/// NOTE (Property Strengthening): when `problem.post` is `Some`, both
 /// this builder and `build_bounded_leap_query_problem` conjoin the
 /// Post obligation `∀X. A′(X) ∧ ¬G(X) ⇒ Post(X)` into the Refine query
 /// (Yao et al., "Demystifying…", §IV-A). The synthesized element is then
@@ -2629,7 +2672,7 @@ fn build_refine_query_problem_skeleton(
     } else {
         format!("(and {})", init_parts.join(" "))
     };
-    let a_x_init = template_formula(rows, vars_len, false, bv, bws, &signed_all);
+    let a_x_init = template_formula(rows, vars_len, false, bv, bws, &signed_all, &[]);
     smt.push_str("(assert (forall (");
     for i in 0..vars_len {
         smt.push_str(&format!("(x_{i} {}) ", sort(bws[i] as u32)));
@@ -2666,7 +2709,7 @@ fn build_refine_query_problem_skeleton(
     if let Some(post) = &problem.post {
         let post_s = cond_to_smt(post, bv, bws, &signed_all, vars_len)?;
         let g_s = cond_to_smt(&problem.loop_guard, bv, bws, &signed_all, vars_len)?;
-        let a_x = template_formula(rows, vars_len, false, bv, bws, &signed_all);
+        let a_x = template_formula(rows, vars_len, false, bv, bws, &signed_all, &[]);
 
         smt.push_str("(assert (forall (");
         for i in 0..vars_len {
@@ -2815,7 +2858,7 @@ fn build_bounded_leap_query_problem(
         init_cond,
         param_range_conds(&problem.params, bv),
         var_range_conds(&problem.vars, bv),
-        template_formula(rows, vars_len, false, bv, bws, &signed_all)
+        template_formula(rows, vars_len, false, bv, bws, &signed_all, &[])
     ));
     for edge in &problem.back_edges {
         parts.push(encode_edge_inductiveness(
@@ -2845,7 +2888,7 @@ fn build_bounded_leap_query_problem(
     if let Some(post) = &problem.post {
         let post_s = cond_to_smt(post, bv, bws, &signed_all, vars_len)?;
         let g_s = cond_to_smt(&problem.loop_guard, bv, bws, &signed_all, vars_len)?;
-        let a_x = template_formula(rows, vars_len, false, bv, bws, &signed_all);
+        let a_x = template_formula(rows, vars_len, false, bv, bws, &signed_all, &[]);
 
         smt.push_str("(assert (forall (");
         for i in 0..vars_len {
@@ -3107,7 +3150,7 @@ pub(crate) fn synthesize_problem_bii(
                                     apply_bounds(&mut cur, &bounds);
                                     limits.tighten_sat(&bounds);
                                     adopted = true;
-                                    // D5 (Algorithm 4's `A = A_last` test):
+                                    // Algorithm 4's `A = A_last` test:
                                     // the witness CHANGED `cur`, so the
                                     // pointers must NOT advance — the bits of
                                     // the changed rows must be re-examined.
@@ -3153,10 +3196,9 @@ pub(crate) fn synthesize_problem_bii(
 
 // ═══ Exact DBM-based inductiveness verification ═══
 //
-// Committee ruling ("if it is strong enough to prove soundness, do not
-// bother z3"): for templates inside the octagon fragment the DBM strong
-// closure proves inductiveness EXACTLY, replacing every solver
-// round-trip of `verify_template_against_problem`.
+// For templates inside the octagon fragment the DBM strong closure
+// proves inductiveness EXACTLY, replacing every solver round-trip of
+// `verify_template_against_problem`.
 /// Maximum number of `if`-paths the DBM verifier enumerates before
 /// falling back to the SMT verifier (fail-closed — exponential path
 /// blowups stay on the z3 path).  16 covers every real branch structure
@@ -3179,8 +3221,7 @@ const DBM_VERIFY_MAX_PATHS: usize = 16;
 /// must close to ⊥. Strong closure only derives constraints IMPLIED by
 /// the input (paper Theorem 4.3 — the closure is the normal form of the
 /// same V-domain), so an unsat closed DBM PROVES the real system unsat:
-/// `Some(true)` is a sound proof and discharges without z3 (the
-/// founder's bifurcation).
+/// `Some(true)` is a sound proof and discharges without z3.
 ///
 /// The converse is NOT trusted: real-domain closure can miss integer
 /// tightenings (Zuo et al. 2026, §V.D), so a satisfiable query might be a
@@ -3341,10 +3382,40 @@ fn dbm_proves_inductiveness(
         param_edges.push((2 * v, 2 * v + 1, hi.checked_mul(2)?)); // p ≤ hi
         param_edges.push((2 * v + 1, 2 * v, lo.checked_mul(-2)?)); // p ≥ lo
     }
-    // Refute one counter-query against a closed premise: SATISFIABLE
+    // Refute one counter-query against a CLOSED premise: SATISFIABLE
     // means a potential counterexample (Some(false) — the SMT verifier
     // decides); ⊥ means the half-bound is proven.
+    //
+    // Fast path: the premise is already `IntegerExact`-closed, so
+    // `node_bound` reads the TIGHT implied bound on every edge (on
+    // self-dual edges the stored value is mod-4-rounded, matching the
+    // `2·ub` scaling `row_half` uses). Most half-bounds are decided by
+    // two O(1) reads; only the rare cross-edge integer-tightening cases
+    // (the Figure-6 pattern) fall back to the clone + re-close.
     let refuted = |dbm: &Dbm, neg: (usize, usize, i128)| -> Option<bool> {
+        // Un-negate: the half-bound is `a − b ≤ c` with `c = −neg_c − 1`
+        // (the inverse of `negate`).
+        let (b, a, neg_c) = neg;
+        let Some(c) = neg_c.checked_neg().and_then(|v| v.checked_sub(1)) else {
+            // Un-negation overflows (neg_c = MIN ⟺ c = MAX): the DBM
+            // path cannot decide — let the SMT verifier rule.
+            return Some(false);
+        };
+        // O(1) refute: premise ⟹ (a − b ≤ c).
+        if let Some(x) = dbm.node_bound(a, b) {
+            if x <= c {
+                return None; // refuted — this half-bound holds
+            }
+        }
+        // O(1) sat: premise ⟹ (b − a ≤ neg_c) ⟹ ¬(a − b ≤ c); the
+        // added edge is implied, so the premise stays non-bottom.
+        if let Some(y) = dbm.node_bound(b, a) {
+            if y <= neg_c {
+                return Some(false);
+            }
+        }
+        // Slow path: cross-edge integer tightening may still refute —
+        // the original clone + re-close, kept for the uncommon case.
         let mut m = dbm.clone();
         m.set_mirrored(neg.0, neg.1, neg.2);
         if m.close_with(ClosureMode::IntegerExact) {
@@ -3974,7 +4045,7 @@ pub(crate) enum VerifyOutcome {
     /// Distinct from `Counterexample`: the invariant itself is
     /// verified, so the hint channel stays sound. Surfacing the
     /// trap signal as a user-visible diagnostic (error vs
-    /// warning, strict vs non-strict) is an L3 decision —
+    /// warning, strict vs non-strict) is a policy decision —
     /// deliberately deferred, not silently dropped.
     TrapUnproven,
     /// Checks 1–2 UNSAT (inductiveness holds), but Check 4 (ϕ₃ exit
@@ -4013,8 +4084,7 @@ pub(crate) fn verify_template_against_problem(
     bv: bool,
 ) -> VerifyOutcome {
     use crate::hir::loop_ir::EdgeKind;
-    // DBM fast path (committee ruling: "if it is strong enough to prove
-    // soundness, do not bother z3"): inside the octagon fragment
+    // DBM fast path: inside the octagon fragment
     // (Interval/Diff/Sum rows, difference-expressible transitions) the
     // DBM closure proves inductiveness EXACTLY — no solver round-trip.
     // Only the LIA reading is covered (BV mode has modular semantics
@@ -4052,7 +4122,7 @@ pub(crate) fn verify_template_against_problem(
             "Int".to_string()
         }
     };
-    let a_x = template_formula_concrete(rows, vars_len, false, bv, &bws_all, &signed_all);
+    let a_x = template_formula_concrete(rows, vars_len, false, bv, &bws_all, &signed_all, &[]);
 
     let mut logic = String::new();
     if bv {
@@ -4354,8 +4424,8 @@ fn build_bounded_leap_query(
     }
     smt.push_str(")\n");
 
-    let a_x = template_formula(rows, n, false, bv, bws, signed);
-    let a_xp = template_formula(rows, n, true, bv, bws, signed);
+    let a_x = template_formula(rows, n, false, bv, bws, signed, &[]);
+    let a_xp = template_formula(rows, n, true, bv, bws, signed, &[]);
 
     let mut pre_parts = Vec::new();
     for instr in init {
@@ -4673,13 +4743,13 @@ pub(crate) fn template_to_invariant_exprs<'a>(
     let ident = |i: usize| -> &'a crate::ast::Expr<'a> {
         arena.alloc(crate::ast::Expr::Ident(
             vars[i],
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ))
     };
     let lit = |c: i128| -> &'a crate::ast::Expr<'a> {
         arena.alloc(crate::ast::Expr::Literal(
             crate::ast::Literal::Int(ast::IntLit::Small(c)),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ))
     };
     let bin = |op: crate::ast::BinOp,
@@ -4690,11 +4760,11 @@ pub(crate) fn template_to_invariant_exprs<'a>(
             left: l,
             op,
             right: r,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     };
 
-    // D15 (hint hygiene): emit the cheap, high-value rows first and stop
+    // Hint hygiene: emit the cheap, high-value rows first and stop
     // once the row budget is spent. SparsePoly templates carry up to 4·C(n,3)
     // Support3 rows that are almost always implied by the Interval/Zone
     // rows — emitting them all feeds a quadratic blow-up into every
@@ -4769,10 +4839,53 @@ pub(crate) fn template_to_invariant_exprs<'a>(
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::hir::loop_ir::{CmpOp, Cond, ScalarExpr};
+
+    /// Regression: BV + `bw = 128` top-level `AddSat` clamp bound must be encodable.
+    /// Before the fix, `lift_cmp_operand`'s `> 126` cutoff rejected `max − c = 2^128 − 2`
+    /// (128 bits), causing `encode_edge_inductiveness` to return `None` and the entire
+    /// synthesis to abort.
+    #[test]
+    fn test_bv_128_top_level_addsat_encodable() {
+        // `clamp(x + 1)` at bw=128: pre + 1 > max ⟺ pre > 2^128 − 2,
+        // the constant requires 128 bits. The old encoding returned None directly.
+        let clamp_up = Cond::Cmp {
+            op: CmpOp::Gt,
+            lhs: Box::new(ScalarExpr::Var(0)),
+            rhs: Box::new(ScalarExpr::Const((num_bigint::BigInt::from(1) << 128) - 2)),
+            signed: false,
+        };
+        // Go through `cond_to_smt`'s BV path (encode_cmp_bv → lift_cmp_operand)
+        let s = cond_to_smt(&clamp_up, true, &[128], &[false], 1)
+            .expect("bw=128 top-level clamp must encode after the fix");
+        assert!(s.starts_with("(bvsgt "), "expected signed predicate: {s}");
+        assert!(s.contains("(_ bv"), "expected bv literal: {s}");
+
+        // End-to-end: `x := 0; while x < 255 { x := x +? 1 }` on UInt<128> must
+        // synthesize and verify under BV (it failed closed before the fix).
+        use crate::hir::loop_infer::LoopInstr;
+        let solver = crate::hir::smt::SmtSolver::new("z3");
+        if !solver.check_version() {
+            eprintln!("z3 unavailable — skipping test_bv_128_top_level_addsat_encodable");
+            return;
+        }
+        let vars = vec![crate::symbol::Symbol::intern("x")];
+        let init = vec![LoopInstr::ConstVar(0, 0)];
+        let body = vec![LoopInstr::TestLe(0, 254), LoopInstr::AddSat(0, 1)];
+        let problem = crate::hir::loop_ir::loop_instrs_to_loop_problem(
+            &vars, &init, &body, &[128], &[false], &[], true,
+        )
+        .expect("must lower");
+        let tpl = synthesize_problem_bii(&solver, &problem, 512, true)
+            .expect("bw=128 + BV + AddSat must not fail closed");
+        assert!(matches!(
+            verify_template_against_problem(&solver, &problem, &tpl, true),
+            VerifyOutcome::Verified
+        ));
+    }
 
     /// `i := 0; while i < 6 { i := i + 1 }` — the BII interval is
     /// `[0, 6]`: the init pins the lower bound to 0, inductiveness forces
@@ -5578,7 +5691,7 @@ mod tests {
             full_ub: BigInt::from(30),
         }];
         let bws = [4u8, 4, 4];
-        let f_lia = template_formula(&rows, 3, false, false, &bws, &[false, false, false]);
+        let f_lia = template_formula(&rows, 3, false, false, &bws, &[false, false, false], &[]);
         assert!(
             f_lia.contains("(<= l_0 (- (+ x_0 x_1) x_2))"),
             "LIA Support3 term: {f_lia}"
@@ -5589,7 +5702,7 @@ mod tests {
         );
         assert!(!f_lia.contains("bvadd"), "LIA must not use BV ops: {f_lia}");
 
-        let f_bv = template_formula(&rows, 3, false, true, &bws, &[false, false, false]);
+        let f_bv = template_formula(&rows, 3, false, true, &bws, &[false, false, false], &[]);
         // enc_bw = 6, each operand zero-extended by 2; (+,−) offset = m = 15.
         assert!(
             f_bv.contains(
@@ -5990,7 +6103,7 @@ mod tests {
         );
     }
 
-    /// D3: a Support3/Clamp row still at its construction tops is VACUOUS
+    /// A Support3/Clamp row still at its construction tops is VACUOUS
     /// (`full_lb ≤ f ≤ full_ub` holds for every state) and must be DROPPED
     /// from A(X)/A(X′) instead of bailing to the SMT verifier — this is
     /// what makes the exact DBM fast path reachable for production
@@ -6822,7 +6935,7 @@ mod tests {
             full_lb: BigInt::from(-383),
             full_ub: BigInt::from(127),
         }];
-        let f = template_formula(&rows, 2, false, true, &[8, 8], &[true, false]);
+        let f = template_formula(&rows, 2, false, true, &[8, 8], &[true, false], &[]);
         assert!(
             f.contains("(bvule l_0 (bvadd (bvsub ((_ sign_extend 1) x_0) ((_ zero_extend 1) x_1)) (_ bv383 9)))"),
             "per-operand extension text: {f}"
@@ -7499,7 +7612,7 @@ mod tests {
         assert_eq!(
             dbm_proves_inductiveness(&problem, &tpl),
             Some(true),
-            "trivial Support3 rows must not disable the DBM fast path (D3)"
+            "trivial Support3 rows must not disable the DBM fast path"
         );
     }
 

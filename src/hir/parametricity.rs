@@ -115,7 +115,7 @@ pub fn scan_type_for_violations<'input>(
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use smallvec::smallvec;
@@ -130,7 +130,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod gate_integration_tests {
     use super::*;
     use crate::hir::types::TypeContext;

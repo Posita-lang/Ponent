@@ -23,6 +23,7 @@
 //! See the [rustc-dev-guide chapter](https://rustc-dev-guide.rust-lang.org/solve/caching.html)
 //! for more details on the caching strategy.
 
+use arrayvec::ArrayVec;
 use crate::hir::infer::TypeVariableKind;
 use crate::hir::query::{DefaultCache as QueryCache, QueryCacheType};
 use crate::hir::traits::solver::delegate::SolverDelegate;
@@ -37,7 +38,6 @@ use rustc_hash::FxHashSet as HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::mem;
-use std::sync::Arc;
 
 // ── Constants ─────────────────────────────────────────────────────
 
@@ -547,7 +547,7 @@ pub struct CanonicalPredicate {
     pub types: Vec<CanonicalTy>,
     /// The kinds of each free inference variable in the goal, in order
     /// of first appearance during canonicalization.
-    pub var_kinds: Vec<TypeVariableKind>,
+    pub var_kinds: ArrayVec<TypeVariableKind, 1>,
     /// The highest universe index nameable by the caller.
     /// Used for HRTB `for<'a>` placeholder scoping.
     pub max_universe: usize,
@@ -822,8 +822,8 @@ fn predicate_has_unresolved_vars<'input>(predicate: &Predicate, ctx: &TypeContex
 fn collect_predicate_var_kinds<'input>(
     predicate: &Predicate,
     ctx: &TypeContext<'input>,
-) -> Vec<TypeVariableKind> {
-    let mut var_kinds: Vec<TypeVariableKind> = Vec::new();
+) -> ArrayVec<TypeVariableKind, 1> {
+    let mut var_kinds: ArrayVec<TypeVariableKind, 1> = ArrayVec::new();
     let mut seen: HashMap<usize, usize> = HashMap::default();
     let self_ty = predicate.self_ty();
     let resolved = ctx.resolve_binding(self_ty);
@@ -1892,7 +1892,6 @@ impl SearchGraph {
         available_depth: AvailableDepth,
     ) -> Option<CanonicalResponse> {
         let entry = self.global_cache.lookup(key)?;
-        let entry = Arc::unwrap_or_clone(entry);
         // Depth validation.
         if !available_depth.cache_entry_is_applicable(entry.required_depth) {
             return None;
@@ -1912,7 +1911,7 @@ impl SearchGraph {
 
     /// Insert a result into the global cache.
     pub fn insert_global_cache(&mut self, key: CanonicalPredicate, response: CanonicalResponse) {
-        self.global_cache.insert(key, Arc::new(response));
+        self.global_cache.insert(key, response);
     }
 
     // ── Fixpoint iteration ────────────────────────────────────────
@@ -2015,7 +2014,7 @@ impl Default for SearchGraph {
 // No manual impls needed — TypeId, DefId, and Vec<TypeId> all
 // implement Hash through their own derives.
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::hir::traits::solver::obligation::{ObligationCause, ObligationCauseCode, Predicate};

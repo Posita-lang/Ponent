@@ -1,5 +1,5 @@
 use super::*;
-use parking_lot::RwLock;
+use crate::sync::RwLock;
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering as AtomicOrdering;

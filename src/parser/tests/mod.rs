@@ -6,9 +6,9 @@ fn leaked_arena() -> &'static crate::arena::SyncArena<'static> {
     Box::leak(Box::new(crate::arena::SyncArena::new(bump)))
 }
 
-fn check_parse(source: &str) -> Program<'static> {
+fn check_parse(source: &'static str) -> Program<'static, 'static> {
     let arena = leaked_arena();
-    let mut parser = Parser::new(source, arena);
+    let mut parser = Parser::new(source, FileId::DUMMY, arena);
     match parser.parse_program() {
         Ok(prog) => {
             assert!(
@@ -24,7 +24,7 @@ fn check_parse(source: &str) -> Program<'static> {
 
 fn check_parse_err<'src>(source: &'src str) -> Vec<Diagnostic<'src>> {
     let arena = leaked_arena();
-    let mut parser = Parser::new(source, arena);
+    let mut parser = Parser::new(source, FileId::DUMMY, arena);
     parser.parse_program().err().unwrap_or_else(|| {
         panic!(
             "expected parse error, but parsing succeeded: {:?}",
@@ -37,7 +37,7 @@ fn check_parse_err<'src>(source: &'src str) -> Vec<Diagnostic<'src>> {
 /// for tests that need direct access to the parser (tokens, pending
 /// stack, etc.) rather than just its result.
 fn new_parser<'src>(source: &'src str) -> Parser<'src, 'static> {
-    Parser::new(source, leaked_arena())
+    Parser::new(source, FileId::DUMMY, leaked_arena())
 }
 
 /// The parser must be `Send` (and `Sync`) so it can run on a rayon worker:
@@ -60,12 +60,13 @@ fn check_parse_fails(source: &str) {
     );
 }
 
-/// The banded edit distance correctness: the transposition-like pair
-/// `"retrun"`/`"return"` is distance 2 (within the limit), and the
+/// The banded edit distance correctness: the transposition pair
+/// `"retrun"`/`"return"` is OSA-distance 1 (within the limit), and the
 /// unrelated pair is clamped to the limit+1 sentinel when it exceeds
 /// the limit.
 #[test]
 fn test_edit_distance_limited_banded() {
+    let mut prev_prev = Vec::new();
     let mut prev = Vec::new();
     let mut curr = Vec::new();
     // Input/candidate strings are pre-split into `Vec<char>` once by the
@@ -74,17 +75,17 @@ fn test_edit_distance_limited_banded() {
     let ret: Vec<char> = "return".chars().collect();
     let leave: Vec<char> = "leave".chars().collect();
     assert_eq!(
-        edit_distance_limited_into(&mut prev, &mut curr, &retrun, &ret, 2),
-        2
+        osa_distance_limited_into(&mut prev_prev, &mut prev, &mut curr, &retrun, &ret, 2),
+        1
     );
     // Within the lenient threshold.
     assert_eq!(
-        edit_distance_limited_into(&mut prev, &mut curr, &retrun, &leave, 6),
+        osa_distance_limited_into(&mut prev_prev, &mut prev, &mut curr, &retrun, &leave, 6),
         5
     );
     // Exceeds the limit → clamped to limit + 1.
     assert_eq!(
-        edit_distance_limited_into(&mut prev, &mut curr, &retrun, &leave, 2),
+        osa_distance_limited_into(&mut prev_prev, &mut prev, &mut curr, &retrun, &leave, 2),
         3
     );
 }
@@ -92,7 +93,7 @@ fn test_edit_distance_limited_banded() {
 #[test]
 fn test_did_you_mean_keyword_suggestion() {
     // The optimized did_you_mean_keyword must still suggest:
-    // "retrun" → "return" (distance 2, first-char match).
+    // "retrun" → "return" (OSA-distance 1, first-char match).
     let suggestion = did_you_mean_keyword("retrun", KeywordContext::Statement);
     assert_eq!(suggestion.as_deref(), Some("did you mean `return`?"));
     // The ASCII fast path (upper-case input → case-insensitive match).
@@ -363,6 +364,138 @@ fn test_suffixed_literal() {
     assert_eq!(program.items.len(), 1);
 }
 
+/// `42i32` desugars to `42: Int<32>` (SYNTAX.md §Literals: "The suffix is
+/// syntactic sugar and the type is fully checked") — the AST must mirror
+/// the shape `parse_type` builds for the hand-written `Int<32>`, since
+/// the checker resolves the two identically.
+#[test]
+fn test_suffixed_literal_desugars_to_annotation() {
+    use crate::ast::{GenericArg, IntLit};
+    let program = check_parse("def main() { set x = 42i32; }");
+    let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+        panic!("expected FunctionDef");
+    };
+    let Stmt::VariableDef { value, .. } = &body.as_ref().unwrap()[0] else {
+        panic!("expected VariableDef");
+    };
+    let Expr::TypeAnnotated { expr, ty, .. } = value.as_ref().expect("initializer present") else {
+        panic!("expected the suffixed literal to desugar to TypeAnnotated");
+    };
+    assert!(matches!(
+        expr,
+        Expr::Literal(Literal::Int(IntLit::Small(42)), _)
+    ));
+    let Type::Generic(base, args, _) = ty else {
+        panic!("expected a generic `Int<32>` type");
+    };
+    assert!(matches!(base, Type::Path(p, _) if p.len() == 1 && p[0].eq_str("Int")));
+    let [GenericArg::Positional(Type::Literal(w, _))] = args.as_slice() else {
+        panic!("expected one positional width argument");
+    };
+    assert!(matches!(
+        w,
+        Expr::Literal(Literal::Int(IntLit::Small(32)), _)
+    ));
+}
+
+/// The unsigned variants desugar to `UInt<w>`, and the width is carried
+/// verbatim even when out of range (`42i999` → `Int<999>`) — the range
+/// check belongs to the checker, so the AST is identical to the
+/// hand-written `42: Int<999>`.
+#[test]
+fn test_suffixed_literal_unsigned_and_width_passthrough() {
+    use crate::ast::{GenericArg, IntLit};
+    let program = check_parse("def main() { set a = 0xFFu8; set b = 42i999; }");
+    let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+        panic!("expected FunctionDef");
+    };
+    let body = body.as_ref().unwrap();
+    let value_of = |i: usize| match &body[i] {
+        Stmt::VariableDef { value, .. } => value.as_ref().expect("initializer present"),
+        other => panic!("expected VariableDef, got {other:?}"),
+    };
+    // (base type name, width, literal value) of the desugared annotation.
+    let desugared = |e: &Expr<'_>| -> (String, i128, i128) {
+        let Expr::TypeAnnotated { expr, ty, .. } = e else {
+            panic!("expected TypeAnnotated");
+        };
+        let Expr::Literal(Literal::Int(IntLit::Small(value)), _) = expr else {
+            panic!("expected an integer literal value");
+        };
+        let Type::Generic(base, args, _) = ty else {
+            panic!("expected Generic");
+        };
+        let Type::Path(p, _) = base else {
+            panic!("expected Path base");
+        };
+        let [GenericArg::Positional(Type::Literal(w, _))] = args.as_slice() else {
+            panic!("expected one positional width argument");
+        };
+        let Expr::Literal(Literal::Int(IntLit::Small(width)), _) = w else {
+            panic!("expected an integer width literal");
+        };
+        (p[0].as_str().to_string(), *width, *value)
+    };
+    assert_eq!(desugared(value_of(0)), ("UInt".into(), 8, 255));
+    assert_eq!(desugared(value_of(1)), ("Int".into(), 999, 42));
+}
+
+/// A `u128`-range value (above `i128::MAX`) desugars to an
+/// `IntLit::Large` value under a `UInt<128>` annotation — the suffix is
+/// sugar for the hand-written `…: UInt<128>`, and the lexer now admits
+/// values up to `u128::MAX` (the widest integer type).
+#[test]
+fn test_suffixed_literal_u128_range_becomes_large() {
+    use crate::ast::{GenericArg, IntLit};
+    let program =
+        check_parse("def main() { set x = 340282366920938463463374607431768211455u128; }");
+    let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+        panic!("expected FunctionDef");
+    };
+    let Stmt::VariableDef { value, .. } = &body.as_ref().unwrap()[0] else {
+        panic!("expected VariableDef");
+    };
+    let Expr::TypeAnnotated { expr, ty, .. } = value.as_ref().expect("initializer present") else {
+        panic!("expected the suffixed literal to desugar to TypeAnnotated");
+    };
+    assert!(matches!(
+        expr,
+        Expr::Literal(Literal::Int(IntLit::Large(_)), _)
+    ));
+    let Type::Generic(base, args, _) = ty else {
+        panic!("expected a generic `UInt<128>` type");
+    };
+    assert!(matches!(base, Type::Path(p, _) if p.len() == 1 && p[0].eq_str("UInt")));
+    let [GenericArg::Positional(Type::Literal(w, _))] = args.as_slice() else {
+        panic!("expected one positional width argument");
+    };
+    assert!(matches!(
+        w,
+        Expr::Literal(Literal::Int(IntLit::Small(128)), _)
+    ));
+}
+
+/// An overflowing suffixed literal reports a diagnostic — the old path
+/// returned `Expr::Error` with NO diagnostic (a silent failure: the
+/// literal compiled into an opaque error node without explanation).
+#[test]
+fn test_suffixed_literal_overflow_is_diagnosed() {
+    let mut parser =
+        new_parser("def main() { set x = 99999999999999999999999999999999999999999i32; }");
+    // `parse_program` moves pushed diagnostics into the `Err` result.
+    let diags = match parser.parse_program() {
+        Err(diags) => diags,
+        Ok(_) => panic!("an overflowing suffixed literal must produce a parse diagnostic"),
+    };
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message() == "suffixed integer literal overflow"),
+        "expected an overflow diagnostic, got {:?}",
+        diags.iter().map(|d| d.message()).collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn test_unsafe_block() {
     let program = check_parse("def main() { unsafe { } }");
@@ -475,16 +608,16 @@ fn test_synchronize_does_not_swallow_statement_start() {
     );
 }
 
-/// A block-level `trait` is a valid statement (committee-approved
-/// rustc-style nested items): `parse_stmt` dispatches it to
+/// A block-level `trait` is a valid statement (rustc-style nested
+/// items): `parse_stmt` dispatches it to
 /// `parse_trait_def`, which consumes the keyword first — so error
 /// recovery always makes progress and the block loop terminates at
 /// the closing brace.  The test completing at all is the assertion
 /// (a spin would hang it).
 #[test]
 fn test_synchronize_block_level_trait_no_spin() {
-    // Block-level `trait` is now a valid statement (committee-approved
-    // rustc-style nested items): parsing succeeds — a spin would hang
+    // Block-level `trait` is now a valid statement (rustc-style nested
+    // items): parsing succeeds — a spin would hang
     // the test instead.
     let program = check_parse("def main() { trait X {} return 0; }");
     assert_eq!(program.items.len(), 1);
@@ -516,7 +649,7 @@ fn test_recovery_keeps_block_level_trait() {
 #[test]
 fn test_peek_next_pending_empty() {
     let mut p = new_parser("a + b");
-    assert_eq!(p.peek_next(), Some(Token::Plus));
+    assert_eq!(p.peek_next(), Some(&Token::Plus));
     // peek() must still return the FIRST token (peek_next is a pure
     // lookahead — it must not have consumed `Ident(a)`).
     assert!(matches!(p.peek(), Ok(Token::Ident(_))));
@@ -528,7 +661,7 @@ fn test_peek_next_pending_empty() {
 fn test_peek_next_pending_one() {
     let mut p = new_parser("a + b");
     p.pending.push(Token::Gt);
-    assert_eq!(p.peek_next(), Some(Token::Ident(Symbol::intern("a"))));
+    assert_eq!(p.peek_next(), Some(&Token::Ident(Symbol::intern("a"))));
     // peek() returns the pending token, not the stream head.
     assert!(matches!(p.peek(), Ok(Token::Gt)));
 }
@@ -540,7 +673,7 @@ fn test_peek_next_pending_two() {
     let mut p = new_parser("a + b");
     p.pending.push(Token::Gt);
     p.pending.push(Token::Lt);
-    assert_eq!(p.peek_next(), Some(Token::Gt));
+    assert_eq!(p.peek_next(), Some(&Token::Gt));
     // peek() returns the pending stack top `Lt`.
     assert!(matches!(p.peek(), Ok(Token::Lt)));
 }
@@ -1803,4 +1936,46 @@ fn test_return_label_parse_error() {
     let src = "def f() -> Int<32> { return @ 4; }";
     let diags = check_parse_err(src);
     assert!(!diags.is_empty(), "expected parse error for `return @`");
+}
+
+#[test]
+fn test_import_forms() {
+    // The three legal import forms: bare module, brace items, alias.
+    let src = "import std::io;\nimport std::{io, fs};\nimport std::io as my_io;\n";
+    let program = check_parse(src);
+    assert_eq!(program.items.len(), 3);
+    match &program.items[0] {
+        Stmt::Import { path, items, alias, .. } => {
+            assert_eq!(path.len(), 2);
+            assert_eq!(path[0].as_str(), "std");
+            assert_eq!(path[1].as_str(), "io");
+            assert!(items.is_none());
+            assert!(alias.is_none());
+        }
+        _ => panic!("expected Stmt::Import"),
+    }
+    match &program.items[1] {
+        Stmt::Import { items, .. } => {
+            let items = items.as_ref().expect("brace items");
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].as_str(), "io");
+            assert_eq!(items[1].as_str(), "fs");
+        }
+        _ => panic!("expected Stmt::Import with items"),
+    }
+    match &program.items[2] {
+        Stmt::Import { alias, .. } => {
+            assert_eq!(alias.expect("alias").as_str(), "my_io");
+        }
+        _ => panic!("expected Stmt::Import with alias"),
+    }
+}
+
+#[test]
+fn test_from_import_is_rejected() {
+    // `from path import {..}` was a Python-flavoured form that never
+    // belonged to Posita — pinned as a hard error, not silent acceptance.
+    let src = "from std import { io };";
+    let diags = check_parse_err(src);
+    assert!(!diags.is_empty(), "`from ... import` must not parse");
 }

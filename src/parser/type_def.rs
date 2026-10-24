@@ -3,6 +3,7 @@
 use super::*;
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
+use crate::lexer::literal::parse_string_literal;
 use crate::lexer::Token;
 use crate::symbol::Symbol;
 
@@ -15,6 +16,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         &mut self,
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
+        bump: &'input bumpalo::Bump,
     ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         self.advance().ok();
@@ -33,7 +35,7 @@ impl<'src, 'input> Parser<'src, 'input> {
             .contains(ParseRestrictions::ALLOW_TYPE_PARAMS)
             && matches!(self.peek(), Ok(Token::Lt))
         {
-            self.parse_type_params()?
+            self.parse_type_params(bump)?
         } else {
             Vec::new()
         };
@@ -41,27 +43,27 @@ impl<'src, 'input> Parser<'src, 'input> {
         let mut ty = if let Ok(Token::Ident(s)) = self.peek().clone() {
             if s.eq_str("struct") {
                 self.advance().ok();
-                return self.parse_struct_def(start, name, params, attributes, doc);
+                return self.parse_struct_def(start, name, params, attributes, doc, bump);
             } else if s.eq_str("impl") {
                 self.advance().ok();
-                return self.parse_opaque_def(start, name, params, attributes, doc);
+                return self.parse_opaque_def(start, name, params, attributes, doc, bump);
             } else if s.eq_str("enum") {
                 self.advance().ok();
-                return self.parse_enum_def(start, name, params, attributes, doc);
+                return self.parse_enum_def(start, name, params, attributes, doc, bump);
             } else {
-                self.parse_type()?
+                self.parse_type(bump)?
             }
         } else {
-            self.parse_type()?
+            self.parse_type(bump)?
         };
 
         if matches!(self.peek(), Ok(Token::Where)) {
             self.advance().ok();
-            let invariant = self.parse_expr()?;
+            let invariant = self.parse_expr(bump)?;
             ty = Type::WhereShorthand {
-                base: Self::alloc_shared(self.arena, ty),
-                invariant: Self::alloc_shared(self.arena, invariant),
-                span: Span::new(start, self.span().end),
+                base: Self::alloc_shared(bump, ty),
+                invariant: Self::alloc_shared(bump, invariant),
+                span: Span::new(self.file_id, start, self.span().end),
             };
         }
 
@@ -69,18 +71,18 @@ impl<'src, 'input> Parser<'src, 'input> {
             let mut types = vec![ty];
             while matches!(self.peek(), Ok(Token::Pipe)) {
                 self.advance().ok();
-                types.push(self.parse_type()?);
+                types.push(self.parse_type(bump)?);
             }
-            ty = Type::Union(types, Span::new(start, self.span().end));
+            ty = Type::Union(types, Span::new(self.file_id, start, self.span().end));
         }
 
-        let modifiers = self.parse_type_modifiers()?;
+        let modifiers = self.parse_type_modifiers(bump)?;
         if matches!(self.peek(), Ok(Token::Semicolon)) {
             self.advance().ok();
         }
         let end = self.span().end;
         Ok(Stmt::TypeDef {
-            span: Span::new(start, end),
+            span: Span::new(self.file_id, start, end),
             attributes,
             doc,
             name,
@@ -96,11 +98,12 @@ impl<'src, 'input> Parser<'src, 'input> {
 
     fn parse_struct_def(
         &mut self,
-        start: usize,
+        start: u32,
         name: Symbol,
         params: Vec<TypeParam<'input>>,
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
+        bump: &'input bumpalo::Bump,
     ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         self.expect(Token::LBrace)?;
         let mut fields = Vec::new();
@@ -120,10 +123,10 @@ impl<'src, 'input> Parser<'src, 'input> {
                 }
             };
             self.expect(Token::Colon)?;
-            let field_ty = self.parse_type()?;
+            let field_ty = self.parse_type(bump)?;
             let default = if matches!(self.peek(), Ok(Token::Assign)) {
                 self.advance().ok();
-                Some(self.parse_expr()?)
+                Some(self.parse_expr(bump)?)
             } else {
                 None
             };
@@ -131,7 +134,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                 name: field_name,
                 ty: field_ty,
                 default,
-                span: Span::new(start, self.span().end),
+                span: Span::new(self.file_id, start, self.span().end),
             });
             if matches!(self.peek(), Ok(Token::Comma)) {
                 self.advance().ok();
@@ -140,10 +143,10 @@ impl<'src, 'input> Parser<'src, 'input> {
                 break;
             }
         }
-        let modifiers = self.parse_type_modifiers()?;
+        let modifiers = self.parse_type_modifiers(bump)?;
         let end = self.span().end;
         Ok(Stmt::TypeDef {
-            span: Span::new(start, end),
+            span: Span::new(self.file_id, start, end),
             attributes,
             doc,
             name,
@@ -159,20 +162,21 @@ impl<'src, 'input> Parser<'src, 'input> {
 
     fn parse_opaque_def(
         &mut self,
-        start: usize,
+        start: u32,
         name: Symbol,
         params: Vec<TypeParam<'input>>,
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
+        bump: &'input bumpalo::Bump,
     ) -> Result<Stmt<'input>, Diagnostic<'src>> {
-        let trait_ty = self.parse_type()?;
-        let modifiers = self.parse_type_modifiers()?;
+        let trait_ty = self.parse_type(bump)?;
+        let modifiers = self.parse_type_modifiers(bump)?;
         if matches!(self.peek(), Ok(Token::Semicolon)) {
             self.advance().ok();
         }
         let end = self.span().end;
         Ok(Stmt::TypeDef {
-            span: Span::new(start, end),
+            span: Span::new(self.file_id, start, end),
             attributes,
             doc,
             name,
@@ -188,11 +192,12 @@ impl<'src, 'input> Parser<'src, 'input> {
 
     fn parse_enum_def(
         &mut self,
-        start: usize,
+        start: u32,
         name: Symbol,
         params: Vec<TypeParam<'input>>,
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
+        bump: &'input bumpalo::Bump,
     ) -> Result<Stmt<'input>, Diagnostic<'src>> {
         self.expect(Token::LBrace)?;
         let mut variants = Vec::new();
@@ -252,7 +257,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                         }
                     }
                 }
-                let ty = self.parse_type()?;
+                let ty = self.parse_type(bump)?;
                 if !variant_exists_params.is_empty() && matches!(self.peek(), Ok(Token::Comma)) {
                     return Err(Diagnostic::error("expected `)` after the `exists` variable type")
                         .with_help("multiple `exists` variables share ONE type — use `exists X, Y: Type` (comma-separated names, then a single `:` and one type), not `exists X: T, exists Y: T`")
@@ -265,7 +270,7 @@ impl<'src, 'input> Parser<'src, 'input> {
             };
             let eq_spec = if matches!(self.peek(), Ok(Token::When)) {
                 self.advance().ok();
-                self.parse_gadt_constraints()?
+                self.parse_gadt_constraints(bump)?
             } else {
                 Vec::new()
             };
@@ -274,7 +279,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                 payload,
                 eq_spec,
                 exists_params: variant_exists_params,
-                span: Span::new(start, self.span().end),
+                span: Span::new(self.file_id, start, self.span().end),
             });
             if matches!(self.peek(), Ok(Token::Comma)) {
                 self.advance().ok();
@@ -290,22 +295,41 @@ impl<'src, 'input> Parser<'src, 'input> {
             self.expect(Token::MissingMatch)?;
             self.expect(Token::Assign)?;
             let msg = match self.advance() {
-                Ok(Token::StringLiteral(Ok(s))) => s,
-                _ => return Err(Diagnostic::error("expected string for missing_match")
-                    .with_code_str("E004")
-                    .with_help("`missing_match` expects a string literal — e.g. `with missing_match = \"message\"`")
-                    .with_suggestion("use a string literal like `\"not all variants covered\"`")
-                    .with_span(self.span())),
+                // The token carries the raw slice; parse at consumption time.
+                Ok(Token::StringLiteral(s)) => match parse_string_literal(s) {
+                    Ok(c) => c.into_owned(),
+                    Err(e) => {
+                        return Err(Diagnostic::error(format!(
+                            "invalid string for missing_match: {}",
+                            e
+                        ))
+                        .with_code_str("E004")
+                        .with_help(
+                            "`missing_match` expects a string literal — e.g. `with missing_match = \"message\"`",
+                        )
+                        .with_suggestion("use a string literal like `\"not all variants covered\"`")
+                        .with_span(self.span()))
+                    }
+                },
+                _ => {
+                    return Err(Diagnostic::error("expected string for missing_match")
+                        .with_code_str("E004")
+                        .with_help(
+                            "`missing_match` expects a string literal — e.g. `with missing_match = \"message\"`",
+                        )
+                        .with_suggestion("use a string literal like `\"not all variants covered\"`")
+                        .with_span(self.span()))
+                }
             };
             self.expect(Token::Semicolon)?;
             Some(msg)
         } else {
             None
         };
-        let enum_modifiers = self.parse_type_modifiers()?;
+        let enum_modifiers = self.parse_type_modifiers(bump)?;
         let end = self.span().end;
         Ok(Stmt::TypeDef {
-            span: Span::new(start, end),
+            span: Span::new(self.file_id, start, end),
             attributes,
             doc,
             name,
@@ -321,6 +345,7 @@ impl<'src, 'input> Parser<'src, 'input> {
 
     pub(super) fn parse_gadt_constraints(
         &mut self,
+        bump: &'input bumpalo::Bump,
     ) -> Result<Vec<(Symbol, Type<'input>)>, Diagnostic<'src>> {
         let mut constraints = Vec::new();
         loop {
@@ -346,7 +371,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                 }
             };
             self.expect(Token::EqEq)?;
-            let concrete_ty = self.parse_type()?;
+            let concrete_ty = self.parse_type(bump)?;
             constraints.push((param_name, concrete_ty));
             match self.peek() {
                 Ok(Token::And) => {
@@ -365,6 +390,7 @@ impl<'src, 'input> Parser<'src, 'input> {
 
     pub(super) fn parse_type_modifiers(
         &mut self,
+        bump: &'input bumpalo::Bump,
     ) -> Result<Vec<TypeModifier<'input>>, Diagnostic<'src>> {
         let mut modifiers = Vec::new();
         while matches!(self.peek(), Ok(Token::With)) {
@@ -374,7 +400,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                     let tok = self.advance().map_err(|_| Diagnostic::error("unexpected token")
                         .with_code_str("E003")
                         .with_help("expected a type modifier name (`overflow`, `validate`, `default`, `no_default`) after `with`")
-                        .with_span(Span::new(0, 0)))?;
+                        .with_span(Span::new(self.file_id, 0, 0)))?;
                     match tok {
                         Token::Ident(ref s) if s.eq_str("overflow") => {
                             self.expect(Token::Assign)?;
@@ -396,7 +422,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                         }
                         Token::Ident(ref s) if s.eq_str("validate") => {
                             self.expect(Token::Assign)?;
-                            let closure = self.parse_closure(self.span().start)?;
+                            let closure = self.parse_closure(self.span().start, bump)?;
                             modifiers.push(TypeModifier::Validate(closure));
                             if matches!(self.peek(), Ok(Token::Semicolon)) {
                                 self.advance().ok();
@@ -404,7 +430,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                         }
                         Token::Default => {
                             self.expect(Token::Assign)?;
-                            let expr = self.parse_expr()?;
+                            let expr = self.parse_expr(bump)?;
                             modifiers.push(TypeModifier::Default(expr));
                             if matches!(self.peek(), Ok(Token::Semicolon)) {
                                 self.advance().ok();
@@ -501,7 +527,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                 name: attr_name,
                 args,
                 named_args: Vec::new(),
-                span: Span::new(start, self.span().end),
+                span: Span::new(self.file_id, start, self.span().end),
             });
         }
         self.expect(Token::RBrace)?;
@@ -509,7 +535,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         Ok(Stmt::LayoutDef {
             name,
             attributes,
-            span: Span::new(start, end),
+            span: Span::new(self.file_id, start, end),
         })
     }
 

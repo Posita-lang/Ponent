@@ -1,3 +1,4 @@
+use crate::ast::FileId;
 use crate::hir::symbol::SymbolTable;
 use crate::hir::traits::TraitEnv;
 use crate::hir::traits::solver::builtins::{BuiltinTrait, BuiltinTraitRegistry};
@@ -387,7 +388,7 @@ impl<'a, 'input> SolverDelegate<'input> for SelectionContext<'a, 'input> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::hir::traits::TraitEnv;
@@ -420,7 +421,7 @@ mod tests {
         // Obligation at exactly MAX_RECURSION_DEPTH: must overflow
         let obligation = Obligation {
             cause: ObligationCause {
-                span: crate::ast::Span::new(0, 0),
+                span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 code: ObligationCauseCode::Misc,
             },
             predicate: Predicate::Sized { ty: int_ty },
@@ -465,7 +466,7 @@ mod tests {
         // Obligation at MAX_RECURSION_DEPTH - 1: must NOT overflow.
         let obligation = Obligation {
             cause: ObligationCause {
-                span: crate::ast::Span::new(0, 0),
+                span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 code: ObligationCauseCode::Misc,
             },
             predicate: Predicate::Sized { ty: int_ty },
@@ -512,7 +513,7 @@ mod tests {
 
         let obligation = Obligation {
             cause: ObligationCause {
-                span: crate::ast::Span::new(0, 0),
+                span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 code: ObligationCauseCode::Misc,
             },
             predicate: Predicate::Sized { ty: infer_var },
@@ -550,7 +551,7 @@ mod tests {
         let infer_var = ctx.alloc_infer_var(1001, 0);
         let obligation = Obligation {
             cause: ObligationCause {
-                span: crate::ast::Span::new(0, 0),
+                span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 code: ObligationCauseCode::Misc,
             },
             predicate: Predicate::Sized { ty: infer_var },
@@ -579,7 +580,7 @@ mod tests {
         let int_ty = ctx.int(32, true);
         let obligation = Obligation {
             cause: ObligationCause {
-                span: crate::ast::Span::new(0, 0),
+                span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 code: ObligationCauseCode::Misc,
             },
             predicate: Predicate::Sized { ty: infer_var },
@@ -612,7 +613,7 @@ mod tests {
         let infer_var = ctx.alloc_infer_var(1003, 0);
         let obligation = Obligation {
             cause: ObligationCause {
-                span: crate::ast::Span::new(0, 0),
+                span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 code: ObligationCauseCode::Misc,
             },
             predicate: Predicate::Sized { ty: infer_var },

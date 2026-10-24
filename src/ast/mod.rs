@@ -9,22 +9,92 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 
+/// Identifies a source file.
+///
+/// `FileId(0)` is a sentinel — never a real file — reserved for synthetic
+/// diagnostics (see [`FileId::DUMMY`]); the first real file gets
+/// [`FileId::FIRST_REAL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FileId(u32);
+
+impl FileId {
+    /// Reserved for synthetic diagnostics; not a real file.
+    pub const DUMMY: FileId = FileId(0);
+    /// The `FileId` value given to the first registered file.
+    pub const FIRST_REAL: u32 = 1;
+
+    /// The raw registry value (0 for [`FileId::DUMMY`]).
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+
+    /// Construct from a raw registry index. Only [`SourceMap`](crate::sourcemap::SourceMap)
+    /// should do this — everyone else gets ids from `SourceMap::add_file`.
+    pub(crate) const fn from_raw(raw: u32) -> Self {
+        FileId(raw)
+    }
+}
+
+/// A byte range inside one source file.
+///
+/// Invariants:
+/// - `start <= end` — both are byte offsets into `file`;
+/// - except for [`Span::DUMMY`], `start` and `end` are UTF-8 char boundaries;
+/// - each file is at most 4 GiB (`u32::MAX` bytes), so offsets fit in `u32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
-    pub start: usize,
-    pub end: usize,
+    pub file: FileId,
+    pub start: u32,
+    pub end: u32,
 }
 
 impl Span {
-    pub const fn new(start: usize, end: usize) -> Self {
-        Span { start, end }
+    pub const fn new(file: FileId, start: u32, end: u32) -> Self {
+        Span { file, start, end }
+    }
+
+    /// Sentinel span for "no source location known": `FileId::DUMMY`, 0..0.
+    /// Used as a fallback in internal error paths that lack a real span;
+    /// diagnostic emitters treat it as an unanchored location.
+    pub const DUMMY: Span = Span {
+        file: FileId::DUMMY,
+        start: 0,
+        end: 0,
+    };
+
+    /// Offsets as `usize` for indexing `&str` (lossless: `u32` → `usize`).
+    pub fn start_as_usize(self) -> usize {
+        self.start as usize
+    }
+
+    /// See [`Span::start_as_usize`].
+    pub fn end_as_usize(self) -> usize {
+        self.end as usize
+    }
+}
+
+/// Order by `(file, start, end)`: spans from different files are ordered by
+/// file first, so sorting/lookup code groups by file before offset.
+impl Ord for Span {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.file
+            .0
+            .cmp(&other.file.0)
+            .then(self.start.cmp(&other.start))
+            .then(self.end.cmp(&other.end))
+    }
+}
+
+impl PartialOrd for Span {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
 /// Sentinel span for "no source location known" (start == end == 0).
 /// Used as a fallback in internal error paths that lack a real span;
 /// diagnostic emitters treat it as an unanchored location.
-pub const DUMMY_SPAN: Span = Span::new(0, 0);
+pub const DUMMY_SPAN: Span = Span::DUMMY;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum IntLit {
@@ -205,7 +275,9 @@ impl PartialOrd<i64> for IntLit {
 pub enum Literal {
     Int(IntLit),
     Float(f64),
-    Char(u8),
+    Char(u32),
+    /// Byte character literal `b'x'` — type `Byte` (alias for `UInt<8>`).
+    Byte(u8),
     String(String),
     ByteString(Vec<u8>),
     Bool(bool),
@@ -296,7 +368,7 @@ pub enum Expr<'input> {
     },
     Call {
         callee: &'input Expr<'input>,
-        args: Vec<Expr<'input>>,
+        args: &'input [Expr<'input>],
         comptime: bool,
         span: Span,
     },
@@ -330,7 +402,7 @@ pub enum Expr<'input> {
     },
     StructLit {
         path: Vec<Symbol>,
-        fields: Vec<(Symbol, Expr<'input>)>,
+        fields: &'input [(Symbol, Expr<'input>)],
         span: Span,
     },
     EnumLit {
@@ -344,13 +416,13 @@ pub enum Expr<'input> {
     /// distinct from FieldAccess (`.`). Used for associated fn calls,
     /// enum variant construction, etc.
     Path(smallvec::SmallVec<[Symbol; 4]>, Span),
-    Tuple(Vec<Expr<'input>>, Span),
-    Array(Vec<Expr<'input>>, Span),
+    Tuple(&'input [Expr<'input>], Span),
+    Array(&'input [Expr<'input>], Span),
     Closure {
-        params: Vec<Param<'input>>,
+        params: &'input [Param<'input>],
         return_type: Option<Type<'input>>,
-        captures: Vec<Capture>,
-        body: Vec<Stmt<'input>>,
+        captures: &'input [Capture],
+        body: &'input [Stmt<'input>],
         span: Span,
     },
     Try {
@@ -358,12 +430,12 @@ pub enum Expr<'input> {
         span: Span,
     },
     UnsafeBlock {
-        body: Vec<Stmt<'input>>,
+        body: &'input [Stmt<'input>],
         span: Span,
     },
     Catch {
         expr: &'input Expr<'input>,
-        branches: Vec<CatchBranch<'input>>,
+        branches: &'input [CatchBranch<'input>],
         span: Span,
     },
     LeaveWith {
@@ -379,25 +451,25 @@ pub enum Expr<'input> {
     },
     If {
         cond: &'input Expr<'input>,
-        then_branch: Vec<Stmt<'input>>,
-        else_branch: Option<Vec<Stmt<'input>>>,
+        then_branch: &'input [Stmt<'input>],
+        else_branch: Option<&'input [Stmt<'input>]>,
         is_expression: bool,
         span: Span,
     },
     IfLet {
         pattern: Pattern<'input>,
         scrutinee: &'input Expr<'input>,
-        then_branch: Vec<Stmt<'input>>,
-        else_branch: Option<Vec<Stmt<'input>>>,
+        then_branch: &'input [Stmt<'input>],
+        else_branch: Option<&'input [Stmt<'input>]>,
         is_expression: bool,
         span: Span,
     },
     Match {
         scrutinee: &'input Expr<'input>,
-        arms: Vec<MatchArm<'input>>,
+        arms: &'input [MatchArm<'input>],
         span: Span,
     },
-    Block(Vec<Stmt<'input>>, Span),
+    Block(&'input [Stmt<'input>], Span),
     /// `poly(expr)` — implicit poly box, or `poly : Scheme(expr)` — explicit.
     PolyBox {
         expr: &'input Expr<'input>,
@@ -426,7 +498,7 @@ pub enum Expr<'input> {
     Old(&'input Expr<'input>, Span),
     /// Spawn a task: `task { body }`
     Task {
-        body: Vec<Stmt<'input>>,
+        body: &'input [Stmt<'input>],
         span: Span,
     },
     /// Compile-time type reflection: `@typeInfo!(Type)` — returns a
@@ -449,7 +521,7 @@ pub enum Expr<'input> {
 pub struct CatchBranch<'input> {
     pub pattern: Pattern<'input>,
     pub bind: Option<Symbol>,
-    pub body: Vec<Stmt<'input>>,
+    pub body: &'input [Stmt<'input>],
     pub span: Span,
 }
 
@@ -490,7 +562,7 @@ pub enum Stmt<'input> {
         pattern: Option<Pattern<'input>>,
         ty: Option<Type<'input>>,
         value: Option<Expr<'input>>,
-        else_branch: Option<Vec<Stmt<'input>>>,
+        else_branch: Option<&'input [Stmt<'input>]>,
         span: Span,
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
@@ -508,12 +580,12 @@ pub enum Stmt<'input> {
         contracts: Vec<Contract<'input>>,
         doc: Option<String>,
         name: Symbol,
-        params: Vec<Param<'input>>,
+        params: &'input [Param<'input>],
         return_type: Option<Type<'input>>,
-        body: Option<Vec<Stmt<'input>>>,
+        body: Option<&'input [Stmt<'input>]>,
         type_params: Vec<TypeParam<'input>>,
         where_clause: Option<WhereClause<'input>>,
-        finally: Option<Vec<Stmt<'input>>>,
+        finally: Option<&'input [Stmt<'input>]>,
         is_comptime: bool,
         is_async: bool,
     },
@@ -543,7 +615,7 @@ pub enum Stmt<'input> {
     ExternFunction {
         abi: String,
         name: Symbol,
-        params: Vec<Param<'input>>,
+        params: &'input [Param<'input>],
         return_type: Type<'input>,
         span: Span,
         attributes: Vec<Attribute<'input>>,
@@ -558,21 +630,21 @@ pub enum Stmt<'input> {
     Expression(Expr<'input>),
     If {
         cond: Expr<'input>,
-        then_branch: Vec<Stmt<'input>>,
-        else_branch: Option<Vec<Stmt<'input>>>,
+        then_branch: &'input [Stmt<'input>],
+        else_branch: Option<&'input [Stmt<'input>]>,
         span: Span,
     },
     IfLet {
         pattern: Pattern<'input>,
         scrutinee: Expr<'input>,
-        then_branch: Vec<Stmt<'input>>,
-        else_branch: Option<Vec<Stmt<'input>>>,
+        then_branch: &'input [Stmt<'input>],
+        else_branch: Option<&'input [Stmt<'input>]>,
         span: Span,
     },
     While {
         label: Option<Symbol>,
         cond: Expr<'input>,
-        body: Vec<Stmt<'input>>,
+        body: &'input [Stmt<'input>],
         invariant: Option<Expr<'input>>,
         decreases: Option<Expr<'input>>,
         span: Span,
@@ -581,7 +653,7 @@ pub enum Stmt<'input> {
         label: Option<Symbol>,
         pattern: Pattern<'input>,
         scrutinee: Expr<'input>,
-        body: Vec<Stmt<'input>>,
+        body: &'input [Stmt<'input>],
         invariant: Option<Expr<'input>>,
         decreases: Option<Expr<'input>>,
         span: Span,
@@ -590,14 +662,14 @@ pub enum Stmt<'input> {
         label: Option<Symbol>,
         pattern: Pattern<'input>,
         iterable: Expr<'input>,
-        body: Vec<Stmt<'input>>,
+        body: &'input [Stmt<'input>],
         invariant: Option<Expr<'input>>,
         decreases: Option<Expr<'input>>,
         span: Span,
     },
     Loop {
         label: Option<Symbol>,
-        body: Vec<Stmt<'input>>,
+        body: &'input [Stmt<'input>],
         span: Span,
     },
     Leave {
@@ -622,17 +694,10 @@ pub enum Stmt<'input> {
         span: Span,
     },
     ComptimeBlock {
-        /// Variables captured from the enclosing runtime scope.
-        /// `comptime [x, y] { ... }` makes `x` and `y` available as
-        /// compile‑time constants inside the block.
-        /// Each entry carries the variable name and its source span in
-        /// the capture list so that errors can point to the specific name.
-        captures: Vec<(Symbol, Span)>,
-        /// Whether this block is annotated `@trusted`, granting access to
-        /// `@trusted` functions and `unsafe` operations during comptime.
+        captures: &'input [(Symbol, Span)],
         trusted: bool,
         attributes: Vec<Attribute<'input>>,
-        body: Vec<Stmt<'input>>,
+        body: &'input [Stmt<'input>],
         span: Span,
     },
     /// A `generate` block: declarative, auditable code generation
@@ -642,14 +707,13 @@ pub enum Stmt<'input> {
     Generate {
         attributes: Vec<Attribute<'input>>,
         for_type: &'input Type<'input>,
-        body: Vec<Stmt<'input>>,
+        body: &'input [Stmt<'input>],
         span: Span,
     },
     ScopeCleanup {
         name: Symbol,
-        /// Optional compile-time guard: `scope_cleanup @name when condition { }`
         when_condition: Option<&'input Expr<'input>>,
-        body: Vec<Stmt<'input>>,
+        body: &'input [Stmt<'input>],
         propagates: bool,
         overrides: bool,
         span: Span,
@@ -659,7 +723,7 @@ pub enum Stmt<'input> {
         span: Span,
     },
     Unsafe {
-        body: Vec<Stmt<'input>>,
+        body: &'input [Stmt<'input>],
         span: Span,
     },
     GhostVariableDef {
@@ -668,7 +732,7 @@ pub enum Stmt<'input> {
     },
     Isolate {
         attributes: Vec<Attribute<'input>>,
-        body: Vec<Stmt<'input>>,
+        body: &'input [Stmt<'input>],
         span: Span,
     },
     ImplBlock {
@@ -679,7 +743,7 @@ pub enum Stmt<'input> {
         /// preserved in the AST (e.g. `impl Add<Int<32>> for Type`).
         trait_path: Option<&'input Type<'input>>,
         for_type: Type<'input>,
-        methods: Vec<ImplMethod<'input>>,
+        methods: &'input [ImplMethod<'input>],
         associated_types: Vec<AssociatedType<'input>>,
         where_clause: Option<WhereClause<'input>>,
         type_params: Vec<TypeParam<'input>>,
@@ -742,13 +806,13 @@ pub enum TypeDefinition<'input> {
         Vec<TypeModifier<'input>>,
     ),
     TraitDef {
-        methods: Vec<TraitMethod<'input>>,
+        methods: &'input [TraitMethod<'input>],
         associated_types: Vec<AssociatedType<'input>>,
     },
     ImplBlock {
         trait_path: Option<Vec<Symbol>>,
         for_type: Type<'input>,
-        methods: Vec<ImplMethod<'input>>,
+        methods: &'input [ImplMethod<'input>],
     },
     Constraint(Vec<Type<'input>>),
     Alias(Type<'input>, Vec<TypeModifier<'input>>),
@@ -771,7 +835,7 @@ pub enum OverflowPolicy {
     Saturate,
     Trap,
     /// IEEE 754 semantics for floats (`with overflow = ieee` — explicit
-    /// opt-in; the default is `trap` per the committee ruling).
+    /// opt-in; the default is `trap`).
     Ieee,
 }
 
@@ -856,9 +920,9 @@ impl<'input> EnumVariant<'input> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TraitMethod<'input> {
+    pub struct TraitMethod<'input> {
     pub name: Symbol,
-    pub params: Vec<Param<'input>>,
+    pub params: &'input [Param<'input>],
     pub return_type: Type<'input>,
     pub span: Span,
 }
@@ -876,12 +940,12 @@ pub struct AssociatedType<'input> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ImplMethod<'input> {
+    pub struct ImplMethod<'input> {
     pub name: Symbol,
     pub attributes: Vec<Attribute<'input>>,
-    pub params: Vec<Param<'input>>,
+    pub params: &'input [Param<'input>],
     pub return_type: Type<'input>,
-    pub body: Option<Vec<Stmt<'input>>>,
+    pub body: Option<&'input [Stmt<'input>]>,
     pub span: Span,
 }
 
@@ -976,10 +1040,10 @@ pub enum Pattern<'input> {
     Wildcard(Span),
     Ident(Symbol, Span),
     Literal(&'input Expr<'input>, Span),
-    Tuple(Vec<Pattern<'input>>, Span),
+    Tuple(&'input [Pattern<'input>], Span),
     Struct {
         path: Vec<Symbol>,
-        fields: Vec<(Symbol, Pattern<'input>)>,
+        fields: &'input [(Symbol, Pattern<'input>)],
         rest: bool,
         span: Span,
     },
@@ -995,11 +1059,11 @@ pub enum Pattern<'input> {
         ty: &'input Type<'input>,
         span: Span,
     },
-    Or(Vec<Pattern<'input>>, Span),
+    Or(&'input [Pattern<'input>], Span),
     Slice(
-        Vec<Pattern<'input>>,
+        &'input [Pattern<'input>],
         Option<&'input Pattern<'input>>,
-        Vec<Pattern<'input>>,
+        &'input [Pattern<'input>],
         Span,
     ),
     Error(Span),
@@ -1040,11 +1104,11 @@ pub enum Contract<'input> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Program<'input> {
+pub struct Program<'input, 'src> {
     pub items: Vec<Stmt<'input>>,
     pub span: Span,
     /// Doc/trivia side channel (never part of any query fingerprint).
-    pub doc_map: DocMap,
+    pub doc_map: DocMap<'src>,
 }
 
 impl fmt::Display for Span {
@@ -1172,14 +1236,10 @@ where
     Self::Item: AsRef<str>,
 {
     fn join_exact(self, sep: &str) -> String {
-        let (total_len, count) = self
-            .clone()
-            .fold((0usize, 0usize), |(len, n), s| {
-                (len + s.as_ref().len(), n + 1)
-            });
-        let capacity = total_len.saturating_add(
-            sep.len().saturating_mul(count.saturating_sub(1)),
-        );
+        let (total_len, count) = self.clone().fold((0usize, 0usize), |(len, n), s| {
+            (len + s.as_ref().len(), n + 1)
+        });
+        let capacity = total_len.saturating_add(sep.len().saturating_mul(count.saturating_sub(1)));
         let mut out = String::with_capacity(capacity);
         for (i, s) in self.enumerate() {
             if i > 0 {

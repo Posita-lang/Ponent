@@ -11,6 +11,7 @@
 //! infrastructure for any flow-sensitive pass (borrow-check liveness,
 //! reachability, dead-code, comptime analysis).
 
+use crate::ast::FileId;
 use crate::ast::UnaryOp;
 use crate::diagnostics::Diagnostic;
 use crate::hir::hir::{HirExpr, HirStmt};
@@ -1259,8 +1260,8 @@ fn collect_read_places_in_write_target<'input>(expr: &HirExpr<'input>, out: &mut
 // ────────────────────────────────────────────────────────────────────────
 // Flow-sensitive borrow-check post-pass (the CFG consumer).
 //
-// Loans die at their borrow variable's LAST USE (committee ruling
-// 2026-08-05): a loan (source place S, borrow variable B) is live at a
+// Loans die at their borrow variable's LAST USE: a loan (source place S,
+// borrow variable B) is live at a
 // block iff B is live there (a use of B is reachable).  Temporary
 // borrows (in-expression, not bound) are live only in their own block.
 // This replaces the block-scoped interleaved approximation.
@@ -3050,13 +3051,13 @@ impl<'input> CfgBuilder<'input> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::hir::checker::tests::check_source;
 
     /// Extract the body of the FIRST function in the program.
-    fn first_body(src: &str) -> Vec<HirStmt<'static>> {
+    fn first_body(src: &'static str) -> Vec<HirStmt<'static>> {
         let prog = check_source(src).expect("program must check");
         let item = &prog.items[0];
         let HirStmt::FunctionDef { body, .. } = item else {
@@ -3076,7 +3077,7 @@ mod tests {
         // non-empty for `attach_finally` to engage).
         let fin_body = vec![HirStmt::Edition(
             "finally".to_string(),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         )];
         let mut builder = CfgBuilder::new();
         let ret_blk = builder.new_block();

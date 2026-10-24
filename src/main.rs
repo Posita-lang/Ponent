@@ -12,6 +12,8 @@
     clippy::large_enum_variant
 )]
 
+pub use smallvec;
+
 mod arena;
 mod ast;
 mod cli;
@@ -26,7 +28,7 @@ mod hir {
     pub mod generate;
     pub mod hir;
     pub mod infer;
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "shuttle")))]
     mod infer_tests;
     pub mod loop_infer;
     pub(crate) mod loop_ir;
@@ -49,11 +51,16 @@ mod hir {
     pub mod anya;
 }
 mod lexer;
+mod loader;
+mod mir;
 mod parser;
 mod sat;
 mod session;
 mod sexp_ext;
+mod source_map;
+mod sourcemap;
 mod symbol;
+mod sync;
 mod vfs;
 
 use mimalloc::MiMalloc;
@@ -62,13 +69,14 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 use clap::Parser;
-use diagnostics::{ColoredEmitter, DiagCtxt, Diagnostic, DiagnosticEmitter, JsonEmitter};
+use diagnostics::{ColorChoice, DiagCtxt, DiagOpts, Diagnostic, Emitter, HumanRenderer, JsonRenderer, OutputFormat, sink};
 use hir::checker::TypeChecker;
 use hir::resolver::NameResolver;
 use hir::types::{CrateId, DefId, TypeContext};
 use logos::Logos;
 use session::CompilerSession;
 use std::fs;
+use std::io::{IsTerminal, Write as _};
 use std::process;
 
 /// Attach source text to all diagnostics in a slice so the emitter can
@@ -86,16 +94,8 @@ fn attach_source_to_diags<'src>(
             diag.set_source(Some(source));
         }
         if diag.file_name() == "<input>" {
-            diag.set_file_name(file_name.to_string());
+            diag.set_file_name(file_name);
         }
-    }
-}
-
-fn make_emitter(json: bool) -> Box<dyn DiagnosticEmitter> {
-    if json {
-        Box::new(JsonEmitter::new_compact())
-    } else {
-        Box::new(ColoredEmitter::new())
     }
 }
 
@@ -104,12 +104,13 @@ fn make_emitter(json: bool) -> Box<dyn DiagnosticEmitter> {
 /// function so each phase's `&mut ctx` borrow is scoped sequentially.
 fn resolve_and_expand<'src, 'input>(
     ctx: &mut TypeContext<'input>,
-    program: ast::Program<'input>,
+    program: ast::Program<'input, 'src>,
     local_crate_id: CrateId,
     source: &'src str,
     file_name: &str,
+    enable_experimental: bool,
 ) -> (
-    ast::Program<'input>,
+    ast::Program<'input, 'src>,
     hir::symbol::SymbolTable<'input>,
     hir::traits::TraitEnv<'input>,
     Vec<Diagnostic<'src>>,
@@ -125,7 +126,7 @@ fn resolve_and_expand<'src, 'input>(
     };
     // Name resolution (the resolver's `&mut ctx` borrow ends here).
     let (symbols, trait_env, resolver_diags, resolution_map) = {
-        let mut resolver = NameResolver::new(ctx, local_crate_id, Some(source));
+        let mut resolver = NameResolver::new(ctx, local_crate_id, Some(source), enable_experimental);
         resolver.resolve_program(&program)
     };
     let mut all_diags = resolver_diags.into_inner();
@@ -140,7 +141,7 @@ fn resolve_and_expand<'src, 'input>(
     };
     // Incremental resolution for newly expanded items.
     let (symbols, trait_env, resolver_diags, resolution_map) = if !new_items.is_empty() {
-        let mut resolver = NameResolver::new(ctx, local_crate_id, Some(source));
+        let mut resolver = NameResolver::new(ctx, local_crate_id, Some(source), enable_experimental);
         resolver.resolve_incremental(&new_items, symbols, trait_env, resolution_map)
     } else {
         (symbols, trait_env, DiagCtxt::new(), resolution_map)
@@ -207,13 +208,16 @@ struct CompilerOptions {
 }
 
 fn main() {
-    // One arena for the whole process, leaked so `'input` is `'static` and
-    // lowered HIR can be a query value.  See `crate::arena::leaked`.  Every
-    // allocation goes through the `SyncArena` (never the bare `&Bump`), so
-    // the arena's allocation lock is always respected.
-    let (_bump, session_sync_arena) = crate::arena::leaked();
+    // The parse arena lives only for this `main` call — nothing borrows it
+    // past process exit, so there is no reason to leak it, and `'input` is a
+    // plain local lifetime rather than `'static`.  Every allocation goes
+    // through the `SyncArena` (never the bare `&Bump`), so the arena's
+    // allocation lock is always respected.
+    let bump = bumpalo::Bump::new();
+    let session_sync_arena = crate::arena::SyncArena::new(&bump);
 
     let cli = cli::Cli::parse();
+    let color_choice = ColorChoice::from_str(&cli.color);
     let opts = CompilerOptions {
         target: cli.target,
         strict: cli.strict,
@@ -226,25 +230,26 @@ fn main() {
     // `process::exit` from a rayon worker would tear down the whole batch.
     // The single process exit lives at the end of `main`.
     let code = match cli.command {
-        cli::Command::Lex { file } => report(run_lex(&file), false),
+        cli::Command::Lex { file } => report(run_lex(&file), false, color_choice),
         cli::Command::Parse { file, ast, json } => {
-            let code = report(run_parse(&file, ast, &opts, session_sync_arena), json);
+            let code = report(run_parse(&file, ast, &opts, &session_sync_arena), json, color_choice);
             if code == 0 && !ast {
                 println!("Type checking succeeded.");
             }
             code
         }
         cli::Command::Check { file, json } => {
-            let code = report(run_check(&file, &opts, session_sync_arena), json);
+            let code = report(run_check(&file, &opts, &session_sync_arena), json, color_choice);
             if code == 0 {
                 println!("Type checking succeeded.");
             }
             code
         }
         cli::Command::Explain { code } => {
-            run_explain(code);
+            run_explain(code, color_choice);
             0
         }
+        cli::Command::Mir { file, json } => report(run_mir(&file, &opts, &session_sync_arena), json, color_choice),
     };
     if code != 0 {
         process::exit(code);
@@ -253,13 +258,25 @@ fn main() {
 
 /// Render a handler's diagnostics and return the process exit code: `1` when
 /// any diagnostic is an error, `0` otherwise (warnings alone do not fail).
-fn report(outcome: Result<(), Vec<Diagnostic<'static>>>, json: bool) -> i32 {
-    let diags = match outcome {
+fn report<'a>(outcome: Result<(), Vec<Diagnostic<'a>>>, json: bool, color: ColorChoice) -> i32 {
+    let mut diags = match outcome {
         Ok(()) => return 0,
         Err(diags) => diags,
     };
-    let mut emitter = make_emitter(json);
-    emitter.emit_all(&diags);
+    let mut opts = DiagOpts::detect();
+    opts.use_color = color.resolve();
+    match OutputFormat::from_json_flag(json) {
+        OutputFormat::Json => {
+            let mut emitter = Emitter::new(JsonRenderer::new_compact(), sink::stderr(), opts);
+            let _ = emitter.emit_all(&mut diags);
+        }
+        OutputFormat::Human => {
+            let use_color = opts.use_color;
+            let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
+            let mut emitter = Emitter::new(renderer, sink::stderr(), opts);
+            let _ = emitter.emit_all(&mut diags);
+        }
+    }
     i32::from(diags.iter().any(|d| d.is_error()))
 }
 
@@ -291,23 +308,31 @@ fn run_lex(file: &str) -> Result<(), Vec<Diagnostic<'static>>> {
 ///
 /// Returns the diagnostics to render; never calls `process::exit`, so it is
 /// safe to invoke from a rayon worker.
-fn run_parse(
+fn run_parse<'a>(
     file: &str,
     ast: bool,
     opts: &CompilerOptions,
-    sync_arena: &'static arena::SyncArena<'static>,
-) -> Result<(), Vec<Diagnostic<'static>>> {
+    sync_arena: &'a arena::SyncArena<'a>,
+) -> Result<(), Vec<Diagnostic<'a>>> {
     let source = fs::read_to_string(file).map_err(|e| {
         vec![Diagnostic::error(format!(
             "failed to read `{}`: {}",
             file, e
         ))]
     })?;
-    // Copy the source into the leaked arena so the diagnostics that borrow it
-    // can outlive this call and be rendered by `main`.
-    let source: &'static str = sync_arena.alloc_str(&source);
+    // Register the file with a SourceMap so every span carries a real
+    // FileId, then copy the source into the leaked arena so the diagnostics
+    // that borrow it can outlive this call and be rendered by `main`.
+    let mut source_map = sourcemap::SourceMap::new();
+    let file_id = source_map.add_file(file, source).map_err(|e| {
+        vec![Diagnostic::error(format!(
+            "failed to register `{}`: {}",
+            file, e
+        ))]
+    })?;
+    let source: &'a str = sync_arena.alloc_str(source_map.file(file_id).source());
 
-    let mut parser = parser::Parser::new(source, sync_arena);
+    let mut parser = parser::Parser::new(source, file_id, sync_arena);
     let program = match parser.parse_program() {
         Ok(p) => p,
         Err(mut diagnostics) => {
@@ -335,7 +360,14 @@ fn run_parse(
     // so each phase's `&mut ctx` borrow is scoped (the helper takes `ctx`
     // once and the phases reborrow it sequentially).
     let (program, symbols, trait_env, mut all_diags, resolution_map) =
-        resolve_and_expand(&mut ctx, program, local_crate_id, source, file);
+        resolve_and_expand(
+            &mut ctx,
+            program,
+            local_crate_id,
+            source,
+            file,
+            opts.enable_experimental,
+        );
     attach_source_to_diags(&mut all_diags, source, file);
 
     // From here the session owns the pipeline state, so a query can be handed
@@ -390,20 +422,27 @@ fn run_parse(
 }
 
 /// Parse, resolve, and type-check a file.  Never calls `process::exit`.
-fn run_check(
+fn run_check<'a>(
     file: &str,
     opts: &CompilerOptions,
-    sync_arena: &'static arena::SyncArena<'static>,
-) -> Result<(), Vec<Diagnostic<'static>>> {
+    sync_arena: &'a arena::SyncArena<'a>,
+) -> Result<(), Vec<Diagnostic<'a>>> {
     let source = fs::read_to_string(file).map_err(|e| {
         vec![Diagnostic::error(format!(
             "failed to read `{}`: {}",
             file, e
         ))]
     })?;
-    let source: &'static str = sync_arena.alloc_str(&source);
+    let mut source_map = sourcemap::SourceMap::new();
+    let file_id = source_map.add_file(file, source).map_err(|e| {
+        vec![Diagnostic::error(format!(
+            "failed to register `{}`: {}",
+            file, e
+        ))]
+    })?;
+    let source: &'a str = sync_arena.alloc_str(source_map.file(file_id).source());
 
-    let mut parser = parser::Parser::new(source, sync_arena);
+    let mut parser = parser::Parser::new(source, file_id, sync_arena);
     let program = match parser.parse_program() {
         Ok(p) => p,
         Err(mut diagnostics) => {
@@ -418,7 +457,7 @@ fn run_check(
     let mut ctx = TypeContext::new_with_target(target.clone());
     ctx.arena = Some(sync_arena);
     let local_crate_id = CrateId(DefId(0));
-    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, Some(source));
+    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, Some(source), opts.enable_experimental);
     let (symbols, trait_env, resolver_diags, resolution_map) = resolver.resolve_program(&program);
     let mut all_diags = resolver_diags.into_inner();
     attach_source_to_diags(&mut all_diags, source, file);
@@ -457,21 +496,108 @@ fn run_check(
     }
 }
 
+fn run_mir<'a>(
+    file: &str,
+    opts: &CompilerOptions,
+    sync_arena: &'a arena::SyncArena<'a>,
+) -> Result<(), Vec<Diagnostic<'a>>> {
+    let source = fs::read_to_string(file).map_err(|e| {
+        vec![Diagnostic::error(format!(
+            "failed to read `{}`: {}",
+            file, e
+        ))]
+    })?;
+    let mut source_map = sourcemap::SourceMap::new();
+    let file_id = source_map.add_file(file, source).map_err(|e| {
+        vec![Diagnostic::error(format!(
+            "failed to register `{}`: {}",
+            file, e
+        ))]
+    })?;
+    let source: &'a str = sync_arena.alloc_str(source_map.file(file_id).source());
+
+    let mut parser = parser::Parser::new(source, file_id, sync_arena);
+    let program = match parser.parse_program() {
+        Ok(p) => p,
+        Err(mut diagnostics) => {
+            attach_source_to_diags(&mut diagnostics, source, file);
+            return Err(diagnostics);
+        }
+    };
+    let target = match resolve_target(&opts.target) {
+        Ok(t) => t,
+        Err(msg) => return Err(vec![Diagnostic::error(msg)]),
+    };
+    let mut ctx = TypeContext::new_with_target(target.clone());
+    ctx.arena = Some(sync_arena);
+    let local_crate_id = CrateId(DefId(0));
+    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, Some(source), opts.enable_experimental);
+    let (symbols, trait_env, resolver_diags, resolution_map) = resolver.resolve_program(&program);
+    let mut all_diags = resolver_diags.into_inner();
+    attach_source_to_diags(&mut all_diags, source, file);
+
+    let mut session = CompilerSession::new(ctx, symbols, trait_env, resolution_map, target);
+
+    let mut checker = TypeChecker::new_with_source(
+        &mut session.ctx,
+        &session.symbols,
+        &mut session.trait_env,
+        session.resolution_map.clone(),
+        opts.strict,
+        opts.enable_experimental,
+        opts.feature.clone(),
+        opts.debug,
+        Some(source),
+    );
+    let checker_result = checker.check_program(&program);
+    let mut checker_diag_vec = checker.take_diagnostics().into_inner();
+    attach_source_to_diags(&mut checker_diag_vec, source, file);
+    match checker_result {
+        Ok(hir_program) => {
+            let mut diags = checker_diag_vec;
+            diags.extend(all_diags);
+            if diags.iter().any(|d| d.is_error()) {
+                return Err(diags);
+            }
+            for item in &hir_program.items {
+                if matches!(item, hir::hir::HirStmt::FunctionDef { .. }) {
+                    println!("{}", mir::build::lower_function(item).pretty());
+                }
+            }
+            if diags.is_empty() { Ok(()) } else { Err(diags) }
+        }
+        Err(errors) => {
+            let mut diags = errors.into_inner();
+            attach_source_to_diags(&mut diags, source, file);
+            diags.extend(checker_diag_vec);
+            diags.extend(all_diags);
+            Err(diags)
+        }
+    }
+}
+
 /// Show an error-code explanation (blocking while the explain server runs).
-fn run_explain(code: Option<String>) {
+fn run_explain(code: Option<String>, color: ColorChoice) {
     match code {
         Some(code) => {
+            let use_color = color.resolve();
             // Start the local explain server on a random port.
             let listener =
                 std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind explain server");
             let port = listener.local_addr().unwrap().port();
-            diagnostics::error_code::set_explain_port(port);
+            // Called once per process; a re-set would be a bug, so surface it.
+            if let Err(previous) = diagnostics::error_code::set_explain_port(port) {
+                eprintln!("warning: explain port already set to {previous}, ignoring {port}");
+            }
 
-            let explanation = diagnostics::explain_error_code(&code);
+            let explanation = diagnostics::explain_error_code(&code, use_color);
             println!("{}", explanation);
 
             let explain_code = code.clone();
-            let url = format!("http://127.0.0.1:{port}/{explain_code}");
+            // The code is untrusted CLI input; `explain_server_url` encodes it
+            // as a single path segment so it cannot escape the path or smuggle
+            // control bytes into the URL handed to the browser.
+            let url = diagnostics::error_code::explain_server_url(port, &explain_code);
             // Open the browser in a background thread so the server can
             // accept connections.
             let url_bg = url.clone();
@@ -479,12 +605,25 @@ fn run_explain(code: Option<String>) {
                 let _ = open_browser(&url_bg);
             });
 
+            // Spin a one-line ASCII spinner on stderr while the server waits
+            // for the browser to connect (~2 s), so the terminal does not
+            // look frozen.  Only when stderr is a real terminal: a pipe or
+            // log file must never receive cursor-movement control bytes.
+            let spinner = if std::io::stderr().is_terminal() {
+                Some(spawn_explain_spinner(&url, &explain_code))
+            } else {
+                None
+            };
+
             // Serve the explain page using the already-bound listener.
-            diagnostics::explain_server::serve_explain(&listener, &explain_code).unwrap_or_else(
-                |e| {
-                    eprintln!("warning: explain server error: {e}");
-                },
-            );
+            let served =
+                diagnostics::explain_server::serve_explain(&listener, &explain_code);
+            if let Some((handle, stop)) = spinner {
+                stop_explain_spinner(handle, &stop);
+            }
+            served.unwrap_or_else(|e| {
+                eprintln!("warning: explain server error: {e}");
+            });
         }
         None => {
             print!("{}", diagnostics::list_error_codes());
@@ -493,6 +632,62 @@ fn run_explain(code: Option<String>) {
 }
 
 /// Open a URL in the user's default browser.
+
+/// Animate a one-line spinner on stderr while the explain server waits for
+/// the browser to connect, e.g.
+///
+/// ```text
+/// ⠋ opening E030 explanation on http://127.0.0.1:41234/explain/E030 …
+/// ```
+///
+/// The URL is wrapped in an OSC 8 hyperlink so terminals that support it
+/// make it clickable.  Frames are redrawn in place with a carriage return;
+/// the caller stops the thread via [`stop_explain_spinner`], which clears
+/// the line so the explanation text that follows stands alone.  Callers
+/// must gate spawning on stderr being a terminal.
+fn spawn_explain_spinner(
+    url: &str,
+    code: &str,
+) -> (std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
+
+    // OSC 8 hyperlink: ST (`ESC \`) terminator, not BEL — the diagnostics
+    // layer's sanitizer rules out BEL for good reason, and ST is the
+    // better-supported form anyway.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_bg = stop.clone();
+    let url = url.to_string();
+    let code = code.to_string();
+    let handle = std::thread::spawn(move || {
+        let mut stderr = std::io::stderr().lock();
+        for frame in FRAMES.iter().cycle() {
+            if stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let _ = write!(
+                stderr,
+                "\r{frame} opening {code} explanation on \
+                 \x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\ …\x1b[K"
+            );
+            let _ = stderr.flush();
+            std::thread::sleep(FRAME_INTERVAL);
+        }
+    });
+    (handle, stop)
+}
+
+/// Stop the spinner thread and erase its line from the terminal.
+fn stop_explain_spinner(handle: std::thread::JoinHandle<()>, stop: &std::sync::atomic::AtomicBool) {
+    // The thread checks the flag every frame (~80 ms), so the join below
+    // cannot block meaningfully.
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = handle.join();
+    let mut stderr = std::io::stderr().lock();
+    let _ = write!(stderr, "\r\x1b[2K");
+    let _ = stderr.flush();
+}
+
 #[cfg(target_os = "linux")]
 fn open_browser(url: &str) -> std::io::Result<()> {
     std::process::Command::new("xdg-open").arg(url).spawn()?;

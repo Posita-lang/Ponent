@@ -11,20 +11,24 @@ impl<'src, 'input> Parser<'src, 'input> {
     /// loop parses directly as an expression without any type-first attempt.
     /// Analogous to rustc's `can_begin_const_arg`/`check_const_arg`.
     pub(super) fn check_const_arg(&mut self) -> bool {
-        match self.peek() {
+        if matches!(
+            self.peek(),
             Ok(Token::True)
-            | Ok(Token::False)
-            | Ok(Token::CharLiteral(_))
-            | Ok(Token::StringLiteral(_))
-            | Ok(Token::ByteStringLiteral(_))
-            | Ok(Token::FloatLiteral(_))
-            | Ok(Token::Minus)
-            | Ok(Token::LBrace)
-            | Ok(Token::If)
-            | Ok(Token::Match) => true,
-            Ok(Token::Ident(_)) => matches!(self.peek_next(), Some(Token::LParen)),
-            _ => false,
+                | Ok(Token::False)
+                | Ok(Token::CharLiteral(_))
+                | Ok(Token::ByteCharLiteral(_))
+                | Ok(Token::StringLiteral(_))
+                | Ok(Token::ByteStringLiteral(_))
+                | Ok(Token::FloatLiteral(_))
+                | Ok(Token::Minus)
+                | Ok(Token::LBrace)
+                | Ok(Token::If)
+                | Ok(Token::Match)
+        ) {
+            return true;
         }
+        matches!(self.peek(), Ok(Token::Ident(_)))
+            && matches!(self.peek_next(), Some(Token::LParen))
     }
 
     /// Parse a const generic argument (value side), e.g. `<{ 2 + 2 }>`, `<N>`, or `{ 42 }`.
@@ -32,17 +36,17 @@ impl<'src, 'input> Parser<'src, 'input> {
     /// Per the Posita syntax spec: complex expressions MUST be wrapped in `{ }`;
     /// only simple literals and identifier paths may appear unbraced.
     /// Analogous to rustc's `parse_const_arg` (rustc_parse/src/parser/path.rs).
-    pub(super) fn parse_const_arg(&mut self) -> Result<AnonConst<'input>, Diagnostic<'src>> {
+    pub(super) fn parse_const_arg(&mut self, bump: &'input bumpalo::Bump) -> Result<AnonConst<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         let value = if matches!(self.peek(), Ok(Token::LBrace)) {
             self.advance().ok();
-            let body = self.parse_block()?;
+            let body = self.parse_block(bump)?;
             self.expect(Token::RBrace)?;
             let end = self.span().end;
-            Expr::Block(body, Span::new(start, end))
+            Expr::Block(body, Span::new(self.file_id, start, end))
         } else {
             let expr =
-                self.with_restrictions(ParseRestrictions::NO_COMPARISON, |this| this.parse_expr())?;
+                self.with_restrictions(ParseRestrictions::NO_COMPARISON, |this| this.parse_expr(bump))?;
             if !Self::is_simple_const_expr(&expr) {
                 let span = expr.span();
                 let end = self.span().end;
@@ -54,14 +58,14 @@ impl<'src, 'input> Parser<'src, 'input> {
                     "wrap the expression in braces — e.g. `<{ N + 1 }>` instead of `<N + 1>`",
                 )
                 .with_suggestion("add `{` before and `}` after the expression")
-                .with_span(Span::new(start, end)));
+                .with_span(Span::new(self.file_id, start, end)));
             }
             expr
         };
         let end = self.span().end;
         Ok(AnonConst {
-            value: Self::alloc_shared(self.arena, value),
-            span: Span::new(start, end),
+            value: Self::alloc_shared(bump, value),
+            span: Span::new(self.file_id, start, end),
         })
     }
 

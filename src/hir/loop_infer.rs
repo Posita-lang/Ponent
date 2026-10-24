@@ -5,10 +5,10 @@
 //! `LoopInstr` is the per-iteration intermediate representation; the
 //! checker translates a HIR loop into it and the widened fixpoint
 //! (`dbm_fixpoint`) converges to the loop-invariant CANDIDATE (a sound
-//! over-approximation). Per the 2026-08-13 committee ruling the
-//! candidates are only `@hint`s for the SMT solver — never a discharge by
-//! themselves.
+//! over-approximation). The candidates are only `@hint`s for the SMT
+//! solver — never a discharge by themselves.
 
+use crate::ast::FileId;
 use crate::hir::loop_ir::Cond;
 use crate::hir::octagon::{ClosureMode, DBM_INF, Dbm, DbmThresholds, sat_neg};
 use crate::symbol::Symbol;
@@ -342,8 +342,8 @@ fn apply_type_bounds(m: &mut Dbm, bounds: &[(Option<i128>, Option<i128>)]) -> bo
 /// the initial state and loop-body instructions drive the widened fixpoint,
 /// and the converged matrix is turned into invariant candidate expressions.
 /// The checker translates a HIR loop to `LoopInstr`s and submits the result
-/// as a `@hint` (committee 2026-08-13: the candidates never discharge
-/// obligations by themselves — the SMT solver stays the authority).
+/// as a `@hint` (the candidates never discharge obligations by
+/// themselves — the SMT solver stays the authority).
 /// Guards (`TestLe`/`TestDiffLe`) are part of the body: the fixpoint absorbs
 /// them, so the guard bound is NOT reported as an invariant (it only holds
 /// inside the loop).
@@ -493,7 +493,7 @@ pub(crate) fn infer_loop_decreases_expr<'a>(
         let ub_expr: &'a crate::ast::Expr<'a> = match instrs.first()? {
             LoopInstr::TestLe(j, ub) if *j == i => arena.alloc(crate::ast::Expr::Literal(
                 crate::ast::Literal::Int(crate::ast::IntLit::Small(*ub)),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
             // `i <= j` (`TestDiffLe(i, j, 0)`) and `i < j` (`TestDiffLe(i, j,
             // -1)`, translated as `i - j <= -1`) both give the decreasing
@@ -501,19 +501,19 @@ pub(crate) fn infer_loop_decreases_expr<'a>(
             // guard holds and strictly decreases by `c` each iteration.
             LoopInstr::TestDiffLe(j, k, _) if *j == i => arena.alloc(crate::ast::Expr::Ident(
                 vars[*k],
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
             _ => return None,
         };
         let i_expr = arena.alloc(crate::ast::Expr::Ident(
             vars[i],
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         return Some(arena.alloc(crate::ast::Expr::BinaryOp {
             left: ub_expr,
             op: crate::ast::BinOp::Sub,
             right: i_expr,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         }));
     }
 
@@ -525,29 +525,29 @@ pub(crate) fn infer_loop_decreases_expr<'a>(
         let lb_expr: &'a crate::ast::Expr<'a> = match instrs.first()? {
             LoopInstr::TestGe(j, lb) if *j == i => arena.alloc(crate::ast::Expr::Literal(
                 crate::ast::Literal::Int(crate::ast::IntLit::Small(*lb)),
-                crate::ast::Span::new(0, 0),
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
             )),
             _ => return None,
         };
         let i_expr = arena.alloc(crate::ast::Expr::Ident(
             vars[i],
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let diff = arena.alloc(crate::ast::Expr::BinaryOp {
             left: i_expr,
             op: crate::ast::BinOp::Sub,
             right: lb_expr,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         });
         let one = arena.alloc(crate::ast::Expr::Literal(
             crate::ast::Literal::Int(crate::ast::IntLit::Small(1)),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         return Some(arena.alloc(crate::ast::Expr::BinaryOp {
             left: diff,
             op: crate::ast::BinOp::Add,
             right: one,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         }));
     }
     None
@@ -1228,9 +1228,8 @@ where
 /// comparison expression (`X ≤ c`, `X ≥ c`, `X − Y ≤ c`, `X + Y ≤ c`), so
 /// the result is the loop-invariant candidate list. Only the tightest
 /// bounds survive the closure, so redundant facts are already eliminated.
-/// The candidate is a sound over-approximation — per the 2026-08-13
-/// ruling it is only a `@hint` for the SMT solver, never a discharge by
-/// itself.
+/// The candidate is a sound over-approximation — it is only a `@hint`
+/// for the SMT solver, never a discharge by itself.
 ///
 /// 2N node numbering (paper §IV.C): `Xᵢ⁺ = 2i`, `Xᵢ⁻ = 2i+1` — there is
 /// NO implicit zero node. Single-variable bounds ride the SELF-DUAL
@@ -1284,12 +1283,12 @@ pub(crate) fn dbm_to_invariant_exprs<'a>(
         return Vec::new();
     }
     let ident = |s: Symbol| -> &'a crate::ast::Expr<'a> {
-        arena.alloc(crate::ast::Expr::Ident(s, crate::ast::Span::new(0, 0)))
+        arena.alloc(crate::ast::Expr::Ident(s, crate::ast::Span::new(FileId::DUMMY, 0, 0)))
     };
     let lit = |c: i128| -> &'a crate::ast::Expr<'a> {
         arena.alloc(crate::ast::Expr::Literal(
             crate::ast::Literal::Int(crate::ast::IntLit::Small(c)),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ))
     };
     let bin = |op: crate::ast::BinOp,
@@ -1300,7 +1299,7 @@ pub(crate) fn dbm_to_invariant_exprs<'a>(
             left: l,
             op,
             right: r,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     };
     // Decode a node into its ±X form: even `2i` ⟹ `+Xᵢ`; odd `2i+1` ⟹
@@ -1380,7 +1379,7 @@ pub(crate) fn dbm_to_invariant_exprs<'a>(
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::hir::type_eq::expr_eq_ignoring_spans;
@@ -1396,7 +1395,7 @@ mod tests {
 
         let mut ctx = TypeContext::new();
         let ty = ctx.int(8, true);
-        let span = crate::ast::Span::new(0, 0);
+        let span = crate::ast::Span::new(FileId::DUMMY, 0, 0);
         let i = Symbol::intern("i");
 
         // `i < 255`
@@ -1632,7 +1631,7 @@ mod tests {
         use crate::hir::loop_ir::{CmpOp, Cond, ScalarExpr};
 
         let ty = crate::hir::types::TypeContext::new().int(8, true);
-        let span = crate::ast::Span::new(0, 0);
+        let span = crate::ast::Span::new(FileId::DUMMY, 0, 0);
         let i = Symbol::intern("i");
         let idx = |s: Symbol| (s == i).then_some(0usize);
         let ident = || HirExpr::Ident(i, ty, span);
@@ -1690,7 +1689,7 @@ mod tests {
         use crate::hir::loop_ir::Cond;
 
         let ty = crate::hir::types::TypeContext::new().int(8, true);
-        let span = crate::ast::Span::new(0, 0);
+        let span = crate::ast::Span::new(FileId::DUMMY, 0, 0);
         let (i, j) = (Symbol::intern("i"), Symbol::intern("j"));
         let idx = |s: Symbol| match s {
             _ if s == i => Some(0usize),
@@ -1753,17 +1752,17 @@ mod tests {
         );
         let i = bump.alloc(crate::ast::Expr::Ident(
             Symbol::intern("i"),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let zero = bump.alloc(crate::ast::Expr::Literal(
             crate::ast::Literal::Int(crate::ast::IntLit::Small(0)),
-            crate::ast::Span::new(0, 0),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ));
         let ge0 = bump.alloc(crate::ast::Expr::BinaryOp {
             left: i,
             op: crate::ast::BinOp::Ge,
             right: zero,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         });
         assert!(
             exprs.iter().any(|e| expr_eq_ignoring_spans(e, ge0)),

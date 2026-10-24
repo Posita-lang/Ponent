@@ -559,12 +559,12 @@ impl<'input> HirStmt<'input> {
             HirStmt::LayoutDef { span, .. } => *span,
             HirStmt::Generate { span, .. } => *span,
             HirStmt::Stripped { span, .. } => *span,
-            HirStmt::Error => Span::new(0, 0),
+            HirStmt::Error => Span::new(FileId::DUMMY, 0, 0),
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod send_audit {
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
@@ -587,7 +587,7 @@ mod send_audit {
     #[test]
     fn pass3_worker_inputs_are_sync() {
         assert_sync::<crate::hir::symbol::SymbolTable<'static>>();
-        assert_sync::<crate::ast::Program<'static>>();
+        assert_sync::<crate::ast::Program<'static, 'static>>();
         assert_sync::<crate::hir::traits::TraitEnv<'static>>();
         assert_sync::<crate::hir::checker::SharedCheckState<'static>>();
         assert_sync::<crate::hir::resolver::ResolutionMap<'static>>();

@@ -1,3 +1,4 @@
+use crate::ast::FileId;
 use crate::ast::Span;
 use crate::hir::traits::ImplCandidate;
 use crate::hir::types::{TypeContext, TypeData, TypeId};
@@ -679,7 +680,7 @@ pub fn check_inherent_overlap<'input>(
             return Some(OverlapConflict {
                 existing_idx,
                 existing_span: existing.span,
-                new_span: Span::new(0, 0), // caller should fill this
+                new_span: Span::new(FileId::DUMMY, 0, 0), // caller should fill this
                 kind: OverlapKind::DirectOverlap,
             });
         }

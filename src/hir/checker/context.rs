@@ -1,3 +1,4 @@
+use crate::ast::FileId;
 use std::mem;
 
 use super::region::RegionTree;
@@ -148,7 +149,7 @@ impl<'a, 'src, 'input> TypeChecker<'a, 'src, 'input> {
         // ── Solve ───────────────────────────────────────────────────
         if let Err(err) = current.solve(self.ctx, self.trait_env, self.symbols) {
             let diag = Diagnostic::error(format!("type inference error: {:?}", err))
-                .with_span(Span::new(0, 0));
+                .with_span(Span::new(FileId::DUMMY, 0, 0));
             self.diagnostics.push(diag);
             return Err(self.take_diagnostics());
         }
@@ -158,11 +159,11 @@ impl<'a, 'src, 'input> TypeChecker<'a, 'src, 'input> {
         let unresolved = current.check_unresolved(self.ctx);
         let has_errors = !unresolved.is_empty();
         if has_errors {
-            for msg in &unresolved {
+            for msg in unresolved {
                 self.diagnostics.push(
                     Diagnostic::error(msg)
                         .with_code_str("E030")
-                        .with_span(Span::new(0, 0)), // no span available from check_unresolved
+                        .with_span(Span::new(FileId::DUMMY, 0, 0)), // no span available from check_unresolved
                 );
             }
             return Err(self.take_diagnostics());

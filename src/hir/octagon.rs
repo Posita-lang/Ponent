@@ -1751,17 +1751,26 @@ impl Dbm {
     ///
     /// (Internal `close()` is `Strong`.)
     pub(crate) fn assign_copy_add_var(&self, i: usize, j: usize, c: i128) -> Dbm {
-        debug_assert!(
-            self.closed,
-            "assign_copy_add_var requires strongly closed input for precision — \
-             re-close the operand first (widen output is deliberately unclosed)"
-        );
         if i == j {
             // X := X + c is an additive shift, not a copy.
             return self.assign_add_var(i, c);
         }
         if self.bottom {
             return Dbm::bottom();
+        }
+        // Repair path (was a bare debug_assert): `dbm_fixpoint`
+        // deliberately keeps its widening-chain left operand unclosed
+        // ([Miné06] §VI.D / Figure 10), and an `i := j` as the first
+        // effective body instruction applies this transfer to that
+        // unclosed state. Close a COPY first so the retained entries
+        // carry the documented (m⁺)• guarantee; the recursion is
+        // one-deep because the clone is closed.
+        if !self.closed {
+            let mut closed = self.clone();
+            if !closed.close() {
+                return Dbm::bottom();
+            }
+            return closed.assign_copy_add_var(i, j, c);
         }
         self.check_var(i);
         self.check_var(j);
@@ -2142,7 +2151,7 @@ impl DbmThresholds {
 // ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
 // Tests
 // ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
 

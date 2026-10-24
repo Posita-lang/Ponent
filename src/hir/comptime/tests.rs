@@ -1,3 +1,4 @@
+use crate::ast::FileId;
 use super::*;
 use crate::ast::{self, BinOp, Literal, Span, VariableKind};
 use crate::hir::hir::{HirExpr, HirMatchArm, HirParam, HirPattern, HirStmt};
@@ -5,7 +6,7 @@ use crate::hir::types::{TypeContext, TypeId};
 use crate::symbol::Symbol;
 
 fn make_int_val<'input>(n: i128, ty: TypeId) -> HirExpr<'input> {
-    HirExpr::Literal(Literal::Int(ast::IntLit::Small(n)), ty, Span::new(0, 0))
+    HirExpr::Literal(Literal::Int(ast::IntLit::Small(n)), ty, Span::new(FileId::DUMMY, 0, 0))
 }
 
 fn make_int<'input>(n: i128) -> HirExpr<'input> {
@@ -36,7 +37,7 @@ fn get_var<'a, 'src, 'input>(
 }
 
 fn make_bool<'input>(b: bool) -> HirExpr<'input> {
-    HirExpr::Literal(Literal::Bool(b), TypeId::NONE, Span::new(0, 0))
+    HirExpr::Literal(Literal::Bool(b), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))
 }
 
 fn make_binop_ty<'input>(
@@ -50,7 +51,7 @@ fn make_binop_ty<'input>(
         op,
         right: Box::new(r),
         ty,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     }
 }
 
@@ -78,7 +79,7 @@ fn make_binop32<'input>(
 fn make_block<'input>(stmts: Vec<HirStmt<'input>>, last: HirExpr<'input>) -> HirExpr<'input> {
     let mut all = stmts;
     all.push(HirStmt::Expression(Box::new(last)));
-    HirExpr::Block(all, TypeId::NONE, Span::new(0, 0))
+    HirExpr::Block(all, TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))
 }
 
 fn make_if<'input>(
@@ -94,7 +95,7 @@ fn make_if<'input>(
         else_branch: else_block,
         is_expression: true,
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     }
 }
 
@@ -264,7 +265,7 @@ fn test_eval_variable_def() {
         ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_block(&[block]);
     assert!(matches!(r, Ok(ComptimeValue::Int(42))));
@@ -283,10 +284,10 @@ fn test_eval_variable_assign() {
     ec.memory_used = ComptimeValue::Int(10).memory_size();
 
     let assign = HirStmt::Assign {
-        target: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
+        target: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
         value: Box::new(make_int(20)),
         op: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_block(&[assign]);
     assert!(matches!(r, Ok(ComptimeValue::Int(20))));
@@ -306,11 +307,11 @@ fn test_eval_assign_unknown_variable() {
         target: Box::new(HirExpr::Ident(
             "nonexistent".into(),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         value: Box::new(make_int(20)),
         op: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_block(&[assign]);
     assert!(matches!(r, Err(ComptimeError::UnknownIdentifier(_))));
@@ -328,7 +329,7 @@ fn test_eval_ident_resolves_local_var() {
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
     insert_var(&mut ec, "x", ComptimeValue::Int(99));
 
-    let expr = HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0));
+    let expr = HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
     let r = ec.eval_expr(&expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(99))));
 }
@@ -342,7 +343,7 @@ fn test_eval_ident_unknown() {
     let mut diag = crate::diagnostics::DiagCtxt::new();
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
-    let expr = HirExpr::Ident("unknown".into(), TypeId::NONE, Span::new(0, 0));
+    let expr = HirExpr::Ident("unknown".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
     let r = ec.eval_expr(&expr);
     assert!(matches!(r, Err(ComptimeError::UnknownIdentifier(_))));
 }
@@ -363,17 +364,17 @@ fn test_eval_comptime_fn_call() {
     let body = vec![HirStmt::Expression(Box::new(make_binop_ty(
         make_int_val(2, int32),
         BinOp::Mul,
-        HirExpr::Ident("x".into(), int32, Span::new(0, 0)),
+        HirExpr::Ident("x".into(), int32, Span::new(FileId::DUMMY, 0, 0)),
         int32,
     )))];
     ec.register_fn("double".into(), vec!["x".into()], body);
 
     let call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("double".into(), int32, Span::new(0, 0))),
+        callee: Box::new(HirExpr::Ident("double".into(), int32, Span::new(FileId::DUMMY, 0, 0))),
         args: vec![make_int_val(21, int32)],
         comptime: true,
         ty: int32,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&call);
     assert!(
@@ -396,12 +397,12 @@ fn test_eval_comptime_fn_call_unknown() {
         callee: Box::new(HirExpr::Ident(
             "undefined_fn".into(),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         args: vec![],
         comptime: true,
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&call);
     assert!(matches!(r, Err(ComptimeError::UnknownIdentifier(_))));
@@ -422,7 +423,7 @@ fn test_eval_while_loop() {
     insert_var(&mut ec, "i", ComptimeValue::Int(0));
     ec.memory_used = ComptimeValue::Int(0).memory_size();
     // Simulate a while loop: while i < 5 { i = i + 1 }
-    let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
+    let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(FileId::DUMMY, 0, 0));
     let cond = make_binop_ty(i_expr(), BinOp::Lt, make_int_val(5, int32), int32);
     let body = vec![HirStmt::Assign {
         target: Box::new(i_expr()),
@@ -433,7 +434,7 @@ fn test_eval_while_loop() {
             int32,
         )),
         op: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     }];
 
     let while_stmt = HirStmt::While {
@@ -442,7 +443,7 @@ fn test_eval_while_loop() {
         body,
         invariant: None,
         decreases: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let _ = ec.eval_block(&[while_stmt]);
     // After the loop, i should be 5
@@ -464,7 +465,7 @@ fn test_eval_while_scope_isolation() {
     ec.memory_used = ComptimeValue::Int(0).memory_size();
 
     // while i < 1 { set x = 42; i = i + 1 }
-    let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
+    let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(FileId::DUMMY, 0, 0));
     let cond = make_binop_ty(i_expr(), BinOp::Lt, make_int_val(1, int32), int32);
     let body = vec![
         HirStmt::VariableDef {
@@ -475,7 +476,7 @@ fn test_eval_while_scope_isolation() {
             ty: int32,
             value: Some(Box::new(make_int_val(42, int32))),
             else_branch: None,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
             type_captures: vec![],
         },
         HirStmt::Assign {
@@ -487,7 +488,7 @@ fn test_eval_while_scope_isolation() {
                 int32,
             )),
             op: None,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         },
     ];
 
@@ -497,7 +498,7 @@ fn test_eval_while_scope_isolation() {
         body,
         invariant: None,
         decreases: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let _ = ec.eval_block(&[while_stmt]);
 
@@ -539,7 +540,7 @@ fn test_eval_while_shadowing_same_name() {
     ec.memory_used = ComptimeValue::Int(5).memory_size() + ComptimeValue::Int(0).memory_size();
 
     // while i < 1 { set x = 42; i = i + 1 }
-    let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
+    let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(FileId::DUMMY, 0, 0));
     let cond = make_binop_ty(i_expr(), BinOp::Lt, make_int_val(1, int32), int32);
     let body = vec![
         // `set x = 42` — shadows outer x inside the loop body
@@ -551,7 +552,7 @@ fn test_eval_while_shadowing_same_name() {
             ty: int32,
             value: Some(Box::new(make_int_val(42, int32))),
             else_branch: None,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
             type_captures: vec![],
         },
         // `i = i + 1` — modifies outer variable
@@ -564,7 +565,7 @@ fn test_eval_while_shadowing_same_name() {
                 int32,
             )),
             op: None,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         },
     ];
     let while_stmt = HirStmt::While {
@@ -573,7 +574,7 @@ fn test_eval_while_shadowing_same_name() {
         body,
         invariant: None,
         decreases: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let _ = ec.eval_block(&[while_stmt]);
 
@@ -613,7 +614,7 @@ fn test_assign_while_internal_var_after_loop() {
     ec.memory_used = ComptimeValue::Int(0).memory_size();
 
     // while i < 1 { set x = 42; i = i + 1 }
-    let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
+    let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(FileId::DUMMY, 0, 0));
     let cond = make_binop_ty(i_expr(), BinOp::Lt, make_int_val(1, int32), int32);
     let body = vec![
         HirStmt::VariableDef {
@@ -624,7 +625,7 @@ fn test_assign_while_internal_var_after_loop() {
             ty: int32,
             value: Some(Box::new(make_int_val(42, int32))),
             else_branch: None,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
             type_captures: vec![],
         },
         HirStmt::Assign {
@@ -636,7 +637,7 @@ fn test_assign_while_internal_var_after_loop() {
                 int32,
             )),
             op: None,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         },
     ];
     let while_stmt = HirStmt::While {
@@ -645,17 +646,17 @@ fn test_assign_while_internal_var_after_loop() {
         body,
         invariant: None,
         decreases: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
 
     let _ = ec.eval_block(&[while_stmt]);
 
     // After the loop, `x` should NOT be assignable — it was scoped inside.
     let assign = HirStmt::Assign {
-        target: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
+        target: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
         value: Box::new(make_int(99)),
         op: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_block(&[assign]);
     assert!(
@@ -677,7 +678,7 @@ fn test_eval_while_step_limit() {
     ec.set_step_limit(5);
 
     insert_var(&mut ec, "i", ComptimeValue::Int(0));
-    let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
+    let i_expr = || HirExpr::Ident("i".into(), int32, Span::new(FileId::DUMMY, 0, 0));
     let cond = make_binop_ty(i_expr(), BinOp::Lt, make_int_val(100, int32), int32);
     let body = vec![HirStmt::Assign {
         target: Box::new(i_expr()),
@@ -688,7 +689,7 @@ fn test_eval_while_step_limit() {
             int32,
         )),
         op: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     }];
 
     let while_stmt = HirStmt::While {
@@ -697,7 +698,7 @@ fn test_eval_while_step_limit() {
         body,
         invariant: None,
         decreases: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_block(&[while_stmt]);
     assert!(matches!(r, Err(ComptimeError::StepLimitExceeded)));
@@ -715,7 +716,7 @@ fn test_eval_type_info() {
     let mut diag = crate::diagnostics::DiagCtxt::new();
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
-    let expr = HirExpr::TypeInfo(int32, Span::new(0, 0));
+    let expr = HirExpr::TypeInfo(int32, Span::new(FileId::DUMMY, 0, 0));
     let r = ec.eval_expr(&expr);
     assert!(r.is_ok() && matches!(r.unwrap(), ComptimeValue::TypeInfo(_)));
 }
@@ -734,10 +735,10 @@ fn test_eval_fn_call_scope_isolation() {
 
     // Register a function that assigns to its own param, not the outer scope
     let body = vec![HirStmt::Assign {
-        target: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
+        target: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
         value: Box::new(make_int(99)),
         op: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     }];
     ec.register_fn("mutate_x".into(), vec!["x".into()], body);
 
@@ -745,12 +746,12 @@ fn test_eval_fn_call_scope_isolation() {
         callee: Box::new(HirExpr::Ident(
             "mutate_x".into(),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         args: vec![make_int(10)],
         comptime: true,
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let _ = ec.eval_expr(&call);
     // Outer x should still be 1, not 99
@@ -766,16 +767,16 @@ fn test_eval_float_add() {
         left: Box::new(HirExpr::Literal(
             Literal::Float(1.5),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         op: BinOp::Add,
         right: Box::new(HirExpr::Literal(
             Literal::Float(2.5),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = eval(&mut ctx, &expr);
     assert!(matches!(r, Ok(ComptimeValue::Float(v)) if (v - 4.0).abs() < 1e-10));
@@ -788,16 +789,16 @@ fn test_eval_float_mul() {
         left: Box::new(HirExpr::Literal(
             Literal::Float(3.0),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         op: BinOp::Mul,
         right: Box::new(HirExpr::Literal(
             Literal::Float(1.5),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = eval(&mut ctx, &expr);
     assert!(matches!(r, Ok(ComptimeValue::Float(v)) if (v - 4.5).abs() < 1e-10));
@@ -812,16 +813,16 @@ fn test_eval_string_concat() {
         left: Box::new(HirExpr::Literal(
             Literal::String("hello ".into()),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         op: BinOp::Add,
         right: Box::new(HirExpr::Literal(
             Literal::String("world".into()),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = eval(&mut ctx, &expr);
     assert!(matches!(&r, Ok(ComptimeValue::String(s)) if s.as_ref() == "hello world"));
@@ -834,16 +835,16 @@ fn test_eval_string_eq() {
         left: Box::new(HirExpr::Literal(
             Literal::String("abc".into()),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         op: BinOp::Eq,
         right: Box::new(HirExpr::Literal(
             Literal::String("abc".into()),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = eval(&mut ctx, &expr);
     assert!(matches!(r, Ok(ComptimeValue::Bool(true))));
@@ -882,8 +883,8 @@ fn test_eval_int_comparisons() {
 #[test]
 fn test_eval_float_comparisons() {
     let mut ctx = TypeContext::new();
-    let a = HirExpr::Literal(Literal::Float(3.14), TypeId::NONE, Span::new(0, 0));
-    let b = HirExpr::Literal(Literal::Float(2.71), TypeId::NONE, Span::new(0, 0));
+    let a = HirExpr::Literal(Literal::Float(3.14), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
+    let b = HirExpr::Literal(Literal::Float(2.71), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
 
     let tests = vec![
         (BinOp::Eq, false),
@@ -897,7 +898,7 @@ fn test_eval_float_comparisons() {
             op,
             right: Box::new(b.clone()),
             ty: TypeId::NONE,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         };
         let r = eval(&mut ctx, &expr);
         assert!(
@@ -925,9 +926,9 @@ fn test_eval_ref_and_deref() {
     // &x
     let ref_expr = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Ref,
-        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
+        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&ref_expr);
     assert!(matches!(&r, Ok(ComptimeValue::Pointer { .. })));
@@ -937,7 +938,7 @@ fn test_eval_ref_and_deref() {
         op: crate::ast::UnaryOp::Deref,
         expr: Box::new(ref_expr),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&deref_expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(42))));
@@ -969,14 +970,14 @@ fn test_eval_pointer_shadowing_block() {
         ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     // set p = &x
     let ref_x = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Ref,
-        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
+        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let def_p = HirStmt::VariableDef {
         name: Some("p".into()),
@@ -987,7 +988,7 @@ fn test_eval_pointer_shadowing_block() {
         ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     // Inner block: { set x = 2; *p }
     let inner_var = HirStmt::VariableDef {
@@ -999,18 +1000,18 @@ fn test_eval_pointer_shadowing_block() {
         ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let deref_p = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Deref,
-        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(0, 0))),
+        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let inner_block = HirExpr::Block(
         vec![inner_var, HirStmt::Expression(Box::new(deref_p))],
         TypeId::NONE,
-        Span::new(0, 0),
+        Span::new(FileId::DUMMY, 0, 0),
     );
     let block_stmt = HirStmt::Expression(Box::new(inner_block));
 
@@ -1043,14 +1044,14 @@ fn test_eval_pointer_shadowing_write_through() {
         ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     // set p = &mut x
     let ref_mut_x = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::RefMut,
-        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
+        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let def_p = HirStmt::VariableDef {
         name: Some("p".into()),
@@ -1061,7 +1062,7 @@ fn test_eval_pointer_shadowing_write_through() {
         ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     // Inner block: { set x = 2; *p = 10 }
     let inner_var = HirStmt::VariableDef {
@@ -1073,20 +1074,20 @@ fn test_eval_pointer_shadowing_write_through() {
         ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     // *p = 10
     let deref_ptr = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Deref,
-        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(0, 0))),
+        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let assign_through_ptr = HirStmt::Assign {
         target: Box::new(deref_ptr),
         value: Box::new(make_int(10)),
         op: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let inner_block = HirExpr::Block(
         vec![
@@ -1095,7 +1096,7 @@ fn test_eval_pointer_shadowing_write_through() {
             HirStmt::Expression(Box::new(make_int(0))),
         ],
         TypeId::NONE,
-        Span::new(0, 0),
+        Span::new(FileId::DUMMY, 0, 0),
     );
     let block_stmt = HirStmt::Expression(Box::new(inner_block));
 
@@ -1129,14 +1130,14 @@ fn test_eval_pointer_shadowing_nested_blocks() {
         ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     // set p = &x
     let ref_x = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Ref,
-        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
+        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let def_p = HirStmt::VariableDef {
         name: Some("p".into()),
@@ -1147,7 +1148,7 @@ fn test_eval_pointer_shadowing_nested_blocks() {
         ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     // Innermost: { set x = 3; *p }
     let inner_def = HirStmt::VariableDef {
@@ -1159,18 +1160,18 @@ fn test_eval_pointer_shadowing_nested_blocks() {
         ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let deref_p = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Deref,
-        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(0, 0))),
+        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let innermost = HirExpr::Block(
         vec![inner_def, HirStmt::Expression(Box::new(deref_p))],
         TypeId::NONE,
-        Span::new(0, 0),
+        Span::new(FileId::DUMMY, 0, 0),
     );
     // Middle: { set x = 2; <innermost> }
     let mid_def = HirStmt::VariableDef {
@@ -1182,12 +1183,12 @@ fn test_eval_pointer_shadowing_nested_blocks() {
         ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let middle = HirExpr::Block(
         vec![mid_def, HirStmt::Expression(Box::new(innermost))],
         TypeId::NONE,
-        Span::new(0, 0),
+        Span::new(FileId::DUMMY, 0, 0),
     );
     let outer_stmt = HirStmt::Expression(Box::new(middle));
 
@@ -1222,7 +1223,7 @@ fn test_eval_pointer_shadowing_while() {
         ty: int32,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     // set i = 0
     let def_i = HirStmt::VariableDef {
@@ -1234,14 +1235,14 @@ fn test_eval_pointer_shadowing_while() {
         ty: int32,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     // set p = &x
     let ref_x = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Ref,
-        expr: Box::new(HirExpr::Ident("x".into(), int32, Span::new(0, 0))),
+        expr: Box::new(HirExpr::Ident("x".into(), int32, Span::new(FileId::DUMMY, 0, 0))),
         ty: int32,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let def_p = HirStmt::VariableDef {
         name: Some("p".into()),
@@ -1252,11 +1253,11 @@ fn test_eval_pointer_shadowing_while() {
         ty: int32,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
 
     // while body: { set x = 99; i = i + 1 }
-    let i = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
+    let i = || HirExpr::Ident("i".into(), int32, Span::new(FileId::DUMMY, 0, 0));
     let shadow_x = HirStmt::VariableDef {
         name: Some("x".into()),
         value: Some(Box::new(make_int_val(99, int32))),
@@ -1266,7 +1267,7 @@ fn test_eval_pointer_shadowing_while() {
         ty: int32,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let inc_i = HirStmt::Assign {
         target: Box::new(i()),
@@ -1277,7 +1278,7 @@ fn test_eval_pointer_shadowing_while() {
             int32,
         )),
         op: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let body = vec![shadow_x, inc_i];
     let cond = make_binop_ty(i(), BinOp::Lt, make_int_val(3, int32), int32);
@@ -1287,7 +1288,7 @@ fn test_eval_pointer_shadowing_while() {
         body,
         invariant: None,
         decreases: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
 
     let _ = ec.eval_block(&[def_x, def_i, def_p, while_stmt]);
@@ -1300,9 +1301,9 @@ fn test_eval_pointer_shadowing_while() {
     // *p should also be 5 (pointer to outer slot)
     let deref_p = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Deref,
-        expr: Box::new(HirExpr::Ident("p".into(), int32, Span::new(0, 0))),
+        expr: Box::new(HirExpr::Ident("p".into(), int32, Span::new(FileId::DUMMY, 0, 0))),
         ty: int32,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&deref_p);
     assert!(
@@ -1332,14 +1333,14 @@ fn test_eval_pointer_shadowing_deref_after_block() {
         ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     // set p = &x
     let ref_x = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Ref,
-        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(0, 0))),
+        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let def_p = HirStmt::VariableDef {
         name: Some("p".into()),
@@ -1350,7 +1351,7 @@ fn test_eval_pointer_shadowing_deref_after_block() {
         ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     // { set x = 2; }
     let inner_var = HirStmt::VariableDef {
@@ -1362,9 +1363,9 @@ fn test_eval_pointer_shadowing_deref_after_block() {
         ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
-    let block = HirExpr::Block(vec![inner_var], TypeId::NONE, Span::new(0, 0));
+    let block = HirExpr::Block(vec![inner_var], TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
     let block_stmt = HirStmt::Expression(Box::new(block));
 
     // Evaluate: declarations + block
@@ -1372,9 +1373,9 @@ fn test_eval_pointer_shadowing_deref_after_block() {
     // After block, *p should still be 1 (outer x restored, pointer slot valid)
     let deref_p = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Deref,
-        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(0, 0))),
+        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&deref_p);
     assert!(
@@ -1402,7 +1403,7 @@ fn test_eval_struct_lit() {
             ("y".into(), Box::new(make_int(20))),
         ],
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&expr);
     assert!(r.is_ok());
@@ -1427,7 +1428,7 @@ fn test_eval_tuple() {
     let expr = HirExpr::Tuple(
         vec![make_int(1), make_int(2), make_int(3)],
         TypeId::NONE,
-        Span::new(0, 0),
+        Span::new(FileId::DUMMY, 0, 0),
     );
     let r = ec.eval_expr(&expr);
     assert!(r.is_ok());
@@ -1450,7 +1451,7 @@ fn test_eval_array() {
     let expr = HirExpr::Array(
         vec![make_int(10), make_int(20), make_int(30)],
         TypeId::NONE,
-        Span::new(0, 0),
+        Span::new(FileId::DUMMY, 0, 0),
     );
     let r = ec.eval_expr(&expr);
     assert!(r.is_ok());
@@ -1478,20 +1479,20 @@ fn test_eval_aggregate_field_access() {
                 Box::new(HirExpr::Literal(
                     Literal::String("test".into()),
                     TypeId::NONE,
-                    Span::new(0, 0),
+                    Span::new(FileId::DUMMY, 0, 0),
                 )),
             ),
             ("value".into(), Box::new(make_int(42))),
         ],
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     // Access field: struct_expr.name
     let field_access = HirExpr::FieldAccess {
         base: Box::new(struct_expr),
         field: "name".into(),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&field_access);
     assert!(matches!(&r, Ok(ComptimeValue::String(s)) if s.as_ref() == "test"));
@@ -1509,7 +1510,7 @@ fn test_eval_aggregate_index() {
     let arr_expr = HirExpr::Array(
         vec![make_int(100), make_int(200), make_int(300)],
         TypeId::NONE,
-        Span::new(0, 0),
+        Span::new(FileId::DUMMY, 0, 0),
     );
     // Index: arr[1]
     let index = HirExpr::Index {
@@ -1517,10 +1518,10 @@ fn test_eval_aggregate_index() {
         index: Box::new(HirExpr::Literal(
             Literal::Int(ast::IntLit::Small(1)),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&index);
     assert!(matches!(r, Ok(ComptimeValue::Int(200))));
@@ -1537,7 +1538,7 @@ fn test_eval_cast_int_to_int() {
         ty: ctx.int(64, true),
         safe: true,
         rounding: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = eval(&mut ctx, &expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(42))));
@@ -1552,7 +1553,7 @@ fn test_eval_cast_int_to_float() {
         ty: ctx.float(64),
         safe: true,
         rounding: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = eval(&mut ctx, &expr);
     assert!(matches!(r, Ok(ComptimeValue::Float(v)) if (v - 42.0).abs() < 1e-10));
@@ -1566,7 +1567,7 @@ fn test_eval_type_annotated() {
     let expr = HirExpr::TypeAnnotated {
         expr: Box::new(make_int(42)),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = eval(&mut ctx, &expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(42))));
@@ -1588,7 +1589,7 @@ fn test_eval_enum_lit() {
         variant: "Some".into(),
         payload: Some(Box::new(make_int(42))),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&expr);
     assert!(r.is_ok());
@@ -1611,7 +1612,7 @@ fn test_eval_if_let_matches() {
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
     let scrutinee = make_int(42);
-    let pattern = HirPattern::Wildcard(Span::new(0, 0));
+    let pattern = HirPattern::Wildcard(Span::new(FileId::DUMMY, 0, 0));
     let then_branch = vec![HirStmt::Expression(Box::new(make_int(1)))];
     let else_branch = vec![HirStmt::Expression(Box::new(make_int(0)))];
 
@@ -1621,7 +1622,7 @@ fn test_eval_if_let_matches() {
         then_branch,
         else_branch: Some(else_branch),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(1))));
@@ -1640,16 +1641,16 @@ fn test_eval_match_wildcard() {
 
     let scrutinee = make_int(42);
     let arms = vec![HirMatchArm {
-        pattern: HirPattern::Wildcard(Span::new(0, 0)),
+        pattern: HirPattern::Wildcard(Span::new(FileId::DUMMY, 0, 0)),
         guard: None,
         body: Box::new(make_int(99)),
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     }];
     let expr = HirExpr::Match {
         scrutinee: Box::new(scrutinee),
         arms,
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(99))));
@@ -1670,22 +1671,22 @@ fn test_eval_layout_of() {
     // Use the correct AST type structure: Type::Generic(Int, [32])
     let path_ty: &'static crate::ast::Type<'static> = Box::leak(Box::new(crate::ast::Type::Path(
         smallvec::smallvec!["Int".into()],
-        Span::new(0, 0),
+        Span::new(FileId::DUMMY, 0, 0),
     )));
     let lit_expr: &'static crate::ast::Expr<'static> =
         Box::leak(Box::new(crate::ast::Expr::Literal(
             crate::ast::Literal::Int(ast::IntLit::Small(32)),
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )));
     let expr = HirExpr::LayoutOf(
         Box::new(crate::ast::Type::Generic(
             path_ty,
             vec![crate::ast::GenericArg::Positional(
-                crate::ast::Type::Literal(lit_expr, Span::new(0, 0)),
+                crate::ast::Type::Literal(lit_expr, Span::new(FileId::DUMMY, 0, 0)),
             )],
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
-        Span::new(0, 0),
+        Span::new(FileId::DUMMY, 0, 0),
     );
     let r = ec.eval_expr(&expr);
     assert!(r.is_ok(), "layout_of!(Int<32>) should succeed: {:?}", r);
@@ -1710,24 +1711,24 @@ fn test_eval_nested_match() {
     let inner_match = HirExpr::Match {
         scrutinee: Box::new(make_int(42)),
         arms: vec![HirMatchArm {
-            pattern: HirPattern::Wildcard(Span::new(0, 0)),
+            pattern: HirPattern::Wildcard(Span::new(FileId::DUMMY, 0, 0)),
             guard: None,
             body: Box::new(make_int(1)),
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         }],
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let outer_match = HirExpr::Match {
         scrutinee: Box::new(inner_match),
         arms: vec![HirMatchArm {
-            pattern: HirPattern::Wildcard(Span::new(0, 0)),
+            pattern: HirPattern::Wildcard(Span::new(FileId::DUMMY, 0, 0)),
             guard: None,
             body: Box::new(make_int(2)),
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         }],
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&outer_match);
     assert!(matches!(r, Ok(ComptimeValue::Int(2))));
@@ -1740,7 +1741,7 @@ fn test_eval_compile_error() {
     let mut ctx = TypeContext::new();
     let r = eval(
         &mut ctx,
-        &HirExpr::CompileError("test error".into(), Span::new(0, 0)),
+        &HirExpr::CompileError("test error".into(), Span::new(FileId::DUMMY, 0, 0)),
     );
     assert!(matches!(r, Err(ComptimeError::AssertionFailed(msg)) if msg == "test error"));
 }
@@ -1762,7 +1763,7 @@ fn test_eval_memory_limit() {
         value: Some(Box::new(HirExpr::Literal(
             Literal::String("this is a long string that should exceed the memory limit".into()),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         ))),
         pattern: None,
         else_branch: None,
@@ -1770,7 +1771,7 @@ fn test_eval_memory_limit() {
         ty: TypeId::NONE,
         type_captures: vec![],
         mutable: false,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_block(&[block]);
     assert!(matches!(r, Err(ComptimeError::MemoryLimitExceeded(_))));
@@ -1790,7 +1791,7 @@ fn test_eval_unsafe_block() {
     let expr = HirExpr::UnsafeBlock {
         body: vec![HirStmt::Expression(Box::new(make_int(42)))],
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(42))));
@@ -1810,7 +1811,7 @@ fn test_eval_try_expr() {
     let expr = HirExpr::Try {
         expr: Box::new(make_int(42)),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(42))));
@@ -1831,7 +1832,7 @@ fn test_eval_poly_box_unbox() {
     let box_expr = HirExpr::PolyBox {
         expr: Box::new(make_int(42)),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&box_expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(42))));
@@ -1854,7 +1855,7 @@ fn test_eval_zero_param_closure() {
         captures: vec![],
         body: vec![HirStmt::Expression(Box::new(make_int(42)))],
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(42))));
@@ -1873,7 +1874,7 @@ fn test_eval_closure_with_params_deferred() {
         name: "x".into(),
         ty: TypeId::NONE,
         default: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let expr = HirExpr::Closure {
         params: vec![param],
@@ -1881,7 +1882,7 @@ fn test_eval_closure_with_params_deferred() {
         captures: vec![],
         body: vec![HirStmt::Expression(Box::new(make_int(42)))],
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&expr);
     assert!(matches!(r, Err(ComptimeError::Deferred)));
@@ -1918,14 +1919,14 @@ fn test_eval_pointer_index() {
 
     // ptr[1]
     let index = HirExpr::Index {
-        base: Box::new(HirExpr::Ident("ptr".into(), TypeId::NONE, Span::new(0, 0))),
+        base: Box::new(HirExpr::Ident("ptr".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
         index: Box::new(HirExpr::Literal(
             Literal::Int(ast::IntLit::Small(1)),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&index);
     assert!(matches!(r, Ok(ComptimeValue::Int(200))));
@@ -1946,16 +1947,16 @@ fn test_eval_assert_success() {
         callee: Box::new(HirExpr::Ident(
             "assert".into(),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         args: vec![HirExpr::Literal(
             Literal::Bool(true),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )],
         comptime: true,
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&call);
     assert!(matches!(r, Ok(ComptimeValue::Unit)));
@@ -1974,16 +1975,16 @@ fn test_eval_assert_failure() {
         callee: Box::new(HirExpr::Ident(
             "assert".into(),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         args: vec![HirExpr::Literal(
             Literal::Bool(false),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )],
         comptime: true,
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&call);
     assert!(matches!(r, Err(ComptimeError::AssertionFailed(_))));
@@ -1994,8 +1995,8 @@ fn test_eval_assert_failure() {
 #[test]
 fn test_eval_bool_eq() {
     let mut ctx = TypeContext::new();
-    let t = HirExpr::Literal(Literal::Bool(true), TypeId::NONE, Span::new(0, 0));
-    let f = HirExpr::Literal(Literal::Bool(false), TypeId::NONE, Span::new(0, 0));
+    let t = HirExpr::Literal(Literal::Bool(true), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
+    let f = HirExpr::Literal(Literal::Bool(false), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
     let eq = make_binop(t.clone(), BinOp::Eq, f.clone());
     let neq = make_binop(t.clone(), BinOp::Neq, f.clone());
     let eq2 = make_binop(t.clone(), BinOp::Eq, t.clone());
@@ -2016,7 +2017,7 @@ fn test_eval_bool_eq() {
 #[test]
 fn test_eval_unit_eq() {
     let mut ctx = TypeContext::new();
-    let u = HirExpr::Block(vec![], TypeId::NONE, Span::new(0, 0));
+    let u = HirExpr::Block(vec![], TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
     let eq = make_binop(u.clone(), BinOp::Eq, u.clone());
     let neq = make_binop(u.clone(), BinOp::Neq, u);
     assert!(matches!(eval(&mut ctx, &eq), Ok(ComptimeValue::Bool(true))));
@@ -2035,7 +2036,7 @@ fn test_eval_neg_int() {
         op: crate::ast::UnaryOp::Neg,
         expr: Box::new(make_int(42)),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     assert!(matches!(eval(&mut ctx, &expr), Ok(ComptimeValue::Int(-42))));
 }
@@ -2048,10 +2049,10 @@ fn test_eval_not_bool() {
         expr: Box::new(HirExpr::Literal(
             Literal::Bool(true),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     assert!(matches!(
         eval(&mut ctx, &expr),
@@ -2082,10 +2083,10 @@ fn test_eval_variable_shadowing() {
             ty: TypeId::NONE,
             type_captures: vec![],
             mutable: false,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         }],
         TypeId::NONE,
-        Span::new(0, 0),
+        Span::new(FileId::DUMMY, 0, 0),
     );
     let _ = ec.eval_expr(&inner);
     // Outer x should still be 10 (block scoping prevents leaks)
@@ -2103,10 +2104,10 @@ fn test_eval_int_min_neg() {
         expr: Box::new(HirExpr::Literal(
             Literal::Int(ast::IntLit::Small(i128::MIN)),
             TypeId::NONE,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = eval(&mut ctx, &expr);
     assert!(r.is_ok(), "negating i128::MIN should not overflow: {:?}", r);
@@ -2115,8 +2116,8 @@ fn test_eval_int_min_neg() {
 #[test]
 fn test_eval_string_neq() {
     let mut ctx = TypeContext::new();
-    let a = HirExpr::Literal(Literal::String("abc".into()), TypeId::NONE, Span::new(0, 0));
-    let b = HirExpr::Literal(Literal::String("def".into()), TypeId::NONE, Span::new(0, 0));
+    let a = HirExpr::Literal(Literal::String("abc".into()), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
+    let b = HirExpr::Literal(Literal::String("def".into()), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
     let expr = make_binop(a, BinOp::Neq, b);
     assert!(matches!(
         eval(&mut ctx, &expr),
@@ -2127,8 +2128,8 @@ fn test_eval_string_neq() {
 #[test]
 fn test_eval_float_neq() {
     let mut ctx = TypeContext::new();
-    let a = HirExpr::Literal(Literal::Float(3.14), TypeId::NONE, Span::new(0, 0));
-    let b = HirExpr::Literal(Literal::Float(2.71), TypeId::NONE, Span::new(0, 0));
+    let a = HirExpr::Literal(Literal::Float(3.14), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
+    let b = HirExpr::Literal(Literal::Float(2.71), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
     let expr = make_binop(a, BinOp::Neq, b);
     assert!(matches!(
         eval(&mut ctx, &expr),
@@ -2150,25 +2151,25 @@ fn test_eval_match_tuple_pattern() {
     let scrutinee = HirExpr::Tuple(
         vec![make_int(1), make_int(2)],
         TypeId::NONE,
-        Span::new(0, 0),
+        Span::new(FileId::DUMMY, 0, 0),
     );
     let arms = vec![HirMatchArm {
         pattern: HirPattern::Tuple(
             vec![
-                HirPattern::Wildcard(Span::new(0, 0)),
-                HirPattern::Wildcard(Span::new(0, 0)),
+                HirPattern::Wildcard(Span::new(FileId::DUMMY, 0, 0)),
+                HirPattern::Wildcard(Span::new(FileId::DUMMY, 0, 0)),
             ],
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         ),
         guard: None,
         body: Box::new(make_int(42)),
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     }];
     let expr = HirExpr::Match {
         scrutinee: Box::new(scrutinee),
         arms,
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     assert!(matches!(ec.eval_expr(&expr), Ok(ComptimeValue::Int(42))));
 }
@@ -2187,24 +2188,24 @@ fn test_eval_match_enum_pattern() {
         variant: "Some".into(),
         payload: Some(Box::new(make_int(42))),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let arms = vec![HirMatchArm {
         pattern: HirPattern::Enum {
             path: vec!["Option".into()],
             variant: "Some".into(),
-            inner: Some(Box::new(HirPattern::Wildcard(Span::new(0, 0)))),
-            span: Span::new(0, 0),
+            inner: Some(Box::new(HirPattern::Wildcard(Span::new(FileId::DUMMY, 0, 0)))),
+            span: Span::new(FileId::DUMMY, 0, 0),
         },
         guard: None,
         body: Box::new(make_int(99)),
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     }];
     let expr = HirExpr::Match {
         scrutinee: Box::new(scrutinee),
         arms,
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     assert!(matches!(ec.eval_expr(&expr), Ok(ComptimeValue::Int(99))));
 }
@@ -2224,7 +2225,7 @@ fn test_eval_catch_expr() {
         expr: Box::new(make_int(42)),
         branches: vec![],
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     assert!(matches!(ec.eval_expr(&expr), Ok(ComptimeValue::Int(42))));
 }
@@ -2243,7 +2244,7 @@ fn test_eval_leave_with_error() {
     let expr = HirExpr::LeaveWith {
         expr: Box::new(make_int(0)),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&expr);
     assert!(matches!(r, Err(ComptimeError::NotComptimeAllowed(_))));
@@ -2261,7 +2262,7 @@ fn test_eval_await_error() {
     let expr = HirExpr::Await {
         expr: Box::new(make_int(0)),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&expr);
     assert!(matches!(r, Err(ComptimeError::NotComptimeAllowed(_))));
@@ -2282,7 +2283,7 @@ fn test_eval_attr_access_default() {
         base: Box::new(make_int(42)),
         attr: "default".into(),
         ty: TypeId::NONE,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&expr);
     assert!(matches!(r, Ok(ComptimeValue::Int(42))));
@@ -2303,8 +2304,8 @@ fn test_eval_while_neested() {
     insert_var(&mut ec, "j", ComptimeValue::Int(0));
     ec.memory_used = ComptimeValue::Int(0).memory_size() + ComptimeValue::Int(0).memory_size();
 
-    let i = || HirExpr::Ident("i".into(), int32, Span::new(0, 0));
-    let j = || HirExpr::Ident("j".into(), int32, Span::new(0, 0));
+    let i = || HirExpr::Ident("i".into(), int32, Span::new(FileId::DUMMY, 0, 0));
+    let j = || HirExpr::Ident("j".into(), int32, Span::new(FileId::DUMMY, 0, 0));
     let outer_cond = make_binop_ty(i(), BinOp::Lt, make_int_val(3, int32), int32);
     let inner_cond = make_binop_ty(j(), BinOp::Lt, make_int_val(2, int32), int32);
     let inner_body = vec![HirStmt::Assign {
@@ -2316,7 +2317,7 @@ fn test_eval_while_neested() {
             int32,
         )),
         op: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     }];
     let inner_while = HirStmt::While {
         label: None,
@@ -2324,7 +2325,7 @@ fn test_eval_while_neested() {
         body: inner_body,
         invariant: None,
         decreases: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let outer_body = vec![
         inner_while,
@@ -2337,7 +2338,7 @@ fn test_eval_while_neested() {
                 int32,
             )),
             op: None,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         },
     ];
     let outer_while = HirStmt::While {
@@ -2346,7 +2347,7 @@ fn test_eval_while_neested() {
         body: outer_body,
         invariant: None,
         decreases: None,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let _ = ec.eval_block(&[outer_while]);
     assert!(matches!(get_var(&ec, "i"), Some(ComptimeValue::Int(3))));
@@ -2368,10 +2369,10 @@ fn test_eval_self_recursion() {
     let mut diag = crate::diagnostics::DiagCtxt::new();
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
-    let n_param = HirExpr::Ident("n".into(), int64, Span::new(0, 0));
+    let n_param = HirExpr::Ident("n".into(), int64, Span::new(FileId::DUMMY, 0, 0));
     let cond = make_binop_ty(n_param.clone(), BinOp::Le, make_int_val(1, int64), int64);
     let recursive_call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("fact".into(), int64, Span::new(0, 0))),
+        callee: Box::new(HirExpr::Ident("fact".into(), int64, Span::new(FileId::DUMMY, 0, 0))),
         args: vec![make_binop_ty(
             n_param.clone(),
             BinOp::Sub,
@@ -2380,7 +2381,7 @@ fn test_eval_self_recursion() {
         )],
         comptime: true,
         ty: int64,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let if_expr = HirExpr::If {
         cond: Box::new(cond),
@@ -2393,18 +2394,18 @@ fn test_eval_self_recursion() {
         )))]),
         is_expression: true,
         ty: int64,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let fn_body = vec![HirStmt::Expression(Box::new(if_expr))];
     ec.register_fn("fact".into(), vec!["n".into()], fn_body);
 
     // fact!(5) = 5 * 4 * 3 * 2 * 1 = 120
     let call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("fact".into(), int64, Span::new(0, 0))),
+        callee: Box::new(HirExpr::Ident("fact".into(), int64, Span::new(FileId::DUMMY, 0, 0))),
         args: vec![make_int_val(5, int64)],
         comptime: true,
         ty: int64,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&call);
     assert!(
@@ -2435,10 +2436,10 @@ fn test_eval_mutual_recursion() {
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
     // is_even body: if n == 0 { true } else { is_odd!(n - 1) }
-    let n_even = HirExpr::Ident("n".into(), int64, Span::new(0, 0));
+    let n_even = HirExpr::Ident("n".into(), int64, Span::new(FileId::DUMMY, 0, 0));
     let cond_even = make_binop_ty(n_even.clone(), BinOp::Eq, make_int_val(0, int64), bool_ty);
     let is_odd_call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("is_odd".into(), bool_ty, Span::new(0, 0))),
+        callee: Box::new(HirExpr::Ident("is_odd".into(), bool_ty, Span::new(FileId::DUMMY, 0, 0))),
         args: vec![make_binop_ty(
             n_even.clone(),
             BinOp::Sub,
@@ -2447,26 +2448,26 @@ fn test_eval_mutual_recursion() {
         )],
         comptime: true,
         ty: bool_ty,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let even_body = vec![HirStmt::Expression(Box::new(HirExpr::If {
         cond: Box::new(cond_even),
         then_branch: vec![HirStmt::Expression(Box::new(HirExpr::Literal(
             crate::ast::Literal::Bool(true),
             bool_ty,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )))],
         else_branch: Some(vec![HirStmt::Expression(Box::new(is_odd_call))]),
         is_expression: true,
         ty: bool_ty,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     }))];
 
     // is_odd body: if n == 0 { false } else { is_even!(n - 1) }
-    let n_odd = HirExpr::Ident("n".into(), int64, Span::new(0, 0));
+    let n_odd = HirExpr::Ident("n".into(), int64, Span::new(FileId::DUMMY, 0, 0));
     let cond_odd = make_binop_ty(n_odd.clone(), BinOp::Eq, make_int_val(0, int64), bool_ty);
     let is_even_call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("is_even".into(), bool_ty, Span::new(0, 0))),
+        callee: Box::new(HirExpr::Ident("is_even".into(), bool_ty, Span::new(FileId::DUMMY, 0, 0))),
         args: vec![make_binop_ty(
             n_odd.clone(),
             BinOp::Sub,
@@ -2475,19 +2476,19 @@ fn test_eval_mutual_recursion() {
         )],
         comptime: true,
         ty: bool_ty,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let odd_body = vec![HirStmt::Expression(Box::new(HirExpr::If {
         cond: Box::new(cond_odd),
         then_branch: vec![HirStmt::Expression(Box::new(HirExpr::Literal(
             crate::ast::Literal::Bool(false),
             bool_ty,
-            Span::new(0, 0),
+            Span::new(FileId::DUMMY, 0, 0),
         )))],
         else_branch: Some(vec![HirStmt::Expression(Box::new(is_even_call))]),
         is_expression: true,
         ty: bool_ty,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     }))];
 
     ec.register_fn("is_even".into(), vec!["n".into()], even_body);
@@ -2495,11 +2496,11 @@ fn test_eval_mutual_recursion() {
 
     // is_even!(4) = is_odd!(3) = is_even!(2) = is_odd!(1) = is_even!(0) = true
     let call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("is_even".into(), bool_ty, Span::new(0, 0))),
+        callee: Box::new(HirExpr::Ident("is_even".into(), bool_ty, Span::new(FileId::DUMMY, 0, 0))),
         args: vec![make_int_val(4, int64)],
         comptime: true,
         ty: bool_ty,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&call);
     assert!(
@@ -2510,11 +2511,11 @@ fn test_eval_mutual_recursion() {
 
     // is_odd!(3) = is_even!(2) = is_odd!(1) = is_even!(0) = true
     let call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("is_odd".into(), bool_ty, Span::new(0, 0))),
+        callee: Box::new(HirExpr::Ident("is_odd".into(), bool_ty, Span::new(FileId::DUMMY, 0, 0))),
         args: vec![make_int_val(3, int64)],
         comptime: true,
         ty: bool_ty,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&call);
     assert!(
@@ -2541,27 +2542,27 @@ fn test_comptime_recursive_step_limit() {
 
     // def recurse(n: Int<32>) -> Int<32> { recurse!(n + 1) }
     let self_call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("recurse".into(), int32, Span::new(0, 0))),
+        callee: Box::new(HirExpr::Ident("recurse".into(), int32, Span::new(FileId::DUMMY, 0, 0))),
         args: vec![HirExpr::BinaryOp {
-            left: Box::new(HirExpr::Ident("n".into(), int32, Span::new(0, 0))),
+            left: Box::new(HirExpr::Ident("n".into(), int32, Span::new(FileId::DUMMY, 0, 0))),
             op: BinOp::Add,
             right: Box::new(make_int_val(1, int32)),
             ty: int32,
-            span: Span::new(0, 0),
+            span: Span::new(FileId::DUMMY, 0, 0),
         }],
         comptime: true,
         ty: int32,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let fn_body = vec![HirStmt::Expression(Box::new(self_call))];
     ec.register_fn("recurse".into(), vec!["n".into()], fn_body);
 
     let call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("recurse".into(), int32, Span::new(0, 0))),
+        callee: Box::new(HirExpr::Ident("recurse".into(), int32, Span::new(FileId::DUMMY, 0, 0))),
         args: vec![make_int_val(0, int32)],
         comptime: true,
         ty: int32,
-        span: Span::new(0, 0),
+        span: Span::new(FileId::DUMMY, 0, 0),
     };
     let r = ec.eval_expr(&call);
     assert!(

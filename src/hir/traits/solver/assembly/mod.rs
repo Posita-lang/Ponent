@@ -24,6 +24,7 @@
 //! references to `TraitEnv` / `BuiltinTraitRegistry` through `ecx.delegate`.
 //! The `EvalCtxt` is only used in the top-level `assemble_and_evaluate_candidates`.
 
+use crate::ast::FileId;
 use crate::hir::traits::ImplCandidate;
 use crate::hir::traits::TraitEnv;
 use crate::hir::traits::solver::builtins;
@@ -91,7 +92,7 @@ fn solver_unify<'input>(
         Err(crate::hir::types::TypeError::Mismatch {
             expected: param,
             found: var,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     } else if ctx.set_binding(var, param) {
         Ok(param)
@@ -99,7 +100,7 @@ fn solver_unify<'input>(
         Err(crate::hir::types::TypeError::Mismatch {
             expected: param,
             found: var,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         })
     };
     match result {
@@ -239,7 +240,7 @@ impl<'input, D: SolverDelegate<'input>> GoalKind<'input, D> for Predicate {
                     args: resolved_args,
                     ambiguous,
                     parent_depth: 0,
-                    span: crate::ast::Span::new(0, 0),
+                    span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 }
             }
             Predicate::AutoTrait { trait_id, self_ty } => {
@@ -251,7 +252,7 @@ impl<'input, D: SolverDelegate<'input>> GoalKind<'input, D> for Predicate {
                     args: vec![],
                     ambiguous,
                     parent_depth: 0,
-                    span: crate::ast::Span::new(0, 0),
+                    span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 }
             }
             Predicate::Sized { ty } => {
@@ -263,7 +264,7 @@ impl<'input, D: SolverDelegate<'input>> GoalKind<'input, D> for Predicate {
                     args: vec![],
                     ambiguous,
                     parent_depth: 0,
-                    span: crate::ast::Span::new(0, 0),
+                    span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 }
             }
             Predicate::Eq { a, b } => {
@@ -276,7 +277,7 @@ impl<'input, D: SolverDelegate<'input>> GoalKind<'input, D> for Predicate {
                     args: vec![rb],
                     ambiguous,
                     parent_depth: 0,
-                    span: crate::ast::Span::new(0, 0),
+                    span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 }
             }
             Predicate::Sub { sub, sup } => {
@@ -289,7 +290,7 @@ impl<'input, D: SolverDelegate<'input>> GoalKind<'input, D> for Predicate {
                     args: vec![rsup],
                     ambiguous,
                     parent_depth: 0,
-                    span: crate::ast::Span::new(0, 0),
+                    span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 }
             }
             Predicate::Match { scrutinee, .. } => {
@@ -301,7 +302,7 @@ impl<'input, D: SolverDelegate<'input>> GoalKind<'input, D> for Predicate {
                     args: vec![],
                     ambiguous,
                     parent_depth: 0,
-                    span: crate::ast::Span::new(0, 0),
+                    span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 }
             }
             _ => {
@@ -312,7 +313,7 @@ impl<'input, D: SolverDelegate<'input>> GoalKind<'input, D> for Predicate {
                     args: vec![],
                     ambiguous: false,
                     parent_depth: 0,
-                    span: crate::ast::Span::new(0, 0),
+                    span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 }
             }
         }
@@ -895,7 +896,7 @@ fn confirm_candidate<'input>(
                 Err(SolveError::NotFound {
                     trait_id: resolved.trait_id,
                     self_ty: resolved.self_ty,
-                    span: crate::ast::Span::new(0, 0),
+                    span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 })
             }
         }
@@ -914,7 +915,7 @@ fn confirm_candidate<'input>(
                     return Err(SolveError::NotFound {
                         trait_id: resolved.trait_id,
                         self_ty: resolved.self_ty,
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     });
                 }
             };
@@ -928,9 +929,9 @@ fn confirm_candidate<'input>(
             let unboxed_body = ctx.subst(body, &fresh_subst);
             let confirmed_obligation = Obligation {
                 cause: ObligationCause {
-                    span: crate::ast::Span::new(0, 0),
+                    span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     code: ObligationCauseCode::PolyUnbox {
-                        span: crate::ast::Span::new(0, 0),
+                        span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
                     },
                 },
                 predicate: Predicate::Trait {
@@ -986,7 +987,7 @@ fn try_match_impl<'input>(
         SolveError::NotFound {
             trait_id: obligation.trait_id,
             self_ty: obligation.self_ty,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         }
     })?;
 
@@ -1001,7 +1002,7 @@ fn try_match_impl<'input>(
         return Err(SolveError::NotFound {
             trait_id: obligation.trait_id,
             self_ty: obligation.self_ty,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         });
     }
 
@@ -1009,7 +1010,7 @@ fn try_match_impl<'input>(
         solver_unify(ctx, *impl_arg, *ob_arg).map_err(|e| SolveError::Mismatch {
             expected: *ob_arg,
             found: *impl_arg,
-            span: crate::ast::Span::new(0, 0),
+            span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
             note: format!("unify failed: {e:?}"),
         })?;
     }
@@ -1045,7 +1046,7 @@ fn try_match_impl<'input>(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use smallvec::smallvec;

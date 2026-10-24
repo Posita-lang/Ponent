@@ -469,7 +469,7 @@ fn resolve_single_ast_type<'input>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
     use crate::hir::target::Target;

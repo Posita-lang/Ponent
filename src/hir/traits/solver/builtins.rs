@@ -1,17 +1,19 @@
 use crate::hir::types::{DefId, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
-use rustc_hash::FxHashMap as HashMap;
+use small_map::FxSmallMap;
 
 /// Registry of builtin trait DefIds, populated at startup.
-/// Maps DefId → BuiltinTrait for fast O(1) lookup during candidate assembly.
+/// Maps DefId → BuiltinTrait for fast lookup during candidate assembly.
+/// There are exactly 18 builtin traits (see `BuiltinTrait`), so an inline
+/// `FxSmallMap<32>` covers them with room to spare and never spills to heap.
 pub struct BuiltinTraitRegistry {
-    map: HashMap<DefId, BuiltinTrait>,
+    map: FxSmallMap<32, DefId, BuiltinTrait>,
 }
 
 impl BuiltinTraitRegistry {
     pub fn new() -> Self {
         BuiltinTraitRegistry {
-            map: HashMap::default(),
+            map: FxSmallMap::new(),
         }
     }
 

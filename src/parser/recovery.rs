@@ -132,7 +132,6 @@ impl<'src, 'input> Parser<'src, 'input> {
                 | Token::Constraint
                 | Token::Edition
                 | Token::Import
-                | Token::From
                 | Token::Extern
                 | Token::Comptime
                 | Token::Async
@@ -159,7 +158,6 @@ impl<'src, 'input> Parser<'src, 'input> {
             Token::Semicolon
                 | Token::RBrace
                 | Token::Import
-                | Token::From
                 | Token::Extern
                 | Token::Edition
                 | Token::Async
@@ -216,13 +214,19 @@ pub enum KeywordContext {
     Generic,
 }
 
-/// Compute Levenshtein distance between two strings.
-/// The limited edit distance with reusable buffers: returns the
-/// Levenshtein distance between `a` and `b`, or `limit + 1` if it
+/// Compute the Damerau-Levenshtein (OSA) distance between two strings.
+/// The limited edit distance with reusable buffer: returns the
+/// OSA distance between `a` and `b`, or `limit + 1` if it
 /// exceeds `limit` (the caller only cares whether it is within the
 /// limit, so the computation can stop early).  The row buffers are
 /// provided by the caller — the per-keyword allocation is avoided.
-pub(crate) fn edit_distance_limited_into(
+///
+/// A transposition transition stays on the same DP diagonal, so the
+/// `2*limit+1` band already contains every path of cost ≤ `limit`, and
+/// the "row entirely > limit → bail" early-exit still holds because every
+/// OSA transition adds ≥ 0.
+pub(crate) fn osa_distance_limited_into(
+    prev_prev: &mut Vec<usize>,
     prev: &mut Vec<usize>,
     curr: &mut Vec<usize>,
     a: &[char],
@@ -246,6 +250,8 @@ pub(crate) fn edit_distance_limited_into(
     prev.clear();
     prev.extend(0..=b_len);
     curr.resize(b_len + 1, overflow);
+    prev_prev.clear();
+    prev_prev.resize(b_len + 1, overflow);
     for (i, &ca) in a.iter().enumerate() {
         // Fill the whole row with the overflow sentinel up front so stale
         // values cannot leak between rows; the band below then overwrites
@@ -264,14 +270,19 @@ pub(crate) fn edit_distance_limited_into(
         for j in lo..=hi {
             let cb = b[j - 1];
             let cost = if ca == cb { 0 } else { 1 };
-            curr[j] = std::cmp::min(
+            let mut d = std::cmp::min(
                 std::cmp::min(curr[j - 1] + 1, prev[j] + 1),
                 prev[j - 1] + cost,
             );
+            if i >= 1 && j >= 2 && ca == b[j - 2] && a[i - 1] == cb {
+                d = std::cmp::min(d, prev_prev[j - 2] + 1);
+            }
+            curr[j] = d;
         }
         if (lo..=hi).all(|j| curr[j] > limit) {
             return overflow;
         }
+        std::mem::swap(prev_prev, prev);
         std::mem::swap(prev, curr);
     }
     let result = prev[b_len];
@@ -280,8 +291,8 @@ pub(crate) fn edit_distance_limited_into(
 
 /// Reusable scratch buffers for the keyword-suggestion engine.
 ///
-/// `did_you_mean_keyword` allocates four `Vec`s per call (input chars,
-/// keyword chars, and the two edit-distance rows).  For one-shot compiler
+/// `did_you_mean_keyword` allocates five `Vec`s per call (input chars,
+/// keyword chars, and the three edit-distance rows).  For one-shot compiler
 /// runs that is negligible, but in dense-diagnostic environments (IDE/LSP
 /// incremental re-parses, fuzzing malformed identifiers) suggestion
 /// generation runs many times per parse; owning the buffers lets callers
@@ -292,6 +303,8 @@ pub struct SuggestionBuffers {
     input_chars: Vec<char>,
     /// The current candidate keyword, refilled once per candidate.
     keyword_chars: Vec<char>,
+    /// Edit-distance DP row `i - 2`.
+    prev_prev: Vec<usize>,
     /// Edit-distance DP row `i - 1`.
     prev: Vec<usize>,
     /// Edit-distance DP row `i`.
@@ -320,6 +333,7 @@ pub fn did_you_mean_keyword_with_buffers(
     let SuggestionBuffers {
         input_chars,
         keyword_chars,
+        prev_prev,
         prev,
         curr,
     } = buffers;
@@ -418,7 +432,7 @@ pub fn did_you_mean_keyword_with_buffers(
         }
         keyword_chars.clear();
         keyword_chars.extend(kw.chars());
-        let d = edit_distance_limited_into(prev, curr, input_chars, keyword_chars, 2);
+        let d = osa_distance_limited_into(prev_prev, prev, curr, input_chars, keyword_chars, 2);
         if d <= 2 {
             match best {
                 None => best = Some((kw, d)),
@@ -438,7 +452,7 @@ pub fn did_you_mean_keyword_with_buffers(
             let threshold = input.len().max(3);
             keyword_chars.clear();
             keyword_chars.extend(kw.chars());
-            let d = edit_distance_limited_into(prev, curr, input_chars, keyword_chars, threshold);
+            let d = osa_distance_limited_into(prev_prev, prev, curr, input_chars, keyword_chars, threshold);
             if d <= threshold && (input.len() < 4 || d * 2 <= input.len()) {
                 match best {
                     None => best = Some((kw, d)),

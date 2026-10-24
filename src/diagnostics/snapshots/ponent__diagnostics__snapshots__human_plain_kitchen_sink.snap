@@ -1,0 +1,36 @@
+---
+source: src/diagnostics/snapshots.rs
+expression: out
+---
++- error[E030,E019]: 1. return type mismatch
+|                       2. duplicate definition of `i`
+|  +- example.ps:3:2
+|  |
+|1 | def foo(x: Bool) -> Int<32> {
+|  | ~~~~~~~~ ^^^^^^^^^^^^^^^^^^^^
+|  | declared to return Int<32>
+|2 |     set j = x;
+|  | ^^^^^^^^^^^^^^
+|  | |
+|3 |     set i = j + 1; // 中
+|  | ^^^^^^^^^^^^^^^^^^^^^^^^
+|  |     ~~~~~~~~~~~~~
+|  |     ^^^^^^^^^^^^^^^^^^^^
+|  | duplicate definition of `i` [E019]
+|  | |
+|4 |     return i;
+|  | ^^^^^^     ^
+|  | ^^^^^^^
+|  | |
+|  | | this is Bool
+|  | |
+|  | | spans four lines
+|  | |
+|  | |
+|5 | }
+|  \-
+|  = note: expected Int<32>
+|  = note: cast with `as`
+|  = help: change the return type
+referenced by:
+    main: example.ps:1:1

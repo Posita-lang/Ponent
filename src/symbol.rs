@@ -8,6 +8,7 @@
 // comparison is a single `u32` comparison — no string allocation, no
 // hashing, no pointer chasing.
 
+use arrayvec::ArrayString;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -45,6 +46,20 @@ impl Symbol {
         }
         drop(guard);
         INTERNER.write().intern(s)
+    }
+
+    /// Intern `prefix` + `name` as one symbol without allocating on the
+    /// probe path.  Used for lifetimes (`'a`) and loop labels (`@outer`):
+    /// the common case is a symbol that already exists, which `format!`
+    /// would re-allocate only to hash and discard.  A 64-byte stack buffer
+    /// covers every realistic name; longer ones fall back to `format!`.
+    pub fn intern_prefixed(prefix: char, name: &str) -> Self {
+        let mut buf = ArrayString::<64>::new();
+        if buf.try_push(prefix).is_ok() && buf.try_push_str(name).is_ok() {
+            Self::intern(buf.as_str())
+        } else {
+            Self::intern(&format!("{}{}", prefix, name))
+        }
     }
 
     /// Retrieve the string representation of this symbol.
@@ -141,8 +156,8 @@ impl Interner {
 //
 // Reads (`as_str` / `eq_str`) take the read lock; `intern` probes under a
 // read lock and only upgrades on a miss.
-static INTERNER: std::sync::LazyLock<parking_lot::RwLock<Interner>> =
-    std::sync::LazyLock::new(|| parking_lot::RwLock::new(Interner::new()));
+static INTERNER: std::sync::LazyLock<crate::sync::RwLock<Interner>> =
+    std::sync::LazyLock::new(|| crate::sync::RwLock::new(Interner::new()));
 
 /// Pre-intern common keywords and built-in type names so that
 /// the parser and type checker can use `Symbol::from("fn")` etc.
@@ -160,7 +175,7 @@ pub fn pre_intern_builtins() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
 
