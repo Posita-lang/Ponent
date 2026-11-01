@@ -685,20 +685,6 @@ pub(crate) struct DepShard {
     /// lookup away via this vector, so edges stay plain `DepNodeIndex`
     /// pairs and the hot read path stays lock-free.
     classes: Vec<ContentClass>,
-    /// Verified generation stamp for transitive green verification.
-    /// When a node's transitive dependencies are verified green, we
-    /// stamp it with the current `dirty_generation`.  Subsequent hits
-    /// can skip re-walking edges as long as `verified_gen >=
-    /// dirty_generation`.  This keeps steady-state hits O(1).
-    verified_gen: Vec<u64>,
-    /// Per-level durability stamp: when a node's closure verifies green,
-    /// this is set to `rev[node.dur]` (the node's durability at stamp
-    /// time).  The durability fast path serves without re-walking while
-    /// `verified_lvl >= rev[node.dur]` — see the `rev` field.  A node
-    /// whose durability later lowers (finish-time aggregation) compares
-    /// its old HIGH stamp against a faster-moving lower counter, which
-    /// can only FAIL the fast path — the conservative direction.
-    verified_lvl: Vec<u64>,
     /// Per-node caller-provided input digest, recorded by the digest-gated
     /// invalidation API ([`DepGraph::digest_gate`]).  `None` = no digest
     /// recorded yet (the gate then invalidates conservatively).  Plain
@@ -706,16 +692,6 @@ pub(crate) struct DepShard {
     /// `mutate_world` quiescence and nothing else reads it, so no
     /// lock-free discipline is needed.
     digests: Vec<Option<u64>>,
-    /// Per-node "finish in progress" flag (d24).  Set before a freshly
-    /// computed value is staged into the cache and cleared after the
-    /// finish tail (post-flush re-check) completes.  A transitive
-    /// verifier that reaches a node with this flag set treats it as
-    /// dirty: the node's colour is not yet final, and serving the staged
-    /// value could hand out a pre-invalidation snapshot — the residual
-    /// sub-window `[in-section colour decision .. post-flush re-check]`
-    /// where a mark landing on a read node could otherwise be invisible
-    /// to a getter whose verify runs inside the window.
-    finishing: Vec<AtomicBool>,
 }
 
 #[inline(always)]
@@ -781,7 +757,9 @@ fn reconcile_forward_edges(
     removed
 }
 
-/// Grow a shard's slot vectors so `slot` is a valid index in all four.
+/// Grow a shard's five slot vectors so `slot` is a valid index in all of
+/// them.  The stamp/finishing slots live in the append-only `stamps`
+/// table, so they are not resized here.
 #[inline]
 fn ensure_shard_len(shard: &mut DepShard, slot: usize) {
     if slot >= shard.edges.len() {
@@ -789,12 +767,7 @@ fn ensure_shard_len(shard: &mut DepShard, slot: usize) {
         shard.rev_edges.resize_with(slot + 1, SmallVec::new);
         shard.fingerprints.resize_with(slot + 1, || None);
         shard.classes.resize_with(slot + 1, ContentClass::default);
-        shard.verified_gen.resize_with(slot + 1, || 0);
-        shard.verified_lvl.resize_with(slot + 1, || 0);
         shard.digests.resize_with(slot + 1, || None);
-        shard
-            .finishing
-            .resize_with(slot + 1, || AtomicBool::new(false));
     }
 }
 
@@ -847,6 +820,16 @@ const DIRTY_INIT_BLOCKS: usize = 64;
 /// path to a genuinely enormous graph.  Do not "unify" this back with
 /// `DIRTY_INIT_BLOCKS` — the asymmetry is the whole point.
 const EPOCH_INIT_BLOCKS: usize = 4;
+
+/// Blocks of the per-node stamp table allocated up front.  A stamp slot
+/// carries two `AtomicU64`s plus the d24 `AtomicBool` (24 bytes), so one
+/// 4096-slot block is ~96 KiB — comparable to an epoch block, and far
+/// smaller than the 2 MiB the old in-shard vectors could reach.  Sized
+/// separately from [`DIRTY_INIT_BLOCKS`] for the same reason as
+/// [`EPOCH_INIT_BLOCKS`]: the tables have different per-node costs and a
+/// shared constant over-allocates the expensive ones.  Growth is
+/// append-only and doubles, so one block is enough head start.
+const STAMP_INIT_BLOCKS: usize = 1;
 
 /// One 4096-node bit block of the dirty bitmap: 64 `AtomicU64` words ×
 /// 64 bits.  Blocks are individually `Arc`-allocated so that regrowth
@@ -1038,6 +1021,23 @@ impl std::ops::Deref for EpochSnap<'_> {
     }
 }
 
+/// Cached view of the stamps table for one use, mirroring `DirtySnap`
+/// (same borrow-fencing protocol — see `DirtySnap`).
+enum StampSnap<'a> {
+    Cached(std::cell::Ref<'a, Vec<Arc<StampBlock>>>),
+    Owned(Arc<Vec<Arc<StampBlock>>>),
+}
+
+impl std::ops::Deref for StampSnap<'_> {
+    type Target = Vec<Arc<StampBlock>>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            StampSnap::Cached(r) => r,
+            StampSnap::Owned(a) => a,
+        }
+    }
+}
+
 /// One block of per-node dirty epochs: one `AtomicU64` per node, 4096
 /// nodes per block (same blocking as the dirty bitmap, so `block_of`
 /// indexes both).  Grown in lockstep with `dirty` under the same
@@ -1054,6 +1054,66 @@ fn zero_epoch_block() -> Arc<EpochBlock> {
 /// Which `AtomicU64` within an [`EpochBlock`] owns `idx`.
 #[inline]
 fn epoch_word_of(idx: u32) -> usize {
+    (idx & 4095) as usize
+}
+
+/// One per-node stamp slot in the append-only `stamps` table.
+///
+/// `verified_gen` is stamped with `dirty_generation` after a transitive
+/// green verification; a hit skips the closure walk while it is `>=` the
+/// reader's current generation.  `verified_lvl` is the per-level
+/// durability stamp (`rev[node.dur]` at stamp time); the durability fast
+/// path serves while it is `>= rev[node.dur]`.  A later durability
+/// lowering compares an old HIGH stamp against a faster lower counter,
+/// which only fails conservatively.
+///
+/// The two counters are SEPARATE words, deliberately not packed.  The
+/// generation check is a complete verdict on its own, and a stale level
+/// stamp can only cause an extra walk.  A reader can see a new generation
+/// with an old level (the generation is sufficient) or an old generation
+/// with a new level (the level certificate is independently valid:
+/// `rev` advances only with a generation bump, and a level stamp is
+/// written only after a stable green walk).  Neither torn combination is
+/// unsound, so pair-atomicity buys nothing and would cost counter width.
+///
+/// `finishing` is d24: set before a freshly computed value is staged into
+/// the cache, cleared after the finish tail.  A verifier that reaches a
+/// finishing node treats it as dirty; the node's colour is not final and
+/// serving the staged value could hand out a pre-invalidation snapshot in
+/// the residual window `[in-section colour decision .. post-flush
+/// re-check]`.  The read order in `verify_inner` is load-bearing:
+/// finishing FIRST, then `verified_gen`, then `verified_lvl`.
+#[derive(Debug)]
+struct StampSlot {
+    finishing: AtomicBool,
+    verified_gen: AtomicU64,
+    verified_lvl: AtomicU64,
+}
+
+impl StampSlot {
+    const fn new() -> Self {
+        Self {
+            finishing: AtomicBool::new(false),
+            verified_gen: AtomicU64::new(0),
+            verified_lvl: AtomicU64::new(0),
+        }
+    }
+}
+
+/// One block of the per-node stamp table: same 4096-node blocking as the
+/// dirty bitmap and epoch table, so [`block_of`] indexes all three.
+/// Blocks are `Arc`-shared and append-only; a stamp write racing a
+/// regrowth lands on a block every later snapshot still points at.
+type StampBlock = [StampSlot; 4096];
+
+#[inline]
+fn zero_stamp_block() -> Arc<StampBlock> {
+    Arc::new([const { StampSlot::new() }; 4096])
+}
+
+/// Which [`StampSlot`] within a [`StampBlock`] owns `idx`.
+#[inline]
+fn stamp_word_of(idx: u32) -> usize {
     (idx & 4095) as usize
 }
 
@@ -1170,48 +1230,61 @@ pub struct DepGraph<S: Scheduler> {
     /// reader's value may encode a pre-invalidation snapshot, and the
     /// reader is restored red instead of being published green stale.
     epochs: ArcSwap<Vec<Arc<EpochBlock>>>,
+    /// Per-node verification stamps and d24 finishing flags, blocked and
+    /// grown with `dirty`/`epochs` (same `block_of` indexing, same
+    /// append-only `ArcSwap` discipline — see `dirty` for why that makes
+    /// lock-free access racing a regrowth safe).
+    ///
+    /// This is the lock-free replacement for the old per-shard
+    /// `verified_gen`/`verified_lvl`/`finishing` vectors: a cache hit
+    /// reads one stable [`StampSlot`] instead of taking the node shard's
+    /// read lock.  See [`StampSlot`] for the counter and d24 invariants.
+    stamps: ArcSwap<Vec<Arc<StampBlock>>>,
     /// Global dirty generation counter.  Incremented on every
     /// `invalidate()`.  Nodes verified transitively green are stamped
     /// with this generation; hits skip re-verification when
     /// `node.verified_gen >= dirty_generation`.
     dirty_generation: AtomicU64,
-    /// Monotonic version of the dirty/epochs guard identity.
+    /// Monotonic version of the dirty/epochs/stamps guard identity.
     ///
     /// # Sustaining invariant
     ///
-    /// **Every `dirty.store(...)` AND every `epochs.store(...)` site MUST
-    /// `fetch_add(1, Release)` this counter after the LAST store of the
-    /// sequence.** There are exactly two store sequences (the grow path that
-    /// appends a block to each table, and the quiesced [`Self::reset`] that
-    /// swaps in fresh tables). The store-then-bump order lets snapshot
-    /// readers treat a matching generation as proof that their cached guards
-    /// observe every block the live tables had at some instant within the
-    /// generation, and treat a mismatch as a signal to reload. See
-    /// `dirty_snapshot` for the soundness argument. One counter covers both
-    /// tables because every sequence stores both (grow) or swaps both
-    /// (reset) — the bump always comes after ALL of the sequence's stores.
-    /// The two sites are tagged `INVARIANT ANCHOR — table_gen::{grow,reset}`
-    /// so a grep audit can confirm nothing escaped untagged; a future third
+    /// **Every `dirty.store(...)`, `epochs.store(...)` AND
+    /// `stamps.store(...)` site MUST `fetch_add(1, Release)` this counter
+    /// after the LAST store of the sequence.** There are exactly two store
+    /// sequences (the grow path that appends blocks to each table, and the
+    /// quiesced [`Self::reset`] that swaps in fresh tables). The
+    /// store-then-bump order lets snapshot readers treat a matching
+    /// generation as proof that their cached guards observe every block the
+    /// live tables had at some instant within the generation, and treat a
+    /// mismatch as a signal to reload. See `dirty_snapshot` for the
+    /// soundness argument. One counter covers all three tables because
+    /// every sequence stores all three (grow) or swaps all three (reset) —
+    /// the bump always comes after ALL of the sequence's stores. The two
+    /// sites are tagged `INVARIANT ANCHOR — table_gen::{grow,reset}` so a
+    /// grep audit can confirm nothing escaped untagged; a future fourth
     /// table or one-table store sequence would silently break
-    /// `dirty_snapshot`/`epochs_snapshot` otherwise.
+    /// `dirty_snapshot`/`epochs_snapshot`/`stamps_snapshot` otherwise.
     table_gen: AtomicU64,
-    /// Per-thread cache of the [`Self::dirty`] and [`Self::epochs`] guards,
-    /// keyed by generation.
+    /// Per-thread cache of the [`Self::dirty`], [`Self::epochs`] and
+    /// [`Self::stamps`] guards, keyed by generation.
     ///
     /// A fresh `ArcSwap` load costs an atomic pointer load plus an [`Arc`]
     /// refcount increment/decrement pair on a hot shared line.
-    /// `is_green` runs once per cache hit *and* once per miss level, and
-    /// `with_epoch_word` runs several times per miss level, so the cache
-    /// holds `(generation, dirty guard, epochs guard)` per thread and the
-    /// snapshot helpers validate with a single read-only `Acquire` load of
-    /// `table_gen`. Field (not `thread_local!`): `DepGraph<S>` is
-    /// generic over the scheduler, and the macro cannot capture outer
-    /// generics.
+    /// `is_green` runs once per cache hit *and* once per miss level,
+    /// `with_epoch_word` runs several times per miss level, and
+    /// `verify_inner` now reads a stamp slot on every hit, so the cache
+    /// holds `(generation, dirty guard, epochs guard, stamps guard)` per
+    /// thread and the snapshot helpers validate with a single read-only
+    /// `Acquire` load of `table_gen`. Field (not `thread_local!`):
+    /// `DepGraph<S>` is generic over the scheduler, and the macro cannot
+    /// capture outer generics.
     dirty_table_cache: thread_local::ThreadLocal<
         std::cell::RefCell<(
             u64,
             Option<Arc<Vec<Arc<DirtyBlock>>>>,
             Option<Arc<Vec<Arc<EpochBlock>>>>,
+            Option<Arc<Vec<Arc<StampBlock>>>>,
         )>,
     >,
     /// Per-durability-level mark counters.  `rev[l]` counts every 0→1
@@ -1484,10 +1557,7 @@ impl<S: Scheduler> DepGraph<S> {
                         rev_edges: Vec::new(),
                         fingerprints: Vec::new(),
                         classes: Vec::new(),
-                        verified_gen: Vec::new(),
-                        verified_lvl: Vec::new(),
                         digests: Vec::new(),
-                        finishing: Vec::new(),
                     }))
                 })
                 .collect(),
@@ -1495,6 +1565,9 @@ impl<S: Scheduler> DepGraph<S> {
             dirty: ArcSwap::from_pointee((0..DIRTY_INIT_BLOCKS).map(|_| zero_block()).collect()),
             epochs: ArcSwap::from_pointee(
                 (0..EPOCH_INIT_BLOCKS).map(|_| zero_epoch_block()).collect(),
+            ),
+            stamps: ArcSwap::from_pointee(
+                (0..STAMP_INIT_BLOCKS).map(|_| zero_stamp_block()).collect(),
             ),
             dirty_generation: AtomicU64::new(0),
             table_gen: AtomicU64::new(0),
@@ -1542,7 +1615,8 @@ impl<S: Scheduler> DepGraph<S> {
         // table the caller's lock already pinned.
         let cur = self.dirty.load(); // caller holds the grow lock
         let ecur = self.epochs.load(); // same critical section
-        // Both tables must be adequate for the early return to fire.
+        let scur = self.stamps.load(); // same critical section
+        // All three tables must be adequate for the early return to fire.
         // `EPOCH_INIT_BLOCKS < DIRTY_INIT_BLOCKS` means the two start out
         // asymmetric (the epochs head start is small on purpose — 32 KiB a
         // block), so a dirty-only check used to return with the epoch table
@@ -1558,13 +1632,21 @@ impl<S: Scheduler> DepGraph<S> {
         // in both tables is exactly "the node about to escape has an epoch
         // word".  `reset` leaves `dirty` longer than `epochs` at rest, but
         // those extra blocks cover only never-allocated indices.
-        if cur.len() >= need && ecur.len() >= need {
+        if cur.len() >= need && ecur.len() >= need && scur.len() >= need {
             return;
         }
         let new_len = need
             .next_power_of_two()
             .max(cur.len().max(ecur.len()) * 2)
             .max(DIRTY_INIT_BLOCKS);
+        // The stamp table has its own per-node cost (two `AtomicU64`s plus
+        // the d24 flag), so it must NOT inherit the dirty table's
+        // `DIRTY_INIT_BLOCKS` floor.  Size it independently and let it
+        // double from its own resting length.
+        let stamp_new_len = need
+            .next_power_of_two()
+            .max(scur.len() * 2)
+            .max(STAMP_INIT_BLOCKS);
         // Store the EPOCH blocks first.  `grow_dirty` only ever grows, so
         // the only possible transient skew is `dirty.len() < epochs.len()`;
         // any operation on a not-yet-covered slot then degrades to the
@@ -1584,18 +1666,31 @@ impl<S: Scheduler> DepGraph<S> {
         v.extend(cur.iter().cloned());
         v.extend((cur.len()..new_len).map(|_| zero_block()));
         self.dirty.store(Arc::new(v));
+
+        // Stamps last: a missing stamp slot degrades to "no stamp" (a
+        // walk), so its position relative to dirty/epochs is not
+        // safety-critical.  It still must be stored before the shared
+        // generation bump below, or a snapshot could accept a stale stamp
+        // guard.
+        let scur = self.stamps.load(); // re-load under the lock
+        let mut sv: Vec<Arc<StampBlock>> = Vec::with_capacity(stamp_new_len);
+        sv.extend(scur.iter().cloned());
+        sv.extend((scur.len()..stamp_new_len).map(|_| zero_stamp_block()));
+        self.stamps.store(Arc::new(sv));
+
         // Every table store must bump the shared generation (Release)
-        // AFTER the last store of the sequence — see `table_gen`. Both
-        // tables were stored above, so one bump covers both.
+        // AFTER the last store of the sequence — see `table_gen`. All
+        // three tables were stored above, so one bump covers all three.
         //
         // INVARIANT ANCHOR — table_gen::grow
         // Grep this tag (with `table_gen::reset` below) to audit every
-        // `dirty.store` / `epochs.store` site in this file: each site must
-        // be followed by exactly one `table_gen.fetch_add(1, Release)`
-        // placed after ALL of that sequence's stores.  A new site touching
-        // only ONE table would break the invariant silently — the cached
-        // slot's `(gen, dirty, epochs)` triplet would then be accepted
-        // with one table at the new generation and the other at the old.
+        // `dirty.store` / `epochs.store` / `stamps.store` site in this
+        // file: each site must be followed by exactly one
+        // `table_gen.fetch_add(1, Release)` placed after ALL of that
+        // sequence's stores.  A new site touching only ONE table would
+        // break the invariant silently — the cached slot's
+        // `(gen, dirty, epochs, stamps)` tuple would then be accepted
+        // with one table at the new generation and another at the old.
         self.table_gen.fetch_add(1, Ordering::Release);
     }
 
@@ -1851,7 +1946,7 @@ impl<S: Scheduler> DepGraph<S> {
         let tbl_gen = self.table_gen.load(Ordering::Acquire);
         let cell = self
             .dirty_table_cache
-            .get_or(|| std::cell::RefCell::new((u64::MAX, None, None)));
+            .get_or(|| std::cell::RefCell::new((u64::MAX, None, None, None)));
         if let Ok(r) = cell.try_borrow() {
             if r.0 == tbl_gen {
                 if let Ok(mapped) = std::cell::Ref::filter_map(r, |t| t.1.as_ref().map(|a| &**a)) {
@@ -1862,11 +1957,23 @@ impl<S: Scheduler> DepGraph<S> {
         loop {
             let g1 = self.table_gen.load(Ordering::Acquire);
             let full = self.dirty.load_full();
+            // Refresh EVERY table in the shared slot, not just this one.
+            // The slot is keyed by the single `table_gen`, which advances
+            // only after all three stores.  A partial refresh would leave
+            // the other fields at the previous generation while stamping
+            // the slot with the new one, and the next helper's `Cached`
+            // fast path would then hand back a pre-reset table.  Loading
+            // all three here is cheap: this slow path runs only on
+            // grow/reset, never on a hit.
+            let epochs = self.epochs.load_full();
+            let stamps = self.stamps.load_full();
             let g2 = self.table_gen.load(Ordering::Acquire);
             if g1 == g2 {
                 if let Ok(mut w) = cell.try_borrow_mut() {
                     w.0 = g2;
                     w.1 = Some(Arc::clone(&full));
+                    w.2 = Some(epochs);
+                    w.3 = Some(stamps);
                 }
                 return DirtySnap::Owned(full);
             }
@@ -1883,7 +1990,7 @@ impl<S: Scheduler> DepGraph<S> {
         let tbl_gen = self.table_gen.load(Ordering::Acquire);
         let cell = self
             .dirty_table_cache
-            .get_or(|| std::cell::RefCell::new((u64::MAX, None, None)));
+            .get_or(|| std::cell::RefCell::new((u64::MAX, None, None, None)));
         if let Ok(r) = cell.try_borrow() {
             if r.0 == tbl_gen {
                 if let Ok(mapped) = std::cell::Ref::filter_map(r, |t| t.2.as_ref().map(|a| &**a)) {
@@ -1894,13 +2001,59 @@ impl<S: Scheduler> DepGraph<S> {
         loop {
             let g1 = self.table_gen.load(Ordering::Acquire);
             let full = self.epochs.load_full();
+            // All-or-nothing refresh of the shared slot — see
+            // `dirty_snapshot`'s slow path for why a partial refresh
+            // would let the shared `table_gen` certify a stale sibling.
+            let dirty = self.dirty.load_full();
+            let stamps = self.stamps.load_full();
             let g2 = self.table_gen.load(Ordering::Acquire);
             if g1 == g2 {
                 if let Ok(mut w) = cell.try_borrow_mut() {
                     w.0 = g2;
+                    w.1 = Some(dirty);
                     w.2 = Some(Arc::clone(&full));
+                    w.3 = Some(stamps);
                 }
                 return EpochSnap::Owned(full);
+            }
+        }
+    }
+
+    /// Generation-validated snapshot of the stamps table: same protocol
+    /// as [`Self::dirty_snapshot`] (shared `table_gen`, shared slot, same
+    /// append-only soundness argument).  A missing stamp block degrades
+    /// to the conservative "no stamp" arm — the verifier walks — and a
+    /// missing slot after `reset` cannot inherit a pre-reset stamp.
+    #[inline]
+    fn stamps_snapshot(&self) -> StampSnap<'_> {
+        let tbl_gen = self.table_gen.load(Ordering::Acquire);
+        let cell = self
+            .dirty_table_cache
+            .get_or(|| std::cell::RefCell::new((u64::MAX, None, None, None)));
+        if let Ok(r) = cell.try_borrow() {
+            if r.0 == tbl_gen {
+                if let Ok(mapped) = std::cell::Ref::filter_map(r, |t| t.3.as_ref().map(|a| &**a)) {
+                    return StampSnap::Cached(mapped);
+                }
+            }
+        }
+        loop {
+            let g1 = self.table_gen.load(Ordering::Acquire);
+            let full = self.stamps.load_full();
+            // All-or-nothing refresh of the shared slot — see
+            // `dirty_snapshot`'s slow path for why a partial refresh
+            // would let the shared `table_gen` certify a stale sibling.
+            let dirty = self.dirty.load_full();
+            let epochs = self.epochs.load_full();
+            let g2 = self.table_gen.load(Ordering::Acquire);
+            if g1 == g2 {
+                if let Ok(mut w) = cell.try_borrow_mut() {
+                    w.0 = g2;
+                    w.1 = Some(dirty);
+                    w.2 = Some(epochs);
+                    w.3 = Some(Arc::clone(&full));
+                }
+                return StampSnap::Owned(full);
             }
         }
     }
@@ -3032,10 +3185,7 @@ impl<S: Scheduler> DepGraph<S> {
                     taken_rev,
                     taken_fp,
                     taken_classes,
-                    taken_vgen,
-                    taken_vlvl,
                     taken_digests,
-                    taken_finishing,
                 ),
                 _t,
             ) = self.with_shard_w(i, self.ticket(), |sh| {
@@ -3044,41 +3194,14 @@ impl<S: Scheduler> DepGraph<S> {
                     std::mem::take(&mut sh.rev_edges),
                     std::mem::take(&mut sh.fingerprints),
                     std::mem::take(&mut sh.classes),
-                    // verified_gen MUST be cleared too: `next_index` restarts at
-                    // 1, so freshly allocated nodes reuse indices whose slots
-                    // still hold pre-reset stamps — a new node would inherit a
-                    // claim that its (not yet recorded) closure was verified,
-                    // and the `vg >= current_gen` fast path would serve stale
-                    // cache entries without ever walking the closure.
-                    std::mem::take(&mut sh.verified_gen),
-                    // Per-level durability stamps die with the generation stamps:
-                    // post-reset every `rev` counter restarts at 0 below, so a
-                    // surviving stamp (== some pre-reset counter value) would
-                    // compare `>= 0` and fast-path every reused node without a
-                    // walk — the per-level twin of the `verified_gen` trap above.
-                    std::mem::take(&mut sh.verified_lvl),
                     // Digest gate state dies with everything else: a reused node
                     // index must not inherit a pre-reset digest (it would let the
                     // gate skip an invalidation for content that never fed the
                     // old node's value).
                     std::mem::take(&mut sh.digests),
-                    // Same for the finish-in-progress flags: post-reset no node
-                    // is finishing (quiescence guarantees no compute is in
-                    // flight), and a stale `true` would make the reused index
-                    // unverifiable until something cleared it.
-                    std::mem::take(&mut sh.finishing),
                 )
             });
-            drop((
-                taken_edges,
-                taken_rev,
-                taken_fp,
-                taken_classes,
-                taken_vgen,
-                taken_vlvl,
-                taken_digests,
-                taken_finishing,
-            ));
+            drop((taken_edges, taken_rev, taken_fp, taken_classes, taken_digests));
         }
         // Append-only bitmap: swap in a fresh zero bitmap under the
         // growth lock.  A mark racing this reset lands on the replaced
@@ -3124,14 +3247,27 @@ impl<S: Scheduler> DepGraph<S> {
         self.epochs.store(Arc::new(
             (0..EPOCH_INIT_BLOCKS).map(|_| zero_epoch_block()).collect(),
         ));
+        // Stamp slots reset with the generation and epoch tables.  This is
+        // what prevents a reused index from inheriting a pre-reset
+        // `verified_gen` (the `vg >= current_gen` fast path would serve a
+        // stale cache entry without walking), a pre-reset `verified_lvl`
+        // (every `rev` restarts at 0, so `vl >= 0` would fast-path every
+        // reused node), or a stale `finishing == true` (the reused index
+        // would be unverifiable until something cleared it).  Quiescence
+        // guarantees no compute or verification is in flight, so the swap
+        // is safe.
+        self.stamps.store(Arc::new(
+            (0..STAMP_INIT_BLOCKS).map(|_| zero_stamp_block()).collect(),
+        ));
         // Shared-generation bump AFTER the last store of the sequence —
-        // see `table_gen`. Both tables were swapped above, so one bump
-        // covers both and no thread can cache a mixed old/new pair.
+        // see `table_gen`. All three tables were swapped above, so one bump
+        // covers all three and no thread can cache a mixed old/new tuple.
         //
         // INVARIANT ANCHOR — table_gen::reset
         // Second and last store sequence in this file.  A grep audit
-        // (`dirty.store`, `epochs.store`) must find exactly two anchors.
-        // See the grow anchor's note for why the pairing matters.
+        // (`dirty.store`, `epochs.store`, `stamps.store`) must find exactly
+        // two anchors.  See the grow anchor's note for why the pairing
+        // matters.
         self.table_gen.fetch_add(1, Ordering::Release);
         // Thread-local: this clears ONLY the calling thread's stack.
         // Sound because `reset` runs under quiescence (`clear_all` →
@@ -3149,10 +3285,13 @@ impl<S: Scheduler> DepGraph<S> {
     /// that would let its later hits skip the closure walk entirely.
     #[cfg(test)]
     pub(crate) fn verified_gen_of(&self, node: DepNodeIndex) -> u64 {
-        let (r, _t) = self.with_shard_r(shard_of(node), self.ticket(), |shard| {
-            shard.verified_gen.get(slot_of(node)).copied().unwrap_or(0)
-        });
-        r
+        let snap = self.stamps_snapshot();
+        snap.get(block_of(node.0))
+            .map_or(0, |b| {
+                b[stamp_word_of(node.0)]
+                    .verified_gen
+                    .load(Ordering::Acquire)
+            })
     }
 
     /// Test-only view of a per-level mark counter.
@@ -3164,10 +3303,13 @@ impl<S: Scheduler> DepGraph<S> {
     /// Test-only view of a node's per-level durability stamp.
     #[cfg(test)]
     pub(crate) fn verified_lvl_of(&self, node: DepNodeIndex) -> u64 {
-        let (r, _t) = self.with_shard_r(shard_of(node), self.ticket(), |shard| {
-            shard.verified_lvl.get(slot_of(node)).copied().unwrap_or(0)
-        });
-        r
+        let snap = self.stamps_snapshot();
+        snap.get(block_of(node.0))
+            .map_or(0, |b| {
+                b[stamp_word_of(node.0)]
+                    .verified_lvl
+                    .load(Ordering::Acquire)
+            })
     }
 
     /// Test hook for the cross-system leak regression: the forward edges
@@ -3218,17 +3360,20 @@ impl<S: Scheduler> DepGraph<S> {
     /// serve the staged value while a late mark on a read node could still
     /// invalidate it (d24).
     ///
-    /// Takes a shard READ lock: the flag lives in an `AtomicBool`, so
-    /// interior mutability makes a read guard sufficient.  No write lock
-    /// is ever held across `set_finishing`/`clear_finishing`, so the
-    /// unwind-safety argument holds.
+    /// The flag lives in the append-only `stamps` table, so this is a
+    /// lock-free `Release` store into a stable slot — no shard read lock
+    /// and no write lock held across `set_finishing`/`clear_finishing`,
+    /// so the unwind-safety argument still holds.  A missing slot is a
+    /// no-op: that can only happen after `reset`, which is quiesced and
+    /// clears every cached value anyway.
     #[inline]
     pub(crate) fn set_finishing(&self, node: DepNodeIndex) {
-        let (_, _t) = self.with_shard_r(shard_of(node), self.ticket(), |shard| {
-            if let Some(f) = shard.finishing.get(slot_of(node)) {
-                f.store(true, Ordering::Release);
-            }
-        });
+        let snap = self.stamps_snapshot();
+        if let Some(b) = snap.get(block_of(node.0)) {
+            b[stamp_word_of(node.0)]
+                .finishing
+                .store(true, Ordering::Release);
+        }
     }
 
     /// Clear the "finish in progress" flag: the node's colour is now
@@ -3236,23 +3381,20 @@ impl<S: Scheduler> DepGraph<S> {
     /// re-check).
     #[inline]
     pub(crate) fn clear_finishing(&self, node: DepNodeIndex) {
-        let (_, _t) = self.with_shard_r(shard_of(node), self.ticket(), |shard| {
-            if let Some(f) = shard.finishing.get(slot_of(node)) {
-                f.store(false, Ordering::Release);
-            }
-        });
+        let snap = self.stamps_snapshot();
+        if let Some(b) = snap.get(block_of(node.0)) {
+            b[stamp_word_of(node.0)]
+                .finishing
+                .store(false, Ordering::Release);
+        }
     }
 
     /// Test-only view of a node's finishing flag.
     #[cfg(test)]
     pub(crate) fn is_finishing(&self, node: DepNodeIndex) -> bool {
-        let (r, _t) = self.with_shard_r(shard_of(node), self.ticket(), |shard| {
-            shard
-                .finishing
-                .get(slot_of(node))
-                .is_some_and(|f| f.load(Ordering::Acquire))
-        });
-        r
+        let snap = self.stamps_snapshot();
+        snap.get(block_of(node.0))
+            .is_some_and(|b| b[stamp_word_of(node.0)].finishing.load(Ordering::Acquire))
     }
 
     /// Returns the first dirty
@@ -3412,76 +3554,51 @@ impl<S: Scheduler> DepGraph<S> {
             })
         };
         {
-            let (verdict, _t) = self.with_shard_r(shard_of(node), self.ticket(), |shard| {
-                // NEW (d24): a finish tail in flight — the colour is not
-                // final yet, and the staged value must not be served.  This
-                // check MUST precede the `verified_gen` fast path: a
-                // finishing node must never be fast-pathed on a stamp.
-                if shard
-                    .finishing
-                    .get(slot_of(node))
-                    .is_some_and(|f| f.load(Ordering::Acquire))
-                {
-                    return Some(node);
-                }
-                if shard.verified_gen.get(slot_of(node)).copied().unwrap_or(0) >= current_gen {
+            let snap = self.stamps_snapshot();
+            let slot = snap
+                .get(block_of(node.0))
+                .map(|b| &b[stamp_word_of(node.0)]);
+            // NEW (d24): a finish tail in flight — the colour is not final
+            // yet, and the staged value must not be served.  This check MUST
+            // precede the `verified_gen` fast path: a finishing node must
+            // never be fast-pathed on a stamp.  The stamp slot is stable
+            // (append-only table), so these are three lock-free Acquire
+            // loads; the read order is load-bearing.
+            if slot.is_some_and(|s| s.finishing.load(Ordering::Acquire)) {
+                return Some(node);
+            }
+            if slot.map_or(0, |s| s.verified_gen.load(Ordering::Acquire)) >= current_gen {
+                return None;
+            }
+            // Durability fast path (structural soundness — see
+            // `Durability`): the closure was verified at per-level stamp
+            // `verified_lvl`, and no mark of durability >= this node's has
+            // linearized since (`rev`'s RMW is the level's linearization
+            // point — a reader loading a lower value linearizes before the
+            // mark, the same overlap doctrine as the global check above).
+            // Sound because the finish-time aggregation plus the reverse-edge
+            // propagation (`propagate_lowering`) maintain `stored(X) <= min
+            // over closure(X) of stored`: a mark of any closure node then
+            // bumps this level's counter and kills the stamp.  Every existing
+            // query is LOW, so this disjunct only ever fires for queries that
+            // opted in; the seqlock-fallback walk disables it.
+            if allow_durability_fast_path {
+                let vl = slot.map_or(0, |s| s.verified_lvl.load(Ordering::Acquire));
+                if vl >= self.rev[dur_of(node) as usize].load(Ordering::Acquire) {
                     return None;
                 }
-                // Durability fast path (structural soundness — see
-                // `Durability`): the closure was verified at per-level stamp
-                // `verified_lvl`, and no mark of durability >= this node's
-                // has linearized since (`rev`'s RMW is the level's
-                // linearization point — a reader loading a lower value
-                // linearizes before the mark, the same overlap doctrine as
-                // the global check above).  Sound because the finish-time
-                // aggregation plus the reverse-edge propagation
-                // (`propagate_lowering`) maintain `stored(X) <= min over
-                // closure(X) of stored`: a mark of any closure node then
-                // bumps this level's counter and kills the stamp.  Every
-                // existing query is LOW, so this disjunct only ever fires for
-                // queries that opted in; the seqlock-fallback walk disables
-                // it.
-                if allow_durability_fast_path {
-                    let vl = shard.verified_lvl.get(slot_of(node)).copied().unwrap_or(0);
-                    if vl >= self.rev[dur_of(node) as usize].load(Ordering::Acquire) {
-                        return None;
-                    }
-                }
-                None
-            });
-            if let Some(dirty) = verdict {
-                return Some(dirty);
             }
         }
 
-        // NOTE (DEFERRED — measured-first) the root fast
-        // path above takes the NODE'S shard READ lock on every cached hit.
-        // A read lock is a shared, uncontended-taken atomic in the common
-        // case, so this is cheap, but it is still far from the lock-free
-        // load the `epochs` word offers.  A possible move was
-        // to pack `finishing` + `verified_gen` + `verified_lvl` into one
-        // lock-free word alongside the durability bits (or a small array
-        // of them), so a hit costs three loads and no lock.
+        // The stable append-only `stamps` table makes the root fast path
+        // lock-free: no shard read lock is taken here, and the three
+        // checks above are plain Acquire loads.  The read order
+        // `finishing` -> `verified_gen` -> `verified_lvl` is load-bearing;
+        // see `StampSlot` for why the three words need not be packed.
         //
-        // NOT DONE, for two reasons.  (1) The repo has no benchmark
-        // harness, so "MEASURE first" has nothing to measure with — the
-        // only available signal is a full-suite wall-clock, which is
-        // dominated by compile time, not query traffic.  (2) d24 makes it
-        // non-trivial: `set_finishing` writes the flag through
-        // `with_shard_r`, so moving the flag out of the shard means
-        // either a second, differently-ordered store on the finish path
-        // (and d24's whole point is that the write is serialized against
-        // the shard section that publishes the fingerprint) or a lock-free
-        // word whose store order must be re-derived from scratch.
-        //
-        // So this is a real opportunity that needs a benchmark to justify
-        // the risk.  If it is ever done, the invariant to preserve is
-        // that the three reads stay in this order: `finishing` FIRST
-        // (a finishing node must never be fast-pathed on a stamp), then
-        // `verified_gen` against `current_gen`, then the durability level
-        // against `rev`.
-        // across traversals via TLS instead of reallocated per walk.
-        // `(node, exiting)` frames: `false` = enter, `true` = all deps
+        // Walk state is TLS-pooled across traversals instead of
+        // reallocated per walk.  `(node, exiting)` frames: `false` = enter,
+        // `true` = all deps
         // verified, stamp post-order.
         let mut scratch = VerifyScratch::take();
         let visited = &mut scratch.visited;
@@ -3530,45 +3647,24 @@ impl<S: Scheduler> DepGraph<S> {
             if !self.is_green(n) {
                 return Some(n);
             }
-            // ONE read lock for the whole enter branch, held in the open
-            // (not lent to a `with_shard_r` closure) so it outlives the
-            // edge walk below.  The d24 finishing check, both fast paths
-            // and the dependency-edge fetch all read shard `shard_of(n)`,
-            // and the slow path now iterates the edge list IN PLACE under
-            // the same guard — no `SmallVec` clone, hence no allocation
-            // under the lock (the old `.cloned()` heap-allocated for edge
-            // sets wider than the inline four).  Releasing explicitly on
-            // every exit path is the same ticket hand-off `with_shard_r`
-            // performs internally; the ticket is a fresh `Held<Idle>` per
-            // node, so no state threads across iterations.  Still strictly
-            // read-only: the shard's write lock stays exclusive to the
-            // exit frame's post-order stamp.
-            //
-            // Widening note: the guard now also covers the local
-            // `stack.push`es.  They touch no shard (no nested lock, so no
-            // deadlock cycle).  The per-edge work is the same work the old
-            // code did — it just moves from after the lock to under it —
-            // but the `SmallVec` allocation, and its malloc/free under the
-            // shard lock, is gone.
-            let (guard, tkt) = self.take_shard_r(shard_of(n), self.ticket());
-            let shard = &*guard;
-            let slot = slot_of(n);
+            // Lock-free stamp checks.  The stable append-only slot makes
+            // these plain Acquire loads; the read order is load-bearing
+            // (`finishing` FIRST: a finishing node must never be
+            // fast-pathed on a stamp), exactly as on the root path above.
+            let stamp_snap = self.stamps_snapshot();
+            let sslot = stamp_snap
+                .get(block_of(n.0))
+                .map(|b| &b[stamp_word_of(n.0)]);
             // NEW (d24): finishing nodes are not verifiable — treat as
             // dirty.  Returning (instead of `continue`) also guarantees
             // the node is never exit-stamped while its colour is still
             // unfinalized.
-            if shard
-                .finishing
-                .get(slot)
-                .is_some_and(|f| f.load(Ordering::Acquire))
-            {
-                let _ = ticket::release_shard_r(guard, tkt);
+            if sslot.is_some_and(|s| s.finishing.load(Ordering::Acquire)) {
                 return Some(n);
             }
             // Fast path: the CLOSURE was already verified at this
             // generation, so skip re-walking its edges.
-            if shard.verified_gen.get(slot).copied().unwrap_or(0) >= current_gen {
-                let _ = ticket::release_shard_r(guard, tkt);
+            if sslot.map_or(0, |s| s.verified_gen.load(Ordering::Acquire)) >= current_gen {
                 continue;
             }
             // Per-level durability fast path for interior nodes — same
@@ -3578,13 +3674,34 @@ impl<S: Scheduler> DepGraph<S> {
             // existing query on the global check; the seqlock-fallback
             // walk disables it.
             if allow_durability_fast_path {
-                if let Some(&vl) = shard.verified_lvl.get(slot) {
-                    if vl >= self.rev[dur_of(n) as usize].load(Ordering::Acquire) {
-                        let _ = ticket::release_shard_r(guard, tkt);
-                        continue;
-                    }
+                let vl = sslot.map_or(0, |s| s.verified_lvl.load(Ordering::Acquire));
+                if vl >= self.rev[dur_of(n) as usize].load(Ordering::Acquire) {
+                    continue;
                 }
             }
+            // The shard read lock below covers ONLY the dependency-edge
+            // fetch; the stamp checks above are lock-free.  It is held in
+            // the open (not lent to a `with_shard_r` closure) so it
+            // outlives the edge walk below.  The slow path iterates the
+            // edge list IN PLACE under the guard — no `SmallVec` clone,
+            // hence no allocation under the lock (the old `.cloned()`
+            // heap-allocated for edge sets wider than the inline four).
+            // Releasing explicitly on every exit path is the same ticket
+            // hand-off `with_shard_r` performs internally; the ticket is a
+            // fresh `Held<Idle>` per node, so no state threads across
+            // iterations.  Still strictly read-only: the shard's write
+            // lock stays exclusive to the exit frame's post-order stamp
+            // and to structural mutation.
+            //
+            // Widening note: the guard also covers the local
+            // `stack.push`es.  They touch no shard (no nested lock, so no
+            // deadlock cycle).  The per-edge work is the same work the old
+            // code did — it just moves from after the lock to under it —
+            // but the `SmallVec` allocation, and its malloc/free under the
+            // shard lock, is gone.
+            let (guard, tkt) = self.take_shard_r(shard_of(n), self.ticket());
+            let shard = &*guard;
+            let slot = slot_of(n);
             // Both fast paths missed: defer the stamp until every
             // dependency has verified, then enter all direct dependencies
             // (reversed so LIFO pops them in declaration order — keeps the
@@ -3605,30 +3722,24 @@ impl<S: Scheduler> DepGraph<S> {
     }
 
     /// Commit the buffered post-order stamps of a completed,
-    /// seqlock-sealed verification: grouped by shard, one write lock at a
-    /// time (module invariant).  `verified_gen` and `verified_lvl` land
-    /// under the same lock, so a reader taking the per-level fast path
-    /// always sees a fully written pair.
+    /// seqlock-sealed verification.  The stable append-only stamp slot
+    /// makes this a set of lock-free Release stores: no shard sort, no
+    /// shard write lock, no `ensure_shard_len`.  The old same-lock
+    /// pair-visibility requirement is gone; `verified_gen` and
+    /// `verified_lvl` are independently valid certificates (see
+    /// `StampSlot`).  `finishing` is untouched — it belongs to the
+    /// compute/finish protocol, not to verification.
     fn flush_stamps(&self, stamps: &mut Vec<PendingStamp>) {
         if stamps.is_empty() {
             return;
         }
-        stamps.sort_unstable_by_key(|s| shard_of(s.node));
-        let mut i = 0;
-        while i < stamps.len() {
-            let shard_idx = shard_of(stamps[i].node);
-            let mut j = i;
-            while j < stamps.len() && shard_of(stamps[j].node) == shard_idx {
-                j += 1;
+        let snap = self.stamps_snapshot();
+        for s in stamps.iter() {
+            if let Some(b) = snap.get(block_of(s.node.0)) {
+                let slot = &b[stamp_word_of(s.node.0)];
+                slot.verified_gen.store(s.generation, Ordering::Release);
+                slot.verified_lvl.store(s.lvl, Ordering::Release);
             }
-            let (_, _t) = self.with_shard_w(shard_idx, self.ticket(), |shard| {
-                for s in &stamps[i..j] {
-                    ensure_shard_len(shard, slot_of(s.node));
-                    shard.verified_gen[slot_of(s.node)] = s.generation;
-                    shard.verified_lvl[slot_of(s.node)] = s.lvl;
-                }
-            });
-            i = j;
         }
         stamps.clear();
     }

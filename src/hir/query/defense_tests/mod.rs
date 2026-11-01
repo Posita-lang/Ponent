@@ -6404,6 +6404,302 @@ mod bench {
             CHAIN_DEPTH
         );
     }
+
+    // ── Invalidation / verification-storm probes ──────────────────
+    //
+    // The hit-path probes above measure the GREEN fast path.  The lazy
+    // invalidation design's other half is the first get AFTER a mark:
+    // `mark_dirty` bumps the global `dirty_generation`, which invalidates
+    // every `verified_gen` stamp in the system, so an unrelated cached
+    // node must walk its whole closure before it can be re-stamped.  These
+    // probes measure that storm directly, and the wide fan-out publish
+    // that creates it.
+    //
+    // `PONENT_BENCH_IR=warmup|hit|storm` runs one warmup-only / one clean
+    // hit pass / one post-mark pass for the callgrind wrapper
+    // (`tools/bench-query-ir.sh`); the difference between a measured total
+    // and the warmup total is that pass's Ir.  `storm - hit` is the
+    // verification walk's deterministic cost.
+
+    const STORM_CHAINS: u32 = 64;
+    const STORM_DEPTH: u32 = 32;
+
+    struct StormQ;
+    impl<'q, 'src: 'q> Query<'q, 'src> for StormQ {
+        type Storage = Owned;
+        type Key = BKey;
+        type Value = BThin;
+        type Cache = DefaultCache<BKey, Stored<'q, 'src, Self>>;
+        fn descriptor() -> QueryDescriptor {
+            QueryDescriptor::new("bench_storm", "invalidation-storm probe")
+        }
+        fn compute<S: Scheduler>(key: &BKey, provider: &dyn QueryProvider<'q, 'src, S>) -> BThin {
+            let k = key.0;
+            if k % STORM_DEPTH == 0 {
+                BThin(0)
+            } else {
+                BThin(query_get::<StormQ, _>(provider, BKey(k - 1)).unwrap().0 + 1)
+            }
+        }
+    }
+
+    /// One mark, then a pass over UNRELATED cached tops.  Every get in the
+    /// pass is a cache hit whose stamp was invalidated by the global
+    /// generation bump, so it pays a full closure walk (`STORM_DEPTH`
+    /// nodes) plus a stamp flush.  The baseline pass runs the same gets
+    /// with current stamps, so `storm / baseline` is the verification
+    /// amplification of one edit.
+    #[test]
+    #[ignore]
+    fn bench_invalidation_storm() {
+        let ir_mode = std::env::var("PONENT_BENCH_IR").ok();
+        let tops: Vec<u32> = (0..STORM_CHAINS)
+            .map(|c| c * STORM_DEPTH + STORM_DEPTH - 1)
+            .collect();
+
+        let (system, provider) = setup();
+        for &top in &tops {
+            let _ = system.get::<StormQ>(BKey(top), provider).unwrap();
+        }
+
+        if ir_mode.as_deref() == Some("warmup") {
+            println!("[bench_storm_ir] gets=0");
+            return;
+        }
+        if ir_mode.as_deref() == Some("hit") {
+            let t = Instant::now();
+            for &top in &tops[1..] {
+                let _ = system.get::<StormQ>(BKey(top), provider).unwrap();
+            }
+            let per = t.elapsed().as_secs_f64() / ((STORM_CHAINS - 1) as f64);
+            println!(
+                "[bench_storm_ir] gets={} ns_get={:.1}",
+                STORM_CHAINS - 1,
+                per * 1e9
+            );
+            return;
+        }
+        if ir_mode.as_deref() == Some("storm") {
+            system.invalidate::<StormQ>(&BKey(0));
+            let t = Instant::now();
+            for &top in &tops[1..] {
+                let _ = system.get::<StormQ>(BKey(top), provider).unwrap();
+            }
+            let per = t.elapsed().as_secs_f64() / ((STORM_CHAINS - 1) as f64);
+            println!(
+                "[bench_storm_ir] gets={} ns_get={:.1}",
+                STORM_CHAINS - 1,
+                per * 1e9
+            );
+            return;
+        }
+
+        // Baseline: all stamps current, so every get is the fast path.
+        let mut baseline = f64::MAX;
+        for _ in 0..5 {
+            let t = Instant::now();
+            for &top in &tops[1..] {
+                let _ = system.get::<StormQ>(BKey(top), provider).unwrap();
+            }
+            let per = t.elapsed().as_secs_f64() / ((STORM_CHAINS - 1) as f64);
+            baseline = baseline.min(per);
+        }
+
+        // Storm: re-arm the global generation each round.  Chain 0 is
+        // recomputed first so its red bit is clear (marking an already-red
+        // node returns early and would NOT bump the generation).
+        let mut storm = f64::MAX;
+        for _ in 0..5 {
+            let _ = system.get::<StormQ>(BKey(0), provider).unwrap();
+            system.invalidate::<StormQ>(&BKey(0));
+            let t = Instant::now();
+            for &top in &tops[1..] {
+                let _ = system.get::<StormQ>(BKey(top), provider).unwrap();
+            }
+            let per = t.elapsed().as_secs_f64() / ((STORM_CHAINS - 1) as f64);
+            storm = storm.min(per);
+        }
+
+        println!(
+            "[bench_storm    ] baseline {:>8.1} ns/get; storm {:>8.1} ns/get \
+             ({:>6.1} ns/node over {} nodes, {:.1}x)",
+            baseline * 1e9,
+            storm * 1e9,
+            storm * 1e9 / STORM_DEPTH as f64,
+            STORM_DEPTH,
+            storm / baseline
+        );
+        println!(
+            "[bench_storm    ] gets={}",
+            (STORM_CHAINS - 1) as u64 * 5
+        );
+    }
+
+    // ── Wide fan-out publish probe ────────────────────────────────
+    //
+    // A hot node with `FANOUT_WIDTH` direct readers.  Control: invalidate
+    // the hot node (and its leaf) with the leaf's semantic UNCHANGED, so
+    // the hot node recomputes but its fingerprint does not change and no
+    // fan-out happens.  Change: bump the leaf's semantic, invalidate the
+    // same pair, and the hot node's changed fingerprint fans out
+    // `mark_dirty` to every reader.  `change - control` isolates the
+    // fan-out loop; the reader pass then measures the downstream
+    // recompute storm the fan-out created.
+
+    const FANOUT_WIDTH: u32 = 256;
+    static FANOUT_INPUT: AtomicU64 = AtomicU64::new(1);
+
+    struct FanLeaf;
+    impl<'q, 'src: 'q> Query<'q, 'src> for FanLeaf {
+        type Storage = Owned;
+        type Key = BKey;
+        type Value = FpValue;
+        type Cache = DefaultCache<BKey, Stored<'q, 'src, Self>>;
+        fn descriptor() -> QueryDescriptor {
+            QueryDescriptor::new("bench_fan_leaf", "fan-out leaf")
+        }
+        fn compute<S: Scheduler>(_: &BKey, _: &dyn QueryProvider<'q, 'src, S>) -> FpValue {
+            let n = FANOUT_INPUT.load(Ordering::SeqCst);
+            FpValue {
+                raw: format!("leaf_{n}"),
+                semantic: n,
+            }
+        }
+    }
+
+    struct FanHot;
+    impl<'q, 'src: 'q> Query<'q, 'src> for FanHot {
+        type Storage = Owned;
+        type Key = BKey;
+        type Value = FpValue;
+        type Cache = DefaultCache<BKey, Stored<'q, 'src, Self>>;
+        fn descriptor() -> QueryDescriptor {
+            QueryDescriptor::new("bench_fan_hot", "fan-out hot node")
+        }
+        fn compute<S: Scheduler>(_: &BKey, provider: &dyn QueryProvider<'q, 'src, S>) -> FpValue {
+            let leaf = query_get::<FanLeaf, _>(provider, BKey(0)).unwrap();
+            FpValue {
+                raw: format!("hot_{}", leaf.semantic),
+                semantic: leaf.semantic * 10,
+            }
+        }
+    }
+
+    struct FanReader;
+    impl<'q, 'src: 'q> Query<'q, 'src> for FanReader {
+        type Storage = Owned;
+        type Key = BKey;
+        type Value = BThin;
+        type Cache = DefaultCache<BKey, Stored<'q, 'src, Self>>;
+        fn descriptor() -> QueryDescriptor {
+            QueryDescriptor::new("bench_fan_reader", "fan-out reader")
+        }
+        fn compute<S: Scheduler>(key: &BKey, provider: &dyn QueryProvider<'q, 'src, S>) -> BThin {
+            let hot = query_get::<FanHot, _>(provider, BKey(0)).unwrap();
+            BThin(hot.semantic + key.0 as u64)
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_fanout_publish() {
+        let ir_mode = std::env::var("PONENT_BENCH_IR").ok();
+        let (system, provider) = setup();
+        FANOUT_INPUT.store(1, Ordering::SeqCst);
+
+        let _ = system.get::<FanHot>(BKey(0), provider).unwrap();
+        for i in 0..FANOUT_WIDTH {
+            let _ = system.get::<FanReader>(BKey(i), provider).unwrap();
+        }
+
+        if ir_mode.as_deref() == Some("warmup") {
+            println!("[bench_fanout_ir] gets=0");
+            return;
+        }
+        // `fanout_control` and `fanout_change` isolate the fan-out loop:
+        // both recompute the hot node once, but only `change` sees a new
+        // fingerprint and marks every reader.  `fanout_readers` additionally
+        // re-gets the readers, so its delta minus `fanout_change`'s is the
+        // downstream republish pass.
+        if ir_mode.as_deref() == Some("fanout_control") {
+            system.invalidate::<FanLeaf>(&BKey(0));
+            system.invalidate::<FanHot>(&BKey(0));
+            let _ = system.get::<FanHot>(BKey(0), provider).unwrap();
+            println!("[bench_fanout_ir] gets=1");
+            return;
+        }
+        if ir_mode.as_deref() == Some("fanout_change") {
+            FANOUT_INPUT.fetch_add(1, Ordering::SeqCst);
+            system.invalidate::<FanLeaf>(&BKey(0));
+            system.invalidate::<FanHot>(&BKey(0));
+            let _ = system.get::<FanHot>(BKey(0), provider).unwrap();
+            println!("[bench_fanout_ir] gets=1");
+            return;
+        }
+        if ir_mode.as_deref() == Some("fanout_readers") {
+            FANOUT_INPUT.fetch_add(1, Ordering::SeqCst);
+            system.invalidate::<FanLeaf>(&BKey(0));
+            system.invalidate::<FanHot>(&BKey(0));
+            let _ = system.get::<FanHot>(BKey(0), provider).unwrap();
+            for i in 0..FANOUT_WIDTH {
+                let _ = system.get::<FanReader>(BKey(i), provider).unwrap();
+            }
+            println!("[bench_fanout_ir] gets={FANOUT_WIDTH}");
+            return;
+        }
+        if ir_mode.as_deref() == Some("fanout") {
+            FANOUT_INPUT.fetch_add(1, Ordering::SeqCst);
+            system.invalidate::<FanLeaf>(&BKey(0));
+            system.invalidate::<FanHot>(&BKey(0));
+            let _ = system.get::<FanHot>(BKey(0), provider).unwrap();
+            for i in 0..FANOUT_WIDTH {
+                let _ = system.get::<FanReader>(BKey(i), provider).unwrap();
+            }
+            println!("[bench_fanout_ir] gets={}", 1 + FANOUT_WIDTH as u64);
+            return;
+        }
+
+        let mut control = f64::MAX;
+        let mut change = f64::MAX;
+        let mut readers = f64::MAX;
+        for _ in 0..5 {
+            // Control: same recompute path, unchanged fingerprint.
+            system.invalidate::<FanLeaf>(&BKey(0));
+            system.invalidate::<FanHot>(&BKey(0));
+            let t = Instant::now();
+            let _ = system.get::<FanHot>(BKey(0), provider).unwrap();
+            control = control.min(t.elapsed().as_secs_f64());
+
+            // Change: new fingerprint, fan-out to every reader.
+            FANOUT_INPUT.fetch_add(1, Ordering::SeqCst);
+            system.invalidate::<FanLeaf>(&BKey(0));
+            system.invalidate::<FanHot>(&BKey(0));
+            let t = Instant::now();
+            let _ = system.get::<FanHot>(BKey(0), provider).unwrap();
+            change = change.min(t.elapsed().as_secs_f64());
+
+            // The fan-out marked every reader red; re-get them.
+            let t = Instant::now();
+            for i in 0..FANOUT_WIDTH {
+                let _ = system.get::<FanReader>(BKey(i), provider).unwrap();
+            }
+            readers = readers.min(t.elapsed().as_secs_f64() / FANOUT_WIDTH as f64);
+        }
+
+        println!(
+            "[bench_fanout   ] control {:>8.1} ns/hot-get; change {:>8.1} ns/hot-get; \
+             fan-out delta {:>8.1} ns for {} readers ({:.1} ns/reader)",
+            control * 1e9,
+            change * 1e9,
+            (change - control) * 1e9,
+            FANOUT_WIDTH,
+            (change - control) * 1e9 / FANOUT_WIDTH as f64
+        );
+        println!(
+            "[bench_fanout   ] reader republish {:>8.1} ns/reader",
+            readers * 1e9
+        );
+    }
 }
 
 /// The hit path must not re-raise a node's aggregated durability: a
