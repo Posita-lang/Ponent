@@ -1,7 +1,7 @@
-use arrayvec::ArrayVec;
 use crate::ast::{BinOp, Expr, Literal, Type, UnaryOp};
 use crate::diagnostics::Diagnostic;
 use crate::smallvec::{SmallVec, smallvec};
+use arrayvec::ArrayVec;
 
 /// Compute the Damerau-Levenshtein (OSA) distance between two strings.
 ///
@@ -51,7 +51,10 @@ pub(crate) fn osa_distance(a: &str, b: &str) -> usize {
 
 /// Find names in `candidates` that are similar to `name` (edit distance ≤ 2),
 /// sorted by closest match. Returns up to 3 suggestions.
-pub(crate) fn find_similar_names<'a>(name: &str, candidates: &'a [&'a str]) -> ArrayVec<&'a str, 3> {
+pub(crate) fn find_similar_names<'a>(
+    name: &str,
+    candidates: &'a [&'a str],
+) -> ArrayVec<&'a str, 3> {
     /// Distance threshold: the filter below keeps only `0 < d <= 3`.
     const MAX_DIST: usize = 3;
     let name_len = name.chars().count();

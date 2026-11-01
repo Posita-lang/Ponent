@@ -2,8 +2,173 @@
 
 use crate::symbol::Symbol;
 use bitflags::bitflags;
-use logos::{Lexer, Logos};
 use memchr::memchr2;
+
+// ── Whitespace run scan (SIMD) ─────────────────────────────────────────
+//
+// Lexical whitespace is the contiguous range 0x09..=0x0D (HT, LF, VT, FF,
+// CR) plus 0x20 (space) — SYNTAX.md §Whitespace.  logos's DFA scans this
+// byte-at-a-time; for long indentation runs (deeply nested source) a
+// vectorized run-scan is materially faster.  The regex matches a single
+// byte and hands control to `whitespace_run`, which SIMD-scans the
+// remainder and bumps past the whole run in one callback.
+//
+// Correctness of the single-byte regex: no other token begins with a
+// whitespace byte (every `#[token]`/`#[regex]` arm below starts with a
+// non-whitespace byte), so shortening `[...]+` to one byte cannot change
+// longest-match.  The callback only runs at the top level — logos has
+// already decided the position is outside any string/comment — so the
+// SIMD scan can never eat into a `"…"` or `//` body.  `FilterResult::Skip`
+// preserves the gap-based trivia reconstruction in `parser::mod`
+// byte-for-byte: whitespace bytes stay in the `prev_end..span_range.start`
+// gap, never entering the token stream, so `TriviaKind` classification
+// (`gap.contains("//") || gap.contains("/*")`) is unchanged.
+
+/// Longest run of ASCII lexical whitespace at the start of `bytes`:
+/// `\t \n \x0B \x0C \r` (0x09..=0x0D) plus space (0x20).
+#[inline]
+pub(super) fn scan_whitespace(bytes: &[u8]) -> usize {
+    let len = bytes.len();
+    if len < 16 {
+        return scan_whitespace_scalar(bytes);
+    }
+    let p = bytes.as_ptr();
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 is checked at runtime; `p` is valid for `len` bytes.
+            return unsafe { scan_whitespace_avx2(p, len) };
+        }
+        // SAFETY: SSE2 is baseline on x86_64.
+        return unsafe { scan_whitespace_sse2(p, len) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        return unsafe { scan_whitespace_neon(p, len) };
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        scan_whitespace_scalar(bytes)
+    }
+}
+
+#[inline]
+fn scan_whitespace_scalar(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .position(|&b| !matches!(b, 0x09..=0x0D | 0x20))
+        .unwrap_or(bytes.len())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn scan_whitespace_sse2(mut p: *const u8, mut len: usize) -> usize {
+    use std::arch::x86_64::*;
+    let start = p;
+    let (eight, fourteen, space) = unsafe {
+        // SAFETY: SSE2 is baseline on x86_64; set1 is always available.
+        (_mm_set1_epi8(8), _mm_set1_epi8(14), _mm_set1_epi8(32))
+    };
+    while len >= 16 {
+        // SAFETY: `len >= 16` guarantees a valid unaligned 16-byte load at `p`.
+        let mask = unsafe {
+            let v = _mm_loadu_si128(p as *const __m128i);
+            // 0x09..=0x0D ⇔ v > 8 && 14 > v (signed).  Bytes ≥ 0x80 are
+            // negative as i8, so they fail `v > 8` and cannot enter the
+            // range — no UTF-8 lead/continuation byte is misclassified.
+            let range = _mm_and_si128(_mm_cmpgt_epi8(v, eight), _mm_cmpgt_epi8(fourteen, v));
+            let ws = _mm_or_si128(range, _mm_cmpeq_epi8(v, space));
+            _mm_movemask_epi8(ws) as u32
+        };
+        let non_ws = !mask & 0xFFFF;
+        if non_ws != 0 {
+            return (p as usize - start as usize) + non_ws.trailing_zeros() as usize;
+        }
+        p = unsafe { p.add(16) };
+        len -= 16;
+    }
+    let off = p as usize - start as usize;
+    // SAFETY: `len < 16` remaining bytes at `p` are valid by the original slice.
+    let tail = unsafe { std::slice::from_raw_parts(p, len) };
+    off + scan_whitespace_scalar(tail)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn scan_whitespace_avx2(mut p: *const u8, mut len: usize) -> usize {
+    use std::arch::x86_64::*;
+    let start = p;
+    let (eight, fourteen, space) = unsafe {
+        // SAFETY: guarded by `is_x86_feature_detected!("avx2")` at the call site.
+        (
+            _mm256_set1_epi8(8),
+            _mm256_set1_epi8(14),
+            _mm256_set1_epi8(32),
+        )
+    };
+    while len >= 32 {
+        // SAFETY: `len >= 32` guarantees a valid unaligned 32-byte load at `p`.
+        let mask = unsafe {
+            let v = _mm256_loadu_si256(p as *const __m256i);
+            let range =
+                _mm256_and_si256(_mm256_cmpgt_epi8(v, eight), _mm256_cmpgt_epi8(fourteen, v));
+            let ws = _mm256_or_si256(range, _mm256_cmpeq_epi8(v, space));
+            _mm256_movemask_epi8(ws) as u32
+        };
+        let non_ws = !mask;
+        if non_ws != 0 {
+            return (p as usize - start as usize) + non_ws.trailing_zeros() as usize;
+        }
+        p = unsafe { p.add(32) };
+        len -= 32;
+    }
+    let off = p as usize - start as usize;
+    // SAFETY: SSE2 is baseline; `p` is valid for the remaining `len` bytes.
+    off + unsafe { scan_whitespace_sse2(p, len) }
+}
+
+// aarch64 has no `pmovmskb`-style horizontal mask extract.  The idiomatic
+// fast path is `vminvq_s8` (single instruction: minimum of 16 lanes) to
+// test "all whitespace", and a scalar scan of the 16-byte window only on
+// the cold path (first non-whitespace byte).  Simulating movemask with a
+// `vshrn`+pack sequence is more instructions and slower for the
+// all-whitespace hot path that dominates real source.  This is the
+// architecture-correct choice, not a fallback.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn scan_whitespace_neon(mut p: *const u8, mut len: usize) -> usize {
+    use std::arch::aarch64::*;
+    let start = p;
+    let (eight, fourteen, space) = unsafe {
+        // SAFETY: NEON is baseline on aarch64.
+        (vdupq_n_s8(8), vdupq_n_s8(14), vdupq_n_s8(32))
+    };
+    while len >= 16 {
+        // SAFETY: `len >= 16` guarantees a valid 16-byte load at `p`.
+        let all_ws = unsafe {
+            let v = vld1q_u8(p);
+            let vs = vreinterpretq_s8_u8(v);
+            let range = vandq_s8(vcgtq_s8(vs, eight), vcgtq_s8(fourteen, vs));
+            let ws = vorrq_s8(range, vceqq_s8(vs, space));
+            // `ws` is 0xFF per whitespace lane, 0x00 otherwise.  `vminvq_s8`
+            // is -1 iff every lane is 0xFF.
+            vminvq_s8(ws) == -1
+        };
+        if !all_ws {
+            // SAFETY: 16 bytes at `p` are valid (`len >= 16`).
+            let chunk = unsafe { std::slice::from_raw_parts(p, 16) };
+            return (p as usize - start as usize) + scan_whitespace_scalar(chunk);
+        }
+        p = p.add(16);
+        len -= 16;
+    }
+    let off = p as usize - start as usize;
+    // SAFETY: `len < 16` remaining bytes at `p` are valid by the original slice.
+    let tail = unsafe { std::slice::from_raw_parts(p, len) };
+    off + scan_whitespace_scalar(tail)
+}
 
 /// Scan a (possibly nested) block comment starting at an already-matched
 /// `/*`. `/*` increments depth, `*/` decrements it; the token ends when
@@ -20,8 +185,8 @@ use memchr::memchr2;
 /// replaced (see the `nested_block_comment` / `deeply_nested_block_comment`
 /// / `unterminated_block_comment_is_error` / `block_comment_with_stars_and_slashes`
 /// regression tests).
-fn block_comment<'src>(lex: &mut Lexer<'src, Token<'src>>) -> logos::FilterResult<(), ()> {
-    let mut rest = lex.remainder().as_bytes();
+pub(super) fn scan_block_comment(rest: &[u8]) -> Result<usize, usize> {
+    let mut rest = rest;
     let mut consumed = 0usize;
     let mut depth = 1usize;
     const WINDOW: usize = 8;
@@ -40,8 +205,7 @@ fn block_comment<'src>(lex: &mut Lexer<'src, Token<'src>>) -> logos::FilterResul
                     // Without consuming `rest.len()`, a dangling byte would
                     // be re-lexed as a spurious token after the error
                     // (e.g. `/* x` → error + `Ident(x)`).
-                    lex.bump(consumed + rest.len());
-                    return logos::FilterResult::Error(());
+                    return Err(consumed + rest.len());
                 }
             }
         }
@@ -52,8 +216,7 @@ fn block_comment<'src>(lex: &mut Lexer<'src, Token<'src>>) -> logos::FilterResul
                 consumed += i + 2;
                 rest = &rest[i + 2..];
                 if depth == 0 {
-                    lex.bump(consumed);
-                    return logos::FilterResult::Emit(());
+                    return Ok(consumed);
                 }
             }
             b'/' if rest.get(i + 1) == Some(&b'*') => {
@@ -69,27 +232,6 @@ fn block_comment<'src>(lex: &mut Lexer<'src, Token<'src>>) -> logos::FilterResul
                 rest = &rest[i + 1..];
             }
         }
-    }
-}
-
-/// U+FEFF (BOM) handling — SYNTAX.md §Whitespace, BOM, and Unicode
-/// Versioning: the BOM is an encoding signature allowed only as the
-/// first bytes of a file, where the lexer strips it; anywhere else it
-/// is an error.  Implemented at the token layer so every `Token::lexer`
-/// entry point (parser, `--emit=tokens`, vfs) behaves identically:
-/// file-start BOMs are skipped (never entering the token stream), and a
-/// mid-file BOM yields exactly one lexer error (spans unchanged).
-fn strip_bom<'src>(lex: &mut Lexer<'src, Token<'src>>) -> logos::FilterResult<(), ()> {
-    if lex.span().start == 0 {
-        // The token match has already consumed the BOM; Skip drops it
-        // silently (it never enters the token stream).
-        logos::FilterResult::Skip
-    } else {
-        // The match consumed the BOM; record exactly one lexer error for
-        // its span and continue after it.  No `bump` here — bump is
-        // relative to the end of the matched region, which logos already
-        // advanced past (a second bump panics "Invalid Lexer bump").
-        logos::FilterResult::Error(())
     }
 }
 
@@ -151,250 +293,132 @@ pub fn token_class(tok: &Token) -> TokenClass {
     }
     c
 }
-#[derive(Logos, Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Token<'src> {
-    #[regex("[ \t\r\n\x0B\x0C]+", logos::skip)]
     // `allow_greedy = true` is LOAD-BEARING, not optional: in logos 0.16+ a
     // `[^\n]*` tail requires it, and it keeps `//` from winning over the
     // longer `///` / `//!` doc-comment regexes below.  Do not "clean up".
-    #[regex("//[^\n]*", logos::skip, allow_greedy = true)]
-    #[regex("/\\*", block_comment)]
     WhitespaceOrComment,
-    #[regex("///[^\n]*", |lex| (lex.slice()[3..].trim()) as &'src str, allow_greedy = true)]
     DocComment(&'src str),
-    #[token("\u{FEFF}", strip_bom)]
     Bom,
-    #[regex("//![^\n]*", |lex| (lex.slice()[3..].trim()) as &'src str, allow_greedy = true)]
     ModuleDocComment(&'src str),
-    #[token("def")]
     Def,
-    #[token("set")]
     Set,
-    #[token("type")]
     Type,
-    #[token("const")]
     Const,
     /// `codomain` — reserved by SYNTAX.md for `ensures` clauses; may not
     /// be used as an ordinary variable or parameter name anywhere.
     /// Deliberately NOT in `as_ident_symbol`.
-    #[token("codomain")]
     Codomain,
-    #[token("with")]
     With,
-    #[token("default")]
     Default,
-    #[token("return")]
     Return,
-    #[token("if")]
     If,
-    #[token("else")]
     Else,
-    #[token("for")]
     For,
-    #[token("in")]
     In,
-    #[token("while")]
     While,
-    #[token("loop")]
     Loop,
-    #[token("leave")]
     Leave,
-    #[token("continue")]
     Continue,
-    #[token("comptime")]
     Comptime,
-    #[token("generate")]
     Generate,
-    #[token("import")]
     Import,
-    #[token("as")]
     As,
-    #[token("true")]
     True,
-    #[token("false")]
     False,
-    #[token("auto")]
     Auto,
-    #[token("and")]
     And,
-    #[token("or")]
     Or,
-    #[token("not")]
     Not,
-    #[token("sizeof")]
     Sizeof,
-    #[token("alignof")]
     Alignof,
-    #[token("catch")]
     Catch,
-    #[token("panic")]
     Panic,
-    #[token("unsafe")]
     Unsafe,
-    #[token("let")]
     Let,
-    #[token("finally")]
     Finally,
-    #[token("where")]
     Where,
-    #[token("when")]
     When,
-    #[token("requires")]
     Requires,
-    #[token("ensures")]
     Ensures,
-    #[token("invariant")]
     Invariant,
-    #[token("constraint")]
     Constraint,
-    #[token("move")]
     Move,
-    #[token("dyn")]
     Dyn,
-    #[token("by")]
     By,
-    #[token("copy")]
     Copy,
-    #[token("ref")]
     Ref,
     /// `ro` — reserved by SYNTAX.md: meaningful only immediately after
     /// `&` (the read-only borrow operator).  Deliberately NOT in
     /// `as_ident_symbol`; any occurrence outside `&ro` is a syntax error.
-    #[token("ro")]
     Ro,
-    #[token("mut")]
     Mut,
-    #[token("wrap")]
     Wrap,
-    #[token("saturate")]
     Saturate,
-    #[token("trap")]
     Trap,
-    #[token("ieee")]
     Ieee,
-    #[token("Self")]
     SelfKw,
-    #[token("no_default")]
     NoDefault,
-    #[token("extern")]
     Extern,
-    #[token("pub")]
     Pub,
-    #[token("edition")]
     Edition,
-    #[token("deprecated")]
     Deprecated,
-    #[token("experimental")]
     Experimental,
-    #[token("endian")]
     Endian,
-    #[token("bit_order")]
     BitOrder,
-    #[token("align")]
     Align,
-    #[token("pad")]
     Pad,
-    #[token("packed")]
     Packed,
-    #[token("async")]
     Async,
-    #[token("await")]
     Await,
-    #[token("task")]
     Task,
-    #[token("channel")]
     Channel,
-    #[token("linear")]
     Linear,
-    #[token("consume")]
     Consume,
-    #[token("pure")]
     Pure,
-    #[token("io")]
     Io,
-    #[token("trusted")]
     Trusted,
-    #[token("ghost")]
     Ghost,
-    #[token("scope_cleanup")]
     ScopeCleanup,
-    #[token("trigger")]
     Trigger,
-    #[token("layout")]
     Layout,
-    #[token("validate")]
     Validate,
-    #[token("missing_match")]
     MissingMatch,
-    #[token("apply_lemma")]
     ApplyLemma,
-    #[token("exists")]
     Exists,
-    #[token("forall")]
     Forall,
-    #[token("implies")]
     Implies,
-    #[token("trait")]
     Trait,
-    #[token("impl")]
     Impl,
-    #[token("decreases")]
     Decreases,
-    #[token("diverges")]
     Diverges,
-    #[token("terminates")]
     Terminates,
-    #[token("cfg")]
     Cfg,
-    #[token("isolate")]
     Isolate,
-    #[token("hint")]
     Hint,
-    #[token("must_use")]
     MustUse,
-    #[token("must_handle")]
     MustHandle,
-    #[token("link_proof")]
     LinkProof,
-    #[token("exhaustive")]
     Exhaustive,
-    #[token("no_alloc_error")]
     NoAllocError,
-    #[token("no_panic")]
     NoPanic,
-    #[token("debug_info")]
     DebugInfo,
-    #[token("ieee_contracts")]
     IeeeContracts,
-    #[token("old")]
     Old,
-    #[token("audit_log")]
     AuditLog,
-    #[token("interrupt")]
     Interrupt,
-    #[token("match")]
     Match,
-    #[token("propagates")]
     Propagates,
-    #[token("overrides")]
     Overrides,
-    #[token("poly")]
     Poly,
-    #[token("unbox")]
     Unbox,
-    #[regex("[a-zA-Z_][a-zA-Z0-9_]*", |lex| Symbol::intern(lex.slice()))]
     Ident(Symbol),
-    #[regex("[0-9][0-9_]*i[0-9]+")]
     IntSuffix(&'src str),
-    #[regex("[0-9][0-9_]*u[0-9]+")]
     UIntSuffix(&'src str),
-    #[regex("0x[0-9a-fA-F][0-9a-fA-F_]*i[0-9]+")]
     HexIntSuffix(&'src str),
-    #[regex("0x[0-9a-fA-F][0-9a-fA-F_]*u[0-9]+")]
     HexUIntSuffix(&'src str),
-    #[regex("0b[01][01_]*i[0-9]+")]
     BinIntSuffix(&'src str),
-    #[regex("0b[01][01_]*u[0-9]+")]
     BinUIntSuffix(&'src str),
     // ── Literal payloads: raw `&'src str` — the source text, verbatim. ──
     //
@@ -408,14 +432,9 @@ pub enum Token<'src> {
     // followed this convention.  The regexes are UNCHANGED from the
     // eager-payload design: the one-unit escape-recovery contract lives
     // entirely in the patterns, not in the (now removed) callbacks.
-    #[regex("[0-9][0-9_]*\\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?")]
-    #[regex("[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*")]
     FloatLiteral(&'src str),
-    #[regex("[0-9][0-9_]*")]
     IntLiteral(&'src str),
-    #[regex("0x[0-9a-fA-F][0-9a-fA-F_]*")]
     HexLiteral(&'src str),
-    #[regex("0b[01][01_]*")]
     BinLiteral(&'src str),
     // Escape-recovery regex (SYNTAX.md §Escape Sequences).  The body is
     // EXACTLY ONE unit — one plain char, or one escape:
@@ -433,126 +452,69 @@ pub enum Token<'src> {
     // breaking attribute access.  Multi-plain-char bodies (`'ab'`) are
     // lexically indistinguishable from attribute access and therefore
     // split — the parser reports them via its Apostrophe handling.
-    #[regex("'(?:[^'\\\\]|\\\\(?:x[0-9a-fA-F]{0,}|u\\{?[0-9a-fA-F]{0,}\\}?|[^\\n]))'")]
     CharLiteral(&'src str),
     /// `b'x'` — byte character literal (SYNTAX.md: type `Byte` = `UInt<8>`).
     /// The regex is permissive (`\\.`) so invalid escapes surface as
     /// parse errors at consumption time (string-literal-style recovery)
     /// rather than token-splitting.
-    #[regex("b'(\\\\.|[^'\\\\])*'")]
     ByteCharLiteral(&'src str),
-    #[regex("b\"(\\\\.|[^\"\\\\])*\"")]
     ByteStringLiteral(&'src str),
-    #[regex("\"(\\\\.|[^\"\\\\])*\"")]
     StringLiteral(&'src str),
-    #[token("'")]
     Apostrophe,
-    #[token("+")]
     Plus,
-    #[token("-")]
     Minus,
-    #[token("*")]
     Star,
-    #[token("/")]
     Slash,
-    #[token("%")]
     Percent,
-    #[token("+%")]
     PlusWrap,
-    #[token("-%")]
     MinusWrap,
-    #[token("*%")]
     StarWrap,
-    #[token("+?")]
     PlusSaturate,
-    #[token("-?")]
     MinusSaturate,
     /// `*?` — saturating multiply. STILL UNDER RESEARCH: the BII template
     /// domain is linear, multiplication is outside the subset, and
     /// lowering fails closed on it. `/?` has no token yet.
-    #[token("*?")]
     StarSaturate,
-    #[token("+!")]
     PlusTrap,
-    #[token("-!")]
     MinusTrap,
-    #[token("*!")]
     StarTrap,
-    #[token("&")]
     Ampersand,
-    #[token("|")]
     Pipe,
-    #[token("^")]
     Caret,
-    #[token("<<")]
     Shl,
-    #[token("<<=")]
     ShlEq,
-    #[token(">>")]
     Shr,
-    #[token(">>=")]
     ShrEq,
-    #[token("~")]
     Tilde,
-    #[token("==")]
     EqEq,
-    #[token("!=")]
     Neq,
-    #[token("<")]
     Lt,
-    #[token(">")]
     Gt,
-    #[token("<=")]
     Le,
-    #[token(">=")]
     Ge,
-    #[token("=")]
     Assign,
-    #[token("+=")]
     PlusEq,
-    #[token("-=")]
     MinusEq,
-    #[token("*=")]
     StarEq,
-    #[token("/=")]
     SlashEq,
-    #[token("!")]
     Bang,
-    #[token("?")]
     Question,
-    #[token(".")]
     Dot,
-    #[token("..")]
     DotDot,
-    #[token("..=")]
     DotDotEq,
-    #[token("::")]
     ColonColon,
-    #[token(":")]
     Colon,
-    #[token(";")]
     Semicolon,
-    #[token(",")]
     Comma,
-    #[token("(")]
     LParen,
-    #[token(")")]
     RParen,
-    #[token("{")]
     LBrace,
-    #[token("}")]
     RBrace,
-    #[token("[")]
     LBracket,
-    #[token("]")]
     RBracket,
-    #[token("->")]
     Arrow,
-    #[token("@")]
     At,
-    #[token("=>")]
     FatArrow,
-    #[token("...")]
     Ellipsis,
 }
 

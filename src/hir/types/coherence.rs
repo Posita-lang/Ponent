@@ -79,9 +79,10 @@ pub(crate) struct CoherenceTree {
     pub nodes: Vec<OccNode>,
     pub parent: Vec<Option<NodeId>>,
     pub root: NodeId,
-    // B8: the binder-scope maps were stored here but never read after
-    // construction — the shadowing check (Notation 5.1) uses the LOCAL maps
-    // inside `build_coherence_tree`, so the struct fields were dead state.
+    // Binder-scope maps deliberately do NOT live here: they were stored
+    // once but never read after construction — the shadowing check
+    // (Notation 5.1) uses the LOCAL maps inside `build_coherence_tree`,
+    // so struct fields would be dead state.
 }
 
 /// A `bool`-like colored variable occurrence collected during lowering.
@@ -117,13 +118,25 @@ struct Pending {
 //   sinks a binder onto them.  They are pure inert terminals.
 const ATOM_BASE: usize = usize::MAX - 1;
 /// Lowest possible atom label = ATOM_BASE - max arena index.
-pub(crate) const ATOM_LABEL_FLOOR: usize = usize::MAX - (usize::MAX >> TypeId::TAG_BITS);
+/// (The previous `usize::MAX - (usize::MAX >> TAG_BITS)` was one too high:
+/// an atom at maximum arena capacity tripped the `atom_label` debug_assert
+/// and could collide with `fresh_param_index`'s boundary.)
+pub(crate) const ATOM_LABEL_FLOOR: usize = (usize::MAX - 1) - (usize::MAX >> TypeId::TAG_BITS);
 
 /// The lazy atom label for a nominal type (see the block above).
 fn atom_label(ty: TypeId) -> usize {
     let l = ATOM_BASE - ty.index();
     debug_assert!(l >= ATOM_LABEL_FLOOR, "atom label underflowed its range");
     l
+}
+
+/// Invert the lazy atom encoding — `label = ATOM_BASE - arena_index`,
+/// so the arena index is recovered in O(1) without any scan.  Returns
+/// None out-of-range (fail-closed): not an atom label, or the reserved
+/// `usize::MAX` unit-leaf label.
+pub(crate) fn atom_label_inverse(label: usize) -> Option<usize> {
+    let idx = ATOM_BASE.checked_sub(label)?;
+    (label >= ATOM_LABEL_FLOOR && label != usize::MAX).then_some(idx)
 }
 
 /// Does `ty` contain NO GenericParam anywhere?  Only GROUND nominal
@@ -325,7 +338,7 @@ impl Pending {
                 // args' polarity, so merge them into this spine (currying
                 // flattening, Lemma 4.1).
                 children.extend(ret_pending.children);
-                // P2: decorate-sort-undecorate — pending_cmp recomputed the
+                // decorate-sort-undecorate — pending_cmp recomputed the
                 // structural key on EVERY comparison (O(key) each, quadratic
                 // in the number of comparisons); compute each child's key
                 // once instead.
@@ -334,8 +347,7 @@ impl Pending {
                     .map(|c| (pending_sort_key(&c), c))
                     .collect();
                 decorated.sort_by(|a, b| a.0.cmp(&b.0));
-                let children: Vec<Pending> =
-                    decorated.into_iter().map(|(_, c)| c).collect();
+                let children: Vec<Pending> = decorated.into_iter().map(|(_, c)| c).collect();
                 Some(Pending {
                     label: ret_pending.label,
                     color,
@@ -434,13 +446,13 @@ pub(crate) struct FlatTree {
     /// Bound variable → r_X (the node whose binder set contains X;
     /// Notation 5.1 gives uniqueness).
     pub(crate) binder_scope: HashMap<usize, NodeId>,
-    /// P3a: (label, color) → node ids, built ONCE at construction.
+    /// (label, color) → node ids, built ONCE at construction.
     /// `nodes_labeled` is an O(1) index lookup instead of an O(N)
     /// rescan — the 2-SAT clause scan in `is_coherent` calls it O(n²)
     /// times, so the precomputed index drops the clause pass from
     /// O(n²·N) to O(n²·avg) + one O(N) build.
     pub(crate) labeled: HashMap<(usize, Color), Vec<NodeId>>,
-    /// P3b: Euler tour entry time (`tin[v]` is assigned on discovery,
+    /// Euler tour entry time (`tin[v]` is assigned on discovery,
     /// `tout[v]` after all descendants).  Standard subtree-interval
     /// test: `g` is an ancestor-OR-EQUAL of `id` ⇔
     /// `tin[g] ≤ tin[id] ∧ tout[id] ≤ tout[g]` — O(1) instead of an
@@ -450,10 +462,10 @@ pub(crate) struct FlatTree {
     pub(crate) tout: Vec<usize>,
 }
 
-/// P3b: iterative Euler tour of the rooted tree (node 0 = root in both
+/// Iterative Euler tour of the rooted tree (node 0 = root in both
 /// construction paths).  `tin` on discovery, `tout` after the whole
 /// subtree — gives the `g ⪯ id` interval test above.  Iterative (stack)
-/// by the P3d no-recursion discipline: pathologically deep spines must
+/// by the no-recursion discipline: pathologically deep spines must
 /// not recurse.
 fn build_euler_times(nodes: &[FlatNode]) -> (Vec<usize>, Vec<usize>) {
     let n = nodes.len();
@@ -484,7 +496,7 @@ fn build_euler_times(nodes: &[FlatNode]) -> (Vec<usize>, Vec<usize>) {
     (tin, tout)
 }
 
-/// P3a: build the (label, color) → [node] index in one O(N) pass.
+/// Build the (label, color) → [node] index in one O(N) pass.
 fn build_labeled_index(nodes: &[FlatNode]) -> HashMap<(usize, Color), Vec<NodeId>> {
     let mut idx: HashMap<(usize, Color), Vec<NodeId>> = HashMap::default();
     for (i, n) in nodes.iter().enumerate() {
@@ -606,7 +618,7 @@ impl FlatTree {
 
     /// Tree distance d(α, β) (number of edges on the unique path).
     fn dist(&self, mut a: NodeId, mut b: NodeId) -> usize {
-        // P2: O(1) fast path when one endpoint is an ancestor of the
+        // O(1) fast path when one endpoint is an ancestor of the
         // other — the is_modular window case dist(α, r_X) with r_X above.
         if self.tin[b] <= self.tin[a] && self.tout[a] <= self.tout[b] {
             return self.depth[a] - self.depth[b];
@@ -631,7 +643,7 @@ impl FlatTree {
         d
     }
 
-    /// All nodes labeled `v` with color `c` (P3a: O(1) index lookup
+    /// All nodes labeled `v` with color `c` (O(1) index lookup
     /// against the precomputed `labeled` map, not an O(N) rescan).
     fn nodes_labeled(&self, v: usize, c: Color) -> &[NodeId] {
         self.labeled
@@ -661,13 +673,21 @@ impl FlatTree {
     /// same node") is a PAPER-tree relation, so in code terms:
     /// - the head-leaf of spine v is parallel to v's bare-leaf children
     ///   only (head-leaves of spine children live under THEIR spines);
-    /// - a bare leaf is parallel to its bare-leaf siblings and to its
-    ///   parent spine's head-leaf (the X̄⇒X̄ shape — both non-modular,
-    ///   which is what keeps the κ=∞ probe `∀XY.(X→(Y→X))→X→Y` incoherent).
-    /// Two same-label spine SIBLINGS (e.g. Example 3.1's `mid`/`YW` W̄
-    /// spines under the root) are NOT paper-parallel — they are leaves
-    /// under different paper parents — which is what makes Example 3.1
-    /// coherent, matching §3's ≅1 proof via Thm 5.6.
+    /// - a bare leaf is parallel to its bare-leaf SIBLINGS only — its
+    ///   parent spine's head-leaf is NOT a same-color parallel partner,
+    ///   because parent/child colors always differ (color structure: each
+    ///   spine edge flips, the currying merge cancels on the ret side).
+    ///   A same-color head⊛arg combination exists only across DIFFERENT
+    ///   variables, which is the `pair_coherent` rule (ii) (c, flip c)
+    ///   clause, not a modularity blocker.
+    /// Two same-label spine SIBLINGS (e.g. the two-continuation variant's
+    /// `mid`/`yw` W̄ spines under the root) are NOT paper-parallel —
+    /// head-leaves under different paper parents.  Load-bearing
+    /// consequence: each W̄ spine head stays modular (no parallel
+    /// same-label node) ⇒ `eb(W)=true`, the premise of that golden's κ=∞
+    /// derivation chain (φ(W)=Blue forced via eb∧¬er, then rule (ii)
+    /// kills it).  Paper Example 3.1 itself is κ=∞ (X/Y/Z un-eliminable);
+    /// its ≅1 verdict lives in App. A's stronger ≡ theory.
     fn is_modular(&self, a: NodeId) -> bool {
         let n = &self.nodes[a];
         let x = n.label;
@@ -679,17 +699,62 @@ impl FlatTree {
         }
         let d = self.dist(a, r);
         let is_terminal = n.children.is_empty();
-        // Distance window, per the representation mapping above.
+        // Distance window — COLOR-ASYMMETRIC (verified against
+        // arXiv:1907.03481v3). Def 5.1 (L185-186) states modularity
+        // locally, but the operative condition is Prop 5.2's IFF
+        // (L191-193): c-eliminable iff the tree matches Fig. 6 left,
+        // whose sites are the G_k = ⟨Z̄_k ⇒ X̄⟩ branch HEADS (possibly
+        // the bare G_k = X̄, proof L197-198). The coherence-preservation
+        // proof (L290-291) fixes the geometry: same-r_X modular nodes
+        // are F_l terminals, while D_jk terminals sit at distance > 2
+        // from r_X — so a paper-d=2 terminal that is NOT its branch's
+        // head (an argument-position X̄, e.g. the X̄ of (X̄⇒Ȳ) under
+        // r_X) matches no LHS instance.  ⇒ RED terminals at code-d=2
+        // are NOT modular.  (History: admitting them once certified
+        // φ(X)=Blue for ∀X.(X⇒Y)⇒X while no rule applied; the earlier zero-branch refusal
+        // since made K=∅ text-legal (θ = µX.Σ_∅ = ∅, in-schema), and
+        // that type's reduction now fires — see
+        // `red_d2_zero_branch_reduct_fires`.)
+        //
+        // BLUE terminals at code-d=2 STAY modular: they are the dual
+        // branch heads ⟨X⁺ ⇒ Ā⟩ of the (Y⁻) LHS. The paper's color
+        // symmetry (L200) lives on its TWO trees (positive/negative);
+        // our single positive tree with in-place color flips maps
+        // negative-tree branch heads onto Blue terminals at d ≤ 2 —
+        // paper-licensed by Example 5.1 / Fig. 7(b) ("X is both
+        // red- and blue-eliminable", X⁺ leaves at d=2).
+        //
+        // (Corrected example — the original parenthetical mislabeled the
+        // colors. Parity: every spine edge flips the color, so
+        // color(node) = color(r_X) ⊕ d, and all x occurrences lie in
+        // r_X's subtree ⇒ under a BLUE r_X, RED terminals sit only at
+        // ODD d (a RED d=2 terminal is structurally impossible there);
+        // under a RED r_X, the d=2 RED terminals are (Y⁻) residue
+        // positions (X̄ inside branch arguments), not blue-rule sites.
+        // Either way the blue rule's sites are exclusively r_X's Red-X
+        // CHILDREN. The RED-d=2 exclusion is load-bearing for (Y⁻)
+        // shapes under a Red r_X (pushes φ toward Red so the red rule
+        // can fire); the BLUE-d=2 keep is load-bearing for the (Y⁻)
+        // dual-head sites under a Blue r_X.)
         let in_window = if is_terminal {
-            (1..=2).contains(&d)
+            d == 1 || (d == 2 && n.color == Color::Blue)
         } else {
             d <= 1 // paper d = code d + 1 ≤ 2
         };
         if !in_window {
             return false;
         }
-        // "no parallel node of label X^c" — paper siblings, per the
-        // mapping above.
+        // "no parallel node of label X^c" — paper siblings.  COLOR
+        // STRUCTURE: every child of a color-c spine lowers at flip(c)
+        // (argument flip; the currying merge re-flips and cancels on the
+        // ret side).  Hence a bare leaf's same-label same-color parallel
+        // partners are its bare SIBLINGS only (two X̄ args of one spine —
+        // live, pinned by d5_pair_polarity_decides_incoherence).  The
+        // parent-head check and the head-leaf's bare-child check were
+        // UNSATISFIABLE (parent/child colors always differ) — dead code,
+        // removed; the former comment wrongly credited the parent-head
+        // check for the κ=∞ probe (that verdict comes from the d≥2
+        // non-modular nodes, see kappa_truly_non_coherent's dump).
         if is_terminal {
             if let Some(p) = self.parent[a] {
                 for &s in &self.nodes[p].children {
@@ -702,28 +767,44 @@ impl FlatTree {
                         return false;
                     }
                 }
-                // parent spine's head-leaf with same label+color
-                let pn = &self.nodes[p];
-                if pn.label == x && pn.color == n.color {
-                    return false;
-                }
-            }
-        } else {
-            // head-leaf of this spine: parallel = bare-leaf children
-            // with the same label+color.
-            for &s in &n.children {
-                let sc = &self.nodes[s];
-                if sc.children.is_empty() && sc.label == x && sc.color == n.color {
-                    return false;
-                }
             }
         }
         true
     }
 
-    /// Def 5.2 (per the LaTeX source): X is `c`-eliminable iff every node
-    /// α : X^c̄ (the OPPOSITE color) is modular.  Vacuously true when no
-    /// node of that color exists.
+    /// Def 5.2 (verbatim, L185-187): X is `c`-eliminable
+    /// iff every node α : X^c̄ (the OPPOSITE color) is modular — no
+    /// "sites non-empty" premise; the vacuous case IS the paper semantics
+    /// (pinned by `kappa_yoneda_with_ground_atom_instantiation`:
+    /// ∀X.(X→Int)→X has an empty X̄ set and must stay coherent).
+    /// NOTE: a variable occurring in only ONE color gets
+    /// φ forced onto the empty color.  The zero-site side was resolved
+    /// zero-site side of this (K=∅ is text-legal, Σ_∅ = 0 fires); what
+    /// remains stuck is the head-gated family — reduction sites whose r_X
+    /// root is NOT X-labeled are refused by `yoneda_step` (see its
+    /// comment), so those coherent types join the coherent-but-stuck
+    /// family (e.g. ∀X.X⇒(X⇒Int)⇒Int, truth ≅ Int→Int) pending the
+    /// Fig. 6 figure-geometry ruling.
+    /// NOTE: the head-gated family includes the paper's
+    /// OWN Example 5.1 type (Fig 7(b) t1): X has no head occurrence there
+    /// (two X̄ branch-head spines + two X⁺ d2 leaves; r_X is the root,
+    /// headed Y⁺) ⇒ κ=0 yet `standard_reduce(t1) = None` — a live Thm 5.6
+    /// violation, pinned by
+    /// rewrite.rs::fig7b_t1_probe_coherent_but_engine_stuck.
+    /// NOTE: the LHS root condition is text-exact — Prop 5.2 verbatim
+    /// admits ANY blue variable Y ("possibly X
+    /// itself") as the rule-(a) site root, and a blue Y ≠ X for (b) — so the
+    /// head gate's X-label requirement is textually refuted.  The engine's
+    /// accepted set is exactly two families (see yoneda_step's precision
+    /// note): blue at X̄-headed r_X (rule (a), Y = X), and red at X̄-headed
+    /// r_X (no positive-tree textual match — candidate Fig-6(c)/(d); sound
+    /// ×3).  The Y ≠ X refusals are PROVABLY forced: red-Y≠X is unsound on
+    /// t1 (νX.((Y→X)→1) ≅ ∀Y.1 vs truth ∅ at Y := ∅); blue-Y≠X's grouping
+    /// is decided by the ∀X.((X→A)→(X→B)→C) family (µ-lift ≅ 0 ✗ / substitution ✗ non-Λ2 /
+    /// K≥1 ⇒ gate text-exact) — the figure's grouping call is the one
+    /// remaining unknown.  t1 (κ=0, refused — pinned by the probe test)
+    /// stays pinned; the
+    /// violation record stands.
     pub(crate) fn color_eliminable(&self, x: usize, c: Color) -> bool {
         self.nodes_labeled(x, c.flip())
             .iter()
@@ -746,19 +827,54 @@ impl FlatTree {
     /// `pair_coherent(x, c̄, y, d̄)`, and 2-SAT clause (2) uses the
     /// equivalent form: a pair (x^c, y^d) forbids the complemented
     /// valuation (φ(x)=c̄, φ(y)=d̄), yielding clause (a_x^c ∨ a_y^d).
-    fn pair_coherent(&self, x: usize, c: Color, y: usize, d: Color) -> bool {
+    /// Paper-parallel test between two (variable, color) pairs — Def 5.4's
+    /// pairwise coherence, shared with rewrite.rs's standard-reduction
+    /// driver (which needs it per reduced pair, Def 5.6, not just through
+    /// the global valuation).
+    pub(crate) fn pair_coherent(&self, x: usize, c: Color, y: usize, d: Color) -> bool {
         if x == y {
             return true; // same variable, no pair (α:X, β:Y) with Y ≠ X
         }
         let xs = self.nodes_labeled(x, c);
         let ys = self.nodes_labeled(y, d);
+        // Paper-parallel — UNIFORM READING: parallel = two
+        // LABELED LEAVES that are immediate successors of the same paper
+        // spine node (Notation 5.1 + L844, labels live on leaves).  Anchor:
+        // Example 5.1 pins X BLUE-eliminable in fig7(b)'s t1, whose three
+        // X̄ branch heads are NON-bare siblings under the root — counting
+        // non-bare successors as parallel would make every X̄ non-modular
+        // and the paper's own verdict unreachable under either tree
+        // reading (Def 4.2 or L844).  Hence:
+        //   (i)  two BARE siblings (same parent, both childless), and
+        //   (ii) a node and its OWN bare-leaf child
+        //        (head-leaf ⊛ arg-leaf of one spine) —
+        // exactly is_modular's internal parallel check, so the two sites
+        // can no longer drift.  (The former bare-free rule (i) flipped
+        // kappa_neg_non_duplicated to a spurious UNSAT on a Prop 3.1
+        // shape.)  Rule (ii) itself stays: Example 5.3's (X̄ head, Y⁺ arg)
+        // pair is a rule-(ii) bare-child pair.
+        let paper_parallel = |a: NodeId, b: NodeId| -> bool {
+            if a == b {
+                return false;
+            }
+            let (pa, pb) = (self.parent[a], self.parent[b]);
+            if pa.is_some() && pa == pb {
+                // (i) same-parent pair — BOTH must be bare leaves.
+                return self.nodes[a].children.is_empty() && self.nodes[b].children.is_empty();
+            }
+            match (pb, pa) {
+                // (ii) parent–child with a BARE child (head ⊛ arg leaf)
+                (Some(p), _) if p == a => self.nodes[b].children.is_empty(),
+                (_, Some(p)) if p == b => self.nodes[a].children.is_empty(),
+                _ => false,
+            }
+        };
         for &a in xs {
             if !self.is_modular(a) {
                 continue;
             }
-            let Some(p) = self.parent[a] else { continue };
             for &b in ys {
-                if b != a && self.parent[b] == Some(p) && self.is_modular(b) {
+                if paper_parallel(a, b) && self.is_modular(b) {
                     return false; // parallel modular pair
                 }
             }
@@ -892,7 +1008,11 @@ impl FlatTree {
             // rule applies: literal true iff its component id is smaller.
             val.insert(
                 x,
-                if comp[blue(i)] < comp[red(i)] { Color::Blue } else { Color::Red },
+                if comp[blue(i)] < comp[red(i)] {
+                    Color::Blue
+                } else {
+                    Color::Red
+                },
             );
         }
         Some(val)
@@ -924,47 +1044,71 @@ impl FlatTree {
     /// Def 5.7 (arXiv:1907.03481v3, verbatim clauses):
     /// - *down-move* α ⊳ β: (α,β) is an X-pair (same label, opposite
     ///   colors) and β is modular.  NO ancestor constraint — α and β are
-    ///   terminal nodes, so the tree order is vacuous between them.
+    ///   terminal nodes, so the tree order is vacuous between them.  The
+    ///   SOURCE is an occurrence of X in A⟨X⟩ (L314–315): r_X's own head
+    ///   occurrence is excluded (paper L381–382: ∀Y.Ȳ⇒Y has κ=0; §7.3's
+    ///   1♯ lands in Λ2^{κ≤0}).
     /// - *up-move* α ⊳ β: α ≠ β, α is a modular node with immediate
     ///   predecessor γ, β : X for some X ∈ bv(E), and γ ⪯ β (γ is an
     ///   ancestor-or-equal of β).
     /// Alternation is enforced structurally: the (node, parity) two-layer
     /// graph only admits down edges at even parity and up edges at odd.
     fn has_cyclic_alternating_path(&self) -> bool {
-        let leaves = self.leaves();
-
         // down-moves: α ⊳ β where (α,β) is an X-pair and β modular.
         // An X-pair is (α : X^blue, β : X^red) (Def 5.1 ordering); only β
-        // must be modular (hence terminal, Def 5.1). α may be ANY node —
-        // an internal spine head and the binder node r_X itself included:
-        // Def 5.7 (verbatim, L2033) puts NO constraint on the source, and
-        // the paper's own construction (L2037: "down-move from an
-        // occurrence of X in A to the modular node labeled X̄, then
-        // up-move back to X") yields κ=1 for ∀X.X⇒X — confirmed by §7.3,
-        // which classifies ∀X.X⇒X into Λ2^{κ≤1} (a μν-type, not κ=0).
-        // (A former r_X-source exclusion here produced κ=0 for ∀X.X⇒X,
-        // contradicting both the verbatim definition and §7.3.)
+        // must be modular (hence terminal, Def 5.1).  The down-move SOURCE
+        // is an occurrence of X *inside the branch arguments* ("down-move
+        // from an occurrence of X in A⟨X⟩ to the modular node labeled
+        // X̄", L314–315) — NEVER r_X's own head occurrence.  The paper
+        // pins the head exclusion twice: the post-Cor.-5.2 example states
+        // ∀Y.Ȳ⇒Y "has characteristic 0" (L381–382), and §7.2/§7.3 embed
+        // 1♯ = ∀X.X̄⇒X⁺ into Λ2^{κ≤0} (the characteristic-0 fragment,
+        // Def 7.1).  Admitting the head as a source misclassified every
+        // (…⇒X̄)⇒X⁺ type with X absent from the branch arguments as
+        // cyclic (e.g. ∀X.(Int⇒X)⇒X, truth ≅ Int, κ=0).  (A former
+        // "verbatim reading, no source constraint" comment mis-cited
+        // §7.3: that section puts the identity type in κ≤0, not κ≤1.)
         let mut down: Vec<(NodeId, NodeId)> = Vec::new();
         for a in 0..self.nodes.len() {
             let na = &self.nodes[a];
             if na.color != Color::Blue {
                 continue;
             }
-            // P2: group by label via the labeled index — a down-move's
-            // target is a same-label Red terminal, so only nodes_labeled
+            // r_X's own head occurrence is not a down-move source.
+            if self.binder_scope.get(&na.label).copied() == Some(a) {
+                continue;
+            }
+            // Group by label via the labeled index — a down-move's
+            // target is a same-label Red node, so only nodes_labeled
             // candidates need the modular test (the old loop scanned
             // every leaf for every Blue node).
             for &b in self.nodes_labeled(na.label, Color::Red) {
-                if self.nodes[b].children.is_empty() && self.is_modular(b) {
+                // Down-move TARGET = "β is modular" (Def 5.7, L312–313) —
+                // the SAME predicate Def 5.2 quantifies over, which per the
+                // head-leaf mapping (is_modular) includes non-terminal d≤1
+                // spine nodes: the paper's branch-head leaves.  Text anchor:
+                // L314–315 constructs the cyclic path "down from an occurrence
+                // of X in A to the modular node labeled X̄, then up-move back"
+                // for EVERY ∀X.(A⟨X⟩⇒X)⇒B⟨X⟩ with X ∈ FV(A) — and Fig. 9(a)
+                // illustrates an alternate path in t1 itself, whose only X̄
+                // nodes ARE the branch heads.  The former bare-leaf-only target
+                // test suppressed this construction and reported κ=0 for the
+                // (Y⁺) family, contradicting §7.3's Λ2^{κ≤1} classification of
+                // the μ-reducts.
+                if self.is_modular(b) {
                     down.push((a, b));
                 }
             }
         }
 
-        // up-moves: α → β where α modular, γ = parent(α), γ ≤ β, and
-        // β is any node labeled with a bound variable.
+        // up-moves: α → β where α MODULAR (bare leaf or spine head — both
+        // map to paper leaves, §4.1: labels live on leaves), γ = parent(α),
+        // γ ≤ β, and β is any node labeled with a bound variable.  The
+        // former leaves-only scan missed modular spine heads (is_modular
+        // holds for non-terminal nodes with d ≤ 1), losing up-moves and
+        // under-reporting κ.
         let mut up: Vec<(NodeId, NodeId)> = Vec::new();
-        for &a in &leaves {
+        for a in 0..self.nodes.len() {
             if !self.is_modular(a) {
                 continue;
             }
@@ -973,12 +1117,9 @@ impl FlatTree {
                 if !self.is_bound(n.label) {
                     continue;
                 }
-                // γ ≤ β: g is ancestor-or-equal of id — P3b Euler
+                // γ ≤ β: g is ancestor-or-equal of id — Euler
                 // subtree-interval test (O(1) instead of a parent climb).
-                if self.tin[g] <= self.tin[id]
-                    && self.tout[id] <= self.tout[g]
-                    && id != a
-                {
+                if self.tin[g] <= self.tin[id] && self.tout[id] <= self.tout[g] && id != a {
                     up.push((a, id));
                 }
             }
@@ -1028,7 +1169,7 @@ impl FlatTree {
     }
 }
 
-/// Structural sort key of a pending spine (P2: extracted from the old
+/// Structural sort key of a pending spine (extracted from the old
 /// comparison closure so the decorate-sort site computes each key once).
 /// Total order for the child permutation (Lemma 4.1 ii: `A ∼ B` up to
 /// argument permutation).  Deterministic.
@@ -1063,12 +1204,16 @@ mod tests {
     #[test]
     fn kappa_identity_type_is_coherent() {
         // ∀X. X → X — the identity type.  Balanced ⇒ coherent (Prop 3.1).
-        // κ = 1, NOT 0: Def 5.7's verbatim down-move admits the source
-        // r_X itself, giving the alternating cycle r_X ⊳ X̄ ⊳ r_X — and
-        // §7.3 explicitly classifies ∀X.X⇒X into Λ2^{κ≤1} (it reduces to
-        // a μ-type, here μX.1, not to a plain finite type).  The
-        // reduction still converges: coherent ⟺ strongly converges
-        // (Thm 5.6), which is all the reduction pipeline needs.
+        // κ = 0: the down-move SOURCE is an occurrence of X *in the branch
+        // arguments* (L314–315); X's only occurrence here is r_X's own
+        // head (h_X), which is not a source ⇒ no alternating cycle.
+        // Paper pins: the post-Cor.-5.2 example ("∀Y.Ȳ⇒Y, which has
+        // characteristic 0", L381–382) and §7.3's embedding of
+        // 1♯ = ∀X.X̄⇒X⁺ into Λ2^{κ≤0} (Def 7.1: exactly the κ=0
+        // fragment).  The type still standard-reduces (to µX.1 —
+        // Thm 5.6: coherent ⟺ strongly converges — is unaffected).  (A
+        // former κ=1 pin here leaned on the head as a down-move source,
+        // mis-citing §7.3 as κ≤1.)
         let mut ctx = TypeContext::new();
         let x = ctx.generic_param(0, "X".into());
         let id_fn = ctx.function(smallvec![x], x);
@@ -1078,13 +1223,28 @@ mod tests {
         let ft = tree.flat();
         // X is bound, both colors present (X⁺ return, X̄ param).
         assert!(ft.eliminable(0), "X should be eliminable in ∀X.X→X");
-        assert_eq!(ft.characteristic(), 1, "§7.3: ∀X.X⇒X ∈ Λ2^{{κ≤1}}");
+        assert_eq!(
+            ft.characteristic(),
+            0,
+            "identity: head occurrence is not a down-move source (paper: κ=0)"
+        );
     }
 
     #[test]
     fn kappa_neg_non_duplicated() {
-        // ∀X.Y. (X→Y) → X → Y: each variable occurs negatively once
-        // (negatively non-duplicated) ⇒ κ = 0 (Prop 3.1).
+        // ∀X.Y. (X→Y) → X → Y — UNIFORM-LEAF-PARALLEL flip (∞ → 1,
+        // probe-verified against the flat read: eb/er(X)=T/T, eb(Y)=T,
+        // er(Y)=F, kappa=1): the former UNSAT leaned on the bare-free
+        // sibling clause (a_X^red ∨ a_Y^red) between the bare X̄ leaf and
+        // the NON-bare xy-head — not a leaf pair, clause withdrawn.
+        // Anchor (Example 5.1: counting non-bare successors as
+        // parallel would contradict fig7(b)'s "X is blue-eliminable").
+        // Remaining: er(Y)=false (h_Y) forces φ(Y)=Blue; the rule-(ii)
+        // clause (a_X^blue ∨ a_Y^red) then forces φ(X)=Blue — SAT.  κ=1:
+        // down (X⁺ d2 leaf → X̄ d1 leaf) + up (X̄ → X⁺, γ=root) cycle.
+        // Aligned with Prop 3.1's negatively-non-duplicated shape.  If the
+        // NF lowering ever changes, re-derive from a flat dump — same
+        // discipline as kappa_truly_non_coherent.
         let mut ctx = TypeContext::new();
         let x = ctx.generic_param(0, "X".into());
         let y = ctx.generic_param(1, "Y".into());
@@ -1095,11 +1255,11 @@ mod tests {
 
         let tree = ctx.build_coherence_tree(ty).expect("Λ2 type");
         let ft = tree.flat();
-        // X⁺ appears as a branch-arg leaf and up/down moves alternate
-        // through the X-pair ⇒ coherent but with an alternating cycle:
-        // κ=1 ("rewrites into a μν-type"), still ≠ ∞.  Prop 3.1's
-        // ≅_Y 1 is compatible: the μ may dissolve via Fig. 4c.
-        assert_ne!(ft.characteristic(), u8::MAX, "neg-non-dup ⇒ coherent");
+        assert_eq!(
+            ft.characteristic(),
+            1,
+            "leaf-parallel uniform reading ⇒ SAT with one cycle"
+        );
     }
 
     #[test]
@@ -1123,7 +1283,10 @@ mod tests {
         let b = ctx.bool();
         let c = ctx.coproduct(smallvec![i32ty, b]);
         let fc = ctx.function(smallvec![c], c);
-        assert!(ctx.build_coherence_tree(fc).is_none(), "sums stay outside Λ2");
+        assert!(
+            ctx.build_coherence_tree(fc).is_none(),
+            "sums stay outside Λ2"
+        );
     }
 
     #[test]
@@ -1154,10 +1317,13 @@ mod tests {
 
     #[test]
     fn kappa_yoneda_with_ground_atom_instantiation() {
-        // The Yoneda shape (1) with a CLOSED-ATOM A: ∀X.(X→Int)→X ≅_Y Int.
-        // The atom terminal is visible to the machinery; the type
-        // must be coherent (κ≠∞) — the earlier machinery refused the whole
-        // type because Int had no lowering at all.
+        // The Yoneda shape (1) with a CLOSED-ATOM A: ∀X.(X→Int)→X —
+        // truth-value correction: this is ≅ ∅, NOT ≅_Y Int
+        // (instantiate X:=0: (0→Int)→0 = 1→0 = ∅); the reduct
+        // µX.((X→Int)⇒0) matches.  The atom terminal is visible to the
+        // machinery; the type must be coherent (κ≠∞) — the earlier
+        // machinery refused the whole type because Int had no lowering
+        // at all.
         let mut ctx = TypeContext::new();
         let x = ctx.generic_param(0, "X".into());
         let i = ctx.int(32, true);
@@ -1177,7 +1343,13 @@ mod tests {
         // ∀X.(X→X→X)→X: matches (Y⁺) with branch ⟨X,X⟩→X and B=X.
         // X⁺ occurs only in the branch args (negative side of the branch),
         // all X̄ nodes sit at depth ≤2 from r_X with no parallel sibling of
-        // the same color ⇒ X is blue-eliminable ⇒ coherent, κ=0.
+        // the same color ⇒ X is blue-eliminable ⇒ coherent.  κ=1 (was
+        // 0 under the bare-only down-move target): the X⁺ d2 branch-arg
+        // leaves down-move to the X̄ d1 BRANCH HEAD (modular per the
+        // head-leaf mapping, d≤1 non-terminal) and up-move back — the
+        // cyclic alternate path L314–315 constructs for EVERY
+        // ∀X.(A⟨X⟩⇒X)⇒B⟨X⟩.  Consistent with §7.3: the reduct
+        // µX.(X×X) is a μ-type ⇒ Λ2^{κ≤1}.
         let mut ctx = TypeContext::new();
         let x = ctx.generic_param(0, "X".into());
         let xxx = ctx.function(smallvec![x, x], x);
@@ -1190,15 +1362,24 @@ mod tests {
             ft.color_eliminable(0, Color::Blue),
             "X should be blue-eliminable per (Y⁺)"
         );
-        assert_eq!(ft.characteristic(), 0);
+        assert_eq!(ft.characteristic(), 1);
     }
 
     #[test]
     fn kappa_truly_non_coherent() {
-        // ∀XY.(X→(Y→X))→X→Y: an X̄ occurrence sits at depth 3 from r_X
-        // (inside the nested arrow) ⇒ beyond the modular window for BOTH
-        // colors ⇒ neither color-eliminable ⇒ incoherent, κ=∞.
-        // (Probed: char=255.)
+        // ∀XY.((Y→X)→Y)→X→Y — κ=∞ CONFIRMED by probe (flat dump):
+        //   node0 root{Y Blue = h_Y}, node1 {X̄ Red bare, d1 modular},
+        //   node2 {Ȳ Red head, d1 modular}, node3 {X⁺ spine HEAD, d2,
+        //   NON-terminal ⇒ non-modular (color-asymmetric window)}, node4
+        //   {Ȳ leaf, d3 non-modular}.
+        // Verdicts: eb(X)=T (node1) but er(X)=F (node3 X⁺ non-terminal
+        // head — the former "d≥3 X̄" premise was inaccurate: no X sits at
+        // d≥3; the blocker is the d2 non-terminal X⁺); eb(Y)=F (node4)
+        // and er(Y)=F (h_Y) ⇒ Y eliminable in NEITHER color ⇒ UNSAT.
+        // (Re-derivation note: the currying-merge prediction of κ=1 did
+        // not match the actual lowering — node3 is a spine HEAD, not a
+        // merged-branch leaf.  Re-derive from this dump if the NF spine
+        // flattening ever changes.)
         let mut ctx = TypeContext::new();
         let x = ctx.generic_param(0, "X".into());
         let y = ctx.generic_param(1, "Y".into());
@@ -1230,70 +1411,203 @@ mod tests {
 
         let tree = ctx.build_coherence_tree(ty).expect("Λ2 type");
         let ft = tree.flat();
-        // X occurs negatively twice (parallel) → not blue-eliminable; but
-        // Y-eliminability may still save coherence for Y.  X itself is
-        // non-eliminable in both colors ⇒ incoherent ⇒ κ=∞.
+        // Coherent (Y-eliminable saves the type; the two parallel X̄ args
+        // only kill X's blue side).  κ=0: the only Blue Y occurrence is
+        // r_Y's own head (excluded as a down-move source — paper
+        // L381–382 pins ∀Y.Ȳ⇒Y-shaped types at κ=0), and the Blue X⁺
+        // d2 arg leaves have no modular X̄ target (the branch head IS
+        // r_X, non-modular per the α ≠ h_X clause) ⇒ no alternating
+        // cycle.  The paper's Fig. 2 chain reduces this exact prefix
+        // shape to a finite type — κ=0 is the paper verdict.  (A former
+        // κ=1 pin here leaned on the head as a down-move source.)
         let k = ft.characteristic();
-        assert!(k == 0 || k == u8::MAX, "expected 0 or ∞, got {}", k);
+        assert_eq!(k, 0, "prefix-Yoneda family: head-source excluded ⇒ acyclic");
     }
 
-    /// Paper Fig. 7(a) verdict (Example 5.1): "X is eliminable but not
-    /// c-eliminable" — exactly one of the two colors is eliminable
-    /// (Lemma 5.1).
-    ///
-    /// BOUNDARY: the exact Fig. 7(a) tree is an SVG diagram in the paper
-    /// that does not reliably extract to text — the text caption
-    /// `∀X.(X→X→X)→X→(Y→X)→X` puts the X's inside `(X→X→X)` beyond the
-    /// modular window (distance > 2 from `r_X`), so *neither* color is
-    /// eliminable there, contradicting the paper.  We therefore pin the
-    /// VERDICT on a hand-verifiable type: `∀X.(X→Y)→X` — X occurs once as
-    /// the head `h_X` (never modular) and once as a modular argument
-    /// (distance 2 from `r_X`), so exactly one color is eliminable.
+    /// Paper Fig. 7(a) verdict (Example 5.1, L189): "X is blue-eliminable
+    /// but not red-eliminable".  Type VERBATIM from the Fig. 7(a) caption
+    /// (ar5iv L218): ∀X.(X⁺⇒X̄)⇒(∀Y.X⁺⇒Ȳ)⇒X⁺ — the former comment's
+    /// "∀X.(X→X→X)→X→(Y→X)→X" was a caption mis-transcription.
+    /// X̄: the (X⇒X̄) branch head (code d=1, non-terminal) ⇒ modular ⇒
+    /// blue-eliminable.  X⁺: the root label is h_X (excluded) ⇒
+    /// red-eliminability fails, whatever the modular d=2 X⁺ leaves do.
     #[test]
     fn fig7_verdict_a_eliminable_not_c_elim() {
         let mut ctx = TypeContext::new();
         let x = ctx.generic_param(0, "X".into());
-        let y = ctx.generic_param(1, "Y".into()); // free
-        let xy = ctx.function(smallvec![x], y);
-        let body = ctx.function(smallvec![xy], x); // (X→Y)→X
+        let y = ctx.generic_param(1, "Y".into());
+        let xx = ctx.function(smallvec![x], x); // (X⇒X̄)
+        let xy = ctx.function(smallvec![x], y); // (X⇒Ȳ)
+        let forall_y = ctx.forall(1, "Y".into(), xy); // ∀Y.X⇒Ȳ
+        let body = ctx.function(smallvec![xx, forall_y], x);
         let ty = ctx.forall(0, "X".into(), body);
 
         let ft = ctx.build_coherence_tree(ty).expect("Λ2").flat();
         let eb = ft.color_eliminable(0, Color::Blue);
         let er = ft.color_eliminable(0, Color::Red);
         assert!(
-            eb != er,
-            "Fig 7(a) verdict: X eliminable but not c-eliminable ⇒ exactly one color (blue={} red={})",
+            eb && !er,
+            "Fig 7(a) verbatim: blue-elim but not red-elim (blue={} red={})",
             eb,
             er
         );
     }
 
-    /// Paper Fig. 7(b) verdict (Example 5.1): "X is both c-eliminable and
-    /// c̄-eliminable".  (Same SVG-extraction boundary as Fig. 7(a).)
-    ///
-    /// Hand-verifiable type: `∀X.(X→Y)→(X→Z)→W` — X occurs in two distinct
-    /// argument subtrees (not parallel), each at distance 2 from `r_X`, and
-    /// `r_X`'s head is `W` (≠ X), so every X node is modular ⇒ both colors
-    /// eliminable.
+    /// Adjudication regression (red side): ∀X.(X⁺⇒Ȳ)⇒X⁺ has
+    /// NO X̄ occurrence — the (X⇒Y) child carries only a Blue X⁺ leaf
+    /// (probe-verified: two polarity flips under the positive root), so
+    /// the Fig. 6(a) LHS matches trivially with L=∅, K=∅ and
+    ///   θ = µX.Σ_∅ = 0   (paper L152: K is an arbitrary family).
+    /// Reduct: µX.((X⇒Y)⇒0) ≅ ∅ — semantically right (X:=0 gives
+    /// (0⇒Y)⇒0 = 1⇒0 = 0).  The former pin (κ=0 + reduction refused)
+    /// was the zero-branch gap before K=∅ was allowed; Thm 5.6 (iff, L306) requires the
+    /// coherent type to converge.  κ=0 pin unchanged.
+    #[test]
+    fn red_d2_zero_branch_reduct_fires() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let y = ctx.generic_param(1, "Y".into());
+        let branch = ctx.function(smallvec![x], y); // (X⁺⇒Ȳ)
+        let body = ctx.function(smallvec![branch], x); // (X⁺⇒Ȳ)⇒X⁺
+        let ty = ctx.forall(0, "X".into(), body);
+        let ft = ctx.build_coherence_tree(ty).expect("Λ2").flat();
+        assert_eq!(
+            ft.characteristic(),
+            0,
+            "coherent per Def 5.2's vacuous truth (X⁺-only)"
+        );
+        let ct = ctx.build_coherence_tree(ty).expect("Λ2");
+        let poly = crate::hir::types::rewrite::from_occ(ct.root_tree());
+        let simple = crate::hir::types::rewrite::standard_reduce(&poly)
+            .expect("zero-branch Σ reduct: Thm 5.6 forward direction");
+        assert!(crate::hir::types::rewrite::is_simple(&simple));
+    }
+
+    /// Adjudication regression (blue side): the X⁺ parameter of a spine —
+    /// the (Y⁻) dual-branch head ⟨X⁺ ⇒ Ā⟩, a BLUE terminal at code d=2 —
+    /// stays a site and drives the red-side reduction. This is the
+    /// classical double negation ∀X.X⇒(X⇒Int)⇒Int ↠ Int; dropping the
+    /// Blue-d=2 window (the naive "tighten to {1}" reading) would kill
+    /// this legitimate reduction and violate Thm 5.6 from the other side.
+    #[test]
+    fn blue_d2_terminal_is_a_site() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let i = ctx.int(32, true);
+        let inner = ctx.function(smallvec![x], i); // (X⁺⇒Int)
+        let body = ctx.function(smallvec![x, inner], i); // X⇒(X⇒Int)⇒Int
+        let ty = ctx.forall(0, "X".into(), body);
+        let ct = ctx.build_coherence_tree(ty).expect("Λ2");
+        // κ = 1 (empirically verified; the earlier pin of 0 was
+        // mis-derived): the Blue d=2 X⁺ leaf down-moves to the Red d=1
+        // X̄ leaf and the up-move returns — a genuine alternating cycle
+        // per Def 5.7, consistent with the Λ2^{κ≤1} classification.
+        assert_eq!(
+            ct.flat().characteristic(),
+            1,
+            "coherent with one alternating cycle (κ≤1)"
+        );
+        let poly = crate::hir::types::rewrite::from_occ(ct.root_tree());
+        // κ = 1 invariant (probe agreement: alternating cycle of down d=2→d=1 + up d=1→d=2).
+        // Head-gate flip: r_X here is the Int-ATOM-headed root spine — not an
+        // X-labeled LHS instance ⇒ BOTH colors refuse (fail-closed).
+        // The former pin (µX.((X→Int)⇒1) ≅ 1) was a provably unsound
+        // reduct: the true value is ≅ Int→Int (relational parametricity,
+        // f ↦ h with f_X x k = h(k x)) — the "≅ Int" and "≅ 1" claims
+        // were both wrong (corrected twice now).
+        assert!(crate::hir::types::rewrite::standard_reduce(&poly).is_none());
+    }
+
+    /// Head-gate anti-regression: ∀X.(X⇒A)⇒(X⇒B)⇒C — the root is C⁺-headed, so
+    /// r_X is NOT an X-labeled LHS instance.  The former head-blind
+    /// surgery deleted the C⁺ head occurrence and returned
+    /// µX.Σ[A,B] ≅ A+B — provably unsound (the parametric truth is ≅C:
+    /// f_X h k = p(h(y₀), k(y₀)) for every y₀ ⇒ p constant ⇒ ≅C).
+    /// Pin: the reduction is refused (fail-closed, coherent-but-stuck).
+    #[test]
+    fn non_x_head_sum_deleted() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let a = ctx.unit();
+        let b = ctx.bool();
+        let c = ctx.generic_param(1, "C".into());
+        let xa = ctx.function(smallvec![x], a); // (X⇒A)
+        let xb = ctx.function(smallvec![x], b); // (X⇒B)
+        let body = ctx.function(smallvec![xa, xb], c); // (X⇒A)⇒(X⇒B)⇒C
+        let ty = ctx.forall(0, "X".into(), body);
+        let ft = ctx.build_coherence_tree(ty).expect("Λ2");
+        assert_ne!(
+            ft.flat().characteristic(),
+            u8::MAX,
+            "the tree itself is coherent — only the reduction refuses"
+        );
+        let poly = crate::hir::types::rewrite::from_occ(ft.root_tree());
+        assert!(
+            crate::hir::types::rewrite::standard_reduce(&poly).is_none(),
+            "non-X head ⇒ not an LHS instance ⇒ refused (head gate)"
+        );
+    }
+
+    /// Example 5.3 regression: the ONLY incoherence
+    /// source is the rule-(ii) parent-child pair. Type (X=0, Y=1 bound;
+    /// U=2, W=3, C=4 free):
+    ///   ∀XY. (Y → (U→X) → X) → ((Y→W) → C) → X → X
+    /// Tree: r_X = r_Y = root. φ(X)=Blue forced (the (U→X) spine head is a
+    /// NON-terminal X⁺ at d=2 ⇒ er(X)=false; the X̄ head of the first branch
+    /// is d=1 modular ⇒ eb(X)=true). φ(Y)=Red forced (a bare Ȳ at d=3 ⇒
+    /// eb(Y)=false; the Y⁺ arg of the first branch is d=2 modular ⇒
+    /// er(Y)=true). The first branch's (X̄ head, Y⁺ arg) is a rule-(ii)
+    /// paper-parallel modular pair ⇒ clause (a_X^red ∨ a_Y^blue) ⇒ UNSAT.
+    /// WITHOUT rule (ii) the same tree is SAT (κ ∈ {0,1}) — this test
+    /// discriminates exactly the reinstated clause.
+    #[test]
+    fn example_5_3_pair_incoherent_via_parent_child_parallel() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let y = ctx.generic_param(1, "Y".into());
+        let u = ctx.generic_param(2, "U".into());
+        let w = ctx.generic_param(3, "W".into());
+        let c = ctx.generic_param(4, "C".into());
+        let ux = ctx.function(smallvec![u], x); // (U→X)
+        let n = ctx.function(smallvec![y, ux], x); // Y → (U→X) → X  (head X̄)
+        let yw = ctx.function(smallvec![y], w); // (Y→W)
+        let b3 = ctx.function(smallvec![yw], c); // ((Y→W)→C) — bare Ȳ at d=3
+        let body = ctx.function(smallvec![n, b3, x], x); // … → X̄ → X⁺
+        let ty = ctx.forall(0, "X".into(), body);
+        let ty = ctx.forall(1, "Y".into(), ty);
+        let ft = ctx.build_coherence_tree(ty).expect("Λ2").flat();
+        assert_eq!(
+            ft.characteristic(),
+            u8::MAX,
+            "rule-(ii) pair (X̄ head, Y⁺ arg) + forced φ(X)=Blue ∧ φ(Y)=Red ⇒ UNSAT"
+        );
+    }
+
+    /// Paper Fig. 7(b) verdict (Example 5.1): "X is both red- and
+    /// blue-eliminable".  Type VERBATIM (ar5iv L239) — the same t1 as
+    /// `d3_fig7b_duel_same_tree`.  X̄: the two branch heads (d=1);
+    /// X⁺: the two parameter leaves (d=2, Blue terminals — the dual
+    /// branch-head sites the verbatim modularity reading keeps modular).
     #[test]
     fn fig7_verdict_b_both_c_elim() {
         let mut ctx = TypeContext::new();
         let x = ctx.generic_param(0, "X".into());
         let y = ctx.generic_param(1, "Y".into());
         let z = ctx.generic_param(2, "Z".into());
-        let w = ctx.generic_param(3, "W".into());
-        let xy = ctx.function(smallvec![x], y);
+        let xx = ctx.function(smallvec![x], x);
         let xz = ctx.function(smallvec![x], z);
-        let body = ctx.function(smallvec![xy, xz], w); // (X→Y)→(X→Z)→W
+        let forall_z = ctx.forall(2, "Z".into(), xz);
+        let yx = ctx.function(smallvec![y], x);
+        let body = ctx.function(smallvec![xx, forall_z, yx], y);
         let ty = ctx.forall(0, "X".into(), body);
+        let ty = ctx.forall(1, "Y".into(), ty);
 
         let ft = ctx.build_coherence_tree(ty).expect("Λ2").flat();
         let eb = ft.color_eliminable(0, Color::Blue);
         let er = ft.color_eliminable(0, Color::Red);
         assert!(
             eb && er,
-            "Fig 7(b) verdict: X both c-eliminable and c̄-eliminable (blue={} red={})",
+            "Fig 7(b) verbatim: both c-eliminable (blue={} red={})",
             eb,
             er
         );

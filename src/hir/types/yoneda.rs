@@ -36,15 +36,15 @@
 //!   iterative (explicit frame stack); `walk_sum`/`walk_prod`
 //!   (rewrite.rs) are depth-capped (`WALK_DEPTH_CAP`, fail-closed `None`).
 //!   The remaining recursive walkers (`to_neg_fv`/`to_pos_fv`,
-//!   `FlatTree::flat`, `PolyTree::subst`, `collect_fvs`) are bounded above
+//!   `FlatTree::flat`, `collect_fvs`) are bounded above
 //!   by the parser's `max_recursion_depth` (256): a type too deep to
 //!   parse can never reach them from source.
 //! - `FUNCTOR_ACTION_FUEL` (`polar_action.rs`): BASE of a size-scaled
 //!   budget — `functor_action_fuel` uses `max(BASE, 10  node_count)`;
 //!   the binder-shadow rule remains the real termination argument.
 
-use crate::ast::FileId;
 use super::*;
+use crate::ast::FileId;
 
 impl<'input> TypeContext<'input> {
     /// Apply Yoneda reduction if this type matches the pattern
@@ -252,7 +252,7 @@ impl<'input> TypeContext<'input> {
     /// check, missing a valid co-Yoneda reduction (e.g., `∀X.(X⇒X)⇒(X⇒D)`).
     ///
     /// To solve this, we collect candidates for BOTH schemas independently
-    /// (Dual-Track), and then adjudicate globally based on the variance of `B⟨X⟩`.
+    /// (Dual-Track), and then decide globally based on the variance of `B⟨X⟩`.
     /// If `X ∉ FV(ret)`, both variance checks vacuously pass, and both paths
     /// yield the exact same result (the replacement is ignored by `replace_generic`),
     /// making the Yoneda-first preference mathematically safe.

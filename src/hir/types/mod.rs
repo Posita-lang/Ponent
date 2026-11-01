@@ -83,10 +83,10 @@ mod transaction;
 pub use transaction::*;
 mod canonical;
 mod coherence;
-pub mod predicativity;
 pub mod polar_action;
-pub mod typed_witness;
+pub mod predicativity;
 mod rewrite;
+pub mod typed_witness;
 pub mod witness;
 mod yoneda;
 pub use yoneda::*;
@@ -135,8 +135,8 @@ pub fn visit_type_children<'input, F: FnMut(TypeId)>(
         }
         TypeData::Array { elem, .. } => f(*elem),
         TypeData::Slice { elem } => f(*elem),
-        TypeData::Pointer { ty } => f(*ty),
-        TypeData::Ptr { size, pointee } => {
+        TypeData::Pointer { ty, .. } => f(*ty),
+        TypeData::Ptr { size, pointee, .. } => {
             f(*size);
             f(*pointee);
         }
@@ -238,8 +238,8 @@ fn is_type_volatile_inner(data: &TypeData, types: Option<&boxcar::Vec<Arc<TypeDa
         TypeData::Array { elem, .. } => is_type_volatile_inner_by_id(*elem, types),
         TypeData::Slice { elem } => is_type_volatile_inner_by_id(*elem, types),
         TypeData::Ref { ty, .. } => is_type_volatile_inner_by_id(*ty, types),
-        TypeData::Pointer { ty } => is_type_volatile_inner_by_id(*ty, types),
-        TypeData::Ptr { size, pointee } => {
+        TypeData::Pointer { ty, .. } => is_type_volatile_inner_by_id(*ty, types),
+        TypeData::Ptr { size, pointee, .. } => {
             is_type_volatile_inner_by_id(*size, types)
                 || is_type_volatile_inner_by_id(*pointee, types)
         }
@@ -260,9 +260,7 @@ fn is_type_volatile_inner(data: &TypeData, types: Option<&boxcar::Vec<Arc<TypeDa
         TypeData::Nu { body, .. } => is_type_volatile_inner_by_id(*body, types),
         // Recurse into self_ty: a `T::Assoc` whose self type is still
         // being inferred is itself volatile (mirrors `type_is_volatile`).
-        TypeData::AssociatedType { self_ty, .. } => {
-            is_type_volatile_inner_by_id(*self_ty, types)
-        }
+        TypeData::AssociatedType { self_ty, .. } => is_type_volatile_inner_by_id(*self_ty, types),
     }
 }
 
@@ -312,8 +310,8 @@ fn is_type_volatile_inner_by_id(ty: TypeId, types: Option<&boxcar::Vec<Arc<TypeD
                 TypeData::Array { elem, .. } => is_type_volatile_inner_by_id(*elem, Some(types)),
                 TypeData::Slice { elem } => is_type_volatile_inner_by_id(*elem, Some(types)),
                 TypeData::Ref { ty, .. } => is_type_volatile_inner_by_id(*ty, Some(types)),
-                TypeData::Pointer { ty } => is_type_volatile_inner_by_id(*ty, Some(types)),
-                TypeData::Ptr { size, pointee } => {
+                TypeData::Pointer { ty, .. } => is_type_volatile_inner_by_id(*ty, Some(types)),
+                TypeData::Ptr { size, pointee, .. } => {
                     is_type_volatile_inner_by_id(*size, Some(types))
                         || is_type_volatile_inner_by_id(*pointee, Some(types))
                 }
@@ -425,6 +423,12 @@ pub struct TypeContext<'input> {
     /// can share it instead of copying it.
     interner: Arc<TypeFactory<'input>>,
     pub(crate) bindings: HashMap<TypeId, TypeId>,
+    /// Monotone counter bumped on every binding mutation (set_binding,
+    /// transaction commit/rollback). Solver-side memo caches keyed on
+    /// resolved types use it as an epoch so a stale hit is impossible
+    /// across binding changes — including across a rolled-back snapshot,
+    /// which must not serve pre-rollback verdicts.
+    pub binding_epoch: std::sync::atomic::AtomicU64,
     pub builtin_unit: TypeId,
     pub builtin_never: TypeId,
     pub builtin_error: TypeId,
@@ -477,7 +481,7 @@ pub struct TypeContext<'input> {
     /// self-referential types.  Keyed by (a, b, variance_tag) where
     /// variance_tag = 0 for Invariant, 1 for Covariant, 2 for Contravariant.
     unify_seen: HashSet<(TypeId, TypeId, u8)>,
-    /// ADT variant-payload expansions for κ recursion detection (B5a):
+    /// ADT variant-payload expansions for κ recursion detection:
     /// Adt `TypeId` → per-variant payload `TypeId`s (nullary variant = unit).
     /// Registered by the checker at enum USE sites (the resolver cannot
     /// resolve self-referential payloads at definition time — the binding
@@ -486,7 +490,7 @@ pub struct TypeContext<'input> {
     /// back-edge in the κ graph, which the Phase-2 SCC classifier
     /// (`kappa.rs::solve_kappa`) classifies by the cycle's variance.
     /// Fail-closed: an unregistered expansion means "recursion not
-    /// detected" (the pre-B5a behavior), never a spurious cycle.
+    /// detected" (the pre-expansion behavior), never a spurious cycle.
     adt_expansions: HashMap<TypeId, Vec<TypeId>>,
     /// Current "operation span" hint: set by `unify_tracked` so that
     /// `set_binding` can record WHERE a GenericParam got bound (precise
@@ -600,6 +604,7 @@ impl<'input> TypeContext<'input> {
             opaque_hidden: HashMap::default(),
             opaque_hidden_undo: Vec::new(),
             transaction_stack: Vec::new(),
+            binding_epoch: std::sync::atomic::AtomicU64::new(0),
             unify_seen: HashSet::default(),
             adt_expansions: HashMap::default(),
             current_unify_span: None,
@@ -674,10 +679,11 @@ impl<'input> TypeContext<'input> {
             builtin_layout_descriptor: other.builtin_layout_descriptor,
             region_subtype_collect: false,
             region_subtype_outlives: Vec::new(),
-            parametricity: crate::hir::parametricity::ParametricityGate::new(),
+            parametricity: other.parametricity,
             opaque_hidden: HashMap::default(),
             opaque_hidden_undo: Vec::new(),
             transaction_stack: Vec::new(),
+            binding_epoch: std::sync::atomic::AtomicU64::new(0),
             unify_seen: HashSet::default(),
             // Copied (not fresh): the expansion table is keyed by shared
             // TypeIds from the shared arena, so a per-query context must
@@ -715,10 +721,14 @@ impl<'input> TypeContext<'input> {
 
     /// Allocate a fresh, globally-unique parameter index for Exists/Forall binders.
     pub fn fresh_param_index(&self) -> usize {
-        let idx = self.interner.next_param_index.load(AtomicOrdering::Relaxed);
-        self.interner
+        // fetch_add (not load+store): the parallel checker path allocates
+        // binder indices concurrently — a load/store race would emit the
+        // SAME index to two workers, colliding two binders and breaking
+        // Notation 5.1's pairwise-distinctness invariant.
+        let idx = self
+            .interner
             .next_param_index
-            .store(idx + 1, AtomicOrdering::Relaxed);
+            .fetch_add(1, AtomicOrdering::Relaxed);
         // Disjointness: param indices (binder identity, Notation 5.1)
         // must never collide with the atom-label band [ATOM_LABEL_FLOOR,
         // ATOM_BASE] — the binder_scope design assumes the two spaces are
@@ -817,8 +827,8 @@ impl<'input> TypeContext<'input> {
             TypeData::Array { elem, .. } => self.type_is_volatile_by_id(*elem),
             TypeData::Slice { elem } => self.type_is_volatile_by_id(*elem),
             TypeData::Ref { ty, .. } => self.type_is_volatile_by_id(*ty),
-            TypeData::Pointer { ty } => self.type_is_volatile_by_id(*ty),
-            TypeData::Ptr { size, pointee } => {
+            TypeData::Pointer { ty, .. } => self.type_is_volatile_by_id(*ty),
+            TypeData::Ptr { size, pointee, .. } => {
                 self.type_is_volatile_by_id(*size) || self.type_is_volatile_by_id(*pointee)
             }
             TypeData::Forall { body, .. }
@@ -1383,6 +1393,8 @@ impl<'input> TypeContext<'input> {
             log.push((key, old));
         }
         self.bindings.insert(key, value);
+        self.binding_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn resolve_binding_tail(&self, id: TypeId) -> TypeId {
@@ -1485,13 +1497,12 @@ impl<'input> TypeContext<'input> {
     /// `OVERLAP_FRESH_VAR_ID`).  Per-context, so long-running processes
     /// and parallel tests never share a single unbounded counter.
     pub fn alloc_overlap_fresh_var(&mut self, universe: usize) -> TypeId {
+        // fetch_add: two workers racing here would otherwise both load the
+        // same id and mint colliding InferVars.
         let id = self
             .interner
             .next_overlap_fresh_id
-            .load(AtomicOrdering::Relaxed);
-        self.interner
-            .next_overlap_fresh_id
-            .store(id + 1, AtomicOrdering::Relaxed);
+            .fetch_add(1, AtomicOrdering::Relaxed);
         self.alloc(TypeData::InferVar { id, universe })
     }
 
@@ -1700,11 +1711,85 @@ impl<'input> TypeContext<'input> {
     }
 
     pub fn pointer(&mut self, ty: TypeId) -> TypeId {
-        self.alloc(TypeData::Pointer { ty })
+        self.alloc(TypeData::Pointer { ty, mutable: false })
     }
 
+    /// `*mut T` — INVARIANT in T.  The surface form is in the 2026-10-28
+    /// grammar (§2.1); in-tree minting sites (checker slices) pending —
+    /// tests mint by hand.
+    pub fn pointer_mut(&mut self, ty: TypeId) -> TypeId {
+        self.alloc(TypeData::Pointer { ty, mutable: true })
+    }
+
+    /// Read-only accessor: `Some(mutable)` when `ty` is a raw
+    /// `*const`/`*mut` pointer, `None` otherwise.  FFI rendering
+    /// (`const T*` vs `T*`) and audit flagging must consult this instead
+    /// of pattern-matching with `mutable: false` (which silently reads
+    /// `*mut` as `*const`).
+    pub fn mutability_of_pointer(&self, ty: TypeId) -> Option<bool> {
+        match self.get(ty) {
+            TypeData::Pointer { mutable, .. } => Some(*mutable),
+            _ => None,
+        }
+    }
+
+    /// Classify `ty` as a raw pointer (§4.6 landing support; enum
+    /// `RawPtrShape` at module scope below).  `None` for everything else —
+    /// refs/slices are BOUNDARY COERCIONS (`&T→*const`, `&mut→*mut`), the
+    /// checker's job, not a shape.
+    pub(crate) fn raw_ptr_shape(&self, ty: TypeId) -> Option<RawPtrShape> {
+        match self.get(ty) {
+            TypeData::Pointer { ty: p, mutable, .. } => Some(if *mutable {
+                RawPtrShape::WordMut { pointee: *p }
+            } else {
+                RawPtrShape::WordConst { pointee: *p }
+            }),
+            TypeData::Ptr {
+                size,
+                pointee,
+                mutable,
+                ..
+            } => Some(RawPtrShape::Explicit {
+                size: *size,
+                pointee: *pointee,
+                mutable: *mutable,
+            }),
+            _ => None,
+        }
+    }
+
+    /// §4.6: may a bare `Ptr`'s size axis stand in an extern "C"
+    /// signature?  Only a word-width Ptr has an ABI representation;
+    /// `word_bits` comes from the checker's Target.  Fail-closed on
+    /// params/inference state (unresolved ⇒ not provably word-width).
+    pub(crate) fn extern_c_ptr_size_ok(&self, size: TypeId, word_bits: u32) -> bool {
+        match self.get(size) {
+            TypeData::USize => true,
+            TypeData::UInt { bits, .. } | TypeData::Int { bits, .. } => *bits == word_bits,
+            _ => false,
+        }
+    }
+    // ── end §4.6 ABI landing support ─────────────────────────────────────
+
     pub fn ptr(&mut self, size: TypeId, pointee: TypeId) -> TypeId {
-        self.alloc(TypeData::Ptr { size, pointee })
+        // §2.1: mutability defaults to const.
+        self.alloc(TypeData::Ptr {
+            size,
+            pointee,
+            mutable: false,
+        })
+    }
+
+    /// `Ptr<size, pointee> with mutability = mut` — INVARIANT in `pointee`
+    /// (§2.4).  The surface form is in the 2026-10-28 grammar (§2.1);
+    /// in-tree minting sites (checker slices) pending — tests mint by
+    /// hand.
+    pub fn ptr_mut(&mut self, size: TypeId, pointee: TypeId) -> TypeId {
+        self.alloc(TypeData::Ptr {
+            size,
+            pointee,
+            mutable: true,
+        })
     }
 
     pub fn function(&mut self, params: SmallVec<[TypeId; 4]>, ret: TypeId) -> TypeId {
@@ -1784,10 +1869,10 @@ impl<'input> TypeContext<'input> {
             TypeData::Array { elem, .. } => {
                 self.poly_body_is_open_inner(*elem, quantifiers, locally_bound)
             }
-            TypeData::Pointer { ty: inner } => {
+            TypeData::Pointer { ty: inner, .. } => {
                 self.poly_body_is_open_inner(*inner, quantifiers, locally_bound)
             }
-            TypeData::Ptr { size, pointee } => {
+            TypeData::Ptr { size, pointee, .. } => {
                 self.poly_body_is_open_inner(*size, quantifiers, locally_bound)
                     || self.poly_body_is_open_inner(*pointee, quantifiers, locally_bound)
             }
@@ -1913,6 +1998,13 @@ impl<'input> TypeContext<'input> {
                 if *pi == param_index {
                     ty
                 } else {
+                    // Capture guard: symmetric with the Mu/Nu/Poly arms and
+                    // with subst()'s binder arms.
+                    debug_assert!(
+                        !self.type_contains_param(*pi, replacement),
+                        "replace_generic: the replacement would be captured by binder {}",
+                        pi
+                    );
                     let new_body = self.replace_generic(*body, param_index, replacement);
                     self.forall(*pi, *param_name, new_body)
                 }
@@ -1926,6 +2018,11 @@ impl<'input> TypeContext<'input> {
                 if *pi == param_index {
                     ty
                 } else {
+                    debug_assert!(
+                        !self.type_contains_param(*pi, replacement),
+                        "replace_generic: the replacement would be captured by binder {}",
+                        pi
+                    );
                     let new_base = self.replace_generic(*base, param_index, replacement);
                     let new_id = self.alloc(TypeData::Exists {
                         param_index: *pi,
@@ -1950,6 +2047,13 @@ impl<'input> TypeContext<'input> {
                 if *pi == param_index {
                     ty
                 } else {
+                    // Capture guard: planting `replacement` under this
+                    // binder must not capture it.
+                    debug_assert!(
+                        !self.type_contains_param(*pi, replacement),
+                        "replace_generic: the replacement would be captured by binder {}",
+                        pi
+                    );
                     let new_body = self.replace_generic(*body, param_index, replacement);
                     self.alloc(TypeData::Mu {
                         param_index: *pi,
@@ -1967,6 +2071,11 @@ impl<'input> TypeContext<'input> {
                 if *pi == param_index {
                     ty
                 } else {
+                    debug_assert!(
+                        !self.type_contains_param(*pi, replacement),
+                        "replace_generic: the replacement would be captured by binder {}",
+                        pi
+                    );
                     let new_body = self.replace_generic(*body, param_index, replacement);
                     self.alloc(TypeData::Nu {
                         param_index: *pi,
@@ -1981,6 +2090,12 @@ impl<'input> TypeContext<'input> {
                 if quantifiers.iter().any(|(idx, _)| *idx == param_index) {
                     ty
                 } else {
+                    debug_assert!(
+                        !quantifiers
+                            .iter()
+                            .any(|(qi, _)| self.type_contains_param(*qi, replacement)),
+                        "replace_generic: the replacement would be captured by a Poly quantifier"
+                    );
                     let new_body = self.replace_generic(*body, param_index, replacement);
                     self.poly(quantifiers.clone(), new_body)
                 }
@@ -1994,14 +2109,35 @@ impl<'input> TypeContext<'input> {
                 let new_inner = self.replace_generic(*inner, param_index, replacement);
                 self.reference_with_lifetime(new_inner, *mutable, *lifetime)
             }
-            TypeData::Pointer { ty: inner } => {
+            TypeData::Pointer {
+                ty: inner, mutable, ..
+            } => {
                 let new_inner = self.replace_generic(*inner, param_index, replacement);
-                self.pointer(new_inner)
+                // Preserve mutability: `pointer()` hardcodes `mutable: false`,
+                // which would silently downgrade `*mut T` to `*const T`
+                // (SYNTAX.md 2026-10-28 §2.3 — mutability is part of the
+                // type; only an explicit `as!` upgrades, and this rewrite is
+                // not an upgrade).
+                if *mutable {
+                    self.pointer_mut(new_inner)
+                } else {
+                    self.pointer(new_inner)
+                }
             }
-            TypeData::Ptr { size, pointee } => {
+            TypeData::Ptr {
+                size,
+                pointee,
+                mutable,
+                ..
+            } => {
                 let new_size = self.replace_generic(*size, param_index, replacement);
                 let new_pointee = self.replace_generic(*pointee, param_index, replacement);
-                self.ptr(new_size, new_pointee)
+                // Preserve mutability (see subst's Ptr arm).
+                if *mutable {
+                    self.ptr_mut(new_size, new_pointee)
+                } else {
+                    self.ptr(new_size, new_pointee)
+                }
             }
             TypeData::Array { elem, size } => {
                 let new_elem = self.replace_generic(*elem, param_index, replacement);
@@ -2049,6 +2185,21 @@ impl<'input> TypeContext<'input> {
                         alternatives: new_alts,
                     })
                 }
+            }
+            // A revealed Opaque's hidden type participates in the
+            // replacement (aligned with `visit_type_children`): a
+            // GenericParam living only inside a revealed TAIT hidden type
+            // must not survive as a stale free param.  `hidden: None`
+            // (still opaque) stays a leaf — falls to the `_ => ty` sink.
+            TypeData::Opaque {
+                def_id,
+                hidden: Some(h),
+            } => {
+                let new_h = self.replace_generic(*h, param_index, replacement);
+                self.alloc(TypeData::Opaque {
+                    def_id: *def_id,
+                    hidden: Some(new_h),
+                })
             }
             _ => ty,
         }
@@ -2099,8 +2250,8 @@ impl<'input> TypeContext<'input> {
             TypeData::Array { elem, .. } => self.occurs_check(param, *elem),
             TypeData::Slice { elem } => self.occurs_check(param, *elem),
             TypeData::Ref { ty, .. } => self.occurs_check(param, *ty),
-            TypeData::Pointer { ty } => self.occurs_check(param, *ty),
-            TypeData::Ptr { size, pointee } => {
+            TypeData::Pointer { ty, .. } => self.occurs_check(param, *ty),
+            TypeData::Ptr { size, pointee, .. } => {
                 self.occurs_check(param, *size) || self.occurs_check(param, *pointee)
             }
             TypeData::Fn { params, ret } => {
@@ -2114,6 +2265,12 @@ impl<'input> TypeContext<'input> {
             | TypeData::Nu { body, .. } => self.occurs_check(param, *body),
             TypeData::AssociatedType { self_ty, .. } => self.occurs_check(param, *self_ty),
             TypeData::GenericParam { .. } | TypeData::InferVar { .. } => false,
+            // A revealed Opaque's hidden type participates in the occurs
+            // check (aligned with `visit_type_children`) — a param living
+            // only inside a revealed TAIT hidden type must be seen.
+            TypeData::Opaque {
+                hidden: Some(h), ..
+            } => self.occurs_check(param, *h),
             TypeData::Int { .. }
             | TypeData::UInt { .. }
             | TypeData::Float { .. }
@@ -2129,7 +2286,7 @@ impl<'input> TypeContext<'input> {
             | TypeData::DynTrait { .. }
             | TypeData::SkolemVar { .. }
             | TypeData::Type
-            | TypeData::Opaque { .. } => false,
+            | TypeData::Opaque { hidden: None, .. } => false,
         }
     }
 
@@ -2192,7 +2349,9 @@ impl<'input> TypeContext<'input> {
             log.push((key, old));
         }
         self.bindings.insert(key, value);
-        // B3: κ cache keys are *resolved* TypeIds, so a LATER binding can
+        self.binding_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // κ cache keys are *resolved* TypeIds, so a LATER binding can
         // change a key's κ (e.g. an Adt whose argument InferVar gets bound
         // to a recursive type keeps its stale verdict).  The doc above
         // promises invalidation on binding changes, but only the
@@ -2216,10 +2375,12 @@ impl<'input> TypeContext<'input> {
     }
 
     pub fn enter_universe(&mut self) -> (usize, TypeId) {
-        let universe = self.interner.next_universe.load(AtomicOrdering::Relaxed);
-        self.interner
+        // fetch_add: two workers racing here would otherwise both load the
+        // same universe number and mint colliding SkolemVars.
+        let universe = self
+            .interner
             .next_universe
-            .store(universe + 1, AtomicOrdering::Relaxed);
+            .fetch_add(1, AtomicOrdering::Relaxed);
         // Dynamically create a SkolemVar with the correct universe_num
         let skolem = self.alloc(TypeData::SkolemVar {
             id: universe,
@@ -2243,13 +2404,17 @@ impl<'input> TypeContext<'input> {
     pub const GADT_SKOLEM_UNIVERSE: usize = usize::MAX;
 
     pub fn fresh_gadt_skolem(&mut self) -> TypeId {
+        // fetch_add — same class as fresh_param_index / enter_universe /
+        // alloc_overlap_fresh_var: the counter lives in the SHARED
+        // interner, so two per-query contexts (each holding &mut on
+        // itself) race here.  A load/store race mints two SkolemVars with
+        // the SAME id — skolem identity IS the id, so two distinct GADT
+        // existentials become indistinguishable.  GADT_SKOLEM_UNIVERSE
+        // separates them from HRTB skolems, not from each other.
         let id = self
             .interner
             .next_gadt_skolem_id
-            .load(AtomicOrdering::Relaxed);
-        self.interner
-            .next_gadt_skolem_id
-            .store(id + 1, AtomicOrdering::Relaxed);
+            .fetch_add(1, AtomicOrdering::Relaxed);
         self.alloc(TypeData::SkolemVar {
             id,
             universe_num: Self::GADT_SKOLEM_UNIVERSE,
@@ -2283,7 +2448,7 @@ impl<'input> TypeContext<'input> {
                 self.check_skolem_escape(*ret, max_universe)
             }
             TypeData::Ref { ty, .. }
-            | TypeData::Pointer { ty }
+            | TypeData::Pointer { ty, .. }
             | TypeData::Array { elem: ty, .. }
             | TypeData::Slice { elem: ty } => self.check_skolem_escape(*ty, max_universe),
             TypeData::Ptr { size, pointee, .. } => {
@@ -2301,6 +2466,17 @@ impl<'input> TypeContext<'input> {
             TypeData::AssociatedType { self_ty, .. } => {
                 self.check_skolem_escape(*self_ty, max_universe)
             }
+            // A revealed TAIT's hidden type participates in every other
+            // escape/occurrence walk (visit_type_children, occurs_check,
+            // contains_error, subst): a SkolemVar living only inside a
+            // revealed hidden type must not slip past the universe-escape
+            // check.  This match hand-rolls its arms instead of using
+            // visit_type_children — the Opaque arm was the one slot that
+            // drifted.  `hidden: None` (still opaque in its defining
+            // scope) has no children — leaf.
+            TypeData::Opaque {
+                hidden: Some(h), ..
+            } => self.check_skolem_escape(*h, max_universe),
             _ => None,
         }
     }
@@ -2375,14 +2551,36 @@ impl<'input> TypeContext<'input> {
                 let new_ty = self.subst(*ty, subst);
                 self.reference_with_lifetime(new_ty, *mutable, *lifetime)
             }
-            TypeData::Pointer { ty } => {
+            TypeData::Pointer { ty, mutable, .. } => {
                 let new_ty = self.subst(*ty, subst);
-                self.pointer(new_ty)
+                // Preserve mutability: `pointer()` hardcodes `mutable: false`,
+                // which would silently downgrade `*mut T` to `*const T`
+                // (SYNTAX.md 2026-10-28 §2.3 — mutability is part of the
+                // type; only an explicit `as!` upgrades, and substitution is
+                // not an upgrade).
+                if *mutable {
+                    self.pointer_mut(new_ty)
+                } else {
+                    self.pointer(new_ty)
+                }
             }
-            TypeData::Ptr { size, pointee } => {
+            TypeData::Ptr {
+                size,
+                pointee,
+                mutable,
+                ..
+            } => {
                 let new_size = self.subst(*size, subst);
                 let new_pointee = self.subst(*pointee, subst);
-                self.ptr(new_size, new_pointee)
+                // Preserve mutability (same rule as the Pointer arm):
+                // `ptr()` hardcodes `mutable: false` and would silently
+                // downgrade `Ptr<..., mut>` (§2.3 — substitution is not
+                // an upgrade).
+                if *mutable {
+                    self.ptr_mut(new_size, new_pointee)
+                } else {
+                    self.ptr(new_size, new_pointee)
+                }
             }
             TypeData::Fn { params, ret } => {
                 let new_params: SmallVec<[TypeId; 4]> =
@@ -2409,6 +2607,15 @@ impl<'input> TypeContext<'input> {
                     .filter(|idx| subst.get(*idx).is_some())
                     .collect();
                 if shadowed_indices.is_empty() {
+                    // Capture guard (per quantifier): a replacement value
+                    // mentioning any of the Poly's own binders would be
+                    // silently captured.
+                    debug_assert!(
+                        !quantifiers.iter().any(|(qi, _)| {
+                            subst.values().any(|&v| self.type_contains_param(*qi, v))
+                        }),
+                        "subst: a replacement value would be captured by a Poly quantifier"
+                    );
                     let new_body = self.subst(*body, subst);
                     self.poly(quantifiers.clone(), new_body)
                 } else {
@@ -2416,6 +2623,15 @@ impl<'input> TypeContext<'input> {
                     if filtered.is_empty() {
                         ty
                     } else {
+                        // Capture guard for the FILTERED path too (per
+                        // quantifier): surviving values are still planted
+                        // under the Poly's binders.
+                        debug_assert!(
+                            !quantifiers.iter().any(|(qi, _)| {
+                                filtered.values().any(|&v| self.type_contains_param(*qi, v))
+                            }),
+                            "subst: a filtered replacement value would be captured by a Poly quantifier"
+                        );
                         let new_body = self.subst(*body, &filtered);
                         self.poly(quantifiers.clone(), new_body)
                     }
@@ -2435,6 +2651,16 @@ impl<'input> TypeContext<'input> {
                     if filtered.is_empty() {
                         ty
                     } else {
+                        // Capture guard for the FILTERED path too: the
+                        // surviving values are still planted UNDER this
+                        // binder.
+                        debug_assert!(
+                            !filtered
+                                .values()
+                                .any(|&v| self.type_contains_param(*param_index, v)),
+                            "subst: a filtered replacement value would be captured by binder {}",
+                            param_index
+                        );
                         let new_body = self.subst(*body, &filtered);
                         self.alloc(TypeData::Forall {
                             param_index: *param_index,
@@ -2443,6 +2669,18 @@ impl<'input> TypeContext<'input> {
                         })
                     }
                 } else {
+                    // Capture guard: the substitution values are planted
+                    // UNDER this binder — a value mentioning the binder's
+                    // own param index would be silently captured (type
+                    // confusion).  Relies on globally-fresh indices; a hit
+                    // means hand-built types or item-domain index aliasing.
+                    debug_assert!(
+                        !subst
+                            .values()
+                            .any(|&v| self.type_contains_param(*param_index, v)),
+                        "subst: a replacement value would be captured by Forall binder {}",
+                        param_index
+                    );
                     let new_body = self.subst(*body, subst);
                     self.alloc(TypeData::Forall {
                         param_index: *param_index,
@@ -2461,6 +2699,13 @@ impl<'input> TypeContext<'input> {
                     if filtered.is_empty() {
                         ty
                     } else {
+                        debug_assert!(
+                            !filtered
+                                .values()
+                                .any(|&v| self.type_contains_param(*param_index, v)),
+                            "subst: a filtered replacement value would be captured by binder {}",
+                            param_index
+                        );
                         let new_body = self.subst(*body, &filtered);
                         self.alloc(TypeData::Mu {
                             param_index: *param_index,
@@ -2469,6 +2714,13 @@ impl<'input> TypeContext<'input> {
                         })
                     }
                 } else {
+                    debug_assert!(
+                        !subst
+                            .values()
+                            .any(|&v| self.type_contains_param(*param_index, v)),
+                        "subst: a replacement value would be captured by binder {}",
+                        param_index
+                    );
                     let new_body = self.subst(*body, subst);
                     self.alloc(TypeData::Mu {
                         param_index: *param_index,
@@ -2487,6 +2739,13 @@ impl<'input> TypeContext<'input> {
                     if filtered.is_empty() {
                         ty
                     } else {
+                        debug_assert!(
+                            !filtered
+                                .values()
+                                .any(|&v| self.type_contains_param(*param_index, v)),
+                            "subst: a filtered replacement value would be captured by binder {}",
+                            param_index
+                        );
                         let new_body = self.subst(*body, &filtered);
                         self.alloc(TypeData::Nu {
                             param_index: *param_index,
@@ -2495,6 +2754,13 @@ impl<'input> TypeContext<'input> {
                         })
                     }
                 } else {
+                    debug_assert!(
+                        !subst
+                            .values()
+                            .any(|&v| self.type_contains_param(*param_index, v)),
+                        "subst: a replacement value would be captured by binder {}",
+                        param_index
+                    );
                     let new_body = self.subst(*body, subst);
                     self.alloc(TypeData::Nu {
                         param_index: *param_index,
@@ -2513,6 +2779,13 @@ impl<'input> TypeContext<'input> {
                     if filtered.is_empty() {
                         ty
                     } else {
+                        debug_assert!(
+                            !filtered
+                                .values()
+                                .any(|&v| self.type_contains_param(*param_index, v)),
+                            "subst: a filtered replacement value would be captured by binder {}",
+                            param_index
+                        );
                         let new_base = self.subst(*base, &filtered);
                         let new_id = self.alloc(TypeData::Exists {
                             param_index: *param_index,
@@ -2527,6 +2800,13 @@ impl<'input> TypeContext<'input> {
                         new_id
                     }
                 } else {
+                    debug_assert!(
+                        !subst
+                            .values()
+                            .any(|&v| self.type_contains_param(*param_index, v)),
+                        "subst: a replacement value would be captured by binder {}",
+                        param_index
+                    );
                     let new_base = self.subst(*base, subst);
                     let new_id = self.alloc(TypeData::Exists {
                         param_index: *param_index,
@@ -2554,6 +2834,22 @@ impl<'input> TypeContext<'input> {
                 let new_self = self.subst(*self_ty, subst);
                 self.associated_type(*trait_id, *name, new_self)
             }
+            // A revealed Opaque's hidden type participates in substitution:
+            // a GenericParam living only inside a revealed TAIT hidden type
+            // must not survive instantiation as a stale free param (aligned
+            // with `visit_type_children`'s recursion).  `hidden: None`
+            // (still opaque in its defining scope) stays a leaf — falls to
+            // the `_ => ty` sink below, nothing to replace.
+            TypeData::Opaque {
+                def_id,
+                hidden: Some(h),
+            } => {
+                let new_h = self.subst(*h, subst);
+                self.alloc(TypeData::Opaque {
+                    def_id: *def_id,
+                    hidden: Some(new_h),
+                })
+            }
             _ => ty,
         }
     }
@@ -2562,6 +2858,12 @@ impl<'input> TypeContext<'input> {
     /// appears as a key in `replacements` with the corresponding value.
     /// Uses a worklist to avoid recursive self-calls and borrow conflicts.
     /// TODO: wire into cross-arm type abstraction in match-arm exit path.
+    // TODO (pre-wiring requirement): when wired into the cross-arm
+    // match-arm exit path, the Forall/Exists/Mu/Nu/Poly arms must gain (a)
+    // binder-shadowing handling and (b) capture debug_asserts — the same
+    // discipline subst()/replace_generic() enforce. A raw TypeId replacement
+    // planted under a binder it mentions free is silent capture (type
+    // confusion); these arms currently do neither.
     #[allow(dead_code)]
     pub fn replace_type_ids(
         &mut self,
@@ -2628,14 +2930,31 @@ impl<'input> TypeContext<'input> {
                 let r = self.replace_type_ids(*rt, replacements);
                 self.reference_with_lifetime(r, *mutable, *lifetime)
             }
-            TypeData::Pointer { ty: pt } => {
+            TypeData::Pointer {
+                ty: pt, mutable, ..
+            } => {
                 let p = self.replace_type_ids(*pt, replacements);
-                self.pointer(p)
+                // Preserve mutability (see replace_generic's Pointer arm).
+                if *mutable {
+                    self.pointer_mut(p)
+                } else {
+                    self.pointer(p)
+                }
             }
-            TypeData::Ptr { size, pointee } => {
+            TypeData::Ptr {
+                size,
+                pointee,
+                mutable,
+                ..
+            } => {
                 let ns = self.replace_type_ids(*size, replacements);
                 let np = self.replace_type_ids(*pointee, replacements);
-                self.ptr(ns, np)
+                // Preserve mutability (see subst's Ptr arm).
+                if *mutable {
+                    self.ptr_mut(ns, np)
+                } else {
+                    self.ptr(ns, np)
+                }
             }
             TypeData::Fn { params, ret } => {
                 let new_ret = self.replace_type_ids(*ret, replacements);
@@ -2720,8 +3039,22 @@ impl<'input> TypeContext<'input> {
             | TypeData::Rational { .. }
             | TypeData::SkolemVar { .. }
             | TypeData::Regex { .. }
-            | TypeData::Opaque { .. }
-            | TypeData::Type { .. } => ty,
+            | TypeData::Type { .. }
+            | TypeData::Opaque { hidden: None, .. } => ty,
+            // A revealed Opaque's hidden type participates in the
+            // replacement (aligned with `visit_type_children`); no
+            // quantifier arms inside, so the binder-shadowing TODO above
+            // does not apply here.  `hidden: None` stays a leaf.
+            TypeData::Opaque {
+                def_id,
+                hidden: Some(h),
+            } => {
+                let new_h = self.replace_type_ids(*h, replacements);
+                self.alloc(TypeData::Opaque {
+                    def_id: *def_id,
+                    hidden: Some(new_h),
+                })
+            }
         }
     }
 
@@ -2762,11 +3095,15 @@ impl<'input> TypeContext<'input> {
     }
 
     fn pointer_ty_no_alloc(&self, ty: TypeId) -> Option<TypeId> {
-        self.find_type(&TypeData::Pointer { ty })
+        self.find_type(&TypeData::Pointer { ty, mutable: false })
     }
 
     fn ptr_ty_no_alloc(&self, size: TypeId, pointee: TypeId) -> Option<TypeId> {
-        self.find_type(&TypeData::Ptr { size, pointee })
+        self.find_type(&TypeData::Ptr {
+            size,
+            pointee,
+            mutable: false,
+        })
     }
 
     fn fn_ty_no_alloc(&self, params: SmallVec<[TypeId; 4]>, ret: TypeId) -> Option<TypeId> {
@@ -2884,8 +3221,8 @@ impl<'input> TypeContext<'input> {
             TypeData::Tuple { elems } => elems.iter().any(|e| self.contains_error(*e)),
             TypeData::Array { elem, .. } => self.contains_error(*elem),
             TypeData::Slice { elem } => self.contains_error(*elem),
-            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => self.contains_error(*ty),
-            TypeData::Ptr { size, pointee } => {
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => self.contains_error(*ty),
+            TypeData::Ptr { size, pointee, .. } => {
                 self.contains_error(*size) || self.contains_error(*pointee)
             }
             TypeData::Fn { params, ret } => {
@@ -2900,9 +3237,11 @@ impl<'input> TypeContext<'input> {
             TypeData::Coproduct { alternatives } => {
                 alternatives.iter().any(|a| self.contains_error(*a))
             }
-            // B7: an opaque type with a revealed hidden type can still carry
+            // An opaque type with a revealed hidden type can still carry
             // an error inside — recurse (hidden: None falls to `_ => false`).
-            TypeData::Opaque { hidden: Some(h), .. } => self.contains_error(*h),
+            TypeData::Opaque {
+                hidden: Some(h), ..
+            } => self.contains_error(*h),
             _ => false,
         }
     }
@@ -2939,7 +3278,7 @@ impl<'input> TypeContext<'input> {
             }
             TypeData::Array { elem, .. } => 1 + self.type_constructor_depth(*elem),
             TypeData::Slice { elem } => 1 + self.type_constructor_depth(*elem),
-            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
                 1 + self.type_constructor_depth(*ty)
             }
             TypeData::Ptr { size, pointee, .. } => {
@@ -2965,6 +3304,17 @@ impl<'input> TypeContext<'input> {
             | TypeData::Mu { body, .. }
             | TypeData::Nu { body, .. } => 1 + self.type_constructor_depth(*body),
             TypeData::DynTrait { .. } => 1,
+            // A revealed TAIT's hidden type participates in every other
+            // structural walk; the Paterson depth must count THROUGH it —
+            // the former `=> 1` under-counted a deep hidden type,
+            // ADMITTING impl candidates whose resolution unfolds through
+            // the TAIT with unbounded depth (the wrong direction for a
+            // termination bound).  `hidden: None` is genuinely 1: nothing
+            // to unfold inside the defining scope.
+            TypeData::Type => 1,
+            TypeData::Opaque {
+                hidden: Some(h), ..
+            } => 1 + self.type_constructor_depth(*h),
             TypeData::Int { .. }
             | TypeData::UInt { .. }
             | TypeData::Float { .. }
@@ -2978,8 +3328,7 @@ impl<'input> TypeContext<'input> {
             | TypeData::Error
             | TypeData::Regex { .. }
             | TypeData::SkolemVar { .. }
-            | TypeData::Type
-            | TypeData::Opaque { .. } => 1,
+            | TypeData::Opaque { hidden: None, .. } => 1,
         }
     }
 
@@ -3051,8 +3400,8 @@ impl<'input> TypeContext<'input> {
             TypeData::Array { elem, .. } => self.contains_regex(*elem),
             TypeData::Slice { elem } => self.contains_regex(*elem),
             TypeData::Ref { ty, .. } => self.contains_regex(*ty),
-            TypeData::Pointer { ty } => self.contains_regex(*ty),
-            TypeData::Ptr { size, pointee } => {
+            TypeData::Pointer { ty, .. } => self.contains_regex(*ty),
+            TypeData::Ptr { size, pointee, .. } => {
                 self.contains_regex(*size) || self.contains_regex(*pointee)
             }
             TypeData::Fn { params, ret } => {
@@ -3064,9 +3413,11 @@ impl<'input> TypeContext<'input> {
             | TypeData::Mu { body, .. }
             | TypeData::Nu { body, .. } => self.contains_regex(*body),
             TypeData::AssociatedType { self_ty, .. } => self.contains_regex(*self_ty),
-            // B7: an opaque type with a revealed hidden type can carry a
+            // An opaque type with a revealed hidden type can carry a
             // Regex inside — recurse (hidden: None falls to the leaf list).
-            TypeData::Opaque { hidden: Some(h), .. } => self.contains_regex(*h),
+            TypeData::Opaque {
+                hidden: Some(h), ..
+            } => self.contains_regex(*h),
             // Leaf types — no children, no Regex.
             TypeData::Int { .. }
             | TypeData::UInt { .. }
@@ -3169,7 +3520,7 @@ impl<'input> TypeContext<'input> {
 
     pub fn pointee_of_pointer(&self, ty: TypeId) -> Option<TypeId> {
         match self.get(ty) {
-            TypeData::Pointer { ty: t } => Some(*t),
+            TypeData::Pointer { ty: t, .. } => Some(*t),
             _ => None,
         }
     }
@@ -3290,6 +3641,87 @@ impl Subst {
 impl Default for Subst {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// ── §4.6 ABI landing support (SYNTAX.md 2026-10-28) ─────────────────────
+/// The types-layer half of the extern "C" pointer rules; the checker
+/// supplies the platform word width and does the rendering.  Contract:
+/// coercion.rs header.  Methods live on `TypeContext` (`raw_ptr_shape`,
+/// `extern_c_ptr_size_ok`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawPtrShape {
+    /// Platform-width `*const T` — ABI-renders `const T *`.
+    WordConst { pointee: TypeId },
+    /// Platform-width `*mut T` — ABI-renders `T *`.
+    WordMut { pointee: TypeId },
+    /// Explicit `Ptr<size, pointee>` — ABI-legal ONLY when the size
+    /// axis matches the platform word width (`extern_c_ptr_size_ok`).
+    Explicit {
+        size: TypeId,
+        pointee: TypeId,
+        mutable: bool,
+    },
+}
+
+#[cfg(all(test, not(feature = "shuttle")))]
+mod raw_ptr_abi_tests {
+    use super::*;
+
+    #[test]
+    fn raw_ptr_shape_classifies_all_forms() {
+        let mut ctx = TypeContext::new();
+        let i = ctx.int(32, true);
+        let u = ctx.usize();
+        let pc = ctx.pointer(i);
+        let pm = ctx.pointer_mut(i);
+        let psc = ctx.ptr(u, i);
+        let psm = ctx.ptr_mut(u, i);
+        let r = ctx.reference(i, false);
+        assert_eq!(
+            ctx.raw_ptr_shape(pc),
+            Some(RawPtrShape::WordConst { pointee: i })
+        );
+        assert_eq!(
+            ctx.raw_ptr_shape(pm),
+            Some(RawPtrShape::WordMut { pointee: i })
+        );
+        assert_eq!(
+            ctx.raw_ptr_shape(psc),
+            Some(RawPtrShape::Explicit {
+                size: u,
+                pointee: i,
+                mutable: false
+            })
+        );
+        assert_eq!(
+            ctx.raw_ptr_shape(psm),
+            Some(RawPtrShape::Explicit {
+                size: u,
+                pointee: i,
+                mutable: true
+            })
+        );
+        assert_eq!(ctx.raw_ptr_shape(r), None, "refs are boundary coercions");
+    }
+
+    #[test]
+    fn extern_c_ptr_size_gate() {
+        let mut ctx = TypeContext::new();
+        let us = ctx.usize();
+        let i64t = ctx.int(64, true);
+        let i32t = ctx.int(32, true);
+        let p = ctx.generic_param(0, "P".into());
+        assert!(ctx.extern_c_ptr_size_ok(us, 64), "USize IS the word width");
+        assert!(ctx.extern_c_ptr_size_ok(i64t, 64));
+        assert!(
+            !ctx.extern_c_ptr_size_ok(i32t, 64),
+            "no ABI representation (§4.6)"
+        );
+        assert!(
+            !ctx.extern_c_ptr_size_ok(p, 64),
+            "unresolved size ⇒ fail-closed"
+        );
     }
 }
 

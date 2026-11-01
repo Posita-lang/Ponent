@@ -442,7 +442,13 @@ impl Predicate {
                 let ra = ctx.resolve_binding(*a);
                 let rb = ctx.resolve_binding(*b);
                 let ambiguous = ctx.is_infer_var(ra) || ctx.is_infer_var(rb);
-                Self::make_obligation(None, ra, vec![rb], ambiguous, crate::ast::Span::new(FileId::DUMMY, 0, 0))
+                Self::make_obligation(
+                    None,
+                    ra,
+                    vec![rb],
+                    ambiguous,
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
+                )
             }
             Predicate::Sub { sub, sup } => {
                 let rsub = ctx.resolve_binding(*sub);
@@ -470,7 +476,13 @@ impl Predicate {
             Predicate::Forall { body } | Predicate::Exists { body } => body.resolve(ctx),
             Predicate::Instance { scheme_ty, .. } => {
                 let resolved = ctx.resolve_binding(*scheme_ty);
-                Self::make_obligation(None, resolved, vec![], false, crate::ast::Span::new(FileId::DUMMY, 0, 0))
+                Self::make_obligation(
+                    None,
+                    resolved,
+                    vec![],
+                    false,
+                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
+                )
             }
             // Quantifier/let wrappers recurse into their inner predicate
             // (unified through `inner_predicate`).

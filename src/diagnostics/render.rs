@@ -7,8 +7,10 @@
 
 use crate::ast::FileId;
 use crate::diagnostics::sink::DiagnosticSink;
+use crate::diagnostics::term::path_to_file_url;
 use crate::diagnostics::{DiagOpts, Diagnostic, LineIndex};
 use crate::smallvec::SmallVec;
+use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::io;
 use std::sync::Arc;
@@ -24,6 +26,12 @@ struct CachedSourceIndex {
     ptr: usize,
     len: usize,
     starts: Arc<[usize]>,
+    ascii: bool,
+    /// Shared sparse non-ASCII char-extra cache (see
+    /// [`LineIndex::char_prefixes_arc`]), threaded through so a cache hit
+    /// reuses the per-line tables a previous render built instead of
+    /// rebuilding them per diagnostic.
+    char_prefixes: Arc<RefCell<FxHashMap<usize, Arc<[(u32, u32)]>>>>,
 }
 
 /// Context shared by every render call in a batch.
@@ -41,6 +49,11 @@ pub struct RenderCtx<'a> {
     /// same source.  The cache is dropped with the ctx at the end of the
     /// batch, so no key can outlive its source.
     source_index: RefCell<SmallVec<[CachedSourceIndex; CACHE_SLOTS]>>,
+    /// Per-batch cache of `file://` URLs keyed by filename, so a batch of M
+    /// diagnostics over one file pays one `canonicalize` (3–6 `stat`
+    /// syscalls) instead of M.  Only touched on the interactive hyperlink
+    /// path; machine formats never call [`Self::file_url`].
+    file_urls: RefCell<FxHashMap<String, Arc<str>>>,
 }
 
 impl<'a> RenderCtx<'a> {
@@ -51,6 +64,7 @@ impl<'a> RenderCtx<'a> {
             opts,
             uri,
             source_index: RefCell::new(SmallVec::new()),
+            file_urls: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -70,7 +84,12 @@ impl<'a> RenderCtx<'a> {
                     let entry = cache.remove(pos);
                     cache.insert(0, entry);
                 }
-                return LineIndex::from_shared(source, Arc::clone(&cache[0].starts));
+                return LineIndex::from_shared(
+                    source,
+                    Arc::clone(&cache[0].starts),
+                    cache[0].ascii,
+                    Arc::clone(&cache[0].char_prefixes),
+                );
             }
         }
         let idx = LineIndex::new(source);
@@ -85,9 +104,31 @@ impl<'a> RenderCtx<'a> {
                 ptr,
                 len,
                 starts: Arc::clone(idx.starts_arc()),
+                ascii: idx.ascii(),
+                char_prefixes: Arc::clone(idx.char_prefixes_arc()),
             },
         );
         idx
+    }
+
+    /// The `file://` URL for `name`, cached per batch so a batch of M
+    /// diagnostics over one file pays one `canonicalize` instead of M.
+    ///
+    /// Callers gate this on `use_color && supports_hyperlinks() &&
+    /// is_real_file_name(name)`; the cache itself is unconditional so the
+    /// hit/miss logic stays here and the caller stays mechanical.
+    pub(crate) fn file_url(&self, name: &str) -> Arc<str> {
+        {
+            let cache = self.file_urls.borrow();
+            if let Some(url) = cache.get(name) {
+                return Arc::clone(url);
+            }
+        }
+        let url: Arc<str> = Arc::from(path_to_file_url(std::path::Path::new(name)).as_str());
+        self.file_urls
+            .borrow_mut()
+            .insert(name.to_string(), Arc::clone(&url));
+        url
     }
 }
 
@@ -154,9 +195,7 @@ mod tests {
 
         // Distinct lengths guarantee distinct `(ptr, len)` keys even if the
         // compiler deduplicates equal-length literals.
-        let sources: Vec<String> = (0..=CACHE_SLOTS)
-            .map(|i| "a\n".repeat(i + 1))
-            .collect();
+        let sources: Vec<String> = (0..=CACHE_SLOTS).map(|i| "a\n".repeat(i + 1)).collect();
 
         let first: Vec<LineIndex<'_>> = sources[..CACHE_SLOTS]
             .iter()
@@ -166,7 +205,9 @@ mod tests {
         // Insert one more — `sources[0]` is the LRU and must be evicted.
         let extra = cx.line_index(&sources[CACHE_SLOTS]);
         assert!(
-            !first.iter().any(|f| Arc::ptr_eq(f.starts_arc(), extra.starts_arc())),
+            !first
+                .iter()
+                .any(|f| Arc::ptr_eq(f.starts_arc(), extra.starts_arc())),
             "new source must not alias any existing cached table"
         );
 
@@ -212,25 +253,35 @@ mod tests {
 /// Formats diagnostics into strings.  Pure: no I/O.
 pub trait Renderer: Send {
     /// Called once per batch, before any diagnostics.
-    fn begin(&mut self, out: &mut impl DiagnosticSink) -> io::Result<()> {
+    fn begin(&self, out: &mut impl DiagnosticSink) -> io::Result<()> {
         let _ = out;
         Ok(())
     }
 
     /// Render one diagnostic.  Pure: no I/O.
-    fn render(&mut self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>) -> String;
+    fn render(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>) -> String;
+
+    /// Render one diagnostic into a caller-supplied buffer.
+    ///
+    /// The default appends [`render`](Self::render); renderers that already
+    /// build into an internal buffer override this to skip the intermediate
+    /// `String`, so the emitter's batch loop reuses one scratch buffer across
+    /// the whole batch instead of allocating one `String` per diagnostic.
+    fn render_into(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>, out: &mut String) {
+        out.push_str(&self.render(diag, cx));
+    }
 
     /// Text written between two adjacent rendered diagnostics in a batch.
     ///
     /// The human renderer inserts a blank line so successive diagnostics do
-    /// not run together; machine-consumed formats (JSON, HTML) leave the
-    /// default empty separator so the document stays well-formed.
-    fn render_separator(&mut self) -> &str {
+    /// not run together; JSON inserts a `,` (or `,\n` in pretty mode) so the
+    /// array stays well-formed; HTML leaves the default empty separator.
+    fn render_separator(&self) -> &str {
         ""
     }
 
     /// Render the summary line.  Empty string means "no summary".
-    fn render_summary(&mut self, errors: usize, warnings: usize) -> String;
+    fn render_summary(&self, errors: usize, warnings: usize) -> String;
 
     /// Render the summary line with a distinct-file count for the
     /// "N errors in M files" overview (checklist item 8).
@@ -238,7 +289,7 @@ pub trait Renderer: Send {
     /// Default impl ignores `files` and delegates to [`render_summary`](Self::render_summary)
     /// so existing renderers keep working; human/HTML overrides include
     /// the file count while JSON keeps the empty summary (machine-consumed).
-    fn render_summary_full(&mut self, errors: usize, warnings: usize, files: usize) -> String {
+    fn render_summary_full(&self, errors: usize, warnings: usize, files: usize) -> String {
         let _ = files;
         self.render_summary(errors, warnings)
     }
@@ -247,7 +298,7 @@ pub trait Renderer: Send {
     /// batch short.  Empty string means "emit nothing".  Formats that are
     /// machine-consumed (JSON, LSP) override this to `""` so the trailer
     /// cannot corrupt the document.
-    fn render_suppressed_note(&mut self, count: usize) -> String {
+    fn render_suppressed_note(&self, count: usize) -> String {
         format!(
             "  = note: {count} additional error{} suppressed\n",
             if count == 1 { "" } else { "s" },
@@ -255,7 +306,7 @@ pub trait Renderer: Send {
     }
 
     /// Called once per batch, after all diagnostics and the summary.
-    fn end(&mut self, out: &mut impl DiagnosticSink) -> io::Result<()> {
+    fn end(&self, out: &mut impl DiagnosticSink) -> io::Result<()> {
         let _ = out;
         Ok(())
     }

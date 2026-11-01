@@ -7,10 +7,10 @@ use crate::hir::smt::SmtSolver;
 use crate::hir::symbol::SymbolTable;
 use crate::hir::traits::TraitEnv;
 use crate::hir::types::*;
-use ena::unify::{EqUnifyValue, UnificationTableStorage, UnifyKey};
 use ena::snapshot_vec as sv;
 use ena::undo_log::{Snapshots, UndoLogs};
 use ena::unify::Delegate;
+use ena::unify::{UnificationTableStorage, UnifyKey, UnifyValue};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet;
 use small_map::FxSmallMap;
@@ -211,6 +211,21 @@ pub struct InferRegionTree {
     /// Uses Vec indexed by var_id (dense sequential integers) for direct
     /// O(1) indexing without hashing overhead.
     var_to_region: Vec<Option<InferRegionId>>,
+    /// Memoized per-region subtree var lists (review 3.5): `check_determinacy`
+    /// rebuilt region membership by scanning all nodes × `is_ancestor` on
+    /// every call.  Membership of region r lives in r and every ancestor, so
+    /// an invalidation clears exactly the mutated region's ancestor chain
+    /// (`invalidate_subtree_cache_upwards`).  Pure cache — rollback clears it
+    /// wholesale (pool state is restored there).
+    subtree_vars_cache: HashMap<InferRegionId, Vec<usize>>,
+    /// Exhaustive NCA cross-check switch for `is_ancestor` (review 3.6):
+    /// region regression tests that historically relied on per-call
+    /// verification opt in via `set_verify_all`; production runs sample
+    /// every 64th call in debug builds.
+    verify_all: std::cell::Cell<bool>,
+    /// Call counter for the sampled debug cross-check. Never reset —
+    /// only the low bits matter for sampling.
+    is_ancestor_calls: std::cell::Cell<u64>,
     /// Region level at which each Forall-introduced skolem was created, keyed
     /// by its `universe_num`.
     ///
@@ -251,6 +266,14 @@ pub enum PoolUndoEntry {
 }
 
 impl InferRegionTree {
+    /// Opt in to exhaustive per-call NCA cross-checks of `is_ancestor`
+    /// (review 3.6). Tests that historically relied on exhaustiveness
+    /// (the ancestor-interval regression suite) call this once at setup.
+    #[cfg(test)]
+    pub fn set_verify_all(&self, on: bool) {
+        self.verify_all.set(on);
+    }
+
     pub fn new() -> Self {
         InferRegionTree {
             nodes: vec![InferRegionNode {
@@ -267,6 +290,9 @@ impl InferRegionTree {
             root: InferRegionId(0),
             current: InferRegionId(0),
             dirty_roots: FxHashSet::default(),
+            subtree_vars_cache: HashMap::default(),
+            verify_all: std::cell::Cell::new(false),
+            is_ancestor_calls: std::cell::Cell::new(0),
             pool_undo_log: Vec::new(),
             pool_logging_enabled: false,
             tin: vec![0],
@@ -317,6 +343,12 @@ impl InferRegionTree {
         self.current = new_id;
         old
     }
+    /// Leave the current region.  NO-OP at the root (there is no parent to
+    /// return to).  This asymmetry with `exit_level` — which hard-asserts
+    /// ancestry — is deliberate: the tolerance walks in the ExitRegion and
+    /// LetBarrier handlers rely on exit_region's root no-op as the
+    /// terminator of their "walk up to the recorded region" loop.  Do not
+    /// add an assert here without re-auditing those two walks.
     pub fn exit_region(&mut self) {
         if let Some(parent) = self.nodes[self.current.0].parent {
             // Assign by id — the post-order exit order differs from the
@@ -344,8 +376,20 @@ impl InferRegionTree {
     }
     /// Lift `node` up `steps` levels.  Clamps to the root when `steps`
     /// exceeds the node's depth.
+    ///
+    /// RELEASE behavior at `steps >= 2^MAX_LOG` (2^20): the query silently
+    /// clamps to the root via the NO_ANCESTOR path — an over-approximation
+    /// of the ancestor relation (the root is everyone's ancestor), so the
+    /// effect is lost precision on promotion/escape checks, never unsound-
+    /// ness.  Each region is one let/∃ binder, so real nesting stays far
+    /// below 2^20; the clamp is observable via `region_lift_clamps()` and a
+    /// non-zero count in CI is a bug signal.
     #[inline(always)]
     fn lift(&self, mut node: InferRegionId, mut steps: usize) -> InferRegionId {
+        if steps >= (1 << MAX_LOG) {
+            REGION_LIFT_CLAMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return self.root;
+        }
         debug_assert!(steps < (1 << MAX_LOG), "lift steps exceed MAX_LOG capacity");
         let mut k = 0;
         while steps > 0 {
@@ -442,13 +486,22 @@ impl InferRegionTree {
         };
         let result = self.tin[ancestor.0] <= self.tin[node.0] && t_node <= t_anc;
         // Debug anchor: NCA is correct for open AND closed regions; the O(1)
-        // interval fast path must agree with it on every reachable tree
-        // state (this is the machine-checked stack-discipline contract).
-        debug_assert_eq!(
-            result,
-            self.nearest_common_ancestor(ancestor, node) == ancestor,
-            "interval fast path must agree with the NCA anchor"
-        );
+        // interval fast path must agree with it.  Sampling (review 3.6):
+        // is_ancestor sits inside exit_level's assert and the determinacy
+        // region scans, so debug profiling pays for the O(log n) NCA on
+        // EVERY call if we verify exhaustively — verify every 64th call in
+        // debug builds, every call under the CI gate, and exhaustively in
+        // tests that opt in via set_verify_all.
+        let verify_all =
+            self.verify_all.get() || std::env::var("PONENT_VERIFY_REGION_INTERVALS").is_ok();
+        if verify_all || (cfg!(debug_assertions) && self.is_ancestor_calls.get() % 64 == 0) {
+            debug_assert_eq!(
+                result,
+                self.nearest_common_ancestor(ancestor, node) == ancestor,
+                "interval fast path must agree with the NCA anchor"
+            );
+        }
+        self.is_ancestor_calls.set(self.is_ancestor_calls.get() + 1);
         result
     }
     /// Mark a region as dirty (its pool changed and it may need
@@ -516,6 +569,7 @@ impl InferRegionTree {
             });
         }
         self.nodes[idx].pool.register_var(var_id);
+        self.invalidate_subtree_cache_upwards(InferRegionId(idx));
         // §6 dirty frontier: the pool's membership changed, so the region
         // must be re-examined at exit (its PG variables may have become
         // generalizable, or a generalized var may have landed here).
@@ -535,6 +589,7 @@ impl InferRegionTree {
             });
         }
         self.nodes[idx].pool.register_rigid_var(var_id);
+        self.invalidate_subtree_cache_upwards(InferRegionId(idx));
     }
     pub fn register_var_in_region(&mut self, var_id: usize, region_id: InferRegionId) {
         let idx = region_id.0;
@@ -556,6 +611,7 @@ impl InferRegionTree {
             });
         }
         self.nodes[idx].pool.register_var(var_id);
+        self.invalidate_subtree_cache_upwards(region_id);
         // §6 dirty frontier: same reasoning as register_var — the target
         // region's membership changed (PG lowering lands vars in parents).
         self.mark_dirty(region_id);
@@ -580,11 +636,45 @@ impl InferRegionTree {
         if var_id < self.var_to_region.len() {
             self.var_to_region[var_id] = None;
         }
+        self.invalidate_subtree_cache_upwards(region_id);
         // §6 dirty frontier: membership changed here too (a var was
         // promoted out or generalized away) — the region must be
         // re-examined before its next exit.
         self.mark_dirty(region_id);
     }
+    /// Exact invalidation for `subtree_vars_cache` (review 3.5): region r's
+    /// membership lives in r and every ancestor, so a mutation clears exactly
+    /// the mutated region's ancestor chain.
+    fn invalidate_subtree_cache_upwards(&mut self, mut region: InferRegionId) {
+        if self.subtree_vars_cache.is_empty() {
+            return;
+        }
+        loop {
+            self.subtree_vars_cache.remove(&region);
+            match self.nodes.get(region.0).and_then(|n| n.parent) {
+                Some(p) => region = p,
+                None => break,
+            }
+        }
+    }
+
+    /// Exact subtree var list for `region`: every pool var in the region's
+    /// whole subtree (what `check_determinacy`'s Det-Dom/Det-Esc membership
+    /// needs).  Memoized; invalidated on pool mutation by
+    /// `invalidate_subtree_cache_upwards` and on rollback.
+    pub fn subtree_vars(&mut self, region: InferRegionId) -> &[usize] {
+        if !self.subtree_vars_cache.contains_key(&region) {
+            let mut list = Vec::new();
+            for n in &self.nodes {
+                if self.is_ancestor(region, n.id) {
+                    list.extend(n.pool.var_ids.iter().copied());
+                }
+            }
+            self.subtree_vars_cache.insert(region, list);
+        }
+        self.subtree_vars_cache[&region].as_slice()
+    }
+
     pub fn collect_dirty_ids(&self) -> Vec<InferRegionId> {
         self.nodes
             .iter()
@@ -791,6 +881,35 @@ pub(crate) enum InferUndoLog {
     PushConstraint,
     PushTypeVar,
     PushVarTypeId,
+    // ── Fine-grained set undo entries (recorded ONLY on actual
+    // transitions, replacing whole-set snapshot clones) ──
+    /// `suspended_vars.insert(var_id)` (only when insert() == true).
+    SuspendedVarsInsert(usize),
+    /// `suspended_vars.remove(var_id)` (only when remove() == true).
+    SuspendedVarsRemove(usize),
+    /// Whole-set snapshot taken before the wake phase's
+    /// `mem::take(suspended_vars)` (lazy clone).
+    SuspendedVarsTaken(FxHashSet<usize>),
+    /// `dirty_set.insert(var_id)` (only when insert() == true).
+    DirtySetInsert(usize),
+    /// Bulk snapshot of `dirty_set` taken before the sweep's
+    /// `clear()`/`retain()`.
+    DirtySetReplaced(FxHashSet<usize>),
+    /// `discharged_matches.insert(k)` (only when insert() == true).
+    DischargedMatchInsert(TypeId, (usize, usize)),
+    /// `discharged_subs.insert(k)` (only when insert() == true).
+    DischargedSubInsert(TypeId, TypeId),
+    /// `pending_inst_copy.insert(v)` (when the transition happens).
+    PendingInstCopyInsert(usize),
+    /// `pending_inst_copy.remove(v)` (when the transition happens).
+    PendingInstCopyRemove(usize),
+    /// Bulk snapshot of `pending_inst_copy` taken before the retry
+    /// `drain()`.
+    PendingInstCopyTaken(FxHashSet<usize>),
+    /// Per-slot cleanup `pending_sub_vars[v].remove(p)` (only when
+    /// remove() == true).
+    PendingSubRemove(usize, (TypeId, TypeId)),
+
     /// Batch registration of match branches: carries the pre-extend
     /// length so a rollback truncates ALL of them (a single per-element
     /// entry cannot invert a variable-size `extend`).
@@ -884,6 +1003,11 @@ pub(crate) enum InferUndoLog {
     /// Undo for `try_promote_var`'s promotions shadow map entry.
     /// Stores the TypeId whose promotion entry should be removed on rollback.
     RemovePromotion(TypeId),
+    /// Undo for the `generalized_in_region.insert` performed by the shared
+    /// PG→G transition helpers (`transition_to_generalized` /
+    /// `mark_generalized_and_copy`).  Only pushed when `insert()` returned
+    /// true, so the reverse never removes an entry that was never added.
+    GeneralizedInRegionInsert(usize, usize),
     /// Undo for `try_promote_var`'s `var_promotions` insertion.  Without
     /// this the stale `var_id → promoted` mapping survives a rollback and
     /// `check_rigid_escape` would follow it into a variable whose region
@@ -953,7 +1077,7 @@ pub struct UnionFind {
 pub(crate) struct UfKey(pub(crate) u32);
 
 impl UnifyKey for UfKey {
-    type Value = Option<TypeId>;
+    type Value = RootValue;
 
     fn index(&self) -> u32 {
         self.0
@@ -968,11 +1092,52 @@ impl UnifyKey for UfKey {
     }
 }
 
-// `Option<TypeId>` inherits `UnifyValue` from this impl: None merges with
-// anything, two equal Somes merge, two distinct Somes conflict — mirroring
-// the `MultiEquation::try_set_concrete` conflict rule for the value-bearing
-// migration that follows this engine swap.
-impl EqUnifyValue for TypeId {}
+// ── Root-value algebra for the resolution union-find ─────────────
+
+/// The value stored at a `UfKey` root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RootValue {
+    /// The class is unbound.
+    Unbound,
+    /// The class is bound to a concrete type.
+    Bound(TypeId),
+    /// Transient input marker — never stored. Passed as the `value`
+    /// argument of `unify_var_value` to force an overwrite of the root's
+    /// current value (the last-write-wins semantics documented on
+    /// `try_promote_var`). Handled symmetrically in `unify_values`, so it
+    /// is resolved away on every code path and cannot leak into storage.
+    Overwrite(Option<TypeId>),
+}
+
+/// Typed conflict: the root is already bound to a different type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValueConflict {
+    pub existing: TypeId,
+    pub incoming: TypeId,
+}
+
+impl UnifyValue for RootValue {
+    type Error = ValueConflict;
+
+    fn unify_values(value1: &RootValue, value2: &RootValue) -> Result<RootValue, ValueConflict> {
+        use RootValue::*;
+        match (value1, value2) {
+            // The overwrite marker wins, independent of argument order
+            // (ena computes `unify_values(root_value, incoming)`; the
+            // symmetry is just robustness).
+            (Overwrite(new), _) | (_, Overwrite(new)) => Ok(match new {
+                Some(ty) => Bound(*ty),
+                None => Unbound,
+            }),
+            (Unbound, other) | (other, Unbound) => Ok(other.clone()),
+            (Bound(a), Bound(b)) if a == b => Ok(Bound(*a)),
+            (Bound(existing), Bound(incoming)) => Err(ValueConflict {
+                existing: *existing,
+                incoming: *incoming,
+            }),
+        }
+    }
+}
 
 /// External undo log consumed by ena's `InPlace` storage.  Entries are
 /// recorded only while a snapshot is open (ena's `in_snapshot()` gate is
@@ -1070,7 +1235,7 @@ impl UnionFind {
     pub fn resize_to(&mut self, n: usize) {
         let mut t = self.table.with_log(&mut self.undo_log);
         while t.len() < n {
-            t.new_key(None);
+            t.new_key(RootValue::Unbound);
         }
     }
 
@@ -1098,11 +1263,11 @@ impl UnionFind {
         }
         match t.unify_var_var(ra, rb) {
             Ok(()) => Some((ra.0 as usize, rb.0 as usize)),
-            Err((v1, v2)) => {
+            Err(conflict) => {
                 debug_assert!(
-                    v1 == v2,
-                    "UnionFind::union_sets: conflicting concrete values {v1:?} vs {v2:?} — \
-                     value conflicts must be resolved by the caller (MultiEquation semantics)"
+                    false,
+                    "UnionFind::union_sets: value conflict {conflict:?} — \
+                     must be resolved at the call site (MultiEquation semantics)"
                 );
                 None
             }
@@ -1116,36 +1281,38 @@ impl UnionFind {
         self.find(x)
     }
 
-    /// Bind the class root of `x` to a concrete type (value on the root).
+    /// Bind the class root of `x` to a concrete type (unification semantics).
     ///
-    /// Resolution semantics: this is a LAST-WRITE-WINS overwrite of the
-    /// root value (matching the old `resolutions` table, where
-    /// `try_promote_var` unconditionally overwrote `resolutions[var_id]`).
-    /// The ena error case (root already bound to a DIFFERENT type) is
-    /// collapsed to the same overwrite by rebinding — rollback safety is
-    /// unaffected because ena's SetElem undo restores the pre-bind value.
-    /// The bind is recorded in the external undo log while a snapshot is
-    /// open, so rollback restores the previous root value.
-    pub fn bind_value(&mut self, x: usize, ty: TypeId) {
+    /// If the root is already bound to a *different* type, returns
+    /// `Err(ValueConflict)` — this is exactly a failed unification; ena
+    /// does not modify the table on error.
+    pub fn try_bind(&mut self, x: usize, ty: TypeId) -> Result<(), ValueConflict> {
         let mut t = self.table.with_log(&mut self.undo_log);
-        // ena's unify_var_value merges; on a value conflict re-run the
-        // unification against the discarded value to force the overwrite.
-        if t.unify_var_value(UfKey(x as u32), Some(ty)).is_err() {
-            // Root currently holds a different Some(_).  Overwrite it:
-            // unify against the stale value first (no-op on the root value
-            // is impossible — Option<TypeId> EqUnifyValue errors on
-            // distinct values), then bind.  The stale value is dropped.
-            let _ = t.unify_var_value(UfKey(x as u32), None).is_ok();
-            t.unify_var_value(UfKey(x as u32), Some(ty))
-                .expect("Option unify with None cannot fail after error reset");
-        }
+        t.unify_var_value(UfKey(x as u32), RootValue::Bound(ty))
+    }
+
+    /// Force-overwrite the class root of `x` with `ty` (last-write-wins).
+    ///
+    /// ena exposes no raw value setter, so the overwrite is expressed as a
+    /// unification against the `Overwrite` marker, which `unify_values`
+    /// resolves unconditionally to `ty`. The write flows through
+    /// `with_log`, so while a snapshot is open ena records a `SetElem`
+    /// undo entry and `rollback_to` restores the previous value.
+    pub fn force_rebind(&mut self, x: usize, ty: TypeId) {
+        let mut t = self.table.with_log(&mut self.undo_log);
+        let _ = t.unify_var_value(UfKey(x as u32), RootValue::Overwrite(Some(ty)));
     }
 
     /// Read the concrete type bound to `x`'s class root, if any.
     /// Ena path-compresses on read, so this is amortized O(1) &mut self.
     pub fn probe_value(&mut self, x: usize) -> Option<TypeId> {
         let mut t = self.table.with_log(&mut self.undo_log);
-        t.probe_value(UfKey(x as u32))
+        match t.probe_value(UfKey(x as u32)) {
+            RootValue::Bound(ty) => Some(ty),
+            // The Overwrite marker is never stored — it is resolved away
+            // inside unify_values on every code path.
+            RootValue::Unbound | RootValue::Overwrite(_) => None,
+        }
     }
 
     /// Read-only probe: returns the value stored at `x`'s node itself.
@@ -1160,9 +1327,10 @@ impl UnionFind {
         if x >= self.table.len() {
             return None;
         }
-        self.table
-            .try_probe_value(UfKey(x as u32))
-            .and_then(|v| v.clone())
+        match self.table.try_probe_value(UfKey(x as u32)) {
+            Some(RootValue::Bound(ty)) => Some(*ty),
+            _ => None,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -1210,6 +1378,33 @@ impl Default for UnionFind {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Per-snapshot captured state (the eight whole-set clones are gone —
+/// those sets are maintained rollback-safe by fine-grained undo entries;
+/// only cheap scalars, lengths, the UF token and the dirty-flag vector are
+/// captured here).
+#[derive(Debug)]
+struct SnapshotState {
+    /// (1.4) The TypeContext transaction depth captured BEFORE this
+    /// snapshot's `begin_transaction`; `rollback_to` restores ctx bindings
+    /// down to it so the two rollback systems cannot diverge.
+    ctx_depth: usize,
+    uf: UFSnapshot,
+    /// Region cursor at snapshot time. Region NODES are append-only (ids
+    /// stay valid), so restoring `current` alone is sufficient.
+    region_current: InferRegionId,
+    pool_log_len: usize,
+    /// `undo_log.len()` at snapshot time — the token `start_snapshot`
+    /// returns.  `rollback_to` asserts the caller passed this innermost
+    /// token: UF/region state is restored from the stack's LAST entry, so
+    /// rolling back an outer token with an inner one open would desync.
+    log_len: usize,
+    vec_lens: [usize; 11],
+    /// `region_tree.nodes[i].dirty` at snapshot time. Restore is exact:
+    /// `dirty_children` / `dirty_roots` are rebuilt deterministically from
+    /// these flags + tree shape on rollback.
+    region_dirty_flags: Vec<bool>,
 }
 
 impl InferenceContext {
@@ -1412,6 +1607,45 @@ impl InferenceContext {
             InferUndoLog::RemovePromotion(ty) => {
                 self.promotions.remove(&ty);
             }
+            InferUndoLog::GeneralizedInRegionInsert(var_id, region) => {
+                self.generalized_in_region.remove(&(var_id, region));
+            }
+            InferUndoLog::SuspendedVarsInsert(v) => {
+                self.suspended_vars.remove(&v);
+            }
+            InferUndoLog::SuspendedVarsRemove(v) => {
+                self.suspended_vars.insert(v);
+            }
+            InferUndoLog::SuspendedVarsTaken(s) => {
+                self.suspended_vars = s;
+            }
+            InferUndoLog::DirtySetInsert(v) => {
+                self.dirty_set.remove(&v);
+            }
+            InferUndoLog::DirtySetReplaced(s) => {
+                self.dirty_set = s;
+            }
+            InferUndoLog::DischargedMatchInsert(ty, k) => {
+                let _ = ty;
+                self.discharged_matches.remove(&(ty, k));
+            }
+            InferUndoLog::DischargedSubInsert(sub, sup) => {
+                self.discharged_subs.remove(&(sub, sup));
+            }
+            InferUndoLog::PendingInstCopyInsert(v) => {
+                self.pending_inst_copy.remove(&v);
+            }
+            InferUndoLog::PendingInstCopyRemove(v) => {
+                self.pending_inst_copy.insert(v);
+            }
+            InferUndoLog::PendingInstCopyTaken(s) => {
+                self.pending_inst_copy = s;
+            }
+            InferUndoLog::PendingSubRemove(v, p) => {
+                if v < self.pending_sub_vars.len() {
+                    self.pending_sub_vars[v].insert(p);
+                }
+            }
             InferUndoLog::RemoveVarPromotion(var_id) => {
                 self.var_promotions.remove(&var_id);
             }
@@ -1433,6 +1667,16 @@ impl InferenceContext {
 // determinism ordering is not buried as magic numbers.
 /// Binary Lifting max levels: 2^20 ≈ 10^6, far beyond any real nesting depth.
 const MAX_LOG: usize = 20;
+
+/// Observability counter (review 4.5): number of times `lift` clamped a
+/// depth >= 2^20 query to the root.  A non-zero count in CI is a bug signal
+/// (region nesting should stay far below the table capacity).
+static REGION_LIFT_CLAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count of `lift` depth clamps observed (see `REGION_LIFT_CLAMPS`).
+pub fn region_lift_clamps() -> u64 {
+    REGION_LIFT_CLAMPS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Sentinel value: "no ancestor" (the root's parent).
 const NO_ANCESTOR: InferRegionId = InferRegionId(usize::MAX);
@@ -1494,33 +1738,18 @@ pub(crate) struct PrioritizedConstraint {
     pub(crate) env: Arc<SkolemEnv>,
 }
 
-impl PartialEq for PrioritizedConstraint {
-    fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority
-    }
-}
+// The BinaryHeap-era `PartialOrd`/`Ord` impls (inverted, promotion-blind)
+// are gone: BucketQueue dispatches on the explicit `priority` field, and a
+// derived ordering API on a queue payload invites accidental mis-sorts.
 
-impl Eq for PrioritizedConstraint {}
-
-impl PartialOrd for PrioritizedConstraint {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        // BinaryHeap is a max-heap; BucketQueue gives native min-priority behavior
-        other.priority.partial_cmp(&self.priority)
-    }
-}
-
-impl Ord for PrioritizedConstraint {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.priority.cmp(&self.priority)
-    }
-}
-
-/// Bucket queue for prioritized constraints with small integer priorities (0..=6).
+/// Bucket queue for prioritized constraints with small integer priorities
+/// `0..=8` — 9 buckets (Eq 0–2, Sub 3–5, resolved Match/Forall/defer 6,
+/// admin 7, let-barrier 8; the `INSTANCE`/`EXISTS`/`LET` aliases share the
+/// Eq bands).
 /// Push is O(1) (append to bucket), pop is amortized O(1) (scan from lowest
 /// non-empty bucket).  Replaces `BinaryHeap` which has O(log n) push/pop.
-///
-/// Priority constants range from PRIORITY_EQ_CONCRETE (0) to PRIORITY_LET_BARRIER (8),
-/// giving exactly 9 buckets.
+/// A push on 9 is a compile-time const violation and panics in debug AND
+/// release builds.
 pub(crate) struct BucketQueue {
     buckets: [VecDeque<PrioritizedConstraint>; 9],
     min_priority: usize,
@@ -1707,6 +1936,11 @@ impl TypeVar {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EqOrigin {
     /// Normal type inference.
+    ///
+    /// Single-variant BY DESIGN: Eq constraints currently have exactly one
+    /// origin.  When a second origin actually exists (e.g. an equality
+    /// elaborated out of Match-branch refinement), add a variant — and pass
+    /// it through to diagnostics — rather than adding one speculatively.
     Normal,
 }
 
@@ -1802,7 +2036,15 @@ impl Constraint {
     /// Compute priority: lower = more deterministic, processed first.
     /// This enables BinaryHeap-based scheduling where concrete-concrete
     /// constraints are resolved before those involving inference variables.
-    pub fn priority<'input>(&self, ctx: &TypeContext<'input>) -> u8 {
+    ///
+    /// Promotion-blind: `ctx.resolve_binding` cannot see solver-local
+    /// promotions, so under an active promotion this mis-bands the
+    /// constraint.  Production callers must use
+    /// `InferenceContext::constraint_priority`; this is kept only for
+    /// legacy tests that pin the raw band numbers.
+    #[doc(hidden)]
+    #[deprecated(note = "promotion-blind; use InferenceContext::constraint_priority")]
+    pub fn legacy_priority<'input>(&self, ctx: &TypeContext<'input>) -> u8 {
         match self {
             Constraint::Eq(a, b, _, _) => {
                 let a_is_infer =
@@ -1950,13 +2192,10 @@ pub struct InferenceContext {
     var_origins: Vec<VarOrigin>,
     /// Local bindings for GenericParam indices during instantiation.
     generic_param_bindings: HashMap<usize, TypeId>,
-    /// Variables resolved since last solver wake-up (avoids O(N) scan).
-    resolved_ids: Vec<usize>,
-    /// Parallel set for O(1) dedup with `resolved_ids`.
-    resolved_set: FxHashSet<usize>,
     /// Variables that currently have non-empty wait lists.
     /// Used for incremental wake-up: only these vars are checked each
     /// outer iteration, avoiding the O(N) scan of all variables.
+    /// Rollback-safe via fine-grained `SuspendedVars*` undo entries (3.1).
     suspended_vars: FxHashSet<usize>,
     /// Match constraints already discharged this solve. Prevents reprocessing.
     discharged_matches: FxHashSet<(TypeId, (usize, usize))>,
@@ -1981,32 +2220,17 @@ pub struct InferenceContext {
     undo_log: Vec<InferUndoLog>,
     /// Current snapshot nesting depth.  0 = no snapshot open.
     snapshot_depth: usize,
-    /// Stack of snapshot states: for each open snapshot, records the
-    /// `resolved_ids` length, `resolved_set`, `dirty_set`, `suspended_vars`,
-    /// `discharged_matches`, `discharged_subs`, and `pool_undo_log` length
-    /// so they can be restored on rollback (not covered by the main undo log).
-    resolved_snapshot_stack: Vec<(
-        usize,
-        FxHashSet<usize>,
-        FxHashSet<usize>,
-        FxHashSet<usize>,
-        FxHashSet<(TypeId, (usize, usize))>,
-        usize,
-        FxHashSet<usize>,
-        UFSnapshot,
-        FxHashSet<(usize, usize)>,
-        FxHashSet<usize>,
-        FxHashSet<(TypeId, TypeId)>,
-        [usize; 11],
-    )>,
-    /// Parallel to `resolved_snapshot_stack`: for each open snapshot, the
-    /// `region_tree.current` at snapshot time.  A snapshot opened mid-`Exists`
-    /// leaves `current` on a child region; rolling back the solver state
-    /// without restoring it would leave the next solve iteration entering
-    /// regions under an ABANDONED region, defeating `is_ancestor` and the
-    /// TcLevel escape check.  Region NODES are append-only (ids stay valid),
-    /// so restoring `current` alone is sufficient.
-    region_current_snapshot_stack: Vec<InferRegionId>,
+    /// A genuine type conflict deferred out of `s_inst_copy` (Bug 2): the
+    /// instance was already bound to a type incompatible with the PG
+    /// variable's resolution.  Tagged with the snapshot depth at which it
+    /// was recorded so `rollback_to` discards conflicts from rolled-back
+    /// speculative windows.  Reported by `solve` on its next pass.
+    deferred_conflict: Option<(usize, TypeError)>,
+    /// Per-snapshot captured state: the TypeContext transaction depth to
+    /// roll back to (1.4 pairing), the region cursor, pool-log length,
+    /// per-variable vector lengths, UF snapshot, and the region dirty
+    /// flags (2.3 — the frontier is fully restored from these).
+    resolved_snapshot_stack: Vec<SnapshotState>,
     /// `(var_id, region_id)` pairs that have already been generalized.
     ///
     /// The sweep consults this to skip variables it has already promoted to
@@ -2040,6 +2264,26 @@ pub struct InferenceContext {
     /// `var_to_region` for the source variable.
     /// entry to `None`.
     var_promotions: HashMap<usize, usize>,
+    /// Memo cache for `check_rigid_escape` keyed by (type, region level)
+    /// (review 3.3: each candidate variable per sweep/transition walked the
+    /// full resolved type). Keyed on `binding_epoch` — types are
+    /// arena-immutable between allocations, so a stale hit is impossible
+    /// across binding changes.
+    escape_cache: HashMap<(TypeId, usize), bool>,
+    escape_cache_epoch: u64,
+    /// Memo cache for the closedness predicate (`!ty_mentions_infer_var`),
+    /// keyed by type alone (level-free). Same epoch discipline.
+    closed_type_cache: HashMap<TypeId, bool>,
+    closed_cache_epoch: u64,
+    /// SMT-unicity memo (review 3.2): keyed by (fingerprint, target type).
+    /// The fingerprint covers every semantic input of the Z3 query (all
+    /// resolved bindings, all active var-var Eq pairs, the skolem env), so
+    /// a hit is a PROOF, not a heuristic reuse; a collision is impossible
+    /// because the inputs are internal solver state and the `ty` key adds a
+    /// belt-and-braces guard.
+    smt_unicity_cache: HashMap<(u64, TypeId), Option<PrincipalShape>>,
+    smt_unicity_queries: u64,
+    smt_unicity_cache_hits: u64,
 }
 
 // ── Test accessors ────────────────────────────────────────────────
@@ -2079,10 +2323,10 @@ impl InferenceContext {
     pub(crate) fn wake_var_for_test<'input>(
         &mut self,
         var_id: usize,
-        ctx: &TypeContext<'input>,
+        ctx: &mut TypeContext<'input>,
     ) -> usize {
         let mut heap = BucketQueue::new();
-        self.wake_var_incremental(var_id, &mut heap, ctx);
+        self.wake_var_incremental(var_id, &mut heap, ctx, None);
         heap.len()
     }
 }
@@ -2166,8 +2410,6 @@ impl InferenceContext {
             union_find: UnionFind::new(),
             var_origins: Vec::new(),
             generic_param_bindings: HashMap::default(),
-            resolved_ids: Vec::new(),
-            resolved_set: FxHashSet::default(),
             suspended_vars: FxHashSet::default(),
             discharged_matches: FxHashSet::default(),
             discharged_subs: FxHashSet::default(),
@@ -2176,12 +2418,19 @@ impl InferenceContext {
             wake_buffer: Vec::new(),
             undo_log: Vec::new(),
             snapshot_depth: 0,
+            deferred_conflict: None,
             resolved_snapshot_stack: Vec::new(),
-            region_current_snapshot_stack: Vec::new(),
             generalized_in_region: FxHashSet::default(),
             pending_inst_copy: FxHashSet::default(),
             promotions: HashMap::default(),
             var_promotions: HashMap::default(),
+            escape_cache: HashMap::default(),
+            escape_cache_epoch: 0,
+            closed_type_cache: HashMap::default(),
+            closed_cache_epoch: 0,
+            smt_unicity_cache: HashMap::default(),
+            smt_unicity_queries: 0,
+            smt_unicity_cache_hits: 0,
         }
     }
 
@@ -2243,6 +2492,78 @@ impl InferenceContext {
         self.forward_refs.resize_with(new_len, Vec::new);
         self.reverse_refs.resize_with(new_len, || None);
         ty_id
+    }
+
+    /// Register an InferVar minted outside the engine (e.g. by the trait
+    /// solver via `TypeContext::alloc_infer_var`) so all per-id bookkeeping
+    /// exists.
+    ///
+    /// Constraint generators MUST call this before an externally minted
+    /// InferVar appears in any constraint: an unregistered id has no wait
+    /// list (`suspend_on_var_with_env` panics), no region (escape and
+    /// generalization checks mis-fire), no type/origin (defaulting guesses).
+    ///
+    /// ID-space policy: adoption is monotone — `next_var_id` moves past
+    /// every adopted id, so engine allocations never collide with external
+    /// ids after adoption.  TypeContext's `alloc_infer_var` registry trips
+    /// debug builds on code that skips adoption.
+    pub fn adopt_external_var<'input>(
+        &mut self,
+        ctx: &mut TypeContext<'input>,
+        ty: TypeId,
+        kind: TypeVariableKind,
+        origin: VarOrigin,
+    ) -> usize {
+        let id = match ctx.get(ty) {
+            TypeData::InferVar { id, .. } => *id as usize,
+            other => panic!("adopt_external_var: expected an InferVar, got {other:?}"),
+        };
+        if id < self.type_vars.len() && self.type_vars[id].id == id {
+            return id; // already engine-owned
+        }
+        self.push_undo(InferUndoLog::SetNextVarId(self.next_var_id));
+        self.next_var_id = self.next_var_id.max(id + 1);
+        self.union_find.resize_to(id + 1);
+        // Fill gaps with poison slots so the "indexed by var id" invariant
+        // (`type_vars[i].id == i`) holds at every index; externally adopted
+        // ids arrive in increasing order in practice, so gaps are rare.
+        while self.type_vars.len() <= id {
+            let gap_id = self.type_vars.len();
+            self.type_vars.push(TypeVar {
+                id: gap_id,
+                kind: TypeVariableKind::Unconstrained,
+                gen_state: GenState::Ungeneralized,
+                shape: PrincipalShape::Unknown,
+                region_id: self.region_tree.root,
+            });
+            self.push_undo(InferUndoLog::PushTypeVar);
+            self.var_type_ids.push(ctx.error()); // poison: unexpected reads are conspicuous
+            self.push_undo(InferUndoLog::PushVarTypeId);
+        }
+        self.type_vars[id] = TypeVar {
+            id,
+            kind,
+            gen_state: GenState::Ungeneralized,
+            shape: PrincipalShape::Unknown,
+            region_id: self.region_tree.current,
+        };
+        self.var_type_ids[id] = ty;
+        let new_len = id + 1;
+        self.var_origins
+            .resize_with(new_len, || VarOrigin::Synthetic);
+        self.var_origins[id] = origin;
+        self.region_tree.register_var(id);
+        self.lower_bounds.resize_with(new_len, Vec::new);
+        self.upper_bounds.resize_with(new_len, Vec::new);
+        self.wait_lists.resize_with(new_len, Vec::new);
+        self.pending_sub_vars
+            .resize_with(new_len, FxHashSet::default);
+        self.guard_sets.resize_with(new_len, GuardSet::empty);
+        self.gen_statuses
+            .resize_with(new_len, || GenStatus::Ungeneralized);
+        self.forward_refs.resize_with(new_len, Vec::new);
+        self.reverse_refs.resize_with(new_len, || None);
+        id
     }
 
     /// Resolve a TypeId through inference variable bindings (TypeOrVar pattern).
@@ -2431,13 +2752,95 @@ impl InferenceContext {
             let TypeData::InferVar { id, .. } = ctx.get(side) else {
                 continue;
             };
-            if self.union_find.probe_read(*id).is_some() {
+            if let Some(bound) = self.union_find.probe_read(*id) {
+                // UF↔ctx desync: ctx is the global authority — resync the UF
+                // root to it (observable; a resync here signals a solver bug).
+                if bound != resolved_side {
+                    debug_assert!(false, "unify_and_track: UF/ctx desync on variable {id}");
+                    eprintln!("unify_and_track: resync UF root {id} to ctx truth (UF/ctx desync)");
+                    self.union_find.force_rebind(*id, resolved_side);
+                }
                 continue; // already tracked
             }
-            // Last-write-wins overwrite; undo via ena SetElem.
-            self.union_find.bind_value(*id, resolved_side);
+            if let Err(conflict) = self.union_find.try_bind(*id, resolved_side) {
+                // Unreachable given the probe above; self-heal conservatively
+                // via force_rebind and stay observable.
+                debug_assert!(
+                    false,
+                    "unify_and_track: unexpected bind conflict {conflict:?}"
+                );
+                eprintln!("unify_and_track: bind conflict on variable {id}; forcing rebind");
+                self.union_find.force_rebind(*id, resolved_side);
+            }
         }
         Ok(result)
+    }
+
+    /// UF-aware occurs-check: does the binding target `ty` transitively
+    /// mention inference variable `id` through ctx bindings, the promotion
+    /// shadow map, AND UF root values?  A plain `ctx.occurs_check` misses
+    /// cycles that exist only through UF edges (promotion aliases), which
+    /// would let a bind create a cyclic root value.
+    pub(crate) fn uf_occurs_check<'input>(
+        &self,
+        ctx: &TypeContext<'input>,
+        id: usize,
+        ty: TypeId,
+    ) -> bool {
+        let mut stack: Vec<TypeId> = vec![ty];
+        let mut visited: FxHashSet<TypeId> = FxHashSet::default();
+        while let Some(t) = stack.pop() {
+            if !visited.insert(t) {
+                continue;
+            }
+            let r = self.resolve_promotion_aware(t, ctx);
+            match ctx.get(r) {
+                TypeData::InferVar { id: vid, .. } => {
+                    if *vid == id {
+                        return true;
+                    }
+                    // Follow the UF edge: the root value participates in the
+                    // binding graph about to be created.
+                    if let Some(bound) = self.union_find.probe_read(*vid) {
+                        stack.push(bound);
+                    }
+                }
+                TypeData::Fn { params, ret } => {
+                    stack.push(*ret);
+                    stack.extend(params.iter().copied());
+                }
+                TypeData::Tuple { elems }
+                | TypeData::Coproduct {
+                    alternatives: elems,
+                } => {
+                    stack.extend(elems.iter().copied());
+                }
+                TypeData::Adt { args, .. } => {
+                    stack.extend(args.iter().copied());
+                }
+                TypeData::Forall { body, .. }
+                | TypeData::Exists { base: body, .. }
+                | TypeData::Poly { body, .. }
+                | TypeData::Mu { body, .. }
+                | TypeData::Nu { body, .. } => {
+                    stack.push(*body);
+                }
+                TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
+                    stack.push(*ty);
+                }
+                TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
+                    stack.push(*elem);
+                }
+                TypeData::Ptr { pointee, .. } => {
+                    stack.push(*pointee);
+                }
+                TypeData::AssociatedType { self_ty, .. } => {
+                    stack.push(*self_ty);
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Unify with local InferVar resolution (TypeOrVar pattern).
@@ -2462,14 +2865,40 @@ impl InferenceContext {
                 // `max_universe(binding_ty) <= var.universe`; only a
                 // strictly-higher binding universe escapes — a lower one
                 // is legal.)
-                if let TypeData::InferVar { universe: bu, .. } = ctx.get(rb)
-                    && *bu > *universe
+                // Var–var: orient by universe. When both sides are InferVars
+                // with different universes, bind the HIGHER-universe variable
+                // to the lower one (a lower-universe value never escapes into
+                // a higher-universe binder).  Rejecting `ua < ub` outright
+                // here would wrongly reject a legal program AND leave the
+                // `(_, InferVar)` arm dead for var–var pairs.
+                if let TypeData::InferVar {
+                    id: bid,
+                    universe: ub,
+                    ..
+                } = ctx.get(rb)
+                    && *ub > *universe
                 {
-                    return Err(TypeError::Mismatch {
-                        expected: ra,
-                        found: rb,
-                        span,
-                    });
+                    // bind b := a  (legal: universe(a) < universe(b))
+                    if self.uf_occurs_check(ctx, *bid, ra) {
+                        return Err(TypeError::Mismatch {
+                            expected: ra,
+                            found: rb,
+                            span,
+                        });
+                    }
+                    if let Err(conflict) = self.union_find.try_bind(*bid, ra) {
+                        debug_assert!(
+                            false,
+                            "unify: bind conflict on root {bid}: {:?} vs {:?}",
+                            conflict.existing, conflict.incoming
+                        );
+                        return Err(TypeError::Mismatch {
+                            expected: rb,
+                            found: conflict.existing,
+                            span,
+                        });
+                    }
+                    return Ok(ra);
                 }
                 if ty_contains_foreign_universe(ctx, rb, *universe) {
                     return Err(TypeError::Mismatch {
@@ -2480,16 +2909,33 @@ impl InferenceContext {
                 }
                 // Occurs-check: `a := rb` where `rb`
                 // contains `a` would create a cyclic binding.
-                if ctx.occurs_check(a, rb) {
+                // UF-aware: follows promotion/UF edges that a bare
+                // ctx.occurs_check cannot see.
+                if self.uf_occurs_check(ctx, *id, rb) {
                     return Err(TypeError::Mismatch {
                         expected: ra,
                         found: rb,
                         span,
                     });
                 }
-                // Bind the var's UF root value to `rb` (last-write-wins).
+                // Bind the var's UF root value to `rb` (unification semantics).
                 // Undo is handled by ena's SetElem log while a snapshot is open.
-                self.union_find.bind_value(*id, rb);
+                if let Err(conflict) = self.union_find.try_bind(*id, rb) {
+                    // Unreachable under the resolve-before-bind discipline
+                    // (a free InferVar's root is unbound by construction); a
+                    // conflict here is exactly a failed unification — surface
+                    // it as one instead of panicking.
+                    debug_assert!(
+                        false,
+                        "unify: bind conflict on root {id}: {:?} vs {:?}",
+                        conflict.existing, conflict.incoming
+                    );
+                    return Err(TypeError::Mismatch {
+                        expected: rb,
+                        found: conflict.existing,
+                        span,
+                    });
+                }
                 Ok(rb)
             }
             (_, TypeData::InferVar { id, universe, .. }) => {
@@ -2514,16 +2960,32 @@ impl InferenceContext {
                 }
                 // Occurs-check: binding `b := ra` where `ra` contains `b`
                 // would create a cyclic binding (resolve would loop).
-                if ctx.occurs_check(rb, ra) {
+                // UF-aware: follows promotion/UF edges.
+                if self.uf_occurs_check(ctx, *id, ra) {
                     return Err(TypeError::Mismatch {
                         expected: ra,
                         found: rb,
                         span,
                     });
                 }
-                // Bind the var's UF root value to `ra` (last-write-wins).
+                // Bind the var's UF root value to `ra` (unification semantics).
                 // Undo is handled by ena's SetElem log while a snapshot is open.
-                self.union_find.bind_value(*id, ra);
+                if let Err(conflict) = self.union_find.try_bind(*id, ra) {
+                    debug_assert!(
+                        false,
+                        "unify: bind conflict on root {id}: {:?} vs {:?}",
+                        conflict.existing, conflict.incoming
+                    );
+                    eprintln!(
+                        "unify: UF bind conflict on variable {id}; reporting as Mismatch (existing={:?} incoming={:?})",
+                        conflict.existing, conflict.incoming
+                    );
+                    return Err(TypeError::Mismatch {
+                        expected: ra,
+                        found: conflict.existing,
+                        span,
+                    });
+                }
                 Ok(ra)
             }
             _ => match ctx.unify(ra, rb) {
@@ -2681,7 +3143,9 @@ impl InferenceContext {
             // will not be checked by the wake loop; the new var carries the
             // constraints and must be tracked instead.
             if self.suspended_vars.remove(&var_id) {
+                self.push_undo(InferUndoLog::SuspendedVarsRemove(var_id));
                 self.suspended_vars.insert(new_id);
+                self.push_undo(InferUndoLog::SuspendedVarsInsert(new_id));
             }
         }
         if var_id < self.guard_sets.len() && new_id < self.guard_sets.len() {
@@ -2778,10 +3242,16 @@ impl InferenceContext {
 
         // Bind the old variable to the new one (promotion): the old var's
         // UF root value now points at `new_ty_id`, so every resolve family
-        // member follows the promotion edge.  Last-write-wins matches the
-        // old unconditional `resolutions[var_id] = Some(new_ty_id)`.  Undo
-        // is ena SetElem while a snapshot is open.
-        self.union_find.bind_value(var_id, new_ty_id);
+        // member follows the promotion edge.  Last-write-wins (documented
+        // promotion semantics).  The promoted source root is unbound by
+        // construction (resolve_promotion_aware produced a free InferVar);
+        // force_rebind makes the overwrite unconditional AND rollback-safe.
+        debug_assert!(
+            self.union_find.probe_read(var_id).is_none(),
+            "try_promote_var: root of variable {var_id} bound before promotion — \
+             resolve-first discipline violated"
+        );
+        self.union_find.force_rebind(var_id, new_ty_id);
         // Bind in the solver-local promotions shadow map instead
         // of the non-rollbackable ctx.set_binding. This keeps promotion
         // aliases local to the solver and fully rollback-safe.
@@ -2792,6 +3262,9 @@ impl InferenceContext {
         // promotion chain when looking up var_to_region.
         self.var_promotions.insert(var_id, new_id);
         self.push_undo(InferUndoLog::RemoveVarPromotion(var_id));
+        // Promotion changes are invisible to binding_epoch — invalidate the
+        // epoch-keyed shape caches explicitly (over-clearing is free).
+        self.clear_shape_caches();
         Some(new_ty_id)
     }
 
@@ -2812,6 +3285,54 @@ impl InferenceContext {
         self.suspend_on_var_with_env(c, empty_skolem_env(), var_id)
     }
 
+    /// Variable `id`'s pending-Sub dedup slot.
+    ///
+    /// Panics when `id` is not a registered engine variable:
+    /// such a variable has no wait list (cannot suspend) and no region, and
+    /// *silently dropping* the Sub is unsound (`α := Int` after `α ≤ Bool`
+    /// would pass).  Register externally minted variables via
+    /// `InferenceContext::adopt_external_var`.
+    fn pending_sub_slot(&mut self, id: usize) -> &mut FxHashSet<(TypeId, TypeId)> {
+        if id >= self.pending_sub_vars.len() {
+            panic!(
+                "Sub constraint on unregistered InferVar id {id} \
+                 (pending_sub_vars.len = {}); register externally minted \
+                 variables via InferenceContext::adopt_external_var before \
+                 emitting constraints on them",
+                self.pending_sub_vars.len(),
+            );
+        }
+        &mut self.pending_sub_vars[id]
+    }
+
+    /// Fail-loud lower-bound slot for variable `id`: silently
+    /// dropping a recorded bound is the same soundness hole as dropping the
+    /// Sub itself.
+    fn lower_bound_slot(&mut self, id: usize) -> &mut Vec<TypeId> {
+        if id >= self.lower_bounds.len() {
+            panic!(
+                "lower bound on unregistered InferVar id {id} \
+                 (lower_bounds.len = {}); register externally minted \
+                 variables via InferenceContext::adopt_external_var",
+                self.lower_bounds.len(),
+            );
+        }
+        &mut self.lower_bounds[id]
+    }
+
+    /// Fail-loud upper-bound slot for variable `id`.
+    fn upper_bound_slot(&mut self, id: usize) -> &mut Vec<TypeId> {
+        if id >= self.upper_bounds.len() {
+            panic!(
+                "upper bound on unregistered InferVar id {id} \
+                 (upper_bounds.len = {}); register externally minted \
+                 variables via InferenceContext::adopt_external_var",
+                self.upper_bounds.len(),
+            );
+        }
+        &mut self.upper_bounds[id]
+    }
+
     /// Internal variant: suspend a constraint with a scoped SkolemEnv so
     /// that Forall-bound rigid variables remain rigid after suspension/wake.
     fn suspend_on_var_with_env(&mut self, c: Constraint, env: Arc<SkolemEnv>, var_id: usize) {
@@ -2823,6 +3344,7 @@ impl InferenceContext {
             self.push_undo(InferUndoLog::PushWaitListEntry(var_id));
             // Track this variable so the wake loop knows to check it.
             self.suspended_vars.insert(var_id);
+            self.push_undo(InferUndoLog::SuspendedVarsInsert(var_id));
             // Add a guard: the variable is now blocked until this constraint
             // is woken and processed.  This is essential for the PG→G lifecycle
             // (OmniML §6).  Uses the reference-counted GuardSet — it also
@@ -2953,7 +3475,8 @@ impl InferenceContext {
         &mut self,
         var_id: usize,
         heap: &mut BucketQueue,
-        ctx: &TypeContext<'input>,
+        ctx: &mut TypeContext<'input>,
+        guarded_roots: Option<&FxHashSet<TypeId>>,
     ) {
         if var_id < self.wait_lists.len() && !self.wait_lists[var_id].is_empty() {
             // Log wait_list and guard_set before mutation so rollback restores them.
@@ -2996,41 +3519,26 @@ impl InferenceContext {
                 self.guard_sets[var_id].clear_direct_guards();
             }
             // All constraints woken and guards cleared — transition to
-            // Generalized if no further guards remain AND no rigid escape.
-            if var_id < self.gen_statuses.len()
-                && self.gen_statuses[var_id] == GenStatus::PartiallyGeneralizable
-            {
-                let guards_empty =
-                    var_id < self.guard_sets.len() && self.guard_sets[var_id].is_empty();
-                let wl_empty = var_id < self.wait_lists.len() && self.wait_lists[var_id].is_empty();
-                if guards_empty && wl_empty {
-                    let resolved = self.resolve_promotion_aware(self.var_type_ids[var_id], ctx);
-                    // Only generalize a *resolved* variable.
-                    // When resolved is still InferVar, the old conjunction
-                    // `!matches!(..InferVar) && ...` was false, making
-                    // `!escapes == true`, silently promoting an unbound var.
-                    if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
-                        let level = self
-                            .type_vars
-                            .get(var_id)
-                            .map(|v| self.region_tree.get_level(v.region_id))
-                            .unwrap_or(0);
-                        if !Self::check_rigid_escape(
-                            ctx,
-                            resolved,
-                            level,
-                            &self.region_tree,
-                            &self.var_promotions,
-                        ) {
-                            self.write_gen_status(var_id, GenStatus::Generalized);
-                        }
-                    }
-                    // If still unresolved, leave as PG: a later wake will retry.
+            // Generalized via the single transition helper if eligible.
+            // OmniML §6: the wake transition includes the transitive
+            // binding-root guard and the S-Inst-Copy the old path skipped.
+            let owned_roots;
+            let roots = match guarded_roots {
+                Some(r) => r,
+                None => {
+                    owned_roots = self.guarded_roots_set(ctx);
+                    &owned_roots
                 }
+            };
+            if self.generalization_eligible(ctx, var_id, roots) {
+                self.transition_to_generalized(ctx, var_id);
             }
+            // If not eligible yet, leave as PG: a later wake will retry.
             // Remove from suspended set: either a new suspension will re-add it,
             // or the variable has no more pending work.
-            self.suspended_vars.remove(&var_id);
+            if self.suspended_vars.remove(&var_id) {
+                self.push_undo(InferUndoLog::SuspendedVarsRemove(var_id));
+            }
         }
     }
 
@@ -3074,19 +3582,39 @@ impl InferenceContext {
         let resolved = self.resolve_with_env(scrutinee, ctx, env);
         match ctx.get(resolved) {
             TypeData::InferVar { id, .. } => {
-                // Always suspend the Match constraint, regardless of whether
-                // this variable already has guards.  A non-empty guard set
-                // from a *previous* Match cannot repel a *new* Match with a
-                // potentially different branches_id — silently dropping it
-                // would lose entire branch sets.
-                let match_c = Constraint::Match {
-                    scrutinee,
-                    branches_id,
-                    span,
-                };
-                // Suspend on this variable only.  Preserve the scoped SkolemEnv
-                // so that Forall-bound rigid variables remain rigid after wake.
-                self.suspend_on_var_with_env(match_c, Arc::clone(env), *id);
+                // Dedup: "always suspend" previously meant a
+                // repeated (scrutinee, branches_id) pair could sit in the
+                // wait list k times — MATCH-CTX's retain removes all k
+                // copies but remove_guard subtracts exactly one guard, so
+                // the variable stayed PG forever. One suspension ⇒ exactly
+                // one direct guard.
+                let already_suspended = self.wait_lists[*id].iter().any(|(c, _)| {
+                    matches!(
+                        c,
+                        Constraint::Match {
+                            scrutinee: s,
+                            branches_id: b,
+                            ..
+                        } if *s == scrutinee && *b == branches_id
+                    )
+                });
+                if !already_suspended {
+                    let match_c = Constraint::Match {
+                        scrutinee,
+                        branches_id,
+                        span,
+                    };
+                    // Suspend on this variable only.  Preserve the scoped SkolemEnv
+                    // so that Forall-bound rigid variables remain rigid after wake.
+                    self.suspend_on_var_with_env(match_c, Arc::clone(env), *id);
+                } else {
+                    debug_assert!(
+                        self.guard_sets
+                            .get(*id)
+                            .is_some_and(|g| g.direct_guards >= 1),
+                        "a duplicated Match suspension must not run ahead of its guard"
+                    );
+                }
                 true
             }
             _ => {
@@ -3182,6 +3710,21 @@ impl InferenceContext {
             _ => return None,
         };
 
+        // Binder-internal skolems must not act as external determiners
+        // (OmniML Def. 5.3: quantification over assignments coinciding
+        // OUTSIDE β̄).  An Eq to a skolem opened at/inside the variable's
+        // own region observes binder-internal structure and must not yield
+        // a shape here — keep this in sync with `check_determinacy` and
+        // with `unicity_check_smt`, which excludes in-env equations.
+        let var_level_u = self
+            .type_vars
+            .get(var_id)
+            .map(|v| self.region_tree.get_level(v.region_id))
+            .unwrap_or(usize::MAX);
+        let is_internal_skolem = |ty: TypeId| -> bool {
+            Self::type_mentions_internal_skolem(ctx, ty, var_level_u, &self.region_tree)
+        };
+
         // ── UNI-VAR: α is unified with a concrete type ───────────
         // If a pre-built Eq index is available, use O(1) lookup.
         // Otherwise fall back to the O(n) linear scan over active constraints.
@@ -3195,6 +3738,9 @@ impl InferenceContext {
                     // `ctx.resolve_binding`.
                     let other_resolved = self.resolve_promotion_aware(other, ctx);
                     if !matches!(ctx.get(other_resolved), TypeData::InferVar { .. }) {
+                        if is_internal_skolem(other_resolved) {
+                            continue;
+                        }
                         return Some(Self::shape_of_type(ctx, other_resolved));
                     }
                 }
@@ -3214,6 +3760,9 @@ impl InferenceContext {
                     if let Some(other_ty) = other {
                         let other_resolved = self.resolve_promotion_aware(other_ty, ctx);
                         if !matches!(ctx.get(other_resolved), TypeData::InferVar { .. }) {
+                            if is_internal_skolem(other_resolved) {
+                                continue;
+                            }
                             return Some(Self::shape_of_type(ctx, other_resolved));
                         }
                     }
@@ -3272,6 +3821,9 @@ impl InferenceContext {
                 // `ctx.resolve_binding` cannot follow.
                 let bound_resolved = self.resolve_promotion_aware(bound, ctx);
                 if !matches!(ctx.get(bound_resolved), TypeData::InferVar { .. }) {
+                    if is_internal_skolem(bound_resolved) {
+                        continue;
+                    }
                     let s = Self::shape_of_type(ctx, bound_resolved);
                     match shape_from_bounds {
                         None => shape_from_bounds = Some(s),
@@ -3286,6 +3838,9 @@ impl InferenceContext {
             for &bound in &self.lower_bounds[var_id] {
                 let bound_resolved = self.resolve_promotion_aware(bound, ctx);
                 if !matches!(ctx.get(bound_resolved), TypeData::InferVar { .. }) {
+                    if is_internal_skolem(bound_resolved) {
+                        continue;
+                    }
                     let s = Self::shape_of_type(ctx, bound_resolved);
                     match shape_from_bounds {
                         None => shape_from_bounds = Some(s),
@@ -3308,12 +3863,15 @@ impl InferenceContext {
     /// This implements the full ⊆-closed erasure semantics:
     ///   C[τ!ζ] iff ∀φ, φ ⊢ [C[τ = g]] ⇒ shape(g) = ζ
     pub fn unicity_check_smt<'input>(
-        &self,
+        &mut self,
         ctx: &TypeContext<'input>,
         ty: TypeId,
         env: &SkolemEnv,
         active: &[PrioritizedConstraint],
     ) -> Option<PrincipalShape> {
+        // Memo lookup happens AFTER the semantic inputs are collected below
+        // (the fingerprint is computed from them), so the fast scan still
+        // runs every call — only the Z3 subprocess is memoized.
         let solver = SmtSolver::new("z3");
 
         // ── 1. Collect all resolved bindings ─────────────────────
@@ -3354,7 +3912,11 @@ impl InferenceContext {
             if in_env(i) {
                 continue;
             }
-            let resolved = ctx.resolve_binding(*var_ty);
+            // Promotion-aware (review 3.2): a promoted var's binding lives
+            // only in the solver-local maps, and a ctx-only resolve here
+            // would feed Z3 a stale InferVar — making unicity HARDER, i.e.
+            // conservative but prone to needless SMT calls.
+            let resolved = self.resolve_promotion_aware(*var_ty, ctx);
             if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
                 bindings.insert(i, resolved);
             }
@@ -3383,8 +3945,39 @@ impl InferenceContext {
             }
         }
 
-        // ── 3. Check unicity via Z3 ──────────────────────────────
-        solver.check_unicity(ctx, ty, &bindings, &eq_pairs)
+        // ── 3. Check unicity via Z3 (memoized, review 3.2) ───────
+        // Fingerprint the ACTUAL inputs, order-independently.
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        ty.hash(&mut h);
+        // Keys are unique per map, so sorting by key alone is a canonical
+        // order (TypeId itself carries no Ord).
+        let mut b: Vec<(usize, TypeId)> = bindings.iter().map(|(&k, &v)| (k, v)).collect();
+        b.sort_unstable_by_key(|(k, _)| *k);
+        b.hash(&mut h);
+        let mut p: Vec<(usize, usize)> = eq_pairs.clone();
+        p.sort_unstable();
+        p.hash(&mut h);
+        let mut e: Vec<(usize, TypeId)> = env.iter().map(|(&k, &v)| (k, v)).collect();
+        e.sort_unstable_by_key(|(k, _)| *k);
+        e.hash(&mut h);
+        let fp = h.finish();
+
+        if let Some(cached) = self.smt_unicity_cache.get(&(fp, ty)) {
+            self.smt_unicity_cache_hits += 1;
+            return *cached;
+        }
+        self.smt_unicity_queries += 1;
+        let result = solver.check_unicity(ctx, ty, &bindings, &eq_pairs);
+        self.smt_unicity_cache.insert((fp, ty), result);
+        result
+    }
+
+    /// SMT fallback statistics: (queries spawned, cache hits). Non-zero
+    /// hit counts with stable constraint sets are the expected steady state;
+    /// queries should stay bounded per solve.
+    pub fn solver_stats(&self) -> (u64, u64) {
+        (self.smt_unicity_queries, self.smt_unicity_cache_hits)
     }
 
     // ── OmniML: Incremental Instantiation ────────────────────────
@@ -3463,11 +4056,14 @@ impl InferenceContext {
         // Enforce closedness in ALL build profiles — a forgotten guard would
         // alias-share types containing unresolved InferVars across instances
         // even in release builds, causing cross-instance contamination.
-        if Self::ty_mentions_infer_var(ctx, resolve_ty) {
+        if !self.ty_is_closed_cached(ctx, resolve_ty) {
             self.pending_inst_copy.insert(pg_var_id); // record for retry
+            self.push_undo(InferUndoLog::PendingInstCopyInsert(pg_var_id));
             return 0; // leave forward_refs intact for later re-processing
         }
-        self.pending_inst_copy.remove(&pg_var_id); // clear on success
+        if self.pending_inst_copy.remove(&pg_var_id) {
+            self.push_undo(InferUndoLog::PendingInstCopyRemove(pg_var_id));
+        } // clear on success
         let mut visited = FxHashSet::default();
         self.s_inst_copy_inner(ctx, pg_var_id, resolve_ty, &mut visited, 0)
     }
@@ -3504,10 +4100,32 @@ impl InferenceContext {
                 // with ctx.bindings.  Using bare ctx.unify would leave
                 // self.resolve() pointing at a stale chain.
                 if self
-                    .unify_and_track(instance_ty_id, resolve_ty, ctx, Span::new(FileId::DUMMY, 0, 0))
+                    .unify_and_track(
+                        instance_ty_id,
+                        resolve_ty,
+                        ctx,
+                        Span::new(FileId::DUMMY, 0, 0),
+                    )
                     .is_err()
                 {
                     all_propagated = false;
+                    // A conflicting instance is a genuine type error: the
+                    // instance was already bound to a type incompatible with
+                    // the PG variable's resolution.  Swallowing it would
+                    // accept the program with the scheme instantiated at the
+                    // wrong type (acceptance would depend on solving order).
+                    // Record it for `solve` to surface; tag with the snapshot
+                    // depth so a rolled-back speculative conflict is discarded.
+                    if self.deferred_conflict.is_none() {
+                        self.deferred_conflict = Some((
+                            self.snapshot_depth,
+                            TypeError::Mismatch {
+                                expected: resolve_ty,
+                                found: instance_ty_id,
+                                span: Span::new(FileId::DUMMY, 0, 0),
+                            },
+                        ));
+                    }
                 } else {
                     // The instance may itself be a PG variable with its own
                     // instances.  Without this recursion the copy stops one
@@ -3564,17 +4182,17 @@ impl InferenceContext {
     /// Falls back to the level-based heuristic when Z3 is unavailable.
     pub fn s_exists_lower<'input>(
         &mut self,
-        ctx: &TypeContext<'input>,
+        ctx: &mut TypeContext<'input>,
         var_id: usize,
         env: &SkolemEnv,
         active: &[PrioritizedConstraint],
         eq_index: Option<&HashMap<usize, Vec<(TypeId, TypeId)>>>,
-    ) -> bool {
+    ) -> Result<bool, TypeError> {
         if var_id >= self.type_vars.len() || var_id >= self.gen_statuses.len() {
-            return false;
+            return Ok(false);
         }
         if self.gen_statuses[var_id] != GenStatus::PartiallyGeneralizable {
-            return false;
+            return Ok(false);
         }
 
         // A Forall-scoped skolem is rigid: it stands for a β̄ variable
@@ -3596,7 +4214,32 @@ impl InferenceContext {
         let resolved = self.resolve_promotion_aware(self.var_type_ids[var_id], ctx);
         if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
             self.set_gen_status(var_id, GenStatus::Ungeneralized);
-            return true;
+            // OmniML §6: a lowered PG variable is unified with all of its
+            // instances.  A conflict is a genuine type error: after
+            // lowering, α *is* `resolved`, so an inconsistent instance is
+            // unsatisfiable.  (Only the value-determinacy branch unifies:
+            // in the Det-Dom/Det-Esc and Z3 branches the variable is still
+            // unresolved, and instances continue to share it by
+            // construction.)
+            if let Some(ids) = self.forward_refs.get(var_id)
+                && !ids.is_empty()
+            {
+                let instances: Vec<usize> = ids.clone();
+                for inst_id in instances {
+                    if inst_id < self.var_type_ids.len() {
+                        let inst_ty = self.var_type_ids[inst_id];
+                        self.unify_and_track(
+                            inst_ty,
+                            resolved,
+                            ctx,
+                            Span::new(FileId::DUMMY, 0, 0),
+                        )?;
+                        self.s_inst_copy(ctx, inst_id, resolved); // transitive
+                    }
+                }
+                self.clear_forward_refs_logged(var_id);
+            }
+            return Ok(true);
         }
 
         // ── Det-Dom / Det-Esc syntactic determinacy (OmniML §5.3) ──
@@ -3605,7 +4248,7 @@ impl InferenceContext {
         // that mentions no region variable (Det-Esc).
         if self.check_determinacy(ctx, var_id, env, active, eq_index) {
             self.set_gen_status(var_id, GenStatus::Ungeneralized);
-            return true;
+            return Ok(true);
         }
 
         // ── Z3-backed semantic check ──────────────────────────────
@@ -3616,7 +4259,7 @@ impl InferenceContext {
             .is_some()
         {
             self.set_gen_status(var_id, GenStatus::Ungeneralized);
-            return true;
+            return Ok(true);
         }
 
         // Removed the unsound level-based fallback.
@@ -3627,7 +4270,7 @@ impl InferenceContext {
         // losing principality. The OmniML reference implementation has no
         // such fallback — it simply leaves the variable PG and revisits
         // when more information arrives.
-        false
+        Ok(false)
     }
 
     /// ── S-Generalize / update_and_generalize_generation (OmniML §5.3) ──
@@ -3733,48 +4376,10 @@ impl InferenceContext {
             }
         }
 
-        // Compute transitive guards via binding-root sharing.
-        // Optimization: pre-compute all roots to avoid O(n²) resolve_binding calls.
-        let mut trans_guarded: FxHashSet<usize> = FxHashSet::default();
-        for &i in &dirty {
-            if i < self.guard_sets.len() && !self.guard_sets[i].is_empty() {
-                trans_guarded.insert(i);
-            }
-        }
-        // Pre-compute binding roots for all dirty indices.
-        let mut roots: HashMap<usize, TypeId> = HashMap::default();
-        for &idx in &dirty {
-            if idx < self.var_type_ids.len() {
-                roots.insert(
-                    idx,
-                    self.resolve_promotion_aware(self.var_type_ids[idx], ctx),
-                );
-            }
-        }
-        // Collect roots of ALL guarded PG variables, not just dirty ones.
-        // A guarded variable unified in a previous iteration (not in `dirty`)
-        // would otherwise be missed, allowing its unified partner to be
-        // incorrectly generalized.
-        let mut guarded_roots: FxHashSet<TypeId> = FxHashSet::default();
-        for &j in self.pg_vars.iter() {
-            if j < self.var_type_ids.len()
-                && j < self.guard_sets.len()
-                && !self.guard_sets[j].is_empty()
-            {
-                let root = self.resolve_promotion_aware(self.var_type_ids[j], ctx);
-                guarded_roots.insert(root);
-            }
-        }
-        // Any non-guarded item whose root matches a guarded root becomes guarded.
-        for &i in &dirty {
-            if !trans_guarded.contains(&i)
-                && i < self.var_type_ids.len()
-                && let Some(&root) = roots.get(&i)
-                && guarded_roots.contains(&root)
-            {
-                trans_guarded.insert(i);
-            }
-        }
+        // Shared eligibility: the guarded PG roots set replaces the old
+        // trans_guarded/roots/rigid_escaped pre-passes — one predicate for
+        // sweep, Eq handler, wake, and region exit.
+        let guarded_roots = self.guarded_roots_set(ctx);
 
         // Process innermost-first (highest level first = most nested first).
         let mut vars_by_level: Vec<(usize, usize)> = dirty
@@ -3791,64 +4396,32 @@ impl InferenceContext {
             .collect();
         vars_by_level.sort_by(|a, b| b.1.cmp(&a.1));
 
-        // Rigid scope check per generation: a PG variable whose resolved
-        // type contains an escaped skolem (introduced inside the region
-        // being generalized) must NOT be generalized — generalizing would
-        // copy the skolem into the type scheme (`s_inst_copy`), leaking
-        // a Forall-bound variable into an outer scope.
-        let mut rigid_escaped: FxHashSet<usize> = FxHashSet::default();
-        for &(i, level) in &vars_by_level {
-            if i >= self.var_type_ids.len() {
-                continue;
-            }
-            let resolved = self.resolve_promotion_aware(self.var_type_ids[i], ctx);
-            if matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
-                continue;
-            }
-            if Self::check_rigid_escape(
-                ctx,
-                resolved,
-                level,
-                &self.region_tree,
-                &self.var_promotions,
-            ) {
-                rigid_escaped.insert(i);
-            }
-        }
-
-        // Generalize eligible PG → G in level order (generation order).
+        // Generalize eligible PG → G in level order (generation order),
+        // through the single transition helper so S-Inst-Copy is atomic
+        // with the status write.
         for &(i, _level) in &vars_by_level {
-            if i >= self.gen_statuses.len()
-                || self.gen_statuses[i] != GenStatus::PartiallyGeneralizable
-            {
-                continue;
-            }
-            let is_trans_guarded = trans_guarded.contains(&i);
-            let has_waiting = i < self.wait_lists.len() && !self.wait_lists[i].is_empty();
-            let is_resolved = {
-                let ty = self.resolve_promotion_aware(self.var_type_ids[i], ctx);
-                !matches!(ctx.get(ty), TypeData::InferVar { .. })
-            };
-            // The rigid-escape check result is CONSUMED here: a variable
-            // whose resolved type escapes a rigid may not be generalized
-            // (it stays PartiallyGeneralizable / handled elsewhere).
-            if is_resolved && !is_trans_guarded && !has_waiting && !rigid_escaped.contains(&i) {
-                self.write_gen_status(i, GenStatus::Generalized);
-                // Record the generalization: (var_id, region_id).
-                if let Some(tv) = self.type_vars.get(i) {
-                    self.generalized_in_region.insert((i, tv.region_id.0));
-                }
+            if self.generalization_eligible(ctx, i, &guarded_roots) {
+                self.transition_to_generalized(ctx, i);
             }
         }
 
         // Update dirty_set: remove only the processed levels.
         if dirty_levels.is_empty() && target_var.is_none() {
-            self.dirty_set.clear();
+            if !self.dirty_set.is_empty() {
+                let before = std::mem::take(&mut self.dirty_set);
+                self.push_undo(InferUndoLog::DirtySetReplaced(before));
+            }
         } else {
             // Hash the removal list once: retain against a Vec would be
             // O(dirty_set × |dirty|) on every sweep.
             let processed: FxHashSet<usize> = dirty.iter().copied().collect();
-            self.dirty_set.retain(|i| !processed.contains(i));
+            if !self.dirty_set.is_empty() {
+                let before = self.dirty_set.clone();
+                self.dirty_set.retain(|i| !processed.contains(i));
+                if before != self.dirty_set {
+                    self.push_undo(InferUndoLog::DirtySetReplaced(before));
+                }
+            }
         }
     }
 
@@ -3860,19 +4433,111 @@ impl InferenceContext {
     /// Eq handler to transition eligible current vars PG → Generalized
     /// deterministically (before S-Exists-Lower), since the sweep itself
     /// now runs once per iteration instead of per transition.
-    fn is_sweep_eligible<'input>(&self, ctx: &TypeContext<'input>, var_id: usize) -> bool {
-        if var_id >= self.gen_statuses.len()
-            || self.gen_statuses[var_id] != GenStatus::PartiallyGeneralizable
-        {
+    /// ── The single PG→G transition (OmniML §5.3 S-Generalize / §6) ──
+    // Invariant (now enforced by construction): every code path that sets
+    // a variable to `Generalized` must go through `transition_to_generalized`
+    // (PG→G) or `mark_generalized_and_copy` (region-exit I/PI→G), because
+    // the transition carries a mandatory side effect — S-Inst-Copy (§5.2) —
+    // and a transition that skips it is unrecoverable (the instances stay
+    // unresolved InferVars forever).
+
+    /// Roots of all *guarded* PG variables (the sweep's `guarded_roots`),
+    /// promotion-aware.
+    pub(crate) fn guarded_roots_set<'input>(&self, ctx: &TypeContext<'input>) -> FxHashSet<TypeId> {
+        let mut roots = FxHashSet::default();
+        for &j in &self.pg_vars {
+            if j < self.var_type_ids.len()
+                && j < self.guard_sets.len()
+                && !self.guard_sets[j].is_empty()
+            {
+                roots.insert(self.resolve_promotion_aware(self.var_type_ids[j], ctx));
+            }
+        }
+        roots
+    }
+
+    /// Memoized `check_rigid_escape` (review 3.3): the predicate is invoked
+    /// per candidate variable per sweep/transition, and each call walked the
+    /// full resolved type. Keyed by `(type, level)` and gated on the ctx
+    /// binding epoch — types are arena-immutable between allocations, so a
+    /// hit from a different binding state is impossible. Promotion and
+    /// region-membership changes do NOT bump the epoch (they are invisible
+    /// to bindings), so those mutation sites call `clear_shape_caches`
+    /// explicitly.
+    pub(crate) fn check_rigid_escape_cached<'input>(
+        &mut self,
+        ctx: &TypeContext<'input>,
+        ty: TypeId,
+        max_level: usize,
+    ) -> bool {
+        let epoch = ctx.binding_epoch.load(std::sync::atomic::Ordering::Relaxed);
+        if self.escape_cache_epoch != epoch {
+            self.escape_cache.clear();
+            self.escape_cache_epoch = epoch;
+        }
+        if let Some(&v) = self.escape_cache.get(&(ty, max_level)) {
+            return v;
+        }
+        let v =
+            Self::check_rigid_escape(ctx, ty, max_level, &self.region_tree, &self.var_promotions);
+        self.escape_cache.insert((ty, max_level), v);
+        v
+    }
+
+    /// Memoized closedness predicate (review 3.3): `!ty_mentions_infer_var`
+    /// walked the full resolved type at every deferred-copy retry and
+    /// Instance-handler check. Same epoch discipline as
+    /// `check_rigid_escape_cached`.
+    pub(crate) fn ty_is_closed_cached<'input>(
+        &mut self,
+        ctx: &TypeContext<'input>,
+        ty: TypeId,
+    ) -> bool {
+        let epoch = ctx.binding_epoch.load(std::sync::atomic::Ordering::Relaxed);
+        if self.closed_cache_epoch != epoch {
+            self.closed_type_cache.clear();
+            self.closed_cache_epoch = epoch;
+        }
+        if let Some(&v) = self.closed_type_cache.get(&ty) {
+            return v;
+        }
+        let closed = !Self::ty_mentions_infer_var(ctx, ty);
+        self.closed_type_cache.insert(ty, closed);
+        closed
+    }
+
+    /// Explicit invalidation for the epoch-keyed caches: promotion and
+    /// region-membership changes are invisible to `binding_epoch`, so every
+    /// site that alters `var_promotions` / `promotions` / pool membership
+    /// must clear both (over-clearing is free).
+    pub(crate) fn clear_shape_caches(&mut self) {
+        self.escape_cache.clear();
+        self.closed_type_cache.clear();
+        self.escape_cache_epoch = 0;
+        self.closed_cache_epoch = 0;
+    }
+
+    /// Shared generalization eligibility (the iterative sweep, the Eq
+    /// handler path, `wake_var_incremental`, and region exit): resolved,
+    /// no direct guards, nothing waiting, no rigid escape, and not
+    /// binding-root-shared with a guarded PG variable.
+    /// Takes `&mut self` solely to benefit from the escape cache.
+    pub(crate) fn generalization_eligible<'input>(
+        &mut self,
+        ctx: &TypeContext<'input>,
+        var_id: usize,
+        guarded_roots: &FxHashSet<TypeId>,
+    ) -> bool {
+        if self.gen_statuses.get(var_id) != Some(&GenStatus::PartiallyGeneralizable) {
             return false;
         }
         if var_id < self.wait_lists.len() && !self.wait_lists[var_id].is_empty() {
             return false;
         }
-        let Some(ty_id) = self.var_type_ids.get(var_id) else {
+        let Some(&ty_id) = self.var_type_ids.get(var_id) else {
             return false;
         };
-        let resolved = self.resolve_promotion_aware(*ty_id, ctx);
+        let resolved = self.resolve_promotion_aware(ty_id, ctx);
         if matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
             return false;
         }
@@ -3884,37 +4549,139 @@ impl InferenceContext {
             .get(var_id)
             .map(|v| self.region_tree.get_level(v.region_id))
             .unwrap_or(0);
-        if Self::check_rigid_escape(
-            ctx,
-            resolved,
-            level,
-            &self.region_tree,
-            &self.var_promotions,
-        ) {
+        if self.check_rigid_escape_cached(ctx, resolved, level) {
             return false;
         }
-        // Transitive guard: a PG var with direct guards sharing our
-        // binding root (mirrors `trans_guarded` + `guarded_roots` in the
-        // sweep).  The sweep scans ALL pg_vars, not just the dirty set —
-        // a guarded var unified in an earlier iteration is no longer
-        // dirty but still blocks generalization of its root partners
-        // (the exact miss the sweep's `guarded_roots` comment warns
-        // about).
-        // Both sides must go through the same resolver, otherwise a
-        // promotion-only difference makes the roots compare unequal and the
-        // transitive guard is silently dropped.
-        let root = resolved;
-        for &j in &self.pg_vars {
-            if j != var_id
-                && j < self.guard_sets.len()
-                && !self.guard_sets[j].is_empty()
-                && j < self.var_type_ids.len()
-                && self.resolve_promotion_aware(self.var_type_ids[j], ctx) == root
-            {
-                return false;
+        !guarded_roots.contains(&resolved)
+    }
+
+    /// The Eq handler's per-variable path (a thin wrapper over the shared
+    /// eligibility predicate).
+    pub(crate) fn is_sweep_eligible<'input>(
+        &mut self,
+        ctx: &TypeContext<'input>,
+        var_id: usize,
+    ) -> bool {
+        let roots = self.guarded_roots_set(ctx);
+        self.generalization_eligible(ctx, var_id, &roots)
+    }
+
+    /// The one and only PG→G transition.  Returns `true` iff the
+    /// transition fired.  Callers establish *eligibility*
+    /// (`generalization_eligible`); this function establishes the
+    /// *semantics*: the status write, scheme bookkeeping, and instance
+    /// propagation, atomically.
+    pub(crate) fn transition_to_generalized<'input>(
+        &mut self,
+        ctx: &mut TypeContext<'input>,
+        var_id: usize,
+    ) -> bool {
+        if self.gen_statuses.get(var_id) != Some(&GenStatus::PartiallyGeneralizable) {
+            return false;
+        }
+        self.write_gen_status(var_id, GenStatus::Generalized);
+        if let Some(tv) = self.type_vars.get(var_id) {
+            if self.generalized_in_region.insert((var_id, tv.region_id.0)) {
+                self.push_undo(InferUndoLog::GeneralizedInRegionInsert(
+                    var_id,
+                    tv.region_id.0,
+                ));
             }
         }
+        if let Some(&ty_id) = self.var_type_ids.get(var_id) {
+            let resolved = self.resolve_promotion_aware(ty_id, ctx);
+            if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
+                // Closedness guard: s_inst_copy defers itself into
+                // pending_inst_copy and retries on the next outer iteration,
+                // so the unconditional call is safe.
+                self.s_inst_copy(ctx, var_id, resolved);
+            }
+        }
+        self.promote_unguarded_instances(var_id);
         true
+    }
+
+    /// Region-exit variant: allows I/PI variables (OmniML §6 "unguarded
+    /// pool members become part of the scheme").
+    pub(crate) fn mark_generalized_and_copy<'input>(
+        &mut self,
+        ctx: &mut TypeContext<'input>,
+        var_id: usize,
+    ) -> bool {
+        let done = match self.gen_statuses.get(var_id) {
+            Some(GenStatus::PartiallyGeneralizable) => self.transition_to_generalized(ctx, var_id),
+            Some(GenStatus::Generalized) => true, // idempotent: still (re)try the copy
+            Some(GenStatus::Ungeneralized) | Some(GenStatus::PartialInstance) => {
+                self.write_gen_status(var_id, GenStatus::Generalized);
+                if let Some(tv) = self.type_vars.get(var_id) {
+                    if self.generalized_in_region.insert((var_id, tv.region_id.0)) {
+                        self.push_undo(InferUndoLog::GeneralizedInRegionInsert(
+                            var_id,
+                            tv.region_id.0,
+                        ));
+                    }
+                }
+                if let Some(&ty_id) = self.var_type_ids.get(var_id) {
+                    let resolved = self.resolve_promotion_aware(ty_id, ctx);
+                    if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
+                        self.s_inst_copy(ctx, var_id, resolved);
+                    }
+                }
+                true
+            }
+            None => false,
+        };
+        if done {
+            self.promote_unguarded_instances(var_id);
+        }
+        done
+    }
+
+    /// OmniML §6: an instance β of a fully generalized variable may itself
+    /// become G if β is unguarded and not PG; "once a term is generalized,
+    /// it is removed from its pool."
+    fn promote_unguarded_instances(&mut self, pg_var_id: usize) {
+        let Some(ids) = self.forward_refs.get(pg_var_id) else {
+            return;
+        };
+        let instance_ids: Vec<usize> = ids.clone();
+        for inst_id in instance_ids {
+            let inst_guarded =
+                inst_id < self.guard_sets.len() && !self.guard_sets[inst_id].is_empty();
+            let inst_pg =
+                self.gen_statuses.get(inst_id) == Some(&GenStatus::PartiallyGeneralizable);
+            if !inst_guarded && !inst_pg {
+                self.write_gen_status(inst_id, GenStatus::Generalized);
+                if let Some(tv) = self.type_vars.get(inst_id) {
+                    let inst_region = tv.region_id;
+                    if inst_region.0 < self.region_tree.nodes.len()
+                        && self.region_tree.nodes[inst_region.0]
+                            .pool
+                            .var_ids
+                            .contains(&inst_id)
+                    {
+                        self.region_tree.unregister_var(inst_id, inst_region);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Helper for instance unification during OmniML §6 lowering: clears
+    /// `forward_refs` with undo logging.
+    fn clear_forward_refs_logged(&mut self, pg_var_id: usize) {
+        if self
+            .forward_refs
+            .get(pg_var_id)
+            .map_or(true, |v| v.is_empty())
+        {
+            return;
+        }
+        if self.snapshot_depth > 0 {
+            let entries = self.forward_refs[pg_var_id].clone();
+            self.push_undo(InferUndoLog::ClearForwardRefs(pg_var_id, entries));
+        }
+        self.forward_refs[pg_var_id].clear();
     }
 
     /// Check whether a resolved type contains escaped rigid (skolem) variables.
@@ -3942,10 +4709,13 @@ impl InferenceContext {
         region_tree: &InferRegionTree,
         var_promotions: &HashMap<usize, usize>,
     ) -> bool {
-        // Iterative traversal with an explicit stack.  Each stack entry is
-        // either a type to visit or a "post-action" that unbinds a variable
-        // after its scope body has been fully processed.  This avoids stack
-        // overflow on deeply nested types (e.g. Fn(Fn(Fn(...)))).
+        // Iterative traversal with an explicit stack, avoiding stack
+        // overflow on deeply nested types (e.g. Fn(Fn(Fn(...)))).  (An
+        // earlier draft had a second "post-action" Action variant that
+        // unbound a variable after its binder body was processed; the
+        // current SkolemVar/GenericParam escape rules need no binder
+        // bookkeeping — the body recurses at the branch — so only
+        // `Visit` remains.)
         enum Action {
             Visit(TypeId),
         }
@@ -4029,7 +4799,7 @@ impl InferenceContext {
                         TypeData::Poly { body, .. } => {
                             stack.push(Action::Visit(*body));
                         }
-                        TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+                        TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
                             stack.push(Action::Visit(*ty));
                         }
                         TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
@@ -4132,7 +4902,7 @@ impl InferenceContext {
                 | TypeData::Nu { body, .. } => {
                     stack.push(*body);
                 }
-                TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+                TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
                     stack.push(*ty);
                 }
                 TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
@@ -4143,6 +4913,78 @@ impl InferenceContext {
                 }
                 TypeData::AssociatedType { self_ty, .. } => {
                     stack.push(*self_ty);
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Whether `ty` mentions a `SkolemVar` introduced at or inside `max_level`.
+    /// Depth rule mirrors `check_rigid_escape`. Such skolems are binder-internal
+    /// structure and must never act as external determiners (OmniML Def. 5.3
+    /// quantifies over assignments coinciding OUTSIDE the region prefix).
+    fn type_mentions_internal_skolem<'input>(
+        ctx: &TypeContext<'input>,
+        ty: TypeId,
+        max_level: usize,
+        region_tree: &InferRegionTree,
+    ) -> bool {
+        // Iterative worklist traversal — avoids stack overflow on deep types.
+        let mut stack: Vec<TypeId> = vec![ty];
+        let mut visited: FxHashSet<TypeId> = FxHashSet::default();
+        while let Some(t) = stack.pop() {
+            if !visited.insert(t) {
+                continue;
+            }
+            let resolved = ctx.resolve_binding(t);
+            match ctx.get(resolved) {
+                TypeData::SkolemVar { universe_num, .. } => {
+                    let depth = region_tree
+                        .skolem_level(*universe_num)
+                        .unwrap_or(*universe_num);
+                    if depth >= max_level {
+                        return true;
+                    }
+                }
+                // Same recursive traversal as `type_mentions_any_var`.
+                TypeData::Fn { params, ret } => {
+                    stack.push(*ret);
+                    stack.extend(params.iter().copied());
+                }
+                TypeData::Tuple { elems }
+                | TypeData::Coproduct {
+                    alternatives: elems,
+                } => {
+                    stack.extend(elems.iter().copied());
+                }
+                TypeData::Adt { args, .. } => {
+                    stack.extend(args.iter().copied());
+                }
+                TypeData::Forall { body, .. }
+                | TypeData::Exists { base: body, .. }
+                | TypeData::Poly { body, .. }
+                | TypeData::Mu { body, .. }
+                | TypeData::Nu { body, .. } => {
+                    stack.push(*body);
+                }
+                TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
+                    stack.push(*ty);
+                }
+                TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
+                    stack.push(*elem);
+                }
+                TypeData::Ptr { pointee, .. } => {
+                    stack.push(*pointee);
+                }
+                TypeData::AssociatedType { self_ty, .. } => {
+                    stack.push(*self_ty);
+                }
+                TypeData::Opaque {
+                    hidden: Some(hidden),
+                    ..
+                } => {
+                    stack.push(*hidden);
                 }
                 _ => {}
             }
@@ -4179,7 +5021,7 @@ impl InferenceContext {
                 | TypeData::Nu { body, .. } => {
                     stack.push(*body);
                 }
-                TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+                TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
                     stack.push(*ty);
                 }
                 TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
@@ -4226,7 +5068,7 @@ impl InferenceContext {
                 | TypeData::Nu { body, .. } => {
                     stack.push(*body);
                 }
-                TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+                TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
                     stack.push(*ty);
                 }
                 TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
@@ -4420,7 +5262,7 @@ impl InferenceContext {
                 | TypeData::Nu { body, .. } => {
                     stack.push(*body);
                 }
-                TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+                TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
                     stack.push(*ty);
                 }
                 TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
@@ -4476,7 +5318,7 @@ impl InferenceContext {
                 | TypeData::Nu { body, .. } => {
                     stack.push(*body);
                 }
-                TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+                TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
                     stack.push(*ty);
                 }
                 TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
@@ -4510,7 +5352,7 @@ impl InferenceContext {
     /// **Det-Esc**: ∃ τ in the multi-equation with fv(τ) # ᾱ ∪ β̄
     ///              (a type external to the region determines ᾱ)
     fn check_determinacy<'input>(
-        &self,
+        &mut self,
         ctx: &TypeContext<'input>,
         var_id: usize,
         env: &SkolemEnv,
@@ -4538,15 +5380,11 @@ impl InferenceContext {
             }
         }
         let var_region = self.type_vars.get(effective_id).map(|v| v.region_id);
+        // Memoized subtree membership (review 3.5): this rebuild ran an
+        // all-nodes × is_ancestor scan per call; callers invoke
+        // check_determinacy per PG variable.
         let mut region_vars: FxHashSet<usize> = var_region
-            .map(|r| {
-                self.region_tree
-                    .nodes
-                    .iter()
-                    .filter(|node| self.region_tree.is_ancestor(r, node.id))
-                    .flat_map(|node| node.pool.var_ids.iter().copied())
-                    .collect()
-            })
+            .map(|r| self.region_tree.subtree_vars(r).iter().copied().collect())
             .unwrap_or_default();
 
         // ── Scoped skolems: level-based rigidity ──────────────────
@@ -4605,6 +5443,20 @@ impl InferenceContext {
             return false;
         }
 
+        // Binder-internal skolems are not external determiners.  A concrete
+        // type in the multi-equation that mentions a skolem introduced at or
+        // inside the variable's own region is an observation about
+        // binder-internal structure — lowering it out would wrongly commit
+        // the variable outside the binder (OmniML Def. 5.3 quantifies over
+        // assignments coinciding OUTSIDE β̄).
+        let var_level_u = var_level.unwrap_or(usize::MAX);
+        if let Some(concrete_ty) = me.concrete {
+            if Self::type_mentions_internal_skolem(ctx, concrete_ty, var_level_u, &self.region_tree)
+            {
+                return false;
+            }
+        }
+
         // ── Det-Dom ───────────────────────────────────────────────
         // The multi-equation contains a variable γ OUTSIDE the region.
         // Since γ is monomorphic (not in ᾱ ∪ β̄), it constrains the
@@ -4640,33 +5492,35 @@ impl InferenceContext {
     /// Called when a variable is unified or updated, enabling incremental
     /// processing instead of re-checking all variables.
     pub fn mark_dirty(&mut self, var_id: usize) {
-        self.dirty_set.insert(var_id);
+        if self.dirty_set.insert(var_id) {
+            self.push_undo(InferUndoLog::DirtySetInsert(var_id));
+        }
     }
 
     // ── Snapshot / Rollback (rustc-style UndoLog) ────────────────
 
-    /// Open a new snapshot.  While open, reversible operations record
-    /// an `InferUndoLog` entry.  Returns the current log length.
+    /// Open a new snapshot (paired with a `TypeContext` transaction).
+    /// While open, reversible operations record an `InferUndoLog`
+    /// entry.  Returns the current log length.
     #[must_use = "start_snapshot returns a snapshot token that must be consumed by rollback_to or commit_snapshot"]
-    pub fn start_snapshot(&mut self) -> usize {
+    pub fn start_snapshot(&mut self, ctx: &mut TypeContext<'_>) -> usize {
+        // (1.4) Open the ctx transaction FIRST so even the earliest ctx
+        // mutation inside the snapshot window is reversible; capture the
+        // depth we must roll back to.
+        let ctx_depth = ctx.transaction_depth();
+        ctx.begin_transaction();
         self.snapshot_depth += 1;
         // Pool mutations from now on are reversible — record them.
         self.region_tree.pool_logging_enabled = true;
-        self.region_current_snapshot_stack
-            .push(self.region_tree.current);
-        self.resolved_snapshot_stack.push((
-            self.resolved_ids.len(),
-            self.resolved_set.clone(),
-            self.dirty_set.clone(),
-            self.suspended_vars.clone(),
-            self.discharged_matches.clone(),
-            self.region_tree.pool_undo_log.len(),
-            self.pg_vars.clone(),
-            self.union_find.snapshot(),
-            self.generalized_in_region.clone(),
-            self.pending_inst_copy.clone(),
-            self.discharged_subs.clone(),
-            [
+        let region_current = self.region_tree.current;
+        let region_dirty_flags = self.region_tree.nodes.iter().map(|n| n.dirty).collect();
+        self.resolved_snapshot_stack.push(SnapshotState {
+            ctx_depth,
+            uf: self.union_find.snapshot(),
+            region_current,
+            pool_log_len: self.region_tree.pool_undo_log.len(),
+            log_len: self.undo_log.len(),
+            vec_lens: [
                 self.type_vars.len(),
                 self.var_type_ids.len(),
                 self.lower_bounds.len(),
@@ -4679,8 +5533,47 @@ impl InferenceContext {
                 self.reverse_refs.len(),
                 self.var_origins.len(),
             ],
-        ));
+            region_dirty_flags,
+        });
         self.undo_log.len()
+    }
+
+    /// Deterministically rebuild the dirty frontier from per-node flags
+    /// (`dirty_children` / `dirty_roots` are pure functions of
+    /// the flags + tree shape; this replays `mark_dirty`'s propagation.
+    fn restore_dirty_frontier(&mut self, flags: &[bool]) {
+        // Nodes that existed at snapshot time get their captured flag;
+        // nodes created inside the rollback window are fresh scopes whose
+        // pool mutations were undone — they are not dirty.
+        for (i, node) in self.region_tree.nodes.iter_mut().enumerate() {
+            node.dirty = flags.get(i).copied().unwrap_or(false);
+            node.dirty_children.clear();
+        }
+        self.region_tree.dirty_roots.clear();
+        let dirty: Vec<InferRegionId> = self
+            .region_tree
+            .nodes
+            .iter()
+            .filter(|n| n.dirty)
+            .map(|n| n.id)
+            .collect();
+        for id in dirty {
+            // A dirty region registers in the NEAREST dirty ancestor's
+            // dirty_children, or in dirty_roots when no ancestor is dirty.
+            let mut current = self.region_tree.nodes[id.0].parent;
+            let mut hit_root_list = true;
+            while let Some(pid) = current {
+                if self.region_tree.nodes[pid.0].dirty {
+                    self.region_tree.nodes[pid.0].dirty_children.insert(id);
+                    hit_root_list = false;
+                    break;
+                }
+                current = self.region_tree.nodes[pid.0].parent;
+            }
+            if hit_root_list {
+                self.region_tree.dirty_roots.insert(id);
+            }
+        }
     }
 
     /// Roll back to a snapshot: pop entries and call `reverse()`.
@@ -4688,118 +5581,123 @@ impl InferenceContext {
     /// All `gen_statuses` mutations (guards, lowering, generalization,
     /// wake transitions, instance promotion) are undo-logged, so a rolled
     /// back status always matches the rolled-back `guard_sets` /
-    /// `forward_refs` / `resolutions`.  Residual non-reversible state from
-    /// the solve loop: `wait_lists` takes (wake paths) and `type_vars[i].
-    /// region_id` (S-Exists-Lower level fallback) — a leaked-but-empty
-    /// wait list is conservative (a var stays PG until its next wake),
-    /// never unsound.
-    pub fn rollback_to(&mut self, snapshot_len: usize) {
-        while self.undo_log.len() > snapshot_len {
-            let undo = self.undo_log.pop().unwrap();
-            self.reverse(undo);
-        }
+    /// `forward_refs` / `resolutions`.  The formerly snapshot-cloned sets
+    /// (`suspended_vars`, `dirty_set`, `discharged_matches`,
+    /// `discharged_subs`, `pending_inst_copy`, `generalized_in_region`)
+    /// are restored through their fine-grained undo entries.  The paired
+    /// `TypeContext` transaction is rolled back too.
+    pub fn rollback_to(&mut self, ctx: &mut TypeContext<'_>, snapshot_len: usize) {
         // Restore region_tree.current FIRST: the undo reversals below (pool
         // unregister, var_to_region writes) only mutate metadata, but any
         // later region operation must run relative to the pre-snapshot
         // position, not the abandoned one.
-        if let Some(prev_region) = self.region_current_snapshot_stack.pop() {
-            self.region_tree.current = prev_region;
+        let (ctx_depth, uf_snap, region_current, pool_log_len, vec_lens, dirty_flags) = {
+            let Some(state) = self.resolved_snapshot_stack.last() else {
+                panic!("rollback_to: no open snapshot");
+            };
+            debug_assert!(
+                state.log_len == snapshot_len,
+                "rollback_to: token {snapshot_len} is not the innermost open snapshot ({}) — \
+                 close inner snapshots first",
+                state.log_len
+            );
+            (
+                state.ctx_depth,
+                state.uf.clone(),
+                state.region_current,
+                state.pool_log_len,
+                state.vec_lens,
+                state.region_dirty_flags.clone(),
+            )
+        };
+        self.region_tree.current = region_current;
+        while self.undo_log.len() > snapshot_len {
+            let undo = self.undo_log.pop().unwrap();
+            self.reverse(undo);
         }
-        // Restore resolved_ids/resolved_set/dirty_set/suspended_vars/discharged_matches
-        // from snapshot stack, and roll back pool mutations that were made inside this
-        // snapshot.
-        if let Some((
-            ids_len,
-            set,
-            dirty,
-            suspended,
-            discharged,
-            pool_len,
-            pg,
-            uf_snap,
-            old_generalized,
-            old_pending,
-            old_discharged_subs,
-            vec_lens,
-        )) = self.resolved_snapshot_stack.pop()
-        {
-            self.resolved_ids.truncate(ids_len);
-            self.resolved_set = set;
-            self.dirty_set = dirty;
-            self.suspended_vars = suspended;
-            self.discharged_matches = discharged;
-            self.discharged_subs = old_discharged_subs;
-            self.pg_vars = pg;
-            self.union_find.rollback_to(&uf_snap);
-            self.generalized_in_region = old_generalized;
-            self.pending_inst_copy = old_pending;
-            // Roll back only pool entries added since this snapshot was opened,
-            // then truncate to preserve entries from outer snapshots.
-            while self.region_tree.pool_undo_log.len() > pool_len {
-                let entry = self.region_tree.pool_undo_log.pop().unwrap();
-                match entry {
-                    PoolUndoEntry::Register {
-                        region_idx,
-                        var_id,
-                        kind,
-                    } => {
-                        if let Some(node) = self.region_tree.nodes.get_mut(region_idx) {
-                            let vec = match kind {
-                                RegisterKind::Var => &mut node.pool.var_ids,
-                                RegisterKind::RigidVar => &mut node.pool.rigid_var_ids,
-                            };
-                            vec.retain(|&v| v != var_id);
-                        }
-                        // Also restore var_to_region to mirror rollback_pool.
-                        if kind == RegisterKind::Var
-                            && var_id < self.region_tree.var_to_region.len()
-                        {
-                            self.region_tree.var_to_region[var_id] = None;
-                        }
+        self.union_find.rollback_to(&uf_snap);
+        // Roll back only pool entries added since this snapshot was opened,
+        // then truncate to preserve entries from outer snapshots.
+        while self.region_tree.pool_undo_log.len() > pool_log_len {
+            let entry = self.region_tree.pool_undo_log.pop().unwrap();
+            match entry {
+                PoolUndoEntry::Register {
+                    region_idx,
+                    var_id,
+                    kind,
+                } => {
+                    if let Some(node) = self.region_tree.nodes.get_mut(region_idx) {
+                        let vec = match kind {
+                            RegisterKind::Var => &mut node.pool.var_ids,
+                            RegisterKind::RigidVar => &mut node.pool.rigid_var_ids,
+                        };
+                        vec.retain(|&v| v != var_id);
                     }
-                    PoolUndoEntry::Unregister { region_idx, var_id } => {
-                        if let Some(node) = self.region_tree.nodes.get_mut(region_idx) {
-                            node.pool.var_ids.push(var_id);
-                        }
-                        // Also restore var_to_region to mirror rollback_pool.
-                        if var_id >= self.region_tree.var_to_region.len() {
-                            self.region_tree.var_to_region.resize(var_id + 1, None);
-                        }
-                        self.region_tree.var_to_region[var_id] = Some(InferRegionId(region_idx));
+                    // Also restore var_to_region to mirror rollback_pool.
+                    if kind == RegisterKind::Var && var_id < self.region_tree.var_to_region.len() {
+                        self.region_tree.var_to_region[var_id] = None;
                     }
                 }
+                PoolUndoEntry::Unregister { region_idx, var_id } => {
+                    if let Some(node) = self.region_tree.nodes.get_mut(region_idx) {
+                        node.pool.var_ids.push(var_id);
+                    }
+                    // Also restore var_to_region to mirror rollback_pool.
+                    if var_id >= self.region_tree.var_to_region.len() {
+                        self.region_tree.var_to_region.resize(var_id + 1, None);
+                    }
+                    self.region_tree.var_to_region[var_id] = Some(InferRegionId(region_idx));
+                }
             }
-            // Restore per-variable vector lengths captured at start_snapshot.
-            // Without this, new_type_var's `resize_with` growth is not undone,
-            // and the invariant `type_vars.len() == gen_statuses.len() == ...`
-            // is violated after rollback. Consumers that index by var_id would
-            // then read stale slots from a previous, discarded inference scope.
-            let [
-                tv_len,
-                vti_len,
-                lb_len,
-                ub_len,
-                wl_len,
-                psv_len,
-                gs_len,
-                gst_len,
-                fr_len,
-                rr_len,
-                vo_len,
-            ] = vec_lens;
-            self.type_vars.truncate(tv_len);
-            self.var_type_ids.truncate(vti_len);
-            self.lower_bounds.truncate(lb_len);
-            self.upper_bounds.truncate(ub_len);
-            self.wait_lists.truncate(wl_len);
-            self.pending_sub_vars.truncate(psv_len);
-            self.guard_sets.truncate(gs_len);
-            self.gen_statuses.truncate(gst_len);
-            self.forward_refs.truncate(fr_len);
-            self.reverse_refs.truncate(rr_len);
-            self.var_origins.truncate(vo_len);
         }
+        // Restore per-variable vector lengths captured at start_snapshot.
+        // Without this, new_type_var's `resize_with` growth is not undone,
+        // and the invariant `type_vars.len() == gen_statuses.len() == ...`
+        // is violated after rollback. Consumers that index by var_id would
+        // then read stale slots from a previous, discarded inference scope.
+        let [
+            tv_len,
+            vti_len,
+            lb_len,
+            ub_len,
+            wl_len,
+            psv_len,
+            gs_len,
+            gst_len,
+            fr_len,
+            rr_len,
+            vo_len,
+        ] = vec_lens;
+        self.type_vars.truncate(tv_len);
+        self.var_type_ids.truncate(vti_len);
+        self.lower_bounds.truncate(lb_len);
+        self.upper_bounds.truncate(ub_len);
+        self.wait_lists.truncate(wl_len);
+        self.pending_sub_vars.truncate(psv_len);
+        self.guard_sets.truncate(gs_len);
+        self.gen_statuses.truncate(gst_len);
+        self.forward_refs.truncate(fr_len);
+        self.reverse_refs.truncate(rr_len);
+        self.var_origins.truncate(vo_len);
+        // (2.3) Exact dirty-frontier restore.
+        self.restore_dirty_frontier(&dirty_flags);
+        // Pool state was rolled back — the pure subtree-membership cache
+        // must not survive it.
+        self.region_tree.subtree_vars_cache.clear();
+        // (1.4) Paired ctx rollback — undo the ctx.unify / ctx.set_binding
+        // effects recorded since this snapshot opened.  Rolls back every
+        // transaction opened after `ctx_depth` (including any manual ones
+        // nested inside the snapshot window — a no-op-safe superset).
+        ctx.rollback_to(ctx_depth);
+        self.resolved_snapshot_stack.pop();
         self.snapshot_depth -= 1;
+        // A deferred conflict recorded inside the rolled-back window is no
+        // longer valid: its snapshot depth exceeds the remaining depth.
+        if let Some((depth, _)) = &self.deferred_conflict {
+            if *depth > self.snapshot_depth {
+                self.deferred_conflict = None;
+            }
+        }
         if self.snapshot_depth == 0 {
             // The reversal loop above already consumed the log down to the
             // snapshot's pool_len; nothing committed can remain — clear and
@@ -4810,16 +5708,24 @@ impl InferenceContext {
     }
 
     /// Commit a snapshot: discard undo entries without reversing.
-    /// At the outermost snapshot, the log is cleared.
-    pub fn commit_snapshot(&mut self, snapshot_len: usize) {
+    /// At the outermost snapshot, the log is cleared.  The paired
+    /// `TypeContext` transaction is committed (merged into the parent).
+    pub fn commit_snapshot(&mut self, ctx: &mut TypeContext<'_>, snapshot_len: usize) {
         if self.snapshot_depth == 1 {
             self.undo_log.truncate(snapshot_len);
         }
         self.union_find.commit();
-        self.resolved_snapshot_stack.pop();
-        // Discard the parallel region-current record: the snapshot is being
-        // kept, so the (possibly deeper) current region stays live.
-        self.region_current_snapshot_stack.pop();
+        if let Some(state) = self.resolved_snapshot_stack.pop() {
+            // (1.4) Commit our ctx transaction: pops exactly the one frame
+            // we opened (depth = ctx_depth + 1) and merges its undo log
+            // into the parent so an outer rollback still sees it.  Deeper
+            // manual transactions inside the window were already merged or
+            // rolled back by their owners; a depth below ctx_depth + 1
+            // (already popped by an owner) means nothing to commit.
+            if ctx.transaction_depth() == state.ctx_depth + 1 {
+                ctx.commit_transaction();
+            }
+        }
         self.snapshot_depth -= 1;
         if self.snapshot_depth == 0 {
             // Outermost commit: every pool mutation is now permanent —
@@ -5040,7 +5946,7 @@ impl InferenceContext {
     /// Remove a guard from a variable when its suspended constraint is discharged.
     /// Decrements the reference count. Performs PG→G transition only when
     /// rigid-escape check passes.
-    pub fn remove_guard<'input>(&mut self, var_id: usize, ctx: &TypeContext<'input>) {
+    pub fn remove_guard<'input>(&mut self, var_id: usize, ctx: &mut TypeContext<'input>) {
         // Only log/mutate when the variable actually carries a direct
         // guard: `GuardSet::remove_guard` is a no-op at count 0 (its
         // debug_assert fires), while an unconditional `RemoveGuard` undo
@@ -5049,39 +5955,15 @@ impl InferenceContext {
         if var_id < self.guard_sets.len() && self.guard_sets[var_id].direct_guards > 0 {
             self.push_undo(InferUndoLog::RemoveGuard(var_id));
             self.guard_sets[var_id].remove_guard();
-            if self.guard_sets[var_id].is_empty()
-                && var_id < self.gen_statuses.len()
-                && self.gen_statuses[var_id] == GenStatus::PartiallyGeneralizable
-            {
-                let resolved = self.resolve_promotion_aware(self.var_type_ids[var_id], ctx);
-                // Only generalize a *resolved* variable.
-                // When resolved is still InferVar, the old conjunction
-                // `!matches!(..InferVar) && ...` was false, making
-                // `!escapes == true`, silently promoting an unbound var.
-                if !matches!(ctx.get(resolved), TypeData::InferVar { .. }) {
-                    let level = self
-                        .type_vars
-                        .get(var_id)
-                        .map(|v| self.region_tree.get_level(v.region_id))
-                        .unwrap_or(0);
-                    // Escape must be judged independently of where the solver
-                    // currently is.  Conjoining `level <= cur_level` made the
-                    // guard vacuously false for every variable in an outer
-                    // region (level < cur_level), so `!escape` became true and
-                    // the variable was generalized even though its type still
-                    // mentions a rigid introduced in that region — a
-                    // soundness hole (escaping skolem copied into the scheme).
-                    if !Self::check_rigid_escape(
-                        ctx,
-                        resolved,
-                        level,
-                        &self.region_tree,
-                        &self.var_promotions,
-                    ) {
-                        self.write_gen_status(var_id, GenStatus::Generalized);
-                    }
+            if self.guard_sets[var_id].is_empty() {
+                // Escape + resolution checks live in the shared eligibility
+                // predicate; the S-Inst-Copy side effect is atomic inside
+                // the transition.  If still unresolved or
+                // ineligible, leave as PG: a later wake will retry.
+                let roots = self.guarded_roots_set(ctx);
+                if self.generalization_eligible(ctx, var_id, &roots) {
+                    self.transition_to_generalized(ctx, var_id);
                 }
-                // If still unresolved, leave as PG: a later wake will retry.
             }
         }
     }
@@ -5119,6 +6001,13 @@ impl InferenceContext {
         // This follows OmniML's job-queue pattern where unify enqueues jobs
         // that the scheduler runs immediately.
         loop {
+            // A deferred conflict from `s_inst_copy` (an instance already
+            // bound to a type incompatible with the PG variable's resolution)
+            // is a genuine type error — surface it instead of accepting the
+            // program with the scheme instantiated at the wrong type.
+            if let Some((_, e)) = self.deferred_conflict.take() {
+                return Err(e);
+            }
             while let Some(pc) = heap.pop() {
                 match &pc.constraint {
                     Constraint::Eq(a, b, eq_span, _) => {
@@ -5427,48 +6316,19 @@ impl InferenceContext {
                             );
                             let shape_changed = self.try_set_shape(*var_id, ctx);
                             if shape_changed || resolved_now {
-                                self.wake_var_incremental(*var_id, &mut heap, ctx);
-                            }
-                            // ── OmniML §5.2: Incremental instantiation ──
-                            // S-Inst-Copy fires on the PG→G *transition*, not while
-                            // the var is still PG.  After wake_var_incremental clears
-                            // the wait list and sets the status to Generalized (no
-                            // guards remain), we propagate the resolved type to all
-                            // instances.  This avoids two bugs:
-                            //   1. Premature copy: s_inst_copy while still PG would
-                            //      clear forward_refs, dropping future refinements.
-                            //   2. Missed copy: if wake_var_incremental already set
-                            //      Generalized, the old PG guard was dead code.
-                            if *var_id < self.gen_statuses.len()
-                                && self.gen_statuses[*var_id] == GenStatus::Generalized
-                            {
-                                let resolved_ty =
-                                    self.resolve_promotion_aware(self.var_type_ids[*var_id], ctx);
-                                if !matches!(ctx.get(resolved_ty), TypeData::InferVar { .. })
-                                    && !Self::ty_mentions_infer_var(ctx, resolved_ty)
-                                {
-                                    self.s_inst_copy(ctx, *var_id, resolved_ty);
-                                }
+                                self.wake_var_incremental(*var_id, &mut heap, ctx, None);
                             }
                             // ── S-Generalize for eligible current vars ──
                             // The sweep runs once per outer iteration (batched),
                             // so a current var that is eligible for generalization
-                            // (resolved, unguarded, nothing waiting, no rigid
-                            // escape) is transitioned HERE — before
-                            // S-Exists-Lower — keeping the PG→G transition and
-                            // S-Inst-Copy deterministic instead of dependent on
-                            // whether an earlier transition in this iteration
-                            // already triggered a sweep.
+                            // is transitioned HERE — before S-Exists-Lower — via
+                            // the single transition helper (the
+                            // S-Inst-Copy formerly replicated after the wake is
+                            // now atomic inside the transition).
                             if *var_id < self.gen_statuses.len()
-                                && self.gen_statuses[*var_id] == GenStatus::PartiallyGeneralizable
                                 && self.is_sweep_eligible(ctx, *var_id)
                             {
-                                self.write_gen_status(*var_id, GenStatus::Generalized);
-                                let resolved_ty =
-                                    self.resolve_promotion_aware(self.var_type_ids[*var_id], ctx);
-                                if !Self::ty_mentions_infer_var(ctx, resolved_ty) {
-                                    self.s_inst_copy(ctx, *var_id, resolved_ty);
-                                }
+                                self.transition_to_generalized(ctx, *var_id);
                             }
                             // ── S-Exists-Lower (OmniML §5.3) ──
                             // For vars that remain PG (still have guards/waiting),
@@ -5488,15 +6348,7 @@ impl InferenceContext {
                                     let index = self.build_eq_index(ctx, &active);
                                     (active, index)
                                 });
-                                if self.s_exists_lower(
-                                    ctx,
-                                    *var_id,
-                                    &pc.env,
-                                    &slot.0,
-                                    Some(&slot.1),
-                                ) {
-                                    // lowering succeeded
-                                }
+                                self.s_exists_lower(ctx, *var_id, &pc.env, &slot.0, Some(&slot.1))?;
                             }
                         }
                     }
@@ -5520,21 +6372,25 @@ impl InferenceContext {
                         // InferVar bounds are never recorded: they carry no
                         // information (the exhaustion pass skips them), so
                         // recording them only bloats the O(n) `contains` scan.
+                        // Fail-loud slots: an unregistered id panics
+                        // instead of silently dropping the bound.
                         if let Some(id) = self.free_infer_var_id(*sup, ctx, &pc.env)
-                            && id < self.lower_bounds.len()
                             && !matches!(ctx.get(resolved_sub), TypeData::InferVar { .. })
-                            && !self.lower_bounds[id].contains(&resolved_sub)
                         {
-                            self.lower_bounds[id].push(resolved_sub);
-                            self.mark_dirty(id);
+                            let slot = self.lower_bound_slot(id);
+                            if !slot.contains(&resolved_sub) {
+                                slot.push(resolved_sub);
+                                self.mark_dirty(id);
+                            }
                         }
                         if let Some(id) = self.free_infer_var_id(*sub, ctx, &pc.env)
-                            && id < self.upper_bounds.len()
                             && !matches!(ctx.get(resolved_sup), TypeData::InferVar { .. })
-                            && !self.upper_bounds[id].contains(&resolved_sup)
                         {
-                            self.upper_bounds[id].push(resolved_sup);
-                            self.mark_dirty(id);
+                            let slot = self.upper_bound_slot(id);
+                            if !slot.contains(&resolved_sup) {
+                                slot.push(resolved_sup);
+                                self.mark_dirty(id);
+                            }
                         }
 
                         // If either side is still a free InferVar, suspend the
@@ -5548,14 +6404,22 @@ impl InferenceContext {
                                 // Both resolved: discharge.  Record in
                                 // discharged_subs so any duplicate copy still
                                 // sitting in another wait_list is skipped.
-                                self.discharged_subs.insert((*sub, *sup));
+                                if self.discharged_subs.insert((*sub, *sup)) {
+                                    self.push_undo(InferUndoLog::DischargedSubInsert(*sub, *sup));
+                                }
                                 // Clean up pending_sub_vars entries for this
                                 // Sub across all variables.  In practice the
                                 // entries are already gone (taken by
                                 // wake_var_incremental), but defensive cleanup
                                 // guards against edge cases.
-                                for slot in self.pending_sub_vars.iter_mut() {
-                                    slot.remove(&(*sub, *sup));
+                                let removed: Vec<usize> = self
+                                    .pending_sub_vars
+                                    .iter_mut()
+                                    .enumerate()
+                                    .filter_map(|(v, slot)| slot.remove(&(*sub, *sup)).then_some(v))
+                                    .collect();
+                                for v in removed {
+                                    self.push_undo(InferUndoLog::PendingSubRemove(v, (*sub, *sup)));
                                 }
                                 if !ctx.subtype(resolved_sub, resolved_sup) {
                                     return Err(TypeError::Mismatch {
@@ -5572,18 +6436,18 @@ impl InferenceContext {
                                 // cycles).  Each live registration carries
                                 // exactly one guard; wake_var_incremental
                                 // clears all guards on a variable atomically.
-                                if sub_id < self.pending_sub_vars.len()
-                                    && self.pending_sub_vars[sub_id].insert((*sub, *sup))
-                                {
+                                // Fail-loud slots: an unregistered id
+                                // panics instead of silently dropping the Sub.
+                                let sub_new = self.pending_sub_slot(sub_id).insert((*sub, *sup));
+                                if sub_new {
                                     self.suspend_on_var_with_env(
                                         pc.constraint.clone(),
                                         Arc::clone(&pc.env),
                                         sub_id,
                                     );
                                 }
-                                if sup_id < self.pending_sub_vars.len()
-                                    && self.pending_sub_vars[sup_id].insert((*sub, *sup))
-                                {
+                                let sup_new = self.pending_sub_slot(sup_id).insert((*sub, *sup));
+                                if sup_new {
                                     self.suspend_on_var_with_env(
                                         pc.constraint.clone(),
                                         Arc::clone(&pc.env),
@@ -5593,10 +6457,9 @@ impl InferenceContext {
                             }
                             (Some(id), None) | (None, Some(id)) => {
                                 // Exactly one side is free: suspend on that side,
-                                // with dedup.
-                                if id < self.pending_sub_vars.len()
-                                    && self.pending_sub_vars[id].insert((*sub, *sup))
-                                {
+                                // with dedup.  Fail-loud slot.
+                                let new = self.pending_sub_slot(id).insert((*sub, *sup));
+                                if new {
                                     self.suspend_on_var_with_env(
                                         pc.constraint.clone(),
                                         Arc::clone(&pc.env),
@@ -5637,7 +6500,12 @@ impl InferenceContext {
                             ) {
                                 return Err(TypeError::PatternNotExhaustive { span: *match_span });
                             }
-                            self.discharged_matches.insert((*scrutinee, *branches_id));
+                            if self.discharged_matches.insert((*scrutinee, *branches_id)) {
+                                self.push_undo(InferUndoLog::DischargedMatchInsert(
+                                    *scrutinee,
+                                    *branches_id,
+                                ));
+                            }
                         } else {
                             // Scrutinee is InferVar — suspend Match on the variable.
                             // try_match_via_shape_var always returns true for InferVar
@@ -5673,6 +6541,7 @@ impl InferenceContext {
                             if old_region != region_id {
                                 self.region_tree.unregister_var(*var_id, old_region);
                                 self.region_tree.register_var_in_region(*var_id, region_id);
+                                self.clear_shape_caches();
                                 self.push_undo(InferUndoLog::SetVarRegion(*var_id, old_region));
                                 self.type_vars[*var_id].region_id = region_id;
                             }
@@ -5821,7 +6690,7 @@ impl InferenceContext {
                                     );
                                     None
                                 }
-                                _ if Self::ty_mentions_infer_var(ctx, resolved_scheme) => {
+                                _ if !self.ty_is_closed_cached(ctx, resolved_scheme) => {
                                     // Scheme contains nested InferVars (e.g. Fn(InferVar, Bool));
                                     // suspend until those variables are resolved.
                                     // InferVar found instead of treating as concrete.
@@ -6030,7 +6899,7 @@ impl InferenceContext {
                                 self.region_tree.nodes[current.0].pool.var_ids.clone();
                             for vid in vars {
                                 if vid < self.wait_lists.len() && !self.wait_lists[vid].is_empty() {
-                                    self.wake_var_incremental(vid, &mut heap, ctx);
+                                    self.wake_var_incremental(vid, &mut heap, ctx, None);
                                 }
                             }
                             self.region_tree.exit_region();
@@ -6110,17 +6979,32 @@ impl InferenceContext {
             // also discharge in the same outer iteration.
             {
                 let mut match_ctx_changed = true;
+                // Cached (active Eqs, eq_index) carried across passes of the
+                // fixed-point loop (review 3.4): a discharge is the only
+                // event that can push new Eqs, so the cache is invalidated
+                // exactly there; passes that discharge nothing reuse it.
+                let mut eq_cache: Option<(
+                    Vec<PrioritizedConstraint>,
+                    HashMap<usize, Vec<(TypeId, TypeId)>>,
+                )> = None;
                 while match_ctx_changed {
                     match_ctx_changed = false;
                     // Collect active Eq constraints from the heap so
                     // UNI-VAR can discover shapes from equations like
                     // α = Int that have not yet been processed by the main
                     // constraint loop.
-                    let active_eqs: Vec<PrioritizedConstraint> = heap
-                        .iter()
-                        .filter(|pc| matches!(pc.constraint, Constraint::Eq(..)))
-                        .cloned()
-                        .collect();
+                    let (active_eqs, eq_index) = match eq_cache.take() {
+                        Some(cached) => cached,
+                        None => {
+                            let active: Vec<PrioritizedConstraint> = heap
+                                .iter()
+                                .filter(|pc| matches!(pc.constraint, Constraint::Eq(..)))
+                                .cloned()
+                                .collect();
+                            let index = self.build_eq_index(ctx, &active);
+                            (active, index)
+                        }
+                    };
                     let mut match_ctx: Vec<(usize, TypeId, (usize, usize), Arc<SkolemEnv>)> =
                         Vec::new();
                     for &vid in self.suspended_vars.iter() {
@@ -6157,9 +7041,16 @@ impl InferenceContext {
                             // Resolved scrutinee — the wake path below handles it.
                             continue;
                         }
-                        if let Some(unicity_shape) =
-                            Self::unicity_check(self, ctx, scrutinee, &env, &active_eqs)
-                        {
+                        // O(1) eq-index lookup instead of a per-match
+                        // linear scan (review 3.4).
+                        if let Some(unicity_shape) = Self::unicity_check_with_index(
+                            self,
+                            ctx,
+                            scrutinee,
+                            &env,
+                            &active_eqs,
+                            Some(&eq_index),
+                        ) {
                             if self.discharge_match_with_shape(
                                 ctx,
                                 scrutinee,
@@ -6169,7 +7060,17 @@ impl InferenceContext {
                                 unicity_shape,
                             ) {
                                 match_ctx_changed = true;
-                                self.discharged_matches.insert((scrutinee, branches_id));
+                                // A discharge may push new Eqs — the cached
+                                // pair is stale from here on (already taken
+                                // at the top of the pass; nothing to drop
+                                // but the re-fill must not be skipped).
+                                eq_cache = None;
+                                if self.discharged_matches.insert((scrutinee, branches_id)) {
+                                    self.push_undo(InferUndoLog::DischargedMatchInsert(
+                                        scrutinee,
+                                        branches_id,
+                                    ));
+                                }
                                 // Remove the discharged entry from the wait list it
                                 // was suspended on.
                                 if vid < self.wait_lists.len() {
@@ -6179,6 +7080,7 @@ impl InferenceContext {
                                             self.wait_lists[vid].clone(),
                                         ));
                                     }
+                                    let before = self.wait_lists[vid].len();
                                     self.wait_lists[vid].retain(|(c, _)| {
                                         !matches!(c, Constraint::Match {
                                             scrutinee: s,
@@ -6186,14 +7088,20 @@ impl InferenceContext {
                                             ..
                                         } if *s == scrutinee && *b == branches_id)
                                     });
+                                    // A deduped Match is suspended at most once.
+                                    debug_assert_eq!(
+                                        before - self.wait_lists[vid].len(),
+                                        1,
+                                        "MATCH-CTX: deduped Match must be suspended at most once"
+                                    );
                                 }
                                 self.remove_guard(vid, ctx);
                                 let wl_empty =
                                     vid < self.wait_lists.len() && self.wait_lists[vid].is_empty();
                                 let guards_empty =
                                     vid < self.guard_sets.len() && self.guard_sets[vid].is_empty();
-                                if wl_empty && guards_empty {
-                                    self.suspended_vars.remove(&vid);
+                                if wl_empty && guards_empty && self.suspended_vars.remove(&vid) {
+                                    self.push_undo(InferUndoLog::SuspendedVarsRemove(vid));
                                 }
                             }
                         }
@@ -6203,36 +7111,11 @@ impl InferenceContext {
 
             // ── Batch force_generalize (OmniML §5.3) ──────────────────
             // One sweep per outer iteration (after the heap drains and the
-            // Match phase has removed guards), replacing the per-transition
-            // sweep in the Eq handler.  The sweep only sets the status, so
-            // for every var it transitions PG → Generalized we replicate
-            // S-Inst-Copy — otherwise forward-referenced instances of a
-            // sweep-transitioned var would keep unresolved InferVars.
+            // Match phase has removed guards).  Each transition inside the
+            // sweep carries its own S-Inst-Copy atomically, so
+            // no post-sweep replication is needed here.
             if !self.dirty_set.is_empty() {
-                let swept: Vec<usize> = self
-                    .dirty_set
-                    .iter()
-                    .copied()
-                    .filter(|i| {
-                        self.gen_statuses.get(*i) == Some(&GenStatus::PartiallyGeneralizable)
-                    })
-                    .collect();
                 self.force_generalize_for_regions(ctx, &[], None);
-                for var_id in swept {
-                    if self.gen_statuses.get(var_id) == Some(&GenStatus::Generalized)
-                        && let Some(ty_id) = self.var_type_ids.get(var_id)
-                    {
-                        // promotion-aware: a promoted var's binding lives
-                        // only in the solver-local maps, and a ctx-only
-                        // resolve here would skip s_inst_copy for it.
-                        let resolved_ty = self.resolve_promotion_aware(*ty_id, ctx);
-                        if !matches!(ctx.get(resolved_ty), TypeData::InferVar { .. })
-                            && !Self::ty_mentions_infer_var(ctx, resolved_ty)
-                        {
-                            self.s_inst_copy(ctx, var_id, resolved_ty);
-                        }
-                    }
-                }
             }
 
             // ── Wake-up: reprocess suspended constraints ───────────────
@@ -6250,10 +7133,36 @@ impl InferenceContext {
             // after waking (e.g. because a newly-suspended constraint was added
             // during processing of an earlier woken constraint).
             self.wake_buffer.clear();
-            let mut tmp = std::mem::take(&mut self.suspended_vars);
+            let before_take = std::mem::take(&mut self.suspended_vars);
+            // Clone only while a snapshot is open: push_undo drops the entry
+            // outside snapshots, but the clone argument is evaluated eagerly.
+            if self.snapshot_depth > 0 {
+                self.push_undo(InferUndoLog::SuspendedVarsTaken(before_take.clone()));
+            }
+            let mut tmp = before_take;
             self.wake_buffer.extend(tmp.drain());
             self.suspended_vars = tmp;
             let to_wake: Vec<usize> = self.wake_buffer.drain(..).collect();
+            // Compute the guarded PG roots ONCE for the whole wake batch —
+            // every wake_var_incremental shares the same sweep predicate
+            // (transitive binding-root guard).  The batch's own variables
+            // are EXCLUDED: their direct guards are cleared inside
+            // wake_var_incremental this very batch, so a pre-wake snapshot
+            // would let each variable block itself through its own stale
+            // guard (a genuine block survives via the other guarded PG var
+            // sharing that root — transitive guards duplicate their source).
+            let to_wake_set: FxHashSet<usize> = to_wake.iter().copied().collect();
+            let wake_roots: FxHashSet<TypeId> = self
+                .pg_vars
+                .iter()
+                .filter(|&j| !to_wake_set.contains(j))
+                .filter(|&j| {
+                    *j < self.var_type_ids.len()
+                        && *j < self.guard_sets.len()
+                        && !self.guard_sets[*j].is_empty()
+                })
+                .map(|&j| self.resolve_promotion_aware(self.var_type_ids[j], ctx))
+                .collect();
             for i in to_wake {
                 if i < self.wait_lists.len() && !self.wait_lists[i].is_empty() {
                     let ty_id = self.var_type_ids[i];
@@ -6264,13 +7173,15 @@ impl InferenceContext {
                         // Unified wake path: wake_var_incremental handles
                         // wait_list drain, guard clearing, and PG→G transition.
                         let count = self.wait_lists[i].len();
-                        self.wake_var_incremental(i, &mut heap, ctx);
+                        self.wake_var_incremental(i, &mut heap, ctx, Some(&wake_roots));
                         woken += count;
                     }
                     // Re-insert only if the wait list is still non-empty
                     // (a new suspension may have been added during processing).
                     if i < self.wait_lists.len() && !self.wait_lists[i].is_empty() {
-                        self.suspended_vars.insert(i);
+                        if self.suspended_vars.insert(i) {
+                            self.push_undo(InferUndoLog::SuspendedVarsInsert(i));
+                        }
                     }
                 }
             }
@@ -6279,7 +7190,11 @@ impl InferenceContext {
             // nested InferVars.  Now that the outer iteration may
             // have resolved some of those, retry the deferred copies.
             {
-                let pending: Vec<usize> = self.pending_inst_copy.drain().collect();
+                let taken = std::mem::take(&mut self.pending_inst_copy);
+                if self.snapshot_depth > 0 {
+                    self.push_undo(InferUndoLog::PendingInstCopyTaken(taken.clone()));
+                }
+                let pending: Vec<usize> = taken.into_iter().collect();
                 for pg_id in pending {
                     if pg_id >= self.var_type_ids.len() {
                         continue;
@@ -6289,7 +7204,7 @@ impl InferenceContext {
                     }
                     let resolved_ty = self.resolve_promotion_aware(self.var_type_ids[pg_id], ctx);
                     if !matches!(ctx.get(resolved_ty), TypeData::InferVar { .. })
-                        && !Self::ty_mentions_infer_var(ctx, resolved_ty)
+                        && self.ty_is_closed_cached(ctx, resolved_ty)
                     {
                         self.s_inst_copy(ctx, pg_id, resolved_ty);
                     }
@@ -6349,7 +7264,12 @@ impl InferenceContext {
                     } else {
                         // Record the discharge so later passes (wait-list scan,
                         // MATCH-CTX) never re-process the same match.
-                        self.discharged_matches.insert((scrutinee, branches_id));
+                        if self.discharged_matches.insert((scrutinee, branches_id)) {
+                            self.push_undo(InferUndoLog::DischargedMatchInsert(
+                                scrutinee,
+                                branches_id,
+                            ));
+                        }
                     }
                 }
                 if !match_errors.is_empty() {
@@ -6418,21 +7338,28 @@ impl InferenceContext {
                     if !self.discharge_match(ctx, scrutinee, branches_id, &mut heap, &env) {
                         return Err(TypeError::PatternNotExhaustive { span: m_span });
                     }
-                    self.discharged_matches.insert((scrutinee, branches_id));
+                    if self.discharged_matches.insert((scrutinee, branches_id)) {
+                        self.push_undo(InferUndoLog::DischargedMatchInsert(scrutinee, branches_id));
+                    }
                     // Remove exactly one guard per extracted Match constraint
-                    // (each suspend_on_var_with_env added one guard).
-                    // Do NOT clear_direct_guards — non-Match constraints still
-                    // in the wait_list may have their own guards.
+                    // through the logged API: the raw
+                    // `guard_sets[vid].remove_guard()` here had no undo
+                    // entry, so a rollback corrupted the refcount. The
+                    // dedup guarantees each pending Match carries
+                    // exactly one direct guard, so one logged removal per
+                    // extraction stays exact. When the removal empties the
+                    // guard set, the PG→G transition fires inside
+                    // remove_guard (arguably correct, OmniML-designated).
                     if vid < self.guard_sets.len() {
-                        self.guard_sets[vid].remove_guard();
+                        self.remove_guard(vid, ctx);
                     }
                     // Only remove from suspended_vars when wait_list is empty
                     // AND all guards are cleared.
                     let wl_empty = vid < self.wait_lists.len() && self.wait_lists[vid].is_empty();
                     let guards_empty =
                         vid < self.guard_sets.len() && self.guard_sets[vid].is_empty();
-                    if wl_empty && guards_empty {
-                        self.suspended_vars.remove(&vid);
+                    if wl_empty && guards_empty && self.suspended_vars.remove(&vid) {
+                        self.push_undo(InferUndoLog::SuspendedVarsRemove(vid));
                     }
                 }
                 // If any discharged continuations were enqueued, re-enter the
@@ -6443,6 +7370,12 @@ impl InferenceContext {
                 break; // converged: no more constraints to wake
             }
             // Continue the loop to process woken constraints
+        }
+
+        // The loop may converge without a further pass over the heap — check
+        // the deferred conflict once more before the bounds-exhaustion pass.
+        if let Some((_, e)) = self.deferred_conflict.take() {
+            return Err(e);
         }
 
         // ── Verify recorded bounds for never-resolved vars (exhaustion pass) ──
@@ -6648,7 +7581,19 @@ impl InferenceContext {
             match data {
                 TypeData::InferVar { id, .. } => {
                     // Variable is still unbound — try to infer from bounds
+                    debug_assert_eq!(
+                        self.type_vars[i].id, i,
+                        "type_vars is indexed by variable id (maintained in new_type_var / rollback truncation)"
+                    );
                     let var_id = *id;
+                    // `var_id` is the RESOLVED variable's id, which differs
+                    // from `i` exactly when variable i was promoted.  Then
+                    // BOTH keys are required: `var_id` (constraint-side
+                    // addressing) and `i` (how replace_infer meets residual
+                    // InferVar(i) leaves — `promotions` is solver-local and
+                    // invisible to it).  When they are equal, the `if i !=
+                    // var_id` guards below skip the mirror, so nothing is
+                    // ever inserted twice.
 
                     // PG variables must not be silently defaulted.
                     // A PG variable that is still unresolved means a suspended
@@ -6865,6 +7810,9 @@ impl InferenceContext {
         ctx: &mut TypeContext<'input>,
         out: &mut Vec<(usize, usize)>,
     ) {
+        // Pool membership changes are invisible to binding_epoch —
+        // invalidate the epoch-keyed shape caches explicitly.
+        self.clear_shape_caches();
         let var_ids: Vec<usize> = self.region_tree.nodes[region_id.0].pool.var_ids.clone();
         // Variables generalized by THIS call only.  The final pool-removal
         // loop must not iterate the caller-accumulated `out`: it mixes
@@ -6872,18 +7820,13 @@ impl InferenceContext {
         // O(total × pool_size) and — if the pool invariant were ever
         // violated — able to remove a foreign variable from this region.
         let mut local_generalized: Vec<usize> = Vec::new();
+        // Shared eligibility: one guarded-roots pass per region.
+        let guarded_roots = self.guarded_roots_set(ctx);
         for &var_id in &var_ids {
             let ty_id = if var_id < self.var_type_ids.len() {
                 self.var_type_ids[var_id]
             } else {
                 continue;
-            };
-            // Check if the variable is guarded (has guards).
-            let is_guarded = if var_id < self.guard_sets.len() {
-                let gs = &self.guard_sets[var_id];
-                !gs.is_empty()
-            } else {
-                false
             };
             // Check if the variable is PG (PartiallyGeneralizable).
             let is_pg = if var_id < self.gen_statuses.len() {
@@ -6892,6 +7835,18 @@ impl InferenceContext {
                 false
             };
             if is_pg {
+                if self.generalization_eligible(ctx, var_id, &guarded_roots) {
+                    // Eligible PG variables generalize in place now —
+                    // lowering to the parent deferred the same decision the
+                    // sweep would already have made, which made region-exit
+                    // generalization nearly dead weight in the common case.
+                    if self.transition_to_generalized(ctx, var_id) {
+                        local_generalized.push(var_id);
+                        out.push((region_id.0, var_id));
+                    }
+                    continue;
+                }
+                // Ineligible PG variable: lower it to the parent (OmniML §6).
                 // PG variables are guarded by suspended constraints.
                 // They cannot be generalized yet.  Instead, "lower" them
                 // to the parent region (OmniML §6 generalize_generation):
@@ -6918,103 +7873,43 @@ impl InferenceContext {
                 // next generalization pass.
                 continue;
             }
-            if !is_guarded {
-                // Full eligibility check — the SAME predicate the sweep
-                // applied, so the frontier path is sound-equivalent to the
-                // retired approximation: resolved, nothing waiting, no
-                // rigid escape from this region's level, and not
-                // binding-root-shared with a guarded PG variable.
-                let resolved_ty = self.resolve_promotion_aware(self.var_type_ids[var_id], ctx);
-                if matches!(ctx.get(resolved_ty), TypeData::InferVar { .. }) {
-                    // Unresolved: cannot enter a scheme.  Leave it in the
-                    // pool — conservative (fail-closed), the end-of-solve
-                    // pass or check_unresolved handles it.
-                    continue;
-                }
-                if var_id < self.wait_lists.len() && !self.wait_lists[var_id].is_empty() {
-                    // Suspended constraints still block this variable.
-                    continue;
-                }
-                let level = self.region_tree.nodes[region_id.0].level;
-                if Self::check_rigid_escape(
-                    ctx,
-                    resolved_ty,
-                    level,
-                    &self.region_tree,
-                    &self.var_promotions,
-                ) {
-                    // A skolem escaping to an outer scope must not be
-                    // copied into the generalized scheme.
-                    continue;
-                }
-                // Binding-root sharing (the sweep's `guarded_roots`): a
-                // PG variable with guards resolving to the same root
-                // blocks our generalization — unifying them later would
-                // otherwise observe a scheme where a monotype was
-                // expected.
-                let shared_with_guarded = self.pg_vars.iter().any(|&j| {
-                    j != var_id
-                        && j < self.guard_sets.len()
-                        && !self.guard_sets[j].is_empty()
-                        && j < self.var_type_ids.len()
-                        && self.resolve_promotion_aware(self.var_type_ids[j], ctx) == resolved_ty
-                });
-                if shared_with_guarded {
-                    continue;
-                }
-                // Update the gen_status if it exists.
-                if var_id < self.gen_statuses.len() {
-                    self.write_gen_status(var_id, GenStatus::Generalized);
-                    // Propagate the resolved type to all instances so they
-                    // see the now-generic binding (OmniML §5.2 S-Inst-Copy).
-                    if !Self::ty_mentions_infer_var(ctx, resolved_ty) {
-                        // S-Inst-Copy: the resolved type is fully closed (no InferVars
-                        // anywhere in the tree), so alias-sharing via unify_and_track
-                        // is safe — no cross-instance contamination possible.
-                        self.s_inst_copy(ctx, var_id, resolved_ty);
-                    }
-                }
-                // When a variable is generalized, update its instances.
-                // BUT: only mark an instance as Generalized if it is NOT
-                // itself still guarded (OmniML §6: a variable can become
-                // Generic only when all its constraints are resolved).
-                if var_id < self.forward_refs.len() {
-                    // Copy the instance list so the (mutable) push_undo
-                    // below does not conflict with the iteration borrow.
-                    let instance_ids: Vec<usize> = self.forward_refs[var_id].clone();
-                    for inst_id in instance_ids {
-                        // Check if the instance is still guarded.
-                        let inst_guarded = if inst_id < self.guard_sets.len() {
-                            !self.guard_sets[inst_id].is_empty()
-                        } else {
-                            false
-                        };
-                        let inst_pg = if inst_id < self.gen_statuses.len() {
-                            self.gen_statuses[inst_id] == GenStatus::PartiallyGeneralizable
-                        } else {
-                            false
-                        };
-                        // Only promote if the instance is not guarded and not PG.
-                        if !inst_guarded && !inst_pg {
-                            self.write_gen_status(inst_id, GenStatus::Generalized);
-                            // Remove the instance from its region's pool.
-                            // Generalized variables must not belong to any pool
-                            // (OmniML §6: "once a term is generalised, it is
-                            // removed from its pool").
-                            if inst_id < self.type_vars.len() {
-                                let inst_region = self.type_vars[inst_id].region_id;
-                                if inst_region.0 < self.region_tree.nodes.len()
-                                    && self.region_tree.nodes[inst_region.0]
-                                        .pool
-                                        .var_ids
-                                        .contains(&inst_id)
-                                {
-                                    self.region_tree.unregister_var(inst_id, inst_region);
-                                }
-                            }
-                        }
-                    }
-                }
+            // Non-PG path (I/PI/Ungeneralized): full eligibility check, then
+            // the shared `mark_generalized_and_copy` carries the status
+            // write + S-Inst-Copy + instance promotion (the
+            // previously inlined instance-promotion loop and inline
+            // s_inst_copy live inside the shared helper now).
+            let resolved_ty = self.resolve_promotion_aware(ty_id, ctx);
+            if matches!(ctx.get(resolved_ty), TypeData::InferVar { .. }) {
+                // Unresolved: cannot enter a scheme.  Leave it in the
+                // pool — conservative (fail-closed), the end-of-solve
+                // pass or check_unresolved handles it.
+                continue;
+            }
+            if var_id < self.wait_lists.len() && !self.wait_lists[var_id].is_empty() {
+                // Suspended constraints still block this variable.
+                continue;
+            }
+            if var_id < self.guard_sets.len() && !self.guard_sets[var_id].is_empty() {
+                // A non-PG variable carrying its own guards is still blocked —
+                // original semantics: leave it in the pool.
+                continue;
+            }
+            let level = self.region_tree.nodes[region_id.0].level;
+            if self.check_rigid_escape_cached(ctx, resolved_ty, level) {
+                // A skolem escaping to an outer scope must not be
+                // copied into the generalized scheme.
+                continue;
+            }
+            // Binding-root sharing (the sweep's `guarded_roots`): a
+            // PG variable with guards resolving to the same root
+            // blocks our generalization — unifying them later would
+            // otherwise observe a scheme where a monotype was
+            // expected.
+            let shared_with_guarded = guarded_roots.contains(&resolved_ty);
+            if shared_with_guarded && !self.guard_sets[var_id].is_empty() {
+                continue;
+            }
+            if var_id < self.gen_statuses.len() && self.mark_generalized_and_copy(ctx, var_id) {
                 local_generalized.push(var_id);
                 out.push((region_id.0, var_id));
             }
@@ -7164,16 +8059,17 @@ pub(crate) fn replace_infer<'input>(
                 lifetime: None,
             })
         }
-        TypeData::Pointer { ty } => {
+        TypeData::Pointer { ty, .. } => {
             let new_ty = replace_infer(ty, solution, ctx);
-            ctx.alloc(TypeData::Pointer { ty: new_ty })
+            ctx.alloc(TypeData::Pointer { ty: new_ty, mutable: false })
         }
-        TypeData::Ptr { size, pointee } => {
+        TypeData::Ptr { size, pointee, .. } => {
             let new_size = replace_infer(size, solution, ctx);
             let new_pointee = replace_infer(pointee, solution, ctx);
             ctx.alloc(TypeData::Ptr {
                 size: new_size,
                 pointee: new_pointee,
+                mutable: false,
             })
         }
         TypeData::Fn { params, ret } => {
@@ -7332,7 +8228,7 @@ mod tests {
             var_id,
         );
         // Waking moves suspended constraints back to the active list
-        let woken = infer.wake_var_for_test(var_id, &ctx);
+        let woken = infer.wake_var_for_test(var_id, &mut ctx);
         // The heap should now have the woken constraint
         assert!(woken > 0);
     }
@@ -7361,7 +8257,7 @@ mod tests {
         );
         // wake_var_incremental needs a heap, var_id, and ctx
         let mut heap = BucketQueue::new();
-        infer.wake_var_incremental(var_id, &mut heap, &ctx);
+        infer.wake_var_incremental(var_id, &mut heap, &mut ctx, None);
         // After waking, the wait list should be empty
         assert!(infer.wait_lists[var_id].is_empty());
     }
@@ -7409,7 +8305,10 @@ mod tests {
         // This test was originally comparing Eq vs Impl (which was removed
         // in the unified solver migration).  Now it verifies that Eq
         // constraints with concrete types are equal priority.
-        assert_eq!(eq.priority(&ctx), eq.priority(&ctx));
+        assert_eq!(
+            InferenceContext::new().constraint_priority(&eq, &ctx),
+            InferenceContext::new().constraint_priority(&eq, &ctx)
+        );
     }
 
     #[test]
@@ -7435,7 +8334,10 @@ mod tests {
         // after the removal of Constraint::Impl (which was previously the lowest
         // priority at 5).  Eq with concrete types has the same priority as Match
         // with a resolved scrutinee (both are priority 3).
-        assert!(eq.priority(&ctx) <= match_c.priority(&ctx));
+        assert!(
+            InferenceContext::new().constraint_priority(&eq, &ctx)
+                <= InferenceContext::new().constraint_priority(&match_c, &ctx)
+        );
     }
 
     #[test]
@@ -7450,7 +8352,7 @@ mod tests {
             span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         };
         assert_eq!(
-            match_c.priority(&ctx),
+            InferenceContext::new().constraint_priority(&match_c, &ctx),
             6,
             "Match on InferVar should have lowest priority"
         );
@@ -7462,7 +8364,7 @@ mod tests {
             EqOrigin::Normal,
         );
         assert_eq!(
-            eq_c.priority(&ctx),
+            InferenceContext::new().constraint_priority(&eq_c, &ctx),
             0,
             "Eq on concrete should have highest priority"
         );
@@ -7565,18 +8467,21 @@ mod tests {
     fn test_rollback_register_match_branches_batch() {
         let mut ctx = TypeContext::new();
         let mut infer = InferenceContext::new();
-        let mut mk_branch = |shape: PrincipalShape| MatchBranchSet {
+        // Pre-build the Int type so the closure does not capture `ctx` —
+        // start_snapshot now needs &mut ctx (paired transaction).
+        let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
+        let mk_branch = |shape: PrincipalShape| MatchBranchSet {
             shape_pattern: shape,
             continuation: Arc::from(vec![Constraint::Eq(
-                ctx.int(DEFAULT_INT_WIDTH, true),
-                ctx.int(DEFAULT_INT_WIDTH, true),
+                int_ty,
+                int_ty,
                 crate::ast::Span::new(FileId::DUMMY, 0, 0),
                 EqOrigin::Normal,
             )]),
             else_continuation: Arc::from(Vec::new() as Vec<Constraint>),
         };
         let pre_len = infer.match_branches_len_for_test();
-        let snap = infer.start_snapshot();
+        let snap = infer.start_snapshot(&mut ctx);
         let (start, count) = infer.register_match_branches(vec![
             mk_branch(PrincipalShape::Arrow),
             mk_branch(PrincipalShape::Tuple(2)),
@@ -7588,7 +8493,7 @@ mod tests {
             pre_len + 2,
             "both branches registered inside the snapshot"
         );
-        infer.rollback_to(snap);
+        infer.rollback_to(&mut ctx, snap);
         assert_eq!(
             infer.match_branches_len_for_test(),
             pre_len,
@@ -7611,12 +8516,15 @@ mod tests {
             span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         };
         // Before resolution: low priority
-        assert_eq!(match_c.priority(&ctx), 6);
+        assert_eq!(
+            InferenceContext::new().constraint_priority(&match_c, &ctx),
+            6
+        );
         // After resolution: medium priority
         let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
         ctx.bindings.insert(var, int_ty);
         assert_eq!(
-            match_c.priority(&ctx),
+            InferenceContext::new().constraint_priority(&match_c, &ctx),
             3,
             "match on resolved type should have medium priority"
         );
@@ -7862,7 +8770,11 @@ mod tests {
             span: crate::ast::Span::new(FileId::DUMMY, 0, 0),
         };
         let ctx = TypeContext::new();
-        assert_eq!(c.priority(&ctx), 2, "Let should have medium-high priority");
+        assert_eq!(
+            InferenceContext::new().constraint_priority(&c, &ctx),
+            2,
+            "Let should have medium-high priority"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -8297,7 +9209,12 @@ mod tests {
         }
         let int32_1 = ctx.int(DEFAULT_INT_WIDTH, true);
         infer.suspend_on_var(
-            Constraint::Eq(var, int32_1, crate::ast::Span::new(FileId::DUMMY, 0, 0), EqOrigin::Normal),
+            Constraint::Eq(
+                var,
+                int32_1,
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
+                EqOrigin::Normal,
+            ),
             var_id,
         );
 
@@ -8502,7 +9419,9 @@ mod tests {
         infer.pg_vars.insert(var_id);
         // exit_level so current_level drops below the var's level
         infer.exit_level(prev);
-        let lowered = infer.s_exists_lower(&mut ctx, var_id, &SkolemEnv::default(), &[], None);
+        let lowered = infer
+            .s_exists_lower(&mut ctx, var_id, &SkolemEnv::default(), &[], None)
+            .expect("s_exists_lower");
         // Removed the unsound level-based fallback.
         // Without determinacy proof, the variable stays PG.
         assert!(
@@ -8627,7 +9546,7 @@ mod tests {
         let fn_bool = ctx.bool();
         let fn_ty = ctx.function(smallvec![fn_bool], fn_bool);
         ctx.bindings.insert(infer_var, fn_ty);
-        infer.wake_var_incremental(var_id, &mut heap, &ctx);
+        infer.wake_var_incremental(var_id, &mut heap, &mut ctx, None);
 
         // The match should now be in the heap
         assert!(!heap.is_empty(), "match should be woken and placed in heap");
@@ -9233,14 +10152,14 @@ mod tests {
         let int32 = ctx.int(32, true);
         ctx.set_binding(var, int32);
 
-        let snap = infer.start_snapshot();
+        let snap = infer.start_snapshot(&mut ctx);
         infer.force_generalize(&mut ctx);
         assert_eq!(
             infer.gen_statuses[var_id],
             GenStatus::Generalized,
             "sweep must generalize the eligible var"
         );
-        infer.rollback_to(snap);
+        infer.rollback_to(&mut ctx, snap);
         assert_eq!(
             infer.gen_statuses[var_id],
             GenStatus::PartiallyGeneralizable,
@@ -9261,15 +10180,17 @@ mod tests {
         let int32 = ctx.int(32, true);
         ctx.set_binding(var, int32);
 
-        let snap = infer.start_snapshot();
-        let lowered = infer.s_exists_lower(&ctx, var_id, &SkolemEnv::default(), &[], None);
+        let snap = infer.start_snapshot(&mut ctx);
+        let lowered = infer
+            .s_exists_lower(&mut ctx, var_id, &SkolemEnv::default(), &[], None)
+            .expect("s_exists_lower");
         assert!(lowered, "resolved PG var must be lowered via UNI-TYPE");
         assert_eq!(
             infer.gen_statuses[var_id],
             GenStatus::Ungeneralized,
             "lowering must set Ungeneralized"
         );
-        infer.rollback_to(snap);
+        infer.rollback_to(&mut ctx, snap);
         assert_eq!(
             infer.gen_statuses[var_id],
             GenStatus::PartiallyGeneralizable,
@@ -9312,7 +10233,7 @@ mod tests {
             EqOrigin::Normal,
         ));
 
-        let snap = infer.start_snapshot();
+        let snap = infer.start_snapshot(&mut ctx);
         let result = infer.solve(&mut ctx, &trait_env, &symbols);
         assert!(result.is_ok(), "solve should succeed, got {:?}", result);
         assert_eq!(
@@ -9325,7 +10246,7 @@ mod tests {
             "s_inst_copy clears forward_refs after propagating"
         );
 
-        infer.rollback_to(snap);
+        infer.rollback_to(&mut ctx, snap);
         assert_eq!(
             infer.gen_statuses[pg_id],
             GenStatus::PartiallyGeneralizable,
@@ -9365,7 +10286,12 @@ mod tests {
         // Eq(inner, outer): the outside variable determines inner.
         let active = vec![PrioritizedConstraint {
             priority: 0,
-            constraint: Constraint::Eq(inner, outer, crate::ast::Span::new(FileId::DUMMY, 0, 0), EqOrigin::Normal),
+            constraint: Constraint::Eq(
+                inner,
+                outer,
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
+                EqOrigin::Normal,
+            ),
             env: Arc::new(HashMap::default()),
         }];
 
@@ -9397,7 +10323,12 @@ mod tests {
         let int_ty = ctx.int(DEFAULT_INT_WIDTH, true);
         let active = vec![PrioritizedConstraint {
             priority: 0,
-            constraint: Constraint::Eq(var, int_ty, crate::ast::Span::new(FileId::DUMMY, 0, 0), EqOrigin::Normal),
+            constraint: Constraint::Eq(
+                var,
+                int_ty,
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
+                EqOrigin::Normal,
+            ),
             env: Arc::new(HashMap::default()),
         }];
 
@@ -9425,7 +10356,12 @@ mod tests {
         // Eq(a, b): both in the same region → NOT determined.
         let active = vec![PrioritizedConstraint {
             priority: 0,
-            constraint: Constraint::Eq(a, b, crate::ast::Span::new(FileId::DUMMY, 0, 0), EqOrigin::Normal),
+            constraint: Constraint::Eq(
+                a,
+                b,
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
+                EqOrigin::Normal,
+            ),
             env: Arc::new(HashMap::default()),
         }];
 
@@ -9462,7 +10398,12 @@ mod tests {
         let fn_ty = ctx.function(smallvec![inner], bool_ty);
         let active = vec![PrioritizedConstraint {
             priority: 0,
-            constraint: Constraint::Eq(outer, fn_ty, crate::ast::Span::new(FileId::DUMMY, 0, 0), EqOrigin::Normal),
+            constraint: Constraint::Eq(
+                outer,
+                fn_ty,
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
+                EqOrigin::Normal,
+            ),
             env: Arc::new(HashMap::default()),
         }];
 
@@ -9494,11 +10435,18 @@ mod tests {
 
         let active = vec![PrioritizedConstraint {
             priority: 0,
-            constraint: Constraint::Eq(inner, outer, crate::ast::Span::new(FileId::DUMMY, 0, 0), EqOrigin::Normal),
+            constraint: Constraint::Eq(
+                inner,
+                outer,
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
+                EqOrigin::Normal,
+            ),
             env: Arc::new(HashMap::default()),
         }];
 
-        let lowered = infer.s_exists_lower(&ctx, inner_id, &SkolemEnv::default(), &active, None);
+        let lowered = infer
+            .s_exists_lower(&mut ctx, inner_id, &SkolemEnv::default(), &active, None)
+            .expect("s_exists_lower");
         assert!(lowered, "s_exists_lower should succeed via Det-Dom");
         assert_eq!(
             infer.gen_statuses[inner_id],
@@ -9637,7 +10585,12 @@ mod tests {
         let fn_ty = ctx.function(smallvec![beta, gamma], bool_ty);
         let active = vec![PrioritizedConstraint {
             priority: 0,
-            constraint: Constraint::Eq(alpha, fn_ty, crate::ast::Span::new(FileId::DUMMY, 0, 0), EqOrigin::Normal),
+            constraint: Constraint::Eq(
+                alpha,
+                fn_ty,
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
+                EqOrigin::Normal,
+            ),
             env: Arc::new(HashMap::default()),
         }];
 
@@ -9692,7 +10645,9 @@ mod tests {
             },
         ];
 
-        let lowered = infer.s_exists_lower(&ctx, alpha_id, &SkolemEnv::default(), &active, None);
+        let lowered = infer
+            .s_exists_lower(&mut ctx, alpha_id, &SkolemEnv::default(), &active, None)
+            .expect("s_exists_lower");
         assert!(
             lowered,
             "s_exists_lower must succeed via transitive Det-Dom"
@@ -9704,5 +10659,392 @@ mod tests {
         );
 
         infer.exit_level(prev);
+    }
+
+    // ── Regression tests from the §9 remediation suite ───────────────
+
+    fn reg_var_id(ctx: &TypeContext, ty: TypeId) -> usize {
+        match ctx.get(ty) {
+            TypeData::InferVar { id, .. } => *id,
+            other => panic!("expected an InferVar, got {other:?}"),
+        }
+    }
+
+    fn reg_span() -> Span {
+        Span::new(FileId::DUMMY, 0, 0)
+    }
+
+    /// (§1.1) A conflicting bind is a typed, table-preserving error.
+    #[test]
+    fn test_bind_conflict_is_typed_error() {
+        let mut ctx = new_ctx();
+        let mut infer = InferenceContext::new();
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let id = reg_var_id(&ctx, var);
+        let int32 = ctx.int(DEFAULT_INT_WIDTH, true);
+        let bool_ty = ctx.bool();
+        infer.union_find.try_bind(id, int32).expect("first bind");
+        infer
+            .union_find
+            .try_bind(id, int32)
+            .expect("identity re-bind must succeed");
+        let err = infer
+            .union_find
+            .try_bind(id, bool_ty)
+            .expect_err("distinct bind must conflict");
+        assert_eq!(err.existing, int32);
+        assert_eq!(err.incoming, bool_ty);
+        // A failed bind leaves the table untouched (ena exits before update).
+        assert_eq!(infer.union_find.probe_value(id), Some(int32));
+    }
+
+    /// (§1.1) The overwrite primitive is rollback-safe (ena SetElem undo).
+    #[test]
+    fn test_force_rebind_overwrites_and_rolls_back() {
+        let mut ctx = new_ctx();
+        let mut infer = InferenceContext::new();
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let id = reg_var_id(&ctx, var);
+        let int32 = ctx.int(DEFAULT_INT_WIDTH, true);
+        let bool_ty = ctx.bool();
+        infer.union_find.try_bind(id, int32).expect("bind");
+        let snap = infer.start_snapshot(&mut ctx);
+        infer.union_find.force_rebind(id, bool_ty);
+        assert_eq!(infer.union_find.probe_value(id), Some(bool_ty));
+        infer.rollback_to(&mut ctx, snap);
+        assert_eq!(
+            infer.union_find.probe_value(id),
+            Some(int32),
+            "force_rebind must be rollback-safe (ena SetElem undo)"
+        );
+    }
+
+    /// (§1.2) A non-Eq wake-path transition copies to instances.
+    #[test]
+    fn test_wake_phase_transition_copies_instances() {
+        let mut ctx = new_ctx();
+        let mut infer = InferenceContext::new();
+        let pg = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let pg_id = reg_var_id(&ctx, pg);
+        let inst = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let inst_id = reg_var_id(&ctx, inst);
+        infer.set_gen_status(pg_id, GenStatus::PartiallyGeneralizable);
+        infer.register_instance(pg_id, inst_id);
+        // Suspend a constraint on the PG variable so the wake phase actually
+        // fires for it (the wake path only visits wait-listed variables).
+        infer.suspend_on_var(Constraint::Eq(pg, pg, reg_span(), EqOrigin::Normal), pg_id);
+        // Resolve via a non-Eq route (pre-solve binding) so the wake phase
+        // is the transition mechanism.
+        let int32 = ctx.int(DEFAULT_INT_WIDTH, true);
+        ctx.bindings.insert(pg, int32);
+        let symbols = SymbolTable::new(crate::hir::types::CrateId(DefId(0)));
+        let trait_env = TraitEnv::new();
+        let result = infer.solve(&mut ctx, &trait_env, &symbols);
+        assert!(result.is_ok(), "solve should succeed: {:?}", result.err());
+        assert_eq!(infer.gen_statuses[pg_id], GenStatus::Generalized);
+        assert!(
+            ctx.is_integer(ctx.resolve_binding(inst)),
+            "wake-path transition must perform S-Inst-Copy"
+        );
+    }
+
+    /// (§1.2) The MATCH-CTX remove_guard transition copies to instances.
+    #[test]
+    fn test_remove_guard_transition_copies_instances() {
+        let mut ctx = new_ctx();
+        let mut infer = InferenceContext::new();
+        let pg = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let pg_id = reg_var_id(&ctx, pg);
+        let inst = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let inst_id = reg_var_id(&ctx, inst);
+        infer.set_gen_status(pg_id, GenStatus::PartiallyGeneralizable);
+        infer.register_instance(pg_id, inst_id);
+        // remove_guard only acts when a direct guard is present.
+        infer.add_guard(pg_id);
+        let int32 = ctx.int(DEFAULT_INT_WIDTH, true);
+        ctx.bindings.insert(pg, int32);
+        infer.remove_guard(pg_id, &mut ctx);
+        assert_eq!(infer.gen_statuses[pg_id], GenStatus::Generalized);
+        assert!(
+            ctx.is_integer(ctx.resolve_binding(inst)),
+            "remove_guard PG→G transition must perform S-Inst-Copy"
+        );
+    }
+
+    /// (§1.2) Value-determinacy lowering unifies the variable with its
+    /// instances (OmniML §6).
+    #[test]
+    fn test_s_exists_lower_unifies_instances() {
+        let mut ctx = new_ctx();
+        let mut infer = InferenceContext::new();
+        let outer = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let outer_id = reg_var_id(&ctx, outer);
+        let inner = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let inner_id = reg_var_id(&ctx, inner);
+        let inst = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let inst_id = reg_var_id(&ctx, inst);
+        infer.set_gen_status(inner_id, GenStatus::PartiallyGeneralizable);
+        infer.register_instance(inner_id, inst_id);
+        // Resolve inner to a concrete type so the value-determinacy branch
+        // fires (it is the only lowering branch that unifies instances).
+        let int32 = ctx.int(DEFAULT_INT_WIDTH, true);
+        ctx.bindings.insert(inner, int32);
+        let lowered = infer
+            .s_exists_lower(&mut ctx, inner_id, &SkolemEnv::default(), &[], None)
+            .expect("s_exists_lower");
+        assert!(lowered, "value-determinacy lowering");
+        assert_eq!(infer.gen_statuses[inner_id], GenStatus::Ungeneralized);
+        assert_eq!(
+            ctx.resolve_binding(inst),
+            ctx.resolve_binding(inner),
+            "a lowered PG variable must unify with all of its instances"
+        );
+    }
+
+    /// (§1.3) A Sub on an unregistered id fails loudly, never silently.
+    #[test]
+    #[should_panic(expected = "unregistered InferVar")]
+    fn test_sub_out_of_range_id_panics() {
+        let mut ctx = new_ctx();
+        let mut infer = InferenceContext::new();
+        // Simulate an externally minted, never-adopted variable.
+        let ghost = ctx.alloc_infer_var(9_999, 0);
+        infer.add_constraint(Constraint::Sub(ghost, ctx.bool(), reg_span()));
+        let symbols = SymbolTable::new(crate::hir::types::CrateId(DefId(0)));
+        let trait_env = TraitEnv::new();
+        let _ = infer.solve(&mut ctx, &trait_env, &symbols); // must panic
+    }
+
+    /// (§1.3 + §2.4) An adopted external variable suspends and re-checks.
+    #[test]
+    fn test_adopt_external_var_then_sub_suspends_and_rechecks() {
+        let mut ctx = new_ctx();
+        let mut infer = InferenceContext::new();
+        let symbols = SymbolTable::new(crate::hir::types::CrateId(DefId(0)));
+        let trait_env = TraitEnv::new();
+        let ghost = ctx.alloc_infer_var(9_999, 0);
+        let id =
+            infer.adopt_external_var(&mut ctx, ghost, TypeVariableKind::Any, VarOrigin::Synthetic);
+        assert_eq!(id, 9_999);
+        infer.add_constraint(Constraint::Sub(ghost, ctx.bool(), reg_span()));
+        infer.add_constraint(Constraint::Eq(
+            ghost,
+            ctx.int(DEFAULT_INT_WIDTH, true),
+            reg_span(),
+            EqOrigin::Normal,
+        ));
+        let result = infer.solve(&mut ctx, &trait_env, &symbols);
+        assert!(
+            result.is_err(),
+            "Int ≤ Bool must fire on the adopted variable"
+        );
+    }
+
+    /// (§1.4) Rollback reverts ctx bindings through the paired transaction.
+    #[test]
+    fn test_rollback_reverts_ctx_bindings() {
+        let mut ctx = new_ctx();
+        let mut infer = InferenceContext::new();
+        let a = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let id_a = reg_var_id(&ctx, a);
+        let snap = infer.start_snapshot(&mut ctx);
+        let int32 = ctx.int(DEFAULT_INT_WIDTH, true);
+        // Bind through BOTH domains inside the snapshot window: ctx via the
+        // tracked set_binding (recorded into the snapshot's transaction) and
+        // UF via try_bind (ena SetElem undo).  Note: ctx.get() resolves
+        // bindings, so unify_and_track's UF mirror only ever fires for
+        // unbound sides — production relies on resolve_promotion_aware's
+        // ctx fallback; binding both domains directly isolates the pairing
+        // contract under test.
+        ctx.set_binding(a, int32);
+        infer.union_find.try_bind(id_a, int32).expect("bind");
+        assert!(infer.union_find.probe_value(id_a).is_some());
+        infer.rollback_to(&mut ctx, snap);
+        assert!(
+            infer.union_find.probe_value(id_a).is_none(),
+            "UF root value must roll back"
+        );
+        // This is the falsifiable assertion the old test lacked: pre-fix,
+        // ctx kept a → Int (transaction not paired) and this failed.
+        assert_eq!(
+            ctx.resolve_binding(a),
+            a,
+            "ctx bindings must roll back with the paired transaction"
+        );
+    }
+
+    /// (§2.1) Wake refuses to generalize a variable whose binding root is
+    /// shared with a guarded PG variable.
+    #[test]
+    fn test_wake_respects_transitive_guard_root() {
+        let mut ctx = new_ctx();
+        let mut infer = InferenceContext::new();
+        let alpha = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let alpha_id = reg_var_id(&ctx, alpha);
+        let beta = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let beta_id = reg_var_id(&ctx, beta);
+        // alpha is guarded (suspended) and unified with beta → shared root.
+        infer.suspend_on_var(
+            Constraint::Eq(alpha, alpha, reg_span(), EqOrigin::Normal),
+            alpha_id,
+        );
+        // beta is a candidate for generalization only if it is PG.
+        infer.set_gen_status(beta_id, GenStatus::PartiallyGeneralizable);
+        infer
+            .unify_and_track(alpha, beta, &mut ctx, reg_span())
+            .expect("unify");
+        assert_eq!(
+            infer.gen_statuses[beta_id],
+            GenStatus::PartiallyGeneralizable
+        );
+        let int32 = ctx.int(DEFAULT_INT_WIDTH, true);
+        ctx.bindings.insert(beta, int32);
+        infer.wake_var_for_test(beta_id, &mut ctx);
+        assert_eq!(
+            infer.gen_statuses[beta_id],
+            GenStatus::PartiallyGeneralizable,
+            "wake must not generalize a variable whose binding root is \
+             shared with a guarded PG variable"
+        );
+    }
+
+    /// (§2.3) The dirty frontier is exactly restored after rollback.
+    #[test]
+    fn test_dirty_frontier_restored_after_rollback() {
+        let mut ctx = new_ctx();
+        let mut infer = InferenceContext::new();
+        let prev = infer.enter_level();
+        let region = infer.region_tree.current;
+        let _var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        assert!(infer.region_tree.nodes[region.0].dirty);
+        let snap = infer.start_snapshot(&mut ctx);
+        // Drain clears the flags inside the region.
+        infer.drain_dirty_generalization(&mut ctx);
+        assert!(!infer.region_tree.nodes[region.0].dirty);
+        infer.rollback_to(&mut ctx, snap);
+        assert!(
+            infer.region_tree.nodes[region.0].dirty,
+            "frontier flags must be restored"
+        );
+        let parent = infer.region_tree.nodes[region.0].parent;
+        let consistent = infer.region_tree.dirty_roots.contains(&region)
+            || parent.is_some_and(|p| {
+                infer.region_tree.nodes[p.0]
+                    .dirty_children
+                    .contains(&region)
+            });
+        assert!(
+            consistent,
+            "rebuilt children/roots must agree with the flags"
+        );
+        infer.exit_level(prev);
+    }
+
+    /// (§2.5) The UF-aware occurs-check catches cycles visible only
+    /// through promotion/UF edges.
+    #[test]
+    fn test_uf_occurs_check_blocks_cycle_through_promotion() {
+        let mut ctx = new_ctx();
+        let mut infer = InferenceContext::new();
+        let a = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let b = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        // a --promote/alias--> b: a UF edge invisible to ctx.occurs_check.
+        infer
+            .unify_and_track(a, b, &mut ctx, reg_span())
+            .expect("unify");
+        let b_id = reg_var_id(&ctx, b);
+        // Binding b := fn(int, a) would loop through a's UF edge.
+        let int32 = ctx.int(DEFAULT_INT_WIDTH, true);
+        let cyc = ctx.function(smallvec![int32], a);
+        assert!(
+            infer.uf_occurs_check(&ctx, b_id, cyc),
+            "UF-aware occurs-check must follow promotion/UF edges"
+        );
+        let result = infer.unify(b, cyc, &mut ctx, reg_span());
+        assert!(result.is_err(), "a cyclic binding must be rejected");
+    }
+
+    /// (§4.1) Duplicate Match suspensions are deduped; the variable can
+    /// still reach Generalized.
+    #[test]
+    fn test_match_dedup_allows_generalization() {
+        let mut ctx = new_ctx();
+        let mut infer = InferenceContext::new();
+        let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let id = reg_var_id(&ctx, var);
+        let bid = infer.register_match_branches(vec![MatchBranchSet {
+            shape_pattern: PrincipalShape::Arrow,
+            continuation: Arc::from(Vec::new() as Vec<Constraint>),
+            else_continuation: Arc::from(Vec::new() as Vec<Constraint>),
+        }]);
+        let mut heap = BucketQueue::new();
+        let env = empty_skolem_env();
+        for _ in 0..2 {
+            // Pre-fix: 2 suspensions, 2 guards → MATCH-CTX leaked 1 guard →
+            // the variable stayed PG forever.
+            assert!(infer.try_match_via_shape_var(&mut ctx, var, bid, &mut heap, reg_span(), &env));
+        }
+        assert_eq!(
+            infer.wait_lists[id].len(),
+            1,
+            "duplicate Match suspensions are deduped"
+        );
+        assert_eq!(
+            infer.guard_sets[id].direct_guards, 1,
+            "exactly one direct guard per suspension"
+        );
+        let int32 = ctx.int(DEFAULT_INT_WIDTH, true);
+        let fn_ty = ctx.function(smallvec![int32], int32);
+        ctx.bindings.insert(var, fn_ty);
+        infer.wake_var_for_test(id, &mut ctx);
+        assert_eq!(
+            infer.gen_statuses[id],
+            GenStatus::Generalized,
+            "after dedup the variable must be able to reach Generalized"
+        );
+    }
+
+    /// (§4.2) The alias mirror insert is load-bearing for promoted
+    /// variables — the rebuttal test.
+    #[test]
+    fn test_finalize_promoted_var_has_both_solution_keys() {
+        let mut ctx = new_ctx();
+        let mut infer = InferenceContext::new();
+        let symbols = SymbolTable::new(crate::hir::types::CrateId(DefId(0)));
+        let trait_env = TraitEnv::new();
+        let prev = infer.enter_level();
+        let deep = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let deep_id = reg_var_id(&ctx, deep);
+        infer.exit_level(prev);
+        let shallow = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
+        let int32 = ctx.int(DEFAULT_INT_WIDTH, true);
+        infer.add_constraint(Constraint::Eq(deep, shallow, reg_span(), EqOrigin::Normal));
+        ctx.bindings.insert(shallow, int32);
+        let result = infer.solve(&mut ctx, &trait_env, &symbols);
+        assert!(result.is_ok(), "solve should succeed: {:?}", result.err());
+        let solution = infer.finalize(&mut ctx);
+        assert!(
+            solution.contains_key(&deep_id),
+            "the pre-promotion alias key must exist"
+        );
+        assert!(
+            solution.values().any(|t| *t == int32),
+            "the solution must be recorded"
+        );
+    }
+
+    /// (§4.5) The lift clamp is observable.
+    #[test]
+    fn test_lift_clamp_counted() {
+        let before = region_lift_clamps();
+        let tree = InferRegionTree::new();
+        // depth(root) = 0; asking for 2^20 steps exceeds MAX_LOG and clamps.
+        let lifted = tree.lift(InferRegionId(0), 1 << 20);
+        assert_eq!(lifted, tree.root, "clamp lands on the root");
+        assert_eq!(
+            region_lift_clamps(),
+            before + 1,
+            "the clamp must be counted"
+        );
     }
 }

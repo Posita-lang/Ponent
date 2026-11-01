@@ -1,8 +1,8 @@
 //! User-friendly token display for diagnostics.
 
 use super::literal::{
-    parse_byte_char_literal, parse_byte_string_literal, parse_char_literal,
-    parse_float_literal, parse_int_literal, parse_string_literal,
+    parse_byte_char_literal, parse_byte_string_literal, parse_char_literal, parse_float_literal,
+    parse_int_literal, parse_string_literal,
 };
 use super::token::Token;
 use std::borrow::Cow;
@@ -17,10 +17,16 @@ impl<'src> Token<'src> {
             // the re-parse cost is bounded by diagnostics, not lexing,
             // and the rendered strings are byte-identical to the eager
             // design (including every error message).
-            Token::IntLiteral(s) => match parse_int_literal(s, 10, "integer literal overflow") {
-                Ok(n) => Cow::Owned(format!("the number `{}`", n)),
-                Err(e) => Cow::Owned(format!("invalid integer literal: {}", e)),
-            },
+            Token::IntLiteral(s) => {
+                // Cold diagnostic path: a scratch arena just for the
+                // (rare) `IntLit::Large` allocation; the small path
+                // allocates nothing.
+                let bump = bumpalo::Bump::new();
+                match parse_int_literal(&bump, s, 10, "integer literal overflow") {
+                    Ok(n) => Cow::Owned(format!("the number `{}`", n)),
+                    Err(e) => Cow::Owned(format!("invalid integer literal: {}", e)),
+                }
+            }
             Token::FloatLiteral(s) => match parse_float_literal(s) {
                 Ok(n) => Cow::Owned(format!("the number `{}`", n)),
                 Err(e) => Cow::Owned(format!("invalid float literal: {}", e)),
@@ -174,14 +180,20 @@ impl<'src> Token<'src> {
             Token::UIntSuffix(_) => "unsigned integer with suffix".into(),
             Token::BinUIntSuffix(_) => "binary unsigned integer with suffix".into(),
             Token::HexUIntSuffix(_) => "hex unsigned integer with suffix".into(),
-            Token::BinLiteral(s) => match parse_int_literal(&s[2..], 2, "binary literal overflow") {
-                Ok(n) => Cow::Owned(format!("the number `{}`", n)),
-                Err(e) => Cow::Owned(format!("invalid binary literal: {}", e)),
-            },
-            Token::HexLiteral(s) => match parse_int_literal(&s[2..], 16, "hex literal overflow") {
-                Ok(n) => Cow::Owned(format!("the number `{}`", n)),
-                Err(e) => Cow::Owned(format!("invalid hex literal: {}", e)),
-            },
+            Token::BinLiteral(s) => {
+                let bump = bumpalo::Bump::new();
+                match parse_int_literal(&bump, &s[2..], 2, "binary literal overflow") {
+                    Ok(n) => Cow::Owned(format!("the number `{}`", n)),
+                    Err(e) => Cow::Owned(format!("invalid binary literal: {}", e)),
+                }
+            }
+            Token::HexLiteral(s) => {
+                let bump = bumpalo::Bump::new();
+                match parse_int_literal(&bump, &s[2..], 16, "hex literal overflow") {
+                    Ok(n) => Cow::Owned(format!("the number `{}`", n)),
+                    Err(e) => Cow::Owned(format!("invalid hex literal: {}", e)),
+                }
+            }
             Token::Deprecated => "`deprecated`".into(),
             Token::Experimental => "`experimental`".into(),
             Token::Endian => "`endian`".into(),

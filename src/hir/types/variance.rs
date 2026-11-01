@@ -164,10 +164,39 @@ impl<'input> TypeContext<'input> {
                 });
                 edges
             }
-            TypeData::Adt { args, .. } => args
-                .iter()
-                .map(|&a| VarianceEdge { target: a, sign: 0 }) // invariant — nominal types have invariant params
-                .collect(),
+            TypeData::Adt { def_id, args, .. } => {
+                // Per-slot ADT variance, derived from the
+                // registered AdtDef fields (field→slot convention of
+                // `adt_field_is_copy`: GenericParam{i} marks arg slot i),
+                // composed with Variance::xform exactly as the
+                // unify/subtype consumers define it (Fn params
+                // contravariant, *mut/&mut/Ptr-mut invariant, everything
+                // else covariant).  A slot's sign is the AGREE over ALL
+                // paths from the ADT surface to GenericParam{slot}: all
+                // +1 ⇒ +1, all −1 ⇒ −1, anything else ⇒ 0.  A path
+                // re-entering a def already on the derivation stack
+                // contributes 0 (cycle-conservative): self-referential
+                // ADTs (List/Tree) land invariant — the path-aggregation
+                // approach loses them,
+                // matching the former uniform-invariant status quo with
+                // NO regression; the rustc-style fixpoint (the
+                // `variances` pass) is the follow-up that would recover
+                // them.
+                // Non-recursive wrappers — Option/Vec/Result, the
+                // dominant parametric shapes — derive exactly.  An
+                // UNREGISTERED def also lands all-invariant (fail-closed
+                // = the former behavior).  The variance_edges cache
+                // inherits the registration-order caveat: register_adt
+                // must precede the first edge computation for the type.
+                let mut stack: Vec<DefId> = Vec::new();
+                let mut memo: HashMap<(DefId, usize), isize> = HashMap::default();
+                let mut edges: Vec<VarianceEdge> = Vec::with_capacity(args.len());
+                for (j, &a) in args.iter().enumerate() {
+                    let sign = self.derive_adt_slot_sign(*def_id, j, &mut stack, &mut memo);
+                    edges.push(VarianceEdge { target: a, sign });
+                }
+                edges
+            }
             TypeData::Tuple { elems } => elems
                 .iter()
                 .map(|&e| VarianceEdge { target: e, sign: 1 })
@@ -178,23 +207,44 @@ impl<'input> TypeContext<'input> {
                     sign: 1,
                 }]
             }
-            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+            TypeData::Ref { ty, .. } => {
+                // &T/&mut T: invariant in T (the borrow checker owns
+                // the region distinction, variance stays strict).
                 vec![VarianceEdge {
                     target: *ty,
                     sign: 0,
                 }]
             }
-            TypeData::Ptr { size, pointee, .. } => {
-                let mut edges = vec![VarianceEdge {
-                    target: *pointee,
-                    sign: 0,
-                }];
-                // size must also be traversed — it may carry GenericParam/SkolemVar
-                edges.push(VarianceEdge {
-                    target: *size,
-                    sign: 0,
-                });
-                edges
+            TypeData::Pointer { ty, mutable, .. } => {
+                // §2.4: *const T is covariant in T; *mut T is INVARIANT
+                // in T.  Never fall through to a generic covariant walk —
+                // that misalignment is the G-class layer mismatch
+                // (κ vs polar_action).
+                vec![VarianceEdge {
+                    target: *ty,
+                    sign: if *mutable { 0 } else { 1 },
+                }]
+            }
+            TypeData::Ptr {
+                size,
+                pointee,
+                mutable,
+                ..
+            } => {
+                // §2.4: the size axis (the pointer's own width) is
+                // invariant; pointee follows mutability.
+                vec![
+                    VarianceEdge {
+                        target: *pointee,
+                        sign: if *mutable { 0 } else { 1 },
+                    },
+                    // size must also be traversed — it may carry
+                    // GenericParam/SkolemVar.
+                    VarianceEdge {
+                        target: *size,
+                        sign: 0,
+                    },
+                ]
             }
             TypeData::Forall { body, .. }
             | TypeData::Exists { base: body, .. }
@@ -218,6 +268,173 @@ impl<'input> TypeContext<'input> {
             }
             // Leaves: no edges (GenericParam, primitives, etc.)
             _ => Vec::new(),
+        }
+    }
+
+    /// The per-slot variance sign of a registered ADT —
+    /// agree over ALL field paths from the def's surface to
+    /// `GenericParam{slot}` (all +1 ⇒ +1, all −1 ⇒ −1, anything else ⇒
+    /// 0).  Unregistered def ⇒ 0 (fail-closed = the former
+    /// uniform-invariant behavior).  `stack` holds the defs currently on
+    /// the derivation path; `memo` caches (def_id, slot) within one
+    /// derive call.
+    fn derive_adt_slot_sign(
+        &self,
+        def_id: DefId,
+        slot: usize,
+        stack: &mut Vec<DefId>,
+        memo: &mut HashMap<(DefId, usize), isize>,
+    ) -> isize {
+        // Cycle-conservative: a def re-entering its own derivation
+        // contributes 0 — self-referential ADTs land invariant (a
+        // fixpoint derive would lift this).
+        if stack.contains(&def_id) {
+            return 0;
+        }
+        if let Some(&s) = memo.get(&(def_id, slot)) {
+            return s;
+        }
+        let Some(def) = self.interner.adt_defs.read().get(&def_id).cloned() else {
+            return 0;
+        };
+        stack.push(def_id);
+        let mut paths: Vec<isize> = Vec::new();
+        for &f in &def.fields {
+            self.adt_field_paths(f, slot, Variance::Covariant, &mut paths, stack, memo);
+        }
+        stack.pop();
+        let sign = if !paths.is_empty() && paths.iter().all(|&s| s == 1) {
+            1
+        } else if !paths.is_empty() && paths.iter().all(|&s| s == -1) {
+            -1
+        } else {
+            0
+        };
+        memo.insert((def_id, slot), sign);
+        sign
+    }
+
+    /// Collect the composed signs of every path from `ty` down to
+    /// `GenericParam{slot}`, threading the position variance with
+    /// `Variance::xform` exactly as the unify/subtype consumers define
+    /// it.  A path reaching a def already on the derivation stack
+    /// contributes 0 and stops (cycle-conservative).
+    fn adt_field_paths(
+        &self,
+        ty: TypeId,
+        slot: usize,
+        pol: Variance,
+        out: &mut Vec<isize>,
+        stack: &mut Vec<DefId>,
+        memo: &mut HashMap<(DefId, usize), isize>,
+    ) {
+        let sign_of = |v: Variance| match v {
+            Variance::Covariant => 1,
+            Variance::Contravariant => -1,
+            Variance::Invariant => 0,
+        };
+        match self.get(ty) {
+            TypeData::GenericParam { index, .. } if *index == slot => {
+                out.push(sign_of(pol));
+            }
+            TypeData::GenericParam { .. } => {}
+            TypeData::Fn { params, ret } => {
+                self.adt_field_paths(*ret, slot, pol.xform(Variance::Covariant), out, stack, memo);
+                for &p in params {
+                    self.adt_field_paths(
+                        p,
+                        slot,
+                        pol.xform(Variance::Contravariant),
+                        out,
+                        stack,
+                        memo,
+                    );
+                }
+            }
+            // §2.4 conventions, same as polar_action/κ: &T/&mut T
+            // invariant, *const covariant, *mut invariant, Ptr-mut
+            // invariant pointee + invariant size axis.
+            TypeData::Ref { ty: t, .. } => {
+                self.adt_field_paths(*t, slot, pol.xform(Variance::Invariant), out, stack, memo)
+            }
+            TypeData::Pointer { ty: t, mutable, .. } => {
+                let v = if *mutable {
+                    Variance::Invariant
+                } else {
+                    Variance::Covariant
+                };
+                self.adt_field_paths(*t, slot, pol.xform(v), out, stack, memo)
+            }
+            TypeData::Ptr {
+                size,
+                pointee,
+                mutable,
+                ..
+            } => {
+                let v = if *mutable {
+                    Variance::Invariant
+                } else {
+                    Variance::Covariant
+                };
+                self.adt_field_paths(*pointee, slot, pol.xform(v), out, stack, memo);
+                self.adt_field_paths(
+                    *size,
+                    slot,
+                    pol.xform(Variance::Invariant),
+                    out,
+                    stack,
+                    memo,
+                );
+            }
+            TypeData::Tuple { elems }
+            | TypeData::Coproduct {
+                alternatives: elems,
+            } => {
+                for &e in elems {
+                    self.adt_field_paths(e, slot, pol.xform(Variance::Covariant), out, stack, memo);
+                }
+            }
+            TypeData::Array { elem, .. } | TypeData::Slice { elem } => self.adt_field_paths(
+                *elem,
+                slot,
+                pol.xform(Variance::Covariant),
+                out,
+                stack,
+                memo,
+            ),
+            TypeData::Adt { def_id, args, .. } => {
+                if stack.contains(def_id) {
+                    // Re-entering a def on the derivation path: the
+                    // occurrence variance is unknowable without a
+                    // fixpoint derive ⇒ 0.
+                    out.push(0);
+                    return;
+                }
+                for (j, &a) in args.iter().enumerate() {
+                    let s = self.derive_adt_slot_sign(*def_id, j, stack, memo);
+                    let v = match s {
+                        1 => Variance::Covariant,
+                        -1 => Variance::Contravariant,
+                        _ => Variance::Invariant,
+                    };
+                    self.adt_field_paths(a, slot, pol.xform(v), out, stack, memo);
+                }
+            }
+            // Binder bodies are covariant in their single child; other
+            // leaves terminate the path.
+            TypeData::Forall { body, .. }
+            | TypeData::Exists { base: body, .. }
+            | TypeData::Mu { body, .. }
+            | TypeData::Nu { body, .. }
+            | TypeData::Poly { body, .. } => self.adt_field_paths(
+                *body,
+                slot,
+                pol.xform(Variance::Covariant),
+                out,
+                stack,
+                memo,
+            ),
+            _ => {}
         }
     }
 
@@ -277,7 +494,7 @@ impl<'input> TypeContext<'input> {
             TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
                 self.type_contains_free_param(param, *elem, scope)
             }
-            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
                 self.type_contains_free_param(param, *ty, scope)
             }
             TypeData::Ptr { size, pointee, .. } => {
@@ -287,6 +504,14 @@ impl<'input> TypeContext<'input> {
             TypeData::AssociatedType { self_ty, .. } => {
                 self.type_contains_free_param(param, *self_ty, scope)
             }
+            // A revealed Opaque's hidden type participates in the scan
+            // (aligned with `visit_type_children`) — a param living only
+            // inside a revealed TAIT hidden type must be seen, otherwise
+            // `replace_generic`'s early-return guard lets stale free
+            // params survive instantiation.  `hidden: None` is a leaf.
+            TypeData::Opaque {
+                hidden: Some(h), ..
+            } => self.type_contains_free_param(param, *h, scope),
             TypeData::Forall { body, .. }
             | TypeData::Exists { base: body, .. }
             | TypeData::Mu { body, .. }

@@ -85,10 +85,22 @@ pub(crate) enum LoopInstr {
 /// Apply a `Cond` as a DBM guard (octagonal fragment only).
 /// Returns the guarded DBM, or the original DBM if the condition
 /// is outside the octagonal fragment (sound over-approximation).
+/// Clone `dbm` and close the copy: the guard functions' fall-through arms
+/// hand an UNMODIFIED matrix onward (into `If`'s join, whose
+/// closed-operand precondition is a debug tripwire) — when `dbm` is a
+/// widening-phase step input it may be deliberately unclosed. Sound
+/// regardless — the pointwise-max domain contains both operands — but
+/// closing the copy keeps the closure invariant honest.
+fn clone_closed(dbm: &Dbm) -> Dbm {
+    let mut c = dbm.clone();
+    let _ = c.close();
+    c
+}
+
 fn apply_cond_as_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
     use crate::hir::loop_ir::{CmpOp, Cond, ScalarExpr};
     match cond {
-        Cond::True => dbm.clone(),
+        Cond::True => clone_closed(dbm),
         Cond::False => Dbm::bottom(),
         Cond::Cmp { op, lhs, rhs, .. } => {
             // Only handle Var-vs-Const and Var-vs-Var (the shapes
@@ -104,7 +116,7 @@ fn apply_cond_as_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
                         CmpOp::Ge => dbm.test_ge_var(*i, c),
                         CmpOp::Gt => dbm.test_ge_var(*i, c.saturating_add(1)),
                         CmpOp::Eq => dbm.test_var_eq(*i, c),
-                        CmpOp::Neq => dbm.clone(), // non-convex, skip
+                        CmpOp::Neq => clone_closed(dbm), // non-convex, skip
                     }
                 }
                 (ScalarExpr::Var(i), ScalarExpr::Var(j)) => {
@@ -115,10 +127,10 @@ fn apply_cond_as_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
                         CmpOp::Ge => dbm.test_diff_le(*j, *i, 0),
                         CmpOp::Gt => dbm.test_diff_le(*j, *i, -1),
                         CmpOp::Eq => dbm.test_diff_eq(*i, *j, 0),
-                        CmpOp::Neq => dbm.clone(),
+                        CmpOp::Neq => clone_closed(dbm),
                     }
                 }
-                _ => dbm.clone(), // outside fragment
+                _ => clone_closed(dbm), // outside fragment
             }
         }
         Cond::And(a, b) => {
@@ -152,7 +164,7 @@ fn apply_negated_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
     use crate::hir::loop_ir::{CmpOp, Cond, ScalarExpr};
     match cond {
         Cond::True => Dbm::bottom(),
-        Cond::False => dbm.clone(),
+        Cond::False => clone_closed(dbm),
         Cond::Cmp { op, lhs, rhs, .. } => {
             match (lhs.as_ref(), rhs.as_ref()) {
                 (ScalarExpr::Var(i), ScalarExpr::Const(c)) => {
@@ -165,7 +177,7 @@ fn apply_negated_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
                         CmpOp::Lt => dbm.guard_not_le_var(*i, c.saturating_sub(1)),
                         CmpOp::Ge => dbm.guard_not_ge_var(*i, c),
                         CmpOp::Gt => dbm.guard_not_ge_var(*i, c.saturating_add(1)),
-                        CmpOp::Eq => dbm.clone(), // ¬(X=c) is non-convex
+                        CmpOp::Eq => clone_closed(dbm), // ¬(X=c) is non-convex
                         // ¬(X ≠ c) ⟺ X = c — exact, and now reachable
                         // since hir_cond_to_cond emits Neq conds.
                         CmpOp::Neq => dbm.test_var_eq(*i, c),
@@ -178,9 +190,9 @@ fn apply_negated_guard(dbm: &Dbm, cond: &crate::hir::loop_ir::Cond) -> Dbm {
                     CmpOp::Gt => dbm.guard_not_diff_le(*j, *i, -1),
                     // ¬(i ≠ j) ⟺ i = j — exact.
                     CmpOp::Neq => dbm.test_diff_eq(*i, *j, 0),
-                    _ => dbm.clone(),
+                    _ => clone_closed(dbm),
                 },
-                _ => dbm.clone(),
+                _ => clone_closed(dbm),
             }
         }
         // De Morgan: ¬(a∧b) = ¬a∨¬b; ¬(a∨b) = ¬a∧¬b
@@ -259,9 +271,20 @@ fn apply_loop_instr(
 /// Fuse adjacent `LoopInstr`s that can be combined to
 /// reduce the number of transfer steps in the fixpoint iteration.
 ///
-/// Currently only merges consecutive `AddVar` on the same variable:
+/// Currently only merges consecutive same-variant adds on the same
+/// variable:
 /// AddVar(i, c1); AddVar(i, c2) → AddVar(i, c1 + c2)
-/// This is a conservative, semantics‑preserving transformation.
+/// AddWrap(i, c1); AddWrap(i, c2) → AddWrap(i, c1 + c2)
+///
+/// CROSS-VARIANT fusion is UNSOUND and must not be done: `AddVar` models
+/// an unbounded mathematical shift, `AddWrap` a shift clamped to the type
+/// range (the wrap residue). A fused `AddVar(i, c1+c2)` after an `AddWrap`
+/// drops the clamp, so the modeled transition excludes the true
+/// wrap-residue successors (model-post ⊉ true-post breaks the fixpoint's
+/// soundness argument); the reverse fusion mis-models the intermediate
+/// state. Same-variant fusion is exact: `AddVar`+`AddVar` is ordinary
+/// addition; two `AddWrap` results are congruent mod the type span and
+/// both lie in `[lo, hi]`, hence equal.
 ///
 /// Other fusion opportunities (e.g. CopyVar chains) are left for future work.
 fn fuse_adjacent_instrs(instrs: &[LoopInstr]) -> Vec<LoopInstr> {
@@ -269,30 +292,35 @@ fn fuse_adjacent_instrs(instrs: &[LoopInstr]) -> Vec<LoopInstr> {
     let mut iter = instrs.iter().peekable();
     while let Some(instr) = iter.next() {
         match instr {
-            LoopInstr::AddVar(i, c) | LoopInstr::AddWrap(i, c) => {
-                let is_wrap = matches!(instr, LoopInstr::AddWrap(..));
+            LoopInstr::AddVar(i, c) => {
                 let mut sum = *c;
                 let mut dead = false;
                 while let Some(next) = iter.peek() {
                     match next {
-                        LoopInstr::AddVar(j, d) | LoopInstr::AddWrap(j, d) if *i == *j => {
-                            match sum.checked_add(*d) {
-                                Some(s) => {
-                                    sum = s;
-                                    iter.next();
-                                }
-                                None => {
-                                    iter.next();
-                                    if is_wrap {
-                                        fused.push(LoopInstr::AddWrap(*i, sum));
-                                    } else {
-                                        fused.push(LoopInstr::AddVar(*i, sum));
-                                    }
-                                    sum = *d;
-                                }
+                        // Fold ONLY same-variant adds: AddVar (mathematical
+                        // shift) and AddWrap (clamp to the type range) do not
+                        // compose into either single fused shift — the wrap
+                        // residue differs by the type span, so cross-variant
+                        // fusion stops the transfer from over-approximating
+                        // the composed semantics.
+                        LoopInstr::AddVar(j, d) if *i == *j => match sum.checked_add(*d) {
+                            Some(s) => {
+                                sum = s;
+                                iter.next();
                             }
-                        }
-                        LoopInstr::ConstVar(j, _) | LoopInstr::CopyVar(j, _) if *i == *j => {
+                            None => {
+                                iter.next();
+                                fused.push(LoopInstr::AddVar(*i, sum));
+                                sum = *d;
+                            }
+                        },
+                        // Everything that overwrites i kills the pending add.
+                        LoopInstr::ConstVar(j, _)
+                        | LoopInstr::CopyVar(j, _)
+                        | LoopInstr::AddSat(j, _)
+                        | LoopInstr::CopyAddVar(j, _, _)
+                            if *i == *j =>
+                        {
                             dead = true;
                             break;
                         }
@@ -300,11 +328,39 @@ fn fuse_adjacent_instrs(instrs: &[LoopInstr]) -> Vec<LoopInstr> {
                     }
                 }
                 if !dead {
-                    if is_wrap {
-                        fused.push(LoopInstr::AddWrap(*i, sum));
-                    } else {
-                        fused.push(LoopInstr::AddVar(*i, sum));
+                    fused.push(LoopInstr::AddVar(*i, sum));
+                }
+            }
+            LoopInstr::AddWrap(i, c) => {
+                let mut sum = *c;
+                let mut dead = false;
+                while let Some(next) = iter.peek() {
+                    match next {
+                        LoopInstr::AddWrap(j, d) if *i == *j => match sum.checked_add(*d) {
+                            Some(s) => {
+                                sum = s;
+                                iter.next();
+                            }
+                            None => {
+                                iter.next();
+                                fused.push(LoopInstr::AddWrap(*i, sum));
+                                sum = *d;
+                            }
+                        },
+                        LoopInstr::ConstVar(j, _)
+                        | LoopInstr::CopyVar(j, _)
+                        | LoopInstr::AddSat(j, _)
+                        | LoopInstr::CopyAddVar(j, _, _)
+                            if *i == *j =>
+                        {
+                            dead = true;
+                            break;
+                        }
+                        _ => break,
                     }
+                }
+                if !dead {
+                    fused.push(LoopInstr::AddWrap(*i, sum));
                 }
             }
             _ => fused.push(instr.clone()),
@@ -419,12 +475,13 @@ pub(crate) fn infer_loop_invariant_exprs<'a>(
 
     // Auto-size the budget ([Miné06]): plain widening converges within
     // size²+1 iterations (each cell rises monotonically through a chain
-    // of at most size² distinct values); threshold widening multiplies
-    // that by the threshold-set size, so the caller-supplied budget is
-    // only ever a MINIMUM — exhaustion now returns None (no hints) only
-    // for genuinely non-converging transfers, not because a magic number
-    // (100) ran out on a larger system.
-    let max_iter = max_iter.max(m.size * m.size + 8);
+    // of at most size² distinct values); threshold widening can need one
+    // extra iteration PER THRESHOLD per edge, so the budget is scaled by
+    // the largest per-edge threshold set. Exhaustion still returns None
+    // (no hints) — the multiplication just makes that mean "genuinely
+    // non-converging transfers" rather than "a magic number ran out".
+    let th_max = th.per_edge.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    let max_iter = max_iter.max(m.size * m.size + 8).saturating_mul(th_max);
 
     let Some(mut fp) = dbm_fixpoint(&m, &step, max_iter, widen_after, &th) else {
         return Vec::new();
@@ -480,6 +537,23 @@ fn collect_thresholds(ins: &LoopInstr, out: &mut Vec<i128>) {
 ///
 /// `None` when no decreasing measure is recognized (fail-closed — the
 /// caller then keeps the explicit `decreases` requirement).
+/// Whether any instruction in `instrs` (recursively through `If` arms)
+/// writes variable `v` — used to require the `decreases` reference
+/// bound to be loop-invariant (a body like `while i < j { i += 1;
+/// j += 1 }` must not yield the non-decreasing measure `j - i`).
+fn writes_var(instrs: &[LoopInstr], v: usize) -> bool {
+    instrs.iter().any(|ins| match ins {
+        LoopInstr::AddVar(i, _)
+        | LoopInstr::AddWrap(i, _)
+        | LoopInstr::AddSat(i, _)
+        | LoopInstr::ConstVar(i, _)
+        | LoopInstr::CopyVar(i, _)
+        | LoopInstr::CopyAddVar(i, _, _) => *i == v,
+        LoopInstr::TestLe(..) | LoopInstr::TestGe(..) | LoopInstr::TestDiffLe(..) => false,
+        LoopInstr::If(_, t, e) => writes_var(t, v) || writes_var(e, v),
+    })
+}
+
 pub(crate) fn infer_loop_decreases_expr<'a>(
     arena: &'a crate::arena::SyncArena<'a>,
     vars: &[Symbol],
@@ -498,11 +572,13 @@ pub(crate) fn infer_loop_decreases_expr<'a>(
             // `i <= j` (`TestDiffLe(i, j, 0)`) and `i < j` (`TestDiffLe(i, j,
             // -1)`, translated as `i - j <= -1`) both give the decreasing
             // measure `j - i`: the measure is ≥ 1 (resp. ≥ 0) while the
-            // guard holds and strictly decreases by `c` each iteration.
-            LoopInstr::TestDiffLe(j, k, _) if *j == i => arena.alloc(crate::ast::Expr::Ident(
-                vars[*k],
-                crate::ast::Span::new(FileId::DUMMY, 0, 0),
-            )),
+            // guard holds and strictly decreases by `c` each iteration —
+            // but only while `j` is LOOP-INVARIANT, so a body that writes
+            // `j` disqualifies the shape (the checker re-verifies the
+            // candidate anyway; this keeps the inference honest).
+            LoopInstr::TestDiffLe(j, k, _) if *j == i && !writes_var(instrs, *k) => arena.alloc(
+                crate::ast::Expr::Ident(vars[*k], crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+            ),
             _ => return None,
         };
         let i_expr = arena.alloc(crate::ast::Expr::Ident(
@@ -672,8 +748,10 @@ pub(crate) fn hir_loop_to_loop_instrs<'input>(
                     (i, Some(j), None)
                 }
                 // Mirror: `j > i +% 0` / `j >= i +% 0` — the wrap is on
-                // the RIGHT operand; the ordered pair is (inner, outer)
-                // so the direction matches the `>`/`>=` arms below.
+                // the RIGHT operand. SOURCE order (lhs = outer, rhs =
+                // inner): the op arms below handle the direction
+                // (`<`/`<=` keep the pair, `>`/`>=` swap), so every
+                // operator is correct for both wrap shapes.
                 (
                     HirExpr::Ident(outer, _, _),
                     HirExpr::BinaryOp {
@@ -693,7 +771,10 @@ pub(crate) fn hir_loop_to_loop_instrs<'input>(
                     if *c != 0 {
                         return None;
                     }
-                    (inner, Some(outer), None)
+                    // Source order (lhs = outer, rhs = inner): the op arms
+                    // below handle the direction (`<`/`<=` keep the pair,
+                    // `>`/`>=` swap).
+                    (outer, Some(inner), None)
                 }
                 _ => return None,
             };
@@ -724,15 +805,15 @@ pub(crate) fn hir_loop_to_loop_instrs<'input>(
                 (crate::ast::BinOp::Le, Some(j), None) => {
                     instrs.push(LoopInstr::TestDiffLe(idx(*i)?, idx(*j)?, 0));
                 }
-                // `j > i` (i.e. `i < j`): the first match already ordered
-                // the pair so the plain `j > i` and the wrap-mirror
-                // `j > i +% 0` both land here with the same encoding as
-                // the `<` arm.
+                // `i > j` ⟺ `j − i ≤ −1` — the pair (i, j) is SOURCE order,
+                // so `>`/`>=` must swap the operands (unlike `<`/`<=`).
+                // This covers the plain `j > i` shape AND the wrap mirrors
+                // `j > i +% 0` / `i > j +% 0`, all with source order (i, j).
                 (crate::ast::BinOp::Gt, Some(j), None) => {
-                    instrs.push(LoopInstr::TestDiffLe(idx(*i)?, idx(*j)?, -1));
+                    instrs.push(LoopInstr::TestDiffLe(idx(*j)?, idx(*i)?, -1));
                 }
                 (crate::ast::BinOp::Ge, Some(j), None) => {
-                    instrs.push(LoopInstr::TestDiffLe(idx(*i)?, idx(*j)?, 0));
+                    instrs.push(LoopInstr::TestDiffLe(idx(*j)?, idx(*i)?, 0));
                 }
                 _ => return None,
             }
@@ -1283,7 +1364,10 @@ pub(crate) fn dbm_to_invariant_exprs<'a>(
         return Vec::new();
     }
     let ident = |s: Symbol| -> &'a crate::ast::Expr<'a> {
-        arena.alloc(crate::ast::Expr::Ident(s, crate::ast::Span::new(FileId::DUMMY, 0, 0)))
+        arena.alloc(crate::ast::Expr::Ident(
+            s,
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
+        ))
     };
     let lit = |c: i128| -> &'a crate::ast::Expr<'a> {
         arena.alloc(crate::ast::Expr::Literal(

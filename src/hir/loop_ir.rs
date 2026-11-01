@@ -322,10 +322,22 @@ pub(crate) fn loop_instrs_to_loop_problem(
                 // (fail-closed), stronger than the branch-refined
                 // `(cond → then_def) ∧ (¬cond → else_def)`.
                 let then_vals = apply_block_with_defs(
-                    &values, then, bit_widths, signed, vars.len(), trap, &mut def_parts,
+                    &values,
+                    then,
+                    bit_widths,
+                    signed,
+                    vars.len(),
+                    trap,
+                    &mut def_parts,
                 )?;
                 let else_vals = apply_block_with_defs(
-                    &values, else_, bit_widths, signed, vars.len(), trap, &mut def_parts,
+                    &values,
+                    else_,
+                    bit_widths,
+                    signed,
+                    vars.len(),
+                    trap,
+                    &mut def_parts,
                 )?;
                 for i in 0..vars.len() {
                     if then_vals[i] != else_vals[i] {
@@ -640,9 +652,8 @@ fn apply_block_with_defs(
             }
             LoopInstr::If(cond, then, else_) => {
                 let cond = fix_signed(cond, signed, vars_len);
-                let then_vals = apply_block_with_defs(
-                    &v, then, bit_widths, signed, vars_len, trap, def_parts,
-                )?;
+                let then_vals =
+                    apply_block_with_defs(&v, then, bit_widths, signed, vars_len, trap, def_parts)?;
                 let else_vals = apply_block_with_defs(
                     &v, else_, bit_widths, signed, vars_len, trap, def_parts,
                 )?;
@@ -1339,10 +1350,7 @@ mod tests {
         };
         assert!(matches!(**down_cond, Cond::Cmp { op: CmpOp::Lt, .. }));
         assert!(matches!(**down_val, ScalarExpr::Const(_)));
-        assert!(matches!(
-            &**add_wrap,
-            ScalarExpr::Add(_, _, ArithSem::Wrap)
-        ));
+        assert!(matches!(&**add_wrap, ScalarExpr::Add(_, _, ArithSem::Wrap)));
     }
 
     /// Regression: `if c { i := 100; i := i + 200 }` on UInt<8> — the second addition
@@ -1385,8 +1393,7 @@ mod tests {
                 // The stale-SSA def is `i ≤ 55` (Var-vs-Const); the correct term is
                 // `Const(100) ≤ Const(55)` (constant-constant, identically false).
                 assert!(
-                    !matches!(**lhs, ScalarExpr::Var(_))
-                        || !matches!(**rhs, ScalarExpr::Const(_)),
+                    !matches!(**lhs, ScalarExpr::Var(_)) || !matches!(**rhs, ScalarExpr::Const(_)),
                     "stale-SSA def `i ≤ 55` must not appear; got {c:?}",
                 );
             }
@@ -1429,9 +1436,15 @@ mod tests {
             .expect("must lower");
         // A def exists (j's AddVar's def), contains no Saturate, and is not the
         // `Cond::False` fallback — the lhs must be the clamp's Ite expansion.
-        let def = problem.back_edges[0].definedness.as_ref().expect("def present");
+        let def = problem.back_edges[0]
+            .definedness
+            .as_ref()
+            .expect("def present");
         assert!(!contains_saturate_expr_in_cond(def));
-        assert!(!matches!(def, Cond::False), "def must not degenerate to Cond::False");
+        assert!(
+            !matches!(def, Cond::False),
+            "def must not degenerate to Cond::False"
+        );
         let mut conjuncts = Vec::new();
         split_and_for_test(def, &mut conjuncts);
         assert!(
@@ -1467,10 +1480,7 @@ mod tests {
         for (name, arm) in [
             (
                 "addwrap",
-                vec![
-                    LoopInstr::AddWrap(0, 100),
-                    LoopInstr::AddVar(0, 200),
-                ],
+                vec![LoopInstr::AddWrap(0, 100), LoopInstr::AddVar(0, 200)],
             ),
             (
                 "copyvar",
@@ -1498,7 +1508,13 @@ mod tests {
                 ),
             ];
             let problem = loop_instrs_to_loop_problem(
-                &vars, &init, &body, &[8, 8], &[false, false], &[], true,
+                &vars,
+                &init,
+                &body,
+                &[8, 8],
+                &[false, false],
+                &[],
+                true,
             )
             .expect("must lower");
             let def = problem.back_edges[0]
@@ -1616,9 +1632,7 @@ mod tests {
     /// Test helper: whether a Cond contains a Saturate expression.
     fn contains_saturate_expr_in_cond(c: &Cond) -> bool {
         match c {
-            Cond::Cmp { lhs, rhs, .. } => {
-                contains_saturate(lhs) || contains_saturate(rhs)
-            }
+            Cond::Cmp { lhs, rhs, .. } => contains_saturate(lhs) || contains_saturate(rhs),
             Cond::And(a, b) | Cond::Or(a, b) => {
                 contains_saturate_expr_in_cond(a) || contains_saturate_expr_in_cond(b)
             }

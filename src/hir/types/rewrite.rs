@@ -19,9 +19,9 @@
 //! tree family small; `τ(E)` (Fig. 5) lowers a simple (P₀) polynomial
 //! tree back to a monomorphic type.
 
-use crate::ast::FileId;
 use super::coherence::{Color, OccNode, OccTree};
 use super::*;
+use crate::ast::FileId;
 
 /// Local occurrence node with a *polynomial* child grammar: unlike
 /// coherence's `OccNode` (children: Vec<Box<OccNode>>, spine-only), a
@@ -77,57 +77,6 @@ pub(crate) fn from_occ(n: OccTree) -> PolyTree {
 }
 
 impl PolyTree {
-    /// Apply the substitution θ: replace every free occurrence of label
-    /// `x` with color `c` by `theta` (a PolySum/PolyProd replacing a
-    /// *leaf* occurrence — θ is only ever applied at leaf positions,
-    /// mirroring Fig. 6 where the X^c terminals are replaced).
-    pub fn subst(&self, x: usize, c: Color, theta: &PolyTree) -> PolyTree {
-        match self {
-            Occ(n) => {
-                // θ on binders of this node: bound variables are renamed
-                // away (α-conversion is implicit — binder indices are
-                // globally unique in our representation).
-                if n.label == x && n.color == c && n.children.is_empty() {
-                    // Leaf occurrence replaced by θ (a •/N node or plain
-                    // subtree); θ is used as-is (its `head` variable has
-                    // been pre-renamed by the caller if needed).
-                    return theta.clone();
-                }
-                let mut n2 = n.clone();
-                for ch in &mut n2.children {
-                    *ch = ch.subst(x, c, theta);
-                }
-                Occ(n2)
-            }
-            PolySum { head, parts, .. } => {
-                let parts2 = parts
-                    .iter()
-                    .map(|(bs, ts)| {
-                        (
-                            bs.clone(),
-                            ts.iter().map(|t| t.subst(x, c, theta)).collect(),
-                        )
-                    })
-                    .collect();
-                PolySum {
-                    head: *head,
-                    parts: parts2,
-                }
-            }
-            PolyProd {
-                head,
-                binders,
-                parts,
-            } => PolyProd {
-                head: *head,
-                binders: binders.clone(),
-                parts: parts.iter().map(|t| t.subst(x, c, theta)).collect(),
-            },
-        }
-    }
-}
-
-impl PolyTree {
     /// Free variables (labels not bound by any binder on the path —
     /// computed structurally: binders stored at a node bind within it).
     pub fn fvs(&self) -> std::collections::HashSet<usize> {
@@ -139,7 +88,26 @@ impl PolyTree {
     fn collect_fvs(&self, out: &mut std::collections::HashSet<usize>) {
         match self {
             Occ(n) => {
-                if !n.binders.contains(&n.label) {
+                // Scope-lifted reduct node: when the LAST child is a Poly
+                // node whose head equals this node's label, or whose head
+                // occurs in an earlier F_l child (residue), the µ/ν from
+                // that Poly scopes over the WHOLE node — the label is not
+                // free, and the F_l residues are bound (removed below).
+                let lifted_head = match n.children.last() {
+                    Some(PolySum { head, .. }) | Some(PolyProd { head, .. }) => {
+                        let h = *head;
+                        let residues = n.children[..n.children.len() - 1].iter().any(|f| {
+                            contains_x_col(f, h, Color::Red) || contains_x_col(f, h, Color::Blue)
+                        });
+                        if h == n.label || residues {
+                            Some(h)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if !lifted_head.is_some() && !n.binders.contains(&n.label) {
                     out.insert(n.label);
                 }
                 for b in &n.binders {
@@ -147,6 +115,9 @@ impl PolyTree {
                 }
                 for c in &n.children {
                     c.collect_fvs(out);
+                }
+                if let Some(h) = lifted_head {
+                    out.remove(&h); // F_l residues are µ/ν-bound
                 }
             }
             PolySum { head, parts, .. } => {
@@ -186,13 +157,67 @@ impl PolyTree {
 // The {µX.}/{νX.} binder appears only in the non-canceling case (X occurs
 // in the substituted bodies).  Fail-closed: unexpected shapes ⇒ None.
 pub fn yoneda_step(tree: &PolyTree, x: usize, c: Color) -> Option<PolyTree> {
+    // GATE READING (text-exhausted; the former gate rationale cited an
+    // "X^c̄-labeled root" that was a misreading of a figure-embedded
+    // fragment). Prop 5.2 verbatim (ar5iv L192-196):
+    //   (a) blue/positive: E as in Fig 6(a) left "for some (D_jk⟨X⟩), (F_l⟨X⟩)
+    //       and blue variable Y (POSSIBLY X ITSELF)" — the site root is ANY
+    //       blue variable, NOT necessarily X;
+    //   (b) red/positive: root = "blue variable Y ≠ X" (derived: h_X = X⁺
+    //       would be non-modular, killing red-eliminability);
+    //   (c)/(d): the negative-tree duals ("switching blue and red everywhere",
+    //       L200) — UNIMPLEMENTED here.
+    // Def 5.3 (L201): the site is "the subtree E of F rooted in r_X" ✓ (our
+    // site choice), and the proof's F_l/G_k split matches collect_sum_branches
+    // / walk_prod verbatim ✓. So the HARVEST is right; the GATE is wrong:
+    // the current `rx.label == x` refutes (a)'s "possibly X itself".
+    // PRECISION (retires the former "fail-closed = sound superset"
+    // slogan, imprecise in BOTH directions). The engine's accepted set is
+    // exactly two families —
+    //   (i) blue at an X̄-headed r_X (= rule (a), Y = X; text ✓, goldens ✓),
+    //   (ii) red at an X̄-headed r_X (NO positive-tree textual match — the
+    //       candidate Fig-6(c)/(d) mechanism; sound ×3:
+    //       red_side_fires_internal_x_labeled_root,
+    //       cancellation_family_reduces_soundly_via_red_rule,
+    //       red_side_quotient_reduces_to_y).
+    // The paper's accepted set is strictly larger (rule (a): blue Y ≠ X;
+    // rule (b): red at blue Y ≠ X) — t1 is pinned engine-refused /
+    // paper-accepted (pinned by fig7b_t1_probe_coherent_but_engine_stuck).
+    // The Y ≠ X refusals are
+    // now PROVABLY forced, not merely figure-pending:
+    //   • red Y ≠ X: keep-root+F_l+θ gives νX.((Y→X)→1) ≅ ∀Y.1 on t1 vs
+    //     truth(t1) = ∅ (the Y := ∅ instance is uninhabitable) ⇒ unsound.
+    //   • blue Y ≠ X: the ∀X.((X→A)→(X→B)→C) family (r_X = the C⁺-
+    //     headed root; rule-(a) LHS match, K = ∅, F_l = both branches)
+    //     DISCRIMINATES the candidate groupings: µ-lift (τ's current form) ⇒
+    //     µX.((X→A)→(X→B)→Σ∅) ≅ 0; substitution (X⁺ := 0) ⇒ ≅ C = truth,
+    //     but 0-leaves are OUTSIDE the Λ2 tree grammar; a K ≥ 1 reading
+    //     of "as in Fig 6(a) left" would make the family LHS-non-matching
+    //     (gate already text-exact). The figure's grouping decision is
+    //     SET-LOAD-BEARING. (The former "conflict" probes dissolved on
+    //     re-derivation: ∀X.(A⇒X)⇒(B⇒X) fires TODAY under family (i),
+    //     sound via µX.(B→A) ≅ B→A; ∀X.(X→X)→Y is X̄-headed ⇒ family (ii),
+    //     not a Y≠X case.)
+    // The absorb shortcut below is the Y = X case and stays correct.
+    let rx = find_binder_node(tree, x)?;
+    let head_ok = match c {
+        Color::Blue => rx.label == x && rx.color == Color::Blue,
+        Color::Red => rx.label == x && rx.color == Color::Red,
+    };
+    if !head_ok {
+        return None;
+    }
     match c {
-        Color::Red => {
-            // (Y⁺): collect Σ-branches from modular X̄ sites.
-            let branches = collect_sum_branches(tree, x)?;
-            if branches.is_empty() {
-                return None; // no X̄ occurrence — X not red-side present
-            }
+        // Fig. 6(a) — X BLUE-eliminable (Def 5.2: every X̄ node modular):
+        // reduct θ(X) = {µX.}Σₖ∃Z⃗ₖ.Πⱼ D_jk[X⁺]; the F_l children of r_X
+        // stay in parameter position, the head slot becomes θ.
+        Color::Blue => {
+            let (f_ctx, branches) = collect_sum_branches(tree, x)?;
+            // Zero branches are text-legal: τ(•) = µX.∃Y⃗.Σ_{k∈K}Π_j τ(E_jk)
+            // (paper L152) quantifies over an arbitrary family K — K=∅ gives
+            // Σ_∅ = 0, and τ lowers PolySum{parts: []} to Never.  (This is
+            // the Thm 5.6 un-stick path for X⁺-only shapes such as
+            // ∀X.(X⇒Y)⇒X ↠ µX.((X⇒Y)⇒0) ≅ ∅.)
             // Always keep the {µX.} binder (non-canceling form).  The
             // canceling elision is βη-redundant (Fig. 4c: µX.A ≡ A when
             // X∉FV(A)), and our shared-set FV computation can leak binder
@@ -203,14 +228,32 @@ pub fn yoneda_step(tree: &PolyTree, x: usize, c: Color) -> Option<PolyTree> {
                 head: x,
                 parts: branches,
             };
-            replace_binder_subtree(tree, x, &theta)
+            splice_reduct(tree, x, &theta, f_ctx, true)
         }
-        Color::Blue => {
-            // (Y⁻): collect Π-factors from modular X⁺ sites.
-            let (binders, parts) = collect_prod_factors(tree, x)?;
-            if parts.is_empty() {
-                return None;
+        // Fig. 6(b) — X RED-eliminable (every X⁺ node modular):
+        // reduct θ(X̄) = {νX.}∀Z⃗ₖ.Πⱼ E_k[X⁻]; the F_l children stay in
+        // parameter position and r_X's OWN head survives (red-eliminable
+        // implies h_X ≠ X⁺, so the head is not absorbed).
+        Color::Red => {
+            let mut f_ctx = Vec::new();
+            let mut binders = Vec::new();
+            let mut parts = Vec::new();
+            for ch in &rx.children {
+                if contains_x_col(ch, x, Color::Blue) {
+                    // X⁺-bearing child: collect its ∀Z⃗ / E_j material.
+                    walk_prod(ch, x, &mut binders, &mut parts, 0)?;
+                } else {
+                    // F_l (red side, paper L199 dual): no X⁺ terminals by
+                    // construction (those took the walk_prod arm above).
+                    // Paper permits F_l⟨X̄⟩ here — its X̄ residues are
+                    // bound by the {νX.} scoping over the WHOLE reduct
+                    // node (τ lifts the scope accordingly).
+                    f_ctx.push(ch.clone());
+                }
             }
+            // Zero factors are text-legal (dual of the blue side): the
+            // N-form Π_{j∈∅} E_j = 1 is the paper's unit constant, and τ
+            // lowers PolyProd{parts: []} to Unit.
             // Symmetric with (Y⁺): always keep the {νX.} binder — the
             // canceling elision is βη-redundant (Fig. 4c) and the FV
             // occurrence test is not trusted (shared-set leak).
@@ -219,49 +262,82 @@ pub fn yoneda_step(tree: &PolyTree, x: usize, c: Color) -> Option<PolyTree> {
                 binders,
                 parts,
             };
-            replace_binder_subtree(tree, x, &theta)
+            splice_reduct(tree, x, &theta, f_ctx, false)
         }
     }
 }
 
-/// Fig. 6 surgery: replace the WHOLE subtree rooted at r_X (the node
-/// whose binder set contains X) with θ — not the leaf terminals.  The
-/// head occurrence X^c at r_X itself is absorbed by θ (its binder or its
-/// elision in the canceling case), which leaf-substitution can never
-/// reach.
-fn replace_binder_subtree(t: &PolyTree, x: usize, theta: &PolyTree) -> Option<PolyTree> {
+/// Fig. 6 surgery: rebuild the root→r_X path, replacing r_X with the
+/// reduct node — NOT a whole-subtree swap.  The former code dropped
+/// r_X's F_l children (and, when several binders stacked on r_X, the
+/// context B shape), destroying legitimate reducts such as
+/// ∀X.(Int⇒X)⇒(Bool⇒Int)⇒X, whose correct reduct keeps (Bool⇒Int).
+///
+/// Blue side (`absorb_head`): the r_X head X̄ is absorbed by θ's {µX.} —
+/// the reduct node's head label is x itself; with an empty F_l context
+/// the reduct is θ alone (matching the ∀X.X→X ⇒ µX.1 golden).
+/// Red side: r_X's own head label survives (never X⁺ under
+/// red-eliminability), with the N-form θ as its last child.
+fn splice_reduct(
+    t: &PolyTree,
+    x: usize,
+    theta: &PolyTree,
+    f_ctx: Vec<PolyTree>,
+    absorb_head: bool,
+) -> Option<PolyTree> {
     match t {
         Occ(n) => {
             if n.binders.contains(&x) {
-                if n.binders.len() == 1 {
+                let mut binders = n.binders.clone();
+                binders.retain(|&b| b != x);
+                if absorb_head && f_ctx.is_empty() {
                     return Some(theta.clone());
                 }
-                // r_X carries binders for OTHER variables too (LCA
-                // placement stacks shared ancestors here).  Dropping them
-                // (the previous bug) leaks those variables as free.  Keep
-                // the spine node as context B: remaining binders stay on
-                // it, θ becomes its child — B⟨X↦θ⟩ per Fig. 6.
-                let mut n2 = n.clone();
-                n2.binders.retain(|&b| b != x);
-                n2.children = vec![theta.clone()];
-                return Some(Occ(n2));
+                let mut children = f_ctx;
+                children.push(theta.clone());
+                // Head label: the reduct node KEEPS r_X's own head label
+                // when F_l is non-empty — overwriting it with x would
+                // erase r_X's genuine head occurrence (e.g. the Z̄ head of
+                // the two-continuation inner spine), shifting the
+                // occurrence multiset and sending later 2-SAT rounds UNSAT.
+                // (The empty-F_l case returned θ directly above, so no
+                // label is needed there.)  F_l's X-residues stay bound by
+                // θ's µ via τ's scope lift (the scope lift), which fires
+                // on the residue condition regardless of the node label.
+                let label = n.label;
+                return Some(Occ(RNode {
+                    label,
+                    color: n.color,
+                    binders,
+                    children,
+                }));
             }
             let mut n2 = n.clone();
             for ch in &mut n2.children {
-                let replaced = replace_binder_subtree(ch, x, theta)?;
-                *ch = replaced;
+                // Only the (unique, globally fresh) subtree containing
+                // r_X changes; siblings are cloned verbatim.
+                if find_binder_node(ch, x).is_some() {
+                    *ch = splice_reduct(ch, x, theta, f_ctx.clone(), absorb_head)?;
+                }
             }
             Some(Occ(n2))
         }
         PolySum { head, parts } => {
             if *head == x {
-                return Some(theta.clone());
+                // x is already bound by a previous reduction's • node —
+                // never an eliminable candidate; reaching here means a
+                // scope bug.  Fail-closed.
+                return None;
             }
             let mut parts2 = Vec::new();
             for (bs, ts) in parts {
                 let mut ts2 = Vec::new();
                 for t2 in ts {
-                    ts2.push(replace_binder_subtree(t2, x, theta)?);
+                    if find_binder_node(t2, x).is_some() {
+                        ts2.push(splice_reduct(t2, x, theta, f_ctx.clone(), absorb_head)?);
+                    } else {
+                        ts2.push(t2.clone());
+                    }
                 }
                 parts2.push((bs.clone(), ts2));
             }
@@ -276,11 +352,15 @@ fn replace_binder_subtree(t: &PolyTree, x: usize, theta: &PolyTree) -> Option<Po
             parts,
         } => {
             if *head == x {
-                return Some(theta.clone());
+                return None; // same defensive fail-closed as above
             }
             let mut parts2 = Vec::new();
             for t2 in parts {
-                parts2.push(replace_binder_subtree(t2, x, theta)?);
+                if find_binder_node(t2, x).is_some() {
+                    parts2.push(splice_reduct(t2, x, theta, f_ctx.clone(), absorb_head)?);
+                } else {
+                    parts2.push(t2.clone());
+                }
             }
             Some(PolyProd {
                 head: *head,
@@ -291,7 +371,7 @@ fn replace_binder_subtree(t: &PolyTree, x: usize, theta: &PolyTree) -> Option<Po
     }
 }
 
-// P3d: depth cap for the recursive PolyTree walkers below.  Source-
+// Depth cap for the recursive PolyTree walkers below.  Source-
 // derived trees are already bounded by the parser's
 // `max_recursion_depth` (256), and Yoneda reduction only reshuffles
 // subtrees (reduct depth ≤ original + O(1)); the cap is defense-
@@ -299,131 +379,77 @@ fn replace_binder_subtree(t: &PolyTree, x: usize, theta: &PolyTree) -> Option<Po
 // one fails closed (None) instead of risking a stack overflow.
 const WALK_DEPTH_CAP: usize = 100_000;
 
-/// Collect one Σ-branch per modular X̄-terminal: (∃Z⃗ binders, Π factors =
-/// the terminal's sibling spine factors).  For a bare X̄ leaf the minimal
-/// branch is (its binders, empty product ≙ 1).
-fn collect_sum_branches(t: &PolyTree, x: usize) -> Option<Vec<(Vec<usize>, Vec<PolyTree>)>> {
-    let mut out = Vec::new();
-    walk_sum(t, x, &mut out)?;
-    Some(out)
-}
-
-fn walk_sum(t: &PolyTree, x: usize, out: &mut Vec<(Vec<usize>, Vec<PolyTree>)>) -> Option<()> {
-    walk_sum_in(t, x, out, false, 0)
-}
-
-fn walk_sum_in(
+/// Prop 5.2 decomposition (paper L196-200): locate r_X (the Occ node
+/// whose binder set contains x) and partition its children into
+///
+///  - F_l: children containing NO X̄ terminal — kept verbatim as the
+///    reduct node's parameter context (paper L72: (Y⇒Z) survives in the
+///    parameter position of the ≡_W reduct);
+///  - G_k: children whose OWN head leaf is the modular X̄ — each
+///    contributes one Σ-branch (∃Z⃗ = G.binders, D_jk = G's own
+///    arguments).  A bare X̄-leaf child gives the branch (∅, []) — the
+///    paper's "possibly I = Z_k = ∅, so that G_k = X̄".
+///
+/// The former path-prefix-sibling machinery polluted D_jk: the paper's
+/// D_jk are only the site's own spine arguments; sibling branches and
+/// F_l are NOT factors (each branch is an independent Σ-alternative and
+/// F_l stays in parameter position).
+///
+/// Fail-closed: any X̄ NOT at a G-child's head (deeper inside a child,
+/// inside G's arguments, inside Poly children) ⇒ None — after the 2-SAT
+/// such positions cannot lie on a modular site; this is defense.
+fn collect_sum_branches(
     t: &PolyTree,
     x: usize,
-    out: &mut Vec<(Vec<usize>, Vec<PolyTree>)>,
-    in_scope: bool,
-    depth: usize,
-) -> Option<()> {
-    if depth > WALK_DEPTH_CAP {
-        return None; // P3d: fail-closed past the depth cap
-    }
-    // Fig. 6a geometric surgery: for the subtree rooted at r_X (the node
-    // binding X), each X̄ terminal at path p contributes one branch
-    // ∃(terminal binders). Π(path sibling factors ++ terminal args).
-    // The sibling factors at each edge r_X→terminal are the OTHER
-    // children at that edge — dropping them (the previous bug) loses the
-    // surrounding spine context and the reduct is not ≙ the paper's.
-    fn sink(
-        n: &RNode,
-        x: usize,
-        prefix: &[PolyTree],
-        out: &mut Vec<(Vec<usize>, Vec<PolyTree>)>,
-        depth: usize,
-    ) -> Option<()> {
-        // Is this node itself an X̄ site?
-        let is_site = n.label == x && n.color == Color::Red;
-        // Children as PolyTrees.
-        let kids: Vec<PolyTree> = n.children.iter().map(|c| c.clone()).collect();
-        if is_site {
-            // Branch factors = path prefix ++ this node's args (the
-            // ⟨A_jk⟩_j of the (Y⁺) LHS codomain position).
-            let mut factors: Vec<PolyTree> = prefix.to_vec();
-            factors.extend(kids);
-            // (Y⁺) LHS shape check: branch factors must not contain X̄ —
-            // such an occurrence means the tree does not fit the schema
-            // (would leak a free variable into the reduct).  Fail-closed.
-            if factors.iter().any(|f| contains_x_col(f, x, Color::Red)) {
-                return None;
-            }
-            out.push((n.binders.clone(), factors));
-            // X̄ terminals don't recurse (their binders are the ∃Z⃗).
-            return Some(());
-        }
-        if n.binders.contains(&x) {
-            // r_X boundary: start a fresh prefix here (its own binders
-            // scope X below).  If r_X is itself the X̄ head site, handled
-            // above only when label/color match; otherwise treat as the
-            // scope root and descend.
-        }
-        for (i, k) in kids.iter().enumerate() {
-            // Siblings at this edge = the other children (Π factors).
-            let mut pf: Vec<PolyTree> = prefix.to_vec();
-            for (j, s) in kids.iter().enumerate() {
-                if j != i {
-                    pf.push(s.clone());
+) -> Option<(Vec<PolyTree>, Vec<(Vec<usize>, Vec<PolyTree>)>)> {
+    let rx = find_binder_node(t, x)?;
+    let mut f_ctx = Vec::new();
+    let mut branches = Vec::new();
+    for c in &rx.children {
+        match c {
+            Occ(g) if g.label == x && g.color == Color::Red => {
+                // G_k: the X̄ is this child's own head leaf.  Its
+                // arguments D_jk must be X̄-free — an X̄ there would leak
+                // a free variable into the reduct (schema violation).
+                if g.children.iter().any(|d| contains_x_col(d, x, Color::Red)) {
+                    return None;
                 }
+                branches.push((g.binders.clone(), g.children.clone()));
             }
-            match k {
-                PolyTree::Occ(inner) => sink(inner, x, &pf, out, depth + 1)?,
-                poly => {
-                    // Σ/Π node under the scope: descend structurally,
-                    // KEEPING the r_X scope (scope is carried by the
-                    // ancestors, not by the constructor node itself).
-                    walk_sum_in(poly, x, out, true, depth + 1)?;
+            _ => {
+                // Paper L197 (color-formatted): F_l = subtrees with no X̄
+                // (RED) terminals; F_l⟨X⁺⟩ is LEGAL — its X⁺ residues are
+                // bound by the {µX.} that scopes over the WHOLE reduct node
+                // (µ over F_l included; τ lifts the scope accordingly).
+                // The former any-color guard was over-tight and
+                // blocked three paper-mandated reductions (Thm 5.6 forward
+                // direction).
+                if contains_x_col(c, x, Color::Red) {
+                    return None;
                 }
+                f_ctx.push(c.clone());
             }
         }
-        Some(())
     }
+    Some((f_ctx, branches))
+}
+
+/// Locate the node whose binder set contains x (the r_X of Fig. 6).
+/// Binder scopes are globally fresh, so at most one node matches.
+fn find_binder_node(t: &PolyTree, x: usize) -> Option<&RNode> {
     match t {
         Occ(n) => {
             if n.binders.contains(&x) {
-                // r_X: collect branches from this subtree only.
-                sink(n, x, &[], out, depth)
-            } else if in_scope && n.label == x && n.color == Color::Red {
-                // An X̄ leaf under a Σ/Π constructor branch below r_X:
-                // still a collection site (scope carried by ancestors).
-                sink(n, x, &[], out, depth)
-            } else {
-                let deeper = in_scope || n.binders.iter().any(|b| *b == x);
-                for ch in &n.children {
-                    walk_sum_in(ch, x, out, deeper, depth + 1)?;
-                }
-                Some(())
+                return Some(n);
             }
+            n.children.iter().find_map(|c| find_binder_node(c, x))
         }
-        // Once inside r_X's subtree (through Σ/Π constructor nodes), the
-        // binder scope is carried by the *ancestors* — any X̄ leaf below
-        // is still a site for the (Y⁺) collection.
-        PolySum { parts, .. } => {
-            for (_, ts) in parts {
-                for t2 in ts {
-                    walk_sum_in(t2, x, out, in_scope, depth + 1)?;
-                }
-            }
-            Some(())
-        }
-        PolyProd { parts, .. } => {
-            for t2 in parts {
-                walk_sum_in(t2, x, out, in_scope, depth + 1)?;
-            }
-            Some(())
-        }
+        PolySum { parts, .. } => parts
+            .iter()
+            .flat_map(|(_, ts)| ts.iter())
+            .find_map(|t2| find_binder_node(t2, x)),
+        PolyProd { parts, .. } => parts.iter().find_map(|t2| find_binder_node(t2, x)),
     }
-}
-
-/// Dual scan for (Y⁻): ∀Z⃗ binders + Π E_j factors from modular X⁺
-/// terminals.
-fn collect_prod_factors(t: &PolyTree, x: usize) -> Option<(Vec<usize>, Vec<PolyTree>)> {
-    let mut binders = Vec::new();
-    let mut parts = Vec::new();
-    walk_prod(t, x, &mut binders, &mut parts, 0)?;
-    Some((binders, parts))
 }
 
 fn walk_prod(
@@ -434,7 +460,7 @@ fn walk_prod(
     depth: usize,
 ) -> Option<()> {
     if depth > WALK_DEPTH_CAP {
-        return None; // P3d: fail-closed past the depth cap
+        return None; // fail-closed past the depth cap
     }
     match t {
         Occ(n) => {
@@ -461,6 +487,24 @@ fn walk_prod(
             Some(())
         }
         PolySum { parts: ps, .. } => {
+            // Foreign-θ guard (defense-in-depth): a Poly node reached
+            // here is an EARLIER round's θ — the x-material in its parts is
+            // bound by THAT θ's constructor ({µx'.}/{νx'}, x' ≠ x; x itself
+            // is ctor-bound and never a candidate again).  Descending would
+            // lift x-sites out of the foreign ctor's scope: their factors
+            // land under the CURRENT θ, stranding the foreign-bound
+            // residues FREE (regression: red_harvest_refuses_foreign_theta_
+            // descent builds the exact shape — fvs gains a free X).
+            // Reachable today: NO — the modular window forces every site
+            // inside a foreign θ to flat-d ≥ 2, non-terminals there are
+            // non-modular (er false ⇒ the step never fires) and only bare
+            // d2-Blue leaves pass, for which walk_prod emits a bare unit
+            // (no material).  The guard turns that window-arithmetic
+            // accident into a structural guarantee.  Skip when the θ
+            // carries no x-material (opaque w.r.t. x); refuse otherwise.
+            if contains_x_col(t, x, Color::Red) || contains_x_col(t, x, Color::Blue) {
+                return None;
+            }
             for (_, ts) in ps {
                 for t2 in ts {
                     walk_prod(t2, x, binders, parts, depth + 1)?;
@@ -469,6 +513,10 @@ fn walk_prod(
             Some(())
         }
         PolyProd { parts: ps, .. } => {
+            // Foreign-θ guard — same rationale as the PolySum arm above.
+            if contains_x_col(t, x, Color::Red) || contains_x_col(t, x, Color::Blue) {
+                return None;
+            }
             for t2 in ps {
                 walk_prod(t2, x, binders, parts, depth + 1)?;
             }
@@ -538,17 +586,22 @@ fn remaining_bound_vars(t: &PolyTree) -> Vec<usize> {
                 binders: bs,
                 parts,
             } => {
-                // Symmetric: {νX.} head is a constructor binder.
+                // Symmetric with the • node: {νX.} AND the ∀Z⃗ are
+                // constructor binders of the polynomial constant — τ
+                // re-wraps the ∀Z⃗, so they are never eliminable by →_X^c.
                 if !binders.contains(head) {
                     binders.push(*head);
+                }
+                if !ctor.contains(head) {
+                    ctor.push(*head);
                 }
                 for b in bs {
                     if !binders.contains(b) {
                         binders.push(*b);
                     }
-                }
-                if !ctor.contains(head) {
-                    ctor.push(*head);
+                    if !ctor.contains(b) {
+                        ctor.push(*b);
+                    }
                 }
                 for t2 in parts {
                     walk(t2, labels, binders, ctor);
@@ -573,6 +626,19 @@ pub fn is_simple(t: &PolyTree) -> bool {
 
 /// Standard reduction to a simple polynomial tree (or fail-closed None).
 ///
+/// Step/depth bound (why the tree walkers below need no stack cap):
+/// each successful `yoneda_step` removes x from r_X's binder set and x
+/// reappears only as θ's CONSTRUCTOR head (`remaining_bound_vars`
+/// excludes ctor-bound labels), and Notation 5.1 gives x a unique r_X —
+/// so every bound variable is eliminated at most once and the loop runs
+/// ≤ (#source binders) ≤ 256 steps (the parser's recursion bound).  Each
+/// step adds at most one wrapping level, so tree depth stays ≤ ~512 —
+/// the same magnitude the polar-action walkers are capped at.
+/// `WALK_DEPTH_CAP` is a termination backstop only; if the
+/// step-elimination invariant ever breaks (a step that keeps its
+/// variable bound), re-derive this bound before trusting the walkers'
+/// recursion.
+///
 /// Candidate order — least-canceling (Def 5.6 + the Thm 5.6 proof): a
 /// c-canceling variable X is reduced only after all bound variables in
 /// r_X's subtree are eliminated (the paper's "variables above r_X" —
@@ -583,8 +649,12 @@ pub fn is_simple(t: &PolyTree) -> bool {
 /// binder index for determinism.
 pub fn standard_reduce(tree: &PolyTree) -> Option<PolyTree> {
     let mut cur = tree.clone();
+    // The (variable, color) pairs already reduced — Def 5.6's standardness
+    // index (each bound variable is eliminated at most once, so the
+    // variable identifies its E₀ entry).
+    let mut chosen: Vec<(usize, Color)> = Vec::new();
     for _step in 0..10_000 {
-        // P2: one walk per step — remaining_bound_vars is BOTH the
+        // One walk per step — remaining_bound_vars is BOTH the
         // simplicity test (empty ⇒ P₀) and the candidate list; the old
         // is_simple precheck walked the tree a second time.
         let mut vars = remaining_bound_vars(&cur);
@@ -595,8 +665,18 @@ pub fn standard_reduce(tree: &PolyTree) -> Option<PolyTree> {
         // the Λ2 forest — polynomial roots are opaque to binder scoping,
         // so we reconstruct an CoherenceTree from the Occ spine.
         let flat = flat_view(&cur)?;
-        // Coherence valuation (Def 5.5) fixes each variable's color.
-        let phi = flat.valuation()?;
+        // Def 5.6 (standard reduction): the sequence's colors must be
+        // PAIRWISE coherent (Def 5.4) — NOT the whole tree coherent (Def
+        // 5.5).  The former `flat.valuation()?` refused every incoherent
+        // tree although the paper itself reduces non-coherent types
+        // (post-Cor.-5.2, L380–382: "such a type A need not even be
+        // coherent … reduces, by eliminating X …").  Track the reduced
+        // (variable, color) pairs; a coherent valuation, when one exists,
+        // is still preferred (the Thm 5.6 strategy) and automatically
+        // satisfies the pairwise condition.  Measuring coherence on the
+        // current view is sound: Lemma 5.5 shows parallel pairs (hence
+        // incoherence) only persist, never appear, along standard steps.
+        let phi = flat.valuation();
         // Least-canceling order: deepest r_X first (see fn docs).
         vars.sort_by_key(|&x| {
             let d = flat
@@ -608,20 +688,44 @@ pub fn standard_reduce(tree: &PolyTree) -> Option<PolyTree> {
         });
         let mut progressed = false;
         for &x in &vars {
-            let Some(&c) = phi.get(&x) else { continue };
-            // φ-color first (Thm 5.6 standard strategy); on failure try
-            // the dual color before declaring the variable stuck — the
-            // valuation may pick a color whose sites were absorbed by an
-            // earlier step, while the opposite color's sites remain.
-            // Fail-closed is preserved: yoneda_step itself refuses any
-            // tree whose shape does not match the schema.
-            let dual = match c {
-                Color::Red => Color::Blue,
-                Color::Blue => Color::Red,
+            // Def 5.2 license: c-eliminable.  Def 5.6 license: coherent
+            // with every previously reduced variable (at-most-once
+            // elimination ⇒ the variable identifies the E₀ entry).
+            let standard = |c: Color| {
+                chosen
+                    .iter()
+                    .all(|&(y, d)| y == x || flat.pair_coherent(x, c, y, d))
             };
-            if let Some(next) = yoneda_step(&cur, x, c).or_else(|| yoneda_step(&cur, x, dual)) {
-                cur = next;
-                progressed = true;
+            let mut colors: Vec<Color> = Vec::new();
+            if let Some(&c) = phi.as_ref().and_then(|v| v.get(&x)) {
+                // φ-color first (Thm 5.6 standard strategy).
+                colors.push(c);
+            }
+            for c in [Color::Blue, Color::Red] {
+                if !colors.contains(&c) {
+                    // Dual-color fallback: the valuation may pick a color
+                    // whose sites were absorbed by an earlier step, while
+                    // the opposite color's sites remain.  A dual step is
+                    // admissible only under the SAME Def 5.6 pairwise
+                    // coherence — a non-standard step is not licensed by
+                    // Lemma 5.3.  Fail-closed is preserved: yoneda_step
+                    // itself refuses any tree whose shape does not match
+                    // the schema.
+                    colors.push(c);
+                }
+            }
+            for &c in &colors {
+                if !flat.color_eliminable(x, c) || !standard(c) {
+                    continue;
+                }
+                if let Some(next) = yoneda_step(&cur, x, c) {
+                    cur = next;
+                    chosen.push((x, c));
+                    progressed = true;
+                    break;
+                }
+            }
+            if progressed {
                 break;
             }
         }
@@ -671,7 +775,7 @@ fn flat_view(t: &PolyTree) -> Option<super::coherence::FlatTree> {
                 // an index already bound upstream (θ reconstruction of the
                 // SAME ∀Z⃗ from the (Y⁺) LHS, not a fresh binder) — treat
                 // re-registration as a reference, not a collision.
-                // B4: this must be `entry().or_insert` — the previous
+                // This must be `entry().or_insert` — the previous
                 // unconditional `scope.insert(*head, id)` CLOBBERED the
                 // upstream scope entry, so a re-used µ/ν head index got a
                 // wrong r_X and every modular-distance computed against it
@@ -699,7 +803,7 @@ fn flat_view(t: &PolyTree) -> Option<super::coherence::FlatTree> {
                 // Symmetric with PolySum: θ's {νX.}∀Z⃗ reconstruction may
                 // re-use indices already bound upstream — treat
                 // re-registration as a reference, not a collision.
-                // B4: `entry().or_insert` (see the PolySum note — the
+                // `entry().or_insert` (see the PolySum note — the
                 // unconditional inserts clobbered upstream scopes; the
                 // `contains_key` pre-checks below them were dead code).
                 scope.entry(*head).or_insert(id);
@@ -738,44 +842,87 @@ fn flat_view(t: &PolyTree) -> Option<super::coherence::FlatTree> {
 // Only meaningful on simple (P₀) trees — asserted by the caller.
 
 impl<'input> TypeContext<'input> {
+    /// Invert the lazy atom encoding (coherence.rs `atom_label`):
+    /// label = ATOM_BASE - arena_index, so the index — and via
+    /// `TypeTag::from(&data)` the full TypeId — is recovered in O(1)
+    /// (same slot, same tag ⇒ the recovered TypeId IS the original).
+    /// Returns None out-of-range (fail-closed).
+    fn atom_tyid(&self, label: usize) -> Option<TypeId> {
+        let idx = super::coherence::atom_label_inverse(label)?;
+        let data = self.interner.types.get(idx)?;
+        debug_assert!(
+            !matches!(**data, TypeData::GenericParam { .. }),
+            "atom labels never carry params (is_ground invariant)"
+        );
+        let tag = TypeTag::from(&**data) as usize;
+        Some(TypeId::from_raw(((idx + 1) << TypeId::TAG_BITS) | tag))
+    }
+
+    /// The ∃Y⃗ₖ.Σₖ Πⱼ E_jk body of a • node WITHOUT the {µX.} wrapper —
+    /// used both by `tau`'s PolySum arm (which adds the µ itself) and by
+    /// the Occ reduct arm's scope lift (where the µ moves OUTSIDE the
+    /// whole reduct node to bind F_l⟨X⁺⟩ residues; paper L152/L197).
+    fn tau_sigma_body(&mut self, parts: &[(Vec<usize>, Vec<PolyTree>)]) -> Option<TypeId> {
+        let alternatives = parts
+            .iter()
+            .map(|(binders, factors)| {
+                let mut branch = if factors.is_empty() {
+                    self.unit()
+                } else {
+                    let elems: Option<SmallVec<[TypeId; 4]>> =
+                        factors.iter().map(|f| self.tau(f)).collect();
+                    let elems = elems?;
+                    if elems.len() == 1 {
+                        elems[0]
+                    } else {
+                        self.tuple(elems)
+                    }
+                };
+                // ∃Y⃗ₖ wrapper (binders in reverse fold order).
+                for &b in binders.iter().rev() {
+                    branch = self.exists(
+                        b,
+                        Symbol::intern(&format!("Z{}", b)),
+                        branch,
+                        crate::ast::Expr::Literal(
+                            crate::ast::Literal::Bool(true),
+                            crate::ast::Span::new(FileId::DUMMY, 0, 0),
+                        ),
+                    );
+                }
+                Some(branch)
+            })
+            .collect::<Option<SmallVec<[TypeId; 4]>>>()?;
+        Some(self.coproduct(alternatives))
+    }
+
+    /// The ∀Y⃗.Πⱼ E_j body of an N node WITHOUT the {νX.} wrapper (dual of
+    /// `tau_sigma_body`; paper L152/L199).
+    fn tau_prod_body(&mut self, binders: &[usize], parts: &[PolyTree]) -> Option<TypeId> {
+        let mut factors: SmallVec<[TypeId; 4]> = SmallVec::new();
+        for f in parts {
+            factors.push(self.tau(f)?);
+        }
+        let mut prod = if factors.is_empty() {
+            self.unit()
+        } else if factors.len() == 1 {
+            factors[0]
+        } else {
+            self.tuple(factors)
+        };
+        // ∀Y⃗ wrapper.
+        for &b in binders.iter().rev() {
+            prod = self.forall(b, Symbol::intern(&format!("Z{}", b)), prod);
+        }
+        Some(prod)
+    }
+
     /// Lower a simple polynomial tree to a `TypeId` (Fig. 5).
     /// Fail-closed: non-simple trees or out-of-Λ2 leaves ⇒ None.
     pub fn tau(&mut self, t: &PolyTree) -> Option<TypeId> {
         match t {
             PolySum { head, parts } => {
-                // µX.∃Y⃗ₖ.Σₖ Πⱼ E_jk  — head == usize::MAX ⇒ no binder
-                // (canceling): plain Σ.
-                let alternatives = parts
-                    .iter()
-                    .map(|(binders, factors)| {
-                        let mut branch = if factors.is_empty() {
-                            self.unit()
-                        } else {
-                            let elems: Option<SmallVec<[TypeId; 4]>> =
-                                factors.iter().map(|f| self.tau(f)).collect();
-                            let elems = elems?;
-                            if elems.len() == 1 {
-                                elems[0]
-                            } else {
-                                self.tuple(elems)
-                            }
-                        };
-                        // ∃Y⃗ₖ wrapper (binders in reverse fold order).
-                        for &b in binders.iter().rev() {
-                            branch = self.exists(
-                                b,
-                                Symbol::intern(&format!("Z{}", b)),
-                                branch,
-                                crate::ast::Expr::Literal(
-                                    crate::ast::Literal::Bool(true),
-                                    crate::ast::Span::new(FileId::DUMMY, 0, 0),
-                                ),
-                            );
-                        }
-                        Some(branch)
-                    })
-                    .collect::<Option<SmallVec<[TypeId; 4]>>>()?;
-                let sigma = self.coproduct(alternatives);
+                let sigma = self.tau_sigma_body(parts)?;
                 if *head == usize::MAX {
                     Some(sigma)
                 } else {
@@ -791,22 +938,7 @@ impl<'input> TypeContext<'input> {
                 binders,
                 parts,
             } => {
-                // νX.∀Y⃗.Πⱼ E_j.
-                let mut factors: SmallVec<[TypeId; 4]> = SmallVec::new();
-                for f in parts {
-                    factors.push(self.tau(f)?);
-                }
-                let mut prod = if factors.is_empty() {
-                    self.unit()
-                } else if factors.len() == 1 {
-                    factors[0]
-                } else {
-                    self.tuple(factors)
-                };
-                // ∀Y⃗ wrapper.
-                for &b in binders.iter().rev() {
-                    prod = self.forall(b, Symbol::intern(&format!("Z{}", b)), prod);
-                }
+                let prod = self.tau_prod_body(binders, parts)?;
                 if *head == usize::MAX {
                     Some(prod)
                 } else {
@@ -822,13 +954,11 @@ impl<'input> TypeContext<'input> {
                 // positively as a tuple→param arrow, or a bare variable.
                 if n.children.is_empty() {
                     if n.label >= super::coherence::ATOM_LABEL_FLOOR && n.label != usize::MAX {
-                        // An inert atom terminal.  τ-lowering an atom
-                        // leaf needs the label→TypeId reverse map (a later
-                        // slice) — fail-closed here rather than minting a
-                        // bogus GenericParam with a huge index.  (κ,
-                        // coherence, and standard reduction all handle
-                        // atoms; only the τ endpoint is pending.)
-                        return None;
+                        // An inert atom terminal: recover the original
+                        // TypeId via the O(1) reverse map; fail-closed
+                        // out-of-range rather than minting a bogus
+                        // GenericParam with a huge index.
+                        return self.atom_tyid(n.label);
                     }
                     if n.label == usize::MAX {
                         // A bare leaf with the reserved label is the
@@ -842,16 +972,127 @@ impl<'input> TypeContext<'input> {
                         // impossible shape fail-closed.)
                         return Some(self.unit());
                     }
-                    Some(self.generic_param(n.label, Symbol::intern(&format!("T{}", n.label))))
+                    // Fig. 5: τ(⊕^X E | Y⃗) = ∀Y⃗.… — node binders must be
+                    // re-wrapped as ∀ (they are the shared-LCA variables
+                    // of the reduct node; dropping them let a bound
+                    // variable escape as a free GenericParam).
+                    let mut leaf =
+                        self.generic_param(n.label, Symbol::intern(&format!("T{}", n.label)));
+                    for &b in n.binders.iter().rev() {
+                        leaf = self.forall(b, Symbol::intern(&format!("Y{}", b)), leaf);
+                    }
+                    return Some(leaf);
                 } else {
-                    // Negative spine: Π τ(children) → label.  Lowered as
-                    // Fn from tuple to the head param.
+                    // Negative spine: Π τ(children) → label.
+                    let atom_ret =
+                        if n.label >= super::coherence::ATOM_LABEL_FLOOR && n.label != usize::MAX {
+                            // Atom-headed spine: recover the atom TypeId via the
+                            // reverse map (None ⇒ fail-closed).
+                            Some(self.atom_tyid(n.label))
+                        } else {
+                            None
+                        };
+                    if let Some(None) = atom_ret {
+                        return None;
+                    }
+                    //
+                    // Head-slot θ with SCOPE LIFT (Fig. 6 RHS after a
+                    // splice; paper L152/L197/L199): when the LAST child is
+                    // a Poly node whose head (a) equals this node's label
+                    // (blue absorb) or (b) occurs in an EARLIER child (an
+                    // F_l⟨X⁺⟩/F_l⟨X̄⟩ residue — legal per Prop 5.2's proof),
+                    // the {µX.}/{νX.} must scope over the WHOLE reduct node
+                    // — F_l included — not just θ's own body.  Lowering:
+                    //   Mu{h, Fn(τ(F…), σ-body)}   (blue, σ-body without µ)
+                    //   Nu{h, Fn(τ(F…), π-body)}   (red,  π-body without ν)
+                    // The former τ(θ)-as-return left the residues free and
+                    // the θ's inner µ could not reach them.
+                    let lifted_head = match n.children.last() {
+                        Some(PolySum { head, .. }) | Some(PolyProd { head, .. }) => {
+                            let h = *head;
+                            let residues = n.children[..n.children.len() - 1].iter().any(|f| {
+                                contains_x_col(f, h, Color::Red)
+                                    || contains_x_col(f, h, Color::Blue)
+                            });
+                            if h == n.label || residues {
+                                Some(h)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    // Parameters: ALL children EXCEPT the trailing Poly θ
+                    // when a scope lift fires.  The former unconditional
+                    // take(len-1) dropped the last REAL parameter of any
+                    // spine without a Poly tail (e.g. F₁ = (X→Int) inside a
+                    // lifted reduct) — masked until atom τ was restored
+                    // (see `atom_tyid`).
+                    let param_count = if lifted_head.is_some() {
+                        n.children.len() - 1
+                    } else {
+                        n.children.len()
+                    };
                     let mut params: SmallVec<[TypeId; 4]> = SmallVec::new();
-                    for c in &n.children {
+                    for c in n.children.iter().take(param_count) {
                         params.push(self.tau(c)?);
                     }
-                    let ret = self.generic_param(n.label, Symbol::intern(&format!("T{}", n.label)));
-                    Some(self.function(params, ret))
+                    if let Some(h) = lifted_head {
+                        // Scope lift: µ/ν wraps the WHOLE reduct node, and
+                        // the node's own binders (shared-LCA variables, x
+                        // already removed by the splice) wrap OUTSIDE the
+                        // µ/ν — the binder sat upstream of the head before
+                        // the surgery (Fig. 5: ∀Y⃗ outside).
+                        let name = Symbol::intern(&format!("X{}", h));
+                        let lifted = match n.children.last() {
+                            Some(PolySum { parts, .. }) => {
+                                let sigma = self.tau_sigma_body(parts)?;
+                                let body = self.function(params, sigma);
+                                self.alloc(TypeData::Mu {
+                                    param_index: h,
+                                    param_name: name,
+                                    body,
+                                })
+                            }
+                            Some(PolyProd {
+                                head,
+                                binders,
+                                parts,
+                            }) => {
+                                let prod = self.tau_prod_body(binders, parts)?;
+                                let body = self.function(params, prod);
+                                self.alloc(TypeData::Nu {
+                                    param_index: *head,
+                                    param_name: name,
+                                    body,
+                                })
+                            }
+                            _ => unreachable!("lifted_head checked a Poly last child"),
+                        };
+                        let mut ty = lifted;
+                        for &b in n.binders.iter().rev() {
+                            ty = self.forall(b, Symbol::intern(&format!("Y{}", b)), ty);
+                        }
+                        return Some(ty);
+                    }
+                    let ret = match atom_ret {
+                        // Atom head recovered via the reverse map.
+                        Some(Some(t)) => t,
+                        // Atom label recognized but the reverse map failed:
+                        // fail closed, mirroring the leaf arm — do NOT mint
+                        // a GenericParam with an atom-label-sized index.
+                        Some(None) => return None,
+                        None => {
+                            self.generic_param(n.label, Symbol::intern(&format!("T{}", n.label)))
+                        }
+                    };
+                    // Fig. 5: re-wrap the node binders as ∀Y⃗ (see the leaf
+                    // arm note — shared-LCA variables must not escape).
+                    let mut ty = self.function(params, ret);
+                    for &b in n.binders.iter().rev() {
+                        ty = self.forall(b, Symbol::intern(&format!("Y{}", b)), ty);
+                    }
+                    Some(ty)
                 }
             }
         }
@@ -886,6 +1127,109 @@ mod tests {
 
         let simple = reduce(&ctx, ty).expect("coherent type must converge");
         assert!(is_simple(&simple), "∀X.X→X must reach P₀");
+    }
+
+    /// ∀X.X — X has NO occurrence at all, so the
+    /// Fig. 6(a) LHS matches trivially (L=∅, K=∅) and
+    ///   θ = µX.Σ_∅ = 0   (paper L152: family quantifier over K).
+    /// Reduct: µX.0 ≅ Never — the paper's zero type, text-legal.
+    #[test]
+    fn reduce_no_occurrence_to_never() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let ty = forall(&mut ctx, 0, x);
+        let simple = reduce(&ctx, ty).expect("K=∅ blue rule must fire");
+        assert!(is_simple(&simple));
+        match &simple {
+            PolySum { head: 0, parts } => assert!(
+                parts.is_empty(),
+                "∀X.X must reduce to µX.Σ_∅ (zero branches)"
+            ),
+            other => panic!("expected µX.Σ_∅, got {:?}", other),
+        }
+    }
+
+    /// ∀X.(X→Int)→X — X occurs only as h_X and as
+    /// the X⁺ parameter of (X→Int)⟨X⁺⟩; L=∅, K=∅ ⇒
+    ///   ∀X.(X→Int)→X ↠ µX.((X→Int)⇒0) ≅ ∅   (X:=0 ⇒ 1⇒0 = 0).
+    /// (The τ endpoint stays fail-closed on the Int atom — pending the
+    /// label→TypeId reverse map; this pins the PolyTree reduct.)
+    #[test]
+    fn reduce_yoneda_atom_shape_to_never() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let i = ctx.int(32, true);
+        let xi = ctx.function(smallvec![x], i); // (X→Int)
+        let body = ctx.function(smallvec![xi], x); // (X→Int)→X
+        let ty = forall(&mut ctx, 0, body);
+        let simple = reduce(&ctx, ty).expect("K=∅ blue rule must fire");
+        assert!(is_simple(&simple));
+        // Reduct shape: the spliced reduct node
+        //   Occ{label: X, children: [F₁=(X→Int)⟨X⁺⟩, PolySum{head: X, ∅}]}
+        // ≙ µX.((X→Int)⇒Σ_∅) — µ scope lifted over F₁, Σ_∅ = 0
+        // (K=∅), F₁'s X⁺ residue bound by the lifted µ.
+        match &simple {
+            Occ(n) if n.label == 0 => match n.children.last() {
+                Some(PolySum { head: 0, parts }) => assert!(
+                    parts.is_empty(),
+                    "∀X.(X→Int)→X must end in Σ_∅, got parts={:?}",
+                    parts.len()
+                ),
+                other => panic!("expected a trailing PolySum head=X, got {:?}", other),
+            },
+            other => panic!("expected the lifted reduct node, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tau_lowers_atom_via_reverse_map() {
+        // τ of the ∀X.(X→Int)→X reduct — the Int atom lowers via the
+        // reverse map, the F_l⟨X⁺⟩ residue is µ-bound (scope lift),
+        // Σ_∅ = Never. Expected ≙ µX.((Int⇒X)⇒0) — the paper's ≡_Y
+        // form (NOT a Set-domain type: F(0)=1, F(1)=0 — µ-non-monotone,
+        // so no Set fixpoint exists; the tree form is still faithful).
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let i = ctx.int(32, true);
+        let xi = ctx.function(smallvec![x], i);
+        let body = ctx.function(smallvec![xi], x);
+        let ty = forall(&mut ctx, 0, body);
+        let ct = ctx.build_coherence_tree(ty).expect("Λ2");
+        let poly = from_occ(ct.root_tree());
+        let simple = standard_reduce(&poly).expect("converges");
+        let m = ctx
+            .tau(&simple)
+            .expect("Int atom lowers via the reverse map");
+        match ctx.get(m) {
+            TypeData::Mu {
+                param_index: 0,
+                body,
+                ..
+            } => match ctx.get(*body) {
+                TypeData::Fn { params, ret } => {
+                    assert_eq!(params.len(), 1);
+                    match ctx.get(params[0]) {
+                        TypeData::Fn {
+                            params: ip,
+                            ret: ir,
+                        } => {
+                            assert_eq!(ip.len(), 1);
+                            // The X⁺ leaf lowers to a (freshly minted)
+                            // GenericParam for index 0 — τ mints per call.
+                            assert!(ctx.is_generic_param(ip[0]), "µ-bound residue");
+                            // The Int atom sits in the RETURN position of
+                            // F₁=(X→Int) and must be recovered via the
+                            // reverse map.
+                            assert_eq!(*ir, i, "Int atom via the reverse map");
+                        }
+                        other => panic!("F₁ shape: {other:?}"),
+                    }
+                    assert!(ctx.is_never(*ret), "Σ_∅ = 0");
+                }
+                other => panic!("µ body: {other:?}"),
+            },
+            other => panic!("expected µX.((Int⇒X)⇒0), got {other:?}"),
+        }
     }
 
     #[test]
@@ -938,12 +1282,25 @@ mod golden_tests {
         standard_reduce(&poly)
     }
 
-    /// Paper Example 3.1 (§3, verbatim):
-    /// ∀XYZW.((((X→Y)→X→Z)→(Y→Z)→W)→(Y→W)→W) ≅ 1 (unique inhabitant).
-    /// Golden: the type must be coherent (κ≠∞) per the §5 machinery,
-    /// standard-reduce to a simple (P₀) tree, and τ of that tree lowers.
+    /// Paper Example 3.1 (arXiv:1907.03481v3 L70-72, verbatim):
+    /// A = ((((X⇒Y)⇒X⇒Z)⇒(Y⇒Z)⇒W)⇒(Y⇒Z)⇒W — the second parameter is
+    /// (Y⇒Z), NOT (Y⇒W).  The ≡_W step of §3,
+    ///   ∀XYZW.A ≡_W ∀XYZ.(Y⇒Z)⇒(((X⇒Y)⇒X⇒Z)×(Y⇒Z)),
+    /// keeps the W-free (Y⇒Z) as an F_l context — it only holds because
+    /// the second parameter's W is free.
+    ///
+    /// §5 tree-level verdict: X̄(inner arg-2, d=4), X⁺(d=5), Ȳ(xy head
+    /// d=5, yz-in-mid arg d=3), Y⁺(yz-arg arg d=3), Z̄(yz-in-mid head
+    /// d=4), Z⁺(inner head d=4) all fall outside the modular window ⇒
+    /// X,Y,Z are eliminable in NEITHER color ⇒ 2-SAT UNSAT ⇒ κ=∞.  This
+    /// does NOT contradict the paper: §3's ≅_Y 1 chain uses the FULL ≡
+    /// isomorphism theory of App. A, strictly stronger than the §5 tree
+    /// rewriting; §5 only gives sufficient conditions (L183), and the
+    /// discussion after Cor. 5.2 (L369-372) exhibits a ≡_Y-finite type
+    /// that is tree-incoherent.  Fail-closed IS the paper-faithful
+    /// behavior here.
     #[test]
-    fn golden_example_3_1_unique_inhabitant() {
+    fn golden_example_3_1_tree_is_incoherent() {
         let mut ctx = TypeContext::new();
         let x = ctx.generic_param(0, "X".into());
         let y = ctx.generic_param(1, "Y".into());
@@ -954,13 +1311,11 @@ mod golden_tests {
         let xy = ctx.function(smallvec![x], y);
         let xz = ctx.function(smallvec![x], z);
         let inner = ctx.function(smallvec![xy], xz);
-        // yz = Y→Z, yw = Y→W
         let yz = ctx.function(smallvec![y], z);
-        let yw = ctx.function(smallvec![y], w);
         // mid = inner → (Y→Z) → W
         let mid = ctx.function(smallvec![inner, yz], w);
-        // A = mid → (Y→W) → W   (paper Example 3.1 exact: second arg is Y→W)
-        let a = ctx.function(smallvec![mid, yw], w);
+        // A = mid → (Y→Z) → W   (paper L71: second parameter is yz)
+        let a = ctx.function(smallvec![mid, yz], w);
 
         let ty = forall(&mut ctx, 0, a);
         let ty = forall(&mut ctx, 1, ty);
@@ -968,30 +1323,423 @@ mod golden_tests {
         let ty = forall(&mut ctx, 3, ty);
 
         let ct = ctx.build_coherence_tree(ty).expect("Λ2 golden type");
-        let k = ct.flat().characteristic();
-        // Corrected verdict: COHERENT (κ=1), matching Thm 5.6 — the paper
-        // proves this type ≅ 1 in §3 via direct Yoneda isomorphisms
-        // (≅_W, ≅_Z, ≅_X, ≅_Y, ≅_η), and Thm 5.6 (coherent ⟺ strong
-        // convergence) therefore REQUIRES the tree to be coherent.  The
-        // the earlier κ=∞ came from counting two same-label spine SIBLINGS
-        // (mid/YW, both W̄) as paper-parallel — but the paper's trees carry
-        // labels on LEAVES only (§4.1 L844), so leaves under different
-        // spines are not parallel (Notation 5.1: parallel = immediate
-        // successors of the same node).  κ=1 (not 0): our tree has a cyclic
-        // alternating path — consistent with the reduction keeping the
-        // {μX.} binder (non-canceling form; the canceling elision is
-        // deferred to the canonical layer, Fig. 4c), so the reduct carries
-        // fixpoint heads.  The paper does not exhibit κ for this exact
-        // type; what Thm 5.6 pins is coherence + convergence, which is
-        // what this golden asserts.
         assert_eq!(
-            k, 1,
-            "Example 3.1 must be coherent (κ≠∞) per Thm 5.6; κ=1 with the non-canceling reduct"
+            ct.flat().characteristic(),
+            u8::MAX,
+            "X,Y,Z eliminable in neither color ⇒ κ=∞"
         );
-        // Thm 5.6 (⟸ direction): coherent ⟹ standard reduction converges.
-        let simple = reduce(&ctx, ty)
-            .expect("coherent ⟹ strong convergence under standard reduction");
-        assert!(is_simple(&simple), "convergence lands on a P₀ tree");
+        // Incoherent ⇒ no standard reduction, no witness.
+        assert!(
+            reduce(&ctx, ty).is_none(),
+            "incoherent ⇒ standard reduction refused"
+        );
+    }
+
+    /// The (Y⇒W) variant of Example 3.1 — the type the old golden
+    /// accidentally encoded.  It is a legitimate coherent (κ=1) type with
+    /// two continuation branches; pinned at the tree level only.  Its
+    /// correct red-side reduct depends on the Fig. 6(b) dual surgery, so
+    /// the reduct shape is deliberately NOT pinned here yet.
+    #[test]
+    fn golden_two_continuation_branches_coherent() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let y = ctx.generic_param(1, "Y".into());
+        let z = ctx.generic_param(2, "Z".into());
+        let w = ctx.generic_param(3, "W".into());
+
+        let xy = ctx.function(smallvec![x], y);
+        let xz = ctx.function(smallvec![x], z);
+        let inner = ctx.function(smallvec![xy], xz);
+        let yz = ctx.function(smallvec![y], z);
+        let yw = ctx.function(smallvec![y], w);
+        let mid = ctx.function(smallvec![inner, yz], w);
+        let a = ctx.function(smallvec![mid, yw], w);
+
+        let ty = forall(&mut ctx, 0, a);
+        let ty = forall(&mut ctx, 1, ty);
+        let ty = forall(&mut ctx, 2, ty);
+        let ty = forall(&mut ctx, 3, ty);
+
+        let ct = ctx.build_coherence_tree(ty).expect("Λ2 type");
+        let ft = ct.flat();
+        // Machine-checked derivation chain (proof in the comment below;
+        // each premise pinned so a future lowering change names the DRIFTED
+        // LEMMA, not a bare "κ changed"):
+        assert!(
+            !ft.color_eliminable(3, Color::Red),
+            "L1 drifted: er(W)=false required (W⁺ = {{h_W}}, a==r ⇒ non-modular)"
+        );
+        assert!(
+            !ft.color_eliminable(1, Color::Blue),
+            "L2 drifted: eb(Y)=false required (yz-branch Ȳ head at d=3, out of window)"
+        );
+        // L3: with L1∧L2 forced, the rule-(ii) clause (a_W^red ∨ a_Y^blue)
+        // is the sole UNSAT source — pinned by the verdict itself.
+        assert_eq!(
+            ft.characteristic(),
+            u8::MAX,
+            "rule-(ii) clause (a_W^red ∨ a_Y^blue) + forced φ(W)=Blue ∧ φ(Y)=Red ⇒ UNSAT"
+        );
+    }
+
+    /// Red-side firing smoke + τ end-to-end (the first pinned red-side
+    /// firing): φ(X)=Red forced —
+    /// eb(X)=false (the S=(X⇒Unit) branch's bare X̄ leaf sits at d2 RED,
+    /// outside the color-asymmetric window) and er(X)=true (the d1 X⁺
+    /// bare leaf) — with r_X = the X̄-labeled INNER spine, so the head
+    /// gate passes and the RED rule fires (the first pinned red-side
+    /// reduction).  Reduct ≙ νX.(S → Π₁): S enters as F_l⟨X̄⟩ (paper
+    /// L199, residues bound by the lifted ν) and the bare X⁺ site
+    /// gives the single Π₁ factor.  τ (via the atom reverse map for
+    /// the Unit atom head) lowers end-to-end.
+    #[test]
+    fn red_side_fires_internal_x_labeled_root() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let u = ctx.unit();
+        let s = ctx.function(smallvec![x], u); // (X⇒Unit)
+        let inner = ctx.function(smallvec![s, x], x); // (X⇒Unit)⇒X
+        let a = ctx.function(smallvec![inner], u); // inner ⇒ Unit
+        let ty = forall(&mut ctx, 0, a);
+
+        let ct = ctx.build_coherence_tree(ty).expect("Λ2");
+        let poly = from_occ(ct.root_tree());
+        let simple = standard_reduce(&poly)
+            .expect("φ(X)=Red forced, X̄-labeled internal root ⇒ red rule fires");
+        assert!(is_simple(&simple));
+        // Reduct shape (per flat dump): the ROOT is the Unit-atom spine
+        // above r_X (A's return is the Unit atom); the spliced X̄-headed
+        // reduct node is its single child — keeping its X̄ head, with the
+        // S spine (F_l⟨X̄⟩ residue) and the N-form θ = νX.Π₁ (single unit
+        // factor from the bare X⁺ site) as children.
+        match &simple {
+            Occ(root) => {
+                assert_eq!(root.children.len(), 1, "root spine: one child (inner)");
+                match root.children.last().expect("checked len") {
+                    Occ(n) if n.label == 0 && n.color == Color::Red => {
+                        match n.children.last() {
+                            Some(PolyProd {
+                                head: 0,
+                                binders,
+                                parts,
+                            }) => {
+                                assert!(binders.is_empty(), "no ∀Z⃗ for a bare site");
+                                assert_eq!(parts.len(), 1, "Π₁ from the bare X⁺ site");
+                            }
+                            other => panic!("expected trailing PolyProd head=X, got {other:?}"),
+                        }
+                        assert_eq!(n.children.len(), 2, "S (F_l⟨X̄⟩) + θ");
+                    }
+                    other => panic!("expected the spliced X̄-headed reduct node, got {other:?}"),
+                }
+            }
+            other => panic!("expected an Occ root spine, got {other:?}"),
+        }
+        // τ endpoint (reverse map + scope lift): the Unit atom head lowers
+        // via the reverse map; S's X̄ residue is ν-bound (a GenericParam
+        // inside the ν scope).
+        let m = ctx
+            .tau(&simple)
+            .expect("reverse map + scope lift lower the red reduct");
+        match ctx.get(m) {
+            TypeData::Fn { params, ret } => {
+                assert_eq!(params.len(), 1, "the Unit-atom spine has one param (S)");
+                match ctx.get(params[0]) {
+                    TypeData::Nu {
+                        param_index: 0,
+                        body,
+                        ..
+                    } => match ctx.get(*body) {
+                        TypeData::Fn {
+                            params: p2,
+                            ret: r2,
+                        } => {
+                            assert_eq!(p2.len(), 1, "S = (X̄⇒Unit) as F_l⟨X̄⟩");
+                            match ctx.get(p2[0]) {
+                                TypeData::Fn {
+                                    params: p3,
+                                    ret: r3,
+                                } => {
+                                    assert_eq!(p3.len(), 1);
+                                    assert!(ctx.is_generic_param(p3[0]), "ν-bound X̄ residue");
+                                    assert_eq!(*r3, u, "S's codomain is the Unit atom");
+                                }
+                                other => panic!("S shape: {other:?}"),
+                            }
+                            assert_eq!(*r2, u, "Π₁ ≙ Unit");
+                        }
+                        other => panic!("ν body: {other:?}"),
+                    },
+                    other => panic!("expected ν, got {other:?}"),
+                }
+                assert_eq!(*ret, u, "atom head via the reverse map");
+            }
+            other => panic!("expected the Unit-atom spine, got {other:?}"),
+        }
+    }
+
+    /// Thm 5.6 probe on the paper's own Example 5.1 type (Fig 7(b) t1 —
+    /// the d3 duel's t1). t1 is coherent with κ=0 (no down-moves: every
+    /// X̄ occurrence is a NON-terminal spine, so no alternating cycle), so
+    /// the paper's a-priori promise (κ≠∞ ⇒ rewrites to a monomorphic
+    /// type) applies. Engine trace (full, three iterations): X has NO head
+    /// occurrence — its occurrences are two X̄ branch-head spines and two
+    /// X⁺ d2 leaves, while r_X is the root headed Y⁺ — so the head gate
+    /// can never pass for X in EITHER color ⇒ X is never eliminable ⇒
+    /// standard_reduce = None. A LIVE Thm 5.6 violation on the paper's own
+    /// example: Fig. 9(a)'s figure ruling is LOAD-BEARING here. (If this
+    /// returns Some, the gate semantics moved — re-derive the figure
+    /// reading and Example 5.1's trace against the new semantics.)
+    #[test]
+    fn fig7b_t1_probe_coherent_but_engine_stuck() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let y = ctx.generic_param(1, "Y".into());
+        let z = ctx.generic_param(2, "Z".into());
+        let xx = ctx.function(smallvec![x], x);
+        let xz = ctx.function(smallvec![x], z);
+        let forall_z = ctx.forall(2, "Z".into(), xz);
+        let yx = ctx.function(smallvec![y], x);
+        let body = ctx.function(smallvec![xx, forall_z, yx], y);
+        let ty = ctx.forall(0, "X".into(), body);
+        let ty = ctx.forall(1, "Y".into(), ty);
+        let ct = ctx.build_coherence_tree(ty).expect("Λ2 t1");
+        // κ=1 (was 0 under the bare-only down-move target): Fig. 9(a)
+        // illustrates an alternate path in t1 itself — the X⁺ d2 leaf
+        // down-moves to the X̄ d1 BRANCH HEAD (modular per Def 5.7's
+        // "β is modular", the same predicate Def 5.2 quantifies over) and
+        // up-moves back ⇒ cyclic.  Thm 5.6 violation record stands and
+        // SHARPENS: a κ=1 type must strongly converge per Thm 5.6, yet the
+        // engine still head-gates (standard_reduce = None) — the violation
+        // moved from "κ=0 yet stuck" to "κ=1 yet stuck".
+        assert_eq!(ct.flat().characteristic(), 1, "coherent, cyclic (κ=1)");
+        let poly = from_occ(ct.root_tree());
+        assert!(
+            standard_reduce(&poly).is_none(),
+            "predicted: X head-gated forever (no X-colored head occurrence) ⇒ stuck"
+        );
+    }
+
+    /// Cancellation-family probe — ADJUDICATED (probe-refuted then
+    /// re-derived from the dump): ∀X.((A⇒X)⇒X)⇒C (A, C free).  The former
+    /// prediction ("coherent but refused") was WRONG on both counts:
+    ///   • place_binders sinks ∀X onto INNER, not the root — inner's own
+    ///     X̄ label IS an X occurrence, so LCA({inner, ax}) = inner (the
+    ///     sink's `here` short-circuit), and the current red gate
+    ///     (X̄-labeled root — the red_side_fires_internal_x_labeled_root
+    ///     family) legitimately fires;
+    ///   • the fired reduct is SOUND: the root C-spine survives, and the
+    ///     inner subtree ≙ νX.Π[A] ≅ A — matching the parametric truth
+    ///     ∀X.((A→X)→X) ≅ A (X:=A, feed id) ⇒ the whole type ≅ A→C.  (The
+    ///     former "truth ≅ C" claim used only the instantiation direction
+    ///     X:=A→0 — sound but incomplete; it cannot establish ≅.)
+    /// Textual note: this firing family (X̄-labeled r_X, red rule —
+    /// red_side_fires_internal_x_labeled_root and this probe, both sound)
+    /// has NO positive-tree rule-(b) textual LHS match under the verbatim
+    /// Prop 5.2 reading ("blue variable Y ≠ X"); it is the candidate
+    /// Fig-6(c)/(d) mechanism.  Parked with the same figure dependency as
+    /// the Y ≠ X RHS question — but the current red gate+RHS now stands
+    /// UNREFUTED on two sound probes.
+    #[test]
+    fn cancellation_family_reduces_soundly_via_red_rule() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let a = ctx.generic_param(1, "A".into());
+        let c = ctx.generic_param(2, "C".into());
+        let ax = ctx.function(smallvec![a], x); // (A⇒X)
+        let inner = ctx.function(smallvec![ax], x); // (A⇒X)⇒X
+        let body = ctx.function(smallvec![inner], c); // ((A⇒X)⇒X)⇒C
+        let ty = ctx.forall(0, "X".into(), body);
+        let ct = ctx.build_coherence_tree(ty).expect("Λ2");
+        assert_ne!(ct.flat().characteristic(), u8::MAX, "coherent (κ=0)");
+        let poly = from_occ(ct.root_tree());
+        let simple = standard_reduce(&poly).expect("red rule fires at the X̄-labeled r_X");
+        assert!(is_simple(&simple));
+        // Reduct shape (per dump): the C-headed root spine SURVIVES; the
+        // spliced inner node keeps its X̄ label; its sole child is the
+        // N-form θ = PolyProd{head: X, parts: [A]} (the A residue).
+        match &simple {
+            Occ(root) if root.label == 2 && root.color == Color::Blue => {
+                assert_eq!(root.children.len(), 1);
+                match root.children.last().expect("checked len") {
+                    Occ(n) if n.label == 0 && n.color == Color::Red => {
+                        assert!(n.binders.is_empty());
+                        match n.children.last() {
+                            Some(PolyProd {
+                                head: 0,
+                                binders,
+                                parts,
+                            }) => {
+                                assert!(binders.is_empty());
+                                assert_eq!(parts.len(), 1, "single A residue factor");
+                                match &parts[0] {
+                                    Occ(leaf) => assert_eq!(leaf.label, 1, "the A leaf"),
+                                    other => panic!("expected the A leaf, got {other:?}"),
+                                }
+                            }
+                            other => panic!("expected θ = PolyProd head=X, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected the X̄-headed red reduct node, got {other:?}"),
+                }
+            }
+            other => panic!("expected the surviving C-headed root spine, got {other:?}"),
+        }
+        // τ end-to-end: m ≙ (νX.A)⇒C ≅ A⇒C — the parametric truth.
+        let m = ctx.tau(&simple).expect("τ lowers the red reduct");
+        match ctx.get(m) {
+            TypeData::Fn { params, ret } => {
+                assert_eq!(params.len(), 1, "the C-spine has one param (the ν image)");
+                assert!(ctx.is_generic_param(*ret), "C survives as the codomain");
+                match ctx.get(params[0]) {
+                    TypeData::Nu {
+                        param_index: 0,
+                        body,
+                        ..
+                    } => match ctx.get(*body) {
+                        TypeData::Fn {
+                            params: p2,
+                            ret: r2,
+                        } => {
+                            assert!(p2.is_empty(), "the ν body is the A image (no params)");
+                            assert!(ctx.is_generic_param(*r2), "the A residue");
+                        }
+                        other => panic!("ν body: {other:?}"),
+                    },
+                    other => panic!("expected νX wrapping the A image, got {other:?}"),
+                }
+            }
+            other => panic!("expected the C-spine, got {other:?}"),
+        }
+    }
+
+    /// Regression pin for the foreign-θ guard: a Ȳ-headed red site whose
+    /// child is an EARLIER round's θ (µX.Σ[Y⁺spine⟨X⁺⟩] — X ctor-bound by
+    /// the FOREIGN µ).  Descending would lift the Y⁺ site out of the
+    /// foreign ctor's scope and strand the X⁺ leaf as a free factor under
+    /// the CURRENT θ (fvs() gains a free 0).  The guard refuses instead;
+    /// pinned by calling `yoneda_step` directly (the modular window makes
+    /// this shape unreachable from `standard_reduce` today — the guard
+    /// turns that window-arithmetic accident into a structural one).
+    #[test]
+    fn red_harvest_refuses_foreign_theta_descent() {
+        use super::super::coherence::Color as C2;
+        let x_leaf = Occ(RNode {
+            label: 0,
+            color: C2::Blue,
+            binders: Vec::new(),
+            children: Vec::new(),
+        });
+        let y_spine = Occ(RNode {
+            label: 1,
+            color: C2::Blue,
+            binders: Vec::new(),
+            children: vec![x_leaf],
+        });
+        let foreign_theta = PolySum {
+            head: 0,
+            parts: vec![(Vec::new(), vec![y_spine])],
+        };
+        let site = Occ(RNode {
+            label: 1, // Ȳ-headed site — the red gate passes (binders: [1])
+            color: C2::Red,
+            binders: vec![1],
+            children: vec![foreign_theta],
+        });
+        let step = yoneda_step(&site, 1, C2::Red);
+        assert!(
+            step.is_none(),
+            "foreign-θ guard must refuse descent into an earlier round's θ"
+        );
+    }
+
+    /// F2's third sound probe, end-to-end: ∀X.(X→X)→Y — the first
+    /// probe covering the "in-branch r_X + empty F_l" shape.  Premises
+    /// (machine-checked): eb(X)=false (h_X IS r_X, a==r ⇒ non-modular),
+    /// er(X)=true (the bare X⁺ leaf at d1) ⇒ φ(X)=Red forced.  Red rule
+    /// fires at the X̄-headed r_X; θ = νX.Π₁; reduct ≙ (νX.1)→Y ≅ 1→Y ≅ Y
+    /// — the parametric truth (∀X.((X→X)→Y) ≅ (∀X.X→X)→Y, feed the
+    /// witness to id).  νX.Π₁ is exactly the ∀X.X→X ≅ 1 quotient — F2's
+    /// ν-quotient semantics verified a third time
+    /// (red_side_fires_internal_x_labeled_root,
+    /// cancellation_family_reduces_soundly_via_red_rule, this).
+    #[test]
+    fn red_side_quotient_reduces_to_y() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let y = ctx.generic_param(1, "Y".into());
+        let xx = ctx.function(smallvec![x], x); // (X→X)
+        let body = ctx.function(smallvec![xx], y); // (X→X)→Y
+        let ty = ctx.forall(0, "X".into(), body);
+        let ct = ctx.build_coherence_tree(ty).expect("Λ2");
+        let ft = ct.flat();
+        // Premises: φ(X)=Red forced.
+        assert!(
+            !ft.color_eliminable(0, Color::Blue),
+            "eb(X)=false required (h_X is r_X itself, a==r ⇒ non-modular)"
+        );
+        assert!(
+            ft.color_eliminable(0, Color::Red),
+            "er(X)=true required (bare X⁺ leaf at d1, modular)"
+        );
+        assert_ne!(ft.characteristic(), u8::MAX, "coherent");
+        let poly = from_occ(ct.root_tree());
+        let simple = standard_reduce(&poly).expect("red rule fires at the X̄-headed r_X");
+        assert!(is_simple(&simple));
+        // Reduct shape: the Y-headed root spine survives; the spliced node
+        // keeps its X̄ label; its sole child is θ = νX.Π₁ (unit factor).
+        match &simple {
+            Occ(root) if root.label == 1 && root.color == Color::Blue => {
+                assert_eq!(root.children.len(), 1);
+                match root.children.last().expect("checked len") {
+                    Occ(n) if n.label == 0 && n.color == Color::Red => {
+                        assert!(n.binders.is_empty(), "x removed from the binder set");
+                        match n.children.last() {
+                            Some(PolyProd {
+                                head: 0,
+                                binders,
+                                parts,
+                            }) => {
+                                assert!(binders.is_empty());
+                                assert_eq!(parts.len(), 1, "Π₁ from the bare X⁺ site");
+                            }
+                            other => panic!("expected θ = PolyProd head=X, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected the X̄-headed red reduct node, got {other:?}"),
+                }
+            }
+            other => panic!("expected the surviving Y-headed root spine, got {other:?}"),
+        }
+        // τ end-to-end: m ≙ (νX.1)→Y ≅ Y — τ mints a fresh param name
+        // ("T1"), so assert is_generic_param, not equality (same precedent
+        // as tau_lowers_simple_tree).
+        let m = ctx.tau(&simple).expect("τ lowers the quotient reduct");
+        match ctx.get(m) {
+            TypeData::Fn { params, ret } => {
+                assert_eq!(params.len(), 1, "the Y-spine has one param (the ν image)");
+                assert!(ctx.is_generic_param(*ret), "Y survives as the codomain");
+                match ctx.get(params[0]) {
+                    TypeData::Nu {
+                        param_index: 0,
+                        body,
+                        ..
+                    } => match ctx.get(*body) {
+                        TypeData::Fn {
+                            params: p2,
+                            ret: r2,
+                        } => {
+                            assert!(p2.is_empty(), "the ν body is the Unit quotient");
+                            assert_eq!(*r2, ctx.unit(), "Π₁ ≙ Unit (the ∀X.X→X ≅ 1 quotient)");
+                        }
+                        other => panic!("ν body: {other:?}"),
+                    },
+                    other => panic!("expected νX wrapping the Unit quotient, got {other:?}"),
+                }
+            }
+            other => panic!("expected the Y-spine, got {other:?}"),
+        }
     }
 
     /// Paper Fig. 2 (§1.1) six-inhabitant chain — the INITIAL type:
@@ -1100,13 +1848,13 @@ pub(crate) fn unit_leaf() -> PolyTree {
     })
 }
 
-// ─── Stage 5b (v1): witness / coercion generation ────────────────────────
+// ─── Witness / coercion generation (App. A) ──────────────────────────────
 //
 // The paper (App. A) constructs explicit *term-level* witnesses for the
 // two Yoneda schemas: s[x]/t[x] for (Y⁺) (built from in_Σ, pack, fold_T
 // and their duals) and u[x]/v[x] for (Y⁻) (built from π_Π, out_U,
 // unfold_U).  A full elaboration-level term generator needs an
-// AST/HIR term constructor with fold/unfold/pack/unpack; this v1 slice
+// AST/HIR term constructor with fold/unfold/pack/unpack; this slice
 // provides the *type-level* half of the witness pair:
 //
 //   - reduce A's tree to a simple P₀ tree (standard reduction),
@@ -1142,7 +1890,7 @@ impl<'input> TypeContext<'input> {
     /// Produce the coercion witness `A ⇄ M` where M = τ(reduct) of A's
     /// standard reduction.  `want` selects the direction.
     ///
-    /// B6 (certification semantics, doc/impl aligned): a direction is
+    /// Certification semantics (doc/impl aligned): a direction is
     /// CERTIFIED exactly when (a) the parametricity gate is open, (b) A
     /// lowers to a coherent Λ2 tree, (c) the standard reduction succeeds,
     /// and (d) τ lowers the reduct.  No separate equivalence check runs —
@@ -1216,15 +1964,44 @@ mod witness_tests {
         assert!(ctx.yoneda_round_trip(ty).is_none());
     }
 
-    /// Example 3.1's type is COHERENT per the corrected §5 2-SAT (κ=1,
-    /// see `golden_example_3_1_unique_inhabitant`), so its standard
-    /// reduction converges and the type-level witness pair exists — the
-    /// earlier "incoherent ⇒ no witness" premise was a mis-translation of
-    /// Notation 5.1 (paper-parallel = paper siblings; labels live on
-    /// leaves, so same-label spines under different parents are not
-    /// parallel).
+    /// Paper Example 3.1 (arXiv:1907.03481v3 L70-72, verbatim — second
+    /// parameter is (Y⇒Z), see golden_example_3_1_tree_is_incoherent).
+    /// Tree-level verdict: κ=∞ ⇒ no Yoneda coercion, no round-trip
+    /// witness — the App. A ≡ theory that proves ≅ 1 in §3 is strictly
+    /// stronger than the §5 machinery, which fails closed here.
     #[test]
-    fn witness_example_3_1_round_trip() {
+    fn witness_example_3_1_incoherent_no_witness() {
+        let mut ctx = TypeContext::new();
+        let x = ctx.generic_param(0, "X".into());
+        let y = ctx.generic_param(1, "Y".into());
+        let z = ctx.generic_param(2, "Z".into());
+        let w = ctx.generic_param(3, "W".into());
+        let xy = ctx.function(smallvec![x], y);
+        let xz = ctx.function(smallvec![x], z);
+        let inner = ctx.function(smallvec![xy], xz);
+        let yz = ctx.function(smallvec![y], z);
+        let mid = ctx.function(smallvec![inner, yz], w);
+        let a = ctx.function(smallvec![mid, yz], w);
+        let ty = ctx.forall(0, "X".into(), a);
+        let ty = ctx.forall(1, "Y".into(), ty);
+        let ty = ctx.forall(2, "Z".into(), ty);
+        let ty = ctx.forall(3, "W".into(), ty);
+
+        // Gate open (tree builds), κ=∞ ⇒ everything downstream refused.
+        assert!(ctx.build_coherence_tree(ty).is_some(), "tree builds");
+        assert!(ctx.yoneda_coercion(ty, YonedaDirection::Elim).is_none());
+        assert!(ctx.yoneda_round_trip(ty).is_none());
+    }
+
+    /// The (Y⇒W) variant — coherent (κ=1, golden unchanged), but the head gate
+    /// refuses the reduction: X's r_X is the Z-headed inner spine
+    /// (label Z ≠ X) — not an X-labeled LHS instance.  The former
+    /// "manually verified" 4-step trace checked CONVERGENCE only; the
+    /// semantic soundness of that step family is refuted by the
+    /// non-X-head counterexamples (∀X.(X⇒B)⇒(X⇒C)⇒D ↠ …≅ 0 vs ≅ D).
+    /// The type joins the coherent-but-stuck family (see yoneda_step's comment).
+    #[test]
+    fn witness_two_continuation_branches_round_trip() {
         let mut ctx = TypeContext::new();
         let x = ctx.generic_param(0, "X".into());
         let y = ctx.generic_param(1, "Y".into());
@@ -1242,17 +2019,15 @@ mod witness_tests {
         let ty = ctx.forall(2, "Z".into(), ty);
         let ty = ctx.forall(3, "W".into(), ty);
 
-        // Coherent (κ=1) ⇒ standard reduction converges ⇒ round-trip
-        // witness exists, mutually inverse at the type level.
-        let (elim, intro) = ctx
-            .yoneda_round_trip(ty)
-            .expect("coherent per Thm 5.6 ⇒ round-trip witness");
-        assert_eq!(elim.source, intro.target);
-        assert_eq!(elim.target, intro.source);
+        // κ=1 (tree-level golden unchanged) but the X step's site root
+        // is Z-headed ⇒ no coercion, no round-trip witness.
+        assert!(ctx.yoneda_round_trip(ty).is_none());
     }
 
     /// Probe (follow-up): pin WHERE the Example 3.1 witness pipeline
     /// runs — build → reduce → τ — so a regression names the stage.
+    /// Paper type (second parameter (Y⇒Z), κ=∞): the gate stays open but
+    /// standard reduction is refused, so stages 2–3 never fire.
     #[test]
     fn witness_example_3_1_pipeline_stages() {
         let mut ctx = TypeContext::new();
@@ -1264,9 +2039,8 @@ mod witness_tests {
         let xz = ctx.function(smallvec![x], z);
         let inner = ctx.function(smallvec![xy], xz);
         let yz = ctx.function(smallvec![y], z);
-        let yw = ctx.function(smallvec![y], w);
         let mid = ctx.function(smallvec![inner, yz], w);
-        let a = ctx.function(smallvec![mid, yw], w);
+        let a = ctx.function(smallvec![mid, yz], w);
         let ty = ctx.forall(0, "X".into(), a);
         let ty = ctx.forall(1, "Y".into(), ty);
         let ty = ctx.forall(2, "Z".into(), ty);
@@ -1274,10 +2048,10 @@ mod witness_tests {
 
         let ct = ctx.build_coherence_tree(ty).expect("stage 1: Λ2 tree");
         let poly = from_occ(ct.root_tree());
-        let simple = standard_reduce(&poly).expect("stage 2: standard reduction");
-        assert!(is_simple(&simple));
-        let m = ctx.tau(&simple).expect("stage 3: τ lowering");
-        assert_ne!(m, ty, "τ endpoint is the monomorphic reduct, not A");
+        assert!(
+            standard_reduce(&poly).is_none(),
+            "stage 2: incoherent (κ=∞) ⇒ standard reduction refused"
+        );
     }
 
     /// An incoherent type admits no witness at all (κ=∞ ⇒ no reduction).

@@ -396,11 +396,12 @@ pub(crate) fn parse_byte_string_literal(s: &str) -> Result<Cow<'_, [u8]>, LitErr
     Ok(Cow::Owned(result))
 }
 
-pub(crate) fn parse_int_literal(
+pub(crate) fn parse_int_literal<'input>(
+    bump: &'input bumpalo::Bump,
     s: &str,
     radix: u32,
     overflow_msg: &str,
-) -> Result<IntLit, LitError> {
+) -> Result<IntLit<'input>, LitError> {
     // Error construction is LAZY (`ok_or_else`): `LitError::from` interns,
     // and the invalid-digit / overflow arms are unreachable for
     // regex-matched input — an eager `ok_or(LitError::from(..))` pays a
@@ -443,22 +444,23 @@ pub(crate) fn parse_int_literal(
             );
             acc = acc * u128::from(radix) + d;
         }
-        return Ok(int_lit_from_u128(acc));
+        return Ok(int_lit_from_u128(bump, acc));
     }
     // Slow path — cold: only reached for literals too long to fit in u128
     // without checked arithmetic (≥ 39 decimal digits, ≥ 33 hex, ≥ 129 bin).
-    parse_int_literal_slow(s, radix, overflow_msg)
+    parse_int_literal_slow(bump, s, radix, overflow_msg)
 }
 
 /// Checked-accumulation path for integer literals too long for the fast
 /// unchecked loop.  Cold: reached only when the digit run exceeds the
 /// provable-fit bound for `radix`.
 #[cold]
-fn parse_int_literal_slow(
+fn parse_int_literal_slow<'input>(
+    bump: &'input bumpalo::Bump,
     s: &str,
     radix: u32,
     overflow_msg: &str,
-) -> Result<IntLit, LitError> {
+) -> Result<IntLit<'input>, LitError> {
     let mut acc: u128 = 0;
     for c in s.chars() {
         if c == '_' {
@@ -473,7 +475,7 @@ fn parse_int_literal_slow(
             .and_then(|v| v.checked_add(d))
             .ok_or_else(|| LitError::from(overflow_msg))?;
     }
-    Ok(int_lit_from_u128(acc))
+    Ok(int_lit_from_u128(bump, acc))
 }
 
 /// Split an unsigned 128-bit accumulator into the AST's small/large
@@ -482,10 +484,10 @@ fn parse_int_literal_slow(
 /// integer type, `UInt<128>` — becomes a `BigInt`.  Both integer
 /// scanners funnel through here so the split cannot drift between the
 /// suffixed and unsuffixed paths.
-fn int_lit_from_u128(acc: u128) -> IntLit {
+fn int_lit_from_u128<'input>(bump: &'input bumpalo::Bump, acc: u128) -> IntLit<'input> {
     match i128::try_from(acc) {
         Ok(v) => IntLit::Small(v),
-        Err(_) => IntLit::Large(Box::new(BigInt::from(acc))),
+        Err(_) => IntLit::Large(bump.alloc(BigInt::from(acc))),
     }
 }
 
@@ -515,7 +517,11 @@ fn int_lit_from_u128(acc: u128) -> IntLit {
 /// nor `u` is a valid digit in any of the three radixes — the first
 /// `i`/`u` byte always terminates the digit run, with no radix
 /// awareness needed.
-pub(crate) fn parse_suffixed_int_literal(s: &str, radix: u32) -> Option<(IntLit, u32)> {
+pub(crate) fn parse_suffixed_int_literal<'input>(
+    bump: &'input bumpalo::Bump,
+    s: &str,
+    radix: u32,
+) -> Option<(IntLit<'input>, u32)> {
     // Skip the `0x` / `0b` prefix (the hex/bin regexes guarantee it); a
     // short slice fails closed instead of panicking on `&s[2..]`.
     let body = match radix {
@@ -566,22 +572,23 @@ pub(crate) fn parse_suffixed_int_literal(s: &str, radix: u32) -> Option<(IntLit,
             let d = u128::from(char::from(b).to_digit(radix)?);
             acc = acc * u128::from(radix) + d;
         }
-        return Some((int_lit_from_u128(acc), width));
+        return Some((int_lit_from_u128(bump, acc), width));
     }
     // Slow path — cold: only reached for runs too long to prove fit in u128
     // without checked arithmetic.
-    parse_suffixed_int_literal_slow(digits, radix, width)
+    parse_suffixed_int_literal_slow(bump, digits, radix, width)
 }
 
 /// Checked-accumulation path for a suffixed integer literal's digit run that
 /// exceeds the fast path's provable-fit bound.  Cold: reached only when the
 /// run is ≥ 39 decimal / 33 hex / 129 binary digits.
 #[cold]
-fn parse_suffixed_int_literal_slow(
+fn parse_suffixed_int_literal_slow<'input>(
+    bump: &'input bumpalo::Bump,
     digits: &str,
     radix: u32,
     width: u32,
-) -> Option<(IntLit, u32)> {
+) -> Option<(IntLit<'input>, u32)> {
     let mut acc: u128 = 0;
     for c in digits.chars() {
         if c == '_' {
@@ -590,7 +597,7 @@ fn parse_suffixed_int_literal_slow(
         let d = u128::from(c.to_digit(radix)?);
         acc = acc.checked_mul(u128::from(radix))?.checked_add(d)?;
     }
-    Some((int_lit_from_u128(acc), width))
+    Some((int_lit_from_u128(bump, acc), width))
 }
 
 /// Parse a float literal.  The fast path parses the ORIGINAL slice

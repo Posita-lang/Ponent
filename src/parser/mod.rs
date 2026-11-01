@@ -5,10 +5,10 @@
 
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
+use crate::diagnostics::ErrCode;
 use crate::lexer::Token;
 use crate::symbol::Symbol;
 use bitflags::bitflags;
-use logos::Logos;
 use std::mem;
 
 // ── Track‑A (Engineering Canon) ──────────────────────────────────────────────
@@ -49,7 +49,8 @@ mod tests;
 // -----------------------------------------------------------------------------
 pub(crate) use recovery::osa_distance_limited_into;
 pub use recovery::{
-    KeywordContext, SuggestionBuffers, did_you_mean_keyword, did_you_mean_keyword_with_buffers,
+    KeywordContext, KeywordSet, SuggestionBuffers, did_you_mean_keyword, did_you_mean_keyword_for,
+    did_you_mean_keyword_for_with_buffers, did_you_mean_keyword_with_buffers, keyword_sets,
 };
 
 // -----------------------------------------------------------------------------
@@ -63,21 +64,6 @@ pub enum Recovery {
     Forbidden,
 }
 
-/// A token that the parser expects, used for error recovery.
-#[derive(Debug, Clone)]
-pub struct ExpectedToken<'src> {
-    /// The expected token kind.
-    pub tok: Token<'src>,
-    /// A human-readable description of what was expected.
-    pub desc: &'static str,
-}
-
-impl<'src> ExpectedToken<'src> {
-    pub fn new(tok: Token<'src>, desc: &'static str) -> Self {
-        ExpectedToken { tok, desc }
-    }
-}
-
 /// Result of parser recovery (rustc-style).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovered {
@@ -85,15 +71,21 @@ pub enum Recovered {
     Yes(ErrorGuaranteed),
 }
 
-/// A token representing that an error has been reported (rustc-style).
+/// Zero-sized proof that a diagnostic has been reported (rustc-style).
+///
+/// The type deliberately carries no payload: consumers only need the
+/// guarantee that an error was emitted, and a ZST makes that proof free to
+/// pass around (and lets `Option`/`Result` niche-optimize it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ErrorGuaranteed(u32);
+pub struct ErrorGuaranteed(());
 
 impl ErrorGuaranteed {
-    pub fn new_unchecked(id: u32) -> Self {
-        ErrorGuaranteed(id)
+    pub const fn new_unchecked() -> Self {
+        ErrorGuaranteed(())
     }
 }
+
+const _: () = assert!(std::mem::size_of::<ErrorGuaranteed>() == 0);
 
 bitflags! {
     /// Parse‑time context restrictions that influence how tokens are interpreted.
@@ -126,11 +118,45 @@ struct SpannedToken<'src> {
 /// Created by [`Parser::checkpoint`] and restored by [`Parser::restore`].
 /// Inspired by rustc's `Parser::checkpoint` / `Parser::rewind`.
 struct Checkpoint<'src> {
-    cursor: usize,
-    peeked: Option<Result<Token<'src>, ()>>,
+    cursor: TokenIndex,
+    peeked: Option<Token<'src>>,
     pending: Vec<Token<'src>>,
     progress: u64,
     sync_stall: Option<u64>,
+}
+
+// -----------------------------------------------------------------------------
+// Restriction RAII guard
+// -----------------------------------------------------------------------------
+
+/// Restores the parser's [`ParseRestrictions`] to the value captured at
+/// [`Parser::push_restrictions`] time when dropped.  Derefs to the parser so
+/// the guarded scope can keep parsing through the guard itself.
+struct RestrictionsGuard<'p, 'src, 'input> {
+    saved: ParseRestrictions,
+    parser: &'p mut Parser<'src, 'input>,
+}
+
+impl<'src, 'input> std::ops::Deref for RestrictionsGuard<'_, 'src, 'input> {
+    type Target = Parser<'src, 'input>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.parser
+    }
+}
+
+impl<'src, 'input> std::ops::DerefMut for RestrictionsGuard<'_, 'src, 'input> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.parser
+    }
+}
+
+impl Drop for RestrictionsGuard<'_, '_, '_> {
+    fn drop(&mut self) {
+        self.parser.restrictions = self.saved;
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -152,8 +178,8 @@ pub struct Parser<'src, 'input> {
     /// The file this source was registered as; stamped into every span.
     file_id: FileId,
     tokens: Vec<SpannedToken<'src>>,
-    cursor: usize,
-    peeked: Option<Result<Token<'src>, ()>>,
+    cursor: TokenIndex,
+    peeked: Option<Token<'src>>,
     pending: Vec<Token<'src>>,
     pub diagnostics: Vec<Diagnostic<'src>>,
     recursion_depth: usize,
@@ -168,8 +194,6 @@ pub struct Parser<'src, 'input> {
     recovery: Recovery,
     /// Span of the last unexpected token, used to detect infinite recovery loops.
     last_unexpected_token_span: Option<Span>,
-    /// Stack of expected token types for better error messages.
-    expected_token_types: Vec<ExpectedToken<'src>>,
     /// Monotonic count of tokens consumed by `advance` — detects
     /// zero-progress error-recovery loops (the stall detector).
     progress: u64,
@@ -234,7 +258,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                         text: body,
                         // Anchor: the next semantic token to be pushed —
                         // the item this doc documents.
-                        anchor: tokens.len(),
+                        anchor: TokenIndex::new(tokens.len()),
                         is_module,
                         span: mk_span(span_range.start, span_range.end),
                     });
@@ -280,14 +304,14 @@ impl<'src, 'input> Parser<'src, 'input> {
             // hashed (StableHash contract).
             doc_map
                 .token_offsets
-                .push((span.start, span.end));
+                .push((ByteOffset::new(span.start), ByteOffset::new(span.end)));
         }
         Parser {
             arena,
             source,
             file_id,
             tokens,
-            cursor: 0,
+            cursor: TokenIndex::ZERO,
             peeked: None,
             pending: Vec::new(),
             diagnostics,
@@ -297,7 +321,6 @@ impl<'src, 'input> Parser<'src, 'input> {
             cascade_suppressed: false,
             recovery: Recovery::Allowed,
             last_unexpected_token_span: None,
-            expected_token_types: Vec::new(),
             progress: 0,
             sync_stall: None,
             suggestion_buffers: SuggestionBuffers::default(),
@@ -314,10 +337,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         bump.alloc(val)
     }
 
-    fn alloc_slice<T: Clone>(
-        bump: &'input bumpalo::Bump,
-        v: &[T],
-    ) -> &'input [T] {
+    fn alloc_slice<T: Clone>(bump: &'input bumpalo::Bump, v: &[T]) -> &'input [T] {
         bump.alloc_slice_clone(v)
     }
 
@@ -332,7 +352,7 @@ impl<'src, 'input> Parser<'src, 'input> {
     /// token position of the item being parsed) and merge their texts
     /// into one doc string.  Module-level docs (`//!`) are left in the
     /// channel — they are not item docs.
-    fn take_doc_for_anchor(&mut self, anchor: usize) -> Option<String> {
+    fn take_doc_for_anchor(&mut self, anchor: TokenIndex) -> Option<String> {
         let mut iter = self
             .doc_map
             .docs
@@ -358,33 +378,33 @@ impl<'src, 'input> Parser<'src, 'input> {
         Some(s)
     }
 
-    fn next_token(&mut self) -> Result<Token<'src>, ()> {
+    fn next_token(&mut self) -> Option<Token<'src>> {
         // Check the pending stack first (e.g. Shr-split Gt).
         if let Some(tok) = self.pending.pop() {
-            return Ok(tok);
+            return Some(tok);
         }
-        if self.cursor < self.tokens.len() {
-            let st = &self.tokens[self.cursor];
-            self.cursor += 1;
-            Ok(st.token.clone())
+        if self.cursor.as_usize() < self.tokens.len() {
+            let st = &self.tokens[self.cursor.as_usize()];
+            self.cursor = TokenIndex::new(self.cursor.as_usize() + 1);
+            Some(st.token.clone())
         } else {
-            Err(())
+            None
         }
     }
 
-    fn peek(&mut self) -> &Result<Token<'src>, ()> {
+    fn peek(&mut self) -> &Option<Token<'src>> {
         if self.peeked.is_none() {
-            self.peeked = Some(self.next_token());
+            self.peeked = self.next_token();
         }
-        self.peeked.as_ref().expect("peek called before next_token")
+        &self.peeked
     }
 
-    fn advance(&mut self) -> Result<Token<'src>, ()> {
+    fn advance(&mut self) -> Option<Token<'src>> {
         let tok = match self.peeked.take() {
-            Some(tok) => tok,
+            Some(tok) => Some(tok),
             None => self.next_token(),
         };
-        if tok.is_ok() {
+        if tok.is_some() {
             self.progress += 1;
         }
         tok
@@ -417,17 +437,18 @@ impl<'src, 'input> Parser<'src, 'input> {
             if self.pending.len() > 1 {
                 return Some(&self.pending[self.pending.len() - 2]);
             }
-            return self.tokens.get(self.cursor).map(|st| &st.token);
+            return self.tokens.get(self.cursor.as_usize()).map(|st| &st.token);
         }
         self.peek();
-        self.tokens.get(self.cursor).map(|st| &st.token)
+        self.tokens.get(self.cursor.as_usize()).map(|st| &st.token)
     }
 
     fn span(&self) -> Span {
-        if self.cursor > 0 && self.cursor - 1 < self.tokens.len() {
-            self.tokens[self.cursor - 1].span
-        } else if self.cursor < self.tokens.len() {
-            self.tokens[self.cursor].span
+        let c = self.cursor.as_usize();
+        if c > 0 && c - 1 < self.tokens.len() {
+            self.tokens[c - 1].span
+        } else if c < self.tokens.len() {
+            self.tokens[c].span
         } else if !self.tokens.is_empty() {
             self.tokens[self.tokens.len() - 1].span
         } else {
@@ -440,17 +461,17 @@ impl<'src, 'input> Parser<'src, 'input> {
     // -------------------------------------------------------------------------
 
     pub fn expect(&mut self, expected: Token<'src>) -> Result<Token<'src>, Diagnostic<'src>> {
-        if matches!(self.peek(), Ok(tok) if tok == &expected) {
-            self.advance().ok();
+        if matches!(self.peek(), Some(tok) if tok == &expected) {
+            self.advance();
             Ok(expected)
         } else {
             let found = match self.peek() {
-                Ok(tok) => format!("{:?}", tok),
-                Err(()) => "end of file".to_string(),
+                Some(tok) => format!("{:?}", tok),
+                None => "end of file".to_string(),
             };
             Err(
                 Diagnostic::error(format!("expected {:?}, found {}", expected, found))
-                    .with_code_str("E001")
+                    .with_code_str(ErrCode::E001)
                     .with_help(format!(
                         "expected `{:?}` but saw `{}` — check for missing or extra tokens",
                         expected, found
@@ -471,17 +492,17 @@ impl<'src, 'input> Parser<'src, 'input> {
     /// onto the pending stack for the outer generic level.
     fn expect_gt(&mut self) -> Result<(), Diagnostic<'src>> {
         match self.peek() {
-            Ok(Token::Gt) => {
-                self.advance().ok();
+            Some(Token::Gt) => {
+                self.advance();
                 Ok(())
             }
-            Ok(Token::Shr) => {
-                self.advance().ok();
+            Some(Token::Shr) => {
+                self.advance();
                 self.pending.push(Token::Gt);
                 Ok(())
             }
             _ => Err(Diagnostic::error("expected '>'")
-                .with_code_str("E004")
+                .with_code_str(ErrCode::E004)
                 .with_span(self.span())),
         }
     }
@@ -492,13 +513,13 @@ impl<'src, 'input> Parser<'src, 'input> {
         inedible: &[Token<'src>],
     ) -> Result<Recovered, ()> {
         for exp in edible {
-            if matches!(self.peek(), Ok(tok) if tok == exp) {
-                self.advance().ok();
+            if matches!(self.peek(), Some(tok) if tok == exp) {
+                self.advance();
                 return Ok(Recovered::No);
             }
         }
         for exp in inedible {
-            if matches!(self.peek(), Ok(tok) if tok == exp) {
+            if matches!(self.peek(), Some(tok) if tok == exp) {
                 return Ok(Recovered::No);
             }
         }
@@ -518,7 +539,7 @@ impl<'src, 'input> Parser<'src, 'input> {
             cursor: self.cursor,
             // `None` is preserved as `None`: `restore` puts it back, and a
             // later `peek` lazily re-reads the next token.  (The previous
-            // `unwrap_or(Ok(Token::WhitespaceOrComment))` fabricated a
+            // `unwrap_or(Some(Token::WhitespaceOrComment))` fabricated a
             // phantom token that `restore` would have handed to `peek` as
             // if it came from the stream.  Unreachable today only because
             // every live checkpoint site peeks first.)
@@ -602,6 +623,20 @@ impl<'src, 'input> Parser<'src, 'input> {
         result
     }
 
+    /// RAII counterpart to [`Parser::with_restrictions`]: push `add` onto
+    /// the restriction set and get a guard that restores the previous set
+    /// on drop.  Reads better than nested closures at call sites that
+    /// already thread `&mut self` through several levels — take the guard,
+    /// call through it (it derefs to [`Parser`]), and the scope end undoes
+    /// the push even on `?` early-return.
+    fn push_restrictions(&mut self, add: ParseRestrictions) -> RestrictionsGuard<'_, 'src, 'input> {
+        self.restrictions |= add;
+        RestrictionsGuard {
+            saved: self.restrictions,
+            parser: self,
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Recovery mode
     // -------------------------------------------------------------------------
@@ -620,15 +655,6 @@ impl<'src, 'input> Parser<'src, 'input> {
         let result = f(self);
         self.recovery = old;
         result
-    }
-
-    fn push_expected(&mut self, tok: Token<'src>, desc: &'static str) {
-        self.expected_token_types
-            .push(ExpectedToken::new(tok, desc));
-    }
-
-    fn pop_expected(&mut self) {
-        self.expected_token_types.pop();
     }
 
     // -------------------------------------------------------------------------
@@ -652,12 +678,18 @@ impl<'src, 'input> Parser<'src, 'input> {
     /// continue after each error, so multiple diagnostics may be returned.
     #[must_use]
     pub fn parse_program(&mut self) -> Result<Program<'input, 'src>, Vec<Diagnostic<'src>>> {
-        // Take exclusive allocation access for the whole parse: the raw
-        // `&Bump` threaded through the grammar is sound only while this scope
-        // holds `alloc_lock` (see `crate::arena`).  The scope drops at return,
-        // before any post-parse allocation, so it cannot deadlock the checker.
+        // Take exclusive access to the backing bump for the whole parse: the
+        // raw `&Bump` threaded through the grammar is sound only while this
+        // scope holds `alloc_lock` (see `crate::arena`).  The scope drops at
+        // return, before any post-parse allocation, so it cannot deadlock the
+        // checker.
         let scope = self.arena.scope();
-        self.parse_program_inner(scope.bump())
+        // SAFETY: `parse_program_inner` only ever threads `bump` through the
+        // grammar as a parameter; it never stores the reference in the AST or
+        // anywhere else that outlives this call.  Values *allocated* through
+        // it are owned by the arena for `'input` and may safely escape.
+        let bump = unsafe { scope.bump_unchecked() };
+        self.parse_program_inner(bump)
     }
 
     fn parse_program_inner(
@@ -665,13 +697,13 @@ impl<'src, 'input> Parser<'src, 'input> {
         bump: &'input bumpalo::Bump,
     ) -> Result<Program<'input, 'src>, Vec<Diagnostic<'src>>> {
         let start = self.span().start;
-        let mut items = Vec::new();
+        let mut items: Vec<Item<'input>> = Vec::new();
         loop {
             match self.peek() {
-                Err(()) => break,
+                None => break,
                 _ => match self.parse_item(bump) {
                     Ok(item) => {
-                        if !matches!(item, Stmt::Error(_)) {
+                        if !matches!(item, Item::Error(_)) {
                             self.cascade_suppressed = false;
                         }
                         items.push(item);

@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// to `cargo:warning` and hard-fails on validation errors.
 fn generate_error_codes(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = env::var_os("CARGO_MANIFEST_DIR").ok_or("CARGO_MANIFEST_DIR not set")?;
-    let outcome = ponent_codegen::collect(&PathBuf::from(manifest));
+    let outcome = ponent_codegen::collect(&PathBuf::from(&manifest));
     for lint in &outcome.lints {
         println!("cargo:warning={lint}");
     }
@@ -83,5 +83,11 @@ fn generate_error_codes(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>
         return Err(outcome.errors.join("\n").into());
     }
     ponent_codegen::write_generated(&out_dir.join("error_codes_gen.rs"), &outcome.generated)?;
+
+    // Generate typed Fluent slug functions from locales/en.ftl.
+    let fluent_src =
+        ponent_codegen::generate_fluent_functions(&PathBuf::from(manifest).join("locales"));
+    ponent_codegen::write_generated(&out_dir.join("fluent_gen.rs"), &fluent_src)?;
+
     Ok(())
 }

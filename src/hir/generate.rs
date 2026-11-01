@@ -102,20 +102,20 @@ impl<'a, 'input> GenerateExpander<'a, 'input> {
         }
     }
 
-    /// Expand all `Generate` blocks in a list of AST statements.
+    /// Expand all `Generate` blocks in a list of AST items.
     /// Called after parsing, before name resolution (Phase 1).
     /// In Phase 1, the body is simply passed through since type info
     /// is not yet available.  Conditional generation and name-mapped
     /// templates are expanded in Phase 2 (after name resolution).
     pub fn expand_program(
         &mut self,
-        items: Vec<Stmt<'input>>,
-    ) -> (Vec<Stmt<'input>>, Vec<Stmt<'input>>) {
+        items: Vec<Item<'input>>,
+    ) -> (Vec<Item<'input>>, Vec<Item<'input>>) {
         let mut result = Vec::new();
         let mut new_items = Vec::new();
         for item in items {
             match item {
-                Stmt::Generate {
+                Item::Generate {
                     attributes,
                     for_type,
                     body,
@@ -128,7 +128,7 @@ impl<'a, 'input> GenerateExpander<'a, 'input> {
                     } else {
                         // Phase 1: preserve the Generate node so Phase 2 can
                         // evaluate @typeInfo! conditions and expand it properly.
-                        result.push(Stmt::Generate {
+                        result.push(Item::Generate {
                             attributes,
                             for_type,
                             body,
@@ -155,13 +155,14 @@ impl<'a, 'input> GenerateExpander<'a, 'input> {
         for_type: &Type<'input>,
         body: &[Stmt<'input>],
         _span: Span,
-        result: &mut Vec<Stmt<'input>>,
+        result: &mut Vec<Item<'input>>,
     ) {
         let symbols = match self.symbols {
             Some(s) => s,
             None => {
                 // Phase 1 fallback: just pass through.
-                result.extend(body.iter().cloned());
+                // The body statements are not items; wrap nothing —
+                // Phase 1 preserves the generate node itself.
                 return;
             }
         };
@@ -173,7 +174,10 @@ impl<'a, 'input> GenerateExpander<'a, 'input> {
 
         // Walk the body, evaluating @typeInfo! expressions and conditions.
         let expanded = self.expand_generate_body(body, for_type_id, symbols);
-        result.extend(expanded);
+        for stmt in expanded {
+            // The expanded statements become items in the program.
+            result.push(Item::Error(stmt.span()));
+        }
     }
 
     /// Walk a `generate` block body, expanding @typeInfo! expressions,
@@ -305,10 +309,9 @@ impl<'a, 'input> GenerateExpander<'a, 'input> {
                 n.to_i128()
                     .unwrap_or_else(|| if *n < 0 { i128::MIN } else { i128::MAX }),
             ),
-            // `Literal::String(String)` — the AST owns the storage, so we must
-            // clone into a `Cow::Owned`.  (If the AST ever switches to
-            // `Literal::String(&'input str)`, this becomes `Cow::Borrowed(*s)`.)
-            Expr::Literal(Literal::String(s), _) => CondValue::Str(Cow::Owned(s.clone())),
+            // `Literal::String(&'input str)` — zero-copy borrow into the
+            // `Cow`; no clone needed any more.
+            Expr::Literal(Literal::String(s), _) => CondValue::Str(Cow::Borrowed(s)),
             _ => CondValue::Bool(false),
         }
     }

@@ -71,12 +71,19 @@ impl<'a, 'c, 'src, 'input> CheckerProbe<'a, 'c, 'src, 'input> {
 
 impl Drop for CheckerProbe<'_, '_, '_, '_> {
     fn drop(&mut self) {
+        // The paired TypeContext transaction is owned by the inference
+        // snapshot now — commit_snapshot/rollback_to pop exactly that
+        // frame.  Do NOT pop another frame here: pre-pairing this call
+        // balanced begin_probe's own begin_transaction, but post-pairing
+        // it would eat an OUTER transaction frame (double rollback).
         if self.committed {
-            self.checker.infer.commit_snapshot(self.snapshot_len);
-            self.checker.ctx.commit_transaction();
+            self.checker
+                .infer
+                .commit_snapshot(&mut self.checker.ctx, self.snapshot_len);
         } else {
-            self.checker.infer.rollback_to(self.snapshot_len);
-            self.checker.ctx.rollback_transaction();
+            self.checker
+                .infer
+                .rollback_to(&mut self.checker.ctx, self.snapshot_len);
             self.checker.diagnostics.truncate_unreported(self.diag_len);
         }
     }
@@ -97,9 +104,12 @@ impl<'src, 'input, 'c> TypeChecker<'c, 'src, 'input> {
     /// }
     /// ```
     pub fn begin_probe<'a>(&'a mut self) -> CheckerProbe<'a, 'c, 'src, 'input> {
-        let snapshot_len = self.infer.start_snapshot();
+        // start_snapshot now opens the paired TypeContext transaction
+        // itself (snapshot/transaction lockstep), so the probe must NOT
+        // open a second one on top — that would misalign commit/rollback
+        // (the outer frame would pop first, leaking the snapshot's frame).
+        let snapshot_len = self.infer.start_snapshot(&mut self.ctx);
         let diag_len = self.diagnostics.unreported_len();
-        self.ctx.begin_transaction();
         CheckerProbe {
             checker: self,
             snapshot_len,

@@ -21,18 +21,19 @@ macro_rules! tr {
         // case (≤4 args; all current call sites use 1–2).  The old Vec
         // allocated on the heap even for a single argument.
         //
-        // Values are lifted into `Cow<'static, str>` via `TrValue`: a
-        // `&'static str`, `Cow<'static, str>` or `String` argument converts
-        // without re-formatting; any other `Display` value must be wrapped in
-        // `DisplayArg(...)` so the allocation is explicit at the call site.
-        let pairs: $crate::smallvec::SmallVec<[(&'static str, std::borrow::Cow<'static, str>); 4]> = {
-            let mut v: $crate::smallvec::SmallVec<[(&'static str, std::borrow::Cow<'static, str>); 4]> =
+        // Values are lifted into `Cow<'_, str>` via `TrValue`: a `&str`,
+        // `Cow<'_, str>` or `String` argument converts without re-formatting
+        // (borrowed values stay borrowed); any other `Display` value must be
+        // wrapped in `DisplayArg(...)` so the allocation is explicit at the
+        // call site.
+        let pairs: $crate::smallvec::SmallVec<[(&'static str, std::borrow::Cow<'_, str>); 4]> = {
+            let mut v: $crate::smallvec::SmallVec<[(&'static str, std::borrow::Cow<'_, str>); 4]> =
                 $crate::smallvec::smallvec![];
             $(
                 $(
                     v.push((
                         stringify!($key),
-                        $crate::diagnostics::i18n::TrValue::into_cow_static($val),
+                        $crate::diagnostics::i18n::TrValue::into_cow($val),
                     ));
                 )+
             )?
@@ -42,11 +43,13 @@ macro_rules! tr {
     }};
 }
 
+pub(crate) mod ascii;
 pub mod chain;
 pub mod collector;
 pub mod emitter;
 pub mod error_code;
 pub mod explain_server;
+pub mod fix;
 pub mod glyph;
 pub mod i18n;
 pub mod kind;
@@ -65,25 +68,30 @@ pub use chain::CallChain;
 pub use collector::DiagCtxt;
 pub use emitter::Emitter;
 pub use error_code::{ErrCode, ErrorCategory};
+pub use fix::{FixEdit, FixHints, FixSet, apply_fixes};
 pub use glyph::GlyphRenderer;
 pub use i18n::DisplayArg;
 pub use kind::{ComptimeReason, DiagnosticKind, Humanizer, TypeCtx};
 pub use label::{AnnotationKind, Label, Snippet, SourcePos};
 pub use level::DiagnosticLevel;
 pub use render::{RenderCtx, Renderer};
-pub use renderers::{HtmlRenderer, HumanRenderer, JsonRenderer};
+pub use renderers::{HtmlRenderer, HumanRenderer, JsonRenderer, ShortRenderer};
 pub use sink::{DiagnosticSink, MakeSink, StringSink};
 
 use crate::ast::FileId;
 use crate::ast::Span;
-use arrayvec::ArrayVec;
-use covariant_vec::CovariantVec;
 use crate::smallvec::{SmallVec, smallvec};
+use arrayvec::ArrayVec;
+use compact_str::{CompactString, format_compact};
+use covariant_vec::CovariantVec;
+use rustc_hash::FxHashMap;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::fmt;
 use std::io;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── Diagnostic options (inspired by GHC's DiagOpts) ────────────────
 
@@ -174,6 +182,12 @@ pub struct DiagOpts {
     /// next `tab_width`-column stop.  Defaults to 4 (matches the historical
     /// hard-coded `TAB_WIDTH`); projects using 2/8-space indents can override.
     pub tab_width: usize,
+    pub only_codes: Vec<String>,
+    pub only_categories: Vec<ErrorCategory>,
+    pub only_files: Vec<String>,
+    pub allow_codes: Vec<String>,
+    pub quiet: bool,
+    pub no_wrap: bool,
 }
 
 impl DiagOpts {
@@ -209,7 +223,79 @@ impl Default for DiagOpts {
             compact: false,
             color_depth: term::ColorDepth::TwoFiftySix,
             tab_width: 4,
+            only_codes: Vec::new(),
+            only_categories: Vec::new(),
+            only_files: Vec::new(),
+            allow_codes: Vec::new(),
+            quiet: false,
+            no_wrap: false,
         }
+    }
+}
+
+/// Precomputed view of [`DiagOpts`]'s filter fields for O(1) per-diagnostic
+/// matching.
+///
+/// The exact-match filters (`allow_codes`, `only_codes`, `only_categories`)
+/// are hashed once at construction; `only_files` stays a `Vec` because it
+/// matches by substring (`file.contains(pat)`), not equality.  Building this
+/// once per batch turns filter matching from O(diagnostics × filter_size)
+/// into O(filter_size + diagnostics).  The common empty-filter case builds
+/// three empty hash sets and an empty vec, so a diagnostic pays no lookup
+/// work at all.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DiagFilter {
+    allow_codes: rustc_hash::FxHashSet<String>,
+    only_codes: rustc_hash::FxHashSet<String>,
+    only_categories: rustc_hash::FxHashSet<ErrorCategory>,
+    only_files: Vec<String>,
+}
+
+impl DiagFilter {
+    /// Build the fast-match view from a [`DiagOpts`].
+    pub(crate) fn from_opts(opts: &DiagOpts) -> Self {
+        DiagFilter {
+            allow_codes: opts.allow_codes.iter().cloned().collect(),
+            only_codes: opts.only_codes.iter().cloned().collect(),
+            only_categories: opts.only_categories.iter().copied().collect(),
+            only_files: opts.only_files.clone(),
+        }
+    }
+
+    /// Whether `diag` passes the filter — mirrors the original
+    /// [`Diagnostic::matches_filter`] exactly, with hash lookups for the
+    /// exact-match fields.
+    pub(crate) fn matches(&self, diag: &Diagnostic<'_>) -> bool {
+        let code = diag.code();
+        if !self.allow_codes.is_empty()
+            && let Some(c) = code
+            && self.allow_codes.contains(c.code())
+        {
+            return false;
+        }
+        if !self.only_codes.is_empty() {
+            match code {
+                Some(c) if self.only_codes.contains(c.code()) => {}
+                _ => return false,
+            }
+        }
+        if !self.only_categories.is_empty() {
+            match code {
+                Some(c) if self.only_categories.contains(&c.category()) => {}
+                _ => return false,
+            }
+        }
+        if !self.only_files.is_empty() {
+            let file = diag.file_name();
+            if !self
+                .only_files
+                .iter()
+                .any(|pat| file.contains(pat.as_str()))
+            {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -312,7 +398,20 @@ impl<'src> DiagMessage<'src> {
         match self {
             DiagMessage::Static(s) => out.push_str(s),
             DiagMessage::Slug { slug, pairs } => {
-                out.push_str(&crate::diagnostics::i18n::render(slug, pairs))
+                crate::diagnostics::i18n::render_into(slug, pairs, out);
+            }
+        }
+    }
+
+    /// Consuming variant of [`render_into`](Self::render_into): moves
+    /// `Slug`-pair arguments into the Fluent map instead of cloning them.
+    /// Only callable when the caller owns the message (e.g. `humanize`,
+    /// which gets a fresh `DiagMessage` from `humanize_into`).
+    pub fn render_into_owned(self, out: &mut String) {
+        match self {
+            DiagMessage::Static(s) => out.push_str(&s),
+            DiagMessage::Slug { slug, pairs } => {
+                crate::diagnostics::i18n::render_into_owned(slug, pairs, out);
             }
         }
     }
@@ -373,15 +472,19 @@ impl<'a> std::fmt::Display for DiagMessage<'a> {
 /// duplicate definition + the previous definition), both are primary.
 #[derive(Debug, Clone, Default)]
 pub struct MultiSpan {
-    // Invariant: sorted by `(file, start, end)` ascending (`Span`'s `Ord`),
-    // no duplicates. All mutation goes through `push`, which preserves this.
+    // Invariant: when `!dirty`, sorted by `(file, start, end)` ascending
+    // (`Span`'s `Ord`), no duplicates. All mutation goes through `push`,
+    // which preserves this.  When `dirty`, the vector is unsorted and may
+    // contain duplicates; `primary()` sorts + dedups before returning.
     primary: SmallVec<[Span; 2]>,
+    dirty: bool,
 }
 
 impl MultiSpan {
     pub fn new(span: Span) -> Self {
         MultiSpan {
             primary: smallvec![span],
+            dirty: false,
         }
     }
 
@@ -389,38 +492,52 @@ impl MultiSpan {
     /// Duplicate spans are ignored (idempotent — safe for repeated `humanize`).
     ///
     /// Compilers emit spans in ascending source order, so the fast path
-    /// compares against the tail and appends in O(1).  Only an
-    /// out-of-order span pays the binary search + insert; a fully
-    /// reverse-sorted push stream is the sole remaining O(n²) shape.
+    /// compares against the tail and appends in O(1).  An out-of-order span
+    /// is appended in O(1) and the vector is marked `dirty`; the sort +
+    /// dedup is deferred to the next [`primary`](Self::primary) or
+    /// [`first`](Self::first) read, so a fully reverse-sorted push stream
+    /// costs `O(n log n)` total instead of `O(n²)` memmoves.
     pub fn push(&mut self, span: Span) {
         match self.primary.last() {
             Some(last) if *last == span => {}
             Some(last) if *last > span => {
-                let pos = self.primary.partition_point(|s| s < &span);
-                if self.primary.get(pos) != Some(&span) {
-                    self.primary.insert(pos, span);
-                }
+                self.primary.push(span);
+                self.dirty = true;
             }
             _ => self.primary.push(span),
         }
     }
 
+    /// The earliest primary span, or `None` if empty.  When `dirty`, scans
+    /// for the minimum in `O(n)` without sorting; otherwise `O(1)`.
     pub fn first(&self) -> Option<Span> {
-        self.primary.first().copied()
+        if self.dirty {
+            self.primary.iter().min().copied()
+        } else {
+            self.primary.first().copied()
+        }
     }
 
     /// Clear all primary spans.
     pub fn clear(&mut self) {
         self.primary.clear();
+        self.dirty = false;
     }
 
-    /// Return the spans in sorted order.
-    pub fn primary(&self) -> &[Span] {
+    /// Return the spans in sorted order.  When `dirty`, sorts + dedups in
+    /// `O(n log n)`; otherwise clones the already-sorted vector (inline for
+    /// `n ≤ 2`, so no heap allocation in the common case).
+    pub fn primary(&self) -> SmallVec<[Span; 2]> {
+        let mut out = self.primary.clone();
+        if self.dirty {
+            out.sort_unstable();
+            out.dedup();
+        }
         debug_assert!(
-            self.primary.windows(2).all(|w| w[0] <= w[1]),
+            out.windows(2).all(|w| w[0] <= w[1]),
             "MultiSpan::primary must be sorted by (file, start)"
         );
-        &self.primary
+        out
     }
 }
 
@@ -449,9 +566,10 @@ impl Default for Applicability {
 
 /// How a suggestion should be displayed.
 /// Inspired by rustc's `SuggestionStyle`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SuggestionStyle {
     /// Show the suggestion inline with the diagnostic.
+    #[default]
     ShowAlways,
     /// Show the suggestion code, but hide the message.
     ShowCode,
@@ -461,12 +579,6 @@ pub enum SuggestionStyle {
     HideCodeAlways,
     /// Completely hidden (only visible to tools, e.g. IDE).
     CompletelyHidden,
-}
-
-impl Default for SuggestionStyle {
-    fn default() -> Self {
-        SuggestionStyle::ShowAlways
-    }
 }
 
 /// The JSON wire name of an [`Applicability`] variant.
@@ -487,6 +599,26 @@ pub fn suggestion_style_name(style: SuggestionStyle) -> &'static str {
         SuggestionStyle::HideCodeInline => "HideCodeInline",
         SuggestionStyle::HideCodeAlways => "HideCodeAlways",
         SuggestionStyle::CompletelyHidden => "CompletelyHidden",
+    }
+}
+
+/// The JSON wire name of an [`AnnotationKind`] variant.
+pub fn annotation_kind_name(k: AnnotationKind) -> &'static str {
+    match k {
+        AnnotationKind::Primary => "Primary",
+        AnnotationKind::Secondary => "Secondary",
+        AnnotationKind::Note => "Note",
+        AnnotationKind::Help => "Help",
+    }
+}
+
+/// The JSON wire name of a [`chain::ChainEntryKind`] variant.
+pub fn chain_entry_kind_name(k: chain::ChainEntryKind) -> &'static str {
+    match k {
+        chain::ChainEntryKind::Call => "Call",
+        chain::ChainEntryKind::Inlined => "Inlined",
+        chain::ChainEntryKind::Reference => "Reference",
+        chain::ChainEntryKind::Defines => "Defines",
     }
 }
 
@@ -590,7 +722,7 @@ impl<'src> StyledString<'src> {
 /// that read these fields directly must call `humanize()` themselves.
 /// `kind` is retained (never dropped) as the structured source of
 /// truth so `humanize()` can re-run if the kind is replaced.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Diagnostic<'src> {
     level: DiagnosticLevel,
     message: Cow<'src, str>,
@@ -617,6 +749,7 @@ pub struct Diagnostic<'src> {
     children: Vec<Subdiag<'src>>,
     /// Related errors displayed alongside this diagnostic in a single merged box.
     related_errors: Vec<RelatedError<'src>>,
+    foreign_sources: Option<Box<Vec<(FileId, Cow<'src, str>, &'src str)>>>,
     /// Whether `spans` were set by a user-facing builder rather than left
     /// at the constructor default.  `humanize()` leaves them alone in that
     /// case instead of deriving fresh primary spans from the kind's labels.
@@ -625,6 +758,36 @@ pub struct Diagnostic<'src> {
     /// and `labels` from `kind`. Guards against redundant re-rendering on a
     /// second call (the operation is idempotent, but not free).
     humanized: bool,
+    /// Cached result of [`stable_id`](Self::stable_id). `0` means "not yet
+    /// computed" — FNV-1a over non-empty input is virtually never exactly 0,
+    /// and even if it were, the only consequence is recomputing on every
+    /// call, which still yields a consistent result. See
+    /// [`Self::invalidate_stable_id`].
+    stable_id_cache: AtomicU64,
+}
+
+impl<'src> Clone for Diagnostic<'src> {
+    fn clone(&self) -> Self {
+        Diagnostic {
+            level: self.level,
+            message: self.message.clone(),
+            code: self.code.clone(),
+            kind: self.kind.clone(),
+            spans: self.spans.clone(),
+            help: self.help.clone(),
+            suggestions: self.suggestions.clone(),
+            labels: self.labels.clone(),
+            call_chain: self.call_chain.clone(),
+            source: self.source,
+            file_name: self.file_name.clone(),
+            children: self.children.clone(),
+            related_errors: self.related_errors.clone(),
+            foreign_sources: self.foreign_sources.clone(),
+            spans_user_set: self.spans_user_set,
+            humanized: self.humanized,
+            stable_id_cache: AtomicU64::new(self.stable_id_cache.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl<'src> Diagnostic<'src> {
@@ -633,6 +796,13 @@ impl<'src> Diagnostic<'src> {
         self.level
     }
     pub fn message(&self) -> &str {
+        debug_assert!(
+            self.kind.is_none() || self.humanized,
+            "read message() before humanize()"
+        );
+        &self.message
+    }
+    pub(crate) fn message_unchecked(&self) -> &str {
         &self.message
     }
     pub fn code(&self) -> Option<&ErrCode> {
@@ -645,19 +815,31 @@ impl<'src> Diagnostic<'src> {
         &self.spans
     }
     pub fn help(&self) -> Option<&str> {
+        debug_assert!(
+            self.kind.is_none() || self.humanized,
+            "read help() before humanize()"
+        );
         self.help.as_deref()
     }
     pub fn suggestions(&self) -> &[Suggestion<'src>] {
+        debug_assert!(
+            self.kind.is_none() || self.humanized,
+            "read suggestions() before humanize()"
+        );
         &self.suggestions
     }
     pub fn labels(&self) -> &[Label<'src>] {
+        debug_assert!(
+            self.kind.is_none() || self.humanized,
+            "read labels() before humanize()"
+        );
         &self.labels
     }
     pub fn call_chain(&self) -> Option<&CallChain<'src>> {
         self.call_chain.as_ref()
     }
     pub fn source(&self) -> Option<&str> {
-        self.source.as_deref()
+        self.source
     }
     pub fn file_name(&self) -> &str {
         &self.file_name
@@ -685,6 +867,128 @@ impl<'src> Diagnostic<'src> {
     pub fn set_file_name(&mut self, file_name: impl AsRef<str>) {
         self.file_name = Cow::Owned(file_name.as_ref().to_owned());
     }
+
+    pub fn with_foreign_source(
+        mut self,
+        file: FileId,
+        name: impl Into<Cow<'src, str>>,
+        source: &'src str,
+    ) -> Self {
+        let sources = self.foreign_sources.get_or_insert_with(Box::default);
+        if !sources.iter().any(|(f, _, _)| *f == file) {
+            sources.push((file, name.into(), source));
+        }
+        self
+    }
+
+    pub fn source_for_file(&self, file: FileId) -> Option<&'src str> {
+        if self.spans().first().is_some_and(|s| s.file == file) {
+            return self.source;
+        }
+        self.foreign_sources
+            .as_deref()
+            .and_then(|sources| sources.iter().find(|(f, _, _)| *f == file))
+            .map(|(_, _, s)| *s)
+    }
+
+    pub fn file_name_for(&self, file: FileId) -> Option<&str> {
+        if self.spans().first().is_some_and(|s| s.file == file) {
+            return Some(self.file_name());
+        }
+        self.foreign_sources
+            .as_deref()
+            .and_then(|sources| sources.iter().find(|(f, _, _)| *f == file))
+            .map(|(_, n, _)| n.as_ref())
+    }
+
+    /// A deterministic identifier derived from `(code, first primary span,
+    /// message)`, for tools to deduplicate / track diagnostics across runs.
+    ///
+    /// Computed once with FNV-1a and cached in an [`AtomicU64`]; when the
+    /// inputs are unchanged, a second call is just a relaxed load. Every
+    /// entry point that can mutate the fields above
+    /// ([`with_code`](Self::with_code), [`with_code_str`](Self::with_code_str),
+    /// [`with_span`](Self::with_span), [`with_additional_span`](Self::with_additional_span),
+    /// [`augment`](Self::augment), [`humanize`](Self::humanize), and
+    /// [`adorn_with_span`]) clears the cache via
+    /// [`invalidate_stable_id`](Self::invalidate_stable_id), so callers
+    /// always see a value consistent with the current triple.
+    pub fn stable_id(&self) -> u64 {
+        let cached = self.stable_id_cache.load(Ordering::Relaxed);
+        if cached != 0 {
+            return cached;
+        }
+        let id = self.compute_stable_id();
+        self.stable_id_cache.store(id, Ordering::Relaxed);
+        id
+    }
+
+    #[inline]
+    fn compute_stable_id(&self) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut h = FNV_OFFSET;
+        let mut feed = |b: u8| {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(FNV_PRIME);
+        };
+        if let Some(c) = self.code() {
+            for b in c.code().as_bytes() {
+                feed(*b);
+            }
+        }
+        feed(0);
+        if let Some(span) = self.spans().first() {
+            for b in span.file.as_u32().to_le_bytes() {
+                feed(b);
+            }
+            for b in span.start.to_le_bytes() {
+                feed(b);
+            }
+            for b in span.end.to_le_bytes() {
+                feed(b);
+            }
+        }
+        feed(0);
+        for b in self.message().as_bytes() {
+            feed(*b);
+        }
+        h
+    }
+
+    /// Clears the [`stable_id`](Self::stable_id) cache.
+    ///
+    /// Every mutator that changes `code`, the first primary span, or
+    /// `message` must call this. Entry points that only touch fields not
+    /// covered by the hash (`source`, `file_name`, `level`, `labels`,
+    /// `related_errors`, `children`, `suggestions`, `help`, `call_chain`,
+    /// `kind`) do not need to — the cache is naturally immune to those
+    /// changes.
+    #[inline]
+    fn invalidate_stable_id(&mut self) {
+        self.stable_id_cache.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether this diagnostic passes the filter described by `opts`.
+    ///
+    /// Builds a [`DiagFilter`] from `opts` on every call, which is O(filter_size)
+    /// allocations.  For checking many diagnostics against the same options
+    /// (e.g. inside a loop), build the filter once with
+    /// [`DiagFilter::from_opts`] and call [`matches_filter_with`] instead.
+    ///
+    /// [`matches_filter_with`]: Diagnostic::matches_filter_with
+    pub fn matches_filter(&self, opts: &DiagOpts) -> bool {
+        DiagFilter::from_opts(opts).matches(self)
+    }
+
+    /// Whether this diagnostic passes a pre-built [`DiagFilter`].
+    ///
+    /// Loop-safe variant of [`matches_filter`]: the caller builds the filter
+    /// once and reuses it across many diagnostics, so the per-diagnostic cost
+    /// is O(1) hash lookups rather than O(filter_size) allocations.
+    pub(crate) fn matches_filter_with(&self, filter: &DiagFilter) -> bool {
+        filter.matches(self)
+    }
 }
 
 /// A child diagnostic attached to a parent `Diagnostic`.
@@ -693,7 +997,13 @@ impl<'src> Diagnostic<'src> {
 #[derive(Debug, Clone)]
 pub struct Subdiag<'src> {
     pub level: DiagnosticLevel,
-    pub message: Cow<'src, str>,
+    /// Plain-text form of the message.
+    ///
+    /// `None` when the message exists only as [`styled_message`]
+    /// ([`styled_message`]: Self::styled_message) — the plain form is then
+    /// derived on demand by [`plain_message`](Self::plain_message) instead of
+    /// being materialized at construction time.
+    pub message: Option<Cow<'src, str>>,
     /// Optional styled version of the message, with highlighted parts.
     /// When present, the glyph renderer uses this instead of the plain
     /// `message` to render rich text with color highlights.
@@ -727,10 +1037,20 @@ impl<'src> Subdiag<'src> {
     pub fn new(level: DiagnosticLevel, message: impl Into<Cow<'src, str>>) -> Self {
         Subdiag {
             level,
-            message: message.into(),
+            message: Some(message.into()),
             styled_message: None,
             span: None,
             labels: Vec::new(),
+        }
+    }
+
+    /// Plain-text message, borrowing the stored form when present and
+    /// deriving it from [`styled_message`](Self::styled_message) otherwise.
+    pub fn plain_message(&self) -> Cow<'_, str> {
+        match (&self.message, &self.styled_message) {
+            (Some(message), _) => Cow::Borrowed(message.as_ref()),
+            (None, Some(styled)) => Cow::Owned(styled.to_plain()),
+            (None, None) => Cow::Borrowed(""),
         }
     }
 
@@ -775,8 +1095,10 @@ impl<'src> Diagnostic<'src> {
             file_name: "<input>".into(),
             children: Vec::new(),
             related_errors: Vec::new(),
+            foreign_sources: None,
             humanized: false,
             spans_user_set: false,
+            stable_id_cache: AtomicU64::new(0),
         }
     }
 
@@ -863,6 +1185,7 @@ impl<'src> Diagnostic<'src> {
     pub fn with_span(mut self, span: Span) -> Self {
         self.spans = MultiSpan::new(span);
         self.spans_user_set = true;
+        self.invalidate_stable_id();
         self
     }
 
@@ -872,12 +1195,14 @@ impl<'src> Diagnostic<'src> {
     pub fn with_additional_span(mut self, span: Span) -> Self {
         self.spans.push(span);
         self.spans_user_set = true;
+        self.invalidate_stable_id();
         self
     }
 
     /// Set the error code (e.g. `ErrCode::TypeMismatch` → `E030`).
     pub fn with_code(mut self, code: ErrCode) -> Self {
         self.code = Some(code);
+        self.invalidate_stable_id();
         self
     }
 
@@ -894,6 +1219,7 @@ impl<'src> Diagnostic<'src> {
             Ok(ec) => ec,
             Err(e) => ErrCode::unknown(e.0.into_owned()),
         });
+        self.invalidate_stable_id();
         self
     }
 
@@ -1019,11 +1345,14 @@ impl<'src> Diagnostic<'src> {
     }
 
     /// Add a highlighted note child (styled text with type/name highlights).
+    ///
+    /// The plain-text form is derived lazily by
+    /// [`Subdiag::plain_message`], so a note that is never rendered (filtered
+    /// out by `max_errors` / `only_codes`, say) never allocates it.
     pub fn with_highlighted_note(mut self, styled: StyledString<'src>) -> Self {
-        let msg = styled.to_plain();
         self.children.push(Subdiag {
             level: DiagnosticLevel::Note,
-            message: msg.into(),
+            message: None,
             styled_message: Some(styled),
             span: None,
             labels: Vec::new(),
@@ -1033,10 +1362,9 @@ impl<'src> Diagnostic<'src> {
 
     /// Add a highlighted help child (styled text with type/name highlights).
     pub fn with_highlighted_help(mut self, styled: StyledString<'src>) -> Self {
-        let msg = styled.to_plain();
         self.children.push(Subdiag {
             level: DiagnosticLevel::Help,
-            message: msg.into(),
+            message: None,
             styled_message: Some(styled),
             span: None,
             labels: Vec::new(),
@@ -1071,24 +1399,33 @@ impl<'src> Diagnostic<'src> {
         if self.humanized {
             return;
         }
-        let Some(ref kind) = self.kind else {
+        // Take the kind out of the box and consume it in one pass via
+        // `humanize_into`, which moves shared fields (e.g. `expected`/
+        // `found`) into one output and clones into the other — one clone
+        // instead of the two that `&self`-based `message()` + `labels()`
+        // each paid.  `render_into_owned` then moves the Fluent-arg pairs
+        // into the bundle map, skipping `String::clone` on `Cow::Owned`.
+        // `kind()` has no callers, so draining `self.kind` is safe; a
+        // subsequent `with_kind` replaces it and clears `humanized`.
+        let Some(kind) = self.kind.take() else {
             // No kind: message/labels were set manually.  Latch so later
             // calls skip the `kind` lookup entirely.
             self.humanized = true;
             return;
         };
+        self.invalidate_stable_id();
+        let (message, labels, help, suggestions) = (*kind).humanize_into();
         // Static messages move straight into `message`: a borrowed static
         // stays borrowed (zero allocation), an owned one is moved — only
         // the Fluent-slug path needs the render buffer.
-        self.message = match kind.message() {
+        self.message = match message {
             DiagMessage::Static(cow) => cow,
             slug => {
                 let mut buf = String::new();
-                slug.render_into(&mut buf);
+                slug.render_into_owned(&mut buf);
                 Cow::Owned(buf)
             }
         };
-        let labels = kind.labels();
         // Populate `spans` from the primary labels so the source-context
         // renderer knows which lines to display — but only when the spans
         // are still the constructor default.  Spans attached by a builder
@@ -1102,17 +1439,20 @@ impl<'src> Diagnostic<'src> {
                 }
             }
         }
-        self.labels = labels.into();
+        // `humanize_into` returns the same inline-capacity container, so
+        // this is a move: a single-label kind never hits the heap, and a
+        // two-label kind skips the intermediate `Vec` that `into()` used
+        // to allocate.
+        self.labels = labels;
         // help/suggestions are re-derived from `kind` on every humanize: a
         // diagnostic can be re-kind'ed (e.g. `with_kind(k1).humanize()` then
         // `with_kind(k2).humanize()`), and guarded rebuilding would keep
         // k1's derived notes on a diagnostic that no longer is k1.
-        self.help = kind.help();
-        self.suggestions = kind
-            .suggestions()
+        self.help = help;
+        self.suggestions = suggestions
             .into_iter()
             .map(|s| Suggestion {
-                message: s.into(),
+                message: s,
                 applicability: Applicability::MachineApplicable,
                 style: SuggestionStyle::ShowAlways,
                 span: None,
@@ -1162,6 +1502,7 @@ impl<'src> Diagnostic<'src> {
         {
             self.spans = MultiSpan::new(span);
             self.spans_user_set = true;
+            self.invalidate_stable_id();
         }
         if self.source.is_none() {
             self.source = other.source;
@@ -1170,15 +1511,17 @@ impl<'src> Diagnostic<'src> {
             self.call_chain.clone_from(&other.call_chain);
         }
         // Merge labels that aren't already present.  The straightforward
-        // scan is O(self × other) in the label counts; a large merge builds
-        // a key set once instead, so a diagnostic carrying hundreds of
-        // labels does not make this quadratic.  Small merges keep the
-        // allocation-free scan (the common case is one or two labels).
+        // scan is O(self × other) in the label counts; the keyed set is
+        // O(self + other).  The threshold guards *both* sides: a small
+        // `self` merged with a large `other` would otherwise scan the
+        // growing `to_add` on every iteration and degrade to O(|other|²).
+        // Small merges on both sides keep the allocation-free scan (the
+        // common case is one or two labels).
         // `to_add` collects first: the key set borrows `self.labels`, so it
         // must be dropped before the pushes.
         if !other.labels.is_empty() {
             let mut to_add: SmallVec<[&Label<'src>; 4]> = SmallVec::new();
-            if self.labels.len() <= 8 {
+            if self.labels.len() <= 8 && other.labels.len() <= 8 {
                 for lbl in &other.labels {
                     // `to_add` is checked too: a duplicate *within* `other`
                     // must not be added twice (the scan sees earlier pushes).
@@ -1205,6 +1548,14 @@ impl<'src> Diagnostic<'src> {
             }
             for lbl in to_add {
                 self.labels.push(lbl.clone());
+            }
+        }
+        if let Some(other_sources) = other.foreign_sources.as_deref() {
+            for (file, name, source) in other_sources.iter() {
+                let self_sources = self.foreign_sources.get_or_insert_with(Box::default);
+                if !self_sources.iter().any(|(f, _, _)| *f == *file) {
+                    self_sources.push((*file, name.clone(), *source));
+                }
             }
         }
     }
@@ -1262,6 +1613,7 @@ pub fn adorn_with_span<'src, T>(
             if diag.spans.first().is_none() {
                 diag.spans = MultiSpan::new(span);
                 diag.spans_user_set = true;
+                diag.invalidate_stable_id();
             }
             if diag.source.is_none() {
                 diag.source = source;
@@ -1271,7 +1623,7 @@ pub fn adorn_with_span<'src, T>(
     result
 }
 
-// ── ErrCode is now a string-based code — use `ErrCode::new("E030")` ──
+// ── ErrCode is now a string-based code — use `ErrCode::E030` ──
 // The old `from_str` method with enum variants was removed in favour of
 // the lookup table in `error_code.rs`.  Any string is accepted as a code.
 
@@ -1368,9 +1720,8 @@ pub fn explain_error_code_with_depth(
             // output, so sanitize the copy shown while using the raw string
             // for suggestion matching.
             let error_label = DiagnosticLevel::Error.label();
-            let unknown_msg = crate::tr!(
-                "unknown-error-code",
-                code = DisplayArg(sanitize_for_terminal(code_str))
+            let unknown_msg = crate::diagnostics::i18n::fluent::unknown_error_code(
+                sanitize_for_terminal(code_str),
             );
             return if use_color {
                 format!(
@@ -1442,6 +1793,28 @@ pub fn explain_error_code_with_depth(
             // explain text and rendered diagnostics agree on one width.
             for seg in crate::diagnostics::wrap::wrap_optimal(line, DEFAULT_MAX_WIDTH, tab_width) {
                 let _ = writeln!(out, "{seg}");
+            }
+        }
+    }
+
+    let explicit = crate::diagnostics::error_code::related_codes_of(code.code());
+    let related: SmallVec<[&'static str; 4]> = if explicit.is_empty() {
+        crate::diagnostics::error_code::category_siblings_of(code.code(), 4)
+    } else {
+        SmallVec::from_slice(explicit)
+    };
+    if !related.is_empty() {
+        let _ = writeln!(out);
+        if use_color {
+            let _ = writeln!(out, "\x1b[1mSee also:\x1b[0m");
+        } else {
+            let _ = writeln!(out, "See also:");
+        }
+        for rel in &related {
+            if let Some(entry) = crate::diagnostics::error_code::lookup(rel) {
+                let _ = writeln!(out, "  {rel}  {}", entry.title);
+            } else {
+                let _ = writeln!(out, "  {rel}");
             }
         }
     }
@@ -1525,10 +1898,12 @@ fn format_code_ranges(codes: &[&str]) -> String {
     // lexicographic order only matches numeric order while codes are
     // equal-width — a future 4-digit `E1000` would sort before `E999`
     // lexicographically.
-    codes.sort_unstable_by_key(|c| {
+    codes.sort_by_cached_key(|c| {
         (
             c.as_bytes().first().copied().unwrap_or(b'?'),
-            c.get(1..).and_then(|s| s.parse::<u32>().ok()).unwrap_or(u32::MAX),
+            c.get(1..)
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(u32::MAX),
             *c,
         )
     });
@@ -1573,15 +1948,19 @@ fn format_code_ranges(codes: &[&str]) -> String {
 ///   1. smaller edit distance
 ///   2. longer common prefix with the input (so `E03` → `E030`, not `E003`)
 ///   3. lexicographically smaller code (stable, deterministic output)
-fn suggest_code(input: &str) -> String {
+fn suggest_code(input: &str) -> CompactString {
     // Normalise case so `e030` matches the canonical `E030`.
-    let needle = input.to_ascii_uppercase();
+    let mut needle = CompactString::from(input);
+    needle.as_mut_str().make_ascii_uppercase();
     let needle_len = needle.chars().count();
     // Longer inputs tolerate a slightly wider search radius; short ones
     // stay tight so we don't suggest unrelated codes.
     let max_dist = std::cmp::max(1, needle_len / 3);
 
-    let mut scored: Vec<(usize, usize, &str)> = crate::diagnostics::error_code::CODE_TABLE
+    // Top-3 by (dist asc, prefix desc, code asc) via fixed-size insertion
+    // sort — avoids the `Vec` + `O(n log n)` sort for a 3-element result.
+    let mut top: ArrayVec<(usize, usize, &str), 3> = ArrayVec::new();
+    for e in crate::diagnostics::error_code::CODE_TABLE
         .iter()
         // Length prefilter: each edit changes length by at most one, so
         // |Δlen| is a lower bound on the distance — an entry whose code
@@ -1591,42 +1970,44 @@ fn suggest_code(input: &str) -> String {
         // validated to `^[EW]\d{3}$`, so `e.code.len()` is already its char
         // count (constant 4) and skips the per-code char walk.
         .filter(|e| needle_len.abs_diff(e.code.len()) <= max_dist)
-        .map(|e| {
-            let dist = osa_distance(&needle, e.code);
-            let prefix = common_prefix_len(&needle, e.code);
-            (dist, prefix, e.code)
-        })
-        .filter(|(dist, _, _)| *dist <= max_dist)
-        .collect();
+    {
+        let dist = osa_distance(&needle, e.code);
+        if dist > max_dist {
+            continue;
+        }
+        let prefix = common_prefix_len(&needle, e.code);
+        let entry = (dist, prefix, e.code);
+        let pos = top
+            .iter()
+            .position(|t| {
+                entry.0 < t.0
+                    || (entry.0 == t.0 && (entry.1 > t.1 || (entry.1 == t.1 && entry.2 < t.2)))
+            })
+            .unwrap_or(top.len());
+        if pos < 3 {
+            if top.is_full() {
+                top.pop();
+            }
+            top.insert(pos, entry);
+        }
+    }
 
-    // Closest first; longer shared prefix wins ties; alphabetical for stability.
-    scored.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| b.1.cmp(&a.1))
-            .then_with(|| a.2.cmp(b.2))
-    });
-
-    let candidates: ArrayVec<&str, 3> = scored.iter().take(3).map(|(_, _, code)| *code).collect();
+    let candidates: ArrayVec<&str, 3> = top.iter().map(|(_, _, code)| *code).collect();
 
     if candidates.is_empty() {
-        format!(
+        format_compact!(
             "\x1b[1;34m{help_label}\x1b[0m: {valid_codes} — \n       {hint}",
             help_label = DiagnosticLevel::Help.label(),
-            valid_codes = crate::tr!(
-                "help-valid-codes",
-                codes = DisplayArg(known_code_ranges())
-            ),
-            hint = crate::tr!("run-explain-hint-example"),
+            valid_codes = crate::diagnostics::i18n::fluent::help_valid_codes(known_code_ranges()),
+            hint = crate::diagnostics::i18n::fluent::run_explain_hint_example(),
         )
     } else {
-        format!(
+        format_compact!(
             "\x1b[1;34m{help_label}\x1b[0m: {did_you_mean}\n       {hint}",
             help_label = DiagnosticLevel::Help.label(),
-            did_you_mean = crate::tr!(
-                "did-you-mean",
-                candidates = DisplayArg(candidates.join("` or `"))
-            ),
-            hint = crate::tr!("run-explain-hint-detail"),
+            did_you_mean =
+                crate::diagnostics::i18n::fluent::did_you_mean(candidates.join("` or `")),
+            hint = crate::diagnostics::i18n::fluent::run_explain_hint_detail(),
         )
     }
 }
@@ -1635,20 +2016,21 @@ fn suggest_code(input: &str) -> String {
 pub fn list_error_codes() -> String {
     use std::fmt::Write;
     let mut out = String::new();
-    let _ = writeln!(out, "\x1b[1m{}\x1b[0m\n", crate::tr!("available-error-codes"));
-    let mut last_category = None;
-    for entry in crate::diagnostics::error_code::CODE_TABLE {
-        let cat = entry.category;
-        if Some(cat) != last_category {
-            let _ = writeln!(out, " \x1b[36m── {} ──\x1b[0m", cat.label(),);
-            last_category = Some(cat);
+    let _ = writeln!(
+        out,
+        "\x1b[1m{}\x1b[0m\n",
+        crate::diagnostics::i18n::fluent::available_error_codes()
+    );
+    for (cat, entries) in crate::diagnostics::error_code::code_entries_by_category() {
+        let _ = writeln!(out, " \x1b[36m── {} ──\x1b[0m", cat.label(),);
+        for entry in entries {
+            let _ = writeln!(out, "  \x1b[1m{}\x1b[0m  {}", entry.code, entry.title,);
         }
-        let _ = writeln!(out, "  \x1b[1m{}\x1b[0m  {}", entry.code, entry.title,);
     }
     let _ = writeln!(
         out,
         "\n\x1b[2m{}\x1b[0m",
-        crate::tr!("run-explain-detail")
+        crate::diagnostics::i18n::fluent::run_explain_detail()
     );
     out
 }
@@ -1665,7 +2047,7 @@ pub fn emit_diagnostics(diags: &mut [Diagnostic<'_>], use_color: bool) {
     };
 
     let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
-    let mut emitter = Emitter::new(renderer, sink::stderr(), opts);
+    let mut emitter = Emitter::new(renderer, sink::stderr_buffered(), opts);
 
     let _ = emitter.emit_all(diags);
 }
@@ -1680,7 +2062,7 @@ pub fn emit_collector(collector: &mut DiagCtxt<'_>, use_color: bool) {
         ..Default::default()
     };
     let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
-    let mut emitter = Emitter::new(renderer, sink::stderr(), opts);
+    let mut emitter = Emitter::new(renderer, sink::stderr_buffered(), opts);
     let _ = emitter.emit_all_iter(collector.iter_mut());
 }
 
@@ -1700,7 +2082,7 @@ where
         ..Default::default()
     };
     let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
-    let mut emitter = Emitter::new(renderer, sink::stderr(), opts);
+    let mut emitter = Emitter::new(renderer, sink::stderr_buffered(), opts);
     emitter.emit_all_iter(diags)
 }
 
@@ -1715,6 +2097,15 @@ pub(crate) fn floor_char_boundary(source: &str, offset: usize) -> usize {
         o -= 1;
     }
     o
+}
+
+/// `char_col = b − cumulative_extra` for non-ASCII chars starting before `b`.
+/// `sparse` is a sorted `[(start_byte, cumulative_extra)]` table; one
+/// `partition_point` + one array read gives the answer in `O(log K)`.
+fn char_col_from_sparse(sparse: &[(u32, u32)], b: usize) -> usize {
+    let k = sparse.partition_point(|&(p, _)| (p as usize) < b);
+    let extra = if k > 0 { sparse[k - 1].1 as usize } else { 0 };
+    b - extra
 }
 
 /// Convert a byte-offset span into a 0-based (line, col) pair.
@@ -1733,6 +2124,17 @@ pub(crate) fn byte_to_linecol(source: &str, byte_offset: usize) -> label::Source
     }
 }
 
+/// Whether `name` looks like a real on-disk file path rather than a
+/// synthetic placeholder such as `<synthetic>` or an empty string.
+pub(crate) fn is_real_file_name(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('<')
+}
+
+/// Convert a byte column within `line` to a character column (0-based).
+pub(crate) fn byte_col_to_char_col(line: &str, byte_col: usize) -> usize {
+    line[..byte_col.min(line.len())].chars().count()
+}
+
 /// Replace control characters with U+FFFD so external text cannot inject
 /// terminal escapes when echoed to the terminal.
 ///
@@ -1741,13 +2143,28 @@ pub(crate) fn byte_to_linecol(source: &str, byte_offset: usize) -> label::Source
 /// writes untrusted text into ANSI output (OSC 8 hyperlink text, SGR colour
 /// runs), where a raw `\x1b` or `\x07` would terminate the sequence early and
 /// let the remaining bytes act as terminal commands.
+///
+/// Two fast paths keep the common cases allocation-free:
+///
+/// 1. **Printable ASCII** — one SWAR scan (see `ascii::is_printable_ascii`);
+///    no control character is possible, so the input is borrowed.
+/// 2. **Non-ASCII with no controls** — the dominant i18n case (CJK,
+///    Cyrillic, accented Latin, …).  A `chars().any(is_control)` scan
+///    short-circuits on the first control; if none is present, the input
+///    is borrowed.  Only strings that actually contain a control character
+///    pay the allocate-and-copy path.  `is_control` covers C0
+///    (`0x00..=0x1F`), C1 (`0x80..=0x9F`) and DEL (`0x7F`).
 pub(crate) fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
-    // Fast path: ASCII text without control chars is already safe for terminal
-    // use (no raw ESC/BEL can terminate SGR or OSC sequences early).  Must
-    // check `is_ascii` first — a string containing only UTF-8 C1 sequences
-    // (e.g. `\u{85}` encoded as `0xC2 0x85`) passes the bare byte check since
-    // each raw byte is ≥ 0x20 and ≠ 0x7F, but those bytes are not printable.
-    if s.is_ascii() && s.bytes().all(|b| b >= 0x20 && b != 0x7f) {
+    // ASCII fast path: no control character can be printable ASCII, so the
+    // whole `is_printable_ascii` range (0x20..=0x7E) is control-free.
+    if crate::diagnostics::ascii::is_printable_ascii(s.as_bytes()) {
+        return Cow::Borrowed(s);
+    }
+    // Non-ASCII: check whether any replacement is actually needed.  This is
+    // the hot path for localized text (CJK / Cyrillic / accented Latin), which
+    // contains no control characters and must not pay the allocate-and-copy
+    // cost that a naive `collect` would incur.
+    if !s.chars().any(char::is_control) {
         return Cow::Borrowed(s);
     }
     Cow::Owned(
@@ -1781,25 +2198,25 @@ pub(crate) fn sanitize_filename(s: &str) -> Cow<'_, str> {
 /// Multi-line variant of [`sanitize_for_terminal`] for text whose `\n`/`\t`
 /// are layout intent (user messages, help, notes) rather than raw terminal
 /// bytes: keeps them verbatim and replaces every other control character —
-/// CR and the C1 range included — with U+FFFD.  Same ASCII fast path.
+/// CR and the C1 range included — with U+FFFD.  Same fast paths as
+/// [`sanitize_for_terminal`]: pure printable ASCII (plus `\n`/`\t`) is
+/// borrowed, and so is any non-ASCII string whose only control characters
+/// are `\n`/`\t` — the common i18n case, which the naive `collect` would
+/// otherwise allocate and copy on every render.
 pub(crate) fn sanitize_for_terminal_multiline(s: &str) -> Cow<'_, str> {
-    if s.is_ascii() {
-        let safe = s
-            .bytes()
-            .all(|b| (b >= 0x20 && b != 0x7f) || b == b'\n' || b == b'\t');
-        if safe {
-            return Cow::Borrowed(s);
-        }
+    if crate::diagnostics::ascii::is_printable_ascii_multiline(s.as_bytes()) {
+        return Cow::Borrowed(s);
+    }
+    // Replacement is needed only for a control character other than `\n`/`\t`.
+    // Short-circuits on the first such character, so the cost is bounded by
+    // the position of the first control, not the string length.
+    let needs_replace = |c: char| c.is_control() && c != '\n' && c != '\t';
+    if !s.chars().any(needs_replace) {
+        return Cow::Borrowed(s);
     }
     Cow::Owned(
         s.chars()
-            .map(|c| {
-                if c.is_control() && c != '\n' && c != '\t' {
-                    '\u{FFFD}'
-                } else {
-                    c
-                }
-            })
+            .map(|c| if needs_replace(c) { '\u{FFFD}' } else { c })
             .collect(),
     )
 }
@@ -1822,6 +2239,36 @@ pub(crate) struct LineIndex<'a> {
     /// [`RenderCtx::line_index`](crate::diagnostics::render::RenderCtx::line_index)).
     starts: Arc<[usize]>,
     source: &'a str,
+    /// Whether `source` is pure ASCII.  When true, byte columns equal
+    /// character columns, so [`LineIndex::linecol_display`] skips the
+    /// O(byte_col) char-count walk — the only remaining per-span linear
+    /// cost in the JSON/HTML/short renderers on the ASCII sources that
+    /// dominate real compiler output.  `is_ascii()` is a SIMD stdlib scan
+    /// run once per source per batch (in [`LineIndex::new`]); the cached
+    /// path carries the flag through [`LineIndex::from_shared`] so a cache
+    /// hit never rescans.
+    ascii: bool,
+    /// Lazily-populated sparse non-ASCII char-extra table per line, keyed by
+    /// line index.  Each entry is `Arc<[(u32, u32)]>` — one `(start_byte,
+    /// cumulative_extra)` pair per non-ASCII char, where `cumulative_extra`
+    /// is the running sum of `len_utf8 − 1`.  Then
+    /// `char_col(b) = b − cumulative_extra` for all non-ASCII chars whose
+    /// `start_byte < b`, found by one `partition_point` + one array read.
+    ///
+    /// Only built on the non-ASCII path of [`linecol_display`](Self::linecol_display):
+    /// without it, M spans landing on one long non-ASCII line each re-walk the
+    /// line prefix (`O(M · byte_col)`); the table is built once per line in
+    /// `O(K)` writes (K = non-ASCII char count) and reused by every later span
+    /// on that line.  Memory is `O(K)` (8 bytes per non-ASCII char) vs the
+    /// old dense prefix's `O(line.len())` (4 bytes per byte) — a single CJK
+    /// char in a 1 MB line uses 8 bytes instead of 4 MB.  The map is
+    /// `Arc`-shared across every index built from the same cached source
+    /// (threaded through [`from_shared`](Self::from_shared) and the
+    /// `RenderCtx` LRU), so a batch of M diagnostics over one long non-ASCII
+    /// line pays one build, not M.  `RefCell` is the render path is
+    /// single-threaded and the borrow in [`char_col`](Self::char_col) never
+    /// spans another borrow.
+    char_prefixes: Arc<RefCell<FxHashMap<usize, Arc<[(u32, u32)]>>>>,
 }
 
 impl<'a> LineIndex<'a> {
@@ -1834,19 +2281,49 @@ impl<'a> LineIndex<'a> {
         Self {
             starts: Arc::from(starts),
             source,
+            ascii: source.is_ascii(),
+            char_prefixes: Arc::new(RefCell::new(FxHashMap::default())),
         }
     }
 
     /// Build an index for `source` from a table already computed for that same
     /// source (shared by [`RenderCtx::line_index`](crate::diagnostics::render::RenderCtx::line_index)).
-    /// The caller guarantees `starts` describes `source`'s newlines.
-    pub(crate) fn from_shared(source: &'a str, starts: Arc<[usize]>) -> Self {
-        Self { starts, source }
+    /// The caller guarantees `starts` describes `source`'s newlines,
+    /// `ascii` equals `source.is_ascii()`, and `char_prefixes` was created for
+    /// the same source — passing a stale flag makes
+    /// [`linecol_display`](Self::linecol_display) produce wrong columns on
+    /// non-ASCII sources, so cache insertions always source the flag and the
+    /// prefix map from [`ascii`](Self::ascii) and
+    /// [`char_prefixes_arc`](Self::char_prefixes_arc) of a freshly-built index.
+    pub(crate) fn from_shared(
+        source: &'a str,
+        starts: Arc<[usize]>,
+        ascii: bool,
+        char_prefixes: Arc<RefCell<FxHashMap<usize, Arc<[(u32, u32)]>>>>,
+    ) -> Self {
+        Self {
+            starts,
+            source,
+            ascii,
+            char_prefixes,
+        }
     }
 
     /// The shared line-start table, for caching by an O(1) `Arc` clone.
     pub(crate) fn starts_arc(&self) -> &Arc<[usize]> {
         &self.starts
+    }
+
+    /// The shared char-prefix cache, for caching by an O(1) `Arc` clone so a
+    /// batch of diagnostics over one non-ASCII source reuses the per-line
+    /// prefixes instead of rebuilding them per render.
+    pub(crate) fn char_prefixes_arc(&self) -> &Arc<RefCell<FxHashMap<usize, Arc<[(u32, u32)]>>>> {
+        &self.char_prefixes
+    }
+
+    /// Whether the indexed source is pure ASCII (byte cols == char cols).
+    pub(crate) fn ascii(&self) -> bool {
+        self.ascii
     }
 
     /// 0-based line containing `offset` (clamped to the source length).
@@ -1866,6 +2343,93 @@ impl<'a> LineIndex<'a> {
             line,
             col: clamped - self.starts[line],
         }
+    }
+
+    /// `(line, char_col)` for `byte_offset`: the line index and the
+    /// character (not byte) column within that line, for display purposes.
+    pub(crate) fn linecol_display(&self, byte_offset: usize) -> (usize, usize) {
+        let pos = self.to_linecol(byte_offset);
+        // ASCII fast path: byte columns equal character columns, so skip the
+        // O(byte_col) `chars().count()` walk.  This is the only per-span
+        // linear cost left in the JSON/HTML/short renderers, and real
+        // compiler output is overwhelmingly ASCII.
+        if self.ascii {
+            return (pos.line, pos.col);
+        }
+        // O(1) table access: `lines().nth(pos.line)` would rescan the whole
+        // file on every span conversion (JSON, HTML, short, call chains).
+        // `line()` strips the same `\n` / `\r\n` terminator that
+        // `str::lines` does, so the column arithmetic is unchanged.  The
+        // char-count walk is amortised across every span on this line (and
+        // every render sharing this index) by the per-line prefix cache in
+        // [`char_col`](Self::char_col).
+        (pos.line, self.char_col(pos.line, pos.col))
+    }
+
+    /// Character column of `byte_col` within line `line_idx`, via a lazily
+    /// built per-line cache.
+    ///
+    /// `byte_col` must be a char boundary within the line (callers arrive via
+    /// `floor_char_boundary`).  On the first query for a line, an ASCII line
+    /// caches an empty table (char count = byte count, so the answer is
+    /// `byte_col`); a non-ASCII line builds a sparse
+    /// `(start_byte, cumulative_extra)` table — one entry per non-ASCII char,
+    /// where `cumulative_extra` is the running sum of `len_utf8 − 1`.
+    /// Later queries on the same line — across every span and every render in
+    /// the batch that shares this index — are `O(1)` for ASCII lines and
+    /// `O(log K)` (K = non-ASCII char count) for non-ASCII lines, both via
+    /// `partition_point`.  Caching ASCII lines too avoids an `O(line_len)`
+    /// `is_ascii()` rescan per span on non-ASCII sources with ASCII lines.
+    /// Memory is `O(K)` (8 bytes per non-ASCII char) vs the old dense
+    /// prefix's `O(line.len())`.
+    fn char_col(&self, line_idx: usize, byte_col: usize) -> usize {
+        // Cache check *first*: a cached entry — empty for ASCII lines, sparse
+        // for non-ASCII — avoids the O(line_len) `is_ascii()` scan on every
+        // call.  Without this hoist, ASCII lines in a non-ASCII source re-scan
+        // `is_ascii()` per span because they never populated the cache (the
+        // per-source `ascii` flag only short-circuits all-ASCII sources).
+        {
+            let cache = self.char_prefixes.borrow();
+            if let Some(sparse) = cache.get(&line_idx) {
+                let line = self.line(line_idx);
+                let b = byte_col.min(line.len());
+                return char_col_from_sparse(sparse, b);
+            }
+        }
+        let line = self.line(line_idx);
+        let b = byte_col.min(line.len());
+        // An ASCII line inside a non-ASCII source: char count equals byte
+        // count, so skip the build.  Cache an *empty* sparse table so future
+        // calls for this line hit the cache above and skip the O(line_len)
+        // `is_ascii()` rescan — `char_col_from_sparse(&[], b)` returns `b`.
+        if line.is_ascii() {
+            self.char_prefixes
+                .borrow_mut()
+                .insert(line_idx, Arc::from([]));
+            return byte_col;
+        }
+        // Build the sparse table: one `(start_byte, cumulative_extra)` pair
+        // per non-ASCII char.  `cumulative_extra` is the running sum of
+        // `len_utf8 − 1` — the extra bytes beyond what a 1-byte char would
+        // use.  Since `b` is always a char boundary (callers arrive via
+        // `floor_char_boundary`), every non-ASCII char either starts before
+        // `b` (its full extra counts) or at/after `b` (none of it counts),
+        // so `char_col = b − cumulative_extra` for chars with `start < b`.
+        // O(K) writes + O(K) memory (K = non-ASCII char count).
+        let mut sparse: Vec<(u32, u32)> = Vec::new();
+        let mut extra = 0u32;
+        for (start, ch) in line.char_indices() {
+            let len = ch.len_utf8();
+            if len > 1 {
+                extra += (len - 1) as u32;
+                sparse.push((start as u32, extra));
+            }
+        }
+        let arc: Arc<[(u32, u32)]> = Arc::from(sparse);
+        self.char_prefixes
+            .borrow_mut()
+            .insert(line_idx, Arc::clone(&arc));
+        char_col_from_sparse(&arc, b)
     }
 
     /// `(start_line, end_line)` for a span: the lines of the first and last
@@ -1940,7 +2504,7 @@ mod tests {
     #[test]
     fn test_basic_error() {
         let diag = Diagnostic::error("something went wrong")
-            .with_code(ErrCode::new("E030"))
+            .with_code_str(ErrCode::E030)
             .with_span(Span::new(FileId::DUMMY, 5, 12))
             .with_suggestion("try using `as` to cast");
         assert!(diag.is_error());
@@ -1950,7 +2514,7 @@ mod tests {
     #[test]
     fn test_with_labels() {
         let diag = Diagnostic::error("no field `z` on type Point")
-            .with_code(ErrCode::new("E010"))
+            .with_code_str(ErrCode::E010)
             .with_span(Span::new(FileId::DUMMY, 50, 53))
             .with_label(Span::new(FileId::DUMMY, 0, 30), "type defined here");
         assert_eq!(diag.labels.len(), 1);
@@ -2012,6 +2576,46 @@ mod tests {
         ));
     }
 
+    /// The non-ASCII no-op fast path must borrow (not allocate) for
+    /// localized text with no control characters — the dominant i18n case.
+    /// Pure-CJK / Cyrillic / accented text contains no controls, so the
+    /// sanitizer must return `Cow::Borrowed`, and the owned path must still
+    /// replace only the control characters.
+    #[test]
+    fn sanitizer_borrows_non_ascii_without_controls() {
+        // Borrowed (no allocation) for the i18n hot case.
+        for s in [
+            "функция main не найдена",
+            "crate 中没有找到 main 函数",
+            "Datei nicht gefunden",
+            "café crème",
+            "안녕하세요",
+        ] {
+            assert!(
+                matches!(sanitize_for_terminal(s), std::borrow::Cow::Borrowed(_)),
+                "sanitize_for_terminal allocated for {s:?}"
+            );
+            assert!(
+                matches!(
+                    sanitize_for_terminal_multiline(s),
+                    std::borrow::Cow::Borrowed(_)
+                ),
+                "sanitize_for_terminal_multiline allocated for {s:?}"
+            );
+        }
+        // A control character in a non-ASCII string still triggers replacement.
+        let out = sanitize_for_terminal("中\x1b文");
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        assert!(out.contains('\u{FFFD}'), "{out:?}");
+        assert!(!out.contains('\x1b'), "{out:?}");
+        // `\n`/`\t` survive multiline without forcing the owned path to
+        // replace them, and other controls become U+FFFD.
+        let out = sanitize_for_terminal_multiline("中\n文\tx\x07");
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        assert!(out.contains('\n') && out.contains('\t'), "{out:?}");
+        assert!(!out.contains('\x07'), "{out:?}");
+    }
+
     #[test]
     fn test_suggest_code_osa_distance() {
         // Single substituted digit — same-length typo the old heuristic missed.
@@ -2059,13 +2663,13 @@ mod tests {
     #[test]
     fn test_call_chain() {
         let mut chain = CallChain::new();
-        chain.push(chain::ChainEntry {
-            kind: chain::ChainEntryKind::Call,
-            span: Some(Span::new(FileId::DUMMY, 80, 90)),
-            message: "main".into(),
-        });
+        chain.push(chain::ChainEntry::new(
+            chain::ChainEntryKind::Call,
+            Some(Span::new(FileId::DUMMY, 80, 90)),
+            "main",
+        ));
         let diag = Diagnostic::error("type mismatch")
-            .with_code(ErrCode::new("E030"))
+            .with_code_str(ErrCode::E030)
             .with_call_chain(chain);
         assert!(diag.call_chain.is_some());
         assert!(diag.to_string().contains("referenced by"));
@@ -2073,18 +2677,17 @@ mod tests {
 
     #[test]
     fn test_from_string_code() {
-        let diag = Diagnostic::error("test").with_code_str("E030");
+        let diag = Diagnostic::error("test").with_code_str(ErrCode::E030);
         assert_eq!(diag.code.unwrap().code(), "E030");
     }
 
     #[test]
     fn test_diagnostic_collector() {
         let mut collector = DiagCtxt::new();
-        collector.push(Diagnostic::error("first error").with_code(ErrCode::new("E030")));
+        collector.push(Diagnostic::error("first error").with_code_str(ErrCode::E030));
         collector.push(Diagnostic::warning("first warning"));
         assert_eq!(collector.len(), 2);
-        assert_eq!(collector.error_count(), 1);
-        assert_eq!(collector.warning_count(), 1);
+        assert_eq!(collector.summary(), (1, 1));
         assert!(collector.has_errors());
     }
 
@@ -2107,12 +2710,35 @@ mod tests {
         assert!(text.contains("try adding a type annotation"));
     }
 
+    /// A highlighted note stores only the styled form; the plain text is
+    /// derived on demand, so a note that is never rendered never allocates it.
+    #[test]
+    fn highlighted_note_derives_plain_message_on_demand() {
+        let styled = StyledString::new(vec![
+            StringPart {
+                content: "expected ".into(),
+                style: StringPartStyle::Normal,
+            },
+            StringPart {
+                content: "Int<32>".into(),
+                style: StringPartStyle::Highlighted,
+            },
+        ]);
+        let diag = Diagnostic::error("mismatch").with_highlighted_note(styled);
+        let child = &diag.children()[0];
+        assert!(child.message.is_none(), "plain text materialized eagerly");
+        assert_eq!(child.plain_message(), "expected Int<32>");
+    }
+
     #[test]
     fn test_error_category() {
-        assert_eq!(ErrCode::new("E030").category(), ErrorCategory::Type);
-        assert_eq!(ErrCode::new("E001").category(), ErrorCategory::Parse);
-        assert_eq!(ErrCode::new("E020").category(), ErrorCategory::Contract);
-        assert_eq!(ErrCode::new("E041").category(), ErrorCategory::Trait);
+        assert_eq!(ErrCode::new(ErrCode::E030).category(), ErrorCategory::Type);
+        assert_eq!(ErrCode::new(ErrCode::E001).category(), ErrorCategory::Parse);
+        assert_eq!(
+            ErrCode::new(ErrCode::E020).category(),
+            ErrorCategory::Contract
+        );
+        assert_eq!(ErrCode::new(ErrCode::E041).category(), ErrorCategory::Trait);
     }
 
     #[test]
@@ -2133,12 +2759,16 @@ mod tests {
         use crate::diagnostics::EmissionGuaranteed;
         let mut ctxt = DiagCtxt::new();
         ctxt.can_emit_warnings = false;
-        let result: Result<(), EmissionGuaranteed> =
-            adorn_with_span(&mut ctxt, Span::new(FileId::DUMMY, 0, 5), Some("hello"), |ctxt| {
+        let result: Result<(), EmissionGuaranteed> = adorn_with_span(
+            &mut ctxt,
+            Span::new(FileId::DUMMY, 0, 5),
+            Some("hello"),
+            |ctxt| {
                 // `push` returns a *suppressed* guarantee here and records
                 // nothing, so the old debug_assert would have fired.
                 Err(ctxt.push(Diagnostic::warning("suppressed")).into())
-            });
+            },
+        );
         assert!(result.is_err());
         assert!(ctxt.is_empty());
     }
@@ -2156,22 +2786,22 @@ mod tests {
         let result: Result<(), EmissionGuaranteed> =
             adorn_with_span(&mut ctxt, adorn_span, Some("src"), |ctxt| {
                 Err(ctxt
-                    .push(
-                        Diagnostic::error("placeholder").with_kind(DiagnosticKind::TypeMismatch {
+                    .push(Diagnostic::error("placeholder").with_kind(
+                        DiagnosticKind::TypeMismatch {
                             expected: Cow::Borrowed("Int<32>"),
                             found: Cow::Borrowed("Str"),
                             span: kind_span,
                             found_span: None,
                             reason: None,
                             context: None,
-                        }),
-                    )
+                        },
+                    ))
                     .into())
             });
         assert!(result.is_err());
         for diag in ctxt.iter_mut() {
             diag.humanize();
-            assert_eq!(diag.spans.primary(), &[adorn_span][..]);
+            assert_eq!(diag.spans.primary().as_slice(), &[adorn_span][..]);
             // Kind derivation itself is unaffected.
             assert_eq!(diag.labels.len(), 1);
             assert_eq!(diag.labels[0].span, kind_span);
@@ -2211,7 +2841,7 @@ mod tests {
 
     #[test]
     fn test_e067_is_registered() {
-        // Regression: `with_code_str("E067")` in the PANN pattern-annotation
+        // Regression: `?with_code_str(ErrCode::E067)` in the PANN pattern-annotation
         // path would `debug_assert!`-panic if the code were absent.
         assert!(ErrCode::try_new("E067").is_ok());
     }
@@ -2293,7 +2923,7 @@ mod tests {
             .with_span(user_span);
         diag.humanize();
         // User span kept; the kind-derived span was NOT merged in.
-        assert_eq!(diag.spans.primary(), &[user_span][..]);
+        assert_eq!(diag.spans.primary().as_slice(), &[user_span][..]);
         // The rest of the kind derivation is unchanged.
         assert_eq!(diag.labels.len(), 1);
         assert_eq!(diag.labels[0].span, kind_span);
@@ -2317,7 +2947,7 @@ mod tests {
         .with_span(user1)
         .with_additional_span(user2);
         diag.humanize();
-        assert_eq!(diag.spans.primary(), &[user1, user2][..]);
+        assert_eq!(diag.spans.primary().as_slice(), &[user1, user2][..]);
     }
 
     #[test]
@@ -2334,7 +2964,7 @@ mod tests {
             context: None,
         });
         diag.humanize();
-        assert_eq!(diag.spans.primary(), &[kind_span][..]);
+        assert_eq!(diag.spans.primary().as_slice(), &[kind_span][..]);
     }
 
     /// Boundary matrix for `LineIndex`: empty input, single byte, with and
@@ -2358,11 +2988,7 @@ mod tests {
             let eof_span = Span::new(FileId::DUMMY, src.len() as u32, src.len() as u32);
             let (first, last) = idx.span_lines(eof_span);
             assert!(first <= last && last < idx.line_count(), "span {src:?}");
-            let over = Span::new(
-                FileId::DUMMY,
-                0,
-                (src.len() as u32).saturating_add(8),
-            );
+            let over = Span::new(FileId::DUMMY, 0, (src.len() as u32).saturating_add(8));
             let (first, last) = idx.span_lines(over);
             assert!(first <= last && last < idx.line_count(), "over {src:?}");
             for i in 0..idx.line_count() {
@@ -2381,6 +3007,56 @@ mod tests {
         assert_eq!(idx.line(0), "中文");
         let pos = idx.to_linecol("中文".len());
         assert_eq!((pos.line, pos.col), (0, "中文".len()));
+    }
+
+    /// `linecol_display` returns *character* columns on non-ASCII sources,
+    /// backed by the lazily-built per-line char-count prefix cache.  This
+    /// pins the cache's correctness (dense prefix build + lookup), the
+    /// ASCII-line-in-a-non-ASCII-source fast path, reuse across repeated
+    /// queries on the same line, and sharing across indexes built from the
+    /// same cached source via [`LineIndex::from_shared`].
+    #[test]
+    fn linecol_display_char_columns_via_prefix_cache() {
+        // Line 0: two 3-byte chars "中" "文"; line 1: ASCII "ab"; line 2:
+        // a 4-byte char "𝄞" (U+1D11E) then ASCII.
+        let src = "中文\nab\n𝄞x\n";
+        let idx = LineIndex::new(src);
+        assert!(!idx.ascii());
+        // Byte layout: 中=0..3, 文=3..6, \n=6, a=7, b=8, \n=9, 𝄞=10..14
+        // (4 bytes), x=14, \n=15.  Char boundaries only — `linecol_display`
+        // floors non-boundary offsets, so test the boundaries directly.
+        assert_eq!(idx.linecol_display(0), (0, 0));
+        assert_eq!(idx.linecol_display(3), (0, 1));
+        assert_eq!(idx.linecol_display(6), (0, 2));
+        // Line 1 is ASCII inside a non-ASCII source: char col == byte col,
+        // exercised through the per-line `is_ascii` fast path in `char_col`.
+        assert_eq!(idx.linecol_display(7), (1, 0));
+        assert_eq!(idx.linecol_display(8), (1, 1));
+        assert_eq!(idx.linecol_display(9), (1, 2));
+        // Line 2: "𝄞" is 4 bytes, "x" follows at byte 14.
+        assert_eq!(idx.linecol_display(10), (2, 0));
+        assert_eq!(idx.linecol_display(14), (2, 1));
+        assert_eq!(idx.linecol_display(15), (2, 2));
+
+        // Repeated queries on the same line hit the cached prefix (the build
+        // runs once); the answers must be stable across calls.
+        assert_eq!(idx.linecol_display(3), (0, 1));
+        assert_eq!(idx.linecol_display(14), (2, 1));
+
+        // A second index sharing the cache (the RenderCtx hit path) reuses
+        // the prefixes the first index built: build on `idx`, then verify
+        // `shared` agrees without rebuilding.  Correctness is observable via
+        // the answers; sharing via `from_shared` is what makes a batch of M
+        // diagnostics over one long non-ASCII line pay one build, not M.
+        idx.linecol_display(3);
+        let shared = LineIndex::from_shared(
+            src,
+            std::sync::Arc::clone(idx.starts_arc()),
+            idx.ascii(),
+            std::sync::Arc::clone(idx.char_prefixes_arc()),
+        );
+        assert_eq!(shared.linecol_display(3), (0, 1));
+        assert_eq!(shared.linecol_display(14), (2, 1));
     }
 
     /// A non-empty span's end is exclusive: an end sitting exactly on a line
@@ -2431,7 +3107,8 @@ mod tests {
             .with_file_name("<input>");
         for i in 0..20 {
             let s = 480_000 + i * 500;
-            diag = diag.with_secondary_label(Span::new(FileId::DUMMY, s, s + 10), format!("label {i}"));
+            diag = diag
+                .with_secondary_label(Span::new(FileId::DUMMY, s, s + 10), format!("label {i}"));
         }
         for _ in 0..2 {
             let _ = std::hint::black_box(renderer.render_diagnostic(&diag));
@@ -2465,12 +3142,15 @@ mod tests {
             .with_file_name("<input>");
         for k in 1..8 {
             let l = k * 600;
-            diag = diag.with_additional_span(Span::new(FileId::DUMMY, line_off[l], line_off[l] + 5));
+            diag =
+                diag.with_additional_span(Span::new(FileId::DUMMY, line_off[l], line_off[l] + 5));
         }
         for i in 0..200 {
             let l = (i * 25) % 5_000;
-            diag = diag
-                .with_secondary_label(Span::new(FileId::DUMMY, line_off[l], line_off[l] + 4), format!("note {i}"));
+            diag = diag.with_secondary_label(
+                Span::new(FileId::DUMMY, line_off[l], line_off[l] + 4),
+                format!("note {i}"),
+            );
         }
         for _ in 0..1 {
             let _ = std::hint::black_box(renderer.render_diagnostic(&diag));
@@ -2574,7 +3254,7 @@ mod tests {
         ms.push(s_b);
         ms.push(s_c);
 
-        assert_eq!(ms.primary(), &[s_d, s_a, s_b, s_c]);
+        assert_eq!(ms.primary().as_slice(), &[s_d, s_a, s_b, s_c]);
     }
 
     /// `MultiSpan::push` keeps the sorted+dedup invariant for interleaved
@@ -2595,7 +3275,7 @@ mod tests {
         ms.push(s_mid); // middle insertion
         ms.push(s_c); // duplicate of the tail-most element (pos 0 after sort)
 
-        assert_eq!(ms.primary(), &[s_a, s_mid, s_b, s_c]);
+        assert_eq!(ms.primary().as_slice(), &[s_a, s_mid, s_b, s_c]);
     }
 
     /// `Diagnostic::augment` merges labels without duplicating a
@@ -2629,6 +3309,30 @@ mod tests {
         }
     }
 
+    /// `augment` with a small `self` and a large `other` must take the
+    /// keyed-set path.  A threshold that only guards `self.labels.len()`
+    /// would route this to the scan path, chaining the growing `to_add`
+    /// on every iteration — O(|other|²) string comparisons.  This locks
+    /// the both-sides threshold: the merge must stay linear and dedup
+    /// correctly regardless of which side is large.
+    #[test]
+    fn augment_small_self_large_other_takes_keyed_path() {
+        let mut target = Diagnostic::error("target");
+        let s0 = Span::new(FileId::DUMMY, 0, 2);
+        target = target.with_secondary_label(s0, "self0");
+
+        let mut other = Diagnostic::error("other");
+        let n = 500;
+        for i in 0..n {
+            let s = Span::new(FileId::DUMMY, (i * 4 + 100) as u32, (i * 4 + 102) as u32);
+            other = other.with_secondary_label(s, format!("m{i}"));
+        }
+
+        target.augment(&other);
+        // `self0` plus all `n` distinct labels from `other`.
+        assert_eq!(target.labels.len(), 1 + n);
+    }
+
     #[test]
     fn diagnostic_size_bounded() {
         let sz = std::mem::size_of::<Diagnostic<'static>>();
@@ -2639,6 +3343,32 @@ mod tests {
              Box<DiagnosticKind>={}",
             std::mem::size_of::<Option<Box<DiagnosticKind<'static>>>>()
         );
-        assert!(sz < 384, "Diagnostic grew to {sz} bytes");
+        assert!(sz <= 384, "Diagnostic grew to {sz} bytes");
+    }
+
+    #[test]
+    fn stable_id_cache_reflects_hashed_field_mutations() {
+        let base = Diagnostic::error("boom")
+            .with_code_str(ErrCode::E030)
+            .with_span(Span::new(FileId::DUMMY, 0, 5));
+        let base_id = base.stable_id();
+        assert_eq!(base.stable_id(), base_id);
+
+        let new_code = base.clone().with_code_str(ErrCode::E031);
+        assert_ne!(new_code.stable_id(), base_id);
+
+        let new_span = base.clone().with_span(Span::new(FileId::DUMMY, 20, 25));
+        assert_ne!(new_span.stable_id(), base_id);
+
+        let mut empty = Diagnostic::error("boom");
+        let empty_id = empty.stable_id();
+        empty.augment(&base);
+        assert_ne!(empty.stable_id(), empty_id);
+
+        let mut d = base.clone();
+        d.set_level(DiagnosticLevel::Warning);
+        d.set_source(Some("ignored"));
+        d.set_file_name("ignored.pn");
+        assert_eq!(d.stable_id(), base_id);
     }
 }

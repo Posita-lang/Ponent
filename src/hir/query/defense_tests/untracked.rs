@@ -226,8 +226,7 @@ fn u7_concurrent_same_key_get_shared_never_tears_or_diverges() {
             // Capacity is left UNBOUNDED (0) on purpose: a bounded memo
             // would let the storm's inserts evict the published handle
             // and the post-storm convergence assertion would flake.
-            QueryDescriptor::new("u7", "untracked memo query, concurrent")
-                .with_untracked(true)
+            QueryDescriptor::new("u7", "untracked memo query, concurrent").with_untracked(true)
         }
         fn compute<S: Scheduler>(key: &DKey, _: &dyn QueryProvider<'q, 'src, S>) -> DValue {
             COMPUTES.fetch_add(1, Ordering::SeqCst);

@@ -16,8 +16,8 @@
 //!   - granularity target: MUST FAIL on the un-fixed eager-BFS invalidation
 //!     (that is the target), must go green after lazy invalidation lands.
 
-use crate::ast::FileId;
 use super::*;
+use crate::ast::FileId;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -2053,7 +2053,10 @@ fn par_get_shared_fans_out_the_handle() {
     assert_eq!(RUNS.load(Ordering::SeqCst), 3, "all warm hits");
     for (slot, r) in again.iter().enumerate() {
         assert!(
-            std::sync::Arc::ptr_eq(r.as_ref().expect("served"), results[slot].as_ref().expect("served")),
+            std::sync::Arc::ptr_eq(
+                r.as_ref().expect("served"),
+                results[slot].as_ref().expect("served")
+            ),
             "a warm fan-out must return the cached handle for slot {slot}"
         );
     }
@@ -2113,9 +2116,8 @@ fn par_get_shared_concurrent_threads_converge_on_one_handle() {
 
     // Thread `t` reads keys [0, t, 9, 1, t, 2] — every set overlaps every
     // other, and each contains one duplicated key.  4 distinct keys total.
-    let keys_for = |t: usize| -> Vec<DKey> {
-        vec![DKey(0), DKey(t), DKey(9), DKey(1), DKey(t), DKey(2)]
-    };
+    let keys_for =
+        |t: usize| -> Vec<DKey> { vec![DKey(0), DKey(t), DKey(9), DKey(1), DKey(t), DKey(2)] };
 
     let per_thread: Vec<Vec<std::sync::Arc<FpValue>>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..THREADS)
@@ -2152,7 +2154,10 @@ fn par_get_shared_concurrent_threads_converge_on_one_handle() {
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("fan-out thread")).collect()
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("fan-out thread"))
+            .collect()
     });
 
     // (4) cross-thread dedup.  Distinct keys are {0, 1, 2, 3, 9} — note
@@ -4519,7 +4524,8 @@ fn doctokens_query_returns_item_docs_via_doc_map() {
             .expect("test source must parse"),
     ));
 
-    let system: &'static QuerySystem<'static, 'static, NoOpScheduler> = Box::leak(Box::new(QuerySystem::new()));
+    let system: &'static QuerySystem<'static, 'static, NoOpScheduler> =
+        Box::leak(Box::new(QuerySystem::new()));
     let provider: &'static SessionQueryProvider<'static, 'static, 'static> = Box::leak(Box::new(
         SessionQueryProvider::new(
             system,
@@ -4600,6 +4606,11 @@ fn doctokens_query_returns_item_docs_via_doc_map() {
 /// Pre-fix, `sys_b`'s serve-path `dep_graph.read` recorded B's node index
 /// into A's task frame; the finish flushed it into A's shards as a
 /// phantom node (and dropped the true edge on the owning system).
+///
+/// That shape is now caught earlier by the `InFlightGuard::acquire`
+/// cross-system mispair tripwire (both builds), which panics on the
+/// first nested foreign acquire before any lock is taken; this test
+/// asserts that gate.
 #[test]
 fn f1_cross_system_nested_serve_must_not_leak_foreign_indices() {
     static E_RUNS: AtomicU64 = AtomicU64::new(0);
@@ -4648,35 +4659,36 @@ fn f1_cross_system_nested_serve_must_not_leak_foreign_indices() {
     .expect("warmup must finish");
     assert_eq!(warm.expect("warmup ok"), 7);
 
-    #[cfg(debug_assertions)]
+    // BOTH builds: the `InFlightGuard::acquire` cross-system mispair
+    // tripwire fires deterministically on the first nested foreign get,
+    // before any lock is taken — the same "loud panic beats hang" trade
+    // documented at the tripwire.  (`DepGraph::read`'s own cross-system
+    // guard is now only reachable by a bare `start_task` without a
+    // matching SESSION entry; the release skip + `CROSS_SYSTEM_SKIPS`
+    // count that this end-to-end shape used to observe is covered by
+    // `dep_graph::tests::cross_system_skip_is_counted_and_reported`.)
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = sys_a.get::<XK>(DKey(0), prov_b).map(|v| v.semantic);
+    }));
+    let payload = r.expect_err("a mispaired nested get must panic in every build");
+    let msg = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .expect("panic payload must be a message");
+    assert!(
+        msg.contains("Provider and executing system must stay paired")
+            && msg.contains("Route the nested query through the paired provider"),
+        "must be the InFlightGuard mispair tripwire: {msg}"
+    );
+    // The unwind is clean: no foreign edge may persist in A's graph.  XK's
+    // node may or may not have been allocated before the nested acquire
+    // tripped, so this is a soft check — the hard assertion is the panic
+    // above.
+    if let Some(vt) = sys_a
+        .find_vtable::<XK>()
+        .and_then(|v| v.lookup_node(&DKey(0)))
     {
-        // Post-fix the cross-system guard fires loudly on the pairing
-        // violation; XK's own compute `catch_unwind` resumes it out of
-        // `get`, so the whole call must panic.
-        let r = run_with_guard(GUARD, move || {
-            let _ = sys_a.get::<XK>(DKey(0), prov_b).map(|v| v.semantic);
-            "returned"
-        });
-        assert_eq!(
-            r,
-            Err("PANIC".to_string()),
-            "debug builds must fail fast on the provider/system pairing violation"
-        );
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let v = run_with_guard(GUARD, move || {
-            sys_a.get::<XK>(DKey(0), prov_b).map(|v| v.semantic)
-        })
-        .expect("get must finish")
-        .expect("release: the get succeeds, the foreign record is skipped");
-        assert_eq!(v, 70);
-        // XK's node on A must carry NO edges: the foreign serve's read was
-        // refused, so nothing from B's index space may appear in A's graph.
-        let vt = sys_a
-            .find_vtable::<XK>()
-            .and_then(|v| v.lookup_node(&DKey(0)))
-            .expect("XK must have a node on A");
         let edges = sys_a.dep_graph.forward_edges_of(vt);
         assert!(
             edges.is_empty(),
@@ -5936,7 +5948,8 @@ mod bench {
         &'static QuerySystem<'static, 'static, NoOpScheduler>,
         &'static dyn QueryProvider<'static, 'static, NoOpScheduler>,
     ) {
-        let system: &'static QuerySystem<'static, 'static, NoOpScheduler> = Box::leak(Box::new(QuerySystem::new()));
+        let system: &'static QuerySystem<'static, 'static, NoOpScheduler> =
+            Box::leak(Box::new(QuerySystem::new()));
         let provider = leak_provider(system);
         (system, provider)
     }
@@ -7041,7 +7054,8 @@ fn l3_transitively_stale_first_touch_is_not_a_hit() {
     assert_eq!(v2.semantic, 3, "the value is still correct");
     let after_control = snap("after_control");
     assert_eq!(
-        after_control.hits, base.hits + 1,
+        after_control.hits,
+        base.hits + 1,
         "control phase: X must be a real hit — the hit must not have been \
          deleted from the verdict path"
     );
@@ -7066,7 +7080,11 @@ fn l3_transitively_stale_first_touch_is_not_a_hit() {
         after_control.misses,
         after_hazard.misses
     );
-    assert_eq!(X_RUNS.load(Ordering::SeqCst), 2, "X recomputed exactly once");
+    assert_eq!(
+        X_RUNS.load(Ordering::SeqCst),
+        2,
+        "X recomputed exactly once"
+    );
 }
 
 /// POST-`reset` REBUILD RACING A SLOW IN-FLIGHT FIRST REGISTRATION
@@ -7190,7 +7208,10 @@ fn post_reset_rebuild_racing_slow_first_registration() {
     let v = system.get::<RQ>(DKey(7), provider).expect("post-race get");
     assert_eq!(v.semantic, 7, "post-race value must be exact");
     assert_eq!(
-        system.get::<RQ>(DKey(7), provider).expect("post-race re-get").semantic,
+        system
+            .get::<RQ>(DKey(7), provider)
+            .expect("post-race re-get")
+            .semantic,
         7,
         "post-race cache must serve the same value"
     );

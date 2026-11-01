@@ -3508,7 +3508,7 @@ mod tests {
     #[test]
     fn test_count_return_refs_recursive() {
         use crate::ast::{Span, Type};
-        let path = Type::Path(smallvec::smallvec![], Span::new(FileId::DUMMY, 0, 1));
+        let path = Type::Path(&[], Span::new(FileId::DUMMY, 0, 1));
         let r1 = Type::Reference {
             inner: &path,
             mutable: true,
@@ -3522,7 +3522,10 @@ mod tests {
             lifetime: None,
             span: Span::new(FileId::DUMMY, 0, 1),
         };
-        let tup = Type::Tuple(vec![r1, r2], Span::new(FileId::DUMMY, 0, 1));
+        let tup = Type::Tuple(
+            Box::leak(vec![r1, r2].into_boxed_slice()),
+            Span::new(FileId::DUMMY, 0, 1),
+        );
         assert_eq!(
             count_return_refs_ast(&tup),
             2,

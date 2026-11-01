@@ -874,7 +874,7 @@ impl<'a, 'src, 'input> ComptimeEvalContext<'a, 'src, 'input> {
                 crate::ast::Literal::Char(c) => Ok(ComptimeValue::Int(*c as i128)),
                 crate::ast::Literal::Byte(b) => Ok(ComptimeValue::Int(*b as i128)),
                 crate::ast::Literal::Bool(b) => Ok(ComptimeValue::Bool(*b)),
-                crate::ast::Literal::String(s) => Ok(ComptimeValue::String(Arc::from(s.as_str()))),
+                crate::ast::Literal::String(s) => Ok(ComptimeValue::String(Arc::from(*s))),
                 crate::ast::Literal::ByteString(b) => Ok(ComptimeValue::String(Arc::from(
                     String::from_utf8_lossy(b).as_ref(),
                 ))),

@@ -14,6 +14,50 @@
 
 use crate::ast::{FileId, Span};
 
+/// A semantic-token index in the parser's grammar stream — the same
+/// numbering the doc anchors use.  Distinct from [`ByteOffset`]: mixing a
+/// token index into a byte position (or vice versa) is a type error, not a
+/// silent misindexing.  Never hashed (position channel).
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TokenIndex(usize);
+
+impl TokenIndex {
+    pub const ZERO: TokenIndex = TokenIndex(0);
+
+    #[inline]
+    pub const fn new(raw: usize) -> Self {
+        TokenIndex(raw)
+    }
+
+    /// The underlying stream position (for `tokens[idx]` indexing and
+    /// arithmetic at the parser's single access point).
+    #[inline]
+    pub const fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+/// A byte offset into one source file — [`Span`]'s raw currency.  Distinct
+/// from [`TokenIndex`] for the same reason that one is distinct from the
+/// other: the position sidetable maps `TokenIndex → (ByteOffset, ByteOffset)`
+/// and the types must not be interchangeable.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ByteOffset(u32);
+
+impl ByteOffset {
+    #[inline]
+    pub const fn new(raw: u32) -> Self {
+        ByteOffset(raw)
+    }
+
+    #[inline]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
 /// Doc-channel + trivia-channel contents of one source file, captured
 /// during the parser's upfront lex.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,7 +76,7 @@ pub struct DocMap<'src> {
     ///
     /// Offsets are `(start, end)` in the file identified by `file`,
     /// mirroring [`Span`]'s `u32` byte-offset representation.
-    pub token_offsets: Vec<(u32, u32)>,
+    pub token_offsets: Vec<(ByteOffset, ByteOffset)>,
     /// The file this doc map was captured from; stamped into every
     /// span built from the position sidetable so `token_span` can
     /// reconstruct a `Span` without carrying the id per offset.
@@ -57,7 +101,7 @@ pub struct DocEntry<'src> {
     pub text: &'src str,
     /// Index of the next semantic token in the parser's token stream
     /// at the time this comment was seen — the item it documents.
-    pub anchor: usize,
+    pub anchor: TokenIndex,
     /// `//!` module-level doc (as opposed to `///`).
     pub is_module: bool,
     /// Byte span of the raw comment (diagnostics/IDE only; never
@@ -81,8 +125,10 @@ pub enum TriviaKind {
 impl<'src> DocMap<'src> {
     /// POSITION CHANNEL: byte span of semantic token `index`
     /// (the same index used for doc anchors).  `None` if out of range.
-    pub fn token_span(&self, index: usize) -> Option<Span> {
-        self.token_offsets.get(index).map(|&(s, e)| Span::new(self.file, s, e))
+    pub fn token_span(&self, index: TokenIndex) -> Option<Span> {
+        self.token_offsets
+            .get(index.as_usize())
+            .map(|&(s, e)| Span::new(self.file, s.as_u32(), e.as_u32()))
     }
 
     /// Doc lines anchored strictly inside `start..end` (an item's
@@ -100,11 +146,7 @@ impl<'src> DocMap<'src> {
     /// (the next semantic token, i.e. the item's `fn`/attribute token)
     /// is.  Module docs (`//!`) never anchor to an item and are
     /// excluded.  This is the lookup the `DocTokens` query uses.
-    pub fn doc_lines_anchored_in(
-        &self,
-        start: u32,
-        end: u32,
-    ) -> impl Iterator<Item = &str> + '_ {
+    pub fn doc_lines_anchored_in(&self, start: u32, end: u32) -> impl Iterator<Item = &str> + '_ {
         self.docs
             .iter()
             .filter(|d| !d.is_module)
@@ -126,7 +168,9 @@ mod tests {
     /// resolves to the byte span of the token that follows it.
     #[test]
     fn test_token_offsets_sidetable() {
-        let source = "/// doc\nlet x = 1;\n  // trivia\nlet y = 2;";
+        // Top-level `let` is rejected (E003), so the two `let` statements
+        // live inside a top-level `comptime` block.
+        let source = "/// doc\ncomptime {\nlet x = 1;\n  // trivia\nlet y = 2;\n}";
         let bump = bumpalo::Bump::new();
         let arena = crate::arena::SyncArena::new(&bump);
         let program = crate::parser::Parser::new(source, FileId::DUMMY, &arena)
@@ -134,8 +178,8 @@ mod tests {
             .expect("parse must succeed");
         let dm = &program.doc_map;
 
-        // 10 semantic tokens: let x = 1 ; let y = 2 ;
-        assert_eq!(dm.token_offsets.len(), 10);
+        // 13 semantic tokens: comptime { let x = 1 ; let y = 2 ; }
+        assert_eq!(dm.token_offsets.len(), 13);
         // Trivia: every inter-token gap is recorded (whitespace runs
         // included); the source has at least the `// trivia` comment.
         assert!(
@@ -143,16 +187,36 @@ mod tests {
             "the `// trivia` comment must appear as a Comment trivia run"
         );
 
-        // Anchor 0 (the `/// doc`'s anchor) is the first `let`.
-        let first_let = dm.token_span(0).expect("anchor 0 must resolve");
-        assert_eq!(&source[first_let.start as usize..first_let.end as usize], "let");
+        // Anchor 0 (the `/// doc`'s anchor) is the first token of the item
+        // the doc attaches to — `comptime`.
+        let item_head = dm
+            .token_span(TokenIndex::new(0))
+            .expect("anchor 0 must resolve");
+        assert_eq!(
+            &source[item_head.start as usize..item_head.end as usize],
+            "comptime"
+        );
 
-        // The second `let` sits after the trivia run (index 5).
-        let second_let = dm.token_span(5).expect("anchor 5 must resolve");
-        assert_eq!(&source[second_let.start as usize..second_let.end as usize], "let");
+        // The first `let` is token 2.
+        let first_let = dm
+            .token_span(TokenIndex::new(2))
+            .expect("anchor 2 must resolve");
+        assert_eq!(
+            &source[first_let.start as usize..first_let.end as usize],
+            "let"
+        );
+
+        // The second `let` sits after the trivia run (index 7).
+        let second_let = dm
+            .token_span(TokenIndex::new(7))
+            .expect("anchor 7 must resolve");
+        assert_eq!(
+            &source[second_let.start as usize..second_let.end as usize],
+            "let"
+        );
 
         // Out of range → None.
-        assert!(dm.token_span(10).is_none());
-        assert!(dm.token_span(usize::MAX).is_none());
+        assert!(dm.token_span(TokenIndex::new(13)).is_none());
+        assert!(dm.token_span(TokenIndex::new(usize::MAX)).is_none());
     }
 }

@@ -1898,14 +1898,20 @@ fn build_refine_query_skeleton(
         format!("(and {})", guard_parts.join(" "))
     };
 
-    // T(X,X') is the SEQUENTIAL (SSA) transition computed above via
-    // `encode_sequential_transition` (its intermediate variables were
-    // quantified in the `forall` binder). `trans` is used verbatim below.
-    // Init: Pre(X) → A'(X). Inductiveness:
+    // Init: Pre(X) ∧ ranges(X) → A'(X) — the declared type ranges join
+    // the antecedent under LIA (`loop_var_range_conds`, same trap-semantics
+    // justification as `var_range_conds` on the BiiLoopProblem path);
+    // BV mode emits `true`. Inductiveness:
     // A'(X) ∧ G(X) ∧ T(X,X') → A'(X').
     smt.push_str(&format!(
-        "  (and (=> {} {}) (=> (and {} {} {}) {}))\n",
-        pre, a_x, a_x, guard, trans, a_xp
+        "  (and (=> (and {} {}) {}) (=> (and {} {} {}) {}))\n",
+        pre,
+        loop_var_range_conds(n, bws, signed, bv),
+        a_x,
+        a_x,
+        guard,
+        trans,
+        a_xp
     ));
     smt.push_str("))\n");
     smt.push_str("(check-sat)\n");
@@ -2104,6 +2110,33 @@ fn var_range_conds(vars: &[crate::hir::loop_ir::BiiVar], bv: bool) -> String {
                 BigInt::zero(),
                 (BigInt::one() << v.bw as usize) - BigInt::one(),
             )
+        };
+        parts.push(format!("(and (<= {} x_{i}) (<= x_{i} {}))", lo, hi));
+    }
+    if parts.len() == 1 {
+        parts.into_iter().next().unwrap()
+    } else {
+        format!("(and {})", parts.join(" "))
+    }
+}
+
+/// The LoopInstr-path counterpart of [`var_range_conds`]: the LIA type
+/// ranges of the loop variables derived from their bit-widths and
+/// signedness (no `BiiLoopProblem` is available on this path). Same
+/// trap-semantics justification: the entry value respects the declared
+/// type, so the ranges may join the Init antecedent. BV mode returns
+/// `true` — the sort already bounds the value.
+fn loop_var_range_conds(n: usize, bws: &[u8], signed: &[bool], bv: bool) -> String {
+    if bv || n == 0 {
+        return "true".to_string();
+    }
+    let mut parts = Vec::new();
+    for i in 0..n {
+        let half = BigInt::one() << (bws[i] as usize - 1);
+        let (lo, hi) = if signed.get(i).copied().unwrap_or(false) {
+            (-half.clone(), half.clone() - BigInt::one())
+        } else {
+            (BigInt::zero(), (half << 1) - BigInt::one())
         };
         parts.push(format!("(and (<= {} x_{i}) (<= x_{i} {}))", lo, hi));
     }
@@ -4154,9 +4187,16 @@ pub(crate) fn verify_template_against_problem(
         q.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
     }
     q.push_str(&format!(
-        ") (=> (and {} {}) {}))))\n",
+        ") (=> (and {} {} {}) {}))))\n",
         init_cond,
         param_range_conds(&problem.params, bv),
+        // Trap semantics: the entry value respects the declared type, so
+        // the ranges join the antecedent (matches the DBM path's
+        // `apply_type_bounds` and the BV path's bounded sorts). Without
+        // them an unpinned loop variable is quantified over ALL of ℤ in
+        // the Init implication and check 1 spuriously reports a
+        // Counterexample.
+        var_range_conds(&problem.vars, bv),
         a_x
     ));
     q.push_str("(check-sat)\n");
@@ -4522,9 +4562,16 @@ fn build_bounded_leap_query(
         format!("(and {})", guard_parts.join(" "))
     };
 
+    // Init: Pre(X) ∧ ranges(X) → A'(X) — see `build_refine_query_skeleton`.
     smt.push_str(&format!(
-        "  (and (=> {} {}) (=> (and {} {} {}) {}))\n",
-        pre, a_x, a_x, guard, trans, a_xp
+        "  (and (=> (and {} {}) {}) (=> (and {} {} {}) {}))\n",
+        pre,
+        loop_var_range_conds(n, bws, signed, bv),
+        a_x,
+        a_x,
+        guard,
+        trans,
+        a_xp
     ));
     smt.push_str("))\n");
     smt.push_str("(check-sat)\n");
@@ -4876,7 +4923,13 @@ mod tests {
         let init = vec![LoopInstr::ConstVar(0, 0)];
         let body = vec![LoopInstr::TestLe(0, 254), LoopInstr::AddSat(0, 1)];
         let problem = crate::hir::loop_ir::loop_instrs_to_loop_problem(
-            &vars, &init, &body, &[128], &[false], &[], true,
+            &vars,
+            &init,
+            &body,
+            &[128],
+            &[false],
+            &[],
+            true,
         )
         .expect("must lower");
         let tpl = synthesize_problem_bii(&solver, &problem, 512, true)

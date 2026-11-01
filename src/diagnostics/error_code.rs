@@ -1,7 +1,9 @@
-use compact_str::CompactString;
+use compact_str::{CompactString, format_compact};
 use std::borrow::Cow;
 use std::fmt;
 use std::sync::OnceLock;
+
+use crate::smallvec::SmallVec;
 
 /// The port number of the local explain server, if running.
 static EXPLAIN_PORT: OnceLock<u16> = OnceLock::new();
@@ -67,13 +69,22 @@ pub fn set_explain_port(port: u16) -> Result<(), u16> {
         .map_err(|_| *EXPLAIN_PORT.get().unwrap_or(&port))
 }
 
+/// Whether the explain server is running (its port has been set).
+pub fn is_explain_server_running() -> bool {
+    EXPLAIN_PORT.get().is_some()
+}
+
 /// The URL for the `--explain` feature.  Returns a `localhost` URL when
 /// the local explain server is running, otherwise the canonical doc URL.
 ///
 /// The code is percent-encoded as a single path segment in both branches, so
 /// an untrusted code (CLI argument, `Diagnostic::with_code_str`) cannot escape
 /// the segment or smuggle control characters into the URL.
-fn explain_url(code: &str) -> String {
+///
+/// Returns a [`CompactString`] — the URL is short enough to inline in the
+/// common case, and `url()`/`url_ansi()` are called per diagnostic that
+/// carries a code.
+fn explain_url(code: &str) -> CompactString {
     explain_url_with_port(code, EXPLAIN_PORT.get().copied())
 }
 
@@ -86,14 +97,14 @@ fn explain_url(code: &str) -> String {
 /// builds one URL per served page, so a process-global mutex + hash + clone
 /// would cost more than the `format!` it caches (and the port is read on
 /// every call, so a later [`set_explain_port`] can never return a stale URL).
-pub(crate) fn explain_url_with_port(code: &str, port: Option<u16>) -> String {
+pub(crate) fn explain_url_with_port(code: &str, port: Option<u16>) -> CompactString {
     if let Some(port) = port {
         explain_server_url(port, code)
     } else {
         // We will register this domain and set up a proper documentation
         // website in the future.  For now, the local explain server is the
         // primary way to view error explanations in a browser.
-        format!(
+        format_compact!(
             "https://doc.posita-lang.org/error_codes/{}.html",
             encode_url_path_segment(code)
         )
@@ -106,14 +117,14 @@ pub(crate) fn explain_url_with_port(code: &str, port: Option<u16>) -> String {
 /// by [`ErrCode::url`] and by the CLI when opening the browser.  The code is
 /// percent-encoded as one path segment so untrusted input cannot escape the
 /// segment or smuggle control characters into the URL.
-pub(crate) fn explain_server_url(port: u16, code: &str) -> String {
-    format!("http://127.0.0.1:{port}/{}", encode_url_path_segment(code))
+pub(crate) fn explain_server_url(port: u16, code: &str) -> CompactString {
+    format_compact!("http://127.0.0.1:{port}/{}", encode_url_path_segment(code))
 }
 
 /// Percent-encode a single URL path segment per RFC 3986.  Unreserved
 /// characters pass through; everything else — including `/`, `:`, `%`,
 /// control characters, and non-ASCII bytes — becomes `%XX`.  Stricter than
-/// [`glyph::encode_file_url_path`](crate::diagnostics::glyph) because a code
+/// [`term::encode_file_url_path`](crate::diagnostics::term) because a code
 /// is *one* segment, and a raw `\x1b` here would terminate the enclosing
 /// OSC 8 hyperlink early.
 fn encode_url_path_segment(s: &str) -> Cow<'_, str> {
@@ -171,27 +182,88 @@ impl ErrorCategory {
     /// human-readable category follows the active
     /// [`Lang`](super::i18n::Lang).
     pub fn label(&self) -> std::borrow::Cow<'static, str> {
-        match self {
-            ErrorCategory::Parse => crate::tr!("category-parse"),
-            ErrorCategory::Resolution => crate::tr!("category-resolution"),
-            ErrorCategory::Type => crate::tr!("category-type"),
-            ErrorCategory::Contract => crate::tr!("category-contract"),
-            ErrorCategory::Trait => crate::tr!("category-trait"),
-            ErrorCategory::Inference => crate::tr!("category-inference"),
-            ErrorCategory::Internal => crate::tr!("category-internal"),
-            ErrorCategory::Generic => crate::tr!("category-generic"),
+        crate::diagnostics::i18n::cached_label! {
+            n = 8,
+            variant = *self as usize,
+            init = [
+                crate::diagnostics::i18n::fluent::category_parse().into_owned(),
+                crate::diagnostics::i18n::fluent::category_resolution().into_owned(),
+                crate::diagnostics::i18n::fluent::category_type().into_owned(),
+                crate::diagnostics::i18n::fluent::category_contract().into_owned(),
+                crate::diagnostics::i18n::fluent::category_trait().into_owned(),
+                crate::diagnostics::i18n::fluent::category_inference().into_owned(),
+                crate::diagnostics::i18n::fluent::category_internal().into_owned(),
+                crate::diagnostics::i18n::fluent::category_generic().into_owned(),
+            ],
+        }
+    }
+}
+
+impl std::str::FromStr for ErrorCategory {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let lower = s.to_ascii_lowercase();
+        match lower.as_str() {
+            "parse" | "parse error" => Ok(ErrorCategory::Parse),
+            "resolution" | "resolution error" => Ok(ErrorCategory::Resolution),
+            "type" | "type error" => Ok(ErrorCategory::Type),
+            "contract" | "contract error" => Ok(ErrorCategory::Contract),
+            "trait" | "trait error" => Ok(ErrorCategory::Trait),
+            "inference" | "inference error" => Ok(ErrorCategory::Inference),
+            "internal" | "internal error" => Ok(ErrorCategory::Internal),
+            "generic" | "error" => Ok(ErrorCategory::Generic),
+            _ => Err(format!(
+                "unknown error category `{s}` (valid: parse, resolution, type, \
+                 contract, trait, inference, internal, generic)"
+            )),
         }
     }
 }
 
 /// A compiler error or warning code (e.g. "E030", "W113").
 ///
-/// Stored as a [`CompactString`]: codes are short (`E030`), so a known or
-/// unknown code stays inline with no heap allocation.  Metadata (title,
-/// category, explanation) is resolved through the same lookup table, removing
-/// the need for exhaustive match arms on enum variants.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ErrCode(CompactString);
+/// A code resolved against [`CODE_TABLE`] is stored as a pointer to its
+/// static entry: construction copies no string, `Clone` is a pointer copy,
+/// and `title()` / `category()` / `explain()` need no further lookup.
+/// A code that is not in the table (CLI input, `Diagnostic::with_code_str`)
+/// stays inline in a [`CompactString`], so short unknown codes still never
+/// allocate.  Equality and hashing compare the code string, so the two
+/// representations are interchangeable.
+#[derive(Clone)]
+pub struct ErrCode(ErrCodeRepr);
+
+/// The two storage forms behind [`ErrCode`].
+#[derive(Clone)]
+enum ErrCodeRepr {
+    /// Resolved table entry — a `'static` pointer, no copy.
+    Known(&'static CodeEntry),
+    /// Unresolved code, stored verbatim (inline for short codes).
+    Other(CompactString),
+}
+
+impl fmt::Debug for ErrCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ErrCode").field(&self.code()).finish()
+    }
+}
+
+/// Compare the code strings, not the storage form: `ErrCode::new("E030")`
+/// and `ErrCode::unknown("E030")` must stay equal (they did when both were
+/// backed by the same `CompactString`).
+impl PartialEq for ErrCode {
+    fn eq(&self, other: &Self) -> bool {
+        self.code() == other.code()
+    }
+}
+
+impl Eq for ErrCode {}
+
+impl std::hash::Hash for ErrCode {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(self.code(), state);
+    }
+}
 
 /// Error returned when an unknown error code string is used.
 #[derive(Debug, Clone)]
@@ -239,9 +311,10 @@ impl ErrCode {
     pub fn new(code: impl AsRef<str>) -> Self {
         let code = code.as_ref();
         // Fast path: an already-canonical code (the overwhelmingly common
-        // case) hits the table with no allocation.
+        // case) hits the table with no allocation and stores the entry
+        // pointer directly.
         if let Some(e) = lookup(code) {
-            return ErrCode(CompactString::from(e.code));
+            return ErrCode(ErrCodeRepr::Known(e));
         }
         // Retry case-insensitively (`e030` → `E030`), matching
         // `suggest_code`'s case-insensitive comparison — a lowercase code
@@ -249,35 +322,16 @@ impl ErrCode {
         // The retry is allocation-free for real codes (see
         // [`lookup_uppercased`]).
         if let Some(e) = lookup_uppercased(code) {
-            return ErrCode(CompactString::from(e.code));
+            return ErrCode(ErrCodeRepr::Known(e));
         }
         // Unknown: stored verbatim — never invent case for arbitrary
         // strings that are not error codes.
-        ErrCode(CompactString::from(code))
-    }
-
-    /// Build an `ErrCode` from a code expected to be in the table, keeping a
-    /// `debug_assert!` so a typo still panics debug builds; release behaves
-    /// exactly like [`Self::new`].
-    ///
-    /// Production code must not depend on the panic: it only marks "this is
-    /// a programming error" for developers.
-    pub(crate) fn new_unchecked(code: impl AsRef<str>) -> Self {
-        let code = code.as_ref();
-        let entry = lookup(code);
-        debug_assert!(
-            entry.is_some(),
-            "unknown error code: {code:?} — must be added to error_codes/codes.toml",
-        );
-        match entry {
-            Some(e) => ErrCode(CompactString::from(e.code)),
-            None => ErrCode(CompactString::from(code)),
-        }
+        ErrCode(ErrCodeRepr::Other(CompactString::from(code)))
     }
 
     /// Validate that `code` exists in the lookup table, returning
     /// [`UnknownCode`] if it does not.  This check runs in **all** build
-    /// profiles (unlike the `debug_assert!` in [`Self::new_unchecked`]).
+    /// profiles.
     ///
     /// On success the canonical entry is copied inline; only the
     /// unknown-code error borrows the rejected input.
@@ -286,7 +340,7 @@ impl ErrCode {
         // in any case is accepted and stored canonically; the error keeps
         // the input verbatim so the user sees what they typed.
         match lookup(code).or_else(|| lookup_uppercased(code)) {
-            Some(e) => Ok(ErrCode(CompactString::from(e.code))),
+            Some(e) => Ok(ErrCode(ErrCodeRepr::Known(e))),
             None => Err(UnknownCode(Cow::Borrowed(code))),
         }
     }
@@ -299,12 +353,15 @@ impl ErrCode {
     /// This is the escape hatch for callers that may receive untrusted or
     /// dynamically-constructed code strings (e.g. `Diagnostic::with_code_str`).
     pub(crate) fn unknown(code: impl Into<CompactString>) -> Self {
-        ErrCode(code.into())
+        ErrCode(ErrCodeRepr::Other(code.into()))
     }
 
     /// The code string, e.g. "E030" or "W113".
     pub fn code(&self) -> &str {
-        self.0.as_str()
+        match &self.0 {
+            ErrCodeRepr::Known(e) => e.code,
+            ErrCodeRepr::Other(s) => s.as_str(),
+        }
     }
 
     /// Resolve this error code to its table entry, if present.
@@ -313,7 +370,13 @@ impl ErrCode {
     /// should use this once and derive each from the returned entry, avoiding
     /// repeated hash lookups.
     pub fn entry(&self) -> Option<&'static CodeEntry> {
-        lookup(&self.0)
+        match &self.0 {
+            ErrCodeRepr::Known(e) => Some(*e),
+            // Preserve the old behaviour for `unknown` codes that happen to
+            // name a real entry: they still resolve their metadata, matching
+            // the case-insensitive resolution in `new`/`try_new`.
+            ErrCodeRepr::Other(s) => lookup(s).or_else(|| lookup_uppercased(s)),
+        }
     }
 
     /// Return the resolved entry or the static unknown-code fallback.
@@ -321,7 +384,12 @@ impl ErrCode {
     /// Equivalent to a single `lookup` call followed by `.unwrap_or(...)`,
     /// so callers can gather `title` / `category` / `explain` in one lookup.
     pub(crate) fn entry_or_unknown(&self) -> &'static CodeEntry {
-        lookup(&self.0).unwrap_or(&UNKNOWN_CODE_ENTRY)
+        match &self.0 {
+            ErrCodeRepr::Known(e) => e,
+            ErrCodeRepr::Other(s) => lookup(s)
+                .or_else(|| lookup_uppercased(s))
+                .unwrap_or(&UNKNOWN_CODE_ENTRY),
+        }
     }
 
     /// Short title, e.g. "type mismatch" or "duplicate definition".
@@ -344,8 +412,8 @@ impl ErrCode {
     /// [`explain_url`] percent-encodes the code as a single path segment, so an
     /// unknown code holding arbitrary bytes (see [`Self::unknown`]) cannot
     /// escape the segment or the enclosing link.
-    pub fn url(&self) -> String {
-        explain_url(&self.0)
+    pub fn url(&self) -> CompactString {
+        explain_url(self.code())
     }
 
     /// The diagnostic URL, formatted as an ANSI hyperlink if the terminal supports it.
@@ -353,11 +421,11 @@ impl ErrCode {
     /// The visible text is sanitized (control characters become U+FFFD) so an
     /// untrusted code cannot terminate the OSC 8 link early and inject further
     /// terminal escapes.
-    pub fn url_ansi(&self) -> String {
-        format!(
+    pub fn url_ansi(&self) -> CompactString {
+        format_compact!(
             "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\",
             self.url(),
-            super::sanitize_for_terminal(&self.0),
+            super::sanitize_for_terminal(self.code()),
         )
     }
 }
@@ -406,6 +474,81 @@ impl fmt::Display for ErrorCategory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
     }
+}
+
+/// `CODE_TABLE` grouped by category in first-appearance order, cached once.
+///
+/// `CODE_TABLE` is in document (toml) order, which is **not** grouped by
+/// category — codes are interleaved across categories.  Callers that print
+/// one header per category (`--list-codes`, the explain-server index page)
+/// must group first; iterating `CODE_TABLE` directly would repeat a category
+/// header each time the category reappears.
+pub(crate) fn code_entries_by_category() -> &'static [(ErrorCategory, Vec<&'static CodeEntry>)] {
+    static GROUPED: std::sync::OnceLock<Box<[(ErrorCategory, Vec<&'static CodeEntry>)]>> =
+        std::sync::OnceLock::new();
+    GROUPED.get_or_init(|| {
+        let mut order: Vec<ErrorCategory> = Vec::new();
+        let mut buckets: rustc_hash::FxHashMap<ErrorCategory, Vec<&'static CodeEntry>> =
+            rustc_hash::FxHashMap::default();
+        for e in CODE_TABLE {
+            let bucket = buckets.entry(e.category).or_default();
+            if bucket.is_empty() {
+                order.push(e.category);
+            }
+            bucket.push(e);
+        }
+        order
+            .into_iter()
+            .map(|cat| (cat, buckets.remove(&cat).unwrap_or_default()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    })
+}
+
+pub fn related_codes_of(code: &str) -> &'static [&'static str] {
+    const PAIRS: &[(&str, &[&str])] = &[
+        ("E030", &["E031", "E032"]),
+        ("E031", &["E030"]),
+        ("E032", &["E030"]),
+    ];
+    for (src, rel) in PAIRS {
+        if *src == code {
+            return rel;
+        }
+    }
+    &[]
+}
+
+pub fn category_siblings_of(code: &str, max: usize) -> SmallVec<[&'static str; 4]> {
+    let Some(entry) = lookup(code) else {
+        return SmallVec::new();
+    };
+    // Codes grouped by category, built once.  CODE_TABLE is static so the
+    // grouping is invariant; caching it turns the per-call O(table) scan into
+    // O(category) — a real win on the terminal renderer's per-diagnostic
+    // "see also" path, which calls this for every diagnostic without explicit
+    // related codes.
+    static BY_CATEGORY: std::sync::OnceLock<
+        rustc_hash::FxHashMap<ErrorCategory, Vec<&'static str>>,
+    > = std::sync::OnceLock::new();
+    let by_category = BY_CATEGORY.get_or_init(|| {
+        let mut map: rustc_hash::FxHashMap<ErrorCategory, Vec<&'static str>> =
+            rustc_hash::FxHashMap::default();
+        for e in CODE_TABLE {
+            map.entry(e.category).or_default().push(e.code);
+        }
+        map
+    });
+    let siblings: &[&'static str] = by_category
+        .get(&entry.category)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    siblings
+        .iter()
+        .filter(|c| **c != code)
+        .take(max)
+        .copied()
+        .collect()
 }
 
 #[cfg(all(test, not(feature = "shuttle")))]
@@ -458,10 +601,33 @@ mod tests {
     /// Regression guard: encoding must not alter canonical codes.
     #[test]
     fn known_codes_are_unchanged() {
-        let ec = ErrCode::new("E030");
+        let ec = ErrCode::new(ErrCode::E030);
         assert!(ec.url().contains("/E030"), "got: {}", ec.url());
         assert!(!ec.url().contains('%'), "got: {}", ec.url());
         assert!(ec.url_ansi().contains("E030"));
+    }
+
+    /// The table-entry and verbatim storage forms must be interchangeable:
+    /// equality, hashing, and metadata all compare the code string, so an
+    /// `unknown` code that happens to name a real entry still resolves.
+    #[test]
+    fn known_and_verbatim_forms_are_equivalent() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let known = ErrCode::new("E030");
+        let verbatim = ErrCode::unknown("E030");
+        assert_eq!(known, verbatim);
+        assert_eq!(known.code(), verbatim.code());
+        assert_eq!(known.title(), verbatim.title());
+        assert_eq!(known.category(), verbatim.category());
+
+        let hash = |c: &ErrCode| {
+            let mut h = DefaultHasher::new();
+            c.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash(&known), hash(&verbatim));
     }
 
     /// Pin the single-segment RFC 3986 contract now that the CLI builds its
@@ -865,14 +1031,6 @@ mod tests {
         assert_eq!(code.title(), "unknown error");
         // The validating constructor still rejects the same input.
         assert!(ErrCode::try_new(&unknown).is_err());
-    }
-
-    /// `new_unchecked` round-trips a table code.  Also the guard keeping
-    /// `new_unchecked` alive: production has no call sites yet, but the
-    /// escape hatch must stay ready and behaviour-identical for dev builds.
-    #[test]
-    fn new_unchecked_round_trips_table_code() {
-        assert_eq!(ErrCode::new_unchecked("E030").code(), "E030");
     }
 
     /// The compile-time direct-address index must agree with a linear scan

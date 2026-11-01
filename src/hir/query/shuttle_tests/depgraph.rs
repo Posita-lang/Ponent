@@ -156,7 +156,8 @@ fn finish_window_erased_fanout_mark_is_repaired() {
         );
 
         // -- Phase A: the fan-out reaches the parked finisher directly --
-        sched.arm(move |p| matches!(p, SchedulePoint::FinishWindow { node } if *node == n_fanned.0));
+        sched
+            .arm(move |p| matches!(p, SchedulePoint::FinishWindow { node } if *node == n_fanned.0));
         let ha = shuttle::thread::spawn(move || {
             dg.start_task(n_fanned);
             dg.read(r);

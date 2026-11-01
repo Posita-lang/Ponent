@@ -39,6 +39,10 @@ impl<'input> TypeContext<'input> {
         self.kappa_cache.clear();
         self.type_flags.clear();
         self.interner.variance_cache.write().clear();
+        // Solver-side epoch caches must not survive a commit that merged
+        // binding mutations into the parent.
+        self.binding_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Rollback the current transaction: reverse-apply every binding change
@@ -79,5 +83,9 @@ impl<'input> TypeContext<'input> {
         self.kappa_cache.clear();
         self.type_flags.clear();
         self.interner.variance_cache.write().clear();
+        // A rolled-back snapshot must never serve pre-rollback verdicts
+        // from epoch-keyed solver caches.
+        self.binding_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }

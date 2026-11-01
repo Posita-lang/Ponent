@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::lexer::Token;
+use smallvec::SmallVec;
 
 impl<'src, 'input> Parser<'src, 'input> {
     /// Generate a diagnostic for an unexpected token, optionally with recovery.
@@ -9,13 +10,11 @@ impl<'src, 'input> Parser<'src, 'input> {
         let span = self.span();
         let found = self.peek().clone();
         let found_str = match &found {
-            Ok(tok) => format!("{:?}", tok),
-            Err(()) => "end of file".to_string(),
+            Some(tok) => format!("{:?}", tok),
+            None => "end of file".to_string(),
         };
         let expected_str = if let Some(tok) = expected {
             format!("{:?}", tok)
-        } else if !self.expected_token_types.is_empty() {
-            self.expected_token_types.last().expect("expected_token_types should be non-empty when formatting error — push_expected was not called before expect_one_of").desc.to_string()
         } else {
             "something".to_string()
         };
@@ -32,7 +31,7 @@ impl<'src, 'input> Parser<'src, 'input> {
             return None;
         }
         self.last_unexpected_token_span = Some(span);
-        Some(Recovered::Yes(ErrorGuaranteed::new_unchecked(0)))
+        Some(Recovered::Yes(ErrorGuaranteed::new_unchecked()))
     }
 
     /// Synchronize the token stream after a parse error.
@@ -45,8 +44,8 @@ impl<'src, 'input> Parser<'src, 'input> {
         // Consume semicolon if present (it's a statement TERMINATOR — not
         // a statement start — so consuming it cannot skip the next valid
         // statement's first token; the next statement starts fresh).
-        if matches!(self.peek(), Ok(Token::Semicolon)) {
-            self.advance().ok();
+        if matches!(self.peek(), Some(Token::Semicolon)) {
+            self.advance();
             self.sync_stall = None;
             return;
         }
@@ -57,12 +56,12 @@ impl<'src, 'input> Parser<'src, 'input> {
         // diagnostics here would cascade noise over the real error.
         loop {
             match self.peek() {
-                Err(()) => return,
+                None => return,
                 // A block's closing brace belongs to the enclosing block —
                 // stop before it so `parse_block_inner`'s `RBrace => break`
                 // guard ends the block cleanly (consuming it would let the
                 // loop keep parsing tokens after the block's close).
-                Ok(Token::RBrace) => return,
+                Some(Token::RBrace) => return,
                 // A statement-start keyword begins the NEXT statement —
                 // stop before it instead of swallowing it, otherwise the
                 // next statement's first token is lost and the follow-up
@@ -75,10 +74,10 @@ impl<'src, 'input> Parser<'src, 'input> {
                 // value, the statement loop made no net consumption — force
                 // consume one token so forward progress is guaranteed even
                 // when a statement arm cannot consume its keyword.
-                Ok(tok) if Self::is_stmt_start_keyword(tok) => {
+                Some(tok) if Self::is_stmt_start_keyword(tok) => {
                     let current = self.progress;
                     if self.sync_stall == Some(current) {
-                        self.advance().ok();
+                        self.advance();
                         self.sync_stall = None;
                         return;
                     }
@@ -90,13 +89,13 @@ impl<'src, 'input> Parser<'src, 'input> {
                 // instead of spinning forever on the same token (the
                 // stuck-test regression: `def main() { type R = Int<32>; }`
                 // looped on `Token::Type`).
-                Ok(tok) if Self::is_sync_token(tok) => {
-                    self.advance().ok();
+                Some(tok) if Self::is_sync_token(tok) => {
+                    self.advance();
                     self.sync_stall = None;
                     return;
                 }
                 _ => {
-                    self.advance().ok();
+                    self.advance();
                     self.sync_stall = None;
                 }
             }
@@ -110,10 +109,10 @@ impl<'src, 'input> Parser<'src, 'input> {
     pub(super) fn skip_to_next_top_level(&mut self) {
         loop {
             match self.peek() {
-                Err(()) => return,
-                Ok(tok) if Self::is_top_level_start(tok) => return,
-                Ok(_) => {
-                    self.advance().ok();
+                None => return,
+                Some(tok) if Self::is_top_level_start(tok) => return,
+                Some(_) => {
+                    self.advance();
                 }
             }
         }
@@ -205,13 +204,122 @@ impl<'src, 'input> Parser<'src, 'input> {
 // -----------------------------------------------------------------------------
 
 /// The syntactic context for keyword suggestions.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeywordContext {
     TopLevel,
     Expression,
     Statement,
     Type,
     Generic,
+}
+
+/// A statically known set of keywords for one syntactic context.
+///
+/// Keeping the table in an associated const lets call sites that know the
+/// context at compile time use `did_you_mean_keyword_for::<K>` without a
+/// runtime dispatch, while [`KeywordContext`] remains available for callers
+/// that genuinely have a runtime context.
+pub trait KeywordSet {
+    const KEYWORDS: &'static [&'static str];
+}
+
+/// The keyword tables, one ZST per [`KeywordContext`].
+pub mod keyword_sets {
+    use super::KeywordSet;
+
+    pub struct TopLevelKeywords;
+    pub struct ExpressionKeywords;
+    pub struct StatementKeywords;
+    pub struct TypeKeywords;
+    pub struct GenericKeywords;
+
+    impl KeywordSet for TopLevelKeywords {
+        const KEYWORDS: &'static [&'static str] = &[
+            "def",
+            "type",
+            "trait",
+            "import",
+            "from",
+            "edition",
+            "constraint",
+            "extern",
+            "impl",
+            "comptime",
+            "async",
+            "set",
+            "let",
+            "layout",
+            "generate",
+        ];
+    }
+
+    impl KeywordSet for ExpressionKeywords {
+        const KEYWORDS: &'static [&'static str] = &[
+            "true", "false", "if", "else", "match", "for", "while", "return", "leave", "continue",
+            "move", "not", "and", "or", "sizeof", "alignof", "catch", "panic", "unsafe", "old",
+            "exists", "forall", "poly", "unbox", "await", "task", "ieee",
+        ];
+    }
+
+    impl KeywordSet for StatementKeywords {
+        const KEYWORDS: &'static [&'static str] = &[
+            "set",
+            "let",
+            "return",
+            "leave",
+            "continue",
+            "if",
+            "else",
+            "while",
+            "for",
+            "unsafe",
+            "ghost",
+            "scope_cleanup",
+            "trigger",
+            "isolate",
+        ];
+    }
+
+    impl KeywordSet for TypeKeywords {
+        const KEYWORDS: &'static [&'static str] = &[
+            "Int", "UInt", "Float", "Bool", "Char", "Byte", "USize", "Never", "Rational", "dyn",
+            "ref", "mut", "ieee",
+        ];
+    }
+
+    impl KeywordSet for GenericKeywords {
+        const KEYWORDS: &'static [&'static str] = &[
+            "def",
+            "type",
+            "trait",
+            "import",
+            "from",
+            "edition",
+            "constraint",
+            "extern",
+            "impl",
+            "comptime",
+            "async",
+            "set",
+            "let",
+            "if",
+            "else",
+            "while",
+            "for",
+            "return",
+            "leave",
+            "continue",
+            "match",
+            "ghost",
+            "propagates",
+            "overrides",
+            "trigger",
+            "scope_cleanup",
+            "true",
+            "false",
+            "ieee",
+        ];
+    }
 }
 
 /// Compute the Damerau-Levenshtein (OSA) distance between two strings.
@@ -226,9 +334,9 @@ pub enum KeywordContext {
 /// the "row entirely > limit → bail" early-exit still holds because every
 /// OSA transition adds ≥ 0.
 pub(crate) fn osa_distance_limited_into(
-    prev_prev: &mut Vec<usize>,
-    prev: &mut Vec<usize>,
-    curr: &mut Vec<usize>,
+    prev_prev: &mut SmallVec<[usize; 16]>,
+    prev: &mut SmallVec<[usize; 16]>,
+    curr: &mut SmallVec<[usize; 16]>,
     a: &[char],
     b: &[char],
     limit: usize,
@@ -300,15 +408,17 @@ pub(crate) fn osa_distance_limited_into(
 #[derive(Debug, Default)]
 pub struct SuggestionBuffers {
     /// The lowercased input identifier, collected once per suggestion pass.
-    input_chars: Vec<char>,
+    /// `32` chars covers ordinary identifiers without touching the heap.
+    input_chars: SmallVec<[char; 32]>,
     /// The current candidate keyword, refilled once per candidate.
-    keyword_chars: Vec<char>,
-    /// Edit-distance DP row `i - 2`.
-    prev_prev: Vec<usize>,
+    /// The longest keyword in the tables fits comfortably in 16.
+    keyword_chars: SmallVec<[char; 16]>,
+    /// Edit-distance DP row `i - 2` (keyword rows are at most 15 wide).
+    prev_prev: SmallVec<[usize; 16]>,
     /// Edit-distance DP row `i - 1`.
-    prev: Vec<usize>,
+    prev: SmallVec<[usize; 16]>,
     /// Edit-distance DP row `i`.
-    curr: Vec<usize>,
+    curr: SmallVec<[usize; 16]>,
 }
 
 /// Suggest a close-matching keyword when an unknown identifier is encountered.
@@ -325,10 +435,46 @@ pub fn did_you_mean_keyword(input: &str, context: KeywordContext) -> Option<Stri
 }
 
 /// Buffer-reusing variant of [`did_you_mean_keyword`] — see [`SuggestionBuffers`].
+///
+/// This is the runtime-context forwarder; callers with a statically known
+/// context should use [`did_you_mean_keyword_for`] /
+/// [`did_you_mean_keyword_for_with_buffers`] to avoid the dispatch.
 pub fn did_you_mean_keyword_with_buffers(
     buffers: &mut SuggestionBuffers,
     input: &str,
     context: KeywordContext,
+) -> Option<String> {
+    use keyword_sets::{
+        ExpressionKeywords, GenericKeywords, StatementKeywords, TopLevelKeywords, TypeKeywords,
+    };
+    match context {
+        KeywordContext::TopLevel => {
+            did_you_mean_keyword_for_with_buffers::<TopLevelKeywords>(buffers, input)
+        }
+        KeywordContext::Expression => {
+            did_you_mean_keyword_for_with_buffers::<ExpressionKeywords>(buffers, input)
+        }
+        KeywordContext::Statement => {
+            did_you_mean_keyword_for_with_buffers::<StatementKeywords>(buffers, input)
+        }
+        KeywordContext::Type => {
+            did_you_mean_keyword_for_with_buffers::<TypeKeywords>(buffers, input)
+        }
+        KeywordContext::Generic => {
+            did_you_mean_keyword_for_with_buffers::<GenericKeywords>(buffers, input)
+        }
+    }
+}
+
+/// Statically dispatched keyword suggestion for context `K`.
+pub fn did_you_mean_keyword_for<K: KeywordSet>(input: &str) -> Option<String> {
+    did_you_mean_keyword_for_with_buffers::<K>(&mut SuggestionBuffers::default(), input)
+}
+
+/// Statically dispatched, buffer-reusing keyword suggestion for context `K`.
+pub fn did_you_mean_keyword_for_with_buffers<K: KeywordSet>(
+    buffers: &mut SuggestionBuffers,
+    input: &str,
 ) -> Option<String> {
     let SuggestionBuffers {
         input_chars,
@@ -337,81 +483,7 @@ pub fn did_you_mean_keyword_with_buffers(
         prev,
         curr,
     } = buffers;
-    let keywords: &[&str] = match context {
-        KeywordContext::TopLevel => &[
-            "def",
-            "type",
-            "trait",
-            "import",
-            "from",
-            "edition",
-            "constraint",
-            "extern",
-            "impl",
-            "comptime",
-            "async",
-            "set",
-            "let",
-            "layout",
-            "generate",
-        ],
-        KeywordContext::Expression => &[
-            "true", "false", "if", "else", "match", "for", "while", "return", "leave", "continue",
-            "move", "not", "and", "or", "sizeof", "alignof", "catch", "panic", "unsafe", "old",
-            "exists", "forall", "poly", "unbox", "await", "task", "ieee",
-        ],
-        KeywordContext::Statement => &[
-            "set",
-            "let",
-            "return",
-            "leave",
-            "continue",
-            "if",
-            "else",
-            "while",
-            "for",
-            "unsafe",
-            "ghost",
-            "scope_cleanup",
-            "trigger",
-            "isolate",
-        ],
-        KeywordContext::Type => &[
-            "Int", "UInt", "Float", "Bool", "Char", "Byte", "USize", "Never", "Rational", "dyn",
-            "ref", "mut", "ieee",
-        ],
-        KeywordContext::Generic => &[
-            "def",
-            "type",
-            "trait",
-            "import",
-            "from",
-            "edition",
-            "constraint",
-            "extern",
-            "impl",
-            "comptime",
-            "async",
-            "set",
-            "let",
-            "if",
-            "else",
-            "while",
-            "for",
-            "return",
-            "leave",
-            "continue",
-            "match",
-            "ghost",
-            "propagates",
-            "overrides",
-            "trigger",
-            "scope_cleanup",
-            "true",
-            "false",
-            "ieee",
-        ],
-    };
+    let keywords: &[&str] = K::KEYWORDS;
     // ASCII fast path: byte-based case folding avoids the allocation of
     // `to_lowercase()`; non-ASCII falls back to the Unicode fold.
     let input_lower = if input.is_ascii() {
@@ -432,7 +504,14 @@ pub fn did_you_mean_keyword_with_buffers(
         }
         keyword_chars.clear();
         keyword_chars.extend(kw.chars());
-        let d = osa_distance_limited_into(prev_prev, prev, curr, input_chars, keyword_chars, 2);
+        let d = osa_distance_limited_into(
+            prev_prev,
+            prev,
+            curr,
+            &input_chars[..],
+            &keyword_chars[..],
+            2,
+        );
         if d <= 2 {
             match best {
                 None => best = Some((kw, d)),
@@ -452,7 +531,14 @@ pub fn did_you_mean_keyword_with_buffers(
             let threshold = input.len().max(3);
             keyword_chars.clear();
             keyword_chars.extend(kw.chars());
-            let d = osa_distance_limited_into(prev_prev, prev, curr, input_chars, keyword_chars, threshold);
+            let d = osa_distance_limited_into(
+                prev_prev,
+                prev,
+                curr,
+                &input_chars[..],
+                &keyword_chars[..],
+                threshold,
+            );
             if d <= threshold && (input.len() < 4 || d * 2 <= input.len()) {
                 match best {
                     None => best = Some((kw, d)),

@@ -18,7 +18,11 @@ fn insert_trait<'input>(symbols: &mut SymbolTable<'input>, name: &str, def_id: &
         attributes: vec![],
         crate_id: symbols.local_crate_id,
     };
-    if let Err(e) = symbols.insert_trait(Symbol::intern(name), binding, Span::new(FileId::DUMMY, 0, 0)) {
+    if let Err(e) = symbols.insert_trait(
+        Symbol::intern(name),
+        binding,
+        Span::new(FileId::DUMMY, 0, 0),
+    ) {
         panic!("duplicate builtin registration: {:?}", e);
     }
 }
@@ -136,7 +140,7 @@ pub fn register_builtins<'input>(
                     context: vec![],
                     arity: 0,
                     trait_args: vec![],
-                    where_clause_bounds: vec![],
+                    where_clause_bounds: Vec::new(),
                     span: Span::new(FileId::DUMMY, 0, 0),
                 },
                 symbols,
@@ -163,7 +167,7 @@ pub fn register_builtins<'input>(
                     context: vec![],
                     arity: 0,
                     trait_args: vec![],
-                    where_clause_bounds: vec![],
+                    where_clause_bounds: Vec::new(),
                     span: Span::new(FileId::DUMMY, 0, 0),
                 },
                 symbols,
@@ -206,7 +210,7 @@ pub fn register_builtins<'input>(
                         context: vec![],
                         arity: 0,
                         trait_args: vec![],
-                        where_clause_bounds: vec![],
+                        where_clause_bounds: Vec::new(),
                         span: Span::new(FileId::DUMMY, 0, 0),
                     },
                     symbols,
@@ -232,7 +236,7 @@ pub fn register_builtins<'input>(
                         context: vec![],
                         arity: 0,
                         trait_args: vec![],
-                        where_clause_bounds: vec![],
+                        where_clause_bounds: Vec::new(),
                         span: Span::new(FileId::DUMMY, 0, 0),
                     },
                     symbols,
@@ -264,7 +268,7 @@ pub fn register_builtins<'input>(
                 context: vec![],
                 arity: 0,
                 trait_args: vec![],
-                where_clause_bounds: vec![],
+                where_clause_bounds: Vec::new(),
                 span: Span::new(FileId::DUMMY, 0, 0),
             },
             symbols,
@@ -294,7 +298,7 @@ pub fn register_builtins<'input>(
                 context: vec![],
                 arity: 0,
                 trait_args: vec![],
-                where_clause_bounds: vec![],
+                where_clause_bounds: Vec::new(),
                 span: Span::new(FileId::DUMMY, 0, 0),
             },
             symbols,
@@ -324,7 +328,7 @@ pub fn register_builtins<'input>(
                 context: vec![],
                 arity: 0,
                 trait_args: vec![],
-                where_clause_bounds: vec![],
+                where_clause_bounds: Vec::new(),
                 span: Span::new(FileId::DUMMY, 0, 0),
             },
             symbols,
@@ -357,7 +361,7 @@ pub fn register_builtins<'input>(
                     context: vec![],
                     arity: 0,
                     trait_args: vec![],
-                    where_clause_bounds: vec![],
+                    where_clause_bounds: Vec::new(),
                     span: Span::new(FileId::DUMMY, 0, 0),
                 },
                 symbols,
@@ -380,20 +384,20 @@ pub fn register_builtins<'input>(
         let def_id = symbols.allocate_def_id();
         let result_t = TypeParam {
             name: Symbol::intern("T"),
-            bounds: vec![],
+            bounds: &[],
             kind: TypeParamKind::Type,
             span: Span::new(FileId::DUMMY, 0, 0),
         };
         let result_e = TypeParam {
             name: Symbol::intern("E"),
-            bounds: vec![],
+            bounds: &[],
             kind: TypeParamKind::Type,
             span: Span::new(FileId::DUMMY, 0, 0),
         };
         let ok_variant = EnumVariant {
             name: Symbol::intern("Ok"),
             payload: Some(Type::Path(
-                smallvec::smallvec![Symbol::intern("T")],
+                Box::leak(vec![Symbol::intern("T")].into_boxed_slice()),
                 Span::new(FileId::DUMMY, 0, 0),
             )),
             eq_spec: Vec::new(),
@@ -403,7 +407,7 @@ pub fn register_builtins<'input>(
         let err_variant = EnumVariant {
             name: Symbol::intern("Err"),
             payload: Some(Type::Path(
-                smallvec::smallvec![Symbol::intern("E")],
+                Box::leak(vec![Symbol::intern("E")].into_boxed_slice()),
                 Span::new(FileId::DUMMY, 0, 0),
             )),
             eq_spec: Vec::new(),
@@ -434,7 +438,11 @@ pub fn register_builtins<'input>(
             align: None,
             pad: None,
         };
-        if let Err(e) = symbols.insert_type(Symbol::intern("Result"), binding, Span::new(FileId::DUMMY, 0, 0)) {
+        if let Err(e) = symbols.insert_type(
+            Symbol::intern("Result"),
+            binding,
+            Span::new(FileId::DUMMY, 0, 0),
+        ) {
             panic!("duplicate builtin registration: {:?}", e);
         }
     }
@@ -444,7 +452,7 @@ pub fn register_builtins<'input>(
         let def_id = symbols.allocate_def_id();
         let option_t = TypeParam {
             name: Symbol::intern("T"),
-            bounds: vec![],
+            bounds: &[],
             kind: TypeParamKind::Type,
             span: Span::new(FileId::DUMMY, 0, 0),
         };
@@ -458,7 +466,7 @@ pub fn register_builtins<'input>(
         let some_variant = EnumVariant {
             name: Symbol::intern("Some"),
             payload: Some(Type::Path(
-                smallvec::smallvec![Symbol::intern("T")],
+                Box::leak(vec![Symbol::intern("T")].into_boxed_slice()),
                 Span::new(FileId::DUMMY, 0, 0),
             )),
             eq_spec: Vec::new(),
@@ -489,7 +497,11 @@ pub fn register_builtins<'input>(
             align: None,
             pad: None,
         };
-        if let Err(e) = symbols.insert_type(Symbol::intern("Option"), binding, Span::new(FileId::DUMMY, 0, 0)) {
+        if let Err(e) = symbols.insert_type(
+            Symbol::intern("Option"),
+            binding,
+            Span::new(FileId::DUMMY, 0, 0),
+        ) {
             panic!("duplicate builtin registration: {:?}", e);
         }
     }
@@ -514,14 +526,14 @@ pub fn register_builtins<'input>(
     {
         let future_t = TypeParam {
             name: Symbol::intern("T"),
-            bounds: vec![],
+            bounds: &[],
             kind: TypeParamKind::Type,
             span: Span::new(FileId::DUMMY, 0, 0),
         };
         let output_variant = EnumVariant {
             name: Symbol::intern("Output"),
             payload: Some(Type::Path(
-                smallvec::smallvec![Symbol::intern("T")],
+                Box::leak(vec![Symbol::intern("T")].into_boxed_slice()),
                 Span::new(FileId::DUMMY, 0, 0),
             )),
             eq_spec: Vec::new(),
@@ -552,7 +564,11 @@ pub fn register_builtins<'input>(
             align: None,
             pad: None,
         };
-        if let Err(e) = symbols.insert_type(Symbol::intern("Future"), binding, Span::new(FileId::DUMMY, 0, 0)) {
+        if let Err(e) = symbols.insert_type(
+            Symbol::intern("Future"),
+            binding,
+            Span::new(FileId::DUMMY, 0, 0),
+        ) {
             panic!("duplicate builtin registration: {:?}", e);
         }
     }
@@ -588,7 +604,7 @@ pub fn register_builtins<'input>(
             context: vec![],
             arity: 1, // Future<T> has one generic param T
             trait_args: vec![],
-            where_clause_bounds: vec![],
+            where_clause_bounds: Vec::new(),
             span: Span::new(FileId::DUMMY, 0, 0),
         },
         symbols,
@@ -623,7 +639,7 @@ pub fn register_builtins<'input>(
     {
         let channel_t = TypeParam {
             name: Symbol::intern("T"),
-            bounds: vec![],
+            bounds: &[],
             kind: TypeParamKind::Type,
             span: Span::new(FileId::DUMMY, 0, 0),
         };
@@ -651,7 +667,11 @@ pub fn register_builtins<'input>(
             align: None,
             pad: None,
         };
-        if let Err(e) = symbols.insert_type(Symbol::intern("Channel"), binding, Span::new(FileId::DUMMY, 0, 0)) {
+        if let Err(e) = symbols.insert_type(
+            Symbol::intern("Channel"),
+            binding,
+            Span::new(FileId::DUMMY, 0, 0),
+        ) {
             panic!("duplicate builtin registration: {:?}", e);
         }
     }

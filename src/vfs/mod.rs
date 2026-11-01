@@ -2,7 +2,6 @@ use crate::ast::Program;
 use crate::diagnostics::Diagnostic;
 use crate::lexer::Token;
 use crate::parser::Parser;
-use logos::Logos;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -149,9 +148,7 @@ impl VfsBackend for FsBackend {
         path: &str,
     ) -> Result<(String, Option<std::time::SystemTime>), VfsError<'static>> {
         let content = self.read_file(path)?;
-        let mtime = std::fs::metadata(path)
-            .and_then(|m| m.modified())
-            .ok();
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
         Ok((content, mtime))
     }
 }
@@ -300,18 +297,27 @@ impl OverlayBackend {
 
     /// Install (or replace) the unsaved buffer for `path`.
     pub fn set_buffer(&self, path: &str, content: String) {
-        self.buffers.write().expect("overlay buffers lock").insert(path.to_string(), content);
+        self.buffers
+            .write()
+            .expect("overlay buffers lock")
+            .insert(path.to_string(), content);
     }
 
     /// Drop the buffer for `path` — the file is saved, the base shows
     /// through again.
     pub fn clear_buffer(&self, path: &str) {
-        self.buffers.write().expect("overlay buffers lock").remove(path);
+        self.buffers
+            .write()
+            .expect("overlay buffers lock")
+            .remove(path);
     }
 
     /// True while `path` has an unsaved buffer.
     pub fn has_buffer(&self, path: &str) -> bool {
-        self.buffers.read().expect("overlay buffers lock").contains_key(path)
+        self.buffers
+            .read()
+            .expect("overlay buffers lock")
+            .contains_key(path)
     }
 }
 
@@ -657,15 +663,21 @@ mod tests {
 
         // Clearing the buffer exposes the base again.
         overlay.clear_buffer("/src/main.ps");
-        assert_eq!(overlay.read_file("/src/main.ps").expect("read"), "from disk");
+        assert_eq!(
+            overlay.read_file("/src/main.ps").expect("read"),
+            "from disk"
+        );
     }
 
     #[test]
     fn canonicalize_is_idempotent_and_normalizes() {
-        let overlay =
-            OverlayBackend::new(std::sync::Arc::new(MemoryBackend::new()));
-        let once = overlay.canonicalize("/src/./a/../main.ps").expect("canonicalize");
-        let twice = overlay.canonicalize(once.to_str().expect("utf8")).expect("canonicalize");
+        let overlay = OverlayBackend::new(std::sync::Arc::new(MemoryBackend::new()));
+        let once = overlay
+            .canonicalize("/src/./a/../main.ps")
+            .expect("canonicalize");
+        let twice = overlay
+            .canonicalize(once.to_str().expect("utf8"))
+            .expect("canonicalize");
         assert_eq!(once, twice);
         assert_eq!(once.to_str().expect("utf8"), "/src/main.ps");
     }

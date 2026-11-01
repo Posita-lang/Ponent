@@ -23,7 +23,6 @@
 //! See the [rustc-dev-guide chapter](https://rustc-dev-guide.rust-lang.org/solve/caching.html)
 //! for more details on the caching strategy.
 
-use arrayvec::ArrayVec;
 use crate::hir::infer::TypeVariableKind;
 use crate::hir::query::{DefaultCache as QueryCache, QueryCacheType};
 use crate::hir::traits::solver::delegate::SolverDelegate;
@@ -33,6 +32,7 @@ use crate::hir::traits::solver::obligation::{
 };
 use crate::hir::types::{DefId, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
+use arrayvec::ArrayVec;
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
 use std::collections::hash_map::DefaultHasher;
@@ -439,10 +439,10 @@ pub fn ty_to_canonical<'input>(
             ty: Box::new(ty_to_canonical(*ty, ctx, bound)),
             mutable: *mutable,
         },
-        TypeData::Pointer { ty } => CanonicalTy::Pointer {
+        TypeData::Pointer { ty, .. } => CanonicalTy::Pointer {
             ty: Box::new(ty_to_canonical(*ty, ctx, bound)),
         },
-        TypeData::Ptr { size, pointee } => CanonicalTy::Ptr {
+        TypeData::Ptr { size, pointee, .. } => CanonicalTy::Ptr {
             size: Box::new(ty_to_canonical(*size, ctx, bound)),
             pointee: Box::new(ty_to_canonical(*pointee, ctx, bound)),
         },
@@ -646,11 +646,11 @@ fn hash_type_canonical<'input>(ty: TypeId, ctx: &TypeContext<'input>, state: &mu
             hash_type_canonical(*ty, ctx, state);
             mutable.hash(state);
         }
-        TypeData::Pointer { ty } => {
+        TypeData::Pointer { ty, .. } => {
             18u64.hash(state);
             hash_type_canonical(*ty, ctx, state);
         }
-        TypeData::Ptr { size, pointee } => {
+        TypeData::Ptr { size, pointee, .. } => {
             19u64.hash(state);
             hash_type_canonical(*size, ctx, state);
             hash_type_canonical(*pointee, ctx, state);

@@ -1,10 +1,10 @@
 use crate::ast::FileId;
 use crate::hir::infer::PrincipalShape;
 use crate::hir::types::*;
+use small_map::FxSmallMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use small_map::FxSmallMap;
 use std::fmt::Write as _;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -697,11 +697,11 @@ impl SmtSolver {
                 let m = if *mutable { "true" } else { "false" };
                 format!("(type-ref {} {})", inner, m)
             }
-            TypeData::Pointer { ty } => {
+            TypeData::Pointer { ty, .. } => {
                 let inner = Self::type_to_smt_term(ctx, *ty);
                 format!("(type-pointer {})", inner)
             }
-            TypeData::Ptr { size, pointee } => {
+            TypeData::Ptr { size, pointee, .. } => {
                 let s = Self::type_to_smt_term(ctx, *size);
                 let p = Self::type_to_smt_term(ctx, *pointee);
                 format!("(type-ptr {} {})", s, p)
@@ -1488,7 +1488,10 @@ mod tests {
     use crate::symbol::Symbol;
 
     fn ident<'a>(arena: &'a bumpalo::Bump, name: &str) -> &'a Expr<'a> {
-        arena.alloc(Expr::Ident(Symbol::intern(name), Span::new(FileId::DUMMY, 0, 0)))
+        arena.alloc(Expr::Ident(
+            Symbol::intern(name),
+            Span::new(FileId::DUMMY, 0, 0),
+        ))
     }
 
     fn lit<'a>(arena: &'a bumpalo::Bump, v: i128) -> &'a Expr<'a> {
@@ -1581,7 +1584,10 @@ mod tests {
         let f = ident(&arena, "f");
         let call = arena.alloc(Expr::Call {
             callee: f,
-            args: arena.alloc_slice_clone(&[Expr::Ident(Symbol::intern("x"), Span::new(FileId::DUMMY, 0, 0))]),
+            args: arena.alloc_slice_clone(&[Expr::Ident(
+                Symbol::intern("x"),
+                Span::new(FileId::DUMMY, 0, 0),
+            )]),
             comptime: false,
             span: Span::new(FileId::DUMMY, 0, 0),
         });
@@ -1595,7 +1601,10 @@ mod tests {
         // A call to a NON-wrap function is not wrap.
         let call_plain = arena.alloc(Expr::Call {
             callee: f,
-            args: arena.alloc_slice_clone(&[Expr::Ident(Symbol::intern("x"), Span::new(FileId::DUMMY, 0, 0))]),
+            args: arena.alloc_slice_clone(&[Expr::Ident(
+                Symbol::intern("x"),
+                Span::new(FileId::DUMMY, 0, 0),
+            )]),
             comptime: false,
             span: Span::new(FileId::DUMMY, 0, 0),
         });
@@ -1615,7 +1624,10 @@ mod tests {
         });
         let method_call = arena.alloc(Expr::Call {
             callee: field,
-            args: arena.alloc_slice_clone(&[Expr::Ident(Symbol::intern("x"), Span::new(FileId::DUMMY, 0, 0))]),
+            args: arena.alloc_slice_clone(&[Expr::Ident(
+                Symbol::intern("x"),
+                Span::new(FileId::DUMMY, 0, 0),
+            )]),
             comptime: false,
             span: Span::new(FileId::DUMMY, 0, 0),
         });
@@ -1691,7 +1703,10 @@ mod tests {
             !expr_to_smt_bv(
                 out,
                 &mut s,
-                &FxSmallMap::<32, _, _>::from_iter([(Symbol::intern("x"), 8u8), (Symbol::intern("y"), 8u8)]),
+                &FxSmallMap::<32, _, _>::from_iter([
+                    (Symbol::intern("x"), 8u8),
+                    (Symbol::intern("y"), 8u8)
+                ]),
                 None
             ),
             "literal Diff bound |c| ≥ 2^(W-1) must fail closed"
@@ -1707,7 +1722,10 @@ mod tests {
         assert!(expr_to_smt_bv(
             inside,
             &mut s2,
-            &FxSmallMap::<32, _, _>::from_iter([(Symbol::intern("x"), 8u8), (Symbol::intern("y"), 8u8)]),
+            &FxSmallMap::<32, _, _>::from_iter([
+                (Symbol::intern("x"), 8u8),
+                (Symbol::intern("y"), 8u8)
+            ]),
             None
         ));
         assert!(s2.contains("bvsub"), "in-range Diff bound uses bvsub");

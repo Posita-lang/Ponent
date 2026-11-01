@@ -11,7 +11,6 @@ use crate::diagnostics::{DiagOpts, Diagnostic};
 /// without ANSI colour.
 pub struct HumanRenderer {
     glyph: GlyphRenderer,
-    use_color: bool,
 }
 
 impl HumanRenderer {
@@ -34,42 +33,48 @@ impl HumanRenderer {
     pub fn with_opts(use_color: bool, opts: Option<&DiagOpts>) -> Self {
         Self {
             glyph: GlyphRenderer::with_opts(use_color, opts),
-            use_color,
         }
     }
 }
 
 impl Renderer for HumanRenderer {
-    fn render(&mut self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>) -> String {
+    fn render_into(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>, out: &mut String) {
         // Build the source's line index at most once per batch and share it
         // between the diagnostic body and its call-chain footer (both used to
         // rescan the file independently).
         let idx = diag.source().map(|s| cx.line_index(s));
-        let mut s = self.glyph.render_diagnostic_with_index(diag, idx.as_ref());
-        // Call chain (Zig-style `referenced by`) — separate from the box.
+        // Both halves append into one buffer: the glyph body first, then the
+        // Zig-style `referenced by` footer.  `render_into` is a no-op for an
+        // empty chain, so no emptiness check is needed here.
+        self.glyph
+            .render_diagnostic_into(diag, idx.as_ref(), Some(cx), out);
         if let Some(chain) = diag.call_chain() {
-            let r = chain.render_with_index(
-                self.use_color,
+            chain.render_into(
+                self.glyph.use_color(),
                 diag.source(),
                 diag.file_name(),
                 idx.as_ref(),
                 self.glyph.max_width(),
                 self.glyph.tab_width(),
+                Some(cx),
+                out,
             );
-            if !r.is_empty() {
-                s.push_str(&r);
-            }
         }
+    }
+
+    fn render(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>) -> String {
+        let mut s = String::new();
+        self.render_into(diag, cx, &mut s);
         s
     }
 
     /// A blank line between successive diagnostics keeps the boxes
     /// visually distinct.
-    fn render_separator(&mut self) -> &str {
+    fn render_separator(&self) -> &str {
         "\n"
     }
 
-    fn render_summary(&mut self, errors: usize, warnings: usize) -> String {
+    fn render_summary(&self, errors: usize, warnings: usize) -> String {
         let mut s = self.glyph.render_summary(errors, warnings);
         if !s.is_empty() {
             s.push('\n');
@@ -77,7 +82,7 @@ impl Renderer for HumanRenderer {
         s
     }
 
-    fn render_summary_full(&mut self, errors: usize, warnings: usize, files: usize) -> String {
+    fn render_summary_full(&self, errors: usize, warnings: usize, files: usize) -> String {
         let mut s = self.glyph.render_summary_full(errors, warnings, files);
         if !s.is_empty() {
             s.push('\n');

@@ -14,8 +14,8 @@ expression: out
 <span class='line-num' data-location='example.ps:3:2' aria-label='Line 3'>3 │ </span><span class='highlight'>    set i = j + 1; // 中</span>
 <span class='line-num'>   │ </span><span class='underline'>^^^^^^^^^^^^^^^^^^^^^^^^</span>
 <span class='line-num'>   │ </span><span class='underline'>    ^^^^^^^^^^^^^^^^^^^^</span>
-<span class='line-num' data-location='example.ps:4' aria-label='Line 4'>4 │ </span><span class='highlight'>    ret</span>urn i;
-<span class='line-num'>   │ </span><span class='underline'>^^^^^^</span>
+<span class='line-num' data-location='example.ps:4' aria-label='Line 4'>4 │ </span><span class='highlight'>    ret</span>urn <span class='highlight'>i</span>;
+<span class='line-num'>   │ </span><span class='underline'>^^^^^^     ^</span>
 <span class='line-num'>   │ </span><span class='underline'>^^^^^^^</span>
 <span class='line-num'>   │ </span><span class='label'>| this is Bool</span>
 <span class='line-num'>   │ </span><span class='label'>| spans four lines</span>

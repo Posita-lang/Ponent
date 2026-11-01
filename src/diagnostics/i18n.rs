@@ -17,42 +17,77 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use fluent_bundle::FluentValue;
 use fluent_templates::{LanguageIdentifier, Loader, langid, static_loader};
 
+use crate::smallvec::SmallVec;
+
+/// Build-time-generated typed functions for every Fluent slug in
+/// `locales/en.ftl`.  Each function takes exactly the `$placeholders`
+/// the slug declares, so a wrong key name or missing argument is a
+/// compile error.  Use `fluent::type_mismatch(x, y)` instead of
+/// `tr!("type-mismatch", expected = x, found = y)`.
+pub mod fluent {
+    include!(concat!(env!("OUT_DIR"), "/fluent_gen.rs"));
+}
+
 /// Wrapper marking a `tr!` argument that must be rendered through [`Display`]
-/// (numbers, error types, non-`'static` strings) into an owned
-/// `Cow<'static, str>`.
+/// (numbers, error types, values whose lifetime cannot be threaded through)
+/// into an owned `Cow`.
 ///
-/// `tr!` arguments are lifted into `Cow<'static, str>` via [`TrValue`].  A
-/// `&'static str`, `Cow<'static, str>` or `String` converts without
-/// re-formatting; anything else must be wrapped explicitly so the (small)
+/// `tr!` arguments are lifted into a `Cow<'_, str>` via [`TrValue`].  A
+/// `&str`, `Cow<'_, str>` or `String` converts without re-formatting; any
+/// other `Display` value must be wrapped explicitly so the (small)
 /// allocation is visible at the call site rather than hidden in the macro.
 pub struct DisplayArg<T>(pub T);
 
-/// Lifts a `tr!` argument into a `Cow<'static, str>` without an unnecessary
+/// Lifts a `tr!` argument into a `Cow<'b, str>` without an unnecessary
 /// `format!` when the value is already string-shaped.
-pub trait TrValue {
-    fn into_cow_static(self) -> Cow<'static, str>;
+///
+/// The trait is parameterised over the value's own lifetime `'a` rather than
+/// being fixed to `'static`: a borrowed argument (`&'src str`,
+/// `Cow<'src, str>`) then stays borrowed for the duration of the render
+/// call, instead of being forced through `to_string()` by a `'static`
+/// return type.  `'a: 'b` lets the caller pick any shorter output lifetime.
+pub trait TrValue<'a> {
+    /// Convert into a `Cow<'b, str>` that borrows for at most `'a`.
+    fn into_cow<'b>(self) -> Cow<'b, str>
+    where
+        'a: 'b;
 }
 
-impl TrValue for &'static str {
-    fn into_cow_static(self) -> Cow<'static, str> {
+impl<'a> TrValue<'a> for &'a str {
+    fn into_cow<'b>(self) -> Cow<'b, str>
+    where
+        'a: 'b,
+    {
         Cow::Borrowed(self)
     }
 }
 
-impl TrValue for Cow<'static, str> {
-    fn into_cow_static(self) -> Cow<'static, str> {
-        self
+impl<'a> TrValue<'a> for Cow<'a, str> {
+    fn into_cow<'b>(self) -> Cow<'b, str>
+    where
+        'a: 'b,
+    {
+        match self {
+            Cow::Borrowed(s) => Cow::Borrowed(s),
+            Cow::Owned(s) => Cow::Owned(s),
+        }
     }
 }
 
-impl TrValue for String {
-    fn into_cow_static(self) -> Cow<'static, str> {
+impl<'a> TrValue<'a> for String {
+    fn into_cow<'b>(self) -> Cow<'b, str>
+    where
+        'a: 'b,
+    {
         Cow::Owned(self)
     }
 }
 
-impl<T: Display> TrValue for DisplayArg<T> {
-    fn into_cow_static(self) -> Cow<'static, str> {
+impl<'a, T: Display> TrValue<'a> for DisplayArg<T> {
+    fn into_cow<'b>(self) -> Cow<'b, str>
+    where
+        'a: 'b,
+    {
         Cow::Owned(self.0.to_string())
     }
 }
@@ -190,33 +225,52 @@ pub fn render<'msg, 'src>(
     msg: &'msg str,
     pairs: &[(&'static str, Cow<'src, str>)],
 ) -> Cow<'msg, str> {
-    if is_ftl_slug(msg) {
-        if let Some(s) = try_fluent(msg, pairs) {
-            return Cow::Owned(s);
-        }
+    if is_ftl_slug(msg)
+        && let Some(s) = try_fluent(msg, pairs)
+    {
+        return Cow::Owned(s);
     }
     Cow::Borrowed(msg)
+}
+
+/// [`render`] into an existing buffer.
+///
+/// The fallback (unknown slug / legacy key) is written straight through
+/// instead of being wrapped in a `Cow` first; a Fluent hit still has to
+/// allocate its `String` internally, so this saves the wrapper, not the
+/// formatting allocation.
+pub fn render_into<'msg, 'src>(
+    msg: &'msg str,
+    pairs: &[(&'static str, Cow<'src, str>)],
+    out: &mut String,
+) {
+    if is_ftl_slug(msg)
+        && let Some(s) = try_fluent(msg, pairs)
+    {
+        out.push_str(&s);
+        return;
+    }
+    out.push_str(msg);
 }
 
 /// FTL text identifiers are `[A-Za-z][A-Za-z0-9_-]*`; every legacy English
 /// key contains spaces, backticks or braces, so the two key spaces cannot
 /// collide and dispatch is unambiguous.
 fn is_ftl_slug(msg: &str) -> bool {
-    !msg.is_empty() && msg.as_bytes().iter().enumerate().all(|(i, b)| {
-        if i == 0 {
-            b.is_ascii_alphabetic()
-        } else {
-            b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_'
-        }
-    })
+    !msg.is_empty()
+        && msg.as_bytes().iter().enumerate().all(|(i, b)| {
+            if i == 0 {
+                b.is_ascii_alphabetic()
+            } else {
+                b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_'
+            }
+        })
 }
 
-fn lang_id() -> LanguageIdentifier {
-    match Lang::current() {
-        Lang::En => langid!("en"),
-        Lang::Ru => langid!("ru"),
-        Lang::Zh => langid!("zh"),
-    }
+fn lang_id() -> &'static LanguageIdentifier {
+    static IDS: std::sync::OnceLock<[LanguageIdentifier; 3]> = std::sync::OnceLock::new();
+    let ids = IDS.get_or_init(|| [langid!("en"), langid!("ru"), langid!("zh")]);
+    &ids[Lang::current() as usize - 1]
 }
 
 /// `None` when the slug is unknown even after the loader's fallback chain
@@ -236,19 +290,94 @@ fn try_fluent<'msg, 'src>(
     // Zero-argument fast path: the common static-message lookup never
     // allocates an argument map.
     if pairs.is_empty() {
-        return LOCALES.try_lookup(&lang_id(), msg);
+        return LOCALES.try_lookup(lang_id(), msg);
     }
     let mut args = HashMap::with_capacity(pairs.len());
     pairs.iter().for_each(|(k, v)| {
+        // `v.clone()` — not `FluentValue::String(v)` by value. `pairs`
+        // arrives as `&[...]` borrowed from `DiagMessage::render_into(&self)`,
+        // so `v` is behind a shared reference and cannot be moved (E0507).
+        // Taking `pairs` by value would force `render_into` to own its
+        // message, breaking the `&self` API (a diagnostic may render more
+        // than once) and rippling through every caller. Under `&self`,
+        // `clone` is the cheapest legal option: `Cow::Borrowed` copies a
+        // pointer (zero heap, the common `&str`-arg path); only `Cow::Owned`
+        // deep-copies — unavoidable without ownership.
         let value = if NUMERIC_ARG_KEYS.contains(k) {
             FluentValue::try_number(v.as_ref())
         } else {
-            FluentValue::String(Cow::Owned(v.as_ref().to_string()))
+            FluentValue::String(v.clone())
         };
         args.insert(Cow::Borrowed(*k), value);
     });
-    LOCALES.try_lookup_with_args(&lang_id(), msg, &args)
+    LOCALES.try_lookup_with_args(lang_id(), msg, &args)
 }
+
+/// Consuming variant of [`render_into`]: moves `pairs` by value so
+/// `FluentValue::String(v)` takes ownership of each `Cow` instead of
+/// cloning — `Cow::Borrowed` was already cheap (pointer copy), but
+/// `Cow::Owned` now skips its `String::clone` entirely.  Called only
+/// from `DiagMessage::render_into_owned`, which in turn is called only
+/// from `humanize` (the kind is `take`n, so the message is fresh-owned).
+pub fn render_into_owned<'msg, 'src>(
+    msg: &'msg str,
+    pairs: SmallVec<[(&'static str, Cow<'src, str>); 4]>,
+    out: &mut String,
+) {
+    if is_ftl_slug(msg)
+        && let Some(s) = try_fluent_owned(msg, pairs)
+    {
+        out.push_str(&s);
+        return;
+    }
+    out.push_str(msg);
+}
+
+fn try_fluent_owned<'msg, 'src>(
+    msg: &'msg str,
+    pairs: SmallVec<[(&'static str, Cow<'src, str>); 4]>,
+) -> Option<String> {
+    if pairs.is_empty() {
+        return LOCALES.try_lookup(lang_id(), msg);
+    }
+    let mut args = HashMap::with_capacity(pairs.len());
+    pairs.into_iter().for_each(|(k, v)| {
+        let value = if NUMERIC_ARG_KEYS.contains(&k)
+            && let Ok(n) = v.as_ref().parse::<fluent_bundle::types::FluentNumber>()
+        {
+            n.into()
+        } else {
+            FluentValue::String(v)
+        };
+        args.insert(Cow::Borrowed(k), value);
+    });
+    LOCALES.try_lookup_with_args(lang_id(), msg, &args)
+}
+
+/// Direct-indexed per-`Lang` cache for a fixed table of zero-argument
+/// Fluent labels.  Each invocation returns `Cow::Borrowed` pointing at the
+/// cached `String`, so the per-diagnostic label lookups
+/// (`DiagnosticLevel::label`, `ChainEntryKind::as_str`,
+/// `ComptimeReason::as_str`, `ErrorCategory::label`) allocate once per
+/// language instead of once per call — turning `prefix_cols`'s
+/// allocate-just-to-measure-`.len()` into a borrowed slice length too.
+macro_rules! cached_label {
+    (
+        n = $n:literal,
+        variant = $variant:expr,
+        init = [$($init:expr),+ $(,)?],
+    ) => {{
+        static CACHES: [::std::sync::OnceLock<[::std::string::String; $n]>; 3] = [
+            ::std::sync::OnceLock::new(),
+            ::std::sync::OnceLock::new(),
+            ::std::sync::OnceLock::new(),
+        ];
+        let lang_idx = ($crate::diagnostics::i18n::Lang::current() as usize) - 1;
+        let table = CACHES[lang_idx].get_or_init(|| [$($init),+]);
+        ::std::borrow::Cow::Borrowed(&table[$variant])
+    }};
+}
+pub(crate) use cached_label;
 
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
@@ -291,7 +420,7 @@ mod tests {
             ("found", Cow::Borrowed("Int<32>")),
         ];
         assert_eq!(
-            render("type-mismatch", &pairs),
+            render("type-mismatch", pairs),
             "type mismatch: expected `{found}`, found `Int<32>`"
         );
         let pairs: &[(&'static str, Cow<'static, str>)] = &[
@@ -299,7 +428,7 @@ mod tests {
             ("found", Cow::Borrowed("Bool")),
         ];
         assert_eq!(
-            render("type-mismatch", &pairs),
+            render("type-mismatch", pairs),
             "type mismatch: expected `Int<32>`, found `Bool`"
         );
     }
@@ -442,5 +571,20 @@ mod tests {
             render("field-not-found", &pairs),
             "no field `00123` found on type `1.0`"
         );
+    }
+
+    /// A borrowed argument must stay borrowed: the lifetime-parametric
+    /// `TrValue` exists so a `Cow::Borrowed` value is not copied into a
+    /// fresh `String` before Fluent renders it.
+    #[test]
+    fn borrowed_arguments_stay_borrowed() {
+        let owned = String::from("Int<32>");
+        let borrowed: Cow<'_, str> = Cow::Borrowed(owned.as_str());
+        let lifted = TrValue::into_cow(borrowed);
+        assert!(
+            matches!(lifted, Cow::Borrowed(_)),
+            "borrowed argument was copied into an owned String"
+        );
+        assert_eq!(lifted, "Int<32>");
     }
 }

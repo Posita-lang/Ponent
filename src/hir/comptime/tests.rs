@@ -1,12 +1,16 @@
-use crate::ast::FileId;
 use super::*;
+use crate::ast::FileId;
 use crate::ast::{self, BinOp, Literal, Span, VariableKind};
 use crate::hir::hir::{HirExpr, HirMatchArm, HirParam, HirPattern, HirStmt};
 use crate::hir::types::{TypeContext, TypeId};
 use crate::symbol::Symbol;
 
 fn make_int_val<'input>(n: i128, ty: TypeId) -> HirExpr<'input> {
-    HirExpr::Literal(Literal::Int(ast::IntLit::Small(n)), ty, Span::new(FileId::DUMMY, 0, 0))
+    HirExpr::Literal(
+        Literal::Int(ast::IntLit::Small(n)),
+        ty,
+        Span::new(FileId::DUMMY, 0, 0),
+    )
 }
 
 fn make_int<'input>(n: i128) -> HirExpr<'input> {
@@ -37,7 +41,11 @@ fn get_var<'a, 'src, 'input>(
 }
 
 fn make_bool<'input>(b: bool) -> HirExpr<'input> {
-    HirExpr::Literal(Literal::Bool(b), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))
+    HirExpr::Literal(
+        Literal::Bool(b),
+        TypeId::NONE,
+        Span::new(FileId::DUMMY, 0, 0),
+    )
 }
 
 fn make_binop_ty<'input>(
@@ -284,7 +292,11 @@ fn test_eval_variable_assign() {
     ec.memory_used = ComptimeValue::Int(10).memory_size();
 
     let assign = HirStmt::Assign {
-        target: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
+        target: Box::new(HirExpr::Ident(
+            "x".into(),
+            TypeId::NONE,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         value: Box::new(make_int(20)),
         op: None,
         span: Span::new(FileId::DUMMY, 0, 0),
@@ -343,7 +355,11 @@ fn test_eval_ident_unknown() {
     let mut diag = crate::diagnostics::DiagCtxt::new();
     let mut ec = ComptimeEvalContext::new(&mut ctx, &symbols, &mut diag);
 
-    let expr = HirExpr::Ident("unknown".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
+    let expr = HirExpr::Ident(
+        "unknown".into(),
+        TypeId::NONE,
+        Span::new(FileId::DUMMY, 0, 0),
+    );
     let r = ec.eval_expr(&expr);
     assert!(matches!(r, Err(ComptimeError::UnknownIdentifier(_))));
 }
@@ -370,7 +386,11 @@ fn test_eval_comptime_fn_call() {
     ec.register_fn("double".into(), vec!["x".into()], body);
 
     let call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("double".into(), int32, Span::new(FileId::DUMMY, 0, 0))),
+        callee: Box::new(HirExpr::Ident(
+            "double".into(),
+            int32,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         args: vec![make_int_val(21, int32)],
         comptime: true,
         ty: int32,
@@ -653,7 +673,11 @@ fn test_assign_while_internal_var_after_loop() {
 
     // After the loop, `x` should NOT be assignable — it was scoped inside.
     let assign = HirStmt::Assign {
-        target: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
+        target: Box::new(HirExpr::Ident(
+            "x".into(),
+            TypeId::NONE,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         value: Box::new(make_int(99)),
         op: None,
         span: Span::new(FileId::DUMMY, 0, 0),
@@ -735,7 +759,11 @@ fn test_eval_fn_call_scope_isolation() {
 
     // Register a function that assigns to its own param, not the outer scope
     let body = vec![HirStmt::Assign {
-        target: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
+        target: Box::new(HirExpr::Ident(
+            "x".into(),
+            TypeId::NONE,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         value: Box::new(make_int(99)),
         op: None,
         span: Span::new(FileId::DUMMY, 0, 0),
@@ -883,8 +911,16 @@ fn test_eval_int_comparisons() {
 #[test]
 fn test_eval_float_comparisons() {
     let mut ctx = TypeContext::new();
-    let a = HirExpr::Literal(Literal::Float(3.14), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
-    let b = HirExpr::Literal(Literal::Float(2.71), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
+    let a = HirExpr::Literal(
+        Literal::Float(3.14),
+        TypeId::NONE,
+        Span::new(FileId::DUMMY, 0, 0),
+    );
+    let b = HirExpr::Literal(
+        Literal::Float(2.71),
+        TypeId::NONE,
+        Span::new(FileId::DUMMY, 0, 0),
+    );
 
     let tests = vec![
         (BinOp::Eq, false),
@@ -926,7 +962,11 @@ fn test_eval_ref_and_deref() {
     // &x
     let ref_expr = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Ref,
-        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
+        expr: Box::new(HirExpr::Ident(
+            "x".into(),
+            TypeId::NONE,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         ty: TypeId::NONE,
         span: Span::new(FileId::DUMMY, 0, 0),
     };
@@ -975,7 +1015,11 @@ fn test_eval_pointer_shadowing_block() {
     // set p = &x
     let ref_x = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Ref,
-        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
+        expr: Box::new(HirExpr::Ident(
+            "x".into(),
+            TypeId::NONE,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         ty: TypeId::NONE,
         span: Span::new(FileId::DUMMY, 0, 0),
     };
@@ -1004,7 +1048,11 @@ fn test_eval_pointer_shadowing_block() {
     };
     let deref_p = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Deref,
-        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
+        expr: Box::new(HirExpr::Ident(
+            "p".into(),
+            TypeId::NONE,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         ty: TypeId::NONE,
         span: Span::new(FileId::DUMMY, 0, 0),
     };
@@ -1049,7 +1097,11 @@ fn test_eval_pointer_shadowing_write_through() {
     // set p = &mut x
     let ref_mut_x = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::RefMut,
-        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
+        expr: Box::new(HirExpr::Ident(
+            "x".into(),
+            TypeId::NONE,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         ty: TypeId::NONE,
         span: Span::new(FileId::DUMMY, 0, 0),
     };
@@ -1079,7 +1131,11 @@ fn test_eval_pointer_shadowing_write_through() {
     // *p = 10
     let deref_ptr = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Deref,
-        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
+        expr: Box::new(HirExpr::Ident(
+            "p".into(),
+            TypeId::NONE,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         ty: TypeId::NONE,
         span: Span::new(FileId::DUMMY, 0, 0),
     };
@@ -1135,7 +1191,11 @@ fn test_eval_pointer_shadowing_nested_blocks() {
     // set p = &x
     let ref_x = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Ref,
-        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
+        expr: Box::new(HirExpr::Ident(
+            "x".into(),
+            TypeId::NONE,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         ty: TypeId::NONE,
         span: Span::new(FileId::DUMMY, 0, 0),
     };
@@ -1164,7 +1224,11 @@ fn test_eval_pointer_shadowing_nested_blocks() {
     };
     let deref_p = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Deref,
-        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
+        expr: Box::new(HirExpr::Ident(
+            "p".into(),
+            TypeId::NONE,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         ty: TypeId::NONE,
         span: Span::new(FileId::DUMMY, 0, 0),
     };
@@ -1240,7 +1304,11 @@ fn test_eval_pointer_shadowing_while() {
     // set p = &x
     let ref_x = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Ref,
-        expr: Box::new(HirExpr::Ident("x".into(), int32, Span::new(FileId::DUMMY, 0, 0))),
+        expr: Box::new(HirExpr::Ident(
+            "x".into(),
+            int32,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         ty: int32,
         span: Span::new(FileId::DUMMY, 0, 0),
     };
@@ -1301,7 +1369,11 @@ fn test_eval_pointer_shadowing_while() {
     // *p should also be 5 (pointer to outer slot)
     let deref_p = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Deref,
-        expr: Box::new(HirExpr::Ident("p".into(), int32, Span::new(FileId::DUMMY, 0, 0))),
+        expr: Box::new(HirExpr::Ident(
+            "p".into(),
+            int32,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         ty: int32,
         span: Span::new(FileId::DUMMY, 0, 0),
     };
@@ -1338,7 +1410,11 @@ fn test_eval_pointer_shadowing_deref_after_block() {
     // set p = &x
     let ref_x = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Ref,
-        expr: Box::new(HirExpr::Ident("x".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
+        expr: Box::new(HirExpr::Ident(
+            "x".into(),
+            TypeId::NONE,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         ty: TypeId::NONE,
         span: Span::new(FileId::DUMMY, 0, 0),
     };
@@ -1365,7 +1441,11 @@ fn test_eval_pointer_shadowing_deref_after_block() {
         mutable: false,
         span: Span::new(FileId::DUMMY, 0, 0),
     };
-    let block = HirExpr::Block(vec![inner_var], TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
+    let block = HirExpr::Block(
+        vec![inner_var],
+        TypeId::NONE,
+        Span::new(FileId::DUMMY, 0, 0),
+    );
     let block_stmt = HirStmt::Expression(Box::new(block));
 
     // Evaluate: declarations + block
@@ -1373,7 +1453,11 @@ fn test_eval_pointer_shadowing_deref_after_block() {
     // After block, *p should still be 1 (outer x restored, pointer slot valid)
     let deref_p = HirExpr::UnaryOp {
         op: crate::ast::UnaryOp::Deref,
-        expr: Box::new(HirExpr::Ident("p".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
+        expr: Box::new(HirExpr::Ident(
+            "p".into(),
+            TypeId::NONE,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         ty: TypeId::NONE,
         span: Span::new(FileId::DUMMY, 0, 0),
     };
@@ -1670,7 +1754,7 @@ fn test_eval_layout_of() {
 
     // Use the correct AST type structure: Type::Generic(Int, [32])
     let path_ty: &'static crate::ast::Type<'static> = Box::leak(Box::new(crate::ast::Type::Path(
-        smallvec::smallvec!["Int".into()],
+        Box::leak(vec![Symbol::intern("Int")].into_boxed_slice()),
         Span::new(FileId::DUMMY, 0, 0),
     )));
     let lit_expr: &'static crate::ast::Expr<'static> =
@@ -1681,9 +1765,12 @@ fn test_eval_layout_of() {
     let expr = HirExpr::LayoutOf(
         Box::new(crate::ast::Type::Generic(
             path_ty,
-            vec![crate::ast::GenericArg::Positional(
-                crate::ast::Type::Literal(lit_expr, Span::new(FileId::DUMMY, 0, 0)),
-            )],
+            Box::leak(
+                vec![crate::ast::GenericArg::Positional(
+                    crate::ast::Type::Literal(lit_expr, Span::new(FileId::DUMMY, 0, 0)),
+                )]
+                .into_boxed_slice(),
+            ),
             Span::new(FileId::DUMMY, 0, 0),
         )),
         Span::new(FileId::DUMMY, 0, 0),
@@ -1919,7 +2006,11 @@ fn test_eval_pointer_index() {
 
     // ptr[1]
     let index = HirExpr::Index {
-        base: Box::new(HirExpr::Ident("ptr".into(), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0))),
+        base: Box::new(HirExpr::Ident(
+            "ptr".into(),
+            TypeId::NONE,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         index: Box::new(HirExpr::Literal(
             Literal::Int(ast::IntLit::Small(1)),
             TypeId::NONE,
@@ -1995,8 +2086,16 @@ fn test_eval_assert_failure() {
 #[test]
 fn test_eval_bool_eq() {
     let mut ctx = TypeContext::new();
-    let t = HirExpr::Literal(Literal::Bool(true), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
-    let f = HirExpr::Literal(Literal::Bool(false), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
+    let t = HirExpr::Literal(
+        Literal::Bool(true),
+        TypeId::NONE,
+        Span::new(FileId::DUMMY, 0, 0),
+    );
+    let f = HirExpr::Literal(
+        Literal::Bool(false),
+        TypeId::NONE,
+        Span::new(FileId::DUMMY, 0, 0),
+    );
     let eq = make_binop(t.clone(), BinOp::Eq, f.clone());
     let neq = make_binop(t.clone(), BinOp::Neq, f.clone());
     let eq2 = make_binop(t.clone(), BinOp::Eq, t.clone());
@@ -2116,8 +2215,16 @@ fn test_eval_int_min_neg() {
 #[test]
 fn test_eval_string_neq() {
     let mut ctx = TypeContext::new();
-    let a = HirExpr::Literal(Literal::String("abc".into()), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
-    let b = HirExpr::Literal(Literal::String("def".into()), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
+    let a = HirExpr::Literal(
+        Literal::String("abc".into()),
+        TypeId::NONE,
+        Span::new(FileId::DUMMY, 0, 0),
+    );
+    let b = HirExpr::Literal(
+        Literal::String("def".into()),
+        TypeId::NONE,
+        Span::new(FileId::DUMMY, 0, 0),
+    );
     let expr = make_binop(a, BinOp::Neq, b);
     assert!(matches!(
         eval(&mut ctx, &expr),
@@ -2128,8 +2235,16 @@ fn test_eval_string_neq() {
 #[test]
 fn test_eval_float_neq() {
     let mut ctx = TypeContext::new();
-    let a = HirExpr::Literal(Literal::Float(3.14), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
-    let b = HirExpr::Literal(Literal::Float(2.71), TypeId::NONE, Span::new(FileId::DUMMY, 0, 0));
+    let a = HirExpr::Literal(
+        Literal::Float(3.14),
+        TypeId::NONE,
+        Span::new(FileId::DUMMY, 0, 0),
+    );
+    let b = HirExpr::Literal(
+        Literal::Float(2.71),
+        TypeId::NONE,
+        Span::new(FileId::DUMMY, 0, 0),
+    );
     let expr = make_binop(a, BinOp::Neq, b);
     assert!(matches!(
         eval(&mut ctx, &expr),
@@ -2194,7 +2309,11 @@ fn test_eval_match_enum_pattern() {
         pattern: HirPattern::Enum {
             path: vec!["Option".into()],
             variant: "Some".into(),
-            inner: Some(Box::new(HirPattern::Wildcard(Span::new(FileId::DUMMY, 0, 0)))),
+            inner: Some(Box::new(HirPattern::Wildcard(Span::new(
+                FileId::DUMMY,
+                0,
+                0,
+            )))),
             span: Span::new(FileId::DUMMY, 0, 0),
         },
         guard: None,
@@ -2372,7 +2491,11 @@ fn test_eval_self_recursion() {
     let n_param = HirExpr::Ident("n".into(), int64, Span::new(FileId::DUMMY, 0, 0));
     let cond = make_binop_ty(n_param.clone(), BinOp::Le, make_int_val(1, int64), int64);
     let recursive_call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("fact".into(), int64, Span::new(FileId::DUMMY, 0, 0))),
+        callee: Box::new(HirExpr::Ident(
+            "fact".into(),
+            int64,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         args: vec![make_binop_ty(
             n_param.clone(),
             BinOp::Sub,
@@ -2401,7 +2524,11 @@ fn test_eval_self_recursion() {
 
     // fact!(5) = 5 * 4 * 3 * 2 * 1 = 120
     let call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("fact".into(), int64, Span::new(FileId::DUMMY, 0, 0))),
+        callee: Box::new(HirExpr::Ident(
+            "fact".into(),
+            int64,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         args: vec![make_int_val(5, int64)],
         comptime: true,
         ty: int64,
@@ -2439,7 +2566,11 @@ fn test_eval_mutual_recursion() {
     let n_even = HirExpr::Ident("n".into(), int64, Span::new(FileId::DUMMY, 0, 0));
     let cond_even = make_binop_ty(n_even.clone(), BinOp::Eq, make_int_val(0, int64), bool_ty);
     let is_odd_call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("is_odd".into(), bool_ty, Span::new(FileId::DUMMY, 0, 0))),
+        callee: Box::new(HirExpr::Ident(
+            "is_odd".into(),
+            bool_ty,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         args: vec![make_binop_ty(
             n_even.clone(),
             BinOp::Sub,
@@ -2467,7 +2598,11 @@ fn test_eval_mutual_recursion() {
     let n_odd = HirExpr::Ident("n".into(), int64, Span::new(FileId::DUMMY, 0, 0));
     let cond_odd = make_binop_ty(n_odd.clone(), BinOp::Eq, make_int_val(0, int64), bool_ty);
     let is_even_call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("is_even".into(), bool_ty, Span::new(FileId::DUMMY, 0, 0))),
+        callee: Box::new(HirExpr::Ident(
+            "is_even".into(),
+            bool_ty,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         args: vec![make_binop_ty(
             n_odd.clone(),
             BinOp::Sub,
@@ -2496,7 +2631,11 @@ fn test_eval_mutual_recursion() {
 
     // is_even!(4) = is_odd!(3) = is_even!(2) = is_odd!(1) = is_even!(0) = true
     let call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("is_even".into(), bool_ty, Span::new(FileId::DUMMY, 0, 0))),
+        callee: Box::new(HirExpr::Ident(
+            "is_even".into(),
+            bool_ty,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         args: vec![make_int_val(4, int64)],
         comptime: true,
         ty: bool_ty,
@@ -2511,7 +2650,11 @@ fn test_eval_mutual_recursion() {
 
     // is_odd!(3) = is_even!(2) = is_odd!(1) = is_even!(0) = true
     let call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("is_odd".into(), bool_ty, Span::new(FileId::DUMMY, 0, 0))),
+        callee: Box::new(HirExpr::Ident(
+            "is_odd".into(),
+            bool_ty,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         args: vec![make_int_val(3, int64)],
         comptime: true,
         ty: bool_ty,
@@ -2542,9 +2685,17 @@ fn test_comptime_recursive_step_limit() {
 
     // def recurse(n: Int<32>) -> Int<32> { recurse!(n + 1) }
     let self_call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("recurse".into(), int32, Span::new(FileId::DUMMY, 0, 0))),
+        callee: Box::new(HirExpr::Ident(
+            "recurse".into(),
+            int32,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         args: vec![HirExpr::BinaryOp {
-            left: Box::new(HirExpr::Ident("n".into(), int32, Span::new(FileId::DUMMY, 0, 0))),
+            left: Box::new(HirExpr::Ident(
+                "n".into(),
+                int32,
+                Span::new(FileId::DUMMY, 0, 0),
+            )),
             op: BinOp::Add,
             right: Box::new(make_int_val(1, int32)),
             ty: int32,
@@ -2558,7 +2709,11 @@ fn test_comptime_recursive_step_limit() {
     ec.register_fn("recurse".into(), vec!["n".into()], fn_body);
 
     let call = HirExpr::Call {
-        callee: Box::new(HirExpr::Ident("recurse".into(), int32, Span::new(FileId::DUMMY, 0, 0))),
+        callee: Box::new(HirExpr::Ident(
+            "recurse".into(),
+            int32,
+            Span::new(FileId::DUMMY, 0, 0),
+        )),
         args: vec![make_int_val(0, int32)],
         comptime: true,
         ty: int32,

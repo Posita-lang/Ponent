@@ -1,5 +1,6 @@
 use crate::ast::visit::replace_ident_in_expr;
 use crate::ast::*;
+use crate::diagnostics::ErrCode;
 use crate::diagnostics::{DiagCtxt, Diagnostic, DiagnosticLevel};
 use crate::hir::builtins;
 use crate::hir::symbol::*;
@@ -252,7 +253,7 @@ pub struct NameResolver<'a, 'src, 'input> {
     /// Temporary mapping of type parameter names to GenericParam TypeIds
     /// used when resolving types inside an `impl<T>` block.
     current_impl_type_params: Option<HashMap<Symbol, TypeId>>,
-    /// B5a: the Adt `TypeId` currently having its variant-payload expansion
+    /// The Adt `TypeId` currently having its variant-payload expansion
     /// registered (re-entrancy guard: resolving a self-referential payload
     /// re-enters `resolve_type_expr` for the same enum — a second
     /// registration attempt would recurse; the guard makes the inner call a
@@ -364,7 +365,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
     /// previous resolution left off, so there is no DefId collision risk.
     pub fn resolve_incremental(
         &mut self,
-        new_items: &[Stmt<'input>],
+        new_items: &[Item<'input>],
         existing_symbols: SymbolTable<'input>,
         existing_trait_env: TraitEnv<'input>,
         existing_resolution_map: ResolutionMap<'input>,
@@ -400,9 +401,9 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
         (symbols, trait_env, diags, resolution_map)
     }
 
-    fn resolve_item(&mut self, item: &Stmt<'input>) {
+    fn resolve_item(&mut self, item: &Item<'input>) {
         match item {
-            Stmt::FunctionDef {
+            Item::FunctionDef {
                 span,
                 attributes,
                 name,
@@ -453,8 +454,8 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                     is_pure,
                     is_ieee_contracts,
                     hints,
-                    contracts: contracts.clone(),
-                    attributes: attributes.clone(),
+                    contracts: contracts.to_vec(),
+                    attributes: attributes.to_vec(),
                 };
                 // Nested function definitions are resolved via `resolve_stmt`
                 // inside an enclosing function's body scope — but the checker
@@ -503,7 +504,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 self.current_impl_type_params = None;
                 self.exit_scope();
             }
-            Stmt::TypeDef {
+            Item::TypeDef {
                 span,
                 attributes,
                 name,
@@ -561,12 +562,12 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                             .collect();
                     }
                     TypeDefinition::Enum(variants_def, mm, modifiers) => {
-                        variants = variants_def.clone();
+                        variants = variants_def.to_vec();
                         // The §Copy derivation: a generic enum is Copy iff
                         // EVERY variant payload is Copy (the value holds
                         // one variant) — collect the payloads into the ADT
                         // fields so `adt_is_copy` checks them uniformly.
-                        for v in variants_def {
+                        for v in variants_def.iter() {
                             if let Some(p) = &v.payload {
                                 // Recursive payloads (`Cons((Int<32>, &mut List))`)
                                 // reference the ADT itself, which is not yet in
@@ -605,7 +606,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                                             "unknown type parameter `{}` in GADT `when` constraint",
                                             pn,
                                         ))
-                                        .with_code_str("E062")
+                                        .with_code_str(ErrCode::E062)
                                         .with_span(*span)
                                         .with_help(
                                             format!(
@@ -643,7 +644,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                                              type parameter `{}` of the same enum",
                                             bad,
                                         ))
-                                        .with_code_str("E064")
+                                        .with_code_str(ErrCode::E064)
                                         .with_span(ct.span())
                                         .with_help(
                                             "the right-hand side of `when` must be a concrete \
@@ -663,7 +664,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                                             "`exists {}` shadows enum type parameter `{}`",
                                             ep, ep,
                                         ))
-                                        .with_code_str("E063")
+                                        .with_code_str(ErrCode::E063)
                                         .with_span(*span)
                                         .with_help(
                                             format!(
@@ -740,7 +741,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                                                 ast_type_display(ct1),
                                                 ast_type_display(ct2),
                                             ))
-                                            .with_code_str("E065")
+                                            .with_code_str(ErrCode::E065)
                                             .with_span(ct2.span())
                                             .with_help(
                                                 "the same type parameter is constrained to two \
@@ -766,13 +767,13 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                                 })
                             });
                         if constraints_involve_type_params {
-                            for m in modifiers {
+                            for m in modifiers.iter() {
                                 if matches!(m, crate::ast::TypeModifier::Default(_)) {
                                     self.diagnostics.push(
                                         Diagnostic::error(
                                             "GADT enum with generic type parameters cannot have a `with default` clause"
                                         )
-                                        .with_code_str("E061")
+                                        .with_code_str(ErrCode::E061)
                                         .with_span(*span)
                                         .with_help(
                                             "a GADT enum's type parameters are constrained by `when` clauses, \
@@ -788,7 +789,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                     }
                     TypeDefinition::Alias(ty, mods) => {
                         alias_ast = Some(ty.clone());
-                        for m in mods {
+                        for m in mods.iter() {
                             match m {
                                 TypeModifier::Default(expr) => default_value = Some(expr.clone()),
                                 TypeModifier::NoDefault => no_default = true,
@@ -806,8 +807,8 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 let mut bit_order = None;
                 let mut align = None;
                 let mut pad = None;
-                let mut expanded_attrs = attributes.clone();
-                for attr in attributes {
+                let mut expanded_attrs = attributes.to_vec();
+                for attr in attributes.iter() {
                     if attr.name.eq_str("layout") {
                         for arg in &attr.args {
                             if let crate::ast::Expr::Ident(name, _) = arg {
@@ -844,7 +845,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                                         "`@endian` expects `little` or `big`, got `{}`",
                                         name
                                     ))
-                                    .with_code_str("E061")
+                                    .with_code_str(ErrCode::E061)
                                     .with_span(attr.span)
                                     .with_suggestion("write `@endian(little)` or `@endian(big)`"),
                                 );
@@ -852,7 +853,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                             Some(_) => {
                                 self.diagnostics.push(
                                     Diagnostic::error("`@endian` requires an identifier argument (`little` or `big`)")
-                                        .with_code_str("E061")
+                                        .with_code_str(ErrCode::E061)
                                         .with_span(attr.span)
                                         .with_suggestion("write `@endian(little)` or `@endian(big)`"),
                                 );
@@ -860,7 +861,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                             None => {
                                 self.diagnostics.push(
                                     Diagnostic::error("`@endian` requires an argument")
-                                        .with_code_str("E061")
+                                        .with_code_str(ErrCode::E061)
                                         .with_span(attr.span)
                                         .with_suggestion(
                                             "write `@endian(little)` or `@endian(big)`",
@@ -880,7 +881,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                             Some(crate::ast::Expr::Ident(name, _)) => {
                                 self.diagnostics.push(
                                     Diagnostic::error(format!("`@bit_order` expects `lsb_to_msb` or `msb_to_lsb`, got `{}`", name))
-                                        .with_code_str("E061")
+                                        .with_code_str(ErrCode::E061)
                                         .with_span(attr.span)
                                         .with_suggestion("write `@bit_order(lsb_to_msb)` or `@bit_order(msb_to_lsb)`"),
                                 );
@@ -888,7 +889,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                             Some(_) => {
                                 self.diagnostics.push(
                                     Diagnostic::error("`@bit_order` requires an identifier argument")
-                                        .with_code_str("E061")
+                                        .with_code_str(ErrCode::E061)
                                         .with_span(attr.span)
                                         .with_suggestion("write `@bit_order(lsb_to_msb)` or `@bit_order(msb_to_lsb)`"),
                                 );
@@ -896,7 +897,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                             None => {
                                 self.diagnostics.push(
                                     Diagnostic::error("`@bit_order` requires an argument")
-                                        .with_code_str("E061")
+                                        .with_code_str(ErrCode::E061)
                                         .with_span(attr.span)
                                         .with_suggestion("write `@bit_order(lsb_to_msb)` or `@bit_order(msb_to_lsb)`"),
                                 );
@@ -919,7 +920,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                                         "`@{}` requires an integer argument",
                                         attr.name
                                     ))
-                                    .with_code_str("E060")
+                                    .with_code_str(ErrCode::E060)
                                     .with_span(attr.span)
                                     .with_suggestion(format!(
                                         "write `@{}(N)` where N is a power of two",
@@ -933,7 +934,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                                         "`@{}` requires an integer argument",
                                         attr.name
                                     ))
-                                    .with_code_str("E060")
+                                    .with_code_str(ErrCode::E060)
                                     .with_span(attr.span)
                                     .with_suggestion(format!("write `@{}(128)`", attr.name)),
                                 );
@@ -956,11 +957,11 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
 
                 let binding = TypeBinding {
                     def_id,
-                    params: type_params,
+                    params: type_params.to_vec(),
                     kind,
                     span: *span,
                     alias_ast,
-                    attributes: attributes.clone(),
+                    attributes: attributes.to_vec(),
                     fields,
                     variants,
                     invariant,
@@ -1001,7 +1002,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 // Restore the previous type param map (if any).
                 self.current_impl_type_params = prev_param_map;
             }
-            Stmt::TraitDef {
+            Item::TraitDef {
                 span,
                 name,
                 methods,
@@ -1016,7 +1017,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 let self_param = self.ctx.generic_param(0, Symbol::intern("Self"));
                 self.current_impl_for_type = Some(self_param);
                 let mut method_bindings = Vec::new();
-                for method in methods {
+                for method in methods.iter() {
                     // Own the signature so the `&mut self` borrow from
                     // `collect_trait_method_signature` ends before the next
                     // loop iteration.
@@ -1034,14 +1035,14 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                         .collect(),
                     super_traits: vec![],
                     span: *span,
-                    attributes: attributes.clone(),
+                    attributes: attributes.to_vec(),
                     crate_id: self.symbols.local_crate_id,
                 };
                 if let Err(diag) = self.symbols.insert_trait(*name, binding, *span) {
                     self.diagnostics.push(diag);
                 }
             }
-            Stmt::ImplBlock {
+            Item::ImplBlock {
                 span,
                 attributes,
                 trait_path,
@@ -1158,7 +1159,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
 
                 // Resolve associated types from the impl block.
                 let mut assoc_tys = Vec::new();
-                for at in associated_types {
+                for at in associated_types.iter() {
                     if let Some(ref default) = at.default {
                         let resolved = self.resolve_type_expr(default);
                         assoc_tys.push((at.name, resolved));
@@ -1199,37 +1200,38 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
 
                 self.exit_scope();
             }
-            Stmt::Import {
+            Item::Import {
                 path,
                 items,
                 alias,
                 span,
             } => {
                 self.import_map.push(ImportEntry {
-                    path: path.clone(),
+                    path: path.to_vec(),
                     alias: *alias,
-                    items: items.clone(),
+                    items: items.map(|i| i.to_vec()),
                     span: *span,
                 });
                 // Resolve the import path against the symbol table and register
                 // the imported symbols in the current scope.
-                let resolved = self.resolve_import_path(path, items, alias, *span);
+                let resolved_items: Option<Vec<Symbol>> = items.map(|i| i.to_vec());
+                let resolved = self.resolve_import_path(path, &resolved_items, alias, *span);
                 if let Err(diag) = resolved {
                     self.diagnostics.push(diag);
                 }
             }
-            Stmt::Edition(version, span) => match crate::hir::types::Edition::from_str(version) {
+            Item::Edition(version, span) => match crate::hir::types::Edition::from_str(version) {
                 Some(ed) => self.ctx.set_edition(ed),
                 None => {
                     self.diagnostics.push(
                         Diagnostic::error(format!("unknown edition `{}`", version))
-                            .with_code_str("E070")
+                            .with_code_str(ErrCode::E070)
                             .with_span(*span)
                             .with_suggestion("use a valid edition: `\"2024\"` or `\"2026\"`"),
                     );
                 }
             },
-            Stmt::LayoutDef {
+            Item::LayoutDef {
                 name, attributes, ..
             } => {
                 // Register a layout alias so that @layout(AliasName) can be expanded.
@@ -1239,10 +1241,10 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                             .with_span(Span::new(FileId::DUMMY, 0, 0)),
                     );
                 } else {
-                    self.layout_aliases.insert(*name, attributes.clone());
+                    self.layout_aliases.insert(*name, attributes.to_vec());
                 }
             }
-            Stmt::Constraint {
+            Item::Constraint {
                 name,
                 params,
                 predicates,
@@ -1282,14 +1284,14 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 self.current_impl_type_params = None;
                 let binding = ConstraintBinding {
                     predicates: resolved_predicates,
-                    params: params.clone(),
+                    params: params.to_vec(),
                     span: *span,
                 };
                 if let Err(diag) = self.symbols.insert_constraint(*name, binding, *span) {
                     self.diagnostics.push(diag);
                 }
             }
-            Stmt::ExternFunction {
+            Item::ExternFunction {
                 abi,
                 name,
                 params,
@@ -1313,41 +1315,39 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                     is_ieee_contracts,
                     hints,
                     contracts: Vec::new(),
-                    attributes: attributes.clone(),
+                    attributes: attributes.to_vec(),
                 };
                 if let Err(diag) = self.symbols.insert_function(*name, binding, *span) {
                     self.diagnostics.push(diag);
                 }
             }
-            _ => {
-                if let Some(stmt_span) = self.get_stmt_span(item) {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            "`set` and `let` statements are not allowed at the top level; only declarations (`def`, `type`, `trait`, `import`, `impl`, `constraint`, `comptime`, `extern`, `edition`) are permitted here",
-                        )
-                        .with_code_str("E018")
-                        .with_span(stmt_span),
-                    );
+            Item::ComptimeBlock { body, .. } => {
+                self.enter_scope();
+                for stmt in *body {
+                    self.resolve_stmt(stmt);
                 }
+                self.exit_scope();
+            }
+            _ => {
+                let stmt_span = item.span();
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "`set` and `let` statements are not allowed at the top level; only declarations (`def`, `type`, `trait`, `import`, `impl`, `constraint`, `comptime`, `extern`, `edition`) are permitted here",
+                    )
+                    .with_code_str(ErrCode::E018)
+                    .with_span(stmt_span),
+                );
             }
         }
     }
 
     fn resolve_stmt(&mut self, stmt: &Stmt<'input>) {
         match stmt {
-            // Nested function definitions: register them like items
-            // (rustc-style — items in blocks are collected and
-            // referenced).  Without this, a nested `def` would never be
-            // registered and the checker's `update_function_return_type`
-            // would panic ("function not found in any scope").
-            Stmt::FunctionDef { .. } => self.resolve_item(stmt),
-            // Nested type definitions — register them like items
-            // (rustc-style, mirroring the FunctionDef<'input> arm above).  Before
-            // this arm existed, a `type R = ...` inside a function body was
-            // silently dropped: `R` was never registered in the symbol
-            // table, so a later reference (`set x: R`) reported
-            // "undefined type: R".
-            Stmt::TypeDef { .. } => self.resolve_item(stmt),
+            // Items nested in a body (rustc-style: a nested `def`/`type` is
+            // registered like a top-level item).  `Item::ComptimeBlock` is
+            // resolved by `resolve_item` too — its body statements are
+            // resolved in a fresh scope.
+            Stmt::Item(item) => self.resolve_item(item),
             Stmt::VariableDef {
                 kind,
                 mutable,
@@ -1389,7 +1389,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
 
                 // `set auto<T> = expr` — register each capture name as a type
                 // in the resolution map so that comptime code can reference it.
-                for cap in type_captures {
+                for cap in type_captures.iter() {
                     // Allocate a unique DefId for each capture so that
                     // placeholder bindings don't collide in the type_defs map.
                     let cap_def_id = self.allocate_def_id();
@@ -1564,15 +1564,8 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 }
             }
             Stmt::Assign { target, value, .. } => {
-                self.resolve_expr(target);
+                self.resolve_expr(target.expr());
                 self.resolve_expr(value);
-            }
-            Stmt::ComptimeBlock { body, .. } => {
-                self.enter_scope();
-                for stmt in *body {
-                    self.resolve_stmt(stmt);
-                }
-                self.exit_scope();
             }
             Stmt::ScopeCleanup { body, .. } => {
                 self.enter_scope();
@@ -2013,7 +2006,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
         }
     }
 
-    /// B5a: register the κ variant-payload expansion for the enum
+    /// Register the κ variant-payload expansion for the enum
     /// instantiation `(def_id, args)` if not yet registered (see
     /// `TypeContext::adt_expansions`).
     ///
@@ -2024,7 +2017,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
     /// resolves to the very same Adt `TypeId` — producing the back-edge
     /// that the κ graph solver (`kappa.rs`) classifies by cycle variance.
     ///
-    /// Fail-closed boundaries (no registration, the pre-B5a behavior):
+    /// Fail-closed boundaries (no registration, the pre-expansion behavior):
     /// - existential variants (payloads need fresh skolems per use site),
     /// - payload resolution pushing any diagnostic (genuine error — the
     ///   diagnostics are truncated and the registration is skipped),
@@ -2159,7 +2152,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                     } else if name.eq_str("Unit") {
                         self.diagnostics.push(
                             Diagnostic::error("use `()` instead of `Unit`")
-                                .with_code_str("E031")
+                                .with_code_str(ErrCode::E031)
                                 .with_help(
                                     "Posita uses `()` (empty tuple) to express the unit type",
                                 )
@@ -2491,13 +2484,7 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
     fn get_stmt_span(&self, stmt: &Stmt<'input>) -> Option<Span> {
         match stmt {
             Stmt::VariableDef { span, .. } => Some(*span),
-            Stmt::FunctionDef { span, .. } => Some(*span),
-            Stmt::TypeDef { span, .. } => Some(*span),
-            Stmt::TraitDef { span, .. } => Some(*span),
-            Stmt::Import { span, .. } => Some(*span),
-            Stmt::ExternFunction { span, .. } => Some(*span),
-            Stmt::Constraint { span, .. } => Some(*span),
-            Stmt::Edition(_, span) => Some(*span),
+            Stmt::Item(item) => Some(item.span()),
             _ => None,
         }
     }
@@ -2645,19 +2632,27 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                         }),
                     })
                     .collect();
+                let arena = self
+                    .ctx
+                    .arena
+                    .expect("arena required for type construction");
                 Type::Generic(
-                    self.ctx
-                        .arena
-                        .expect("arena required for type construction")
-                        .alloc(new_base),
-                    new_args,
+                    arena.alloc(new_base),
+                    arena.alloc_slice_clone(&new_args),
                     *span,
                 )
             }
             Type::Tuple(tys, span) => Type::Tuple(
-                tys.iter()
-                    .map(|t| self.resolve_self_in_type(t, self_ty))
-                    .collect(),
+                {
+                    let mapped: Vec<Type<'input>> = tys
+                        .iter()
+                        .map(|t| self.resolve_self_in_type(t, self_ty))
+                        .collect();
+                    self.ctx
+                        .arena
+                        .expect("arena required for type construction")
+                        .alloc_slice_clone(&mapped)
+                },
                 *span,
             ),
             Type::Slice(inner, span) => Type::Slice(
@@ -2676,17 +2671,29 @@ impl<'a, 'src, 'input: 'a> NameResolver<'a, 'src, 'input> {
                 *span,
             ),
             Type::DynTrait(traits, span) => Type::DynTrait(
-                traits
-                    .iter()
-                    .map(|t| self.resolve_self_in_type(t, self_ty))
-                    .collect(),
+                {
+                    let mapped: Vec<Type<'input>> = traits
+                        .iter()
+                        .map(|t| self.resolve_self_in_type(t, self_ty))
+                        .collect();
+                    self.ctx
+                        .arena
+                        .expect("arena required for type construction")
+                        .alloc_slice_clone(&mapped)
+                },
                 *span,
             ),
             Type::Function { params, ret, span } => Type::Function {
-                params: params
-                    .iter()
-                    .map(|p| self.resolve_self_in_type(p, self_ty))
-                    .collect(),
+                params: {
+                    let mapped: Vec<Type<'input>> = params
+                        .iter()
+                        .map(|p| self.resolve_self_in_type(p, self_ty))
+                        .collect();
+                    self.ctx
+                        .arena
+                        .expect("arena required for type construction")
+                        .alloc_slice_clone(&mapped)
+                },
                 ret: self
                     .ctx
                     .arena

@@ -1,5 +1,5 @@
-use crate::ast::FileId;
 use super::*;
+use crate::ast::FileId;
 
 fn new_ctx() -> TypeContext<'static> {
     TypeContext::new()
@@ -126,20 +126,18 @@ fn test_place_is_prefix_of_const_index() {
 fn test_type_is_copy_raw_pointer() {
     let mut ctx = TypeContext::new();
     let int_ty = ctx.int(32, true);
-    let ptr = ctx.alloc(TypeData::Pointer { ty: int_ty });
-    assert!(
-        ctx.type_is_copy(ptr),
-        "raw `Pointer` must be Copy"
-    );
+    let ptr = ctx.alloc(TypeData::Pointer {
+        ty: int_ty,
+        mutable: false,
+    });
+    assert!(ctx.type_is_copy(ptr), "raw `Pointer` must be Copy");
     let usize_ty = ctx.alloc(TypeData::USize);
     let ptr2 = ctx.alloc(TypeData::Ptr {
         size: usize_ty,
         pointee: int_ty,
+        mutable: false,
     });
-    assert!(
-        ctx.type_is_copy(ptr2),
-        "raw `Ptr` must be Copy"
-    );
+    assert!(ctx.type_is_copy(ptr2), "raw `Ptr` must be Copy");
 }
 
 // -- TypeId tag --
@@ -360,13 +358,13 @@ fn test_characteristic_ksp_convergence() {
     );
 }
 
-// -- B5a: ADT recursion detection via variant-payload expansion --
+// -- ADT recursion detection via variant-payload expansion --
 #[test]
 fn kappa_recursive_enum_covariant_infinite() {
     // A monomorphic self-recursive enum with a covariant payload
     // (shape: `type Tree = enum { Node(Tree, Tree) }`): the expansion
     // back-edge makes a covariant cycle → InfiniteEnumerable (the
-    // pre-B5a verdict was FiniteExhaustible(usize::MAX) — recursion was
+    // pre-expansion verdict was FiniteExhaustible(usize::MAX) — recursion was
     // invisible to the graph).
     let mut ctx = TypeContext::new();
     let tree = ctx.enum_ty(DefId(9001), smallvec![]);
@@ -397,11 +395,11 @@ fn kappa_recursive_enum_invariant_undecidable() {
 
 #[test]
 fn kappa_per_scc_refinement_covariant_root() {
-    // B5b: the root sits in a COVARIANT cycle while a DISJOINT
+    // The root sits in a COVARIANT cycle while a DISJOINT
     // non-covariant cycle is also reachable:
     //   wrap = enum { V(wrap, evil) }   (covariant self-cycle)
     //   evil = enum { E(evil -> ()) }   (contravariant self-cycle)
-    // The pre-B5b global-flag classifier reported the root
+    // The former global-flag classifier reported the root
     // `Undecidable` (worst SCC's verdict); per-SCC classification
     // gives the root its own SCC's verdict — InfiniteEnumerable.
     let mut ctx = TypeContext::new();
@@ -420,7 +418,7 @@ fn kappa_per_scc_refinement_covariant_root() {
 
 #[test]
 fn kappa_generic_recursive_enum_instantiation() {
-    // The shape the resolver hook (B5a) registers for a generic
+    // The shape the resolver hook registers for a generic
     // self-recursive enum instantiation:
     //   `type List<T> = enum { Cons(T, List<T>), Nil }` with T = Int<32>
     //   → payloads [Tuple{Int<32>, List[Int<32>]}, Unit]
@@ -1677,7 +1675,7 @@ fn test_bias_fresh_vars_occurs_check() {
     );
 }
 
-/// Stage 5a: yoneda_equiv_check — canonical-form (βη) equivalence fallback
+/// yoneda_equiv_check — canonical-form (βη) equivalence fallback
 /// with parametricity gate (fail-closed).
 #[test]
 fn test_yoneda_equiv_check_basic() {
@@ -1779,4 +1777,131 @@ fn boxcar_count_lags_in_flight_push_so_index_lt_count_is_unsound() {
              — otherwise the old get() precondition would hold"
         );
     });
+}
+
+/// Revealed-Opaque blindness pins (turn-1 minor #3): a `GenericParam`
+/// living ONLY inside a revealed TAIT hidden type must participate in
+/// `subst` / `replace_generic` / `replace_type_ids` and be SEEN by
+/// `occurs_check` — the former `_ => ty` / leaf treatments let it
+/// survive instantiation as a stale free param (silent type rot).
+#[test]
+fn test_revealed_opaque_hidden_type_participates() {
+    let mut ctx = TypeContext::new();
+    let p0 = ctx.generic_param(0, "P".into());
+    let unit = ctx.unit();
+    let hidden = ctx.function(smallvec![p0], unit); // fn(P₀→Unit)
+    let opaque = ctx.alloc(TypeData::Opaque {
+        def_id: DefId(42),
+        hidden: Some(hidden),
+    });
+
+    // subst(0 ↦ Int): the hidden type must become fn(Int→Unit).
+    let int = ctx.int(32, true);
+    let subbed = ctx.subst(opaque, &Subst::from_single(0, int));
+    let expected_sub = ctx.function(smallvec![int], unit);
+    match ctx.get(subbed) {
+        TypeData::Opaque {
+            hidden: Some(h), ..
+        } => {
+            assert_eq!(*h, expected_sub, "hidden type must be substituted");
+        }
+        other => panic!("expected an Opaque after subst: {other:?}"),
+    }
+
+    // replace_generic: same participation.
+    let replaced = ctx.replace_generic(opaque, 0, int);
+    let expected_rep = ctx.function(smallvec![int], unit);
+    match ctx.get(replaced) {
+        TypeData::Opaque {
+            hidden: Some(h), ..
+        } => {
+            assert_eq!(
+                *h, expected_rep,
+                "replace_generic must reach the hidden type"
+            );
+        }
+        other => panic!("expected an Opaque after replace_generic: {other:?}"),
+    }
+
+    // occurs_check: the param inside the hidden type must be SEEN.
+    assert!(
+        ctx.occurs_check(p0, opaque),
+        "occurs_check must see through a revealed Opaque's hidden type"
+    );
+
+    // hidden: None (still opaque in its defining scope) stays a leaf:
+    // no replacement, no occurs-check recursion, subst returns it verbatim.
+    let bare = ctx.alloc(TypeData::Opaque {
+        def_id: DefId(43),
+        hidden: None,
+    });
+    let subbed_bare = ctx.subst(bare, &Subst::from_single(0, int));
+    assert_eq!(
+        subbed_bare, bare,
+        "hidden: None is a leaf: nothing to replace"
+    );
+    assert!(!ctx.occurs_check(p0, bare), "hidden: None has no children");
+}
+
+/// check_skolem_escape's hand-rolled match must see through a
+/// revealed Opaque's hidden type — a SkolemVar living only inside a
+/// revealed TAIT hidden type must not slip past the universe-escape
+/// check (the one slot that had drifted from visit_type_children).
+#[test]
+fn skolem_escape_seen_inside_revealed_opaque() {
+    let mut ctx = TypeContext::new();
+    // A skolem from a DEEPER universe, reachable only through a
+    // revealed TAIT hidden type.  (Fresh ctx: the first enter_universe
+    // yields 0, which is never > a max_universe of 0 — so descend one
+    // level and use the second universe.)
+    let _ = ctx.enter_universe();
+    let (u, sk) = ctx.enter_universe();
+    assert!(u > 0, "premise: a genuinely deeper universe");
+    let i = ctx.int(32, true);
+    let fn_i_sk = ctx.function(smallvec![i], sk);
+    let opaque = ctx.alloc(TypeData::Opaque {
+        def_id: DefId(7),
+        hidden: Some(fn_i_sk),
+    });
+    assert!(
+        matches!(ctx.check_skolem_escape(opaque, 0), Some(escaped) if escaped == u),
+        "escape through a revealed Opaque hidden must be detected"
+    );
+    // Still-opaque TAIT: no children, nothing to escape.
+    let plain = ctx.alloc(TypeData::Opaque {
+        def_id: DefId(7),
+        hidden: None,
+    });
+    assert_eq!(ctx.check_skolem_escape(plain, 0), None);
+}
+
+/// The Paterson constructor-depth must count THROUGH a revealed
+/// Opaque's hidden type — the former `=> 1` under-counted a deep hidden
+/// type, admitting impl candidates whose resolution unfolds through the
+/// TAIT with unbounded depth (the wrong direction for a termination
+/// bound).
+#[test]
+fn constructor_depth_counts_through_revealed_opaque() {
+    let mut ctx = TypeContext::new();
+    let p0 = ctx.generic_param(0, "P".into()); // 0
+    let unit = ctx.unit();
+    let hidden = ctx.function(smallvec![p0], unit); // 1 + max(0,1) = 2
+    let op = ctx.alloc(TypeData::Opaque {
+        def_id: DefId(8401),
+        hidden: Some(hidden),
+    });
+    assert_eq!(
+        ctx.type_constructor_depth(op),
+        3,
+        "depth counts through the reveal"
+    );
+    let op0 = ctx.alloc(TypeData::Opaque {
+        def_id: DefId(8401),
+        hidden: None,
+    });
+    assert_eq!(
+        ctx.type_constructor_depth(op0),
+        1,
+        "defining-scope opacity stays 1"
+    );
 }

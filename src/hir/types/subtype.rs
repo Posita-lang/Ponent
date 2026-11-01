@@ -131,9 +131,34 @@ impl<'input> TypeContext<'input> {
                 }
                 r1 == r2 // same mutability, invariant
             }
-            (TypeData::Pointer { ty: t1 }, TypeData::Pointer { ty: t2 }) => {
-                // Invariant — exact equality required after resolving bindings.
-                self.resolve_binding_compressed(*t1) == self.resolve_binding_compressed(*t2)
+            (
+                TypeData::Pointer {
+                    ty: t1,
+                    mutable: m1,
+                    ..
+                },
+                TypeData::Pointer {
+                    ty: t2,
+                    mutable: m2,
+                    ..
+                },
+            ) => {
+                // §2.6 + §2.4 (landing point per the coercion.rs contract):
+                //   *mut T → *const T    SAFE implicit downcast;
+                //   *const T → *mut T    NEVER implicit (`as!` only);
+                //   *const T <: *const U ⟺ T <: U (§2.4 covariance);
+                //   *mut T   <: *mut U   ⟺ T = U (§2.4 invariance);
+                //   *mut T   <: *const U ⟺ T <: U (downcast ∘ covariance).
+                if !*m1 && *m2 {
+                    return false; // the upgrade direction
+                }
+                let r1 = self.resolve_binding_compressed(*t1);
+                let r2 = self.resolve_binding_compressed(*t2);
+                if *m1 && *m2 {
+                    r1 == r2 // invariant pointee
+                } else {
+                    self.subtype(r1, r2) // covariant (both downcast arms)
+                }
             }
             (
                 TypeData::Fn {
@@ -208,19 +233,39 @@ impl<'input> TypeContext<'input> {
                     frac_bits: q2,
                 },
             ) => *p1 == *p2 && *q1 == *q2,
-            // Ptr: invariant on both size and pointee — resolve bindings first.
+            // Ptr (§2.4): the size axis (the pointer's own width) is
+            // invariant both ways; the pointee follows the SAME mutability
+            // rules as Pointer above (§2.6 downgrade is safe, upgrade is
+            // `as!`-only).
             (
                 TypeData::Ptr {
                     size: s1,
                     pointee: p1,
+                    mutable: m1,
+                    ..
                 },
                 TypeData::Ptr {
                     size: s2,
                     pointee: p2,
+                    mutable: m2,
+                    ..
                 },
             ) => {
-                self.resolve_binding_compressed(*s1) == self.resolve_binding_compressed(*s2)
-                    && self.resolve_binding_compressed(*p1) == self.resolve_binding_compressed(*p2)
+                let rs1 = self.resolve_binding_compressed(*s1);
+                let rs2 = self.resolve_binding_compressed(*s2);
+                if rs1 != rs2 {
+                    return false; // size axis invariant both directions
+                }
+                if !*m1 && *m2 {
+                    return false; // the upgrade direction
+                }
+                let rp1 = self.resolve_binding_compressed(*p1);
+                let rp2 = self.resolve_binding_compressed(*p2);
+                if *m1 && *m2 {
+                    rp1 == rp2 // invariant pointee
+                } else {
+                    self.subtype(rp1, rp2) // covariant (both downcast arms)
+                }
             }
             // Poly: α-convert quantifiers → covariant body
             (
@@ -258,5 +303,90 @@ impl<'input> TypeContext<'input> {
             ) => id1 == id2 && u1 == u2,
             _ => false,
         }
+    }
+}
+
+#[cfg(all(test, not(feature = "shuttle")))]
+mod tests {
+    use super::*;
+
+    /// Four-quadrant pin (§2.4 + §2.6): subtype's pointer arms and
+    /// variance.rs's edge signs now pin EACH OTHER.
+    #[test]
+    fn pointer_subtype_matches_mutability_rules() {
+        let mut ctx = TypeContext::new();
+        let cat = ctx.int(32, true);
+        let animal = ctx.usize();
+        // A base-level pair WITH a real subtype relation (leaf pairs are
+        // equality-only in this relation; Never <: anything is the one
+        // asymmetric base case) — needed to demonstrate pointee covariance.
+        let never = ctx.never();
+        // --- §2.4 covariance (both const) ---
+        let pc_cat = ctx.pointer(cat);
+        let pc_animal = ctx.pointer(animal);
+        let pc_never = ctx.pointer(never);
+        assert!(
+            ctx.subtype(pc_cat, pc_cat) && ctx.subtype(pc_animal, pc_animal),
+            "*const T <: *const T (identity)"
+        );
+        assert!(
+            ctx.subtype(pc_never, pc_animal),
+            "*const T <: *const U ⟺ T <: U (Never <: USize drives it)"
+        );
+        assert!(
+            !ctx.subtype(pc_animal, pc_never),
+            "covariance is one-directional"
+        );
+        // --- §2.4 invariance (both mut) ---
+        let pm_cat = ctx.pointer_mut(cat);
+        let pm_animal = ctx.pointer_mut(animal);
+        assert!(
+            ctx.subtype(pm_cat, pm_cat),
+            "*mut T <: *mut T (identity holds)"
+        );
+        assert!(
+            !ctx.subtype(pm_cat, pm_animal),
+            "*mut T <: *mut U requires T = U (§2.4)"
+        );
+        assert!(!ctx.subtype(pm_animal, pm_cat));
+        // --- §2.6 downcast (mut → const) is SAFE ---
+        assert!(
+            ctx.subtype(pm_cat, pc_cat),
+            "*mut T → *const T is a safe implicit downgrade"
+        );
+        // ... and composes with covariance on the pointee (Never drives it).
+        let pm_never = ctx.pointer_mut(never);
+        assert!(ctx.subtype(pm_never, pc_animal), "downcast ∘ covariance");
+        // --- §2.6 upgrade (const → mut) is NEVER implicit ---
+        assert!(
+            !ctx.subtype(pc_cat, pm_cat),
+            "*const T → *mut T requires `as!` (§2.6)"
+        );
+    }
+
+    /// Ptr pin: the size axis is invariant BOTH ways (§2.4); the
+    /// pointee follows the same mutability rules as Pointer.
+    #[test]
+    fn ptr_subtype_size_axis_invariant() {
+        let mut ctx = TypeContext::new();
+        let s16 = ctx.uint(16);
+        let s64 = ctx.usize();
+        let pointee1 = ctx.int(32, true);
+        let p1c = ctx.ptr(s16, pointee1);
+        let p2c = ctx.ptr(s64, pointee1);
+        assert!(
+            !ctx.subtype(p1c, p2c) && !ctx.subtype(p2c, p1c),
+            "size axis invariant in BOTH directions"
+        );
+        // Same size, mut → const downgrade is safe.
+        let p1m = ctx.ptr_mut(s16, pointee1);
+        assert!(
+            ctx.subtype(p1m, p1c),
+            "Ptr<..., mut> → Ptr<..., const> safe"
+        );
+        assert!(
+            !ctx.subtype(p1c, p1m),
+            "Ptr<..., const> → Ptr<..., mut> is as!-only"
+        );
     }
 }

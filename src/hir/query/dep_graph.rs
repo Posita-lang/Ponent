@@ -504,7 +504,10 @@ impl StampBuf {
             .try_with(|c| c.try_borrow_mut().ok().map(|mut b| std::mem::take(&mut *b)))
             .unwrap_or(None);
         match pooled {
-            Some(stamps) => Self { stamps, pooled: true },
+            Some(stamps) => Self {
+                stamps,
+                pooled: true,
+            },
             None => Self {
                 stamps: Vec::new(),
                 pooled: false,
@@ -768,7 +771,13 @@ fn reconcile_forward_edges(
             removed.push(old);
         }
     }
-    *list = reads.iter().copied().collect();
+    // Reuse the old list's allocation instead of replacing it: when the
+    // read set is larger than the four inline slots the SmallVec is on
+    // the heap, and copying into its existing capacity allocates
+    // nothing.  `reads` is a separate task-deps slice at every call
+    // site, never `list` itself, so clearing first cannot lose input.
+    list.clear();
+    list.extend_from_slice(reads);
     removed
 }
 
@@ -1135,9 +1144,21 @@ pub struct DepGraph<S: Scheduler> {
     /// direction.  `is_green` — the hot path — takes no lock at all.
     dirty: ArcSwap<Vec<Arc<DirtyBlock>>>,
     /// Per-node dirty epochs, one `AtomicU64` per node, blocked and grown
-    /// in lockstep with `dirty` (same `block_of` indexing, same
-    /// append-only `ArcSwap` discipline — see `dirty` for why that makes
-    /// lock-free access racing a regrowth safe).
+    /// WITH `dirty` (same `block_of` indexing, same append-only
+    /// `ArcSwap` discipline — see `dirty` for why that makes lock-free
+    /// access racing a regrowth safe).
+    ///
+    /// The two tables are NOT kept at equal lengths, and the safety
+    /// invariant is NOT a global length order.  It is per ALLOCATED node:
+    /// every node that can be marked must have an epoch word.  Allocation
+    /// enforces exactly that — `grow_dirty(idx)` returns early only when
+    /// BOTH tables already cover `idx`, and the index does not escape the
+    /// allocator until it has — while `reset` restores the deliberately
+    /// asymmetric resting state (`DIRTY_INIT_BLOCKS` = 64 dirty blocks
+    /// against `EPOCH_INIT_BLOCKS` = 4 epoch blocks).  A dirty table
+    /// longer than the epoch table therefore covers only indices that were
+    /// never allocated; no valid caller can mark one.  See `reset` for why
+    /// the asymmetry is kept and `grow_dirty` for the growth order.
     ///
     /// This guards against the late-fan-out failure mode: when a query
     /// reads another query for the first time, its reverse edge does not
@@ -1527,9 +1548,16 @@ impl<S: Scheduler> DepGraph<S> {
         // block), so a dirty-only check used to return with the epoch table
         // still short.  That is the UNSAFE skew direction: `mark_dirty`
         // would find the node's dirty block and then `bump_epoch` would
-        // find no epoch word and drop the bump WITHOUT touching the
-        // generation — which is precisely the mark the finish-side epoch
-        // re-check depends on.  Grow here instead of silently degrading.
+        // find no epoch word and drop the EPOCH bump (the `dirty_generation`
+        // bump still happens — the missing-block arm is not taken) — and
+        // the epoch bump is precisely what the finish-side re-check
+        // compares.  Grow here instead of silently degrading.
+        //
+        // The invariant this protects is per ALLOCATED node, not a global
+        // length order: the caller is allocating `idx`, so covering `idx`
+        // in both tables is exactly "the node about to escape has an epoch
+        // word".  `reset` leaves `dirty` longer than `epochs` at rest, but
+        // those extra blocks cover only never-allocated indices.
         if cur.len() >= need && ecur.len() >= need {
             return;
         }
@@ -1891,6 +1919,15 @@ impl<S: Scheduler> DepGraph<S> {
         // returned.  The missing-block branch returns without touching it.
         let d;
         if let Some(block) = self.dirty_snapshot().get(block_of(node.0)) {
+            // For an ALLOCATED node the epoch word is guaranteed present:
+            // `allocate_node_index` grows BOTH tables to cover `idx` before
+            // the index escapes (see `grow_dirty`), and every caller here
+            // passes an allocated node.  The post-`reset` resting skew
+            // (dirty longer than epochs) covers only never-allocated
+            // indices, so `bump_epoch` below is a real bump — the
+            // missing-word degradation the missing-block arm documents is
+            // unreachable from this branch for valid input.
+            //
             // Epoch bump BEFORE the bit set: any Acquire observer of the
             // red bit then also observes the bump (the bump is a prior
             // access of the Release bit-set, so it can never be reordered
@@ -2052,16 +2089,23 @@ impl<S: Scheduler> DepGraph<S> {
     /// Idle → OneShard → ShardAndGrow → OneShard → Idle; `grow_dirty` only
     /// accepts `&GrowGuard`.
     pub fn allocate_node_index(&self, class: ContentClass) -> DepNodeIndex {
-        // `fetch_add` wraps at u32::MAX: a wrapped index would alias a live
-        // node (node_to_key overwrite, shared fingerprints/edges).  2^32
-        // nodes is far beyond any real session — fail loudly instead of
-        // corrupting.
-        let prev = self.next_index.fetch_add(1, Ordering::Relaxed);
-        assert!(
-            prev != u32::MAX,
-            "DepNodeIndex address space exhausted ({} nodes allocated)",
-            prev as u64 + 1,
-        );
+        // `checked_add` inside `fetch_update`, NOT `fetch_add`: the old
+        // shape wrapped the counter to 0 BEFORE the assert fired, so a
+        // caller that caught the panic would keep allocating from
+        // `DepNodeIndex(0)` — the `DefaultCache` sentinel for "no node"
+        // (index 0 is never allocated: the counter starts at 1) — and
+        // alias every live slot.  On exhaustion `fetch_update` leaves the
+        // counter SATURATED at `u32::MAX`, so every later call panics the
+        // same way instead of handing out index 0.  2^32 nodes is far
+        // beyond any real session — fail loudly, but fail closed.
+        let prev = self
+            .next_index
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                cur.checked_add(1)
+            })
+            .unwrap_or_else(|cur| {
+                panic!("DepNodeIndex address space exhausted (next_index = {cur})")
+            });
         let idx = DepNodeIndex(prev);
         let slot = slot_of(idx);
         let (_, _t) = self.with_shard_and_grow(shard_of(idx), self.ticket(), |shard, growth| {
@@ -2569,24 +2613,24 @@ impl<S: Scheduler> DepGraph<S> {
                         // epoch-based and otherwise blind to value changes
                         // that arrive without a mark.
                         self.bump_epoch(node);
-                // Perf item 1: the fan-out is O(readers) x 4–6
-                // atomic RMWs, and it used to run here — under THIS
-                // NODE'S SHARD WRITE LOCK, which every reader's own
-                // finish (`flush_rev_edges` → `with_shard_w` on the
-                // read's shard) and every verifier of the node must
-                // take.  A popular node's republish therefore
-                // serialized the whole graph behind its own
-                // invalidation.  `mark_dirty` is lock-free (dirty
-                // bitmap + `rev` counters + generation bump), so the
-                // marks only need the READER LIST, not the lock:
-                // clone it into a POOLED buffer (`FanoutBuf`) and mark below,
-                // after the section
-                // releases.  The pool matters precisely here: the
-                // buffer is FILLED under this lock, and an inline
-                // `SmallVec` heap-allocates as soon as the node has
-                // more than four direct readers — a malloc inside the
-                // critical section, on the tail-latency path of the
-                // hottest nodes.
+                        // Perf item 1: the fan-out is O(readers) x 4–6
+                        // atomic RMWs, and it used to run here — under THIS
+                        // NODE'S SHARD WRITE LOCK, which every reader's own
+                        // finish (`flush_rev_edges` → `with_shard_w` on the
+                        // read's shard) and every verifier of the node must
+                        // take.  A popular node's republish therefore
+                        // serialized the whole graph behind its own
+                        // invalidation.  `mark_dirty` is lock-free (dirty
+                        // bitmap + `rev` counters + generation bump), so the
+                        // marks only need the READER LIST, not the lock:
+                        // clone it into a POOLED buffer (`FanoutBuf`) and mark below,
+                        // after the section
+                        // releases.  The pool matters precisely here: the
+                        // buffer is FILLED under this lock, and an inline
+                        // `SmallVec` heap-allocates as soon as the node has
+                        // more than four direct readers — a malloc inside the
+                        // critical section, on the tail-latency path of the
+                        // hottest nodes.
                         //
                         // Soundness of the move, in the order a reader
                         // checking it would want:
@@ -3043,9 +3087,23 @@ impl<S: Scheduler> DepGraph<S> {
         // can be stale).
         let _tw_grow = sync_order::Acquired::acquire(sync_order::Fam::GrowLock, "reset.grow");
         let _growth = self.grow_lock.lock();
-        // Dirty first, epochs after: the safe transient here is
-        // `dirty.len() < epochs.len()` — which is exactly the conservative
-        // skew (the comparison is the flipped form of grow_dirty's).
+        // Store order carries no safety weight HERE: reset runs under
+        // `&Quiesced`, so no mark, capture or verifier can observe the
+        // window between the two stores.  (grow_dirty's order DOES matter —
+        // there a concurrent allocator can mark immediately.)
+        //
+        // The RESTING state is deliberately asymmetric: dirty is restored
+        // to `DIRTY_INIT_BLOCKS` (64 blocks = 262144 nodes) while epochs
+        // goes back to `EPOCH_INIT_BLOCKS` (4 blocks = 16384 nodes), so
+        // `dirty.len() > epochs.len()` until the first allocation past
+        // block 3 grows both.  That is safe because the invariant is per
+        // ALLOCATED node, not a global length order: `next_index` restarts
+        // at 1, no node exists yet, and `allocate_node_index` calls
+        // `grow_dirty(idx)`, whose early return requires BOTH tables to
+        // cover `idx`.  The extra dirty blocks cover only indices that
+        // were never allocated, which no valid caller can mark.
+        // Do NOT "fix" this by restoring 64 epoch blocks: that is the
+        // 2 MiB-per-`clear_all` cost `EPOCH_INIT_BLOCKS` exists to avoid.
         self.dirty.store(Arc::new(
             (0..DIRTY_INIT_BLOCKS).map(|_| zero_block()).collect(),
         ));
@@ -3057,10 +3115,12 @@ impl<S: Scheduler> DepGraph<S> {
         // dirty bitmap.  `EPOCH_INIT_BLOCKS`, not `DIRTY_INIT_BLOCKS`: an
         // epoch block is 32 KiB against a dirty block's 512 bytes, so
         // sizing the head start together cost 2 MiB per `clear_all`.
-        // Growth re-syncs the pair (`grow_dirty` now checks BOTH tables
-        // before its early return, so the epoch table can never be left
-        // short — which would be the unsafe skew: a missing epoch word
-        // makes `bump_epoch` drop the bump and the generation with it).
+        // Growth re-syncs the pair (`grow_dirty` checks BOTH tables before
+        // its early return, so the epoch table can never be left short for
+        // an ALLOCATED node — a missing epoch word makes `bump_epoch` drop
+        // the epoch bump while the dirty bit and the `dirty_generation`
+        // bump still happen, so the finish-side epoch re-check would
+        // compare 0 against 0 and miss the mark).
         self.epochs.store(Arc::new(
             (0..EPOCH_INIT_BLOCKS).map(|_| zero_epoch_block()).collect(),
         ));
@@ -4126,7 +4186,8 @@ mod tests {
         // Debug panics (the pairing guard's loud mode); release skips.
         // Either way the edge must not be recorded.
         #[cfg(debug_assertions)]
-        r.err().expect("debug builds must panic on a cross-system edge");
+        r.err()
+            .expect("debug builds must panic on a cross-system edge");
         #[cfg(not(debug_assertions))]
         r.expect("release builds skip, never panic");
         let after = super::cross_system_skip_count();
@@ -4136,8 +4197,9 @@ mod tests {
         );
     }
 
-    /// A graph must never be left with the dirty table LONGER than the
-    /// epoch table (safety side of `EPOCH_INIT_BLOCKS`).
+    /// Every ALLOCATED node must have an epoch word — the precise form of
+    /// the "epoch table never lags" invariant (safety side of
+    /// `EPOCH_INIT_BLOCKS`).
     ///
     /// The epoch table's head start is deliberately smaller than the dirty
     /// table's (an epoch block is 32 KiB, a dirty block 512 bytes), so the
@@ -4146,15 +4208,24 @@ mod tests {
     /// boundary but not the dirty one could allocate nodes whose dirty
     /// block exists while their EPOCH BLOCK DOES NOT.  That is the unsafe
     /// skew: `mark_dirty` would find the bit, `bump_epoch` would find no
-    /// word and silently drop the bump — while still taking the
-    /// `dirty_generation` path — so a finish-side epoch re-check comparing
-    /// `epoch_of(node)` against a captured value would see 0 vs 0 and
-    /// conclude "unchanged".
+    /// word and silently drop the epoch bump (the bit-set and the
+    /// `dirty_generation` bump still happen), so a finish-side epoch
+    /// re-check comparing `epoch_of(node)` against a captured value would
+    /// see 0 vs 0 and conclude "unchanged".
+    ///
+    /// The invariant is PER NODE, not a global length order: after `reset`
+    /// the dirty table is deliberately LONGER than the epoch table while no
+    /// node is allocated (see `reset`), and that is safe.  On a graph that
+    /// has only ever grown — this test — the grow path also happens to keep
+    /// `dirty.len() <= epochs.len()`; that assertion pins the grow-path
+    /// shape, while the mark of the LAST node pins the invariant that
+    /// actually matters.  `reset_resting_skew_is_benign_for_allocated_nodes`
+    /// covers the post-reset side.
     ///
     /// Allocates past `EPOCH_INIT_BLOCKS` (well inside `DIRTY_INIT_BLOCKS`)
     /// and then proves a mark of the LAST node really does bump its epoch.
     #[test]
-    fn epoch_table_never_lags_the_dirty_table() {
+    fn epoch_table_covers_every_allocated_node() {
         let dg = DepGraph::new(Arc::new(NoOpScheduler));
         let n = super::EPOCH_INIT_BLOCKS * 4096 + 8;
         let nodes: Vec<DepNodeIndex> = (0..n)
@@ -4162,10 +4233,12 @@ mod tests {
             .collect();
         let late = *nodes.last().expect("nonempty");
 
-        // The safe direction is `dirty.len() <= epochs.len()`.
+        // Grow-path shape (a never-reset graph): the epoch table is not
+        // the shorter one.  This is NOT the safety invariant — see the
+        // test doc.
         assert!(
             dg.dirty_snapshot().len() <= dg.epochs_snapshot().len(),
-            "the epoch table must never be the shorter one: dirty={} epochs={}",
+            "grow left the epoch table shorter than the dirty table: dirty={} epochs={}",
             dg.dirty_snapshot().len(),
             dg.epochs_snapshot().len(),
         );
@@ -4184,6 +4257,62 @@ mod tests {
             1,
             "mark_dirty must bump the epoch of a node in the last-grown \
              block — 0 means the bump was dropped for a missing block"
+        );
+    }
+
+    /// Post-`reset` resting state: the dirty table is deliberately LONGER
+    /// than the epoch table (`DIRTY_INIT_BLOCKS` vs `EPOCH_INIT_BLOCKS`),
+    /// which is safe BECAUSE the invariant is per allocated node, not a
+    /// global length order.
+    ///
+    /// This is the trap the old wording hid: `dirty.len() <= epochs.len()`
+    /// does not hold at rest, but every index the dirty table covers past
+    /// the epoch table is unallocated (`next_index` restarts at 1), so no
+    /// valid caller can mark one.  The test pins BOTH halves: the exact
+    /// resting lengths (so "unifying" the two constants trips here) and
+    /// the per-node guarantee across the epoch head-start boundary.
+    #[test]
+    fn reset_resting_skew_is_benign_for_allocated_nodes() {
+        let dg = DepGraph::new(Arc::new(NoOpScheduler));
+        // Grow the pre-reset tables past the epoch head start, so `reset`
+        // demonstrably SHRINKS them back to the resting shape instead of
+        // merely leaving a fresh graph untouched.
+        for _ in 0..(EPOCH_INIT_BLOCKS * 4096 + 8) {
+            let _ = dg.allocate_node_index(ContentClass::SEMANTIC);
+        }
+        dg.reset(&q());
+
+        // Resting state: dirty is the longer table, by design.
+        assert_eq!(dg.dirty_snapshot().len(), DIRTY_INIT_BLOCKS);
+        assert_eq!(dg.epochs_snapshot().len(), EPOCH_INIT_BLOCKS);
+        assert!(dg.dirty_snapshot().len() > dg.epochs_snapshot().len());
+
+        // No node exists yet, so the skew covers only unallocated indices.
+        // The FIRST post-reset node is inside the epoch head start: its
+        // mark must bump the epoch normally.
+        let first = dg.allocate_node_index(ContentClass::SEMANTIC);
+        assert_eq!(first.0, 1, "reset must restart the allocator at 1");
+        assert_eq!(dg.epoch_of(first), 0);
+        dg.mark_dirty(first);
+        assert_eq!(dg.epoch_of(first), 1, "first post-reset mark must bump");
+
+        // The node just past the epoch head start forces the joint grow;
+        // after it, the epoch table must cover the node it handed out.
+        for _ in 0..(EPOCH_INIT_BLOCKS * 4096 - 1) {
+            let _ = dg.allocate_node_index(ContentClass::SEMANTIC);
+        }
+        let late = dg.allocate_node_index(ContentClass::SEMANTIC);
+        assert!(late.0 as usize > EPOCH_INIT_BLOCKS * 4096);
+        assert!(
+            dg.epochs_snapshot().len() > EPOCH_INIT_BLOCKS,
+            "allocating past the epoch head start must grow the epoch table"
+        );
+        assert_eq!(dg.epoch_of(late), 0);
+        dg.mark_dirty(late);
+        assert_eq!(
+            dg.epoch_of(late),
+            1,
+            "mark_dirty must bump a post-reset node past the epoch head start"
         );
     }
 
@@ -4240,14 +4369,14 @@ mod tests {
             vec![],
             vec![0],
             vec![5],
-            vec![5, 70],                       // 5, 6 — already sorted
-            vec![70, 5],                       // 6, 5 — swapped
-            vec![7, 71, 135, 9, 3],            // all shard 7 — sorted, dup shards
-            vec![9, 70, 3, 135, 5],            // 9, 6, 3, 7, 5 — small, unsorted
-            vec![1, 2, 130, 3, 8, 4],          // 1, 2, 2, 3, 8, 4 — equal shards
-            vec![7, 8, 1, 2, 130, 3],          // 7, 8, 1, 2, 2, 3 — equal shards
-            (0..40).map(|i| i * 64 + i).collect(), // large, already sorted
-            (0..40).rev().map(|i| i * 64 + i).collect(), // large, reversed
+            vec![5, 70],                                       // 5, 6 — already sorted
+            vec![70, 5],                                       // 6, 5 — swapped
+            vec![7, 71, 135, 9, 3],                            // all shard 7 — sorted, dup shards
+            vec![9, 70, 3, 135, 5],                            // 9, 6, 3, 7, 5 — small, unsorted
+            vec![1, 2, 130, 3, 8, 4],                          // 1, 2, 2, 3, 8, 4 — equal shards
+            vec![7, 8, 1, 2, 130, 3],                          // 7, 8, 1, 2, 2, 3 — equal shards
+            (0..40).map(|i| i * 64 + i).collect(),             // large, already sorted
+            (0..40).rev().map(|i| i * 64 + i).collect(),       // large, reversed
             (0..40).map(|i| ((i * 7) % 5) * 64 + i).collect(), // large, cycling shards
         ];
         for pat in patterns {
@@ -4303,10 +4432,8 @@ mod tests {
         // Previous edges: 5, 7, 9.  Current read set: 7, 5, 11 — note it
         // arrives in first-read order (7 BEFORE 5), so the replacement is
         // verbatim, not sorted and not reordered.
-        let mut list: SmallVec<[DepNodeIndex; 4]> = [5u32, 7, 9]
-            .into_iter()
-            .map(DepNodeIndex)
-            .collect();
+        let mut list: SmallVec<[DepNodeIndex; 4]> =
+            [5u32, 7, 9].into_iter().map(DepNodeIndex).collect();
         let reads = [7u32, 5, 11].map(DepNodeIndex);
         let removed = super::reconcile_forward_edges(&mut list, &reads);
         assert_eq!(
@@ -4321,7 +4448,11 @@ mod tests {
         );
         // Idempotent: reconciling the same read set again is a no-op.
         let removed2 = super::reconcile_forward_edges(&mut list, &reads);
-        assert_eq!(removed2.to_vec(), vec![], "second reconciliation is a no-op");
+        assert_eq!(
+            removed2.to_vec(),
+            vec![],
+            "second reconciliation is a no-op"
+        );
     }
 
     /// F(dur-prop): the reverse-edge cascade terminates on a cycle among

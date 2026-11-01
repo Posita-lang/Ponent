@@ -3,6 +3,7 @@
 use super::*;
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
+use crate::diagnostics::ErrCode;
 use crate::lexer::Token;
 
 impl<'src, 'input> Parser<'src, 'input> {
@@ -13,21 +14,21 @@ impl<'src, 'input> Parser<'src, 'input> {
     pub(super) fn check_const_arg(&mut self) -> bool {
         if matches!(
             self.peek(),
-            Ok(Token::True)
-                | Ok(Token::False)
-                | Ok(Token::CharLiteral(_))
-                | Ok(Token::ByteCharLiteral(_))
-                | Ok(Token::StringLiteral(_))
-                | Ok(Token::ByteStringLiteral(_))
-                | Ok(Token::FloatLiteral(_))
-                | Ok(Token::Minus)
-                | Ok(Token::LBrace)
-                | Ok(Token::If)
-                | Ok(Token::Match)
+            Some(Token::True)
+                | Some(Token::False)
+                | Some(Token::CharLiteral(_))
+                | Some(Token::ByteCharLiteral(_))
+                | Some(Token::StringLiteral(_))
+                | Some(Token::ByteStringLiteral(_))
+                | Some(Token::FloatLiteral(_))
+                | Some(Token::Minus)
+                | Some(Token::LBrace)
+                | Some(Token::If)
+                | Some(Token::Match)
         ) {
             return true;
         }
-        matches!(self.peek(), Ok(Token::Ident(_)))
+        matches!(self.peek(), Some(Token::Ident(_)))
             && matches!(self.peek_next(), Some(Token::LParen))
     }
 
@@ -36,24 +37,28 @@ impl<'src, 'input> Parser<'src, 'input> {
     /// Per the Posita syntax spec: complex expressions MUST be wrapped in `{ }`;
     /// only simple literals and identifier paths may appear unbraced.
     /// Analogous to rustc's `parse_const_arg` (rustc_parse/src/parser/path.rs).
-    pub(super) fn parse_const_arg(&mut self, bump: &'input bumpalo::Bump) -> Result<AnonConst<'input>, Diagnostic<'src>> {
+    pub(super) fn parse_const_arg(
+        &mut self,
+        bump: &'input bumpalo::Bump,
+    ) -> Result<AnonConst<'input>, Diagnostic<'src>> {
         let start = self.span().start;
-        let value = if matches!(self.peek(), Ok(Token::LBrace)) {
-            self.advance().ok();
+        let value = if matches!(self.peek(), Some(Token::LBrace)) {
+            self.advance();
             let body = self.parse_block(bump)?;
             self.expect(Token::RBrace)?;
             let end = self.span().end;
             Expr::Block(body, Span::new(self.file_id, start, end))
         } else {
-            let expr =
-                self.with_restrictions(ParseRestrictions::NO_COMPARISON, |this| this.parse_expr(bump))?;
+            let expr = self.with_restrictions(ParseRestrictions::NO_COMPARISON, |this| {
+                this.parse_expr(bump)
+            })?;
             if !Self::is_simple_const_expr(&expr) {
                 let span = expr.span();
                 let end = self.span().end;
                 return Err(Diagnostic::error(
                     "complex const generic argument must be wrapped in `{ }`",
                 )
-                .with_code_str("E004")
+                .with_code_str(ErrCode::E004)
                 .with_help(
                     "wrap the expression in braces — e.g. `<{ N + 1 }>` instead of `<N + 1>`",
                 )

@@ -99,6 +99,8 @@ impl SourceFile {
 /// Slot 0 is a pre-registered dummy file (empty, name `"<dummy>"`)
 /// backing [`FileId::DUMMY`], so [`SourceMap::file`] is infallible:
 /// every valid `FileId` — including the sentinel — has an entry.
+/// [`FileId::DUMMY`] is not a vector index; it is mapped to slot 0.
+/// Real ids start at [`FileId::FIRST_REAL`] and equal their vector index.
 #[derive(Debug, Clone)]
 pub struct SourceMap {
     files: Vec<SourceFile>,
@@ -121,7 +123,7 @@ impl SourceMap {
     /// Register a file and return its [`FileId`].
     ///
     /// Ids are assigned in load order starting at [`FileId::FIRST_REAL`]
-    /// (the dummy occupies id 0, so a file's id equals its vector index).
+    /// (the dummy occupies slot 0, so a file's id equals its vector index).
     pub fn add_file(
         &mut self,
         name: impl Into<String>,
@@ -129,25 +131,32 @@ impl SourceMap {
     ) -> Result<FileId, SourceMapError> {
         let source = source.into();
         if source.len() > MAX_FILE_LEN {
-            return Err(SourceMapError::FileTooLarge {
-                len: source.len(),
-            });
+            return Err(SourceMapError::FileTooLarge { len: source.len() });
         }
         // The dummy keeps `files.len() >= 1`, so the raw id is `>= 1`
         // (i.e. `>= FIRST_REAL`). A `u32` index would require 4 billion
         // registered files — far beyond addressable memory — but fall
-        // back to an error rather than a truncating cast.
+        // back to an error rather than a truncating cast.  `u32::MAX`
+        // is the non-index sentinel (`FileId::DUMMY`), so reserve it too.
         let raw = u32::try_from(self.files.len()).map_err(|_| SourceMapError::TooManyFiles)?;
+        if raw == FileId::DUMMY.as_u32() {
+            return Err(SourceMapError::TooManyFiles);
+        }
         self.files.push(SourceFile::new(name.into(), source));
         Ok(FileId::from_raw(raw))
     }
 
     /// The file registered under `id`.
     ///
-    /// Infallible: slot 0 holds the dummy file, and every other id is
-    /// only ever produced by [`SourceMap::add_file`].
+    /// Infallible: the sentinel maps to the dummy file in slot 0, and every
+    /// other id is only ever produced by [`SourceMap::add_file`].
     pub fn file(&self, id: FileId) -> &SourceFile {
-        &self.files[id.as_u32() as usize]
+        if id == FileId::DUMMY {
+            return &self.files[0];
+        }
+        self.files
+            .get(id.as_u32() as usize)
+            .unwrap_or(&self.files[0])
     }
 
     /// How many files are registered (including the dummy).

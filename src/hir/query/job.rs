@@ -28,19 +28,65 @@ impl QueryJobId {
     }
 }
 
+/// Identity of the currently executing unit of work: an OS thread in a
+/// normal build, a shuttle TASK under feature = "shuttle".
+///
+/// Shuttle multiplexes every task onto ONE OS thread, so
+/// std::thread::current().id() cannot distinguish two tasks that
+/// interleave at a schedule point.  `QueryJob::owner` and the wait-graph
+/// keys need a per-TASK identity, so they use this type and
+/// [`current_exec_id`].  (The deferred-mutation partition stays keyed by
+/// OS thread id on purpose — its coalescing is load-bearing; see
+/// `QuerySystem::deferred`.)
+///
+/// ### Known limitation: the rest of the per-thread state is still
+/// ### per-OS-thread
+///
+/// The dep-graph task stack (TASK_STACK), the per-query active partitions
+/// (QueryVTable::active), SESSION and the sync_order::HELD tripwire are
+/// plain thread_local! (see the "task-multiplexed TLS under shuttle" note
+/// in sync_order.rs).  A cross-task same-key get under shuttle therefore
+/// still looks like a same-thread cycle to validate_enter (it reads the
+/// shared active partition BEFORE acquire_key_slot's owner == me arm),
+/// and the task stack is shared across parked tasks.  This type removes
+/// the *identity* conflation only; making the whole model per-task is the
+/// larger TLS change that note describes.  Until then, do not write a
+/// shuttle test that expects two tasks to get the same TRACKED key
+/// concurrently (d5 sidesteps it with eval_always, which skips active
+/// keys entirely).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExecId(
+    #[cfg(not(feature = "shuttle"))] std::thread::ThreadId,
+    #[cfg(feature = "shuttle")] shuttle::thread::ThreadId,
+);
+
+/// The current task's [ExecId] -- see its doc for why this is not
+/// std::thread::current().id() under shuttle.
+#[inline]
+pub fn current_exec_id() -> ExecId {
+    #[cfg(not(feature = "shuttle"))]
+    {
+        ExecId(std::thread::current().id())
+    }
+    #[cfg(feature = "shuttle")]
+    {
+        ExecId(shuttle::thread::current().id())
+    }
+}
+
 /// Represents an active query job.
 ///
-/// When a query starts executing on one thread, a `QueryJob` is created
-/// and recorded in the `ActiveKeyStatus`.  If another thread requests the
+/// When a query starts executing on one task, a `QueryJob` is created
+/// and recorded in the `ActiveKeyStatus`.  If another task requests the
 /// same key, it will find the `QueryJob` and call `wait_on()` to block
 /// until the result is ready.
 #[derive(Debug, Clone)]
 pub struct QueryJob {
     pub id: QueryJobId,
-    /// The thread computing this job.  Used as a double-safety guard for
-    /// same-thread cycle detection and as the anchor of the
-    /// cross-thread wait graph.
-    pub owner: std::thread::ThreadId,
+    /// The task computing this job.  Used as a double-safety guard for
+    /// same-task cycle detection and as the anchor of the cross-task wait
+    /// graph.
+    pub owner: ExecId,
     /// The latch that other threads can wait on.
     pub latch: QueryLatch,
 }
@@ -49,7 +95,7 @@ impl QueryJob {
     pub fn new() -> Self {
         QueryJob {
             id: QueryJobId::fresh(),
-            owner: std::thread::current().id(),
+            owner: current_exec_id(),
             latch: QueryLatch::new(),
         }
     }

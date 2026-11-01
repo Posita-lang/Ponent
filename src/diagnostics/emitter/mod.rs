@@ -7,25 +7,79 @@
 
 use crate::diagnostics::render::{RenderCtx, Renderer};
 use crate::diagnostics::sink::{DiagnosticSink, MakeSink};
-use crate::diagnostics::{DiagOpts, Diagnostic};
-use smallvec::SmallVec;
+use crate::diagnostics::{DiagFilter, DiagOpts, Diagnostic};
+use crate::smallvec::SmallVec;
+use compact_str::CompactString;
 use std::io;
 
 pub mod stylesheet;
+
+/// Distinct-file set used by the batch summary, shaped for the access
+/// pattern: the overwhelmingly common batch draws from 1–2 files, where a
+/// handful of `eq` checks against a `SmallVec` beat hashing a `CompactString`
+/// and maintaining a bucket array.  Once the distinct-file count crosses the
+/// inline capacity the set spills to an `FxHashSet`, preserving the O(1)
+/// amortized dedup that large multi-file batches need.
+enum FilesSeen {
+    Small(SmallVec<[CompactString; 4]>),
+    Large(rustc_hash::FxHashSet<CompactString>),
+}
+
+impl FilesSeen {
+    fn new() -> Self {
+        FilesSeen::Small(SmallVec::new())
+    }
+
+    fn insert(&mut self, name: &str) {
+        match self {
+            FilesSeen::Small(v) => {
+                if v.iter().any(|x| x.as_str() == name) {
+                    return;
+                }
+                if v.len() < 4 {
+                    v.push(CompactString::from(name));
+                    return;
+                }
+                let mut set: rustc_hash::FxHashSet<CompactString> = v.drain(..).collect();
+                set.insert(CompactString::from(name));
+                *self = FilesSeen::Large(set);
+            }
+            FilesSeen::Large(s) => {
+                if s.contains(name) {
+                    return;
+                }
+                s.insert(CompactString::from(name));
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            FilesSeen::Small(v) => v.len(),
+            FilesSeen::Large(s) => s.len(),
+        }
+    }
+}
 
 /// Composes a renderer with a sink factory and emits batches of diagnostics.
 pub struct Emitter<R, M> {
     renderer: R,
     make_sink: M,
     opts: DiagOpts,
+    /// Filter view built once from `opts` in [`Emitter::new`] and reused by
+    /// every emit path, so a caller looping on [`Emitter::emit`] does not
+    /// rebuild the filter's hash sets per diagnostic.
+    filter: DiagFilter,
 }
 
 impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     pub fn new(renderer: R, make_sink: M, opts: DiagOpts) -> Self {
+        let filter = DiagFilter::from_opts(&opts);
         Self {
             renderer,
             make_sink,
             opts,
+            filter,
         }
     }
 
@@ -36,11 +90,16 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     /// *current* i18n `Lang` right before rendering, so a diagnostic's
     /// language is never frozen at construction time.
     pub fn emit(&mut self, diag: &mut Diagnostic<'_>) -> io::Result<()> {
+        if !self.filter.matches(diag) {
+            return Ok(());
+        }
         diag.humanize();
         let mut sink = self.make_sink.make();
         self.renderer.begin(&mut sink)?;
         let cx = RenderCtx::new(&self.opts, None);
-        sink.write_str(&self.renderer.render(diag, &cx))?;
+        let mut buf = String::new();
+        self.renderer.render_into(diag, &cx, &mut buf);
+        sink.write_str(&buf)?;
         self.renderer.end(&mut sink)?;
         sink.flush()
     }
@@ -118,15 +177,22 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         let mut first = true;
         // Owned names: the batch loop now humanizes (`&mut`) each
         // diagnostic mid-iteration, so the file list cannot hold `&str`
-        // views borrowed from the diagnostics themselves.
-        let mut files: SmallVec<[String; 4]> = SmallVec::new();
+        // views borrowed from the diagnostics themselves.  `FilesSeen`
+        // starts as a `SmallVec` linear scan (1–2 files is the common
+        // case, where a few `eq` checks beat hashing) and spills to an
+        // `FxHashSet` only once the distinct-file count crosses the inline
+        // capacity — preserving the O(1) amortized dedup of large
+        // multi-file batches without taxing the small ones.
+        let mut files = FilesSeen::new();
         let cx = RenderCtx::new(&self.opts, None);
+        let mut buf = String::new();
 
         for diag in iter {
-            let name = diag.file_name();
-            if !files.iter().any(|f| f == name) {
-                files.push(name.to_string());
+            if !self.filter.matches(diag) {
+                continue;
             }
+            let name = diag.file_name();
+            files.insert(name);
             if diag.is_error() {
                 errors += 1;
                 if let Some(limit) = self.opts.max_errors
@@ -171,14 +237,20 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                     sink.write_str(sep)?;
                 }
             }
-            sink.write_str(&self.renderer.render(diag, &cx))?;
+            buf.clear();
+            self.renderer.render_into(diag, &cx, &mut buf);
+            sink.write_str(&buf)?;
         }
 
         if suppressed > 0 {
             sink.write_str(&self.renderer.render_suppressed_note(suppressed))?;
         }
-        if errors > 0 || warnings > 0 {
-            sink.write_str(&self.renderer.render_summary_full(errors, warnings, files.len()))?;
+        if !self.opts.quiet && (errors > 0 || warnings > 0) {
+            sink.write_str(
+                &self
+                    .renderer
+                    .render_summary_full(errors, warnings, files.len()),
+            )?;
         }
 
         self.renderer.end(sink)?;
@@ -190,8 +262,8 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
 mod tests {
     use super::*;
     use crate::ast::{FileId, Span};
-    use crate::diagnostics::sink::{string, StringSink};
     use crate::diagnostics::JsonRenderer;
+    use crate::diagnostics::sink::{StringSink, string};
 
     fn warn_diag() -> Diagnostic<'static> {
         Diagnostic::warning("boom")

@@ -66,9 +66,10 @@ fn check_parse_fails(source: &str) {
 /// the limit.
 #[test]
 fn test_edit_distance_limited_banded() {
-    let mut prev_prev = Vec::new();
-    let mut prev = Vec::new();
-    let mut curr = Vec::new();
+    use smallvec::smallvec;
+    let mut prev_prev: smallvec::SmallVec<[usize; 16]> = smallvec![];
+    let mut prev: smallvec::SmallVec<[usize; 16]> = smallvec![];
+    let mut curr: smallvec::SmallVec<[usize; 16]> = smallvec![];
     // Input/candidate strings are pre-split into `Vec<char>` once by the
     // caller (see `SuggestionBuffers` in recovery.rs).
     let retrun: Vec<char> = "retrun".chars().collect();
@@ -139,7 +140,7 @@ fn test_empty_function() {
     let program = check_parse("def main() { }");
     assert_eq!(program.items.len(), 1);
     match &program.items[0] {
-        Stmt::FunctionDef {
+        Item::FunctionDef {
             name, params, body, ..
         } => {
             assert!(name.eq_str("main"));
@@ -154,7 +155,7 @@ fn test_empty_function() {
 fn test_variable_def() {
     let program = check_parse("def main() { set x = 42; }");
     match &program.items[0] {
-        Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+        Item::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
             Stmt::VariableDef { name, .. } => assert!(name.unwrap().eq_str("x")),
             _ => panic!("expected VariableDef"),
         },
@@ -168,7 +169,7 @@ fn test_variable_def() {
 #[test]
 fn test_range_expr_with_upper_bound() {
     let program = check_parse("def main() { set r = 0..10; }");
-    let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+    let Item::FunctionDef { body, .. } = &program.items[0] else {
         panic!("expected FunctionDef");
     };
     let Stmt::VariableDef { value, .. } = &body.as_ref().unwrap()[0] else {
@@ -190,7 +191,7 @@ fn test_range_expr_with_upper_bound() {
 #[test]
 fn test_range_expr_open_ended() {
     let program = check_parse("def main() { set r = 0..; }");
-    let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+    let Item::FunctionDef { body, .. } = &program.items[0] else {
         panic!("expected FunctionDef");
     };
     let Stmt::VariableDef { value, .. } = &body.as_ref().unwrap()[0] else {
@@ -212,7 +213,7 @@ fn test_range_expr_open_ended() {
 #[test]
 fn test_binary_sub_left_associative() {
     let program = check_parse("def main() -> Int<32> { set r = a - b - c; return 0; }");
-    let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+    let Item::FunctionDef { body, .. } = &program.items[0] else {
         panic!("expected FunctionDef");
     };
     let Stmt::VariableDef { value, .. } = &body.as_ref().unwrap()[0] else {
@@ -242,7 +243,7 @@ fn test_binary_sub_left_associative() {
 #[test]
 fn test_binary_div_left_associative() {
     let program = check_parse("def main() -> Int<32> { set r = a / b / c; return 0; }");
-    let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+    let Item::FunctionDef { body, .. } = &program.items[0] else {
         panic!("expected FunctionDef");
     };
     let Stmt::VariableDef { value, .. } = &body.as_ref().unwrap()[0] else {
@@ -270,7 +271,7 @@ fn test_binary_div_left_associative() {
 fn test_if_stmt() {
     let program = check_parse("def main() { if true { } }");
     match &program.items[0] {
-        Stmt::FunctionDef { body, .. } => {
+        Item::FunctionDef { body, .. } => {
             assert!(matches!(body.as_ref().unwrap()[0], Stmt::If { .. }));
         }
         _ => panic!("expected FunctionDef"),
@@ -281,7 +282,7 @@ fn test_if_stmt() {
 fn test_scope_cleanup_with_at() {
     let program = check_parse("def main() { scope_cleanup @close_file { } }");
     match &program.items[0] {
-        Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+        Item::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
             Stmt::ScopeCleanup {
                 name,
                 body: _,
@@ -372,7 +373,7 @@ fn test_suffixed_literal() {
 fn test_suffixed_literal_desugars_to_annotation() {
     use crate::ast::{GenericArg, IntLit};
     let program = check_parse("def main() { set x = 42i32; }");
-    let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+    let Item::FunctionDef { body, .. } = &program.items[0] else {
         panic!("expected FunctionDef");
     };
     let Stmt::VariableDef { value, .. } = &body.as_ref().unwrap()[0] else {
@@ -389,7 +390,7 @@ fn test_suffixed_literal_desugars_to_annotation() {
         panic!("expected a generic `Int<32>` type");
     };
     assert!(matches!(base, Type::Path(p, _) if p.len() == 1 && p[0].eq_str("Int")));
-    let [GenericArg::Positional(Type::Literal(w, _))] = args.as_slice() else {
+    let [GenericArg::Positional(Type::Literal(w, _))] = args else {
         panic!("expected one positional width argument");
     };
     assert!(matches!(
@@ -406,7 +407,7 @@ fn test_suffixed_literal_desugars_to_annotation() {
 fn test_suffixed_literal_unsigned_and_width_passthrough() {
     use crate::ast::{GenericArg, IntLit};
     let program = check_parse("def main() { set a = 0xFFu8; set b = 42i999; }");
-    let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+    let Item::FunctionDef { body, .. } = &program.items[0] else {
         panic!("expected FunctionDef");
     };
     let body = body.as_ref().unwrap();
@@ -428,7 +429,7 @@ fn test_suffixed_literal_unsigned_and_width_passthrough() {
         let Type::Path(p, _) = base else {
             panic!("expected Path base");
         };
-        let [GenericArg::Positional(Type::Literal(w, _))] = args.as_slice() else {
+        let [GenericArg::Positional(Type::Literal(w, _))] = args else {
             panic!("expected one positional width argument");
         };
         let Expr::Literal(Literal::Int(IntLit::Small(width)), _) = w else {
@@ -449,7 +450,7 @@ fn test_suffixed_literal_u128_range_becomes_large() {
     use crate::ast::{GenericArg, IntLit};
     let program =
         check_parse("def main() { set x = 340282366920938463463374607431768211455u128; }");
-    let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+    let Item::FunctionDef { body, .. } = &program.items[0] else {
         panic!("expected FunctionDef");
     };
     let Stmt::VariableDef { value, .. } = &body.as_ref().unwrap()[0] else {
@@ -466,7 +467,7 @@ fn test_suffixed_literal_u128_range_becomes_large() {
         panic!("expected a generic `UInt<128>` type");
     };
     assert!(matches!(base, Type::Path(p, _) if p.len() == 1 && p[0].eq_str("UInt")));
-    let [GenericArg::Positional(Type::Literal(w, _))] = args.as_slice() else {
+    let [GenericArg::Positional(Type::Literal(w, _))] = args else {
         panic!("expected one positional width argument");
     };
     assert!(matches!(
@@ -652,7 +653,7 @@ fn test_peek_next_pending_empty() {
     assert_eq!(p.peek_next(), Some(&Token::Plus));
     // peek() must still return the FIRST token (peek_next is a pure
     // lookahead — it must not have consumed `Ident(a)`).
-    assert!(matches!(p.peek(), Ok(Token::Ident(_))));
+    assert!(matches!(p.peek(), Some(Token::Ident(_))));
 }
 
 /// One pending token (`Gt`, as after a `>>` split): `peek()` will pop
@@ -663,7 +664,7 @@ fn test_peek_next_pending_one() {
     p.pending.push(Token::Gt);
     assert_eq!(p.peek_next(), Some(&Token::Ident(Symbol::intern("a"))));
     // peek() returns the pending token, not the stream head.
-    assert!(matches!(p.peek(), Ok(Token::Gt)));
+    assert!(matches!(p.peek(), Some(Token::Gt)));
 }
 
 /// Two pending tokens (`[Gt, Lt]`, stack top `Lt`): `peek()` will pop
@@ -675,7 +676,7 @@ fn test_peek_next_pending_two() {
     p.pending.push(Token::Lt);
     assert_eq!(p.peek_next(), Some(&Token::Gt));
     // peek() returns the pending stack top `Lt`.
-    assert!(matches!(p.peek(), Ok(Token::Lt)));
+    assert!(matches!(p.peek(), Some(Token::Lt)));
 }
 
 #[test]
@@ -689,7 +690,7 @@ fn test_comptime_function_def() {
     let program = check_parse("comptime def eval() -> Int<32> { return 42; }");
     assert_eq!(program.items.len(), 1);
     match &program.items[0] {
-        Stmt::FunctionDef {
+        Item::FunctionDef {
             is_comptime, name, ..
         } => {
             assert!(is_comptime);
@@ -704,7 +705,7 @@ fn test_async_function_def() {
     let program = check_parse("async def fetch() -> Data { }");
     assert_eq!(program.items.len(), 1);
     match &program.items[0] {
-        Stmt::FunctionDef { is_async, name, .. } => {
+        Item::FunctionDef { is_async, name, .. } => {
             assert!(is_async);
             assert!(name.eq_str("fetch"));
         }
@@ -718,7 +719,7 @@ fn test_trait_def() {
     let program = check_parse(src);
     assert_eq!(program.items.len(), 1);
     match &program.items[0] {
-        Stmt::TraitDef {
+        Item::TraitDef {
             name,
             methods,
             associated_types,
@@ -739,7 +740,7 @@ fn test_constraint() {
     let program = check_parse(src);
     assert_eq!(program.items.len(), 1);
     match &program.items[0] {
-        Stmt::Constraint {
+        Item::Constraint {
             name, predicates, ..
         } => {
             assert!(name.eq_str("MyConstraint"));
@@ -766,7 +767,7 @@ fn test_constraint_with_generic_params() {
     let program = check_parse(src);
     assert_eq!(program.items.len(), 1);
     match &program.items[0] {
-        Stmt::Constraint {
+        Item::Constraint {
             name,
             params,
             predicates,
@@ -800,7 +801,7 @@ fn test_where_tuple_subject() {
     let program = check_parse(src);
     assert_eq!(program.items.len(), 1);
     match &program.items[0] {
-        Stmt::FunctionDef { where_clause, .. } => {
+        Item::FunctionDef { where_clause, .. } => {
             let wc = where_clause
                 .as_ref()
                 .expect("where clause should be parsed");
@@ -855,7 +856,7 @@ fn test_ieee_keyword_attribute_name() {
     let src = "@ieee\ndef f() { }";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::FunctionDef { attributes, .. } => {
+        Item::FunctionDef { attributes, .. } => {
             assert_eq!(attributes.len(), 1);
             assert!(
                 attributes[0].name.eq_str("ieee"),
@@ -873,7 +874,7 @@ fn test_type_alias_with_overflow() {
     let program = check_parse(src);
     assert_eq!(program.items.len(), 1);
     match &program.items[0] {
-        Stmt::TypeDef {
+        Item::TypeDef {
             definition: TypeDefinition::Alias(_, modifiers),
             ..
         } => {
@@ -892,7 +893,7 @@ fn test_type_alias_with_default() {
     let src = "type MyInt = Int<32> with default = 42;";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::TypeDef {
+        Item::TypeDef {
             definition: TypeDefinition::Alias(_, modifiers),
             ..
         } => {
@@ -908,7 +909,7 @@ fn test_type_alias_with_no_default() {
     let src = "type MyInt = Int<32> with no_default;";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::TypeDef {
+        Item::TypeDef {
             definition: TypeDefinition::Alias(_, modifiers),
             ..
         } => {
@@ -924,7 +925,7 @@ fn test_ensures_on_ok() {
     let src = "def div(a: Int<32>, b: Int<32>) -> Int<32> requires b != 0 ensures on Ok(result) => result * b == a { return a / b; }";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::FunctionDef { contracts, .. } => {
+        Item::FunctionDef { contracts, .. } => {
             assert_eq!(contracts.len(), 2);
             match &contracts[1] {
                 Contract::Ensures { target, .. } => {
@@ -942,7 +943,7 @@ fn test_deprecated_attribute() {
     let src = "@deprecated(\"use new_method\") def old_fn() { }";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::FunctionDef { attributes, .. } => {
+        Item::FunctionDef { attributes, .. } => {
             assert_eq!(attributes.len(), 1);
             assert!(attributes[0].name.eq_str("deprecated"));
         }
@@ -955,7 +956,7 @@ fn test_cfg_attribute() {
     let src = "@cfg(target_os = \"linux\") def linux_only() { }";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::FunctionDef { attributes, .. } => {
+        Item::FunctionDef { attributes, .. } => {
             assert_eq!(attributes.len(), 1);
             assert!(attributes[0].name.eq_str("cfg"));
         }
@@ -970,7 +971,7 @@ fn test_module_doc_comment() {
     // Module docs (`//!`) belong to the doc side channel, NOT to any
     // item's `doc` field — the grammar stream must stay doc-free.
     match &program.items[0] {
-        Stmt::FunctionDef { doc, .. } => {
+        Item::FunctionDef { doc, .. } => {
             assert_eq!(doc.as_deref(), None);
         }
         _ => panic!("expected FunctionDef"),
@@ -988,7 +989,7 @@ fn test_item_doc_comment_via_doc_channel() {
     // pulled back into the item's `doc` field by anchor — the grammar
     // stream itself must contain no doc tokens.
     match &program.items[0] {
-        Stmt::FunctionDef { doc, .. } => {
+        Item::FunctionDef { doc, .. } => {
             assert_eq!(doc.as_deref(), Some("@spec A spec\nmore"));
         }
         _ => panic!("expected FunctionDef"),
@@ -1003,7 +1004,7 @@ fn test_comptime_block() {
     let program = check_parse(src);
     assert_eq!(program.items.len(), 1);
     match &program.items[0] {
-        Stmt::ComptimeBlock { .. } => {}
+        Item::ComptimeBlock { .. } => {}
         _ => panic!("expected ComptimeBlock"),
     }
 }
@@ -1057,7 +1058,7 @@ fn test_as_bitcast() {
     let program = check_parse(src);
     assert_eq!(program.items.len(), 1);
     match &program.items[0] {
-        Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+        Item::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
             Stmt::VariableDef {
                 value: Some(Expr::Cast { safe, .. }),
                 ..
@@ -1074,7 +1075,7 @@ fn test_as_bitcast() {
 fn test_scope_cleanup_with_propagates() {
     let program = check_parse("def main() { scope_cleanup @close_file propagates { } }");
     match &program.items[0] {
-        Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+        Item::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
             Stmt::ScopeCleanup {
                 propagates,
                 overrides,
@@ -1093,7 +1094,7 @@ fn test_scope_cleanup_with_propagates() {
 fn test_scope_cleanup_with_propagates_overrides() {
     let program = check_parse("def main() { scope_cleanup @close_file propagates overrides { } }");
     match &program.items[0] {
-        Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+        Item::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
             Stmt::ScopeCleanup {
                 propagates,
                 overrides,
@@ -1118,7 +1119,7 @@ fn test_ensures_on_err() {
     let src = "def f() -> Result<Int<32>, Err> ensures on Err(e) => e != 0 { return Err(1); }";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::FunctionDef { contracts, .. } => {
+        Item::FunctionDef { contracts, .. } => {
             assert_eq!(contracts.len(), 1);
             match &contracts[0] {
                 Contract::Ensures { target, .. } => {
@@ -1136,7 +1137,7 @@ fn test_type_union_alias() {
     let src = "type AppError = IoError | ParseError;";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::TypeDef {
+        Item::TypeDef {
             definition: TypeDefinition::Alias(ty, _),
             ..
         } => {
@@ -1151,7 +1152,7 @@ fn test_type_keyword_as_literal() {
     let src = "comptime def foo() -> type { return 42; }";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::FunctionDef { return_type, .. } => {
+        Item::FunctionDef { return_type, .. } => {
             let rt = return_type.as_ref().expect("return_type should be Some");
             assert!(matches!(rt, Type::Path(path, _) if path.len() == 1 && path[0].eq_str("type")));
         }
@@ -1164,7 +1165,7 @@ fn test_cast_with_rounding() {
     let src = "def f() { set x = 3.14 as Int<32> round; }";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+        Item::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
             Stmt::VariableDef {
                 value: Some(Expr::Cast { rounding, .. }),
                 ..
@@ -1182,7 +1183,7 @@ fn test_enum_missing_match() {
     let src = "type State = enum { A, B } with missing_match = \"missing variants\";";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::TypeDef {
+        Item::TypeDef {
             definition: TypeDefinition::Enum(_, Some(msg), _),
             ..
         } => {
@@ -1199,7 +1200,7 @@ fn test_gadt_when_clause() {
     let program = check_parse(src);
     assert_eq!(program.items.len(), 1);
     match &program.items[0] {
-        Stmt::TypeDef {
+        Item::TypeDef {
             definition: TypeDefinition::Enum(variants, _, _),
             params,
             ..
@@ -1230,7 +1231,7 @@ fn test_gadt_when_multi_and() {
     let program = check_parse(src);
     assert_eq!(program.items.len(), 1);
     match &program.items[0] {
-        Stmt::TypeDef {
+        Item::TypeDef {
             definition: TypeDefinition::Enum(variants, _, _),
             ..
         } => {
@@ -1256,7 +1257,7 @@ fn test_gadt_mixed() {
     let program = check_parse(src);
     assert_eq!(program.items.len(), 1);
     match &program.items[0] {
-        Stmt::TypeDef {
+        Item::TypeDef {
             definition: TypeDefinition::Enum(variants, _, _),
             ..
         } => {
@@ -1279,7 +1280,7 @@ fn test_gadt_mixed() {
 fn test_trigger_with_at() {
     let program = check_parse("def main() { trigger @close_file; }");
     match &program.items[0] {
-        Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+        Item::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
             Stmt::Trigger { name, .. } => assert!(name.eq_str("close_file")),
             _ => panic!("expected Trigger"),
         },
@@ -1292,7 +1293,7 @@ fn test_ensures_on_timeout() {
     let src = "async def f() -> Int<32> ensures on_timeout => result == 0 { return 1; }";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::FunctionDef { contracts, .. } => {
+        Item::FunctionDef { contracts, .. } => {
             assert_eq!(contracts.len(), 1);
             match &contracts[0] {
                 Contract::Ensures { target, .. } => {
@@ -1310,7 +1311,7 @@ fn test_ensures_on_cancel() {
     let src = "async def f() -> Int<32> ensures on_cancel => result == -1 { return 1; }";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::FunctionDef { contracts, .. } => {
+        Item::FunctionDef { contracts, .. } => {
             assert_eq!(contracts.len(), 1);
             match &contracts[0] {
                 Contract::Ensures { target, .. } => {
@@ -1328,7 +1329,7 @@ fn test_literal_type_annotation() {
     let src = "def main() { set x = 1: PositiveInt; }";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+        Item::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
             Stmt::VariableDef {
                 value: Some(Expr::TypeAnnotated { expr, ty, .. }),
                 ..
@@ -1352,7 +1353,7 @@ fn test_type_where_clause() {
     let src = "type PositiveInt = Int<32> where value > 0 with default = 1;";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::TypeDef {
+        Item::TypeDef {
             definition: TypeDefinition::Alias(ty, modifiers),
             ..
         } => {
@@ -1378,7 +1379,7 @@ fn test_type_where_clause() {
 fn test_replace_ident_renames_into_nested_stmt() {
     let src = "def main() -> Int<32> { if value > 0 { value } else { -value } return 0; }";
     let program = check_parse(src);
-    let Stmt::FunctionDef { body, .. } = &program.items[0] else {
+    let Item::FunctionDef { body, .. } = &program.items[0] else {
         panic!("expected a function def");
     };
     let if_stmt = &body.as_ref().unwrap()[0];
@@ -1462,7 +1463,7 @@ fn test_nested_generics_with_shr_expr() {
     assert_eq!(program.items.len(), 1);
     // Verify the second generic arg is GenericArg::Const
     match &program.items[0] {
-        Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+        Item::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
             Stmt::VariableDef {
                 ty: Some(Type::Generic(_, args, _)),
                 ..
@@ -1798,7 +1799,7 @@ fn test_return_label_single() {
     let src = "def f() -> Int<32> { return @even 4; }";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::FunctionDef {
+        Item::FunctionDef {
             body: Some(body), ..
         } => {
             assert_eq!(body.len(), 1);
@@ -1820,7 +1821,7 @@ fn test_return_label_multiple() {
     let src = "def f() -> Int<32> { return @even @big 200; }";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::FunctionDef {
+        Item::FunctionDef {
             body: Some(body), ..
         } => {
             assert_eq!(body.len(), 1);
@@ -1843,7 +1844,7 @@ fn test_return_label_without_expr() {
     let src = "def f() { return @done; }";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::FunctionDef {
+        Item::FunctionDef {
             body: Some(body), ..
         } => {
             assert_eq!(body.len(), 1);
@@ -1869,7 +1870,7 @@ fn test_ensures_label() {
                     { return @even x; }";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::FunctionDef { contracts, .. } => {
+        Item::FunctionDef { contracts, .. } => {
             assert_eq!(contracts.len(), 1);
             match &contracts[0] {
                 Contract::Ensures { expr, .. } => {
@@ -1904,7 +1905,7 @@ fn test_ensures_label_and_codomain() {
                     { return @fast x; }";
     let program = check_parse(src);
     match &program.items[0] {
-        Stmt::FunctionDef { contracts, .. } => {
+        Item::FunctionDef { contracts, .. } => {
             assert_eq!(contracts.len(), 2);
             // Second ensures should have the @fast label in the expression
             match &contracts[1] {
@@ -1945,29 +1946,31 @@ fn test_import_forms() {
     let program = check_parse(src);
     assert_eq!(program.items.len(), 3);
     match &program.items[0] {
-        Stmt::Import { path, items, alias, .. } => {
+        Item::Import {
+            path, items, alias, ..
+        } => {
             assert_eq!(path.len(), 2);
             assert_eq!(path[0].as_str(), "std");
             assert_eq!(path[1].as_str(), "io");
             assert!(items.is_none());
             assert!(alias.is_none());
         }
-        _ => panic!("expected Stmt::Import"),
+        _ => panic!("expected Item::Import"),
     }
     match &program.items[1] {
-        Stmt::Import { items, .. } => {
+        Item::Import { items, .. } => {
             let items = items.as_ref().expect("brace items");
             assert_eq!(items.len(), 2);
             assert_eq!(items[0].as_str(), "io");
             assert_eq!(items[1].as_str(), "fs");
         }
-        _ => panic!("expected Stmt::Import with items"),
+        _ => panic!("expected Item::Import with items"),
     }
     match &program.items[2] {
-        Stmt::Import { alias, .. } => {
+        Item::Import { alias, .. } => {
             assert_eq!(alias.expect("alias").as_str(), "my_io");
         }
-        _ => panic!("expected Stmt::Import with alias"),
+        _ => panic!("expected Item::Import with alias"),
     }
 }
 

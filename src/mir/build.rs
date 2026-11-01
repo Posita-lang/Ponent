@@ -1146,7 +1146,7 @@ fn lower_literal(lit: &Literal) -> MirConst {
         Literal::Char(v) => MirConst::Char(*v),
         // A byte char `b'x'` is just the integer 0..=255 at runtime.
         Literal::Byte(v) => MirConst::Int(*v as i128),
-        Literal::String(s) => MirConst::Str(Symbol::from(s.as_str())),
+        Literal::String(s) => MirConst::Str(Symbol::from(*s)),
         Literal::ByteString(_) => MirConst::Opaque,
     }
 }

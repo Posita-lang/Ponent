@@ -38,11 +38,11 @@ const SRC: &str =
 /// * a suggestion, a help line, and a call chain.
 fn kitchen_sink() -> Diagnostic<'static> {
     let mut chain = CallChain::new();
-    chain.push(ChainEntry {
-        kind: ChainEntryKind::Call,
-        span: Some(Span::new(FileId::DUMMY, 0, 3)),
-        message: "main".into(),
-    });
+    chain.push(ChainEntry::new(
+        ChainEntryKind::Call,
+        Some(Span::new(FileId::DUMMY, 0, 3)),
+        "main",
+    ));
     let styled = StyledString::new(vec![
         StringPart {
             content: "expected ".into(),
@@ -54,14 +54,14 @@ fn kitchen_sink() -> Diagnostic<'static> {
         },
     ]);
     Diagnostic::error("return type mismatch")
-        .with_code_str("E030")
+        .with_code_str(ErrCode::E030)
         .with_span(Span::new(FileId::DUMMY, 43, 68)) // `set i = j + 1` … into `return`
         .with_additional_span(Span::new(FileId::DUMMY, 73, 74)) // `i` in `return i`
         .with_label(Span::new(FileId::DUMMY, 43, 68), "this is Bool")
         .with_secondary_label(Span::new(FileId::DUMMY, 0, 8), "declared to return Int<32>")
         .with_label(Span::new(FileId::DUMMY, 9, 69), "spans four lines")
         .with_related(RelatedError {
-            code: Some(ErrCode::new("E019")),
+            code: Some(ErrCode::new(ErrCode::E019)),
             message: "duplicate definition of `i`".into(),
             span: Some(Span::new(FileId::DUMMY, 43, 56)),
             label: None,
@@ -129,7 +129,7 @@ fn html_kitchen_sink() {
 fn html_cjk_columns() {
     const SRC: &str = "set a = \"中\" + b;\n";
     let diag = Diagnostic::error("wide char")
-        .with_code_str("E030")
+        .with_code_str(ErrCode::E030)
         .with_span(Span::new(FileId::DUMMY, 9, 12)) // the `中` grapheme
         .with_secondary_label(Span::new(FileId::DUMMY, 16, 17), "after CJK") // `b`
         .with_source(SRC);

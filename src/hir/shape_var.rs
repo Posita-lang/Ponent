@@ -283,7 +283,8 @@ impl ShapeVarContext {
             self.unresolved_by_level.resize(level + 1, Vec::new());
         }
         self.unresolved_by_level[level].push(id);
-        self.bucket_pos.insert(id.0, self.unresolved_by_level[level].len() - 1);
+        self.bucket_pos
+            .insert(id.0, self.unresolved_by_level[level].len() - 1);
         id
     }
 

@@ -36,12 +36,12 @@
 // dead helpers on the production queries — exactly the kind of rot the
 // attribute is supposed to surface, not hide.)
 
-use crate::ast::FileId;
 use super::{
     Arena, ContentClass, DefaultCache, Owned, Query, QueryDescriptor, QueryProvider, Scheduler,
     StableHash, Stored, TaggedQueryKey,
 };
-use crate::ast::Stmt;
+use crate::ast::FileId;
+use crate::ast::{Item, Stmt};
 use crate::hir::polonius::{count_return_refs_ast, extract_borrow_signature, signature_facts};
 use crate::hir::symbol::TypeKind;
 use crate::hir::types::{DefId, SignatureFacts, TypeId};
@@ -298,8 +298,12 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnSignature {
         // nothing — memo only.  The memo is bounded by the default cache
         // capacity (4096) with evict-one overflow (no working-set cliff),
         // which is the deliberate capacity decision for this query: a
-        // crate with more functions keeps a most-recent window and pays
-        // deterministic recomputes for evicted entries.
+        // crate with more functions keeps AT MOST that many entries and
+        // pays deterministic recomputes for evicted ones.  The victim is
+        // `FxHashMap::keys().next()` — ARBITRARY bucket order, not
+        // recency and not FIFO: the untracked memo is a plain map with no
+        // CLOCK chain, so do not read tracked-cache admission quality
+        // into it.
         //
         // Driver obligation: `clear_all` between Programs (or
         // `clear::<CheckFnSignature>` between iterations).  A FnId is
@@ -344,7 +348,7 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnSignature {
             // the query total instead of panicking (a panic would poison
             // the latch and surface as a cycle error).
             (
-                Stmt::FunctionDef {
+                Item::FunctionDef {
                     params,
                     return_type,
                     body,
@@ -358,7 +362,7 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnSignature {
             // false`) carries no comptime flag at all — the parser only
             // accepts comptime on free functions (SYNTAX.md §const), so an
             // impl method addressed by `FnId` is always a runtime method.
-            (Stmt::ImplBlock { methods, .. }, Some(i)) => match methods.get(i) {
+            (Item::ImplBlock { methods, .. }, Some(i)) => match methods.get(i) {
                 Some(m) => signature_facts_of(&m.params, Some(&m.return_type), m.body.as_deref()),
                 None => FnSignatureFacts::default(),
             },
@@ -1257,7 +1261,7 @@ impl<'input> StableHash for FnBodyCheck<'input> {
         });
         hash_seq(&mut h, &self.diagnostics, |h, d| {
             h.write_u8(d.level() as u8);
-            d.message().hash(&mut *h);
+            d.message_unchecked().hash(&mut *h);
             hash_opt(&mut *h, &d.code().map(|c| c.code()), |h, c| c.hash(h));
         });
         h.finish()
@@ -1437,7 +1441,7 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnBody {
         // panicking into a latch poison — or worse, invoking the checker
         // on an item shape it does not expect.
         let Some(
-            stmt @ Stmt::FunctionDef {
+            item @ Item::FunctionDef {
                 is_comptime: false, ..
             },
         ) = program.items.get(key.item)
@@ -1453,7 +1457,15 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnBody {
                 diagnostics: Vec::new(),
             };
         };
-        let out = worker.check_function_def_salvaged(&stmt);
+        // `check_function_def_salvaged` takes `&Item<'q>` with a free
+        // outer borrow lifetime, so the borrow from `program` (shorter
+        // than `'q`) passes through unchanged — only the pointee
+        // lifetime `'q` reaches the result (`FnBodyCheck<'q>`).  The old
+        // `Stmt::Item(item)` wrapper forced `&'q Item<'q>` (the variant
+        // is `&'input Item<'input>`, which pins both lifetimes equal)
+        // and needed a transmute to satisfy; taking the item directly
+        // removes that requirement.
+        let out = worker.check_function_def_salvaged(item);
         worker.pop_literal_scope();
         out
     }
@@ -1535,12 +1547,12 @@ impl<'q, 'src: 'q> Query<'q, 'src> for DocTokens {
             return arena.alloc(DocLines::default());
         };
         let lines = match (item, key.method) {
-            (Stmt::FunctionDef { span, .. }, None) => program
+            (Item::FunctionDef { span, .. }, None) => program
                 .doc_map
                 .doc_lines_anchored_in(span.start, span.end)
                 .map(String::from)
                 .collect(),
-            (Stmt::ImplBlock { methods, .. }, Some(i)) => match methods.get(i) {
+            (Item::ImplBlock { methods, .. }, Some(i)) => match methods.get(i) {
                 Some(m) => program
                     .doc_map
                     .doc_lines_anchored_in(m.span.start, m.span.end)

@@ -108,11 +108,11 @@ fn check_source_with(
         diags
             .into_iter()
             .map(|mut d| {
-                    // `*_kind` diagnostics derive `message` lazily; the
-                    // emitter humanizes at its render boundary.
-                    d.humanize();
-                    d.message().to_string()
-                })
+                // `*_kind` diagnostics derive `message` lazily; the
+                // emitter humanizes at its render boundary.
+                d.humanize();
+                d.message().to_string()
+            })
             .collect::<Vec<_>>()
     })?;
 
@@ -127,11 +127,11 @@ fn check_source_with(
             .into_inner()
             .into_iter()
             .map(|mut d| {
-                    // `*_kind` diagnostics derive `message` lazily; the
-                    // emitter humanizes at its render boundary.
-                    d.humanize();
-                    d.message().to_string()
-                })
+                // `*_kind` diagnostics derive `message` lazily; the
+                // emitter humanizes at its render boundary.
+                d.humanize();
+                d.message().to_string()
+            })
             .collect::<Vec<_>>());
     }
 
@@ -152,16 +152,16 @@ fn check_source_with(
             .into_inner()
             .into_iter()
             .map(|mut d| {
-                    // `*_kind` diagnostics derive `message` lazily; the
-                    // emitter humanizes at its render boundary.
-                    d.humanize();
-                    d.message().to_string()
-                })
+                // `*_kind` diagnostics derive `message` lazily; the
+                // emitter humanizes at its render boundary.
+                d.humanize();
+                d.message().to_string()
+            })
             .collect::<Vec<_>>()
     })
 }
 
-/// B5a end-to-end: the resolver hook registers the variant-payload
+/// End-to-end: the resolver hook registers the variant-payload
 /// expansion for a self-referential enum at its first USE site (a
 /// signature annotation), producing the back-edge the κ graph solver
 /// classifies by cycle variance.
@@ -178,8 +178,7 @@ fn b5a_recursive_enum_expansion_via_resolver() {
     ctx.arena = Some(arena);
     let local_crate_id = CrateId(DefId(0));
     let mut resolver = NameResolver::new(&mut ctx, local_crate_id, None, false);
-    let (_symbols, _trait_env, _diags, resolution_map) =
-        resolver.resolve_program(&program);
+    let (_symbols, _trait_env, _diags, resolution_map) = resolver.resolve_program(&program);
     let tree_def = *resolution_map
         .type_def_ids
         .get(&Symbol::intern("Tree"))
@@ -188,7 +187,7 @@ fn b5a_recursive_enum_expansion_via_resolver() {
     // Copy the payloads out: the assertion below calls `ctx` mutably.
     let payloads: Vec<_> = ctx
         .adt_expansion(tree_ty)
-        .expect("B5a: recursive enum expansion must be registered at use sites")
+        .expect("recursive enum expansion must be registered at use sites")
         .iter()
         .copied()
         .collect();
@@ -200,7 +199,7 @@ fn b5a_recursive_enum_expansion_via_resolver() {
         "Node(Tree, Tree) → the self-referential tuple (the back-edge)"
     );
     // End-to-end κ verdict: covariant cycle → InfiniteEnumerable
-    // (pre-B5a: FiniteExhaustible(usize::MAX) — recursion was invisible).
+    // (pre-expansion: FiniteExhaustible(usize::MAX) — recursion was invisible).
     assert_eq!(
         ctx.characteristic(tree_ty),
         crate::hir::types::Characteristic::InfiniteEnumerable
@@ -260,11 +259,11 @@ pub(crate) fn check_strict(source: &'static str) -> Result<HirProgram<'static>, 
         diags
             .into_iter()
             .map(|mut d| {
-                    // `*_kind` diagnostics derive `message` lazily; the
-                    // emitter humanizes at its render boundary.
-                    d.humanize();
-                    d.message().to_string()
-                })
+                // `*_kind` diagnostics derive `message` lazily; the
+                // emitter humanizes at its render boundary.
+                d.humanize();
+                d.message().to_string()
+            })
             .collect::<Vec<_>>()
     })?;
 
@@ -279,11 +278,11 @@ pub(crate) fn check_strict(source: &'static str) -> Result<HirProgram<'static>, 
             .into_inner()
             .into_iter()
             .map(|mut d| {
-                    // `*_kind` diagnostics derive `message` lazily; the
-                    // emitter humanizes at its render boundary.
-                    d.humanize();
-                    d.message().to_string()
-                })
+                // `*_kind` diagnostics derive `message` lazily; the
+                // emitter humanizes at its render boundary.
+                d.humanize();
+                d.message().to_string()
+            })
             .collect::<Vec<_>>());
     }
 
@@ -302,11 +301,11 @@ pub(crate) fn check_strict(source: &'static str) -> Result<HirProgram<'static>, 
             .into_inner()
             .into_iter()
             .map(|mut d| {
-                    // `*_kind` diagnostics derive `message` lazily; the
-                    // emitter humanizes at its render boundary.
-                    d.humanize();
-                    d.message().to_string()
-                })
+                // `*_kind` diagnostics derive `message` lazily; the
+                // emitter humanizes at its render boundary.
+                d.humanize();
+                d.message().to_string()
+            })
             .collect::<Vec<_>>()
     })
 }
@@ -2023,7 +2022,7 @@ fn test_if_statement_with_return() {
             Literal::Int(ast::IntLit::Small(42)),
             Span::new(FileId::DUMMY, 2, 4),
         )),
-        labels: Vec::new(),
+        labels: &[],
         span: Span::new(FileId::DUMMY, 2, 4),
     };
     let else_stmt = Stmt::Return {
@@ -2031,7 +2030,7 @@ fn test_if_statement_with_return() {
             Literal::Int(ast::IntLit::Small(0)),
             Span::new(FileId::DUMMY, 5, 6),
         )),
-        labels: Vec::new(),
+        labels: &[],
         span: Span::new(FileId::DUMMY, 5, 6),
     };
     let if_expr = Expr::If {
@@ -2093,14 +2092,20 @@ fn test_if_expression_tuple() {
     )));
     let if_expr = Expr::If {
         cond,
-        then_branch: Box::leak(vec![Stmt::Expression(Expr::Literal(
-            Literal::Int(ast::IntLit::Small(1)),
-            Span::new(FileId::DUMMY, 2, 3),
-        ))].into_boxed_slice()),
-        else_branch: Some(Box::leak(vec![Stmt::Expression(Expr::Literal(
-            Literal::Int(ast::IntLit::Small(2)),
-            Span::new(FileId::DUMMY, 4, 5),
-        ))].into_boxed_slice())),
+        then_branch: Box::leak(
+            vec![Stmt::Expression(Expr::Literal(
+                Literal::Int(ast::IntLit::Small(1)),
+                Span::new(FileId::DUMMY, 2, 3),
+            ))]
+            .into_boxed_slice(),
+        ),
+        else_branch: Some(Box::leak(
+            vec![Stmt::Expression(Expr::Literal(
+                Literal::Int(ast::IntLit::Small(2)),
+                Span::new(FileId::DUMMY, 4, 5),
+            ))]
+            .into_boxed_slice(),
+        )),
         is_expression: true,
         span: Span::new(FileId::DUMMY, 0, 5),
     };
@@ -8085,7 +8090,7 @@ fn test_move_branch_path_propagation() {
 fn test_move_reinitialization() {
     let result = check_source(
         "def main() -> Int<32> {
-             set a = \"hello\";
+             set mut a = \"hello\";
              set b = a;
              a = \"new\";
              set c = a;
@@ -8168,7 +8173,7 @@ fn test_str_array_copy_accepted() {
 fn test_move_array_reinitialization() {
     let result = check_source(
         "def main() -> Int<32> {
-             set arr = [\"a\", \"b\", \"c\"];
+             set mut arr = [\"a\", \"b\", \"c\"];
              let t = move arr;
              arr = [\"x\", \"y\", \"z\"];
              let k: Int<32> = 0;
@@ -9182,7 +9187,7 @@ fn test_cross_function_return_borrow_liveness() {
 fn test_finally_block_checked() {
     let result = check_source(
         "def f() -> Int<32> {
-             set x = 5;
+             set mut x = 5;
              return x;
          } finally {
              x = 6;
@@ -9539,7 +9544,7 @@ fn test_closure_mutation_after_loan() {
 fn test_compound_assign_after_move() {
     let result = check_source(
         "def main() -> Int<32> {
-             set a = String::new();
+             set mut a = String::new();
              set b = a;
              a += 1;
              return 0;
@@ -9637,7 +9642,8 @@ fn test_suffixed_literal_desugars_to_checked_width() {
     // The desugared width participates in unification: `Int<64>` ≠ `Int<32>`.
     match check_source("def main() -> Int<32> { set x: Int<64> = 42i32; return 0; }") {
         Err(errs) => assert!(
-            errs.iter().any(|e| e.contains("Int<64>") && e.contains("Int<32>")),
+            errs.iter()
+                .any(|e| e.contains("Int<64>") && e.contains("Int<32>")),
             "expected a width mismatch, got {errs:?}"
         ),
         Ok(_) => panic!("`42i32` must not satisfy `Int<64>`"),
@@ -9667,7 +9673,8 @@ fn test_out_of_range_int_widths_are_rejected() {
     ] {
         match check_source(src) {
             Err(errs) => assert!(
-                errs.iter().any(|e| e.contains("bit width must be in 1..=64")),
+                errs.iter()
+                    .any(|e| e.contains("bit width must be in 1..=64")),
                 "expected a width diagnostic for {src:?}, got {errs:?}"
             ),
             Ok(_) => panic!("out-of-range width must be rejected: {src:?}"),
@@ -9862,7 +9869,7 @@ fn test_compound_assign_index_target_after_move() {
     let result = check_source(
         "def make() -> String { return \"x\"; }
          def main() -> Int<32> {
-             set arr = [make(), make(), make()];
+             set mut arr = [make(), make(), make()];
              set b = arr;
              arr[0] += \"!\";
              return 0;
@@ -11822,11 +11829,11 @@ fn test_digest_gate_recomputes_only_changed_function() {
                 diags
                     .into_iter()
                     .map(|mut d| {
-                    // `*_kind` diagnostics derive `message` lazily; the
-                    // emitter humanizes at its render boundary.
-                    d.humanize();
-                    d.message().to_string()
-                })
+                        // `*_kind` diagnostics derive `message` lazily; the
+                        // emitter humanizes at its render boundary.
+                        d.humanize();
+                        d.message().to_string()
+                    })
                     .collect::<Vec<_>>()
             )
         })
@@ -11880,11 +11887,11 @@ fn test_digest_gate_recomputes_only_changed_function() {
                 diags
                     .into_iter()
                     .map(|mut d| {
-                    // `*_kind` diagnostics derive `message` lazily; the
-                    // emitter humanizes at its render boundary.
-                    d.humanize();
-                    d.message().to_string()
-                })
+                        // `*_kind` diagnostics derive `message` lazily; the
+                        // emitter humanizes at its render boundary.
+                        d.humanize();
+                        d.message().to_string()
+                    })
                     .collect::<Vec<_>>()
             )
         })
@@ -11927,11 +11934,11 @@ fn test_check_fn_body_mismatched_key_folds_to_error_value() {
                 diags
                     .into_iter()
                     .map(|mut d| {
-                    // `*_kind` diagnostics derive `message` lazily; the
-                    // emitter humanizes at its render boundary.
-                    d.humanize();
-                    d.message().to_string()
-                })
+                        // `*_kind` diagnostics derive `message` lazily; the
+                        // emitter humanizes at its render boundary.
+                        d.humanize();
+                        d.message().to_string()
+                    })
                     .collect::<Vec<_>>()
             )
         })
@@ -11939,7 +11946,7 @@ fn test_check_fn_body_mismatched_key_folds_to_error_value() {
     let impl_idx = program
         .items
         .iter()
-        .position(|i| matches!(i, crate::ast::Stmt::ImplBlock { .. }))
+        .position(|i| matches!(i, crate::ast::Item::ImplBlock { .. }))
         .expect("fixture must contain an impl block");
     let comptime_idx = program
         .items
@@ -11947,7 +11954,7 @@ fn test_check_fn_body_mismatched_key_folds_to_error_value() {
         .position(|i| {
             matches!(
                 i,
-                crate::ast::Stmt::FunctionDef {
+                crate::ast::Item::FunctionDef {
                     is_comptime: true,
                     ..
                 }
@@ -11960,7 +11967,7 @@ fn test_check_fn_body_mismatched_key_folds_to_error_value() {
         .position(|i| {
             matches!(
                 i,
-                crate::ast::Stmt::FunctionDef {
+                crate::ast::Item::FunctionDef {
                     is_comptime: false,
                     ..
                 }

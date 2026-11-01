@@ -11,6 +11,7 @@
 use arrayvec::ArrayString;
 use std::collections::HashMap;
 use std::fmt;
+use std::num::NonZeroU32;
 
 /// A compact, interned string identifier.
 ///
@@ -25,16 +26,20 @@ use std::fmt;
 /// here includes `resolve_ref` which the fork lacked.
 /// ──────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Symbol(u32);
+pub struct Symbol(NonZeroU32);
 
 impl Symbol {
     /// The invalid / sentinel symbol (used for errors, uninitialised slots).
-    pub const INVALID: Symbol = Symbol(u32::MAX);
+    ///
+    /// `0` is the niche used by `Option<Symbol>`; valid interned symbols are
+    /// therefore numbered from `1`, and `u32::MAX` is reserved for this
+    /// sentinel.
+    pub const INVALID: Symbol = Symbol(NonZeroU32::MAX);
 
     /// The underlying interner index (used by the Polonius fact extractor
     /// to encode variables as plain integers).
     pub fn to_u32(self) -> u32 {
-        self.0
+        self.0.get()
     }
 
     /// Create a new interned symbol from a string slice.
@@ -109,7 +114,8 @@ impl From<&str> for Symbol {
 struct Interner {
     /// Map from string content to its `Symbol` (stable index).
     map: HashMap<String, Symbol>,
-    /// Arena: each interned string is stored exactly once.  Index == id.
+    /// Arena: each interned string is stored exactly once.  Symbol id `n`
+    /// indexes `arena[n - 1]` (`0` is the `Option` niche, never a symbol).
     arena: Vec<&'static str>,
 }
 
@@ -127,7 +133,14 @@ impl Interner {
         if let Some(&sym) = self.map.get(s) {
             return sym;
         }
-        let sym = Symbol(self.arena.len() as u32);
+        let next = self.arena.len() + 1;
+        let raw = u32::try_from(next).ok().and_then(NonZeroU32::new);
+        let Some(raw) = raw else {
+            // 4 GiB of distinct identifiers is far beyond any real program;
+            // fail closed rather than silently aliasing the `Option` niche.
+            return Symbol::INVALID;
+        };
+        let sym = Symbol(raw);
         self.map.insert(s.to_string(), sym);
         self.arena.push(Box::leak(s.to_string().into_boxed_str()));
         sym
@@ -135,11 +148,11 @@ impl Interner {
 
     /// Resolve a symbol to a `&str` reference into the arena (no allocation).
     fn resolve_ref(&self, sym: Symbol) -> &'static str {
-        if sym.0 == u32::MAX {
+        if sym == Symbol::INVALID {
             return "<invalid>";
         }
         self.arena
-            .get(sym.0 as usize)
+            .get(sym.0.get() as usize - 1)
             .copied()
             .unwrap_or("<unknown>")
     }

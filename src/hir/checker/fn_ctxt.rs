@@ -1,11 +1,12 @@
-use crate::ast::FileId;
 use super::{
     CtxKind, EffectSet, Expectation, ScopedVarMap, TypeChecker, TypingContext,
     did_you_mean_suggestion, typing_context_to_type_ctx,
 };
+use crate::ast::FileId;
 use crate::ast::ast_type_display;
 use crate::ast::visit::replace_ident_in_expr;
 use crate::ast::{Attribute, BinOp, Expr, GenericArg, Literal, Pattern, Span, Stmt, Type, UnaryOp};
+use crate::diagnostics::ErrCode;
 use crate::diagnostics::{Applicability, Diagnostic, DiagnosticKind, Suggestion, SuggestionStyle};
 use crate::hir::comptime::{ComptimeEvalContext, ComptimeValue};
 use crate::hir::hir::{HirCatchBranch, HirExpr, HirMatchArm, HirParam, HirPattern, HirStmt};
@@ -59,10 +60,10 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
     /// restore.  See `crate::hir::types::coercion` module doc.
     pub(crate) fn with_call_site_coercion<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let prev = crate::hir::types::CoercionContext::from_u8(
-            self.checker
-                .ctx
-                .current_coercion_ctx
-                .swap(crate::hir::types::CoercionContext::CallSite.to_u8(), std::sync::atomic::Ordering::Relaxed),
+            self.checker.ctx.current_coercion_ctx.swap(
+                crate::hir::types::CoercionContext::CallSite.to_u8(),
+                std::sync::atomic::Ordering::Relaxed,
+            ),
         );
         let r = f(self);
         self.checker
@@ -78,10 +79,10 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
     /// sequential-borrow discipline as `with_call_site_coercion`.
     pub(crate) fn with_structural_coercion<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let prev = crate::hir::types::CoercionContext::from_u8(
-            self.checker
-                .ctx
-                .current_coercion_ctx
-                .swap(crate::hir::types::CoercionContext::Structural.to_u8(), std::sync::atomic::Ordering::Relaxed),
+            self.checker.ctx.current_coercion_ctx.swap(
+                crate::hir::types::CoercionContext::Structural.to_u8(),
+                std::sync::atomic::Ordering::Relaxed,
+            ),
         );
         let r = f(self);
         self.checker
@@ -262,7 +263,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     reason,
                     context: None,
                 })
-                .with_code_str("E030");
+                .with_code_str(ErrCode::E030);
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
                     diag = diag.with_suggestion(suggestion.message);
                 }
@@ -300,9 +301,9 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                         span,
                         found_span: None,
                         reason,
-                        context: Some(type_ctx),
+                        context: type_ctx,
                     })
-                    .with_code_str("E030");
+                    .with_code_str(ErrCode::E030);
                 }
                 let msg = match ctx {
                     TypingContext::ReturnValue => format!(
@@ -337,7 +338,9 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                         self.checker.ctx.get(actual)
                     ),
                 };
-                let mut diag = Diagnostic::error(msg).with_code_str("E030").with_span(span);
+                let mut diag = Diagnostic::error(msg)
+                    .with_code_str(ErrCode::E030)
+                    .with_span(span);
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
                     diag = diag.with_suggestion(suggestion.message);
                 }
@@ -504,8 +507,14 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
         variant: &Symbol,
         payload: Option<&Expr<'input>>,
     ) -> bool {
-        let ty_ast =
-            crate::ast::Type::Path(smallvec::SmallVec::from(path), crate::ast::Span::new(FileId::DUMMY, 0, 0));
+        let ty_ast = crate::ast::Type::Path(
+            self.checker
+                .ctx
+                .arena
+                .expect("arena required for type construction")
+                .alloc_slice_copy(path),
+            crate::ast::Span::new(FileId::DUMMY, 0, 0),
+        );
         let Ok(enum_ty) = self.resolve_type(&ty_ast) else {
             return false;
         };
@@ -573,7 +582,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             }
             crate::ast::Type::Generic(base, args, _) => {
                 self.collect_ast_param_indices(base, params, out);
-                for arg in args {
+                for arg in args.iter() {
                     match arg {
                         crate::ast::GenericArg::Positional(t)
                         | crate::ast::GenericArg::Named(_, t) => {
@@ -592,7 +601,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 self.collect_ast_param_indices(elem, params, out)
             }
             crate::ast::Type::Tuple(elems, _) => {
-                for e in elems {
+                for e in elems.iter() {
                     self.collect_ast_param_indices(e, params, out);
                 }
             }
@@ -601,7 +610,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 ret,
                 ..
             } => {
-                for p in f_params {
+                for p in f_params.iter() {
                     self.collect_ast_param_indices(p, params, out);
                 }
                 self.collect_ast_param_indices(ret, params, out);
@@ -731,8 +740,8 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             TypeData::Slice { elem } => Self::collect_generic_indices(*elem, ctx, out, bound),
             TypeData::Array { elem, .. } => Self::collect_generic_indices(*elem, ctx, out, bound),
             TypeData::Ref { ty, .. } => Self::collect_generic_indices(*ty, ctx, out, bound),
-            TypeData::Pointer { ty } => Self::collect_generic_indices(*ty, ctx, out, bound),
-            TypeData::Ptr { size, pointee } => {
+            TypeData::Pointer { ty, .. } => Self::collect_generic_indices(*ty, ctx, out, bound),
+            TypeData::Ptr { size, pointee, .. } => {
                 Self::collect_generic_indices(*size, ctx, out, bound);
                 Self::collect_generic_indices(*pointee, ctx, out, bound);
             }
@@ -947,7 +956,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                              sandbox checks may be incomplete in strict mode",
                             name_str,
                         ))
-                        .with_code_str("W092")
+                        .with_code_str(ErrCode::W092)
                         .with_span(*span)
                         .with_help("method attributes are resolved through trait/impl lookup, which is not yet supported here"),
                     );
@@ -975,7 +984,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                             "cannot call `{}` from comptime context: only comptime functions (called with `!`) are allowed in comptime blocks",
                             name_str,
                         ))
-                        .with_code_str("E081")
+                        .with_code_str(ErrCode::E081)
                         .with_span(*span)
                         .with_suggestion(format!(
                             "use `{}!()` to call a comptime function, or move this call outside the comptime block",
@@ -1028,7 +1037,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                 "cannot call function `{}` inside isolate block: it accesses mutable global state",
                                 name_str,
                             ))
-                            .with_code_str("E093")
+                            .with_code_str(ErrCode::E093)
                             .with_span(*span)
                             .with_help("isolate blocks guarantee no external mutable state access; this function reads or writes mutable globals")
                         );
@@ -1049,7 +1058,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                             "cannot call `{}!()`: `{}` is not a comptime function; remove the `!` to call it at runtime",
                             name, name,
                         ))
-                        .with_code_str("E081")
+                        .with_code_str(ErrCode::E081)
                         .with_span(*span)
                         .with_help("only `comptime def` functions can be called with `!`")
                     );
@@ -1126,7 +1135,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                     "cannot call method `{}` inside isolate block: it accesses mutable global state",
                                     field,
                                 ))
-                                .with_code_str("E093")
+                                .with_code_str(ErrCode::E093)
                                 .with_span(*span)
                                 .with_help("isolate blocks guarantee no external mutable state access; this method reads or writes mutable globals"),
                             );
@@ -1146,7 +1155,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                     "`@pure` function cannot call method `{}`: it has a forbidden side effect",
                                     field,
                                 ))
-                                .with_code_str("E117")
+                                .with_code_str(ErrCode::E117)
                                 .with_span(*span)
                                 .with_help(
                                     "a @pure function must have no side effects, transitively — \
@@ -1236,7 +1245,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 }
                 let mut diag =
                     Diagnostic::error(format!("no method named `{}` found for type", field))
-                        .with_code_str("E011")
+                        .with_code_str(ErrCode::E011)
                         .with_span(*span);
                 if !method_names.is_empty() {
                     diag = diag.with_suggestion(format!(
@@ -1260,7 +1269,14 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             // Resolve the type from the first path segment.
             let type_name = path[0];
             let method_name = path[1];
-            let type_path = Type::Path(smallvec::smallvec![type_name], *span);
+            let type_path = Type::Path(
+                self.checker
+                    .ctx
+                    .arena
+                    .expect("arena required for type construction")
+                    .alloc_slice_copy(&[type_name]),
+                *span,
+            );
             if let Ok(ty) = self.resolve_type(&type_path) {
                 // Look up the method on the resolved type.
                 // lookup_method also handles inherent methods.
@@ -1327,7 +1343,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                     "cannot call method `{}` inside isolate block: it accesses mutable global state",
                                     method_name,
                                 ))
-                                .with_code_str("E093")
+                                .with_code_str(ErrCode::E093)
                                 .with_span(*span)
                                 .with_help("isolate blocks guarantee no external mutable state access; this method reads or writes mutable globals"),
                             );
@@ -1347,7 +1363,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                     "`@pure` function cannot call method `{}`: it has a forbidden side effect",
                                     method_name,
                                 ))
-                                .with_code_str("E117")
+                                .with_code_str(ErrCode::E117)
                                 .with_span(*span)
                                 .with_help(
                                     "a @pure function must have no side effects, transitively — \
@@ -1664,7 +1680,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                      is expected; each arm must type-check for every \
                                      instantiation",
                         )
-                        .with_code_str("E030")
+                        .with_code_str(ErrCode::E030)
                         .with_span(arm.span));
                     }
                     self.unify_with(exp_resolved, arm_body_ty, arm.span, TypingContext::None)?;
@@ -1698,7 +1714,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                  is expected; each arm must type-check for every \
                                  instantiation",
                     )
-                    .with_code_str("E030")
+                    .with_code_str(ErrCode::E030)
                     .with_span(first_pre_discharge_span.unwrap_or(*span)));
                 }
                 self.unify_with(
@@ -1774,7 +1790,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                             // (unlike a manual resolve_type chain that would fail
                             // on existential param names).
                             let pattern = crate::ast::Pattern::Enum {
-                                path: Vec::new(),
+                                path: &[],
                                 variant: v.name,
                                 inner: None,
                                 span: *span,
@@ -1906,7 +1922,11 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             unreachable!("infer_expr dispatch guarantees the expression variant");
         };
         let resolved_ty = self.resolve_type(&Type::Path(
-            smallvec::SmallVec::from(path.as_slice()),
+            self.checker
+                .ctx
+                .arena
+                .expect("arena required for type construction")
+                .alloc_slice_copy(path),
             *span,
         ))?;
         let (def_id, mut args) = self
@@ -2095,7 +2115,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     "GADT constraint on `{}` not satisfied",
                     variant,
                 ))
-                .with_code_str("E060")
+                .with_code_str(ErrCode::E060)
                 .with_span(*span));
             }
             // If any scrutinee type argument is an unresolved variable
@@ -2162,7 +2182,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     "GADT constraint on `{}` not satisfied",
                     variant,
                 ))
-                .with_code_str("E060")
+                .with_code_str(ErrCode::E060)
                 .with_span(*span));
             }
             // Same as the existential branch: unresolved scrutinee
@@ -2256,7 +2276,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
         };
         Ok((
             HirExpr::EnumLit {
-                path: path.clone(),
+                path: path.to_vec(),
                 variant: *variant,
                 payload: payload_hir,
                 ty: enum_ty,
@@ -2307,12 +2327,12 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             );
             let diag = if self.checker.strict_mode {
                 Diagnostic::error(msg)
-                    .with_code_str("E108")
+                    .with_code_str(ErrCode::E108)
                     .with_help("strict mode requires local handling for `@must_handle` variants")
                     .with_span(*span)
             } else {
                 Diagnostic::warning(msg)
-                            .with_code_str("W004")
+                            .with_code_str(ErrCode::W004)
                             .with_help("use `catch` to explicitly handle `@must_handle` variants before `?`")
                             .with_suggestion(format!(
                                 "add `catch |variant| {{ ... }}` before `?` to handle the required variants, or add `@delegates_must_handle` to this function"
@@ -2381,11 +2401,11 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             );
             let diag = if self.checker.strict_mode {
                 Diagnostic::error(msg)
-                    .with_code_str("E108")
+                    .with_code_str(ErrCode::E108)
                     .with_span(*span)
             } else {
                 Diagnostic::warning(msg)
-                    .with_code_str("W004")
+                    .with_code_str(ErrCode::W004)
                     .with_span(*span)
             };
             self.checker.diagnostics.push(diag);
@@ -2401,11 +2421,11 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             );
             let diag = if self.checker.strict_mode {
                 Diagnostic::error(msg)
-                    .with_code_str("E108")
+                    .with_code_str(ErrCode::E108)
                     .with_span(*span)
             } else {
                 Diagnostic::warning(msg)
-                    .with_code_str("W004")
+                    .with_code_str(ErrCode::W004)
                     .with_span(*span)
             };
             self.checker.diagnostics.push(diag);
@@ -2512,14 +2532,14 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     };
                     let diag = if self.checker.strict_mode {
                         Diagnostic::error(msg)
-                                        .with_code_str("E108")
+                                        .with_code_str(ErrCode::E108)
                                         .with_help(
                                             "strict mode requires explicit local handling for `@must_handle` variants",
                                         )
                                         .with_span(*span)
                     } else {
                         Diagnostic::warning(msg)
-                            .with_code_str("W005")
+                            .with_code_str(ErrCode::W005)
                             .with_help(
                                 "add explicit catch branches for each `@must_handle` variant",
                             )
@@ -2543,7 +2563,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                         "call to `{}` has `@must_handle` but catch only uses wildcard",
                                         name,
                                     ))
-                                    .with_code_str("W006")
+                                    .with_code_str(ErrCode::W006)
                                     .with_help("add explicit catch branches for the required variants")
                                     .with_suggestion("use specific catch arms like `|Variant| { ... }` instead of `|_| { ... }`")
                                     .with_span(*span),
@@ -2612,11 +2632,11 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             );
             let diag = if self.checker.strict_mode {
                 Diagnostic::error(msg)
-                    .with_code_str("E108")
+                    .with_code_str(ErrCode::E108)
                     .with_span(*span)
             } else {
                 Diagnostic::warning(msg)
-                    .with_code_str("W005")
+                    .with_code_str(ErrCode::W005)
                     .with_span(*span)
             };
             self.checker.diagnostics.push(diag);
@@ -2633,11 +2653,11 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             );
             let diag = if self.checker.strict_mode {
                 Diagnostic::error(msg)
-                    .with_code_str("E108")
+                    .with_code_str(ErrCode::E108)
                     .with_span(*span)
             } else {
                 Diagnostic::warning(msg)
-                    .with_code_str("W005")
+                    .with_code_str(ErrCode::W005)
                     .with_span(*span)
             };
             self.checker.diagnostics.push(diag);
@@ -2927,7 +2947,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                 "cannot read mutable global `{}` outside `@trusted` function",
                                 name,
                             ))
-                            .with_code_str("E040")
+                            .with_code_str(ErrCode::E040)
                             .with_span(*span)
                             .with_help("wrap the function in `@trusted` and add `requires`/`ensures` contracts")
                         );
@@ -2951,7 +2971,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                 "cannot read mutable global `{}` inside isolate block",
                                 name,
                             ))
-                            .with_code_str("E093")
+                            .with_code_str(ErrCode::E093)
                             .with_span(*span)
                             .with_help("isolate blocks must not access external mutable state"),
                         );
@@ -3047,18 +3067,9 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     // negates to a negative BigInt; `to_i128` would drop
                     // it and silently skip the check, letting e.g.
                     // `-340282366920938463463374607431768211455: UInt<128>`
-                    // through.
-                    let neg = match v {
-                        crate::ast::IntLit::Small(n) => {
-                            n.checked_neg().map(crate::ast::IntLit::Small)
-                        }
-                        crate::ast::IntLit::Large(b) => Some(crate::ast::IntLit::Large(
-                            Box::new(-(&**b)),
-                        )),
-                    };
-                    if let Some(neg) = neg {
-                        self.check_int_literal_fits(&neg, e, *span);
-                    }
+                    // through.  The check runs on the NEGATED value
+                    // without materializing it (`negated_fits`).
+                    self.check_int_literal_fits_negated(v, e, *span);
                 }
                 let result_ty = match op {
                     UnaryOp::Neg | UnaryOp::BitNot => ty,
@@ -3108,7 +3119,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                         Diagnostic::warning(
                                             "`&ro` on an already-immutable reference is redundant — the operand is already `&T`",
                                         )
-                                        .with_code_str("W114")
+                                        .with_code_str(ErrCode::W114)
                                         .with_span(*span),
                                     );
                                 }
@@ -3118,7 +3129,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                             _ => {
                                 self.checker.diagnostics.push(
                                     Diagnostic::error("`&ro` requires a reference operand")
-                                        .with_code_str("E111")
+                                        .with_code_str(ErrCode::E111)
                                         .with_span(*span),
                                 );
                                 self.checker.ctx.error()
@@ -3170,7 +3181,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 if !self.checker.ctx.is_integer(index_ty) && !self.checker.ctx.is_usize(index_ty) {
                     self.checker.diagnostics.push(
                         Diagnostic::error("index must be an integer")
-                            .with_code_str("E030")
+                            .with_code_str(ErrCode::E030)
                             .with_span(*span)
                             .with_label(
                                 index.span(),
@@ -3337,7 +3348,11 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             }
             Expr::StructLit { path, fields, span } => {
                 let resolved_ty = self.resolve_type(&Type::Path(
-                    smallvec::SmallVec::from(path.as_slice()),
+                    self.checker
+                        .ctx
+                        .arena
+                        .expect("arena required for type construction")
+                        .alloc_slice_copy(path),
                     *span,
                 ))?;
                 let (def_id, args) = self
@@ -3375,7 +3390,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                         type_name,
                                         span: *span,
                                     })
-                                    .with_code_str("E010")
+                                    .with_code_str(ErrCode::E010)
                                     .with_suggestion(format!(
                                         "available fields: {}",
                                         field_names.join(", ")
@@ -3408,7 +3423,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 }
                 Ok((
                     HirExpr::StructLit {
-                        path: path.clone(),
+                        path: path.to_vec(),
                         fields: hir_fields,
                         ty: struct_ty,
                         span: *span,
@@ -3484,8 +3499,34 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 // Enter a variable scope for closure parameters so they don't leak
                 // into the enclosing function's scope.
                 let _closure_scope = self.checker.enter_var_scope();
+                // Captures inherit the source binding's type, rigidity AND
+                // mutability (a `set mut x` captured into the closure stays
+                // assignable inside it; a Rigid binding stays eligible for
+                // GADT refinement).  The parser currently emits an empty
+                // capture list (closures capture via the enclosing scope),
+                // so this loop is a no-op today — it exists so that an
+                // explicit capture list, if added later, inherits the full
+                // binding instead of silently becoming an immutable Wobbly
+                // (which would both block assignment and drop GADT
+                // refinement eligibility).
+                for cap in *captures {
+                    let ty = self.checker.local_variable_types.get(cap.name);
+                    let rigidity = self.checker.local_variable_types.get_rigidity(cap.name);
+                    let mutable = self.checker.local_variable_types.is_mutable(cap.name);
+                    if let (Some(ty), Some(rigidity), Some(mutable)) = (ty, rigidity, mutable) {
+                        self.checker
+                            .local_variable_types
+                            .insert_with_rigidity_and_mut(cap.name, ty, rigidity, mutable);
+                        self.checker.span_insert(cap.name, cap.span);
+                    }
+                }
+                // Closure parameters are mutable rebindable slots, matching
+                // free-function and method parameters — the grammar has no
+                // parameter-level `mut`, so `|x| { x = x + 1; }` must work.
                 for p in &hir_params {
-                    self.checker.local_variable_types.insert(p.name, p.ty);
+                    self.checker
+                        .local_variable_types
+                        .insert_with_mut(p.name, p.ty, true);
                 }
                 self.checker.push_ctx(CtxKind::Closure, *span, None);
                 let body_hir = self.check_block(body)?;
@@ -3580,7 +3621,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                             // The semantic code for a return
                             // type mismatch is E036 — E003 is "unexpected
                             // token" (parser).
-                            .with_code_str("E036")
+                            .with_code_str(ErrCode::E036)
                             .with_span(*span));
                         }
                         self.unify_with(ret_ty, err_ty, *span, TypingContext::ReturnValue)?;
@@ -3647,7 +3688,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 if !cond_is_bool {
                     self.checker.diagnostics.push(
                         Diagnostic::error("if condition must be boolean")
-                            .with_code_str("E004")
+                            .with_code_str(ErrCode::E004)
                             .with_span(*span)
                             .with_label(
                                 cond.span(),
@@ -3909,13 +3950,13 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 ))
             }
             Expr::CompileError(msg, span) => {
-                let diag = Diagnostic::error(msg.clone())
-                    .with_code_str("E099")
+                let diag = Diagnostic::error(msg.to_string())
+                    .with_code_str(ErrCode::E099)
                     .with_help("`@compile_error` halts compilation unconditionally when evaluated")
                     .with_span(*span);
                 self.checker.diagnostics.push(diag);
                 Ok((
-                    HirExpr::CompileError(msg.clone(), *span),
+                    HirExpr::CompileError(msg.to_string(), *span),
                     self.checker.ctx.error(),
                 ))
             }
@@ -4303,7 +4344,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 crate::ast::Literal::Float(v) => Some(ComptimeValue::Float(*v)),
                 crate::ast::Literal::Bool(v) => Some(ComptimeValue::Bool(*v)),
                 crate::ast::Literal::String(s) => {
-                    Some(ComptimeValue::String(std::sync::Arc::from(s.as_str())))
+                    Some(ComptimeValue::String(std::sync::Arc::from(*s)))
                 }
                 _ => None,
             },
@@ -4444,7 +4485,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                          comptime code is sandboxed and cannot call @trusted functions",
                         kind, name,
                     ))
-                    .with_code_str("E081")
+                    .with_code_str(ErrCode::E081)
                     .with_span(span)
                     .with_help("@trusted functions may perform I/O or unsafe operations, which are prohibited in comptime"),
                 );
@@ -4457,7 +4498,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                          comptime code is sandboxed and cannot perform I/O",
                         kind, name,
                     ))
-                    .with_code_str("E081")
+                    .with_code_str(ErrCode::E081)
                     .with_span(span)
                     .with_help("I/O operations are prohibited in comptime"),
                 );
@@ -4472,7 +4513,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                          isolate blocks must not access external mutable state",
                         kind, name,
                     ))
-                    .with_code_str("E093")
+                    .with_code_str(ErrCode::E093)
                     .with_span(span)
                     .with_help("isolate blocks guarantee no external mutable state access; @trusted functions may violate this"),
                 );
@@ -4485,7 +4526,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                          isolate blocks must not perform I/O",
                         kind, name,
                     ))
-                    .with_code_str("E093")
+                    .with_code_str(ErrCode::E093)
                     .with_span(span)
                     .with_help("isolate blocks guarantee no external mutable state access; @io functions may perform I/O"),
                 );
@@ -4584,6 +4625,56 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
         );
     }
 
+    /// Value-fit enforcement for a NEGATED integer literal (`-lit` in a
+    /// unary-minus const context).  Same semantics as
+    /// [`FnCtxt::check_int_literal_fits`] but the fit check runs on the
+    /// negated value, which is never materialized — `IntLit::negated_fits`
+    /// decides without allocating (a `Large` u128-range literal negates to
+    /// a negative BigInt that `to_i128` would silently drop).
+    fn check_int_literal_fits_negated(
+        &mut self,
+        v: &crate::ast::IntLit,
+        expected: TypeId,
+        span: Span,
+    ) {
+        let (bits, unsigned) = match self.checker.ctx.get(expected) {
+            TypeData::Int { bits, signed, .. } => (*bits, !*signed),
+            TypeData::UInt { bits, .. } => (*bits, true),
+            _ => return,
+        };
+        // `bits == 0` is unreachable (`ctx.int` asserts 1..=128) but
+        // `negated_fits` would shift by `bits - 1` underflow — fail closed.
+        if bits == 0 {
+            return;
+        }
+        if v.negated_fits(bits as u64, unsigned) {
+            return;
+        }
+        let ty_name = if unsigned {
+            format!("UInt<{bits}>")
+        } else {
+            format!("Int<{bits}>")
+        };
+        let range = if unsigned {
+            if bits >= 128 {
+                format!("0..={}", u128::MAX)
+            } else {
+                format!("0..={}", (1u128 << bits) - 1)
+            }
+        } else if bits >= 128 {
+            format!("{}..={}", i128::MIN, i128::MAX)
+        } else {
+            format!("{}..={}", -(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+        };
+        self.checker.diagnostics.push(
+            Diagnostic::error(format!(
+                "negated integer literal `-{v}` does not fit in `{ty_name}`"
+            ))
+            .with_span(span)
+            .with_help(format!("`{ty_name}` represents values in {range}")),
+        );
+    }
+
     /// Resolve a syntactic type to a TypeId — actual implementation.
     #[must_use]
     pub fn resolve_type(&mut self, ty: &Type<'input>) -> Result<TypeId, Diagnostic<'src>> {
@@ -4627,7 +4718,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                         .map(|s| s.as_str().to_string())
                                         .unwrap_or_else(|| "?".to_string()),
                                 ))
-                                .with_code_str("E094")
+                                .with_code_str(ErrCode::E094)
                                 .with_span(*span)
                                 .with_help("experimental features are not enabled; use `--enable-experimental` to use this type"),
                             );
@@ -4704,7 +4795,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                         Ok(self.checker.ctx.usize())
                     } else if path[0].eq_str("Unit") {
                         return Err(Diagnostic::error("use `()` instead of `Unit`")
-                            .with_code_str("E031")
+                            .with_code_str(ErrCode::E031)
                             .with_help("Posita uses `()` (empty tuple) to express the unit type")
                             .with_suggestion("replace `Unit` with `()`")
                             .with_span(*span));
@@ -4754,7 +4845,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                         } else if path[0].eq_str("Ptr") {
                             let mut size = self.checker.ctx.usize();
                             let mut pointee = self.checker.ctx.error();
-                            for arg in args {
+                            for arg in args.iter() {
                                 let ty = self.resolve_type(&arg.ty())?;
                                 match arg {
                                     GenericArg::Named(name, _) if name.eq_str("size") => size = ty,
@@ -4780,7 +4871,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 let base_ty = self.resolve_type(base)?;
                 let expanded = self.expand_base_type(base_ty, *span)?;
                 let mut arg_tys: SmallVec<[TypeId; 4]> = SmallVec::new();
-                for arg in args {
+                for arg in args.iter() {
                     arg_tys.push(self.resolve_type(&arg.ty())?);
                 }
                 match self.checker.ctx.get(expanded) {
@@ -4966,7 +5057,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                         Diagnostic::error(
                             "`dyn Trait` is not allowed in strict mode outside `@trusted` code",
                         )
-                        .with_code_str("E004")
+                        .with_code_str(ErrCode::E004)
                         .with_span(*span)
                         .with_help(
                             "dynamic dispatch is rejected in strict mode (SYNTAX.md \
@@ -5177,14 +5268,14 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 Err(Diagnostic::error(
                     "safe cast from reference type requires explicit dereference or unsafe cast",
                 )
-                .with_code_str("E601")
+                .with_code_str(ErrCode::E601)
                 .with_span(span)
                 .with_suggestion("consider dereferencing first: `*expr as TargetType`")
                 .with_suggestion("or use `as!` for an unsafe bitcast"))
             } else {
                 Err(
                     Diagnostic::error("safe cast only allowed between numeric and boolean types")
-                        .with_code_str("E601")
+                        .with_code_str(ErrCode::E601)
                         .with_span(span)
                         .with_suggestion("use `From` trait for non-primitive type conversions"),
                 )
@@ -5200,7 +5291,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             } else if self.ctx().is_reference(from) && self.ctx().is_integer(to) {
                 Err(
                     Diagnostic::error("unsafe cast from reference to integer not yet supported")
-                        .with_code_str("E601")
+                        .with_code_str(ErrCode::E601)
                         .with_span(span)
                         .with_suggestion("consider using `*expr as usize` via a pointer cast"),
                 )
@@ -5209,7 +5300,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 match (c.get(from), c.get(to)) {
                     (TypeData::Ptr { .. }, TypeData::Ptr { .. }) => Ok(to),
                     _ => Err(Diagnostic::error("unsafe cast requires compatible types (numeric<->numeric, ref<->ptr, ptr<->ptr)")
-                        .with_code_str("E601").with_span(span)),
+                        .with_code_str(ErrCode::E601).with_span(span)),
                 }
             }
         }
@@ -5390,7 +5481,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                             "pattern annotation is structurally incompatible \
                              with the existential payload type",
                         )
-                        .with_code_str("E030")
+                        .with_code_str(ErrCode::E030)
                         .with_span(*span));
                     }
                     let res = self.check_pattern(inner, expected_ty, exist_depth);
@@ -5447,7 +5538,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                     type_name,
                                     span: *span,
                                 })
-                                .with_code_str("E010")
+                                .with_code_str(ErrCode::E010)
                             })?;
                     let field_ty = self.checker.ctx.subst(field_def.ty, &subst);
                     hir_fields.push((
@@ -5456,7 +5547,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     ));
                 }
                 Ok(HirPattern::Struct {
-                    path: path.clone(),
+                    path: path.to_vec(),
                     fields: hir_fields,
                     rest: false, // lower_irrelevance is a type-level concern; rest is informational
                     span: *span,
@@ -5696,7 +5787,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                         .map(|inner| self.check_pattern(inner, inner_ty, exist_depth))
                         .transpose()?;
                     Ok(HirPattern::Enum {
-                        path: path.clone(),
+                        path: path.to_vec(),
                         variant: *variant,
                         inner: inner_hir.map(Box::new),
                         span: *span,
@@ -5785,7 +5876,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                         "or-pattern alternatives must bind the same variables: `{}` is missing from an earlier alternative",
                                         n,
                                     ))
-                                    .with_code_str("E105")
+                                    .with_code_str(ErrCode::E105)
                                     .with_span(*span),
                                 );
                             }
@@ -5797,7 +5888,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                         "or-pattern alternatives must bind the same variables: `{}` is missing from this alternative",
                                         n,
                                     ))
-                                    .with_code_str("E105")
+                                    .with_code_str(ErrCode::E105)
                                     .with_span(*span),
                                 );
                             }
@@ -5816,7 +5907,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                                     "or-pattern binding `{}` has incompatible types across alternatives",
                                     n,
                                 ))
-                                .with_code_str("E106")
+                                .with_code_str(ErrCode::E106)
                                 .with_span(*span),
                             );
                             break;
@@ -5848,7 +5939,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     return Err(Diagnostic::error(
                         "cannot bind new type variables in pattern annotation when the expected type is wobbly (inferred)",
                     )
-                    .with_code_str("E067")
+                    .with_code_str(ErrCode::E067)
                     .with_span(span)
                     .with_help("add a type annotation to the scrutinee to make it rigid, or use an existing scoped type variable"));
                 }
@@ -5879,7 +5970,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 elems.iter().any(|&e| self.contains_gadt_skolem(e))
             }
             crate::hir::types::TypeData::Array { elem, .. } => self.contains_gadt_skolem(*elem),
-            crate::hir::types::TypeData::Pointer { ty } => self.contains_gadt_skolem(*ty),
+            crate::hir::types::TypeData::Pointer { ty, .. } => self.contains_gadt_skolem(*ty),
             crate::hir::types::TypeData::Adt { args, .. } => {
                 args.iter().any(|&a| self.contains_gadt_skolem(a))
             }
@@ -5966,8 +6057,8 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             ) => e_size == a_size && self.existential_annotation_compatible(*e_elem, *a_elem),
 
             (
-                crate::hir::types::TypeData::Pointer { ty: e_ty },
-                crate::hir::types::TypeData::Pointer { ty: a_ty },
+                crate::hir::types::TypeData::Pointer { ty: e_ty, .. },
+                crate::hir::types::TypeData::Pointer { ty: a_ty, .. },
             ) => self.existential_annotation_compatible(*e_ty, *a_ty),
 
             (
@@ -6031,7 +6122,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 let msg = format!("use of experimental function `{}`", name);
                 self.checker.diagnostics.push(
                     Diagnostic::error(msg)
-                        .with_code_str("E094")
+                        .with_code_str(ErrCode::E094)
                         .with_span(span)
                         .with_help(
                             "experimental features are not enabled; use `--enable-experimental` to use this function",
@@ -6051,7 +6142,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     };
                     self.checker.diagnostics.push(
                         Diagnostic::warning(msg)
-                            .with_code_str("W090")
+                            .with_code_str(ErrCode::W090)
                             .with_span(span)
                             .with_help("consider migrating to a replacement function"),
                     );

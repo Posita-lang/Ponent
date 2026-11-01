@@ -1,4 +1,4 @@
-//! Stage 5b v2: term-level Yoneda witnesses (paper App. A).
+//! Term-level Yoneda witnesses (paper App. A).
 //!
 //! The paper realizes the isomorphisms (Y⁺)/(Y⁻) with explicit pairs of
 //! terms: s[x]/t[x] for (Y⁺) (built from the initial-algebra fold `fold_T`,
@@ -26,6 +26,23 @@
 //! `embed_type_instantiation` / `embed_type_abstraction` (+ `FlatKind`).
 
 /// A Church-style λ2 term, de Bruijn.
+///
+/// TWO-POOL INVARIANT: `Var(i)` indices count ONLY `Lam` binders.
+/// `TyLam` (Λ) and `TyApp` are pure markers — they occupy no de Bruijn
+/// slot and never shift term indices.  This is the faithful image of the
+/// paper's App. A named-variable witness discipline: type instantiation
+/// leaves term variables untouched (`s[t[x]] ≈_βη x` holds by
+/// construction, with no per-erasure shift lemma).  The `TyApp` usize is
+/// a type marker; no scope walker touches it.
+///
+/// HIDDEN-FIELD AUDIT (two-pool, field by field): every extra `usize`
+/// carried by a variant is a TAG, not a term index — `InSum.branch`
+/// (ι_k branch tag), `Proj.index` (π_j projection tag), `TyApp`'s
+/// type-arg marker.  `SumCase.branches`, `Pair`, `Fold/Unfold.body`
+/// carry term slots only.  All scope walkers (`fvs`, `subst_term`,
+/// `shift`) recurse exclusively into `Term`-bearing fields and pass the
+/// tags through verbatim (pinned for Fold/Unfold+TyLam by
+/// `shift_two_pool_pins`; the tag fields are skipped by construction).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Term {
     /// de Bruijn index (term variable).
@@ -90,7 +107,11 @@ impl Term {
                 }
             }
             Term::TyApp(f, t) => {
-                // Type-β: ΛX.b instantiated ↦ b.  The IR does not track
+                // Type-β: ΛX.b instantiated ↦ b.  Two-pool: the erasure is
+                // SHIFT-FREE — Λ binds no term variable, so b's term
+                // indices are already correct in the outer scope (this is
+                // exactly the paper's App. A named-variable behavior,
+                // `s[t[x]] ≈_βη x`).  The IR does not track
                 // type structure in terms (the usize only marks WHICH
                 // instantiation a caller planted, e.g. the §7.2 reduct
                 // marker α); the marker survives on non-Λ heads — it must,
@@ -163,7 +184,10 @@ impl Term {
                     }
                 }
                 Term::Var(_) => {}
-                Term::Lam(b) | Term::TyLam(b) => go(b, depth + 1, out),
+                // Two-pool: Λ is transparent — it binds no term variable
+                // and occupies no de Bruijn level.
+                Term::Lam(b) => go(b, depth + 1, out),
+                Term::TyLam(b) => go(b, depth, out),
                 Term::App(f, a) => {
                     go(f, depth, out);
                     go(a, depth, out);
@@ -189,6 +213,13 @@ impl Term {
             }
         }
         go(self, 0, out);
+    }
+
+    /// Lift every free term variable by `d` levels (for planting a term
+    /// under `d` NEW `Lam` binders).  Two-pool: `TyLam` is transparent —
+    /// type binders consume no term slot, so nothing under a Λ moves.
+    pub fn shift(&self, d: usize) -> Term {
+        shift(self.clone(), 0, d as isize)
     }
 
     /// η-reduce λx. f x → f (x ∉ FV(f)) at the top level, once.
@@ -224,7 +255,8 @@ fn subst_term(t: Term, j: usize, v: &Term) -> Term {
                 }
             }
             Term::Lam(b) => Term::lam(go(*b, j, v, depth + 1)),
-            Term::TyLam(b) => Term::tylam(go(*b, j, v, depth + 1)),
+            // Two-pool: Λ binds no term variable — depth unchanged.
+            Term::TyLam(b) => Term::tylam(go(*b, j, v, depth)),
             Term::App(f, a) => Term::app(go(*f, j, v, depth), go(*a, j, v, depth)),
             Term::TyApp(f, ty) => Term::TyApp(Box::new(go(*f, j, v, depth)), ty),
             Term::InSum { branch, value } => Term::InSum {
@@ -273,7 +305,8 @@ fn shift(t: Term, cutoff: usize, d: isize) -> Term {
                 }
             }
             Term::Lam(b) => Term::lam(go(*b, cutoff, d, depth + 1)),
-            Term::TyLam(b) => Term::tylam(go(*b, cutoff, d, depth + 1)),
+            // Two-pool: Λ binds no term variable — depth unchanged.
+            Term::TyLam(b) => Term::tylam(go(*b, cutoff, d, depth)),
             Term::App(f, a) => Term::app(go(*f, cutoff, d, depth), go(*a, cutoff, d, depth)),
             Term::TyApp(f, ty) => Term::TyApp(Box::new(go(*f, cutoff, d, depth)), ty),
             Term::InSum { branch, value } => Term::InSum {
@@ -363,10 +396,11 @@ pub fn yoneda_plus_terms(branch_arities: &[usize]) -> (Term, Term) {
     // application to an InSum-valued z dispatches to f_k.
     let mut case_bodies = Vec::new();
     for (k, &arity) in branch_arities.iter().enumerate() {
-        // Binders inside the case body: p_j (arity, innermost), w (the
-        // fold's λ), z, then f_{K-1}..f_0 (f_{K-1} innermost — the λ⟨f_k⟩
-        // sequence curries f_0 outermost).  NB the ΛX TyLam also occupies
-        // a de Bruijn level:  f_k = Var(arity + 2 + (K-1-k)).
+        // Binders inside the case body (innermost first): p_j (arity),
+        // w (the fold's λ), z, then f_{K-1}..f_0 (f_{K-1} innermost —
+        // the λ⟨f_k⟩ sequence curries f_0 outermost):  f_k =
+        // Var(arity + 2 + (K-1-k)).  Two-pool: the outermost ΛX binds no
+        // term variable and consumes no slot — it never enters the count.
         let mut call = Term::Var(arity + 2 + (branch_arities.len() - 1 - k));
         for j in 0..arity {
             call = Term::app(call, Term::Var(arity - 1 - j));
@@ -604,6 +638,65 @@ mod tests {
         assert_eq!(term.normalize(), Term::app(Term::Var(3), Term::Var(0)));
     }
 
+    /// Two-pool semantic pin (the paper's App. A named-variable behavior):
+    /// instantiating a Λ must NOT move term variables.  Under the old
+    /// unified-pool reading the Λ consumed a phantom de Bruijn slot, so
+    /// erasure left free indices dangling by one; here λa. (ΛY. a)@Y a
+    /// →_βη λa. a a with `a` (Var(0)) surviving untouched.
+    #[test]
+    fn tyapp_beta_erasure_leaves_term_indices_untouched() {
+        let inner = Term::TyLam(Box::new(Term::Var(0))); // ΛY. a
+        let t = Term::Lam(Box::new(Term::App(
+            // λa. (ΛY.a)@Y a
+            Box::new(Term::TyApp(Box::new(inner), 7)),
+            Box::new(Term::Var(0)),
+        )));
+        let nf = t.normalize();
+        match &nf {
+            Term::Lam(b) => match b.as_ref() {
+                Term::App(f_, a) => {
+                    assert!(matches!(a.as_ref(), Term::Var(0)));
+                    assert!(
+                        matches!(f_.as_ref(), Term::Var(0)),
+                        "a must survive the Λ erasure unchanged: {f_:?}"
+                    );
+                }
+                other => panic!("expected an application: {other:?}"),
+            },
+            other => panic!("expected the λ to survive: {other:?}"),
+        }
+    }
+
+    /// Two-pool shift pin: `shift` must traverse Fold/Unfold bodies, and
+    /// TyLam must be TRANSPARENT to the de Bruijn space (it consumes no
+    /// slot, so a free Var under it still shifts).  The free Var(0) under
+    /// the TyLam lands at 2 after shift(2); under the old unified-pool
+    /// discipline the TyLam would have counted as a binder and the Var
+    /// (seen as bound, 0 < depth) would have stayed at 0.
+    #[test]
+    fn shift_two_pool_pins() {
+        let t = Term::Fold {
+            body: Box::new(Term::Unfold {
+                body: Box::new(Term::TyLam(Box::new(Term::Var(0)))),
+            }),
+        };
+        let planted = t.shift(2);
+        let v = match planted {
+            Term::Fold { body } => match *body {
+                Term::Unfold { body } => match *body {
+                    Term::TyLam(b) => *b,
+                    o => panic!("expected TyLam: {o:?}"),
+                },
+                o => panic!("expected Unfold: {o:?}"),
+            },
+            o => panic!("expected Fold: {o:?}"),
+        };
+        assert!(
+            matches!(v, Term::Var(2)),
+            "shift through Fold/Unfold, TyLam transparent: {v:?}"
+        );
+    }
+
     /// (μ) computation rule: fold_T(case-split) applied to an InSum
     /// dispatches to the matching branch handler — the computational
     /// content of s∘t in App. A's proof of s[t[x]] ≈ x.
@@ -667,7 +760,10 @@ mod tests {
         // (ν) fires twice (outer unfold exposes the inner coalgebra, the
         // inner Unfold{Pair} cancels) → h.
         let nf = composed.normalize();
-        assert_eq!(nf, h, "out∘unfold must expose the coalgebra: ĉ_0 over ν-package");
+        assert_eq!(
+            nf, h,
+            "out∘unfold must expose the coalgebra: ĉ_0 over ν-package"
+        );
         let _ = v;
     }
 
@@ -675,7 +771,9 @@ mod tests {
     /// TyApp; abstraction wraps in the intro witness.
     #[test]
     fn embed_shapes() {
-        let plus = FlatKind::Plus { branch_arities: vec![2, 1] };
+        let plus = FlatKind::Plus {
+            branch_arities: vec![2, 1],
+        };
         let minus = FlatKind::Minus { factor_count: 3 };
         // Instantiation: s/u applied to TyApp(u^♭, α).
         let e = embed_type_instantiation(Term::Var(0), &plus, 7);
@@ -725,7 +823,9 @@ mod tests {
     /// firing inside the fold.
     #[test]
     fn embed_plus_round_trip_kernel() {
-        let kind = FlatKind::Plus { branch_arities: vec![1] };
+        let kind = FlatKind::Plus {
+            branch_arities: vec![1],
+        };
         // x_mock = ΛX. λh. h@X g   (g = λq. q, closed) — the faithful
         // Λ2 mock: u^♭ is Λ-abstracted (so the reduct marker type-β's),
         // and its handler use goes through a type application (so that
@@ -752,10 +852,7 @@ mod tests {
         // t@α f s_out → (μ) fold dispatches branch 0 → f (Pair([g])).
         let (_, t) = yoneda_plus_terms(&[1]);
         let identity = Term::lam(Term::Var(0));
-        let intro = Term::app(
-            Term::app(Term::TyApp(Box::new(t), 0), identity),
-            s_out,
-        );
+        let intro = Term::app(Term::app(Term::TyApp(Box::new(t), 0), identity), s_out);
         let nf = intro.normalize();
         assert_eq!(
             nf,

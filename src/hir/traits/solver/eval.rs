@@ -236,8 +236,10 @@ fn canonicalize_type<'input>(
             ty: Box::new(canonicalize_type(ctx, *ty, bound)),
             mutable: *mutable,
         },
-        TypeData::Pointer { ty } => CanonTy::Pointer(Box::new(canonicalize_type(ctx, *ty, bound))),
-        TypeData::Ptr { size, pointee } => CanonTy::Ptr {
+        TypeData::Pointer { ty, .. } => {
+            CanonTy::Pointer(Box::new(canonicalize_type(ctx, *ty, bound)))
+        }
+        TypeData::Ptr { size, pointee, .. } => CanonTy::Ptr {
             size: Box::new(canonicalize_type(ctx, *size, bound)),
             pointee: Box::new(canonicalize_type(ctx, *pointee, bound)),
         },

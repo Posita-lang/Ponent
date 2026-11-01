@@ -52,8 +52,9 @@ pub enum TypeTag {
     Adt = 28,
     SkolemVar = 29,
     /// A compile-time validated regular expression: `Regex<"pattern">`.
-    /// Replaces the old `Reserved30` slot — the last valid discriminant is
-    /// now `Regex = 30`; only `Reserved31 = 31` remains as a padding variant.
+    /// Replaces the old `Reserved30` slot.  (No padding variant remains:
+    /// `TypeKind = 31` is a REAL variant — see the note on
+    /// `TAG_LAST_VARIANT`; the next variant must bump `TAG_BITS` to 6.)
     Regex = 30,
     /// `Type` — the type of types, used as a first-class value in comptime.
     TypeKind = 31,
@@ -107,7 +108,7 @@ impl TypeId {
     const TAG_MASK: usize = (1 << Self::TAG_BITS) - 1;
     /// The last valid discriminant value (not the mask — those differ when
     /// reserved variants fill the gap to the bit boundary).  Set to the
-    /// highest *real* variant.  B2: `TypeKind = 31` is a REAL variant
+    /// highest *real* variant.  `TypeKind = 31` is a REAL variant
     /// (`TypeData::Type` / `TypeData::Opaque` map to it), so the bound is
     /// TypeKind, not Regex — the old `Regex` bound fired the `tag()`
     /// debug assert on every `Type`/`Opaque`-tagged `TypeId` (TAITs are a
@@ -133,8 +134,9 @@ impl TypeId {
     pub const NONE: TypeId = TypeId(unsafe {
         // SAFETY: `usize::MAX` is non-zero, so `NonZeroUsize::new_unchecked`
         // never creates an invalid value; the encoding is a sentinel whose
-        // `index()` lands on the reserved `Reserved31` variant (guarded by
-        // `debug_assert!` in `index()`).
+        // 5-bit tag is 31 (`TypeKind` — a real variant:
+        // ALL 32 five-bit patterns are occupied, none reserved) and whose
+        // `index()` is guarded by an `assert!`.
         NonZeroUsize::new_unchecked(usize::MAX)
     });
 
@@ -179,10 +181,11 @@ impl TypeId {
             Self::TAG_MAX,
         );
         // SAFETY: every TypeId created through TypeContext::alloc has a valid
-        // tag in 0..TAG_LAST_VARIANT, enforced by TypeTag's explicit discriminants
-        // and debug_assert above.  TAG_MASK covers all 5-bit patterns, and
-        // Reserved30/Reserved31 ensure that even out-of-range values (30, 31)
-        // produce a valid, albeit unreachable, variant — never UB.
+        // tag in 0..=TAG_LAST_VARIANT, enforced by TypeTag's explicit
+        // discriminants and the debug_assert above.  Since then ALL
+        // 32 five-bit patterns are real `TypeTag` variants (none reserved),
+        // so the transmute is total — any in-range 5-bit value decodes to a
+        // meaningful variant, never UB.
         unsafe { std::mem::transmute::<usize, TypeTag>(tag_val) }
     }
 }
@@ -243,12 +246,32 @@ pub enum TypeData {
         /// annotation to the UniversalRegions early-bound region.
         lifetime: Option<Symbol>,
     },
+    /// Raw pointer. `mutable: false` ≙ `*const T` — covariant in T (the
+    /// current `*T` sugar lowers here); `mutable: true` ≙ `*mut T` —
+    /// INVARIANT in T.  The `*const`/`*mut` surface split IS in the
+    /// grammar as of SYNTAX.md 2026-10-28 (§2.1/§2.2).  Layer status:
+    /// variance invariant edges ✓ (pinned by
+    /// `variance_edges_match_pointer_mutability`); subtype four-quadrant ✓
+    /// (pinned by `pointer_subtype_matches_mutability_rules`).  Pending:
+    /// checker ABI gate (types-layer support:
+    /// `raw_ptr_shape`/`extern_c_ptr_size_ok`), UnsafeCell::get/MMIO
+    /// minting via `pointer_mut`, parser deprecation warning on bare `*T`.
     Pointer {
         ty: TypeId,
+        mutable: bool,
     },
+    /// Non-platform-width raw pointer: `Ptr<size, pointee> with
+    /// mutability = const | mut` (SYNTAX.md 2026-10-28 §2.1).  The FAQ
+    /// pins why the field lives here: mutability must be expressible for
+    /// ANY Ptr, including non-platform-width ones, and §4.6 makes a
+    /// platform-width bare Ptr ambiguous in an extern "C" signature
+    /// without it.  Variance (§2.4) follows `mutable`: const ⇒ covariant
+    /// in `pointee`, mut ⇒ invariant; `size` (the pointer's own width
+    /// axis) is invariant either way.
     Ptr {
         size: TypeId,
         pointee: TypeId,
+        mutable: bool,
     },
     Fn {
         params: SmallVec<[TypeId; 4]>,
@@ -470,9 +493,28 @@ impl fmt::Display for TypeData {
                     write!(f, "&{}", ty.tag())
                 }
             }
-            TypeData::Pointer { ty } => write!(f, "*{}", ty.tag()),
-            TypeData::Ptr { size, pointee } => {
-                write!(f, "Ptr<size={}, pointee={}>", size.tag(), pointee.tag())
+            TypeData::Pointer { ty, mutable } => {
+                if *mutable {
+                    write!(f, "*mut {}", ty.tag())
+                } else {
+                    // §2.2: bare `*T` is a DEPRECATED synonym for `*const T`;
+                    // display must use the explicit form (capsa audit shows
+                    // the expanded form too).
+                    write!(f, "*const {}", ty.tag())
+                }
+            }
+            TypeData::Ptr {
+                size,
+                pointee,
+                mutable,
+            } => {
+                write!(
+                    f,
+                    "Ptr<size={}, pointee={}> with mutability = {}",
+                    size.tag(),
+                    pointee.tag(),
+                    if *mutable { "mut" } else { "const" }
+                )
             }
             TypeData::Fn { params, ret } => {
                 write!(f, "fn(")?;
@@ -552,13 +594,26 @@ impl TypeData {
                 let ret = ctx.get(*ret).display_with(ctx, symbols);
                 Cow::Owned(format!("fn({}) -> {}", params.join(", "), ret))
             }
-            TypeData::Ptr { size, pointee } => Cow::Owned(format!(
-                "Ptr<size={}, pointee={}>",
+            TypeData::Ptr {
+                size,
+                pointee,
+                mutable,
+            } => Cow::Owned(format!(
+                "Ptr<size={}, pointee={}> with mutability = {}",
                 ctx.get(*size).display_with(ctx, symbols),
-                ctx.get(*pointee).display_with(ctx, symbols)
+                ctx.get(*pointee).display_with(ctx, symbols),
+                if *mutable { "mut" } else { "const" }
             )),
-            TypeData::Pointer { ty } => {
-                Cow::Owned(format!("*{}", ctx.get(*ty).display_with(ctx, symbols)))
+            TypeData::Pointer { ty, mutable } => {
+                if *mutable {
+                    Cow::Owned(format!("*mut {}", ctx.get(*ty).display_with(ctx, symbols)))
+                } else {
+                    // §2.2: bare `*T` is deprecated — display the explicit form.
+                    Cow::Owned(format!(
+                        "*const {}",
+                        ctx.get(*ty).display_with(ctx, symbols)
+                    ))
+                }
             }
             TypeData::Adt { kind, def_id, .. } => {
                 if def_id == &DefId::SENTINEL_STR {
@@ -670,19 +725,21 @@ pub enum Variance {
 
 impl Variance {
     /// Transform variance when going through a position of `self` variance.
-    /// For example, if we are in an Invariant context and encounter a Covariant
-    /// position (Fn return), the result is Invariant * Covariant = Covariant.
-    /// If we are in a Covariant context and encounter a Contravariant position
-    /// (Fn parameter), the result is Covariant * Contravariant = Contravariant.
+    /// Composition multiplies {Cov=+1, Contra=−1, Invariant=0}:
+    /// Invariant dominates in EITHER argument (0·x = x·0 = 0).
+    /// For example, going through an Invariant context (e.g. inside
+    /// `&mut T`) always requires strict equality, regardless of the
+    /// inner position; if we are in a Covariant context and encounter a
+    /// Contravariant position (Fn parameter), the result is
+    /// Covariant * Contravariant = Contravariant.
     pub fn xform(self, position: Variance) -> Variance {
         match (self, position) {
-            (Variance::Invariant, _) => position,
+            (Variance::Invariant, _) => Variance::Invariant,
+            (_, Variance::Invariant) => Variance::Invariant,
             (Variance::Covariant, Variance::Covariant) => Variance::Covariant,
             (Variance::Covariant, Variance::Contravariant) => Variance::Contravariant,
-            (Variance::Covariant, Variance::Invariant) => Variance::Invariant,
             (Variance::Contravariant, Variance::Covariant) => Variance::Contravariant,
             (Variance::Contravariant, Variance::Contravariant) => Variance::Covariant,
-            (Variance::Contravariant, Variance::Invariant) => Variance::Invariant,
         }
     }
 }
@@ -854,11 +911,37 @@ impl<'input> TypeFactory<'input> {
     }
 
     pub fn pointer(&self, ty: TypeId) -> TypeId {
-        self.alloc(TypeData::Pointer { ty }).0
+        self.alloc(TypeData::Pointer { ty, mutable: false }).0
+    }
+
+    /// `*mut T` — INVARIANT in T.  The surface form is in the 2026-10-28
+    /// grammar (§2.1); in-tree minting sites (checker slices) pending —
+    /// tests mint by hand.
+    pub fn pointer_mut(&self, ty: TypeId) -> TypeId {
+        self.alloc(TypeData::Pointer { ty, mutable: true }).0
     }
 
     pub fn ptr(&self, size: TypeId, pointee: TypeId) -> TypeId {
-        self.alloc(TypeData::Ptr { size, pointee }).0
+        // §2.1: `mutability` defaults to `const`.
+        self.alloc(TypeData::Ptr {
+            size,
+            pointee,
+            mutable: false,
+        })
+        .0
+    }
+
+    /// `Ptr<size, pointee> with mutability = mut` — INVARIANT in `pointee`
+    /// (§2.4).  The surface form is in the 2026-10-28 grammar (§2.1);
+    /// in-tree minting sites (checker slices) pending — tests mint by
+    /// hand.
+    pub fn ptr_mut(&self, size: TypeId, pointee: TypeId) -> TypeId {
+        self.alloc(TypeData::Ptr {
+            size,
+            pointee,
+            mutable: true,
+        })
+        .0
     }
 
     pub fn function(&self, params: SmallVec<[TypeId; 4]>, ret: TypeId) -> TypeId {

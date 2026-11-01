@@ -1,4 +1,4 @@
-//! Stage 5b v3: typed witness IR — carries the typed B-protocol context Φ
+//! Typed witness IR — carries the typed B-protocol context Φ
 //! (the ε-rule premise) so that the witness round trips s[t[x]] ≈_ε x /
 //! t[s[x]] ≈_ε x close *fully*: every reduction step is type-checked
 //! (fail-closed), and Φ is definitionally expanded over the polynomial
@@ -65,28 +65,55 @@ pub struct TTerm {
 pub enum TKind {
     Var(usize),
     /// λ over a term binder of type `binder`.
-    Lam { binder: TypeId, body: Box<TTerm> },
+    Lam {
+        binder: TypeId,
+        body: Box<TTerm>,
+    },
     App(Box<TTerm>, Box<TTerm>),
     /// Λ over the type binder `param` (a `GenericParam` index).
-    TyLam { param: usize, body: Box<TTerm> },
+    TyLam {
+        param: usize,
+        body: Box<TTerm>,
+    },
     /// Type application with the caller-supplied instantiated result type.
     /// `typed_normalize` verifies `result ≡ subst(f's ∀-body, param ↦ arg)`
     /// — the reduct marker of the §7.2 embedding is checked, not trusted.
-    TyApp { f: Box<TTerm>, arg: TypeId, result: TypeId },
+    TyApp {
+        f: Box<TTerm>,
+        arg: TypeId,
+        result: TypeId,
+    },
     /// Sum injection into branch k.  The stamped `ty` is EITHER the
     /// T-view `Σ(branches)` or the μ-view (the carrier whose body is
     /// that coproduct — the constructor application `in^k(w)`); both are
     /// verified against the branches at normalization.
-    InSum { branch: usize, value: Box<TTerm>, branches: Vec<TypeId> },
-    SumCase { scrutinee: Box<TTerm>, branches: Vec<Box<TTerm>>, result: TypeId },
+    InSum {
+        branch: usize,
+        value: Box<TTerm>,
+        branches: Vec<TypeId>,
+    },
+    SumCase {
+        scrutinee: Box<TTerm>,
+        branches: Vec<Box<TTerm>>,
+        result: TypeId,
+    },
     Pair(Vec<Box<TTerm>>),
-    Proj { index: usize, value: Box<TTerm> },
+    Proj {
+        index: usize,
+        value: Box<TTerm>,
+    },
     /// Initial-algebra fold: `body : F(carrier) → carrier`, `ty = carrier`.
     /// `carrier` must be a `Mu`.
-    Fold { body: Box<TTerm>, carrier: TypeId },
+    Fold {
+        body: Box<TTerm>,
+        carrier: TypeId,
+    },
     /// Final-coalgebra unfold: `body : carrier`, `ty = carrier`'s body.
     /// `carrier` must be a `Nu`.
-    Unfold { body: Box<TTerm>, carrier: TypeId },
+    Unfold {
+        body: Box<TTerm>,
+        carrier: TypeId,
+    },
 }
 
 fn mk(kind: TKind, ty: TypeId) -> TTerm {
@@ -111,15 +138,18 @@ fn mentions(ctx: &TypeContext, ty: TypeId, param: usize) -> bool {
         TypeData::Coproduct { alternatives } => {
             alternatives.iter().any(|&a| mentions(ctx, a, param))
         }
-        TypeData::Mu { param_index, body, .. } | TypeData::Nu { param_index, body, .. } => {
-            *param_index != param && mentions(ctx, *body, param)
+        TypeData::Mu {
+            param_index, body, ..
         }
-        TypeData::Forall { param_index, body, .. } => {
-            *param_index != param && mentions(ctx, *body, param)
-        }
-        TypeData::Exists { param_index, base, .. } => {
-            *param_index != param && mentions(ctx, *base, param)
-        }
+        | TypeData::Nu {
+            param_index, body, ..
+        } => *param_index != param && mentions(ctx, *body, param),
+        TypeData::Forall {
+            param_index, body, ..
+        } => *param_index != param && mentions(ctx, *body, param),
+        TypeData::Exists {
+            param_index, base, ..
+        } => *param_index != param && mentions(ctx, *base, param),
         _ => false,
     }
 }
@@ -132,12 +162,7 @@ fn mentions(ctx: &TypeContext, ty: TypeId, param: usize) -> bool {
 /// tuples (pointwise), and `Fn(P, A')` with `param` only in the codomain
 /// (post-composition `A(g)(z) = g ∘ z`).  Everything else — including
 /// μ/ν/∃/∀-shaped functors — is fail-closed `None`.
-pub fn functor_action(
-    ctx: &mut TypeContext,
-    a: TypeId,
-    param: usize,
-    g: TTerm,
-) -> Option<TTerm> {
+pub fn functor_action(ctx: &mut TypeContext, a: TypeId, param: usize, g: TTerm) -> Option<TTerm> {
     // g must be a single-param morphism src → dst.
     let (src, dst) = match ctx.get(g.ty) {
         TypeData::Fn { params, ret } if params.len() == 1 => (params[0], *ret),
@@ -146,7 +171,10 @@ pub fn functor_action(
     if !mentions(ctx, a, param) {
         // Const functor: the morphism map is the identity at A.
         return Some(mk(
-            TKind::Lam { binder: a, body: Box::new(mk(TKind::Var(0), a)) },
+            TKind::Lam {
+                binder: a,
+                body: Box::new(mk(TKind::Var(0), a)),
+            },
             ctx.function(smallvec![a], a),
         ));
     }
@@ -165,7 +193,10 @@ pub fn functor_action(
             let mut parts: Vec<Box<TTerm>> = Vec::new();
             for (j, &a_j) in elems.iter().enumerate() {
                 let proj_j = mk(
-                    TKind::Proj { index: j, value: Box::new(mk(TKind::Var(0), a_src)) },
+                    TKind::Proj {
+                        index: j,
+                        value: Box::new(mk(TKind::Var(0), a_src)),
+                    },
                     ctx.subst(a_j, &Subst::from_single(param, src)),
                 );
                 if mentions(ctx, a_j, param) {
@@ -187,7 +218,10 @@ pub fn functor_action(
             }
             let pair = mk(TKind::Pair(parts), a_dst);
             Some(mk(
-                TKind::Lam { binder: a_src, body: Box::new(pair) },
+                TKind::Lam {
+                    binder: a_src,
+                    body: Box::new(pair),
+                },
                 ctx.function(smallvec![a_src], a_dst),
             ))
         }
@@ -214,7 +248,10 @@ pub fn functor_action(
             for j in 0..n {
                 let call_ty = call.ty;
                 call = mk(
-                    TKind::App(Box::new(call), Box::new(mk(TKind::Var(n - 1 - j), params[j]))),
+                    TKind::App(
+                        Box::new(call),
+                        Box::new(mk(TKind::Var(n - 1 - j), params[j])),
+                    ),
                     {
                         // each step's type: the remaining function type of z
                         match ctx.get(call_ty) {
@@ -230,10 +267,22 @@ pub fn functor_action(
             let mut cur_ty = dst;
             for j in (0..n).rev() {
                 let layer_ty = ctx.function(smallvec![params[j]], cur_ty);
-                term = mk(TKind::Lam { binder: params[j], body: Box::new(term) }, layer_ty);
+                term = mk(
+                    TKind::Lam {
+                        binder: params[j],
+                        body: Box::new(term),
+                    },
+                    layer_ty,
+                );
                 cur_ty = layer_ty;
             }
-            term = mk(TKind::Lam { binder: a_src, body: Box::new(term) }, ctx.function(smallvec![a_src], a_dst));
+            term = mk(
+                TKind::Lam {
+                    binder: a_src,
+                    body: Box::new(term),
+                },
+                ctx.function(smallvec![a_src], a_dst),
+            );
             Some(term)
         }
         _ => None, // μ/ν/∃/∀-shaped functors: v2 (fail-closed)
@@ -260,47 +309,88 @@ fn tsubst(t: TTerm, j: usize, v: &TTerm, depth: usize) -> TTerm {
             }
         }
         TKind::Lam { binder, body } => mk(
-            TKind::Lam { binder, body: Box::new(tsubst(*body, j, v, depth + 1)) },
+            TKind::Lam {
+                binder,
+                body: Box::new(tsubst(*body, j, v, depth + 1)),
+            },
             t.ty,
         ),
         TKind::App(f, a) => mk(
-            TKind::App(Box::new(tsubst(*f, j, v, depth)), Box::new(tsubst(*a, j, v, depth))),
+            TKind::App(
+                Box::new(tsubst(*f, j, v, depth)),
+                Box::new(tsubst(*a, j, v, depth)),
+            ),
             t.ty,
         ),
         TKind::TyLam { param, body } => mk(
-            TKind::TyLam { param, body: Box::new(tsubst(*body, j, v, depth)) },
+            TKind::TyLam {
+                param,
+                body: Box::new(tsubst(*body, j, v, depth)),
+            },
             t.ty,
         ),
         TKind::TyApp { f, arg, result } => mk(
-            TKind::TyApp { f: Box::new(tsubst(*f, j, v, depth)), arg, result },
+            TKind::TyApp {
+                f: Box::new(tsubst(*f, j, v, depth)),
+                arg,
+                result,
+            },
             t.ty,
         ),
-        TKind::InSum { branch, value, branches } => mk(
-            TKind::InSum { branch, value: Box::new(tsubst(*value, j, v, depth)), branches },
+        TKind::InSum {
+            branch,
+            value,
+            branches,
+        } => mk(
+            TKind::InSum {
+                branch,
+                value: Box::new(tsubst(*value, j, v, depth)),
+                branches,
+            },
             t.ty,
         ),
-        TKind::SumCase { scrutinee, branches, result } => mk(
+        TKind::SumCase {
+            scrutinee,
+            branches,
+            result,
+        } => mk(
             TKind::SumCase {
                 scrutinee: Box::new(tsubst(*scrutinee, j, v, depth)),
-                branches: branches.into_iter().map(|b| Box::new(tsubst(*b, j, v, depth))).collect(),
+                branches: branches
+                    .into_iter()
+                    .map(|b| Box::new(tsubst(*b, j, v, depth)))
+                    .collect(),
                 result,
             },
             t.ty,
         ),
         TKind::Pair(ps) => mk(
-            TKind::Pair(ps.into_iter().map(|p| Box::new(tsubst(*p, j, v, depth))).collect()),
+            TKind::Pair(
+                ps.into_iter()
+                    .map(|p| Box::new(tsubst(*p, j, v, depth)))
+                    .collect(),
+            ),
             t.ty,
         ),
         TKind::Proj { index, value } => mk(
-            TKind::Proj { index, value: Box::new(tsubst(*value, j, v, depth)) },
+            TKind::Proj {
+                index,
+                value: Box::new(tsubst(*value, j, v, depth)),
+            },
             t.ty,
         ),
         TKind::Fold { body, carrier } => mk(
-            TKind::Fold { body: Box::new(tsubst(*body, j, v, depth)), carrier },
+            TKind::Fold {
+                body: Box::new(tsubst(*body, j, v, depth)),
+                carrier,
+            },
             t.ty,
         ),
         TKind::Unfold { body, carrier } => mk(
-            TKind::Unfold { body: Box::new(tsubst(*body, j, v, depth)), carrier },
+            TKind::Unfold {
+                body: Box::new(tsubst(*body, j, v, depth)),
+                carrier,
+            },
             t.ty,
         ),
     }
@@ -316,27 +406,37 @@ fn tshift(t: TTerm, cutoff: usize, d: isize) -> TTerm {
                     TKind::Var(i)
                 }
             }
-            TKind::Lam { binder, body } => {
-                TKind::Lam { binder, body: Box::new(go(*body, cutoff, d, depth + 1)) }
-            }
+            TKind::Lam { binder, body } => TKind::Lam {
+                binder,
+                body: Box::new(go(*body, cutoff, d, depth + 1)),
+            },
             TKind::App(f, a) => TKind::App(
                 Box::new(go(*f, cutoff, d, depth)),
                 Box::new(go(*a, cutoff, d, depth)),
             ),
-            TKind::TyLam { param, body } => {
-                TKind::TyLam { param, body: Box::new(go(*body, cutoff, d, depth)) }
-            }
+            TKind::TyLam { param, body } => TKind::TyLam {
+                param,
+                body: Box::new(go(*body, cutoff, d, depth)),
+            },
             TKind::TyApp { f, arg, result } => TKind::TyApp {
                 f: Box::new(go(*f, cutoff, d, depth)),
                 arg,
                 result,
             },
-            TKind::InSum { branch, value, branches } => TKind::InSum {
+            TKind::InSum {
+                branch,
+                value,
+                branches,
+            } => TKind::InSum {
                 branch,
                 value: Box::new(go(*value, cutoff, d, depth)),
                 branches,
             },
-            TKind::SumCase { scrutinee, branches, result } => TKind::SumCase {
+            TKind::SumCase {
+                scrutinee,
+                branches,
+                result,
+            } => TKind::SumCase {
                 scrutinee: Box::new(go(*scrutinee, cutoff, d, depth)),
                 branches: branches
                     .into_iter()
@@ -345,17 +445,22 @@ fn tshift(t: TTerm, cutoff: usize, d: isize) -> TTerm {
                 result,
             },
             TKind::Pair(ps) => TKind::Pair(
-                ps.into_iter().map(|p| Box::new(go(*p, cutoff, d, depth))).collect(),
+                ps.into_iter()
+                    .map(|p| Box::new(go(*p, cutoff, d, depth)))
+                    .collect(),
             ),
-            TKind::Proj { index, value } => {
-                TKind::Proj { index, value: Box::new(go(*value, cutoff, d, depth)) }
-            }
-            TKind::Fold { body, carrier } => {
-                TKind::Fold { body: Box::new(go(*body, cutoff, d, depth)), carrier }
-            }
-            TKind::Unfold { body, carrier } => {
-                TKind::Unfold { body: Box::new(go(*body, cutoff, d, depth)), carrier }
-            }
+            TKind::Proj { index, value } => TKind::Proj {
+                index,
+                value: Box::new(go(*value, cutoff, d, depth)),
+            },
+            TKind::Fold { body, carrier } => TKind::Fold {
+                body: Box::new(go(*body, cutoff, d, depth)),
+                carrier,
+            },
+            TKind::Unfold { body, carrier } => TKind::Unfold {
+                body: Box::new(go(*body, cutoff, d, depth)),
+                carrier,
+            },
         };
         mk(kind, t.ty)
     }
@@ -384,7 +489,10 @@ impl TTerm {
                 let body = body?;
                 let body_ty = body.ty;
                 Some(mk(
-                    TKind::Lam { binder: *binder, body: Box::new(body) },
+                    TKind::Lam {
+                        binder: *binder,
+                        body: Box::new(body),
+                    },
                     ctx.function(smallvec![*binder], body_ty),
                 ))
             }
@@ -395,14 +503,29 @@ impl TTerm {
                 // consuming a constructor application commutes with the
                 // functor action on the branch payload.
                 if let (
-                    TTerm { kind: TKind::Fold { body: h, carrier }, .. },
-                    TTerm { kind: TKind::InSum { branch, value, branches }, .. },
+                    TTerm {
+                        kind: TKind::Fold { body: h, carrier },
+                        ..
+                    },
+                    TTerm {
+                        kind:
+                            TKind::InSum {
+                                branch,
+                                value,
+                                branches,
+                            },
+                        ..
+                    },
                 ) = (&f, &a)
                 {
                     let carrier_data = ctx.get(ctx.resolve_binding(*carrier)).clone();
                     let (carrier_param, carrier_body, is_mu) = match carrier_data {
-                        TypeData::Mu { param_index, body, .. } => (param_index, body, true),
-                        TypeData::Nu { param_index, body, .. } => (param_index, body, false),
+                        TypeData::Mu {
+                            param_index, body, ..
+                        } => (param_index, body, true),
+                        TypeData::Nu {
+                            param_index, body, ..
+                        } => (param_index, body, false),
                         _ => return None, // fold/unfold at a non-fixpoint: fail-closed
                     };
                     let _ = is_mu;
@@ -417,7 +540,10 @@ impl TTerm {
                     // checked ≡ carrier at the Fold node).
                     let fold_fn_ty = ctx.function(smallvec![*carrier], *carrier);
                     let fold_term = mk(
-                        TKind::Fold { body: h.clone(), carrier: *carrier },
+                        TKind::Fold {
+                            body: h.clone(),
+                            carrier: *carrier,
+                        },
                         fold_fn_ty,
                     );
                     // Φ_{branch_k}(fold(h))(w) — the definitional ε-step.
@@ -481,7 +607,10 @@ impl TTerm {
                 let body = body.go(ctx, env)?;
                 let body_ty = body.ty;
                 Some(mk(
-                    TKind::TyLam { param: *param, body: Box::new(body) },
+                    TKind::TyLam {
+                        param: *param,
+                        body: Box::new(body),
+                    },
                     ctx.forall(*param, Symbol::intern("X"), body_ty),
                 ))
             }
@@ -490,7 +619,9 @@ impl TTerm {
                 // Verify the caller-supplied result against the real
                 // substitution — the reduct marker is checked.
                 let (param_index, forall_body) = match ctx.get(f.ty) {
-                    TypeData::Forall { param_index, body, .. } => (*param_index, *body),
+                    TypeData::Forall {
+                        param_index, body, ..
+                    } => (*param_index, *body),
                     _ => return None,
                 };
                 let expected = ctx.subst(forall_body, &Subst::from_single(param_index, *arg));
@@ -498,11 +629,19 @@ impl TTerm {
                     return None;
                 }
                 Some(mk(
-                    TKind::TyApp { f: Box::new(f), arg: *arg, result: *result },
+                    TKind::TyApp {
+                        f: Box::new(f),
+                        arg: *arg,
+                        result: *result,
+                    },
                     *result,
                 ))
             }
-            TKind::InSum { branch, value, branches } => {
+            TKind::InSum {
+                branch,
+                value,
+                branches,
+            } => {
                 let value = value.go(ctx, env)?;
                 if !ty_eq(ctx, value.ty, branches[*branch]) {
                     return None;
@@ -521,11 +660,19 @@ impl TTerm {
                     return None;
                 }
                 Some(mk(
-                    TKind::InSum { branch: *branch, value: Box::new(value), branches: branches.clone() },
+                    TKind::InSum {
+                        branch: *branch,
+                        value: Box::new(value),
+                        branches: branches.clone(),
+                    },
                     self.ty,
                 ))
             }
-            TKind::SumCase { scrutinee, branches, result } => {
+            TKind::SumCase {
+                scrutinee,
+                branches,
+                result,
+            } => {
                 let s = scrutinee.go(ctx, env)?;
                 let alts = match ctx.get(s.ty) {
                     TypeData::Coproduct { alternatives } => alternatives.clone(),
@@ -540,7 +687,11 @@ impl TTerm {
                     out.push(Box::new(b));
                 }
                 Some(mk(
-                    TKind::SumCase { scrutinee: Box::new(s), branches: out, result: *result },
+                    TKind::SumCase {
+                        scrutinee: Box::new(s),
+                        branches: out,
+                        result: *result,
+                    },
                     *result,
                 ))
             }
@@ -589,7 +740,10 @@ impl TTerm {
                         };
                         let ty = *elems.get(*index)?;
                         Some(mk(
-                            TKind::Proj { index: *index, value: Box::new(v) },
+                            TKind::Proj {
+                                index: *index,
+                                value: Box::new(v),
+                            },
                             ty,
                         ))
                     }
@@ -613,7 +767,10 @@ impl TTerm {
                     return None;
                 }
                 Some(mk(
-                    TKind::Fold { body: Box::new(b), carrier: *carrier },
+                    TKind::Fold {
+                        body: Box::new(b),
+                        carrier: *carrier,
+                    },
                     *carrier,
                 ))
             }
@@ -627,7 +784,10 @@ impl TTerm {
                     return None;
                 }
                 Some(mk(
-                    TKind::Unfold { body: Box::new(b), carrier: *carrier },
+                    TKind::Unfold {
+                        body: Box::new(b),
+                        carrier: *carrier,
+                    },
                     nu_body,
                 ))
             }
@@ -665,7 +825,11 @@ mod tests {
             TKind::Lam {
                 binder: int,
                 body: Box::new(mk(
-                    TKind::InSum { branch: 0, value: Box::new(mk(TKind::Var(0), int)), branches: vec![int] },
+                    TKind::InSum {
+                        branch: 0,
+                        value: Box::new(mk(TKind::Var(0), int)),
+                        branches: vec![int],
+                    },
                     alpha,
                 )),
             },
@@ -673,30 +837,43 @@ mod tests {
         );
         // in(g) : α  (constructor application, μ-view stamp)
         let in_g = mk(
-            TKind::InSum { branch: 0, value: Box::new(mk(TKind::Var(0), int)), branches: vec![int] },
+            TKind::InSum {
+                branch: 0,
+                value: Box::new(mk(TKind::Var(0), int)),
+                branches: vec![int],
+            },
             alpha,
         );
         // fold(f)(in(g))
         let fold_f = mk(
-            TKind::Fold { body: Box::new(f), carrier: alpha },
+            TKind::Fold {
+                body: Box::new(f),
+                carrier: alpha,
+            },
             alpha,
         );
-        let chain = mk(
-            TKind::App(Box::new(fold_f), Box::new(in_g)),
-            alpha,
-        );
+        let chain = mk(TKind::App(Box::new(fold_f), Box::new(in_g)), alpha);
         let body = mk(
-            TKind::Lam { binder: int, body: Box::new(chain) },
+            TKind::Lam {
+                binder: int,
+                body: Box::new(chain),
+            },
             ctx.function(smallvec![int], alpha),
         );
-        let nf = body.normalize(&mut ctx).expect("typed round trip must close");
+        let nf = body
+            .normalize(&mut ctx)
+            .expect("typed round trip must close");
         // The normal form's body must be in(g) again — the initial-algebra
         // equation, fully type-checked.
         match &nf.kind {
             TKind::Lam { body, .. } => {
                 assert_eq!(body.ty, alpha, "closed chain has type α = μX.Σ(Int)");
                 match &body.kind {
-                    TKind::InSum { branch: 0, value, branches } => {
+                    TKind::InSum {
+                        branch: 0,
+                        value,
+                        branches,
+                    } => {
                         assert_eq!(branches.len(), 1);
                         assert_eq!(value.ty, int, "payload is the Int argument");
                         assert!(matches!(value.kind, TKind::Var(0)), "payload is g");
@@ -732,11 +909,17 @@ mod tests {
             TKind::Lam { binder, body } => {
                 assert_eq!(*binder, ctx.function(smallvec![int], src));
                 match &body.kind {
-                    TKind::Lam { binder: b2, body: inner } => {
+                    TKind::Lam {
+                        binder: b2,
+                        body: inner,
+                    } => {
                         assert_eq!(*b2, int);
                         match &inner.kind {
                             TKind::App(f, a) => {
-                                assert!(matches!(f.kind, TKind::Var(2)), "g is Var(2) under two binders");
+                                assert!(
+                                    matches!(f.kind, TKind::Var(2)),
+                                    "g is Var(2) under two binders"
+                                );
                                 match &a.kind {
                                     TKind::App(z, i) => {
                                         assert!(matches!(z.kind, TKind::Var(1)), "z is Var(1)");
@@ -758,7 +941,10 @@ mod tests {
         // the whole thing in λg:g_ty to give the free variable an
         // environment entry; the normal form is the term itself.
         let wrapped = mk(
-            TKind::Lam { binder: g_ty, body: Box::new(phi) },
+            TKind::Lam {
+                binder: g_ty,
+                body: Box::new(phi),
+            },
             ctx.function(smallvec![g_ty], expected_ty),
         );
         let nf = wrapped.normalize(&mut ctx).expect("Φ expansion normalizes");
@@ -788,25 +974,42 @@ mod tests {
             TKind::Lam {
                 binder: boolean,
                 body: Box::new(mk(
-                    TKind::InSum { branch: 0, value: Box::new(mk(TKind::Var(0), boolean)), branches: vec![boolean] },
+                    TKind::InSum {
+                        branch: 0,
+                        value: Box::new(mk(TKind::Var(0), boolean)),
+                        branches: vec![boolean],
+                    },
                     alpha,
                 )),
             },
             ctx.function(smallvec![boolean], alpha),
         );
         let in_g = mk(
-            TKind::InSum { branch: 0, value: Box::new(mk(TKind::Var(0), boolean)), branches: vec![boolean] },
+            TKind::InSum {
+                branch: 0,
+                value: Box::new(mk(TKind::Var(0), boolean)),
+                branches: vec![boolean],
+            },
             alpha,
         );
         let chain = mk(
             TKind::App(
-                Box::new(mk(TKind::Fold { body: Box::new(f), carrier: alpha }, alpha)),
+                Box::new(mk(
+                    TKind::Fold {
+                        body: Box::new(f),
+                        carrier: alpha,
+                    },
+                    alpha,
+                )),
                 Box::new(in_g),
             ),
             alpha,
         );
         let wrapped = mk(
-            TKind::Lam { binder: boolean, body: Box::new(chain) },
+            TKind::Lam {
+                binder: boolean,
+                body: Box::new(chain),
+            },
             ctx.function(smallvec![boolean], alpha),
         );
         assert!(
@@ -829,7 +1032,10 @@ mod tests {
             TKind::TyLam {
                 param: 0,
                 body: Box::new(mk(
-                    TKind::Lam { binder: gp, body: Box::new(mk(TKind::Var(0), gp)) },
+                    TKind::Lam {
+                        binder: gp,
+                        body: Box::new(mk(TKind::Var(0), gp)),
+                    },
                     id_fn_ty,
                 )),
             },

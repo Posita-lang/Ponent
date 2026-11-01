@@ -1,9 +1,9 @@
 ---
 source: src/diagnostics/snapshots.rs
-assertion_line: 150
 expression: out
 ---
 {
+  "id": "0x2d4bdb8fd810f164",
   "level": "error",
   "message": "return type mismatch",
   "code": "E030",
@@ -12,9 +12,9 @@ expression: out
   "file": "example.ps",
   "span": {"start": 43, "end": 68, "line": 3, "column": 2},
   "labels": [
-    {"start": 43, "end": 68, "message": "this is Bool", "kind": "Primary"},
-    {"start": 0, "end": 8, "message": "declared to return Int<32>", "kind": "Secondary"},
-    {"start": 9, "end": 69, "message": "spans four lines", "kind": "Primary"}
+    {"start": 43, "end": 68, "file": 4294967295, "message": "this is Bool", "kind": "Primary"},
+    {"start": 0, "end": 8, "file": 4294967295, "message": "declared to return Int<32>", "kind": "Secondary"},
+    {"start": 9, "end": 69, "file": 4294967295, "message": "spans four lines", "kind": "Primary"}
   ],
   "relatedErrors": [
     {"code": "E019", "message": "duplicate definition of `i`", "span": {"start": 43, "end": 56}}

@@ -272,7 +272,7 @@ fn test_guard_basic_lifecycle() {
 
     // Remove the guard: var is still unresolved (InferVar), so PG→G
     // does NOT fire (only generalize resolved variables).
-    infer.remove_guard(id, &ctx);
+    infer.remove_guard(id, &mut ctx);
     assert_eq!(
         infer.get_gen_status(id),
         Some(GenStatus::PartiallyGeneralizable),
@@ -300,14 +300,14 @@ fn test_guard_multi_guard() {
         "should be PG with 2 guards"
     );
 
-    infer.remove_guard(id, &ctx);
+    infer.remove_guard(id, &mut ctx);
     assert_eq!(
         infer.get_gen_status(id),
         Some(GenStatus::PartiallyGeneralizable),
         "should still be PG with 1 guard"
     );
 
-    infer.remove_guard(id, &ctx);
+    infer.remove_guard(id, &mut ctx);
     assert_eq!(
         infer.get_gen_status(id),
         Some(GenStatus::PartiallyGeneralizable),
@@ -323,11 +323,11 @@ fn test_guard_snapshot_rollback() {
     let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let id = infer_var_id(&ctx, var);
 
-    let snap = infer.start_snapshot();
+    let snap = infer.start_snapshot(&mut ctx);
     infer.add_guard(id);
     assert!(infer.is_guarded(id), "should be guarded inside snapshot");
 
-    infer.rollback_to(snap);
+    infer.rollback_to(&mut ctx, snap);
     assert!(!infer.is_guarded(id), "guard should be rolled back");
 }
 
@@ -338,7 +338,7 @@ fn test_guard_double_add_rollback_restores_status() {
     let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let id = infer_var_id(&ctx, var);
 
-    let snap = infer.start_snapshot();
+    let snap = infer.start_snapshot(&mut ctx);
     infer.add_guard(id);
     infer.add_guard(id);
     assert_eq!(
@@ -350,7 +350,7 @@ fn test_guard_double_add_rollback_restores_status() {
     // Rolling back must undo BOTH guards and restore the pre-snapshot
     // status — the second add (on an already-PG var) must not leave a
     // stale `SetGenStatus` undo behind.
-    infer.rollback_to(snap);
+    infer.rollback_to(&mut ctx, snap);
     assert!(!infer.is_guarded(id), "both guards should be rolled back");
     assert_eq!(
         infer.get_gen_status(id),
@@ -405,7 +405,7 @@ fn test_suspend_on_var_basic() {
     );
 
     // Waking moves suspended constraints back to active
-    let woken = infer.wake_var_for_test(id, &ctx);
+    let woken = infer.wake_var_for_test(id, &mut ctx);
     assert!(woken > 0, "woken constraints should be active");
     assert!(
         infer.wait_lists()[id].is_empty(),
@@ -804,7 +804,9 @@ fn test_s_exists_lower_concrete() {
     // Exit the level so current_level drops below the var's level
     infer.exit_level(prev);
 
-    let result = infer.s_exists_lower(&ctx, id, &SkolemEnv::default(), &[], None);
+    let result = infer
+        .s_exists_lower(&mut ctx, id, &SkolemEnv::default(), &[], None)
+        .expect("s_exists_lower");
     // Removed the unsound level-based fallback.
     // Without determinacy proof, the variable stays PG.
     assert!(
@@ -837,7 +839,9 @@ fn test_s_exists_lower_forall() {
     infer.add_guard(id);
     infer.exit_level(prev);
 
-    let result = infer.s_exists_lower(&ctx, id, &SkolemEnv::default(), &[], None);
+    let result = infer
+        .s_exists_lower(&mut ctx, id, &SkolemEnv::default(), &[], None)
+        .expect("s_exists_lower");
     // Removed the unsound level-based fallback.
     // The Forall Eq constraint is not yet processed by solve, so
     // determinacy cannot be proven — variable stays PG.
@@ -882,7 +886,9 @@ fn test_s_exists_lower_env_precision() {
 
     let mut env = SkolemEnv::default();
     env.insert(other_id, ctx.enter_universe().1);
-    let result = infer.s_exists_lower(&ctx, id, &env, &[], None);
+    let result = infer
+        .s_exists_lower(&mut ctx, id, &env, &[], None)
+        .expect("s_exists_lower");
     assert!(
         result,
         "non-empty env must not block lowering when no equation \
@@ -891,7 +897,9 @@ fn test_s_exists_lower_env_precision() {
 
     // (2) Same setup, but the variable is equated with the skolem-bound
     // var itself: the equation observes binder-internal structure, so
-    // lowering must be refused.
+    // lowering must be refused.  The Eq must actually reach the checker as
+    // an ACTIVE constraint (carrying the env) — an empty `active` list made
+    // this scenario vacuous before (check_determinacy saw no equation).
     let mut ctx = new_ctx();
     let mut infer = new_infer();
 
@@ -901,12 +909,22 @@ fn test_s_exists_lower_env_precision() {
     let other = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let other_id = infer_var_id(&ctx, other);
     infer.add_guard(id);
-    infer.add_constraint(Constraint::Eq(var, other, span(), EqOrigin::Normal));
     infer.exit_level(prev);
 
+    // Forall opened at the variable's own region level: the skolem is
+    // binder-INTERNAL, so the equation must block lowering.
+    let (universe, skolem_ty) = ctx.enter_universe();
+    infer.region_tree.record_skolem_level(universe, 1);
     let mut env = SkolemEnv::default();
-    env.insert(other_id, ctx.enter_universe().1);
-    let result = infer.s_exists_lower(&ctx, id, &env, &[], None);
+    env.insert(other_id, skolem_ty);
+    let active = vec![PrioritizedConstraint {
+        priority: 2, // PRIORITY_EQ_INFER
+        constraint: Constraint::Eq(var, other, span(), EqOrigin::Normal),
+        env: Arc::new(env.clone()),
+    }];
+    let result = infer
+        .s_exists_lower(&mut ctx, id, &env, &active, None)
+        .expect("s_exists_lower");
     assert!(
         !result,
         "an equation linking the variable to a β̄ skolem must block \
@@ -955,7 +973,9 @@ fn test_s_exists_lower_outer_skolem_determines() {
         constraint: Constraint::Eq(var, other, span(), EqOrigin::Normal),
         env: Arc::new(env.clone()),
     }];
-    let result = infer.s_exists_lower(&ctx, id, &env, &active, None);
+    let result = infer
+        .s_exists_lower(&mut ctx, id, &env, &active, None)
+        .expect("s_exists_lower");
     assert!(
         result,
         "an outer (lower-level) skolem is a fixed outer constant and \
@@ -1150,7 +1170,7 @@ fn test_snapshot_rollback_restores_guards() {
     let a = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let id = infer_var_id(&ctx, a);
 
-    let snap = infer.start_snapshot();
+    let snap = infer.start_snapshot(&mut ctx);
     // Add a guard — tracked by the undo log
     infer.add_guard(id);
     assert!(
@@ -1158,7 +1178,7 @@ fn test_snapshot_rollback_restores_guards() {
         "guard should be added inside snapshot"
     );
 
-    infer.rollback_to(snap);
+    infer.rollback_to(&mut ctx, snap);
     assert!(!infer.is_guarded(id), "guard should be rolled back",);
 }
 
@@ -1171,9 +1191,9 @@ fn test_inference_snapshot_commit_does_not_rollback_type_context_binding() {
     let a = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let int32 = ctx.int(32, true);
 
-    let snap = infer.start_snapshot();
+    let snap = infer.start_snapshot(&mut ctx);
     ctx.set_binding(a, int32);
-    infer.commit_snapshot(snap);
+    infer.commit_snapshot(&mut ctx, snap);
 
     assert!(
         ctx.is_integer(ctx.resolve_binding(a)),
@@ -1913,7 +1933,7 @@ fn test_try_promote_var_resolution_rollback() {
     );
 
     // Open a snapshot, promote, verify resolution was set.
-    let snap = infer.start_snapshot();
+    let snap = infer.start_snapshot(&mut ctx);
     let promoted = infer.try_promote_var(&mut ctx, id, root);
     assert!(promoted.is_some(), "promotion should succeed");
     assert!(
@@ -1922,7 +1942,7 @@ fn test_try_promote_var_resolution_rollback() {
     );
 
     // Rollback — resolution should revert to None.
-    infer.rollback_to(snap);
+    infer.rollback_to(&mut ctx, snap);
     assert!(
         infer.resolution_for_test(id).is_none(),
         "resolution should be restored to None after rollback",
@@ -1938,7 +1958,7 @@ fn test_pool_undo_via_rollback_to() {
     let root_pool_before = infer.region_tree.nodes[root.0].pool.var_ids.len();
 
     // Create variables inside a snapshot — they register into the root pool.
-    let snap = infer.start_snapshot();
+    let snap = infer.start_snapshot(&mut ctx);
     let v1 = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let v2 = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let id1 = infer_var_id(&ctx, v1);
@@ -1953,7 +1973,7 @@ fn test_pool_undo_via_rollback_to() {
     );
 
     // Rollback — pool should revert to pre-snapshot state.
-    infer.rollback_to(snap);
+    infer.rollback_to(&mut ctx, snap);
     assert_eq!(
         infer.region_tree.nodes[root.0].pool.var_ids.len(),
         root_pool_before,
@@ -1991,8 +2011,13 @@ fn test_unify_resolution_undo() {
     );
 
     // Open a snapshot, unify a with Bool.
-    let snap = infer.start_snapshot();
-    let result = infer.unify(a, ctx.bool(), &mut ctx, crate::ast::Span::new(FileId::DUMMY, 0, 0));
+    let snap = infer.start_snapshot(&mut ctx);
+    let result = infer.unify(
+        a,
+        ctx.bool(),
+        &mut ctx,
+        crate::ast::Span::new(FileId::DUMMY, 0, 0),
+    );
     assert!(result.is_ok(), "unify a with Bool should succeed");
 
     let resolved_id_a = infer.resolution_for_test(id_a);
@@ -2002,7 +2027,7 @@ fn test_unify_resolution_undo() {
     );
 
     // Rollback — resolution for a should revert to None.
-    infer.rollback_to(snap);
+    infer.rollback_to(&mut ctx, snap);
     assert!(
         infer.resolution_for_test(id_a).is_none(),
         "resolution for a should be None after rollback",
@@ -2037,8 +2062,13 @@ fn test_unify_and_track_resolution_undo() {
     );
 
     // Open a snapshot, unify_and_track var with Int<32>.
-    let snap = infer.start_snapshot();
-    let result = infer.unify_and_track(var, int32, &mut ctx, crate::ast::Span::new(FileId::DUMMY, 0, 0));
+    let snap = infer.start_snapshot(&mut ctx);
+    let result = infer.unify_and_track(
+        var,
+        int32,
+        &mut ctx,
+        crate::ast::Span::new(FileId::DUMMY, 0, 0),
+    );
     assert!(result.is_ok(), "unify_and_track should succeed");
 
     let resolved = ctx.resolve_binding(result.unwrap());
@@ -2052,7 +2082,7 @@ fn test_unify_and_track_resolution_undo() {
     }
 
     // Rollback — resolution should revert to None.
-    infer.rollback_to(snap);
+    infer.rollback_to(&mut ctx, snap);
     assert!(
         infer.resolution_for_test(id).is_none(),
         "resolution should be None after rollback",
@@ -2075,12 +2105,12 @@ fn test_pool_undo_nested_snapshots() {
     let root_pool_before = infer.region_tree.nodes[root.0].pool.var_ids.len();
 
     // Outer snapshot: create v1.
-    let outer = infer.start_snapshot();
+    let outer = infer.start_snapshot(&mut ctx);
     let v1 = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let id1 = infer_var_id(&ctx, v1);
 
     // Inner snapshot: create v2.
-    let inner = infer.start_snapshot();
+    let inner = infer.start_snapshot(&mut ctx);
     let v2 = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let id2 = infer_var_id(&ctx, v2);
 
@@ -2090,7 +2120,7 @@ fn test_pool_undo_nested_snapshots() {
     );
 
     // Rollback inner — v2 should be removed, v1 should remain.
-    infer.rollback_to(inner);
+    infer.rollback_to(&mut ctx, inner);
     assert!(
         !infer.region_tree.nodes[root.0].pool.var_ids.contains(&id2),
         "v2 should not be in root pool after inner rollback",
@@ -2101,7 +2131,7 @@ fn test_pool_undo_nested_snapshots() {
     );
 
     // Rollback outer — v1 should also be removed.
-    infer.rollback_to(outer);
+    infer.rollback_to(&mut ctx, outer);
     assert_eq!(
         infer.region_tree.nodes[root.0].pool.var_ids.len(),
         root_pool_before,
@@ -2417,11 +2447,21 @@ fn test_universe_mismatch_rejected() {
             .unify(a0, b0, &mut ctx, crate::ast::Span::new(FileId::DUMMY, 0, 0))
             .is_ok()
     );
-    // Different universes (0 vs 1) → rejected.
+    // Different universes (0 vs 1) → the HIGHER-universe variable is bound
+    // to the lower one (a lower-universe value never escapes into a
+    // higher-universe binder), in EITHER call order.  Afterwards `a0` can
+    // only be instantiated at universe ≤ 0 types — the escape check in
+    // `unify` enforces that.
     assert!(
         infer
             .unify(a0, b1, &mut ctx, crate::ast::Span::new(FileId::DUMMY, 0, 0))
-            .is_err()
+            .is_ok(),
+        "must bind the higher-universe variable to the lower one"
+    );
+    assert!(
+        infer
+            .unify(b1, a0, &mut ctx, crate::ast::Span::new(FileId::DUMMY, 0, 0))
+            .is_ok()
     );
 }
 
@@ -2511,7 +2551,9 @@ fn test_s_exists_lower_syntactic_unicity_first() {
         env: Arc::new(SkolemEnv::default()),
     }];
 
-    let result = infer.s_exists_lower(&ctx, id, &SkolemEnv::default(), &active, None);
+    let result = infer
+        .s_exists_lower(&mut ctx, id, &SkolemEnv::default(), &active, None)
+        .expect("s_exists_lower");
     assert!(result, "syntactic unicity must lower the PG var");
     assert_eq!(
         infer.get_gen_status(id),
@@ -2922,7 +2964,7 @@ fn test_rollback_restores_var_to_region() {
     let var_id = infer_var_id(&ctx, var);
     let original_region = infer.type_vars()[var_id].region_id;
 
-    let snap = infer.start_snapshot();
+    let snap = infer.start_snapshot(&mut ctx);
 
     // Enter a deeper region and create a new variable there.
     let prev = infer.enter_level();
@@ -2932,7 +2974,7 @@ fn test_rollback_restores_var_to_region() {
     assert_ne!(original_region, inner_region, "regions should differ");
 
     // Rollback — inner variable's region assignment must be undone.
-    infer.rollback_to(snap);
+    infer.rollback_to(&mut ctx, snap);
 
     // After rollback, the inner variable's var_to_region should be restored.
     // The region tree's var_to_region for inner_id should reflect the
@@ -2975,7 +3017,7 @@ fn test_rollback_restores_wake_state() {
     );
     assert!(infer.is_guarded(var_id), "should be guarded");
 
-    let snap = infer.start_snapshot();
+    let snap = infer.start_snapshot(&mut ctx);
 
     // Resolve var to trigger wake_var_incremental.
     ctx.set_binding(var, int_ty);
@@ -2985,7 +3027,7 @@ fn test_rollback_restores_wake_state() {
 
     // After solve, wait list should be empty and guards cleared.
     // Now rollback.
-    infer.rollback_to(snap);
+    infer.rollback_to(&mut ctx, snap);
 
     // After rollback, wait_list and guard_set should be restored
     // (TakeWaitList and SetGuardSet undo entries).
@@ -3006,9 +3048,9 @@ fn test_commit_snapshot_balances_uf_snapshot_stack() {
 
     // Open and commit multiple snapshots.
     for _ in 0..10 {
-        let snap = infer.start_snapshot();
+        let snap = infer.start_snapshot(&mut ctx);
         let _var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
-        infer.commit_snapshot(snap);
+        infer.commit_snapshot(&mut ctx, snap);
     }
 
     // After 10 balanced open/commit cycles, the UF snapshot stack
@@ -3016,10 +3058,10 @@ fn test_commit_snapshot_balances_uf_snapshot_stack() {
     // grows forever. We verify by opening one more snapshot, creating
     // a var, and rolling back — if the stack is balanced, rollback
     // works correctly.
-    let snap = infer.start_snapshot();
+    let snap = infer.start_snapshot(&mut ctx);
     let var = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let var_id = infer_var_id(&ctx, var);
-    infer.rollback_to(snap);
+    infer.rollback_to(&mut ctx, snap);
 
     // After rollback, var_id should no longer be in any pool.
     let region = infer.region_tree.region_of_var(var_id);
@@ -3121,7 +3163,7 @@ fn test_rollback_truncates_per_var_vectors() {
     let _v0 = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     let base = (infer.type_vars().len(), infer.gen_statuses().len());
 
-    let snap = infer.start_snapshot();
+    let snap = infer.start_snapshot(&mut ctx);
     for _ in 0..5 {
         let _ = infer.new_type_var(&mut ctx, TypeVariableKind::Any, VarOrigin::Synthetic);
     }
@@ -3129,7 +3171,7 @@ fn test_rollback_truncates_per_var_vectors() {
     assert!(infer.type_vars().len() > base.0);
     assert!(infer.gen_statuses().len() > base.1);
 
-    infer.rollback_to(snap);
+    infer.rollback_to(&mut ctx, snap);
 
     // After rollback, the per-variable vectors are back to baseline.
     assert_eq!(

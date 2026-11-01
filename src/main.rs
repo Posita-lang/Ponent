@@ -63,17 +63,20 @@ mod symbol;
 mod sync;
 mod vfs;
 
+use crate::diagnostics::ErrCode;
 use mimalloc::MiMalloc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 use clap::Parser;
-use diagnostics::{ColorChoice, DiagCtxt, DiagOpts, Diagnostic, Emitter, HumanRenderer, JsonRenderer, OutputFormat, sink};
+use diagnostics::{
+    ColorChoice, DiagCtxt, DiagFilter, DiagOpts, Diagnostic, Emitter, FixHints, HumanRenderer,
+    JsonRenderer, ShortRenderer, sink,
+};
 use hir::checker::TypeChecker;
 use hir::resolver::NameResolver;
 use hir::types::{CrateId, DefId, TypeContext};
-use logos::Logos;
 use session::CompilerSession;
 use std::fs;
 use std::io::{IsTerminal, Write as _};
@@ -126,7 +129,8 @@ fn resolve_and_expand<'src, 'input>(
     };
     // Name resolution (the resolver's `&mut ctx` borrow ends here).
     let (symbols, trait_env, resolver_diags, resolution_map) = {
-        let mut resolver = NameResolver::new(ctx, local_crate_id, Some(source), enable_experimental);
+        let mut resolver =
+            NameResolver::new(ctx, local_crate_id, Some(source), enable_experimental);
         resolver.resolve_program(&program)
     };
     let mut all_diags = resolver_diags.into_inner();
@@ -141,7 +145,8 @@ fn resolve_and_expand<'src, 'input>(
     };
     // Incremental resolution for newly expanded items.
     let (symbols, trait_env, resolver_diags, resolution_map) = if !new_items.is_empty() {
-        let mut resolver = NameResolver::new(ctx, local_crate_id, Some(source), enable_experimental);
+        let mut resolver =
+            NameResolver::new(ctx, local_crate_id, Some(source), enable_experimental);
         resolver.resolve_incremental(&new_items, symbols, trait_env, resolution_map)
     } else {
         (symbols, trait_env, DiagCtxt::new(), resolution_map)
@@ -218,6 +223,27 @@ fn main() {
 
     let cli = cli::Cli::parse();
     let color_choice = ColorChoice::from_str(&cli.color);
+
+    let mut diag_opts = DiagOpts::detect();
+    diag_opts.use_color = color_choice.resolve();
+    diag_opts.only_codes = cli.only_code.clone();
+    diag_opts.only_categories = match cli
+        .only_category
+        .iter()
+        .map(|s| s.parse::<diagnostics::ErrorCategory>())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            process::exit(2);
+        }
+    };
+    diag_opts.only_files = cli.only_file.clone();
+    diag_opts.allow_codes = cli.allow.clone();
+    diag_opts.quiet = cli.quiet;
+    diag_opts.no_wrap = cli.no_wrap;
+
     let opts = CompilerOptions {
         target: cli.target,
         strict: cli.strict,
@@ -226,30 +252,78 @@ fn main() {
         debug: cli.debug,
     };
 
+    let fix_hints = match cli.fix_hints.as_str() {
+        "auto" => FixHints::Auto,
+        "review" => FixHints::Review,
+        "all" => FixHints::All,
+        other => {
+            eprintln!("error: unknown --fix-hints value `{other}` (valid: auto, review, all)");
+            process::exit(2);
+        }
+    };
+
     // Each handler returns the diagnostics to render instead of exiting:
     // `process::exit` from a rayon worker would tear down the whole batch.
     // The single process exit lives at the end of `main`.
     let code = match cli.command {
-        cli::Command::Lex { file } => report(run_lex(&file), false, color_choice),
+        cli::Command::Lex { file } => report(run_lex(&file), &cli.error_format, diag_opts),
         cli::Command::Parse { file, ast, json } => {
-            let code = report(run_parse(&file, ast, &opts, &session_sync_arena), json, color_choice);
+            let fmt = if json {
+                "json".to_string()
+            } else {
+                cli.error_format.clone()
+            };
+            let code = report(
+                run_parse(&file, ast, &opts, &session_sync_arena),
+                &fmt,
+                diag_opts,
+            );
             if code == 0 && !ast {
                 println!("Type checking succeeded.");
             }
             code
         }
         cli::Command::Check { file, json } => {
-            let code = report(run_check(&file, &opts, &session_sync_arena), json, color_choice);
+            let fmt = if json {
+                "json".to_string()
+            } else {
+                cli.error_format.clone()
+            };
+            let outcome = run_check(&file, &opts, &session_sync_arena);
+            // `--fix` applies machine-applicable suggestions to the source
+            // file in place, then re-runs the check to confirm.
+            if cli.fix {
+                if let Err(ref diags) = outcome {
+                    let src = fs::read_to_string(&file).unwrap_or_default();
+                    let (fixed, n) = diagnostics::apply_fixes(diags, &src, fix_hints);
+                    if n > 0 {
+                        let _ = fs::write(&file, fixed.as_bytes());
+                        eprintln!(
+                            "applied {n} fix{} to `{}`",
+                            if n == 1 { "" } else { "es" },
+                            file
+                        );
+                    }
+                }
+            }
+            let code = report(outcome, &fmt, diag_opts);
             if code == 0 {
                 println!("Type checking succeeded.");
             }
             code
         }
-        cli::Command::Explain { code } => {
-            run_explain(code, color_choice);
+        cli::Command::Explain { code, serve } => {
+            run_explain(code, color_choice, serve);
             0
         }
-        cli::Command::Mir { file, json } => report(run_mir(&file, &opts, &session_sync_arena), json, color_choice),
+        cli::Command::Mir { file, json } => {
+            let fmt = if json {
+                "json".to_string()
+            } else {
+                cli.error_format.clone()
+            };
+            report(run_mir(&file, &opts, &session_sync_arena), &fmt, diag_opts)
+        }
     };
     if code != 0 {
         process::exit(code);
@@ -258,26 +332,44 @@ fn main() {
 
 /// Render a handler's diagnostics and return the process exit code: `1` when
 /// any diagnostic is an error, `0` otherwise (warnings alone do not fail).
-fn report<'a>(outcome: Result<(), Vec<Diagnostic<'a>>>, json: bool, color: ColorChoice) -> i32 {
+fn report<'a>(
+    outcome: Result<(), Vec<Diagnostic<'a>>>,
+    error_format: &str,
+    diag_opts: DiagOpts,
+) -> i32 {
     let mut diags = match outcome {
         Ok(()) => return 0,
         Err(diags) => diags,
     };
-    let mut opts = DiagOpts::detect();
-    opts.use_color = color.resolve();
-    match OutputFormat::from_json_flag(json) {
-        OutputFormat::Json => {
-            let mut emitter = Emitter::new(JsonRenderer::new_compact(), sink::stderr(), opts);
+    // Exit code reflects the *filtered* set: `--only-code=E030` on a batch
+    // that contains only warnings is a clean exit, matching rustc's
+    // `-A`-style semantics where allowed diagnostics do not fail the build.
+    let filter = DiagFilter::from_opts(&diag_opts);
+    let any_visible_errors = diags
+        .iter()
+        .any(|d| d.is_error() && d.matches_filter_with(&filter));
+    let use_color = diag_opts.use_color;
+    match error_format {
+        "json" => {
+            let mut emitter = Emitter::new(JsonRenderer::new_compact(), sink::stderr(), diag_opts);
             let _ = emitter.emit_all(&mut diags);
         }
-        OutputFormat::Human => {
-            let use_color = opts.use_color;
-            let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
-            let mut emitter = Emitter::new(renderer, sink::stderr(), opts);
+        "short" => {
+            let renderer = if use_color {
+                ShortRenderer::colored()
+            } else {
+                ShortRenderer::new()
+            };
+            let mut emitter = Emitter::new(renderer, sink::stderr(), diag_opts);
+            let _ = emitter.emit_all(&mut diags);
+        }
+        _ => {
+            let renderer = HumanRenderer::with_opts(use_color, Some(&diag_opts));
+            let mut emitter = Emitter::new(renderer, sink::stderr(), diag_opts);
             let _ = emitter.emit_all(&mut diags);
         }
     }
-    i32::from(diags.iter().any(|d| d.is_error()))
+    i32::from(any_visible_errors)
 }
 
 /// Lex a file, printing each token.  Never exits.
@@ -359,15 +451,14 @@ fn run_parse<'a>(
     // Phase 1 → resolve → Phase 2 → incremental resolve, all inside a helper
     // so each phase's `&mut ctx` borrow is scoped (the helper takes `ctx`
     // once and the phases reborrow it sequentially).
-    let (program, symbols, trait_env, mut all_diags, resolution_map) =
-        resolve_and_expand(
-            &mut ctx,
-            program,
-            local_crate_id,
-            source,
-            file,
-            opts.enable_experimental,
-        );
+    let (program, symbols, trait_env, mut all_diags, resolution_map) = resolve_and_expand(
+        &mut ctx,
+        program,
+        local_crate_id,
+        source,
+        file,
+        opts.enable_experimental,
+    );
     attach_source_to_diags(&mut all_diags, source, file);
 
     // From here the session owns the pipeline state, so a query can be handed
@@ -401,7 +492,7 @@ fn run_parse<'a>(
             if !has_main {
                 let mut main_diag = vec![
                     Diagnostic::error("`main` function not found in crate")
-                        .with_code_str("E062")
+                        .with_code_str(ErrCode::E062)
                         .with_help("add a `def main() { ... }` function as the entry point"),
                 ];
                 attach_source_to_diags(&mut main_diag, source, file);
@@ -457,7 +548,12 @@ fn run_check<'a>(
     let mut ctx = TypeContext::new_with_target(target.clone());
     ctx.arena = Some(sync_arena);
     let local_crate_id = CrateId(DefId(0));
-    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, Some(source), opts.enable_experimental);
+    let mut resolver = NameResolver::new(
+        &mut ctx,
+        local_crate_id,
+        Some(source),
+        opts.enable_experimental,
+    );
     let (symbols, trait_env, resolver_diags, resolution_map) = resolver.resolve_program(&program);
     let mut all_diags = resolver_diags.into_inner();
     attach_source_to_diags(&mut all_diags, source, file);
@@ -531,7 +627,12 @@ fn run_mir<'a>(
     let mut ctx = TypeContext::new_with_target(target.clone());
     ctx.arena = Some(sync_arena);
     let local_crate_id = CrateId(DefId(0));
-    let mut resolver = NameResolver::new(&mut ctx, local_crate_id, Some(source), opts.enable_experimental);
+    let mut resolver = NameResolver::new(
+        &mut ctx,
+        local_crate_id,
+        Some(source),
+        opts.enable_experimental,
+    );
     let (symbols, trait_env, resolver_diags, resolution_map) = resolver.resolve_program(&program);
     let mut all_diags = resolver_diags.into_inner();
     attach_source_to_diags(&mut all_diags, source, file);
@@ -577,7 +678,11 @@ fn run_mir<'a>(
 }
 
 /// Show an error-code explanation (blocking while the explain server runs).
-fn run_explain(code: Option<String>, color: ColorChoice) {
+fn run_explain(code: Option<String>, color: ColorChoice, serve: bool) {
+    if serve {
+        run_explain_serve(code);
+        return;
+    }
     match code {
         Some(code) => {
             let use_color = color.resolve();
@@ -616,8 +721,7 @@ fn run_explain(code: Option<String>, color: ColorChoice) {
             };
 
             // Serve the explain page using the already-bound listener.
-            let served =
-                diagnostics::explain_server::serve_explain(&listener, &explain_code);
+            let served = diagnostics::explain_server::serve_explain(&listener, &explain_code);
             if let Some((handle, stop)) = spinner {
                 stop_explain_spinner(handle, &stop);
             }
@@ -628,6 +732,31 @@ fn run_explain(code: Option<String>, color: ColorChoice) {
         None => {
             print!("{}", diagnostics::list_error_codes());
         }
+    }
+}
+
+/// Persistent explain server: opens the browser, then blocks serving the
+/// index at `/` and per-code pages at `/<code>` until Ctrl+C.
+fn run_explain_serve(initial_code: Option<String>) {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind explain server");
+    let port = listener.local_addr().unwrap().port();
+    let _ = diagnostics::error_code::set_explain_port(port);
+
+    let url = match initial_code.as_deref() {
+        Some(code) => diagnostics::error_code::explain_server_url(port, code),
+        None => compact_str::format_compact!("http://127.0.0.1:{port}/"),
+    };
+    println!("Serving error explanations at {url}");
+    println!("Press Ctrl+C to stop.");
+
+    let url_bg = url.clone();
+    std::thread::spawn(move || {
+        let _ = open_browser(&url_bg);
+    });
+
+    if let Err(e) = diagnostics::explain_server::serve_explain_persistent(&listener) {
+        eprintln!("explain server error: {e}");
     }
 }
 
@@ -648,7 +777,10 @@ fn run_explain(code: Option<String>, color: ColorChoice) {
 fn spawn_explain_spinner(
     url: &str,
     code: &str,
-) -> (std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+) -> (
+    std::thread::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
 

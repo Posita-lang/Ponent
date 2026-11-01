@@ -83,7 +83,7 @@ fn type_eq_ignoring_spans_renamed<'input>(
         }
         (crate::ast::Type::Tuple(e1, _), crate::ast::Type::Tuple(e2, _)) => {
             e1.len() == e2.len()
-                && e1.iter().zip(e2).all(|(x, y)| {
+                && e1.iter().zip(e2.iter()).all(|(x, y)| {
                     type_eq_ignoring_spans_renamed(x, y, exists_params, symbols, rename)
                 })
         }
@@ -100,7 +100,7 @@ fn type_eq_ignoring_spans_renamed<'input>(
             },
         ) => {
             p1.len() == p2.len()
-                && p1.iter().zip(p2).all(|(x, y)| {
+                && p1.iter().zip(p2.iter()).all(|(x, y)| {
                     type_eq_ignoring_spans_renamed(x, y, exists_params, symbols, rename)
                 })
                 && type_eq_ignoring_spans_renamed(r1, r2, exists_params, symbols, rename)
@@ -125,7 +125,7 @@ fn type_eq_ignoring_spans_renamed<'input>(
         }
         (crate::ast::Type::DynTrait(es1, _), crate::ast::Type::DynTrait(es2, _)) => {
             es1.len() == es2.len()
-                && es1.iter().zip(es2).all(|(x, y)| {
+                && es1.iter().zip(es2.iter()).all(|(x, y)| {
                     type_eq_ignoring_spans_renamed(x, y, exists_params, symbols, rename)
                 })
         }
@@ -193,7 +193,7 @@ fn type_eq_ignoring_spans_renamed<'input>(
         (crate::ast::Type::Never(_), crate::ast::Type::Never(_)) => true,
         (crate::ast::Type::Union(es1, _), crate::ast::Type::Union(es2, _)) => {
             es1.len() == es2.len()
-                && es1.iter().zip(es2).all(|(x, y)| {
+                && es1.iter().zip(es2.iter()).all(|(x, y)| {
                     type_eq_ignoring_spans_renamed(x, y, exists_params, symbols, rename)
                 })
         }
@@ -542,8 +542,8 @@ struct Affine<'a, 'b> {
 }
 
 fn affine_of<'a, 'b>(e: &'a crate::ast::Expr<'b>) -> Option<Affine<'a, 'b>> {
-    let lit = |x: &crate::ast::Expr| match x {
-        crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => Some(v.clone()),
+    let lit = |x: &crate::ast::Expr<'b>| match x {
+        crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => Some(*v),
         _ => None,
     };
     match e {
@@ -686,8 +686,8 @@ impl Linear {
 }
 
 pub(crate) fn linear_of<'a, 'b>(e: &'a crate::ast::Expr<'b>) -> Option<Linear> {
-    let lit = |x: &crate::ast::Expr| match x {
-        crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => Some(v.clone()),
+    let lit = |x: &crate::ast::Expr<'b>| match x {
+        crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => Some(*v),
         _ => None,
     };
     match e {
@@ -738,8 +738,8 @@ fn linear_cmp<'a, 'b>(
     if !is_int {
         return None;
     }
-    let lit = |x: &crate::ast::Expr| match x {
-        crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => Some(v.clone()),
+    let lit = |x: &crate::ast::Expr<'b>| match x {
+        crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => Some(*v),
         _ => None,
     };
     // Mirror the constant to the right (`c < X` ⟺ `X > c`).
@@ -1194,8 +1194,8 @@ pub(crate) fn norm_cmp<'a, 'b: 'a>(
         } => (op, left, right),
         _ => return None,
     };
-    let lit = |x: &crate::ast::Expr| match x {
-        crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => Some(v.clone()),
+    let lit = |x: &crate::ast::Expr<'b>| match x {
+        crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => Some(*v),
         _ => None,
     };
     // L3.5: multi-variable linear — both sides affine (e.g. `X > Y`,
@@ -1554,9 +1554,11 @@ fn stmt_free_in(name: Symbol, s: &crate::ast::Stmt) -> bool {
             value.as_ref().is_some_and(|v| expr_free_in(name, v))
         }
         crate::ast::Stmt::Assign { target, value, .. } => {
-            expr_free_in(name, target) || expr_free_in(name, value)
+            expr_free_in(name, target.expr()) || expr_free_in(name, value)
         }
-        crate::ast::Stmt::ComptimeBlock { body, .. } => body.iter().any(|s| stmt_free_in(name, s)),
+        crate::ast::Stmt::Item(crate::ast::Item::ComptimeBlock { body, .. }) => {
+            body.iter().any(|s| stmt_free_in(name, s))
+        }
         crate::ast::Stmt::ScopeCleanup {
             when_condition,
             body,
@@ -1897,7 +1899,7 @@ mod tests {
 
     fn path<'a>(arena: &'a bumpalo::Bump, seg: &str) -> &'a crate::ast::Type<'a> {
         arena.alloc(crate::ast::Type::Path(
-            smallvec::smallvec![Symbol::intern(seg)],
+            arena.alloc_slice_copy(&[Symbol::intern(seg)]),
             crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ))
     }
@@ -1909,7 +1911,7 @@ mod tests {
     ) -> &'a crate::ast::Type<'a> {
         arena.alloc(crate::ast::Type::Generic(
             base,
-            args,
+            arena.alloc_slice_clone(&args),
             crate::ast::Span::new(FileId::DUMMY, 0, 0),
         ))
     }

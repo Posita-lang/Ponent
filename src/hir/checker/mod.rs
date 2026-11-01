@@ -1,8 +1,9 @@
 use crate::ast::FileId;
 use crate::ast::{
-    Attribute, BinOp, Contract, Expr, GenericArg, Literal, Pattern, Program, Span, Stmt, Type,
-    UnaryOp, VariableKind,
+    Attribute, BinOp, Contract, Expr, GenericArg, Item, Literal, Pattern, Program, Span, Stmt,
+    Type, UnaryOp, VariableKind,
 };
+use crate::diagnostics::ErrCode;
 use crate::diagnostics::{
     Applicability, ComptimeReason, DiagCtxt, Diagnostic, DiagnosticKind, DisplayArg, Label,
     Suggestion, SuggestionStyle, TypeCtx,
@@ -26,16 +27,16 @@ use crate::hir::types::{
     TypeData, TypeId,
 };
 use crate::symbol::Symbol;
+use arrayvec::ArrayVec;
 use num_bigint::BigInt;
 use num_traits::Zero;
-use arrayvec::ArrayVec;
+use small_map::FxSmallMap;
 use smallvec::{SmallVec, smallvec};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use small_map::FxSmallMap;
 use std::mem;
 use std::rc::Rc;
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -50,9 +51,7 @@ pub mod region;
 pub mod types;
 use self::autoderef::{AutoderefIter, DEFAULT_MAX_DEREF_DEPTH};
 use self::context::ScopeGuard;
-use self::helpers::{
-    did_you_mean_suggestion, find_similar_names, is_valid_lvalue, osa_distance,
-};
+use self::helpers::{did_you_mean_suggestion, find_similar_names, is_valid_lvalue, osa_distance};
 use self::types::{Expectation, TypingContext, typing_context_to_type_ctx};
 pub use contract::{Guarantee, GuaranteeChain, Predicate};
 pub use fn_ctxt::FnCtxt;
@@ -105,7 +104,14 @@ pub struct CtxFrame {
 /// scope after the block).
 #[derive(Debug, Clone)]
 pub struct ScopedVarMap {
-    frames: Rc<RefCell<Vec<HashMap<Symbol, TypeId>>>>,
+    /// name → (type, binding mutability).  The bool records the `mut`
+    /// modifier at the declaration site (`set mut x` ⇒ true); variables
+    /// are immutable by default (SYNTAX.md §Variable Declaration), and
+    /// `check_assign_stmt` consults this to reject reassignment of an
+    /// immutable local.  Kept in the same frame as the type (rather
+    /// than a parallel stack) so shadowing, the `insert_global` cache
+    /// and GADT refinement frames push/pop in lockstep with the type.
+    frames: Rc<RefCell<Vec<HashMap<Symbol, (TypeId, bool)>>>>,
     /// Parallel scope frames tracking the rigidity of each variable
     /// (Peyton Jones et al. PLDI'06 §2).  Rigid types come from user
     /// annotations/signatures; wobbly types from inference.  GADT
@@ -144,17 +150,32 @@ impl ScopedVarMap {
     /// Insert a binding with explicit rigidity into the innermost scope frame.
     /// (Peyton Jones et al. PLDI'06 §2): rigid types are user-specified and
     /// eligible for GADT refinement; wobbly types are inferred and immune.
+    /// The binding is immutable by default — use `insert_with_rigidity_and_mut`
+    /// to record a `set mut` binding.
     pub fn insert_with_rigidity(
         &self,
         name: Symbol,
         ty: TypeId,
         rigidity: crate::hir::types::Rigidity,
     ) {
+        self.insert_with_rigidity_and_mut(name, ty, rigidity, false);
+    }
+
+    /// Insert a binding with explicit rigidity AND binding mutability.
+    /// `mutable = true` records a `set mut x` declaration, permitting
+    /// later `x = ...` / `x += ...` assignments.
+    pub fn insert_with_rigidity_and_mut(
+        &self,
+        name: Symbol,
+        ty: TypeId,
+        rigidity: crate::hir::types::Rigidity,
+        mutable: bool,
+    ) {
         self.frames
             .borrow_mut()
             .last_mut()
             .expect("insert called with empty scope frame stack (push_frame missing)")
-            .insert(name, ty);
+            .insert(name, (ty, mutable));
         self.rigidity_frames
             .borrow_mut()
             .last_mut()
@@ -162,11 +183,20 @@ impl ScopedVarMap {
             .insert(name, rigidity);
     }
 
+    /// Insert a wobbly (inferred) binding with explicit binding mutability.
+    /// Used by `set mut x = <unannotated inferred>` — the type is wobbly
+    /// but the binding is mutable.
+    pub fn insert_with_mut(&self, name: Symbol, ty: TypeId, mutable: bool) {
+        self.insert_with_rigidity_and_mut(name, ty, crate::hir::types::Rigidity::Wobbly, mutable);
+    }
+
     /// Insert a binding into the base (outermost) scope frame.
     /// Used for caching global/module-level variable types so they
-    /// persist across all nested scopes.
+    /// persist across all nested scopes.  The cached binding is always
+    /// immutable — mutable globals are governed by `mutable_globals` +
+    /// the `@trusted` effect check, not by this flag.
     pub fn insert_global(&self, name: Symbol, ty: TypeId) {
-        self.frames.borrow_mut()[0].insert(name, ty);
+        self.frames.borrow_mut()[0].insert(name, (ty, false));
         self.rigidity_frames.borrow_mut()[0].insert(name, crate::hir::types::Rigidity::Wobbly);
     }
 
@@ -174,8 +204,22 @@ impl ScopedVarMap {
     pub fn get(&self, name: Symbol) -> Option<TypeId> {
         let frames = self.frames.borrow();
         for frame in frames.iter().rev() {
-            if let Some(&ty) = frame.get(&name) {
+            if let Some(&(ty, _)) = frame.get(&name) {
                 return Some(ty);
+            }
+        }
+        None
+    }
+
+    /// Look up the binding mutability of a name, searching from innermost
+    /// to outermost scope.  Returns `None` if the name is not bound in any
+    /// scope.  Innermost frame wins so a shadowing binding's own mutability
+    /// takes effect.
+    pub fn is_mutable(&self, name: Symbol) -> Option<bool> {
+        let frames = self.frames.borrow();
+        for frame in frames.iter().rev() {
+            if let Some(&(_, mutable)) = frame.get(&name) {
+                return Some(mutable);
             }
         }
         None
@@ -209,7 +253,7 @@ impl ScopedVarMap {
             .expect("extend called with empty scope frame stack (push_frame missing)");
         for (name, ty) in iter {
             rigidity_frame.insert(name, crate::hir::types::Rigidity::Wobbly);
-            frame.insert(name, ty);
+            frame.insert(name, (ty, false));
         }
     }
 
@@ -218,7 +262,7 @@ impl ScopedVarMap {
     fn rc_clone(
         &self,
     ) -> (
-        Rc<RefCell<Vec<HashMap<Symbol, TypeId>>>>,
+        Rc<RefCell<Vec<HashMap<Symbol, (TypeId, bool)>>>>,
         Rc<RefCell<Vec<HashMap<Symbol, crate::hir::types::Rigidity>>>>,
     ) {
         (Rc::clone(&self.frames), Rc::clone(&self.rigidity_frames))
@@ -242,7 +286,7 @@ impl ScopedVarMap {
         let mut result = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for frame in frames.iter().rev() {
-            for (name, ty) in frame {
+            for (name, (ty, _)) in frame {
                 if seen.insert(*name) {
                     result.push((*name, *ty));
                 }
@@ -260,7 +304,7 @@ impl ScopedVarMap {
 /// Owns its own `Rc` reference to the frames vector, completely
 /// independent of any borrow on the `TypeChecker` or `ScopedVarMap`.
 pub(crate) struct VarScopeGuard {
-    frames: Rc<RefCell<Vec<HashMap<Symbol, TypeId>>>>,
+    frames: Rc<RefCell<Vec<HashMap<Symbol, (TypeId, bool)>>>>,
     rigidity_frames: Rc<RefCell<Vec<HashMap<Symbol, crate::hir::types::Rigidity>>>>,
     span_frames: Rc<RefCell<Vec<HashMap<Symbol, Span>>>>,
     ghost_frames: Rc<RefCell<Vec<HashSet<Symbol>>>>,
@@ -269,7 +313,7 @@ pub(crate) struct VarScopeGuard {
 
 impl VarScopeGuard {
     fn new(
-        frames: Rc<RefCell<Vec<HashMap<Symbol, TypeId>>>>,
+        frames: Rc<RefCell<Vec<HashMap<Symbol, (TypeId, bool)>>>>,
         rigidity_frames: Rc<RefCell<Vec<HashMap<Symbol, crate::hir::types::Rigidity>>>>,
         span_frames: Rc<RefCell<Vec<HashMap<Symbol, Span>>>>,
         ghost_frames: Rc<RefCell<Vec<HashSet<Symbol>>>>,
@@ -306,7 +350,7 @@ impl Drop for VarScopeGuard {
 ///
 /// Modelled on `VarScopeGuard` but does NOT push on construction.
 pub(crate) struct GadtRefinementGuard {
-    frames: Rc<RefCell<Vec<HashMap<Symbol, TypeId>>>>,
+    frames: Rc<RefCell<Vec<HashMap<Symbol, (TypeId, bool)>>>>,
     rigidity_frames: Rc<RefCell<Vec<HashMap<Symbol, crate::hir::types::Rigidity>>>>,
     span_frames: Rc<RefCell<Vec<HashMap<Symbol, Span>>>>,
     ghost_frames: Rc<RefCell<Vec<HashSet<Symbol>>>>,
@@ -1031,16 +1075,16 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             .items
             .iter()
             .enumerate()
-            .filter_map(|(i, stmt)| {
-                if self.should_skip_due_to_cfg(stmt) {
+            .filter_map(|(i, item)| {
+                if self.should_skip_due_to_cfg(item) {
                     return None;
                 }
-                if let Stmt::FunctionDef {
+                if let Item::FunctionDef {
                     name,
                     params,
                     is_comptime,
                     ..
-                } = stmt
+                } = item
                 {
                     if *is_comptime {
                         let param_names: Vec<Symbol> = params.iter().map(|p| p.name).collect();
@@ -1063,7 +1107,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         // so that forward references to comptime functions defined later work correctly.
         self.comptime_fn_pass = true;
         for &i in &comptime_fn_indices {
-            match self.check_stmt(&program.items[i]) {
+            match self.check_item_stmt(&program.items[i]) {
                 Ok(hir) => items.push(hir),
                 Err(diag) => {
                     self.diagnostics.push(diag);
@@ -1124,7 +1168,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         Ok(_) => Ok(()),
                         Err(e) => {
                             let msg = if traceback.is_empty() {
-                                crate::tr!("comptime-error", e = DisplayArg(&e))
+                                crate::diagnostics::i18n::fluent::comptime_error(DisplayArg(&e))
                             } else {
                                 let tb_str: Vec<String> = traceback
                                     .iter()
@@ -1181,17 +1225,17 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         // ── Parallel Pass 3 (Stage B) ──
         // 1. Serial per-item gates.
         let mut fn_jobs: Vec<(usize, bool)> = Vec::new();
-        for (i, stmt) in program.items.iter().enumerate() {
+        for (i, item) in program.items.iter().enumerate() {
             if comptime_fn_indices.contains(&i) {
                 fn_jobs.push((i, false));
                 continue; // already processed in pass 2
             }
             if self.strict_mode {
-                self.check_cfg_reachability(stmt);
+                self.check_cfg_reachability(item);
             }
-            self.validate_auto_ro_placement(stmt);
-            if self.should_skip_due_to_cfg(stmt) {
-                items.push(HirStmt::Stripped { span: stmt.span() }); // item excluded by @cfg
+            self.validate_auto_ro_placement(item);
+            if self.should_skip_due_to_cfg(item) {
+                items.push(HirStmt::Stripped { span: item.span() }); // item excluded by @cfg
                 fn_jobs.push((i, false));
                 continue;
             }
@@ -1214,7 +1258,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 let stmt = &program.items[i];
                 let is_barrier = !matches!(
                     stmt,
-                    crate::ast::Stmt::FunctionDef {
+                    crate::ast::Item::FunctionDef {
                         is_comptime: false,
                         ..
                     }
@@ -1256,7 +1300,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 // top-level `set mut`); check it on the main checker (it
                 // mutates `trait_env`/`method_cache`).
                 let i = run[0];
-                match self.check_stmt(&program.items[i]) {
+                match self.check_item_stmt(&program.items[i]) {
                     Ok(hir) => results[i] = Some(Ok(hir)),
                     Err(diag) => results[i] = Some(Err(diag)),
                 }
@@ -1380,7 +1424,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             );
         }
         // 4. Emit in item order.
-        for (i, stmt) in program.items.iter().enumerate() {
+        for (i, item) in program.items.iter().enumerate() {
             let (_, checked) = fn_jobs[i];
             if !checked {
                 continue;
@@ -1395,7 +1439,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 }
                 continue;
             }
-            match self.check_stmt(stmt) {
+            match self.check_item_stmt(item) {
                 Ok(hir) => items.push(hir),
                 Err(diag) => {
                     self.diagnostics.push(diag);
@@ -1512,8 +1556,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     .and_then(|e| e.span())
                     .unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0));
                 self.diagnostics.push(
-                    Diagnostic::error(crate::tr!("trait-solver-error", msg = msg))
-                        .with_code_str("E030")
+                    Diagnostic::error(crate::diagnostics::i18n::fluent::trait_solver_error(msg))
+                        .with_code_str(ErrCode::E030)
                         .with_span(span),
                 );
             }
@@ -1602,7 +1646,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     }
                     for msg in move_errors {
                         self.diagnostics
-                            .push(Diagnostic::error(msg).with_code_str("E114"));
+                            .push(Diagnostic::error(msg).with_code_str(ErrCode::E114));
                     }
                 }
                 // ── Retry deferred top-level trait obligations ──
@@ -1661,7 +1705,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                             .unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0));
                         self.diagnostics.push(
                             Diagnostic::error(format!("trait solver error: {}", msg))
-                                .with_code_str("E030")
+                                .with_code_str(ErrCode::E030)
                                 .with_span(span),
                         );
                     }
@@ -2938,7 +2982,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
     fn check_stmt(&mut self, stmt: &Stmt<'input>) -> Result<HirStmt<'input>, Diagnostic<'src>> {
         match stmt {
             Stmt::VariableDef { .. } => self.check_variable_def_stmt(stmt),
-            Stmt::FunctionDef { .. } => self.check_function_def_stmt(stmt),
+            Stmt::Item(item) => self.check_item_stmt(item),
             Stmt::Expression(expr) => {
                 let (hir, _) = self.infer_expr(expr, None)?;
                 Ok(HirStmt::Expression(Box::new(hir)))
@@ -2956,7 +3000,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 if !cond_is_bool {
                     self.diagnostics.push(
                         Diagnostic::error("if condition must be boolean")
-                            .with_code_str("E004")
+                            .with_code_str(ErrCode::E004)
                             .with_span(*span)
                             .with_label(cond.span(), format!("got {:?}", self.ctx.get(cond_ty))),
                     );
@@ -3185,13 +3229,13 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         if enclosing_closure.is_some() {
                             self.diagnostics.push(
                                 Diagnostic::error("cannot `leave` out of a closure or async block")
-                                    .with_code_str("E005")
+                                    .with_code_str(ErrCode::E005)
                                     .with_span(*span),
                             );
                         } else if label.is_some() {
                             self.diagnostics.push(
                                 Diagnostic::error(format!("cannot `leave` with label `{}` – no matching labeled block or loop found", label.as_ref().unwrap()))
-                                    .with_code_str("E005")
+                                    .with_code_str(ErrCode::E005)
                                     .with_span(*span)
                             );
                         } else {
@@ -3199,7 +3243,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                 Diagnostic::error(
                                     "`leave` statement outside of loop; use `return` instead",
                                 )
-                                .with_code_str("E005")
+                                .with_code_str(ErrCode::E005)
                                 .with_span(*span)
                                 .with_suggestion("use `return` to exit the current function"),
                             );
@@ -3232,7 +3276,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                 Diagnostic::error(
                                     "cannot `continue` out of a closure or async block",
                                 )
-                                .with_code_str("E006")
+                                .with_code_str(ErrCode::E006)
                                 .with_span(*span),
                             );
                         } else if label.is_some() {
@@ -3241,13 +3285,13 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                     "cannot `continue` with label `{}` – no matching labeled loop found",
                                     label.as_ref().unwrap()
                                 ))
-                                .with_code_str("E006")
+                                .with_code_str(ErrCode::E006)
                                 .with_span(*span),
                             );
                         } else {
                             self.diagnostics.push(
                                 Diagnostic::error("`continue` statement outside of loop")
-                                    .with_code_str("E006")
+                                    .with_code_str(ErrCode::E006)
                                     .with_span(*span)
                                     .with_suggestion("use `leave` or `return` instead"),
                             );
@@ -3265,7 +3309,6 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             }
             Stmt::Return { .. } => self.check_return_stmt(stmt),
             Stmt::Assign { .. } => self.check_assign_stmt(stmt),
-            Stmt::ComptimeBlock { .. } => self.check_comptime_block_stmt(stmt),
             Stmt::ScopeCleanup {
                 name,
                 body,
@@ -3403,120 +3446,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 };
                 body_hir
             }
-            Stmt::LayoutDef {
-                name,
-                attributes,
-                span,
-            } => {
-                // Layout alias definitions are handled by the resolver.
-                // The checker just passes them through.
-                Ok(HirStmt::LayoutDef {
-                    name: *name,
-                    attributes: attributes.clone(),
-                    span: *span,
-                })
-            }
-            Stmt::TypeDef { span, .. } => {
-                // Type definitions are already handled by the resolver;
-                // no additional checking needed here.
-                Ok(HirStmt::Stripped { span: *span })
-            }
-            Stmt::Edition(version, span) => {
-                // Edition is validated and stored by the resolver.
-                // The checker simply passes it through.
-                Ok(HirStmt::Edition(version.clone(), *span))
-            }
-            Stmt::TraitDef { span, .. } => {
-                // Trait definitions are handled by the resolver; skip silently.
-                Ok(HirStmt::Stripped { span: *span })
-            }
-            Stmt::Import {
-                path,
-                items,
-                alias,
-                span,
-            } => {
-                // Imports are already resolved by the NameResolver and registered
-                // in the resolution map. The checker just passes them through.
-                Ok(HirStmt::Import {
-                    path: path.clone(),
-                    items: items.clone(),
-                    alias: *alias,
-                    span: *span,
-                })
-            }
-            Stmt::ExternFunction {
-                abi,
-                name,
-                params,
-                return_type,
-                span,
-                attributes,
-            } => {
-                let ret_ty = self.resolve_type(return_type)?;
-                let mut hir_params = Vec::new();
-                for p in *params {
-                    let p_ty = if let Some(ref ty) = p.ty {
-                        self.resolve_type(ty)?
-                    } else {
-                        self.new_infer_var(
-                            TypeVariableKind::Unconstrained,
-                            crate::hir::infer::VarOrigin::Expression(Some(p.span)),
-                        )
-                    };
-                    hir_params.push(HirParam {
-                        name: p.name,
-                        ty: p_ty,
-                        default: p.default.clone(),
-                        span: p.span,
-                    });
-                }
-                Ok(HirStmt::ExternFunction {
-                    abi: abi.clone(),
-                    name: *name,
-                    params: hir_params,
-                    return_type: ret_ty,
-                    span: *span,
-                    attributes: attributes.clone(),
-                })
-            }
-            Stmt::Constraint {
-                name,
-                params,
-                predicates,
-                span,
-            } => {
-                let resolved_bounds: Vec<TypeId> = predicates
-                    .iter()
-                    .flat_map(|p| {
-                        let subject = self.resolve_type(&p.ty);
-                        let mut bs: Vec<TypeId> = p
-                            .bounds
-                            .iter()
-                            .map(|b| self.resolve_type(b))
-                            .collect::<Result<_, _>>()
-                            .unwrap_or_default();
-                        if subject.is_ok() {
-                            bs.insert(0, subject.unwrap());
-                        }
-                        bs
-                    })
-                    .collect();
-                Ok(HirStmt::Constraint {
-                    name: *name,
-                    bounds: resolved_bounds,
-                    span: *span,
-                })
-            }
-            Stmt::ImplBlock { .. } => self.check_impl_block_stmt(stmt),
+            Stmt::Item(item) => self.check_item_stmt(item),
             Stmt::Error(span) => Err(Diagnostic::error("invalid statement").with_span(*span)),
-            // Stmt::Generate is expanded before name resolution, so it
-            // should never reach the checker.  If it does, the pipeline
-            // is misconfigured.
-            Stmt::Generate { span, .. } => Err(Diagnostic::error(
-                "generate block not expanded before type checking",
-            )
-            .with_span(*span)),
         }
     }
 
@@ -3589,7 +3520,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             {
                 self.diagnostics.push(
                     Diagnostic::error("ensures condition must be boolean at return")
-                        .with_code_str("E022")
+                        .with_code_str(ErrCode::E022)
                         .with_span(*span),
                 );
             }
@@ -3603,7 +3534,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         if !in_function {
             self.diagnostics.push(
                 Diagnostic::error("`return` statement outside of function")
-                    .with_code_str("E007")
+                    .with_code_str(ErrCode::E007)
                     .with_span(*span),
             );
         }
@@ -3625,14 +3556,14 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 )?;
                 Ok(HirStmt::Return {
                     value: Some(Box::new(hir)),
-                    labels: labels.clone(),
+                    labels: labels.to_vec(),
                     span: *span,
                 })
             } else {
                 let (hir, _) = self.infer_expr(value, None)?;
                 Ok(HirStmt::Return {
                     value: Some(Box::new(hir)),
-                    labels: labels.clone(),
+                    labels: labels.to_vec(),
                     span: *span,
                 })
             }
@@ -3660,7 +3591,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             }
             Ok(HirStmt::Return {
                 value: None,
-                labels: labels.clone(),
+                labels: labels.to_vec(),
                 span: *span,
             })
         }
@@ -3682,22 +3613,17 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         // Mutation of a frozen place is enforced by the flow-sensitive
         // point-level borrow-check post-pass (see the FunctionDef<'input>
         // arm) — loans die at their borrow variable's last use.
-        // Validate that the target is a valid lvalue
-        if !is_valid_lvalue(target) {
-            self.diagnostics.push(
-                Diagnostic::error("invalid left-hand side for assignment; expected variable, field access, or index")
-                    .with_span(*span)
-            );
-        }
+        // (The lvalue invariant is established by the parser — `LValue`
+        // in `Stmt::Assign` — so no "is this an lvalue" re-check here.)
         // Check that mutable globals are only assigned inside @trusted functions
-        if let Expr::Ident(name, _) = target {
+        if let Expr::Ident(name, _) = target.expr() {
             if self.shared.mutable_globals.read().contains(name) && !self.current_function_trusted {
                 self.diagnostics.push(
                     Diagnostic::error(format!(
                         "cannot assign to mutable global `{}` outside `@trusted` function",
                         name,
                     ))
-                    .with_code_str("E040")
+                    .with_code_str(ErrCode::E040)
                     .with_span(*span)
                     .with_help(
                         "wrap the function in `@trusted` and add `requires`/`ensures` contracts",
@@ -3720,7 +3646,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         "cannot assign to mutable global `{}` inside comptime context",
                         name,
                     ))
-                    .with_code_str("E082")
+                    .with_code_str(ErrCode::E082)
                     .with_span(*span)
                     .with_help("comptime code is sandboxed and cannot access mutable global state"),
                 );
@@ -3732,7 +3658,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         "cannot assign to mutable global `{}` inside isolate block",
                         name,
                     ))
-                    .with_code_str("E093")
+                    .with_code_str(ErrCode::E093)
                     .with_span(*span)
                     .with_help("isolate blocks must not access external mutable state"),
                 );
@@ -3756,7 +3682,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                             "cannot assign to captured variable `{}` inside isolate block",
                             name,
                         ))
-                        .with_code_str("E093")
+                        .with_code_str(ErrCode::E093)
                         .with_span(*span)
                         .with_help(
                             "isolate blocks must not mutate captured outer state — \
@@ -3769,7 +3695,50 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         // An assign TARGET is written, not read — the
         // mutation check below handles the write side (the old
         // read-side suppression is removed ).
-        let target_res = self.infer_expr(target, None);
+        // ── Local immutability (SYNTAX.md §Variable Declaration) ──
+        // `set i = 1; i = 2;` (incl. `+=`) is rejected.  Parameters are
+        // mutable slots (set at insertion) so `ls = tl` walks type-check.
+        // `x.f = v` / `x[i] = v` through a `&mut T` / raw-pointer root is
+        // allowed (implicit deref); `*r = v` is skipped entirely — its
+        // legality rests on the reference's own type-level mutability +
+        // borrow check, not on binding `r`.
+        if let Some(root) = assign_target_root(target.expr()) {
+            let is_mutable_global = self.shared.mutable_globals.read().contains(&root);
+            if !is_mutable_global && self.local_variable_types.get(root).is_some() {
+                let is_direct = matches!(target.expr(), Expr::Ident(_, _));
+                let allowed = if is_direct {
+                    self.local_variable_types.is_mutable(root).unwrap_or(false)
+                } else {
+                    match self
+                        .local_variable_types
+                        .get(root)
+                        .map(|t| self.ctx.get(self.ctx.resolve_binding(t)))
+                    {
+                        Some(TypeData::Ref { mutable, .. }) => *mutable,
+                        Some(TypeData::Ptr { .. }) | Some(TypeData::Pointer { .. }) => true,
+                        Some(TypeData::InferVar { .. })
+                        | Some(TypeData::SkolemVar { .. })
+                        | Some(TypeData::Error) => true,
+                        _ => self.local_variable_types.is_mutable(root).unwrap_or(false),
+                    }
+                };
+                if !allowed {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "cannot assign to immutable variable `{}`",
+                            root,
+                        ))
+                        .with_code_str(ErrCode::E045)
+                        .with_span(*span)
+                        .with_help(format!(
+                            "variables are immutable by default; declare it with \
+                             `set mut {root} = ...` to allow reassignment",
+                        )),
+                    );
+                }
+            }
+        }
+        let target_res = self.infer_expr(target.expr(), None);
         let (target_hir, target_ty) = target_res?;
         let value_hir = if let Some(op) = op {
             let result_ty = self.binary_op_type(*op, target_ty, target_ty, None, None, *span)?;
@@ -3786,19 +3755,19 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         })
     }
 
-    fn check_comptime_block_stmt(
+    fn check_comptime_block_item(
         &mut self,
-        stmt: &Stmt<'input>,
+        item: &Item<'input>,
     ) -> Result<HirStmt<'input>, Diagnostic<'src>> {
-        let Stmt::ComptimeBlock {
+        let Item::ComptimeBlock {
             captures,
             body,
             trusted,
             span,
             ..
-        } = stmt
+        } = item
         else {
-            unreachable!("check_stmt dispatch guarantees the statement variant");
+            unreachable!("check_item_stmt dispatch guarantees the item variant");
         };
         // Push a comptime context frame so that `return` inside comptime
         // blocks is treated as comptime control flow, not an error.
@@ -3857,7 +3826,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                         "cannot capture mutable variable `{}` in comptime block",
                                         capture,
                                     ))
-                                    .with_code_str("E082")
+                                    .with_code_str(ErrCode::E082)
                                     .with_span(*capture_span),
                                 );
                             } else {
@@ -3868,7 +3837,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                          another comptime-known value)",
                                         capture,
                                     ))
-                                    .with_code_str("E082")
+                                    .with_code_str(ErrCode::E082)
                                     .with_span(*capture_span),
                                 );
                             }
@@ -3878,7 +3847,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                     "unknown variable `{}` in comptime capture list",
                                     capture,
                                 ))
-                                .with_code_str("E082")
+                                .with_code_str(ErrCode::E082)
                                 .with_span(*capture_span),
                             );
                         }
@@ -3915,7 +3884,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     if let Err(e) = eval.eval_block(&hir) {
                         self.diagnostics.push(
                             Diagnostic::error(format!("comptime error: {}", e))
-                                .with_code_str("E080")
+                                .with_code_str(ErrCode::E080)
                                 .with_span(*span),
                         );
                     }
@@ -3934,6 +3903,133 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             }
         };
         body_hir
+    }
+
+    /// Dispatch a `Stmt::Item(item)` — the top-level or block-level item checker.
+    /// Each `Item` variant is handled here; `check_stmt` routes
+    /// `Stmt::Item(item)` to this function.
+    fn check_item_stmt(
+        &mut self,
+        item: &Item<'input>,
+    ) -> Result<HirStmt<'input>, Diagnostic<'src>> {
+        match item {
+            Item::FunctionDef { .. } => self.check_function_def_item(item),
+            Item::LayoutDef {
+                name,
+                attributes,
+                span,
+            } => {
+                // Layout alias definitions are handled by the resolver.
+                // The checker just passes them through.
+                Ok(HirStmt::LayoutDef {
+                    name: *name,
+                    attributes: attributes.to_vec(),
+                    span: *span,
+                })
+            }
+            Item::TypeDef { span, .. } => {
+                // Type definitions are already handled by the resolver;
+                // no additional checking needed here.
+                Ok(HirStmt::Stripped { span: *span })
+            }
+            Item::Edition(version, span) => {
+                // Edition is validated and stored by the resolver.
+                // The checker simply passes it through.
+                Ok(HirStmt::Edition(version.clone(), *span))
+            }
+            Item::TraitDef { span, .. } => {
+                // Trait definitions are handled by the resolver; skip silently.
+                Ok(HirStmt::Stripped { span: *span })
+            }
+            Item::Import {
+                path,
+                items,
+                alias,
+                span,
+            } => {
+                // Imports are already resolved by the NameResolver and registered
+                // in the resolution map. The checker just passes them through.
+                Ok(HirStmt::Import {
+                    path: path.to_vec(),
+                    items: items.map(|i| i.to_vec()),
+                    alias: *alias,
+                    span: *span,
+                })
+            }
+            Item::ExternFunction {
+                abi,
+                name,
+                params,
+                return_type,
+                span,
+                attributes,
+            } => {
+                let ret_ty = self.resolve_type(return_type)?;
+                let mut hir_params = Vec::new();
+                for p in *params {
+                    let p_ty = if let Some(ref ty) = p.ty {
+                        self.resolve_type(ty)?
+                    } else {
+                        self.new_infer_var(
+                            TypeVariableKind::Unconstrained,
+                            crate::hir::infer::VarOrigin::Expression(Some(p.span)),
+                        )
+                    };
+                    hir_params.push(HirParam {
+                        name: p.name,
+                        ty: p_ty,
+                        default: p.default.clone(),
+                        span: p.span,
+                    });
+                }
+                Ok(HirStmt::ExternFunction {
+                    abi: abi.clone(),
+                    name: *name,
+                    params: hir_params,
+                    return_type: ret_ty,
+                    span: *span,
+                    attributes: attributes.to_vec(),
+                })
+            }
+            Item::Constraint {
+                name,
+                params,
+                predicates,
+                span,
+            } => {
+                let resolved_bounds: Vec<TypeId> = predicates
+                    .iter()
+                    .flat_map(|p| {
+                        let subject = self.resolve_type(&p.ty);
+                        let mut bs: Vec<TypeId> = p
+                            .bounds
+                            .iter()
+                            .map(|b| self.resolve_type(b))
+                            .collect::<Result<_, _>>()
+                            .unwrap_or_default();
+                        if subject.is_ok() {
+                            bs.insert(0, subject.unwrap());
+                        }
+                        bs
+                    })
+                    .collect();
+                Ok(HirStmt::Constraint {
+                    name: *name,
+                    bounds: resolved_bounds,
+                    span: *span,
+                })
+            }
+            Item::ImplBlock { .. } => self.check_impl_block_item(item),
+            Item::ComptimeBlock { .. } => self.check_comptime_block_item(item),
+            // Item::Generate is expanded before name resolution, so it
+            // should never reach the checker.  If it does, the pipeline
+            // is misconfigured.
+            Item::Generate { span, .. } => Err(Diagnostic::error(
+                "generate block not expanded before type checking",
+            )
+            .with_span(*span)),
+            Item::Error(span) => Err(Diagnostic::error("parse error in item").with_span(*span)),
+        }
     }
 
     fn check_variable_def_stmt(
@@ -3962,7 +4058,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 Diagnostic::error(
                     "`set` does not support pattern destructuring; use `let` instead",
                 )
-                .with_code_str("E001")
+                .with_code_str(ErrCode::E001)
                 .with_span(*span),
             );
         }
@@ -3971,7 +4067,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         if *kind == VariableKind::Let && value.is_none() {
             self.diagnostics.push(
                 Diagnostic::error("`let` requires an explicit initializer; it cannot rely on a type's default value")
-                    .with_code_str("E002")
+                    .with_code_str(ErrCode::E002)
                     .with_span(*span),
             );
         }
@@ -4001,7 +4097,10 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             && self.local_variable_types.get(*var_name).is_some()
         {
             let assign = Stmt::Assign {
-                target: arena.alloc(crate::ast::Expr::Ident(*var_name, *span)),
+                target: crate::ast::LValue::try_from_expr(
+                    arena.alloc(crate::ast::Expr::Ident(*var_name, *span)),
+                )
+                .expect("an identifier is always a valid lvalue"),
                 op: None,
                 value: (*value_expr).clone(),
                 span: *span,
@@ -4024,17 +4123,16 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         this_span: *span,
                         original_span: prev_span,
                     })
-                    .with_code_str("E019"),
+                    .with_code_str(ErrCode::E019),
                 );
             } else if self.local_variable_types.get(*var_name).is_some() {
                 // Shadowing is allowed but warns.
                 let prev_span = self.span_get(var_name).unwrap_or(*span);
                 self.diagnostics.push(
-                    Diagnostic::warning(crate::tr!(
-                        "shadowing-definition",
-                        name = DisplayArg(var_name.as_str())
+                    Diagnostic::warning(crate::diagnostics::i18n::fluent::shadowing_definition(
+                        var_name.as_str(),
                     ))
-                    .with_code_str("W113")
+                    .with_code_str(ErrCode::W113)
                     .with_span(*span)
                     .with_additional_span(prev_span)
                     .with_secondary_label(prev_span, "previous definition here"),
@@ -4118,7 +4216,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         // The semantic code for "no
                         // default value" is E016 — E003 is
                         // "unexpected token" (parser).
-                        .with_code_str("E016")
+                        .with_code_str(ErrCode::E016)
                         .with_span(*span),
                     );
                     (None, declared_ty)
@@ -4154,6 +4252,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         let (value_hir, inferred_ty, pattern_hir, else_hir) = match rhs_result {
             Ok(r) => r,
             Err(rhs_err) => {
+                let mut rhs_err = rhs_err;
+                rhs_err.humanize();
                 if let Some(ref mut d) = dup_diag {
                     d.related_errors_mut()
                         .push(crate::diagnostics::RelatedError {
@@ -4193,10 +4293,11 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             // is RIGID (user-specified) and eligible for GADT refinement;
             // inferred bindings stay wobbly.
             if ty.is_some() {
-                self.local_variable_types.insert_with_rigidity(
+                self.local_variable_types.insert_with_rigidity_and_mut(
                     *var_name,
                     final_ty,
                     crate::hir::types::Rigidity::Rigid,
+                    *mutable,
                 );
             } else {
                 // LET-W (Smart Let): inherit rigidity from the RHS expression.
@@ -4207,13 +4308,15 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     fc.scrut_is_rigid(v)
                 });
                 if is_rigid {
-                    self.local_variable_types.insert_with_rigidity(
+                    self.local_variable_types.insert_with_rigidity_and_mut(
                         *var_name,
                         final_ty,
                         crate::hir::types::Rigidity::Rigid,
+                        *mutable,
                     );
                 } else {
-                    self.local_variable_types.insert(*var_name, final_ty);
+                    self.local_variable_types
+                        .insert_with_mut(*var_name, final_ty, *mutable);
                 }
             }
             self.span_insert(*var_name, *span);
@@ -4245,9 +4348,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         Literal::Int(v) => v.to_i128().map(ComptimeValue::Int),
                         Literal::Float(v) => Some(ComptimeValue::Float(*v)),
                         Literal::Bool(v) => Some(ComptimeValue::Bool(*v)),
-                        Literal::String(s) => {
-                            Some(ComptimeValue::String(std::sync::Arc::from(s.as_str())))
-                        }
+                        Literal::String(s) => Some(ComptimeValue::String(std::sync::Arc::from(*s))),
                         _ => None,
                     };
                     if let Some(val) = cv {
@@ -4315,7 +4416,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         // `set auto<T, N> = expr` — bind captured type names to the inferred type.
         // Each name in `type_captures` becomes available as a type alias in
         // comptime reflection (e.g., `@typeInfo!(T)`).
-        for capture in type_captures {
+        for capture in type_captures.iter() {
             self.local_type_param_cache.insert(capture.name, final_ty);
         }
 
@@ -4389,14 +4490,28 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             value: value_hir.map(Box::new),
             else_branch: else_hir,
             span: *span,
-            type_captures: type_captures.clone(),
+            type_captures: type_captures.to_vec(),
         })
     }
 
-    fn check_impl_block_stmt(
+    fn check_impl_block_item(
         &mut self,
-        stmt: &Stmt<'input>,
+        item: &Item<'input>,
     ) -> Result<HirStmt<'input>, Diagnostic<'src>> {
+        let Item::ImplBlock {
+            span,
+            trait_path,
+            for_type,
+            methods,
+            attributes,
+            type_params,
+            where_clause,
+            associated_types,
+            ..
+        } = item
+        else {
+            unreachable!("check_item_stmt dispatch guarantees the item variant");
+        };
         let (
             trait_path,
             for_type,
@@ -4406,34 +4521,16 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             type_params,
             where_clause,
             associated_types,
-        ) = match stmt {
-            Stmt::ImplBlock {
-                span,
-                trait_path,
-                for_type,
-                methods,
-                attributes,
-                type_params,
-                where_clause,
-                associated_types,
-                ..
-            } => (
-                trait_path,
-                for_type,
-                methods,
-                *span,
-                attributes,
-                type_params,
-                where_clause,
-                associated_types,
-            ),
-            _ => {
-                let msg = format!("check_stmt: expected ImplBlock, got {:?}", stmt);
-                self.diagnostics
-                    .push(Diagnostic::error(msg).with_span(stmt.span()));
-                return Ok(HirStmt::Error);
-            }
-        };
+        ) = (
+            trait_path,
+            for_type,
+            methods,
+            *span,
+            attributes,
+            type_params,
+            where_clause,
+            associated_types,
+        );
         // Collect impl type-param names once — shared by all methods
         // of this impl.  Passed to `check_method_body` so the E104
         // generality check runs per method (methods are generic
@@ -4475,7 +4572,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         None => {
                             self.diagnostics.push(
                                 Diagnostic::error("trait not found")
-                                    .with_code_str("E100")
+                                    .with_code_str(ErrCode::E100)
                                     .with_span(span),
                             );
                             return Ok(HirStmt::Error);
@@ -4489,7 +4586,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         None => {
                             self.diagnostics.push(
                                 Diagnostic::error("trait not found")
-                                    .with_code_str("E100")
+                                    .with_code_str(ErrCode::E100)
                                     .with_span(span),
                             );
                             return Ok(HirStmt::Error);
@@ -4502,7 +4599,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 None => {
                     self.diagnostics.push(
                         Diagnostic::error("trait not found")
-                            .with_code_str("E100")
+                            .with_code_str(ErrCode::E100)
                             .with_span(span),
                     );
                     return Ok(HirStmt::Error);
@@ -4523,7 +4620,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                             "use of experimental trait `{}`",
                             trait_name,
                         ))
-                        .with_code_str("E094")
+                        .with_code_str(ErrCode::E094)
                         .with_span(span)
                         .with_help("experimental features are not enabled; use `--enable-experimental` to use this trait"),
                     );
@@ -4555,7 +4652,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                             impl_span: span,
                             trait_span: trait_binding.span,
                         })
-                        .with_code_str("E101")
+                        .with_code_str(ErrCode::E101)
                         .with_help("every trait method must be implemented — add a `def` for it in this impl block"));
                 }
             }
@@ -4599,7 +4696,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                             m.params.len(),
                             trait_sig.params.len(),
                         ))
-                        .with_code_str("E103")
+                        .with_code_str(ErrCode::E103)
                         .with_span(m.span),
                     );
                 }
@@ -4631,7 +4728,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             // so deref coercions (`try_deref_trait_step`) can find
             // the `Target` through the impl.
             let mut assoc_tys = Vec::new();
-            for at in associated_types {
+            for at in associated_types.iter() {
                 let ty = match &at.default {
                     Some(d) => {
                         let resolved = self.resolve_self_ty(d, self_ty);
@@ -4659,7 +4756,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     // every bare type variable in the head type appears in at
                     // least one context type.
                     if let Some(wc) = where_clause {
-                        for pred in &wc.predicates {
+                        for pred in wc.predicates {
                             match self.resolve_type(&pred.ty) {
                                 Ok(resolved) => ctx_tys.push(resolved),
                                 Err(diag) => {
@@ -4688,7 +4785,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     if let Some(tp) = &trait_path
                         && let Type::Generic(_, generic_args, _) = tp
                     {
-                        for arg in generic_args {
+                        for arg in generic_args.iter() {
                             if let GenericArg::Positional(ty) = arg {
                                 match self.resolve_type(ty) {
                                     Ok(resolved) => args.push(resolved),
@@ -4707,13 +4804,13 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     let mut bounds = Vec::new();
                     // Extract from where clause predicates
                     if let Some(wc) = where_clause {
-                        for pred in &wc.predicates {
+                        for pred in wc.predicates {
                             if let Ok(subject_ty) = self.resolve_type(&pred.ty) {
-                                for bound in &pred.bounds {
+                                for bound in pred.bounds {
                                     if let Some(trait_id) = self.resolve_trait_path(bound) {
                                         let mut bound_args = Vec::new();
                                         if let Type::Generic(_, args, _) = bound {
-                                            for arg in args {
+                                            for arg in args.iter() {
                                                 if let GenericArg::Positional(ty) = arg
                                                     && let Ok(resolved) = self.resolve_type(ty)
                                                 {
@@ -4731,11 +4828,11 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     for (i, tp) in type_params.iter().enumerate() {
                         if !tp.bounds.is_empty() {
                             let param_id = self.ctx.generic_param(i, tp.name);
-                            for bound in &tp.bounds {
+                            for bound in tp.bounds {
                                 if let Some(trait_id) = self.resolve_trait_path(bound) {
                                     let mut bound_args = Vec::new();
                                     if let Type::Generic(_, args, _) = bound {
-                                        for arg in args {
+                                        for arg in args.iter() {
                                             if let GenericArg::Positional(ty) = arg
                                                 && let Ok(resolved) = self.resolve_type(ty)
                                             {
@@ -4758,7 +4855,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             {
                 self.diagnostics.push(
                     Diagnostic::error(format!("{}", orphan))
-                        .with_code_str("E102")
+                        .with_code_str(ErrCode::E102)
                         .with_span(span),
                 );
             } else {
@@ -4801,7 +4898,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
 
             Ok(HirStmt::ImplBlock {
                 span,
-                attributes: attributes.clone(),
+                attributes: attributes.to_vec(),
                 trait_path: Some(trait_id),
                 for_type: for_ty,
                 methods: methods.to_vec(),
@@ -4887,7 +4984,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             }
             Ok(HirStmt::ImplBlock {
                 span,
-                attributes: attributes.clone(),
+                attributes: attributes.to_vec(),
                 trait_path: None,
                 for_type: for_ty,
                 methods: methods.to_vec(),
@@ -4972,16 +5069,16 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
     ///
     /// The interner is shared, so every `TypeId` in the returned HIR stays
     /// valid in the caller's context; only the *bindings* are per-function.
-    fn check_function_def_stmt(
+    fn check_function_def_item(
         &mut self,
-        stmt: &Stmt<'input>,
+        item: &Item<'input>,
     ) -> Result<HirStmt<'input>, Diagnostic<'src>> {
         let fresh_ctx = TypeContext::new_sharing(&*self.ctx);
         let fresh_env = self.trait_env.clone();
         let caller_ctx = std::mem::replace(&mut *self.ctx, fresh_ctx);
         let caller_env = std::mem::replace(&mut *self.trait_env, fresh_env);
 
-        let result = self.check_function_def_stmt_inner(stmt);
+        let result = self.check_function_def_stmt_inner(item);
 
         // Discard the per-function inference state.  Diagnostics were
         // pushed onto `self.diagnostics` (which is NOT swapped), so they
@@ -4992,7 +5089,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
     }
 
     /// Full per-function body check for the [`crate::hir::query::queries::CheckFnBody`]
-    /// query: check the function-def statement and salvage EVERYTHING the
+    /// query: check the function-def item and salvage EVERYTHING the
     /// Pass-3 driver used to pull off the worker — diagnostics, deferred
     /// obligations, GADT constructs, and the HIR body.
     ///
@@ -5007,12 +5104,12 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
     /// `'src = 'input` (the harness stores `source: Option<&'input str>`).
     pub(crate) fn check_function_def_salvaged(
         &mut self,
-        stmt: &Stmt<'input>,
+        item: &Item<'input>,
     ) -> crate::hir::query::queries::FnBodyCheck<'input>
     where
         'src: 'input,
     {
-        let result = self.check_function_def_stmt(stmt);
+        let result = self.check_function_def_item(item);
         let hir = match result {
             Ok(h) => h,
             Err(diag) => {
@@ -5033,9 +5130,9 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
 
     fn check_function_def_stmt_inner(
         &mut self,
-        stmt: &Stmt<'input>,
+        stmt: &Item<'input>,
     ) -> Result<HirStmt<'input>, Diagnostic<'src>> {
-        let Stmt::FunctionDef {
+        let Item::FunctionDef {
             span,
             attributes,
             contracts,
@@ -5133,7 +5230,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         // the "looks odd ⇒ likely a programmer error" heuristic, minus
         // the overly aggressive compile error.
         if let Some(wc) = where_clause.as_ref() {
-            for eq in &wc.equalities {
+            for eq in wc.equalities {
                 if let (Ok(l), Ok(r)) = (self.resolve_type(&eq.left), self.resolve_type(&eq.right))
                 {
                     // Redundancy check: the two sides are "already
@@ -5155,7 +5252,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                     Diagnostic::error(
                                         "where equality contradicts a prior constraint: the two sides cannot be unified",
                                     )
-                                    .with_code_str("E107")
+                                    .with_code_str(ErrCode::E107)
                                     .with_span(eq.span)
                                     .with_help(
                                         "remove the contradictory equality, or split into separate functions",
@@ -5218,7 +5315,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                 "@trusted function `{}` must have @link_proof or @comptime_test evidence in strict mode",
                                 name,
                             ))
-                            .with_code_str("E091")
+                            .with_code_str(ErrCode::E091)
                             .with_span(*span)
                             .with_help("add `@link_proof(path, hash)` referencing an external proof, or `@comptime_test` to validate at compile time")
                             .with_suggestion("add `@link_proof(\"path/to/proof.coq\", \"sha256:...\")` or `@comptime_test` above this function"),
@@ -5247,7 +5344,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         "@trusted function `{}` must carry `requires`/`ensures` contracts",
                         name,
                     ))
-                    .with_code_str("E092")
+                    .with_code_str(ErrCode::E092)
                     .with_span(*span)
                     .with_help(
                         "add `requires <condition>` and `ensures <condition>` \
@@ -5309,8 +5406,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             guard.checker.region_outlives.push((*r, *r));
         }
         if let Some(wc) = where_clause.as_ref() {
-            for (lt, outlives) in &wc.lifetime_outlives {
-                for bound in outlives {
+            for (lt, outlives) in wc.lifetime_outlives {
+                for bound in outlives.iter() {
                     guard.checker.region_outlives.push((*lt, *bound));
                 }
             }
@@ -5339,7 +5436,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             if return_type.is_none() || !guard.checker.ctx.is_never(return_ty) {
                 guard.checker.diagnostics.push(
                             Diagnostic::error("@interrupt handler must return `!` (never type)")
-                                .with_code_str("E050")
+                                .with_code_str(ErrCode::E050)
                                 .with_span(*span)
                                 .with_help("interrupt handlers must have return type `!` because they never return")
                         );
@@ -5348,7 +5445,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             if !params.is_empty() {
                 guard.checker.diagnostics.push(
                             Diagnostic::error("@interrupt handler cannot have parameters")
-                                .with_code_str("E051")
+                                .with_code_str(ErrCode::E051)
                                 .with_span(*span)
                                 .with_help("interrupt handlers take no arguments — state is read via MMIO or ghost variables")
                         );
@@ -5359,7 +5456,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             if !has_no_alloc {
                 guard.checker.diagnostics.push(
                     Diagnostic::error("@interrupt handler must satisfy @no_alloc")
-                        .with_code_str("E052")
+                        .with_code_str(ErrCode::E052)
                         .with_span(*span)
                         .with_suggestion(
                             "add `@no_alloc` to this function (redundant with `@no_panic`?)",
@@ -5369,7 +5466,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             if !has_no_panic {
                 guard.checker.diagnostics.push(
                     Diagnostic::error("@interrupt handler must satisfy @no_panic")
-                        .with_code_str("E053")
+                        .with_code_str(ErrCode::E053)
                         .with_span(*span)
                         .with_suggestion("add `@no_panic` to this function"),
                 );
@@ -5378,7 +5475,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             if attributes.iter().any(|a| a.name.eq_str("alloc")) {
                 guard.checker.diagnostics.push(
                             Diagnostic::error("@interrupt handler cannot have @alloc")
-                                .with_code_str("E054")
+                                .with_code_str(ErrCode::E054)
                                 .with_span(*span)
                                 .with_help("@interrupt and @alloc are incompatible — interrupt handlers must not allocate")
                         );
@@ -5387,7 +5484,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             if attributes.iter().any(|a| a.name.eq_str("io")) {
                 guard.checker.diagnostics.push(
                             Diagnostic::error("@interrupt handler cannot have @io")
-                                .with_code_str("E055")
+                                .with_code_str(ErrCode::E055)
                                 .with_span(*span)
                                 .with_help("@interrupt and @io are incompatible — interrupt handlers must not perform I/O")
                         );
@@ -5408,13 +5505,20 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         // and `result` so that ensures clauses can reference them.
         // Function parameters are RIGID (PLDI'06 §2) — the user wrote
         // their types in the signature, so they are eligible for GADT
-        // refinement.
+        // refinement — and are mutable rebindable slots (the grammar has
+        // no parameter-level `mut`, so loop-carried walks like `ls = tl`
+        // in E0499/LLBC# §6 `get_suffix` require parameters to be
+        // assignable).
         for p in &hir_params {
-            guard.checker.local_variable_types.insert_with_rigidity(
-                p.name,
-                p.ty,
-                crate::hir::types::Rigidity::Rigid,
-            );
+            guard
+                .checker
+                .local_variable_types
+                .insert_with_rigidity_and_mut(
+                    p.name,
+                    p.ty,
+                    crate::hir::types::Rigidity::Rigid,
+                    true,
+                );
             guard.checker.span_insert(p.name, p.span);
         }
         guard
@@ -5425,7 +5529,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
 
         // SCAP: collect ensures conditions into the guarantee chain.
         // Each `ensures` becomes a postcondition that must hold at return.
-        for contract in contracts {
+        for contract in contracts.iter() {
             if let Contract::Ensures { expr, .. } = contract {
                 let expr_labels = extract_labels_from_expr(expr);
                 // Inject each label as a scoped variable with the
@@ -5480,7 +5584,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         //   subject and bounds, and emits Impl(substituted_subject, trait, span).
         let mut caller_bounds: Vec<TraitPredicate> = Vec::new();
         if let Some(wc) = where_clause {
-            for pred in &wc.predicates {
+            for pred in wc.predicates {
                 // Resolve the subject(s).  A `Type::Tuple` means
                 // `where (A, B, …): Bound` — resolve each element.
                 let subject_tys: Vec<TypeId> = if let Type::Tuple(elems, _) = &pred.ty {
@@ -5492,7 +5596,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     vec![guard.checker.resolve_type(&pred.ty)?]
                 };
 
-                for bound in &pred.bounds {
+                for bound in pred.bounds {
                     // ── Direct trait bound ──────────────────────────
                     if let Some(trait_id) = guard.checker.resolve_trait_path(bound) {
                         if subject_tys.len() > 1 {
@@ -5504,7 +5608,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                              to multiple types in a tuple subject; \
                                              use separate `where` clauses",
                                 )
-                                .with_code_str("E004")
+                                .with_code_str(ErrCode::E004)
                                 .with_span(pred.span),
                             );
                         } else {
@@ -5515,7 +5619,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                             // to TypeIds for the new solver's TraitPredicate.
                             let mut trait_args: Vec<TypeId> = Vec::new();
                             if let Type::Generic(_, args, _) = bound {
-                                for arg in args {
+                                for arg in args.iter() {
                                     match arg {
                                         GenericArg::Positional(ty) => {
                                             match guard.checker.resolve_type(ty) {
@@ -5554,7 +5658,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                             // arg is an associated type projection that must
                             // be resolved.
                             if let Type::Generic(_, args, _) = bound {
-                                for arg in args {
+                                for arg in args.iter() {
                                     match arg {
                                         GenericArg::Named(assoc_name, assoc_ty) => {
                                             // Resolve the associated type value
@@ -5610,7 +5714,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                 subject_tys.len(),
                                 if subject_tys.len() > 1 { "were" } else { "was" },
                             ))
-                            .with_code_str("E004")
+                            .with_code_str(ErrCode::E004)
                             .with_span(pred.span),
                         );
                         continue;
@@ -5897,7 +6001,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                             ),
                             context: None,
                         })
-                        .with_code_str("E044"),
+                        .with_code_str(ErrCode::E044),
                     );
                 }
             }
@@ -5997,7 +6101,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                         "label `@{}` used in `ensures` but never attached to a `return`",
                                         label_name,
                                     ))
-                                    .with_code_str("E030")
+                                    .with_code_str(ErrCode::E030)
                                     .with_help("each label in `ensures @label` must have a matching `return @label`")
                                     .with_suggestion(format!(
                                         "add `return @{} <value>` to the function body, or remove `@{}` from the ensures clause",
@@ -6024,7 +6128,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                         "label `@{}` attached to a `return` but never referenced in an `ensures` clause",
                                         label_name,
                                     ))
-                                    .with_code_str("E030")
+                                    .with_code_str(ErrCode::E030)
                                     .with_help("each `return @label` must have a matching `ensures @label` clause")
                                     .with_suggestion(format!(
                                         "add `ensures @{} <property>` to the function's contracts, or remove `@{}` from the return statement",
@@ -6201,7 +6305,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 let msg = format_solve_errors(symbols, ctx, &errors);
                 let err_span = errors.first().and_then(|e| e.span()).unwrap_or(*span);
                 return Err(Diagnostic::error(format!("trait solver error: {}", msg))
-                    .with_code_str("E030")
+                    .with_code_str(ErrCode::E030)
                     .with_span(err_span));
             }
         }
@@ -6256,7 +6360,10 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
 
         let exit_res = guard.commit();
 
-        if let Err(diags) = exit_res {
+        if let Err(mut diags) = exit_res {
+            for d in diags.iter_mut() {
+                d.humanize();
+            }
             let details: Vec<String> = diags.iter().map(|d| d.message().to_string()).collect();
             return Err(
                 Diagnostic::error(format!("inference failure: {}", details.join("; ")))
@@ -6266,7 +6373,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
 
         // Contract<'input> verification skeleton: check that requires/ensures are bool,
         // and decreases/terminates are integer types.
-        for contract in contracts {
+        for contract in contracts.iter() {
             match contract {
                 Contract::Requires(expr, cspan) | Contract::Invariant(expr, cspan) => {
                     let (_, ty) = self.infer_expr(expr, None)?;
@@ -6276,7 +6383,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                     Diagnostic::error(
                                         "Regex types cannot appear in contracts; they are for runtime use only",
                                     )
-                                    .with_code_str("E030")
+                                    .with_code_str(ErrCode::E030)
                                     .with_span(*cspan)
                                     .with_help("use a boolean predicate instead of a Regex type")
                                     .with_suggestion("replace the Regex type with a compatible boolean expression"),
@@ -6284,7 +6391,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     } else if !self.ctx.is_bool(ty) {
                         self.diagnostics.push(
                             Diagnostic::error("contract condition must be boolean")
-                                .with_code_str("E020")
+                                .with_code_str(ErrCode::E020)
                                 .with_span(*cspan)
                                 .with_label(expr.span(), format!("got {:?}", self.ctx.get(ty))),
                         );
@@ -6300,7 +6407,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                     Diagnostic::error(
                                         "Regex types cannot appear in contracts; they are for runtime use only",
                                     )
-                                    .with_code_str("E030")
+                                    .with_code_str(ErrCode::E030)
                                     .with_span(*cspan)
                                     .with_help("use a boolean predicate instead of a Regex type")
                                     .with_suggestion("replace the Regex type with a compatible boolean expression"),
@@ -6308,7 +6415,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     } else if !self.ctx.is_bool(ty) {
                         self.diagnostics.push(
                             Diagnostic::error("ensures clause must be boolean")
-                                .with_code_str("E020")
+                                .with_code_str(ErrCode::E020)
                                 .with_span(*cspan)
                                 .with_label(expr.span(), format!("got {:?}", self.ctx.get(ty))),
                         );
@@ -6319,7 +6426,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     if !self.ctx.is_numeric(ty) && !self.ctx.is_integer(ty) {
                         self.diagnostics.push(
                             Diagnostic::error("decreases/terminates expression must be an integer")
-                                .with_code_str("E021")
+                                .with_code_str(ErrCode::E021)
                                 .with_span(*cspan)
                                 .with_label(expr.span(), format!("got {:?}", self.ctx.get(ty))),
                         );
@@ -6479,7 +6586,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 let msg = format_solve_errors(symbols, ctx, &errors);
                 let err_span = errors.first().and_then(|e| e.span()).unwrap_or(*span);
                 return Err(Diagnostic::error(format!("trait solver error: {}", msg))
-                    .with_code_str("E030")
+                    .with_code_str(ErrCode::E030)
                     .with_span(err_span));
             }
         }
@@ -6681,7 +6788,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                 "generic parameter `{}` is constrained to a specific type by the function body; the body must type-check for every instantiation",
                                 name,
                             ))
-                            .with_code_str("E104")
+                            .with_code_str(ErrCode::E104)
                             .with_span(origin.unwrap_or(*span)),
                         );
             }
@@ -6719,7 +6826,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             if !params.is_empty() {
                 self.diagnostics.push(
                             Diagnostic::error("@comptime_test function must have no parameters")
-                                .with_code_str("E090")
+                                .with_code_str(ErrCode::E090)
                                 .with_span(*span)
                                 .with_help("@comptime_test functions are executed at compile time with no arguments")
                                 .with_suggestion("remove the parameters, or use a regular comptime def function instead"),
@@ -6765,7 +6872,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                         "@comptime_test `{}` failed: {}",
                                         name, e,
                                     ))
-                                    .with_code_str("E090")
+                                    .with_code_str(ErrCode::E090)
                                     .with_span(*span)
                                     .with_help("@comptime_test functions are executed at compile time; fix the assertion failure"),
                                 );
@@ -6782,7 +6889,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 // body_hir is None (extern function) — emit error below.
                 self.diagnostics.push(
                         Diagnostic::error("@comptime_test requires a function body")
-                            .with_code_str("E090")
+                            .with_code_str(ErrCode::E090)
                             .with_span(*span)
                             .with_help("@comptime_test functions must have a body to execute at compile time; extern declarations cannot be tested")
                             .with_suggestion("remove `@comptime_test` from this function, or provide a body"),
@@ -6836,7 +6943,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 };
                 self.diagnostics.push(
                     Diagnostic::error(format!("`@pure` function `{}` {}", name, what,))
-                        .with_code_str("E117")
+                        .with_code_str(ErrCode::E117)
                         .with_span(*span)
                         .with_help(
                             "a @pure function must have no side effects, transitively — \
@@ -6924,14 +7031,14 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
 
         Ok(HirStmt::FunctionDef {
             span: *span,
-            attributes: attributes.clone(),
-            contracts: contracts.clone(),
+            attributes: attributes.to_vec(),
+            contracts: contracts.to_vec(),
             doc: None,
             name: *name,
             params: hir_params,
             return_type: Some(return_ty),
             body: body_hir,
-            type_params: type_params.clone(),
+            type_params: type_params.to_vec(),
             where_clause: where_clause.clone().map(|_| ()),
             finally: finally_hir,
             is_comptime: *is_comptime,
@@ -7007,7 +7114,10 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 default: None,
                 span: p.span,
             });
-            self.local_variable_types.insert(p.name, ty);
+            // Method parameters are mutable rebindable slots, matching
+            // free-function parameters — `ls = tl` walks and `&mut self`
+            // field writes depend on this.
+            self.local_variable_types.insert_with_mut(p.name, ty, true);
             self.span_insert(p.name, p.span);
         }
         let ret_ty = {
@@ -7081,7 +7191,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         "generic parameter `{}` is constrained to a specific type by the method body; the body must type-check for every instantiation",
                         name,
                     ))
-                    .with_code_str("E104")
+                    .with_code_str(ErrCode::E104)
                     .with_span(origin.unwrap_or(m.span)),
                 );
             }
@@ -7209,7 +7319,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                 "GADT variant `{}` constraint not satisfied (unresolvable)",
                                 p.variant,
                             ))
-                            .with_code_str("E060")
+                            .with_code_str(ErrCode::E060)
                             .with_span(p.span),
                         );
                         continue;
@@ -7225,7 +7335,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                             "GADT variant `{}` constraint cannot be verified: type argument is still unresolved after solving",
                             p.variant,
                         ))
-                        .with_code_str("E060")
+                        .with_code_str(ErrCode::E060)
                         .with_span(p.span),
                     );
                     continue;
@@ -7255,7 +7365,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                             "GADT variant `{}` constraint not satisfied",
                             p.variant,
                         ))
-                        .with_code_str("E060")
+                        .with_code_str(ErrCode::E060)
                         .with_span(p.span)
                         .with_help(format!(
                             "`{}` requires `{} == {}`, but the type argument is constrained differently",
@@ -7350,19 +7460,27 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         }
                     })
                     .collect();
+                let arena = self
+                    .ctx
+                    .arena
+                    .expect("arena required for type construction");
                 Type::Generic(
-                    self.ctx
-                        .arena
-                        .expect("arena required for type construction")
-                        .alloc(new_base),
-                    new_args,
+                    arena.alloc(new_base),
+                    arena.alloc_slice_clone(&new_args),
                     *span,
                 )
             }
             Type::Tuple(tys, span) => Type::Tuple(
-                tys.iter()
-                    .map(|t| self.resolve_self_ty(t, self_ty))
-                    .collect(),
+                {
+                    let mapped: Vec<Type<'input>> = tys
+                        .iter()
+                        .map(|t| self.resolve_self_ty(t, self_ty))
+                        .collect();
+                    self.ctx
+                        .arena
+                        .expect("arena required for type construction")
+                        .alloc_slice_clone(&mapped)
+                },
                 *span,
             ),
             Type::Slice(inner, span) => Type::Slice(
@@ -7381,17 +7499,29 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 *span,
             ),
             Type::DynTrait(traits, span) => Type::DynTrait(
-                traits
-                    .iter()
-                    .map(|t| self.resolve_self_ty(t, self_ty))
-                    .collect(),
+                {
+                    let mapped: Vec<Type<'input>> = traits
+                        .iter()
+                        .map(|t| self.resolve_self_ty(t, self_ty))
+                        .collect();
+                    self.ctx
+                        .arena
+                        .expect("arena required for type construction")
+                        .alloc_slice_clone(&mapped)
+                },
                 *span,
             ),
             Type::Function { params, ret, span } => Type::Function {
-                params: params
-                    .iter()
-                    .map(|p| self.resolve_self_ty(p, self_ty))
-                    .collect(),
+                params: {
+                    let mapped: Vec<Type<'input>> = params
+                        .iter()
+                        .map(|p| self.resolve_self_ty(p, self_ty))
+                        .collect();
+                    self.ctx
+                        .arena
+                        .expect("arena required for type construction")
+                        .alloc_slice_clone(&mapped)
+                },
                 ret: self
                     .ctx
                     .arena
@@ -7465,8 +7595,11 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             .map(|b| b.def_id)
             .or_else(|| self.symbols.lookup_trait(path[0]).map(|b| b.def_id))
             .ok_or_else(|| {
-                Diagnostic::error(format!("'{}' not found", path[0].as_str()))
-                    .with_span(Span::new(FileId::DUMMY, 0, 0))
+                Diagnostic::error(format!("'{}' not found", path[0].as_str())).with_span(Span::new(
+                    FileId::DUMMY,
+                    0,
+                    0,
+                ))
             })
     }
 
@@ -7574,7 +7707,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     reason,
                     context: Some(context),
                 })
-                .with_code_str("E030");
+                .with_code_str(ErrCode::E030);
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
                     diag = diag.with_suggestion(suggestion.message);
                 }
@@ -7643,19 +7776,21 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     }
                 };
                 let mut diag = match ctx {
-                    TypingContext::ReturnValue => {
-                        Diagnostic::error(msg).with_code_str("E036").with_span(span)
-                    }
-                    TypingContext::Argument { .. } => {
-                        Diagnostic::error(msg).with_code_str("E037").with_span(span)
-                    }
-                    TypingContext::Condition => {
-                        Diagnostic::error(msg).with_code_str("E038").with_span(span)
-                    }
-                    TypingContext::Index => {
-                        Diagnostic::error(msg).with_code_str("E039").with_span(span)
-                    }
-                    _ => Diagnostic::error(msg).with_code_str("E030").with_span(span),
+                    TypingContext::ReturnValue => Diagnostic::error(msg)
+                        .with_code_str(ErrCode::E036)
+                        .with_span(span),
+                    TypingContext::Argument { .. } => Diagnostic::error(msg)
+                        .with_code_str(ErrCode::E037)
+                        .with_span(span),
+                    TypingContext::Condition => Diagnostic::error(msg)
+                        .with_code_str(ErrCode::E038)
+                        .with_span(span),
+                    TypingContext::Index => Diagnostic::error(msg)
+                        .with_code_str(ErrCode::E039)
+                        .with_span(span),
+                    _ => Diagnostic::error(msg)
+                        .with_code_str(ErrCode::E030)
+                        .with_span(span),
                 };
                 if let Some(suggestion) = self.suggest_cast(expected, actual) {
                     diag = diag.with_suggestion(suggestion.message);
@@ -7912,7 +8047,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                 "type mismatch: expected `Bool`, found `{}`",
                                 other_type_str,
                             ))
-                            .with_code_str("E031")
+                            .with_code_str(ErrCode::E031)
                             .with_span(span),
                         )
                     } else {
@@ -7928,7 +8063,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                 "type mismatch: expected integer type, found `{}`",
                                 other_type_str,
                             ))
-                            .with_code_str("E031")
+                            .with_code_str(ErrCode::E031)
                             .with_span(span),
                         )
                     } else {
@@ -7942,7 +8077,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                 "type mismatch: expected float type, found `{}`",
                                 other_type_str,
                             ))
-                            .with_code_str("E031")
+                            .with_code_str(ErrCode::E031)
                             .with_span(span),
                         )
                     } else {
@@ -7956,7 +8091,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                                 "type mismatch: expected numeric type, found `{}`",
                                 other_type_str,
                             ))
-                            .with_code_str("E031")
+                            .with_code_str(ErrCode::E031)
                             .with_span(span),
                         )
                     } else {
@@ -8039,14 +8174,14 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 Err(Diagnostic::error(
                     "safe cast from reference type requires explicit dereference or unsafe cast",
                 )
-                .with_code_str("E601")
+                .with_code_str(ErrCode::E601)
                 .with_span(span)
                 .with_suggestion("consider dereferencing first: `*expr as TargetType`")
                 .with_suggestion("or use `as!` for an unsafe bitcast"))
             } else {
                 Err(
                     Diagnostic::error("safe cast only allowed between numeric and boolean types")
-                        .with_code_str("E601")
+                        .with_code_str(ErrCode::E601)
                         .with_span(span)
                         .with_suggestion("use `From` trait for non-primitive type conversions"),
                 )
@@ -8064,13 +8199,13 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             } else if self.ctx.is_reference(from) && self.ctx.is_integer(to) {
                 Err(
                     Diagnostic::error("unsafe cast from reference to integer not yet supported")
-                        .with_code_str("E601")
+                        .with_code_str(ErrCode::E601)
                         .with_span(span)
                         .with_suggestion("consider using `*expr as usize` via a pointer cast"),
                 )
             } else {
                 Err(Diagnostic::error("unsafe cast requires compatible types (numeric<->numeric, ref<->ptr, ptr<->ptr)")
-                    .with_code_str("E601")
+                    .with_code_str(ErrCode::E601)
                     .with_span(span))
             }
         }
@@ -8165,7 +8300,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
     pub(crate) fn emit_return_err_lint(&mut self, span: Span) {
         self.diagnostics.push(
             Diagnostic::error("`return Err(...)` is not valid; use `leave with` instead")
-                .with_code_str("E008")
+                .with_code_str(ErrCode::E008)
                 .with_span(span)
                 .with_help(
                     "`leave with` is the only valid error exit in Posita \
@@ -8411,7 +8546,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         // Create fresh InferVars for each GenericParam index
         let mut infer_var_for_index: Vec<TypeId> = Vec::new();
         // Wrap in a snapshot so leaked InferVars are rolled back on early exit.
-        let _snap = self.infer.start_snapshot();
+        let _snap = self.infer.start_snapshot(self.ctx);
         for _ in &generic_indices {
             let var = self.new_infer_var(
                 TypeVariableKind::Any,
@@ -8435,7 +8570,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
 
         // Check arity
         if substituted_params.len() != args.len() {
-            self.infer.rollback_to(_snap);
+            self.infer.rollback_to(self.ctx, _snap);
             return Err(Diagnostic::error(format!(
                 "wrong number of arguments: expected {}, found {}",
                 substituted_params.len(),
@@ -8458,7 +8593,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 &self.ctx,
             );
             if has_contra {
-                self.infer.rollback_to(_snap);
+                self.infer.rollback_to(self.ctx, _snap);
                 return Ok(None);
             }
             // Try unification — if it fails, don't error; just fall back.
@@ -8468,7 +8603,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 .unify_tracked(substituted_ret, exp_ty, span)
                 .is_ok();
             if !unify_ok {
-                self.infer.rollback_to(_snap);
+                self.infer.rollback_to(self.ctx, _snap);
                 self.ctx.rollback_transaction();
                 return Ok(None);
             }
@@ -8502,7 +8637,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     if expected.is_some() {
                         self.ctx.rollback_transaction();
                     }
-                    self.infer.rollback_to(_snap);
+                    self.infer.rollback_to(self.ctx, _snap);
                     return Err(e);
                 }
             }
@@ -8519,7 +8654,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             let resolved = self.ctx.resolve_binding(var);
             // Cannot resolve — reuse the InferVar itself; the caller will fallback
             if self.ctx.is_error(resolved) || self.ctx.is_infer_var(resolved) {
-                self.infer.rollback_to(_snap);
+                self.infer.rollback_to(self.ctx, _snap);
                 return Ok(None);
             }
             final_subst.insert(gp_idx, resolved);
@@ -8527,7 +8662,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
 
         // Apply the resolved substitution to the return type
         let final_ret = self.ctx.subst(ret, &final_subst);
-        self.infer.commit_snapshot(_snap);
+        self.infer.commit_snapshot(self.ctx, _snap);
         Ok(Some((
             HirExpr::Call {
                 callee: Box::new(callee_hir.clone()),
@@ -8569,7 +8704,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 Self::collect_generic_param_indices(*elem, ctx, out, bound)
             }
             TypeData::Slice { elem } => Self::collect_generic_param_indices(*elem, ctx, out, bound),
-            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
                 Self::collect_generic_param_indices(*ty, ctx, out, bound);
             }
             TypeData::Ptr { pointee, .. } => {
@@ -8665,7 +8800,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 Self::type_var_in_problematic_position(*ret, vars, ctx)
             }
             // Ref/Pointer/Ptr are invariant — if any var appears inside, it's risky
-            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
                 for &v in vars {
                     if Self::type_tree_contains(*ty, v, ctx) {
                         return true;
@@ -8717,7 +8852,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
                 Self::type_tree_contains(*elem, target, ctx)
             }
-            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
                 Self::type_tree_contains(*ty, target, ctx)
             }
             TypeData::Ptr { pointee, .. } => Self::type_tree_contains(*pointee, target, ctx),
@@ -8810,7 +8945,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             type_name,
             span,
         })
-        .with_code_str("E010");
+        .with_code_str(ErrCode::E010);
 
         // If we found the type definition, show where it was defined
         if let TypeData::Adt { def_id, .. } = self.ctx.get(ty)
@@ -9495,7 +9630,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
     fn refine_environment_for_gadt_arm(&mut self) -> GadtRefinementGuard {
         let all_bindings = self.local_variable_types.iter();
 
-        let mut refined: Vec<(Symbol, TypeId, crate::hir::types::Rigidity)> = Vec::new();
+        let mut refined: Vec<(Symbol, TypeId, crate::hir::types::Rigidity, bool)> = Vec::new();
 
         for (name, ty) in all_bindings {
             let rigidity = self.local_variable_types.get_rigidity(name);
@@ -9504,7 +9639,16 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             }
             let refined_ty = self.ctx.resolve_binding(ty);
             if refined_ty != ty {
-                refined.push((name, refined_ty, crate::hir::types::Rigidity::Rigid));
+                // GADT refinement changes the type but must NOT change the
+                // binding's mutability: a `set mut x` stays assignable in the
+                // refined frame, and an immutable binding stays frozen.
+                let mutable = self.local_variable_types.is_mutable(name).unwrap_or(false);
+                refined.push((
+                    name,
+                    refined_ty,
+                    crate::hir::types::Rigidity::Rigid,
+                    mutable,
+                ));
             }
         }
 
@@ -9530,12 +9674,12 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         ghost_rc.borrow_mut().push(HashSet::new());
         runtime_rc.borrow_mut().push(HashSet::new());
 
-        for (name, ty, rig) in &refined {
+        for (name, ty, rig, mutable) in &refined {
             frames_rc
                 .borrow_mut()
                 .last_mut()
                 .unwrap()
-                .insert(*name, *ty);
+                .insert(*name, (*ty, *mutable));
             rigidity_rc
                 .borrow_mut()
                 .last_mut()
@@ -9771,7 +9915,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         "conflicting GADT refinements in or-pattern: `{}` is refined to different types by the alternatives",
                         eq.param_name,
                     ))
-                    .with_code_str("E066")
+                    .with_code_str(ErrCode::E066)
                     .with_span(span),
                 );
             } else if all_same {
@@ -9888,7 +10032,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 let db = self.ctx.get(*eb).clone();
                 self.type_data_alpha_eq(&da, &db)
             }
-            (TypeData::Pointer { ty: ea }, TypeData::Pointer { ty: eb }) => {
+            (TypeData::Pointer { ty: ea, .. }, TypeData::Pointer { ty: eb, .. }) => {
                 let da = self.ctx.get(*ea).clone();
                 let db = self.ctx.get(*eb).clone();
                 self.type_data_alpha_eq(&da, &db)
@@ -10117,7 +10261,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 Diagnostic::error(
                     "conflicting GADT refinements: the same type parameter is refined to two different types by nested `when` constraints",
                 )
-                .with_code_str("E061")
+                .with_code_str(ErrCode::E061)
                 .with_span(span),
             );
         }
@@ -10142,8 +10286,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             TypeData::Tuple { elems } => elems.iter().any(|&e| self.type_has_unresolved_vars(e)),
             TypeData::Adt { args, .. } => args.iter().any(|&a| self.type_has_unresolved_vars(a)),
             TypeData::Array { elem, .. } => self.type_has_unresolved_vars(*elem),
-            TypeData::Pointer { ty: inner } => self.type_has_unresolved_vars(*inner),
-            TypeData::Ptr { size, pointee } => {
+            TypeData::Pointer { ty: inner, .. } => self.type_has_unresolved_vars(*inner),
+            TypeData::Ptr { size, pointee, .. } => {
                 self.type_has_unresolved_vars(*size) || self.type_has_unresolved_vars(*pointee)
             }
             TypeData::Fn { params, ret, .. } => {
@@ -10316,7 +10460,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             (TypeData::Array { elem: d_elem, .. }, TypeData::Array { elem: a_elem, .. }) => {
                 self.register_structural_gadt_eq(*d_elem, *a_elem, span);
             }
-            (TypeData::Pointer { ty: d_ty }, TypeData::Pointer { ty: a_ty }) => {
+            (TypeData::Pointer { ty: d_ty, .. }, TypeData::Pointer { ty: a_ty, .. }) => {
                 self.register_structural_gadt_eq(*d_ty, *a_ty, span);
             }
             (
@@ -10397,10 +10541,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 // Generic type: resolve the base and build with skolem-substituted args.
                 let base_id = match &**base {
                     Type::Path(path, _) => {
-                        match self.resolve_type(&Type::Path(
-                            smallvec::SmallVec::from(path.as_slice()),
-                            ty.span(),
-                        )) {
+                        match self.resolve_type(&Type::Path(*path, ty.span())) {
                             Ok(t) => t,
                             // Base may be a built-in that only resolves as
                             // part of the full generic type (e.g. `Int` in
@@ -10458,7 +10599,11 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             }
             Type::Pointer(inner, _) => {
                 let inner_ty = self.resolve_type_with_skolems(inner, exist_params, skolems)?;
-                Some(self.ctx.alloc(TypeData::Pointer { ty: inner_ty }))
+                // The `*T` surface sugar is `*const` — mutable: false.
+                Some(self.ctx.alloc(TypeData::Pointer {
+                    ty: inner_ty,
+                    mutable: false,
+                }))
             }
             Type::Tuple(elems, _) => {
                 let resolved: SmallVec<[TypeId; 4]> = elems
@@ -10690,21 +10835,19 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         facts_vec.push((name, is_method, receiver_ty, input_positions, facts));
     }
 
-    fn validate_auto_ro_placement(&mut self, stmt: &Stmt<'input>) {
-        let attributes = match stmt {
+    fn validate_auto_ro_placement(&mut self, item: &Item<'input>) {
+        let attributes = match item {
             // Function definitions are the ONLY valid placement.
-            Stmt::FunctionDef { attributes, .. }
-            | Stmt::TypeDef { attributes, .. }
-            | Stmt::TraitDef { attributes, .. }
-            | Stmt::ImplBlock { attributes, .. }
-            | Stmt::ExternFunction { attributes, .. }
-            | Stmt::LayoutDef { attributes, .. }
-            | Stmt::Generate { attributes, .. }
-            | Stmt::VariableDef { attributes, .. }
-            | Stmt::ComptimeBlock { attributes, .. }
-            | Stmt::Isolate { attributes, .. } => attributes,
+            Item::FunctionDef { attributes, .. }
+            | Item::TypeDef { attributes, .. }
+            | Item::TraitDef { attributes, .. }
+            | Item::ImplBlock { attributes, .. }
+            | Item::ExternFunction { attributes, .. }
+            | Item::LayoutDef { attributes, .. }
+            | Item::ComptimeBlock { attributes, .. }
+            | Item::Generate { attributes, .. } => attributes,
             _ => {
-                // A future attribute-bearing `Stmt<'input>` variant must not
+                // A future attribute-bearing `Item<'input>` variant must not
                 // silently bypass the `@auto_ro`/`@auto_coerce` placement
                 // validation.  Within this crate the match stays exhaustive
                 // (new variants are compile errors); the `#[non_exhaustive]`
@@ -10712,9 +10855,10 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 return;
             }
         };
-        for attr in attributes {
+        let is_fn = matches!(item, Item::FunctionDef { .. });
+        for attr in attributes.iter() {
             if attr.name.eq_str("auto_ro") {
-                if !matches!(stmt, Stmt::FunctionDef { .. }) {
+                if !is_fn {
                     self.diagnostics.push(
                         Diagnostic::error("`@auto_ro` is only valid on function definitions")
                             .with_span(attr.span)
@@ -10725,7 +10869,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     );
                 }
             } else if attr.name.eq_str("auto_coerce") {
-                if !matches!(stmt, Stmt::FunctionDef { .. }) {
+                if !is_fn {
                     self.diagnostics.push(
                         Diagnostic::error("`@auto_coerce` is only valid on function definitions")
                             .with_span(attr.span),
@@ -10739,21 +10883,19 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
     /// Returns `true` if the item has a `@cfg(condition)` attribute whose
     /// condition is not met on the current target, meaning the item should
     /// be excluded from compilation.
-    fn should_skip_due_to_cfg(&mut self, stmt: &Stmt<'input>) -> bool {
-        let attributes = match stmt {
-            Stmt::FunctionDef { attributes, .. }
-            | Stmt::TypeDef { attributes, .. }
-            | Stmt::TraitDef { attributes, .. }
-            | Stmt::ImplBlock { attributes, .. }
-            | Stmt::ExternFunction { attributes, .. }
-            | Stmt::LayoutDef { attributes, .. }
-            | Stmt::Generate { attributes, .. }
-            | Stmt::VariableDef { attributes, .. }
-            | Stmt::ComptimeBlock { attributes, .. }
-            | Stmt::Isolate { attributes, .. } => attributes,
+    fn should_skip_due_to_cfg(&mut self, item: &Item<'input>) -> bool {
+        let attributes = match item {
+            Item::FunctionDef { attributes, .. }
+            | Item::TypeDef { attributes, .. }
+            | Item::TraitDef { attributes, .. }
+            | Item::ImplBlock { attributes, .. }
+            | Item::ExternFunction { attributes, .. }
+            | Item::LayoutDef { attributes, .. }
+            | Item::ComptimeBlock { attributes, .. }
+            | Item::Generate { attributes, .. } => attributes,
             _ => return false,
         };
-        for attr in attributes {
+        for attr in attributes.iter() {
             if !crate::hir::cfg::eval_cfg(
                 attr,
                 &self.ctx.target,
@@ -10771,41 +10913,35 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
     /// are provably reachable under some target configuration.
     /// If a condition is contradictory (e.g. `all(target_os = "linux", target_os = "windows")`),
     /// emit a diagnostic error.
-    fn check_cfg_reachability(&mut self, stmt: &Stmt<'input>) {
-        let (attributes, span) = match stmt {
-            Stmt::FunctionDef {
+    fn check_cfg_reachability(&mut self, item: &Item<'input>) {
+        let (attributes, span) = match item {
+            Item::FunctionDef {
                 attributes, span, ..
             }
-            | Stmt::TypeDef {
+            | Item::TypeDef {
                 attributes, span, ..
             }
-            | Stmt::TraitDef {
+            | Item::TraitDef {
                 attributes, span, ..
             }
-            | Stmt::ImplBlock {
+            | Item::ImplBlock {
                 attributes, span, ..
             }
-            | Stmt::ExternFunction {
+            | Item::ExternFunction {
                 attributes, span, ..
             }
-            | Stmt::LayoutDef {
+            | Item::LayoutDef {
                 attributes, span, ..
             }
-            | Stmt::Generate {
+            | Item::ComptimeBlock {
                 attributes, span, ..
             }
-            | Stmt::VariableDef {
-                attributes, span, ..
-            }
-            | Stmt::ComptimeBlock {
-                attributes, span, ..
-            }
-            | Stmt::Isolate {
+            | Item::Generate {
                 attributes, span, ..
             } => (attributes, *span),
             _ => return,
         };
-        for attr in attributes {
+        for attr in attributes.iter() {
             if !crate::hir::cfg::is_provably_reachable(
                 attr,
                 self.strict_mode,
@@ -10815,7 +10951,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     Diagnostic::error(
                         "@cfg condition is unreachable: no target configuration can satisfy it"
                     )
-                    .with_code_str("E092")
+                    .with_code_str(ErrCode::E092)
                     .with_span(span)
                     .with_help("the @cfg condition contradicts itself (e.g. target_os = \"linux\" and target_os = \"windows\" simultaneously)")
                 );
@@ -11812,7 +11948,7 @@ pub(crate) fn pre_register_signatures<'src, 'input, 'a>(
     let mut slots: Vec<Slot> = Vec::new();
     for (i, item) in program.items.iter().enumerate() {
         match item {
-            crate::ast::Stmt::FunctionDef {
+            crate::ast::Item::FunctionDef {
                 name,
                 // The comptime functions are compile-time — they never
                 // exist at runtime (SYNTAX.md §const — "never exist at
@@ -11837,7 +11973,7 @@ pub(crate) fn pre_register_signatures<'src, 'input, 'a>(
             // `impl for A`) is part of the registry key: same-name
             // methods on DIFFERENT receivers no longer collide (the
             // consumer matches on it instead of find-first-match).
-            crate::ast::Stmt::ImplBlock {
+            crate::ast::Item::ImplBlock {
                 for_type, methods, ..
             } => {
                 let receiver_ty = checker.resolve_type(for_type).ok();
@@ -12178,19 +12314,10 @@ pub(crate) fn collect_function_effects<'src, 'input: 'a, 'a>(
     checker: &mut TypeChecker<'a, 'src, 'input>,
     program: &crate::ast::Program<'input, 'src>,
 ) {
-    // 1. Top-level mutable globals: `set mut x = ...` at module scope.
+    // 1. Top-level mutable globals are now part of the item stream — but
+    // `set mut x` at module scope is not a valid item; the parser rejects
+    // it.  The globals set is therefore empty for parsed programs.
     let mut globals: HashSet<Symbol> = HashSet::new();
-    for item in &program.items {
-        if let crate::ast::Stmt::VariableDef {
-            kind: crate::ast::VariableKind::Set,
-            mutable: true,
-            name: Some(n),
-            ..
-        } = item
-        {
-            globals.insert(*n);
-        }
-    }
     // Pre-collect into the shared table BEFORE any body check: a body's
     // view of `mutable_globals` must not depend on whether its top-level
     // `set mut` item has been reached yet (order-independence for the
@@ -12201,7 +12328,7 @@ pub(crate) fn collect_function_effects<'src, 'input: 'a, 'a>(
     let mut callers_of: HashMap<DefId, Vec<DefId>> = HashMap::new();
     let mut direct: HashMap<DefId, EffectSet> = HashMap::new();
     for item in &program.items {
-        if let crate::ast::Stmt::FunctionDef {
+        if let crate::ast::Item::FunctionDef {
             name,
             body,
             is_comptime: false,
@@ -12275,7 +12402,7 @@ pub(crate) fn collect_function_effects<'src, 'input: 'a, 'a>(
     let mut method_effect_of: HashMap<DefId, EffectSet> = HashMap::new();
     let mut method_edges: HashMap<DefId, HashSet<DefId>> = HashMap::new();
     for item in &program.items {
-        if let crate::ast::Stmt::ImplBlock {
+        if let crate::ast::Item::ImplBlock {
             for_type, methods, ..
         } = item
         {
@@ -12381,6 +12508,25 @@ pub(crate) fn collect_function_effects<'src, 'input: 'a, 'a>(
         .expect("collect_function_effects runs before any body is checked in parallel");
     shared.effect_of = effect_of;
     shared.method_effect_of = method_effect_of;
+}
+
+/// The assignment-target root identifier used by the local-mutability
+/// check in `check_assign_stmt`.  Descends through field/index access to
+/// the root (`x.f[i].g` → `x`).  Deliberately stops at `Deref`: `*r = v`
+/// writes the pointee, whose legality rests on the reference's own
+/// `&mut`/`*mut` type and the borrow check, not on binding `r`'s
+/// mutability — so `r` is NOT subjected to the binding-mutability check.
+/// (Differs from `place_root_ast`, which descends through `Deref`/`Ref`/
+/// `RefMut`/`Ro` because its callers want the storage root for
+/// output-origin derivation — a different question.)
+fn assign_target_root(e: &crate::ast::Expr) -> Option<Symbol> {
+    match e {
+        crate::ast::Expr::Ident(name, _) => Some(*name),
+        crate::ast::Expr::FieldAccess { base, .. } | crate::ast::Expr::Index { base, .. } => {
+            assign_target_root(base)
+        }
+        _ => None,
+    }
 }
 
 /// The AST-level return-place root (the counterpart of the HIR

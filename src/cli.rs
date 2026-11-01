@@ -39,6 +39,51 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "WHEN", default_value = "auto")]
     pub color: String,
 
+    /// Only emit diagnostics with one of these error codes (repeatable, or
+    /// comma-separated: `--only-code=E030,E031`).
+    #[arg(long, global = true, value_name = "CODE", value_delimiter = ',')]
+    pub only_code: Vec<String>,
+
+    /// Only emit diagnostics in this error category: `parse`, `resolution`,
+    /// `type`, `contract`, `trait`, `inference`, `internal`, `generic`
+    /// (repeatable, comma-separated).
+    #[arg(long, global = true, value_name = "CATEGORY", value_delimiter = ',')]
+    pub only_category: Vec<String>,
+
+    /// Only emit diagnostics whose file path contains this substring
+    /// (repeatable, comma-separated).
+    #[arg(long, global = true, value_name = "PATTERN", value_delimiter = ',')]
+    pub only_file: Vec<String>,
+
+    /// Suppress diagnostics with these error codes entirely (rustc-style
+    /// `-A`).  Applied before `--only-*` filters.
+    #[arg(long, global = true, value_name = "CODE", value_delimiter = ',')]
+    pub allow: Vec<String>,
+
+    /// Suppress `help:` / `note:` / suggestions / sub-diagnostics and the
+    /// batch summary.  The error header and source context stay visible.
+    #[arg(long, short = 'q', global = true)]
+    pub quiet: bool,
+
+    /// Do not soft-wrap message text (copy-paste-friendly).  Hard newlines
+    /// are preserved.
+    #[arg(long, global = true)]
+    pub no_wrap: bool,
+
+    /// Apply machine-applicable suggestions to the source file in place.
+    /// Only safe edits by default; use `--fix-hints` to widen.
+    #[arg(long, global = true)]
+    pub fix: bool,
+
+    /// Which suggestion applicability levels `--fix` accepts:
+    /// `auto` (default, safe only), `review` (also maybe-incorrect), `all`.
+    #[arg(long, global = true, value_name = "HINTS", default_value = "auto")]
+    pub fix_hints: String,
+
+    /// Output format: `human` (default), `short` (one line per diagnostic), `json`.
+    #[arg(long, global = true, value_name = "FORMAT", default_value = "human")]
+    pub error_format: String,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -67,6 +112,12 @@ pub enum Command {
     Explain {
         /// Error code to explain, e.g. "E030" or "W113".
         code: Option<String>,
+        /// Run as a persistent local server: the index page at `/` lists
+        /// every code, and `/<code>` serves that code's explanation.  Opens
+        /// `code`'s page (or the index, if no code is given) in the browser
+        /// and blocks until Ctrl+C.
+        #[arg(long)]
+        serve: bool,
     },
     /// Parse, resolve, and type-check a file, then dump the MIR for every
     /// function body to stdout (debug aid for the lowering).

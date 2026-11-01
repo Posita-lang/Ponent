@@ -14,6 +14,7 @@
 use crate::ast::FileId;
 use crate::ast::UnaryOp;
 use crate::diagnostics::Diagnostic;
+use crate::diagnostics::ErrCode;
 use crate::hir::hir::{HirExpr, HirStmt};
 use crate::hir::place::place_is_prefix_of;
 use crate::hir::types::{FrozenPlace, LoanKind};
@@ -1312,7 +1313,7 @@ pub(crate) fn borrow_error_diagnostic<'src>(err: &BorrowError) -> Diagnostic<'sr
         )
         // E113 (registered — "the function's CFG exceeds the
         // point-encoding capacity") is the sentinel's semantics.
-        .with_code_str("E113")
+        .with_code_str(ErrCode::E113)
         .with_help(
             "the point encoding is bounded at 65536 expressions per statement, \
          1M statements per block, and 1M blocks per function — split an \
@@ -1329,7 +1330,7 @@ pub(crate) fn borrow_error_diagnostic<'src>(err: &BorrowError) -> Diagnostic<'sr
         && n.eq_str("<region>")
     {
         return Diagnostic::error("region subset not declared in signature")
-            .with_code_str("E115")
+            .with_code_str(ErrCode::E115)
             .with_span(err.span);
     }
     // The drop-while-borrowed error (E116 — registered): a dropped value
@@ -1337,7 +1338,7 @@ pub(crate) fn borrow_error_diagnostic<'src>(err: &BorrowError) -> Diagnostic<'sr
     // the value (rustc E0505).
     if err.is_drop {
         return Diagnostic::error("cannot drop a value while its borrow is still live")
-            .with_code_str("E116")
+            .with_code_str(ErrCode::E116)
             .with_span(err.span);
     }
     let mut diag = Diagnostic::error(if err.is_read {

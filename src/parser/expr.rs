@@ -3,11 +3,12 @@
 use super::*;
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
-use crate::lexer::literal::{
-    parse_byte_char_literal, parse_byte_string_literal, parse_char_literal,
-    parse_float_literal, parse_int_literal, parse_string_literal,
-};
+use crate::diagnostics::ErrCode;
 use crate::lexer::Token;
+use crate::lexer::literal::{
+    parse_byte_char_literal, parse_byte_string_literal, parse_char_literal, parse_float_literal,
+    parse_int_literal, parse_string_literal,
+};
 use crate::symbol::Symbol;
 use smallvec::smallvec;
 
@@ -16,8 +17,11 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Expression entry
     // -------------------------------------------------------------------------
 
-    pub fn parse_expr(&mut self, bump: &'input bumpalo::Bump) -> Result<Expr<'input>, Diagnostic<'src>> {
-        if let Some(e) = self.parse_expr_fast()? {
+    pub fn parse_expr(
+        &mut self,
+        bump: &'input bumpalo::Bump,
+    ) -> Result<Expr<'input>, Diagnostic<'src>> {
+        if let Some(e) = self.parse_expr_fast(bump)? {
             return Ok(e);
         }
         self.parse_expr_bp(0, bump)
@@ -29,7 +33,10 @@ impl<'src, 'input> Parser<'src, 'input> {
     /// without the full Pratt machinery.  A following `:` (type
     /// annotation) or anything else falls back to the general parser.
     #[inline(always)]
-    fn parse_expr_fast(&mut self) -> Result<Option<Expr<'input>>, Diagnostic<'src>> {
+    fn parse_expr_fast(
+        &mut self,
+        bump: &'input bumpalo::Bump,
+    ) -> Result<Option<Expr<'input>>, Diagnostic<'src>> {
         // Check the token AFTER the literal FIRST (without consuming):
         // only a terminator (or a type-annotation colon) lets the literal
         // stand alone — otherwise (e.g. `1 + 2`) we must fall back WITHOUT
@@ -50,17 +57,17 @@ impl<'src, 'input> Parser<'src, 'input> {
             return Ok(None);
         }
         match self.peek() {
-            Ok(Token::IntLiteral(_))
-            | Ok(Token::HexLiteral(_))
-            | Ok(Token::BinLiteral(_))
-            | Ok(Token::FloatLiteral(_))
-            | Ok(Token::StringLiteral(_))
-            | Ok(Token::ByteStringLiteral(_))
-            | Ok(Token::CharLiteral(_))
-            | Ok(Token::ByteCharLiteral(_))
-            | Ok(Token::True)
-            | Ok(Token::False) => {
-                let expr = self.parse_literal()?;
+            Some(Token::IntLiteral(_))
+            | Some(Token::HexLiteral(_))
+            | Some(Token::BinLiteral(_))
+            | Some(Token::FloatLiteral(_))
+            | Some(Token::StringLiteral(_))
+            | Some(Token::ByteStringLiteral(_))
+            | Some(Token::CharLiteral(_))
+            | Some(Token::ByteCharLiteral(_))
+            | Some(Token::True)
+            | Some(Token::False) => {
+                let expr = self.parse_literal(bump)?;
                 Ok(Some(expr))
             }
             _ => Ok(None),
@@ -71,12 +78,16 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Pratt parser (binding power)
     // -------------------------------------------------------------------------
 
-    fn parse_expr_bp(&mut self, min_bp: u8, bump: &'input bumpalo::Bump) -> Result<Expr<'input>, Diagnostic<'src>> {
+    fn parse_expr_bp(
+        &mut self,
+        min_bp: u8,
+        bump: &'input bumpalo::Bump,
+    ) -> Result<Expr<'input>, Diagnostic<'src>> {
         self.recursion_depth += 1;
         if self.recursion_depth > self.max_recursion_depth {
             self.recursion_depth -= 1;
             return Err(Diagnostic::error(format!("maximum recursion depth {} exceeded", self.max_recursion_depth))
-                .with_code_str("E006")
+                .with_code_str(ErrCode::E006)
                 .with_help("the parser reached its recursion limit — the type/structure may be deeply nested or self-referential")
                 .with_suggestion("try breaking up deeply nested structures, or use less complex type expressions")
                 .with_span(self.span()));
@@ -86,13 +97,17 @@ impl<'src, 'input> Parser<'src, 'input> {
         result
     }
 
-    fn parse_expr_bp_inner(&mut self, min_bp: u8, bump: &'input bumpalo::Bump) -> Result<Expr<'input>, Diagnostic<'src>> {
+    fn parse_expr_bp_inner(
+        &mut self,
+        min_bp: u8,
+        bump: &'input bumpalo::Bump,
+    ) -> Result<Expr<'input>, Diagnostic<'src>> {
         let mut lhs = self.parse_prefix(bump)?;
         loop {
             // Borrow the peeked token directly — no clone needed;
             // prefix_binding_power is a static fn that doesn't read &self.
             let lbp = match self.peek() {
-                Ok(tok)
+                Some(tok)
                     if !matches!(
                         tok,
                         Token::Semicolon
@@ -115,9 +130,9 @@ impl<'src, 'input> Parser<'src, 'input> {
             }
             if self.restrictions.contains(ParseRestrictions::NO_COMPARISON) {
                 let is_compare = match self.peek() {
-                    Ok(tok) => crate::lexer::token_class(tok)
+                    Some(tok) => crate::lexer::token_class(tok)
                         .contains(crate::lexer::TokenClass::COMPARISON),
-                    Err(()) => false,
+                    None => false,
                 };
                 if is_compare {
                     break;
@@ -187,22 +202,25 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Prefix expression parser
     // -------------------------------------------------------------------------
 
-    fn parse_prefix(&mut self, bump: &'input bumpalo::Bump) -> Result<Expr<'input>, Diagnostic<'src>> {
+    fn parse_prefix(
+        &mut self,
+        bump: &'input bumpalo::Bump,
+    ) -> Result<Expr<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         match self.peek() {
-            Ok(Token::IntLiteral(_))
-            | Ok(Token::HexLiteral(_))
-            | Ok(Token::BinLiteral(_))
-            | Ok(Token::FloatLiteral(_))
-            | Ok(Token::StringLiteral(_))
-            | Ok(Token::ByteStringLiteral(_))
-            | Ok(Token::CharLiteral(_))
-            | Ok(Token::ByteCharLiteral(_))
-            | Ok(Token::True)
-            | Ok(Token::False) => {
-                let expr = self.parse_literal()?;
-                if matches!(self.peek(), Ok(Token::Colon)) {
-                    self.advance().ok();
+            Some(Token::IntLiteral(_))
+            | Some(Token::HexLiteral(_))
+            | Some(Token::BinLiteral(_))
+            | Some(Token::FloatLiteral(_))
+            | Some(Token::StringLiteral(_))
+            | Some(Token::ByteStringLiteral(_))
+            | Some(Token::CharLiteral(_))
+            | Some(Token::ByteCharLiteral(_))
+            | Some(Token::True)
+            | Some(Token::False) => {
+                let expr = self.parse_literal(bump)?;
+                if matches!(self.peek(), Some(Token::Colon)) {
+                    self.advance();
                     let ty = self.parse_type(bump)?;
                     let end = self.span().end;
                     Ok(Expr::TypeAnnotated {
@@ -214,17 +232,20 @@ impl<'src, 'input> Parser<'src, 'input> {
                     Ok(expr)
                 }
             }
-            Ok(Token::Ident(_)) => self.parse_path_or_literal(start, bump),
-            Ok(Token::LParen) => {
-                self.advance().ok();
-                if matches!(self.peek(), Ok(Token::RParen)) {
-                    self.advance().ok();
+            Some(Token::Ident(_)) => self.parse_path_or_literal(start, bump),
+            Some(Token::LParen) => {
+                self.advance();
+                if matches!(self.peek(), Some(Token::RParen)) {
+                    self.advance();
                     let end = self.span().end;
-                    return Ok(Expr::Tuple(Self::alloc_slice(bump, &[]), Span::new(self.file_id, start, end)));
+                    return Ok(Expr::Tuple(
+                        Self::alloc_slice(bump, &[]),
+                        Span::new(self.file_id, start, end),
+                    ));
                 }
                 let expr = self.parse_expr(bump)?;
-                if matches!(self.peek(), Ok(Token::Colon)) {
-                    self.advance().ok();
+                if matches!(self.peek(), Some(Token::Colon)) {
+                    self.advance();
                     let ty = self.parse_type(bump)?;
                     self.expect(Token::RParen)?;
                     let end = self.span().end;
@@ -233,42 +254,48 @@ impl<'src, 'input> Parser<'src, 'input> {
                         ty: Self::alloc_shared(bump, ty),
                         span: Span::new(self.file_id, start, end),
                     })
-                } else if matches!(self.peek(), Ok(Token::Comma)) {
+                } else if matches!(self.peek(), Some(Token::Comma)) {
                     let mut exprs = bumpalo::collections::Vec::with_capacity_in(4, bump);
                     exprs.push(expr);
-                    while matches!(self.peek(), Ok(Token::Comma)) {
-                        self.advance().ok();
+                    while matches!(self.peek(), Some(Token::Comma)) {
+                        self.advance();
                         exprs.push(self.parse_expr(bump)?);
                     }
                     self.expect(Token::RParen)?;
                     let end = self.span().end;
-                    Ok(Expr::Tuple(exprs.into_bump_slice(), Span::new(self.file_id, start, end)))
+                    Ok(Expr::Tuple(
+                        exprs.into_bump_slice(),
+                        Span::new(self.file_id, start, end),
+                    ))
                 } else {
                     self.expect(Token::RParen)?;
                     Ok(expr)
                 }
             }
-            Ok(Token::LBracket) => {
-                self.advance().ok();
+            Some(Token::LBracket) => {
+                self.advance();
                 let mut exprs = bumpalo::collections::Vec::with_capacity_in(8, bump);
                 loop {
-                    if matches!(self.peek(), Ok(Token::RBracket)) {
-                        self.advance().ok();
+                    if matches!(self.peek(), Some(Token::RBracket)) {
+                        self.advance();
                         break;
                     }
                     exprs.push(self.parse_expr(bump)?);
-                    if matches!(self.peek(), Ok(Token::Comma)) {
-                        self.advance().ok();
+                    if matches!(self.peek(), Some(Token::Comma)) {
+                        self.advance();
                     } else {
                         self.expect(Token::RBracket)?;
                         break;
                     }
                 }
                 let end = self.span().end;
-                Ok(Expr::Array(exprs.into_bump_slice(), Span::new(self.file_id, start, end)))
+                Ok(Expr::Array(
+                    exprs.into_bump_slice(),
+                    Span::new(self.file_id, start, end),
+                ))
             }
-            Ok(Token::Plus) | Ok(Token::Minus) | Ok(Token::Star) | Ok(Token::Slash)
-            | Ok(Token::Percent) => {
+            Some(Token::Plus) | Some(Token::Minus) | Some(Token::Star) | Some(Token::Slash)
+            | Some(Token::Percent) => {
                 let next = self.peek_next();
                 let is_operator_arg = matches!(
                     next,
@@ -278,9 +305,9 @@ impl<'src, 'input> Parser<'src, 'input> {
                         | Some(Token::RBrace)
                 );
                 if is_operator_arg {
-                    let op_tok = self.advance().map_err(|_| {
+                    let op_tok = self.advance().ok_or_else(|| {
                         Diagnostic::error("unexpected token")
-                            .with_code_str("E003")
+                            .with_code_str(ErrCode::E003)
                             .with_help("expected an expression after the operator position")
                             .with_span(Span::new(self.file_id, 0, 0))
                     })?;
@@ -295,8 +322,8 @@ impl<'src, 'input> Parser<'src, 'input> {
                     let end = self.span().end;
                     Ok(Expr::Ident(op_name, Span::new(self.file_id, start, end)))
                 } else {
-                    match self.advance().map_err(|_| Diagnostic::error("unexpected token")
-                        .with_code_str("E003")
+                    match self.advance().ok_or_else(|| Diagnostic::error("unexpected token")
+                        .with_code_str(ErrCode::E003)
                         .with_help("expected a unary operator (`-`, `*`, `!`, `~`, `&`, `move`)")
                         .with_span(Span::new(self.file_id, 0, 0)))?
                     {
@@ -311,16 +338,16 @@ impl<'src, 'input> Parser<'src, 'input> {
                             Ok(Expr::UnaryOp { op: UnaryOp::Deref, expr: Self::alloc_shared(bump, expr), span: Span::new(self.file_id, start, end) })
                         }
                         _ => Err(Diagnostic::error("unexpected operator in expression")
-                            .with_code_str("E007")
+                            .with_code_str(ErrCode::E007)
                             .with_help("this operator is not valid at this position — check for missing operands or extra operators")
                             .with_span(self.span())),
                     }
                 }
             }
-            Ok(Token::If) => self.parse_if_expr(bump),
-            Ok(Token::Task) => {
+            Some(Token::If) => self.parse_if_expr(bump),
+            Some(Token::Task) => {
                 let start = self.span().start;
-                self.advance().ok();
+                self.advance();
                 self.expect(Token::LBrace)?;
                 let body = self.parse_block(bump)?;
                 self.expect(Token::RBrace)?;
@@ -330,9 +357,9 @@ impl<'src, 'input> Parser<'src, 'input> {
                     span: Span::new(self.file_id, start, end),
                 })
             }
-            Ok(Token::Match) => self.parse_match_expr(bump),
-            Ok(Token::Leave) => {
-                self.advance().ok();
+            Some(Token::Match) => self.parse_match_expr(bump),
+            Some(Token::Leave) => {
+                self.advance();
                 self.expect(Token::With)?;
                 let expr = self.parse_expr(bump)?;
                 let end = self.span().end;
@@ -342,15 +369,16 @@ impl<'src, 'input> Parser<'src, 'input> {
                     span: Span::new(self.file_id, start, end),
                 })
             }
-            Ok(Token::Return) => {
+            Some(Token::Return) => {
                 // Consume the `return` keyword FIRST — the value
                 // expression below is parsed from the NEXT token;
                 // otherwise `parse_expr` on the value re-enters this
                 // branch with the unconsumed `return` (an infinite
                 // recursion — stack overflow — exposed by expression-
                 // position returns such as a match arm's `return 0`).
-                self.advance().ok();
-                let value = if !matches!(self.peek(), Ok(Token::Semicolon) | Ok(Token::RBrace)) {
+                self.advance();
+                let value = if !matches!(self.peek(), Some(Token::Semicolon) | Some(Token::RBrace))
+                {
                     Some(Self::alloc_shared(bump, self.parse_expr(bump)?))
                 } else {
                     None
@@ -360,15 +388,18 @@ impl<'src, 'input> Parser<'src, 'input> {
                     expr: value.unwrap_or_else(|| {
                         Self::alloc_shared(
                             bump,
-                            Expr::Tuple(Self::alloc_slice(bump, &[]), Span::new(self.file_id, start, end)),
+                            Expr::Tuple(
+                                Self::alloc_slice(bump, &[]),
+                                Span::new(self.file_id, start, end),
+                            ),
                         )
                     }),
                     is_return: true,
                     span: Span::new(self.file_id, start, end),
                 })
             }
-            Ok(Token::Await) => {
-                self.advance().ok();
+            Some(Token::Await) => {
+                self.advance();
                 let expr = self.parse_expr(bump)?;
                 let end = self.span().end;
                 Ok(Expr::Await {
@@ -376,8 +407,8 @@ impl<'src, 'input> Parser<'src, 'input> {
                     span: Span::new(self.file_id, start, end),
                 })
             }
-            Ok(Token::Poly) => {
-                self.advance().ok();
+            Some(Token::Poly) => {
+                self.advance();
                 self.expect(Token::LParen)?;
                 let expr = self.parse_expr(bump)?;
                 self.expect(Token::RParen)?;
@@ -388,8 +419,8 @@ impl<'src, 'input> Parser<'src, 'input> {
                     span: Span::new(self.file_id, start, end),
                 })
             }
-            Ok(Token::Unbox) => {
-                self.advance().ok();
+            Some(Token::Unbox) => {
+                self.advance();
                 self.expect(Token::LParen)?;
                 let expr = self.parse_expr(bump)?;
                 self.expect(Token::RParen)?;
@@ -400,8 +431,8 @@ impl<'src, 'input> Parser<'src, 'input> {
                     span: Span::new(self.file_id, start, end),
                 })
             }
-            Ok(Token::Old) => {
-                self.advance().ok();
+            Some(Token::Old) => {
+                self.advance();
                 self.expect(Token::LParen)?;
                 let expr = self.parse_expr(bump)?;
                 self.expect(Token::RParen)?;
@@ -414,16 +445,16 @@ impl<'src, 'input> Parser<'src, 'input> {
             // `codomain` is the reserved return-value name in `ensures`
             // clauses (SYNTAX.md).  It parses to a plain identifier
             // expression; the checker binds that symbol to the return type.
-            Ok(Token::Codomain) => {
-                self.advance().ok();
+            Some(Token::Codomain) => {
+                self.advance();
                 let end = self.span().end;
                 Ok(Expr::Ident(
                     crate::symbol::Symbol::intern("codomain"),
                     Span::new(self.file_id, start, end),
                 ))
             }
-            Ok(Token::Not) => {
-                self.advance().ok();
+            Some(Token::Not) => {
+                self.advance();
                 let expr = self.parse_expr_bp(1, bump)?;
                 let end = self.span().end;
                 Ok(Expr::UnaryOp {
@@ -432,8 +463,8 @@ impl<'src, 'input> Parser<'src, 'input> {
                     span: Span::new(self.file_id, start, end),
                 })
             }
-            Ok(Token::Tilde) => {
-                self.advance().ok();
+            Some(Token::Tilde) => {
+                self.advance();
                 let expr = self.parse_prefix(bump)?;
                 let end = self.span().end;
                 Ok(Expr::UnaryOp {
@@ -442,21 +473,21 @@ impl<'src, 'input> Parser<'src, 'input> {
                     span: Span::new(self.file_id, start, end),
                 })
             }
-            Ok(Token::Ampersand) => {
-                self.advance().ok();
+            Some(Token::Ampersand) => {
+                self.advance();
                 // `&ro` freezes a `&mut T` into a `&T` (SYNTAX.md §Reference
                 // Coercion): `ro` only has special meaning immediately
                 // following `&` in a borrow expression.  `ro` is a reserved
                 // token, so anywhere else the parser rejects it with a
                 // proper "unexpected `ro`" diagnostic instead of silently
                 // treating it as an identifier.
-                let read_only = matches!(self.peek(), Ok(Token::Ro));
+                let read_only = matches!(self.peek(), Some(Token::Ro));
                 if read_only {
-                    self.advance().ok();
+                    self.advance();
                 }
-                let mutable = !read_only && matches!(self.peek(), Ok(Token::Mut));
+                let mutable = !read_only && matches!(self.peek(), Some(Token::Mut));
                 if mutable {
-                    self.advance().ok();
+                    self.advance();
                 }
                 // The borrow's operand must include the POSTFIX chain
                 // (`&mut arr[0]` = `&mut (arr[0])`, NOT `(&mut arr)[0]`):
@@ -478,8 +509,8 @@ impl<'src, 'input> Parser<'src, 'input> {
                     span: Span::new(self.file_id, start, end),
                 })
             }
-            Ok(Token::Move) => {
-                self.advance().ok();
+            Some(Token::Move) => {
+                self.advance();
                 let expr = self.parse_prefix(bump)?;
                 let end = self.span().end;
                 Ok(Expr::Move(
@@ -487,8 +518,8 @@ impl<'src, 'input> Parser<'src, 'input> {
                     Span::new(self.file_id, start, end),
                 ))
             }
-            Ok(Token::Unsafe) => {
-                self.advance().ok();
+            Some(Token::Unsafe) => {
+                self.advance();
                 self.expect(Token::LBrace)?;
                 let body = self.parse_block(bump)?;
                 self.expect(Token::RBrace)?;
@@ -498,49 +529,52 @@ impl<'src, 'input> Parser<'src, 'input> {
                     span: Span::new(self.file_id, start, end),
                 })
             }
-            Ok(Token::Pipe) => self.parse_closure(start, bump),
-            Ok(Token::LBrace) => {
+            Some(Token::Pipe) => self.parse_closure(start, bump),
+            Some(Token::LBrace) => {
                 if self
                     .restrictions
                     .contains(ParseRestrictions::NO_STRUCT_LITERAL)
                 {
-                    self.advance().ok();
+                    self.advance();
                     let body = self.parse_block(bump)?;
                     self.expect(Token::RBrace)?;
-                    Ok(Expr::Block(body, Span::new(self.file_id, start, self.span().end)))
+                    Ok(Expr::Block(
+                        body,
+                        Span::new(self.file_id, start, self.span().end),
+                    ))
                 } else {
                     self.parse_struct_lit(vec![], start, bump)
                 }
             }
-            Ok(Token::IntSuffix(s))
-            | Ok(Token::HexIntSuffix(s))
-            | Ok(Token::BinIntSuffix(s)) => {
+            Some(Token::IntSuffix(s))
+            | Some(Token::HexIntSuffix(s))
+            | Some(Token::BinIntSuffix(s)) => {
                 // Copy the bare `&'src str` payload out of the `&Token`
                 // binding so the token can be advanced (no `String` is
                 // cloned — the payload is a zero-allocation source slice).
                 let s: &'src str = *s;
                 self.parse_suffixed_int(s, true, start, bump)
             }
-            Ok(Token::UIntSuffix(s))
-            | Ok(Token::HexUIntSuffix(s))
-            | Ok(Token::BinUIntSuffix(s)) => {
+            Some(Token::UIntSuffix(s))
+            | Some(Token::HexUIntSuffix(s))
+            | Some(Token::BinUIntSuffix(s)) => {
                 let s: &'src str = *s;
                 self.parse_suffixed_int(s, false, start, bump)
             }
-            Ok(Token::Forall) | Ok(Token::Exists) => {
-                let quantifier = match self.advance().map_err(|_| unreachable!())? {
+            Some(Token::Forall) | Some(Token::Exists) => {
+                let quantifier = match self.advance().ok_or_else(|| unreachable!())? {
                     Token::Forall => Quantifier::Forall,
                     Token::Exists => Quantifier::Exists,
                     _ => unreachable!(),
                 };
                 let binder = match self.advance() {
-                    Ok(Token::Ident(name)) => name,
-                    Ok(tok) => {
+                    Some(Token::Ident(name)) => name,
+                    Some(tok) => {
                         return Err(Diagnostic::error(format!(
                             "expected binder name after {:?}, found {:?}",
                             quantifier, tok
                         ))
-                        .with_code_str("E004")
+                        .with_code_str(ErrCode::E004)
                         .with_help(format!(
                             "`{:?}` must be followed by a binder variable and `in <range>`",
                             quantifier
@@ -548,12 +582,12 @@ impl<'src, 'input> Parser<'src, 'input> {
                         .with_suggestion("try `forall i in 0..n: arr[i] > 0`")
                         .with_span(self.span()));
                     }
-                    Err(()) => {
+                    None => {
                         return Err(Diagnostic::error(format!(
                             "unexpected end of file after {:?}",
                             quantifier
                         ))
-                        .with_code_str("E002")
+                        .with_code_str(ErrCode::E002)
                         .with_help("quantified expression is incomplete")
                         .with_span(self.span()));
                     }
@@ -571,18 +605,18 @@ impl<'src, 'input> Parser<'src, 'input> {
                     span: Span::new(self.file_id, start, end),
                 })
             }
-            Ok(Token::At) => {
-                self.advance().ok();
+            Some(Token::At) => {
+                self.advance();
                 let name = match self.advance() {
-                    Ok(Token::Ident(n)) => n,
-                    Ok(tok) => {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => {
                         return Err(Diagnostic::error(format!(
                             "expected built-in name after `@`, found {:?}",
                             tok
                         ))
                         .with_span(self.span()));
                     }
-                    Err(()) => {
+                    None => {
                         return Err(Diagnostic::error("unexpected end of input after `@`")
                             .with_span(self.span()));
                     }
@@ -600,12 +634,12 @@ impl<'src, 'input> Parser<'src, 'input> {
                 } else if name.eq_str("compile_error") {
                     // The `!` suffix is optional in `@compile_error` per the spec
                     // (the syntax doc omits it but examples use it).
-                    if matches!(self.peek(), Ok(Token::Bang)) {
-                        self.advance().ok();
+                    if matches!(self.peek(), Some(Token::Bang)) {
+                        self.advance();
                     }
                     self.expect(Token::LParen)?;
                     let msg = match self.advance() {
-                        Ok(Token::StringLiteral(s)) => match parse_string_literal(s) {
+                        Some(Token::StringLiteral(s)) => match parse_string_literal(s) {
                             Ok(c) => c.into_owned(),
                             Err(e) => {
                                 return Err(Diagnostic::error(format!(
@@ -620,7 +654,10 @@ impl<'src, 'input> Parser<'src, 'input> {
                     };
                     self.expect(Token::RParen)?;
                     let end = self.span().end;
-                    Ok(Expr::CompileError(msg.into(), Span::new(self.file_id, start, end)))
+                    Ok(Expr::CompileError(
+                        bump.alloc_str(&msg),
+                        Span::new(self.file_id, start, end),
+                    ))
                 } else {
                     let end = self.span().end;
                     Ok(Expr::Ident(
@@ -631,9 +668,9 @@ impl<'src, 'input> Parser<'src, 'input> {
             }
             _ => {
                 let mut diag = Diagnostic::error("expected expression")
-                    .with_code_str("E007")
+                    .with_code_str(ErrCode::E007)
                     .with_span(self.span());
-                if let Ok(Token::Semicolon) = self.peek() {
+                if let Some(Token::Semicolon) = self.peek() {
                     diag = diag
                         .with_help("remove this extra semicolon")
                         .with_suggestion("remove the `;` here");
@@ -664,7 +701,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         start: u32,
         bump: &'input bumpalo::Bump,
     ) -> Result<Expr<'input>, Diagnostic<'src>> {
-        self.advance().ok();
+        self.advance();
         let end = self.span().end;
         let span = Span::new(self.file_id, start, end);
         // Radix from the token's prefix.  The regexes pin lowercase
@@ -679,7 +716,8 @@ impl<'src, 'input> Parser<'src, 'input> {
         };
         // Zero-allocation scan: the old path built a `replace('_', "")`
         // String and then re-scanned it through `from_str_radix`.
-        let Some((value, width)) = crate::lexer::literal::parse_suffixed_int_literal(s, radix)
+        let Some((value, width)) =
+            crate::lexer::literal::parse_suffixed_int_literal(bump, s, radix)
         else {
             // The old path returned `Expr::Error` with NO diagnostic, so
             // an overflowing literal silently compiled into an opaque
@@ -699,12 +737,12 @@ impl<'src, 'input> Parser<'src, 'input> {
             Expr::Literal(Literal::Int(crate::ast::IntLit::Small(width as i128)), span);
         let width_ty = Type::Literal(Self::alloc_shared(bump, width_expr), span);
         let base_ty = Type::Path(
-            smallvec![Symbol::intern(if signed { "Int" } else { "UInt" })],
+            bump.alloc_slice_clone(&[Symbol::intern(if signed { "Int" } else { "UInt" })]),
             span,
         );
         let ty = Type::Generic(
             Self::alloc_shared(bump, base_ty),
-            vec![GenericArg::Positional(width_ty)],
+            bump.alloc_slice_clone(&[GenericArg::Positional(width_ty)]),
             span,
         );
         let annotated = Expr::TypeAnnotated {
@@ -712,11 +750,11 @@ impl<'src, 'input> Parser<'src, 'input> {
             ty: Self::alloc_shared(bump, ty),
             span,
         };
-        if matches!(self.peek(), Ok(Token::Colon)) {
+        if matches!(self.peek(), Some(Token::Colon)) {
             // `42i32: T` keeps the old colon-wrap shape: the desugared
             // annotation becomes the inner expression, so the literal
             // must satisfy both `Int<32>` and `T`.
-            self.advance().ok();
+            self.advance();
             let outer_ty = self.parse_type(bump)?;
             let end = self.span().end;
             Ok(Expr::TypeAnnotated {
@@ -733,36 +771,40 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Closure
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_closure(&mut self, start: u32, bump: &'input bumpalo::Bump) -> Result<Expr<'input>, Diagnostic<'src>> {
-        self.advance().ok();
+    pub(super) fn parse_closure(
+        &mut self,
+        start: u32,
+        bump: &'input bumpalo::Bump,
+    ) -> Result<Expr<'input>, Diagnostic<'src>> {
+        self.advance();
         let mut params = bumpalo::collections::Vec::with_capacity_in(4, bump);
         loop {
-            if matches!(self.peek(), Ok(Token::Pipe)) {
-                self.advance().ok();
+            if matches!(self.peek(), Some(Token::Pipe)) {
+                self.advance();
                 break;
             }
             let name = match self.advance() {
-                Ok(Token::Ident(n)) => n,
-                Ok(tok) => return Err(Diagnostic::error(format!(
+                Some(Token::Ident(n)) => n,
+                Some(tok) => return Err(Diagnostic::error(format!(
                     "expected parameter name, found {:?}",
                     tok
                 ))
-                .with_code_str("E004")
+                .with_code_str(ErrCode::E004)
                 .with_help("closure parameters must have a name — e.g. `|x, y| { ... }`")
                 .with_suggestion(
                     "use a valid identifier like `x`, `acc`, or `item` for the closure parameter",
                 )
                 .with_span(self.span())),
-                Err(()) => return Err(Diagnostic::error("unexpected end of file in closure")
-                    .with_code_str("E002")
+                None => return Err(Diagnostic::error("unexpected end of file in closure")
+                    .with_code_str(ErrCode::E002)
                     .with_help("closure definition is incomplete — expected `| ... | { ... }`")
                     .with_suggestion(
                         "close the closure with `| { body }` or add parameters: `|x, y| { ... }`",
                     )
                     .with_span(self.span())),
             };
-            let ty = if matches!(self.peek(), Ok(Token::Colon)) {
-                self.advance().ok();
+            let ty = if matches!(self.peek(), Some(Token::Colon)) {
+                self.advance();
                 Some(self.parse_type(bump)?)
             } else {
                 None
@@ -773,23 +815,24 @@ impl<'src, 'input> Parser<'src, 'input> {
                 default: None,
                 span: self.span(),
             });
-            if matches!(self.peek(), Ok(Token::Comma)) {
-                self.advance().ok();
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.advance();
             } else {
                 self.expect(Token::Pipe)?;
                 break;
             }
         }
-        let return_type = if matches!(self.peek(), Ok(Token::Arrow)) {
-            self.advance().ok();
+        let return_type = if matches!(self.peek(), Some(Token::Arrow)) {
+            self.advance();
             Some(self.parse_type(bump)?)
         } else {
             None
         };
-        let body = if matches!(self.peek(), Ok(Token::LBrace)) {
-            self.advance().ok();
-            let stmts =
-                self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block(bump))?;
+        let body = if matches!(self.peek(), Some(Token::LBrace)) {
+            self.advance();
+            let stmts = self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| {
+                this.parse_block(bump)
+            })?;
             self.expect(Token::RBrace)?;
             stmts
         } else {
@@ -810,28 +853,32 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Path / literal / struct / enum / call
     // -------------------------------------------------------------------------
 
-    fn parse_path_or_literal(&mut self, start: u32, bump: &'input bumpalo::Bump) -> Result<Expr<'input>, Diagnostic<'src>> {
+    fn parse_path_or_literal(
+        &mut self,
+        start: u32,
+        bump: &'input bumpalo::Bump,
+    ) -> Result<Expr<'input>, Diagnostic<'src>> {
         let mut path = Vec::new();
         let name = match self.advance() {
-            Ok(Token::Ident(n)) => n,
+            Some(Token::Ident(n)) => n,
             _ => unreachable!(),
         };
         path.push(name);
-        while matches!(self.peek(), Ok(Token::ColonColon)) {
-            self.advance().ok();
+        while matches!(self.peek(), Some(Token::ColonColon)) {
+            self.advance();
             match self.advance() {
-                Ok(tok) => match tok.as_ident_symbol() {
+                Some(tok) => match tok.as_ident_symbol() {
                     Some(sym) => path.push(sym),
                     None => return Err(Diagnostic::error("expected identifier after '::'")
-                        .with_code_str("E004")
+                        .with_code_str(ErrCode::E004)
                         .with_help(
                             "`::` must be followed by an identifier — e.g. `std::collections::HashMap`",
                         )
                         .with_suggestion("add an identifier after `::`, e.g. `MyModule::MyType`")
                         .with_span(self.span())),
                 },
-                Err(_) => return Err(Diagnostic::error("expected identifier after '::'")
-                    .with_code_str("E004")
+                None => return Err(Diagnostic::error("expected identifier after '::'")
+                    .with_code_str(ErrCode::E004)
                     .with_help(
                         "`::` must be followed by an identifier — e.g. `std::collections::HashMap`",
                     )
@@ -844,15 +891,15 @@ impl<'src, 'input> Parser<'src, 'input> {
             .contains(ParseRestrictions::NO_STRUCT_LITERAL);
 
         if path.len() == 1 && path[0].eq_str("layout_of") {
-            if !matches!(self.peek(), Ok(Token::Bang)) {
+            if !matches!(self.peek(), Some(Token::Bang)) {
                 let found = match self.peek() {
-                    Ok(tok) => format!("{:?}", tok),
-                    Err(()) => "end of file".to_string(),
+                    Some(tok) => format!("{:?}", tok),
+                    None => "end of file".to_string(),
                 };
                 return Err(Diagnostic::error(
                     "`layout_of` requires `!` suffix — use `layout_of!(Type)`",
                 )
-                .with_code_str("E001")
+                .with_code_str(ErrCode::E001)
                 .with_span(Span::new(self.file_id, start, self.span().end))
                 .with_help(format!(
                     "`layout_of` is a comptime intrinsic; add `!` before `(` (found `{}`)",
@@ -860,7 +907,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                 ))
                 .with_suggestion("layout_of!(Type)"));
             }
-            self.advance().ok();
+            self.advance();
             self.expect(Token::LParen)?;
             let ty = self.parse_type(bump)?;
             self.expect(Token::RParen)?;
@@ -872,15 +919,15 @@ impl<'src, 'input> Parser<'src, 'input> {
         }
 
         match self.peek() {
-            Ok(Token::LBrace) if !restrict => self.parse_struct_lit(path, start, bump),
-            Ok(Token::LParen) => {
+            Some(Token::LBrace) if !restrict => self.parse_struct_lit(path, start, bump),
+            Some(Token::LParen) => {
                 if path.len() == 2 {
                     let variant = path[1];
                     let enum_path = vec![path[0]];
                     self.parse_enum_lit(enum_path, variant, start, bump)
                 } else if path.len() >= 2 {
                     let span = Span::new(self.file_id, start, self.span().end);
-                    let callee = Expr::Path(smallvec::SmallVec::from(path), span);
+                    let callee = Expr::Path(bump.alloc_slice_clone(&path), span);
                     self.parse_call(callee, start, bump)
                 } else {
                     self.parse_call(
@@ -900,7 +947,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                     let variant = path.pop().expect("Enum pattern must have a variant");
                     let end = self.span().end;
                     Ok(Expr::EnumLit {
-                        path,
+                        path: bump.alloc_slice_clone(&path),
                         variant,
                         payload: None,
                         span: Span::new(self.file_id, start, end),
@@ -926,24 +973,24 @@ impl<'src, 'input> Parser<'src, 'input> {
         self.expect(Token::LBrace)?;
         let mut fields = bumpalo::collections::Vec::with_capacity_in(4, bump);
         loop {
-            if matches!(self.peek(), Ok(Token::RBrace)) {
-                self.advance().ok();
+            if matches!(self.peek(), Some(Token::RBrace)) {
+                self.advance();
                 break;
             }
             let field_name = match self.advance() {
-                Ok(Token::Ident(n)) => n,
-                Ok(tok) => return Err(Diagnostic::error(format!(
+                Some(Token::Ident(n)) => n,
+                Some(tok) => return Err(Diagnostic::error(format!(
                     "expected field name, found {:?}",
                     tok
                 ))
-                .with_code_str("E004")
+                .with_code_str(ErrCode::E004)
                 .with_help("struct literal fields must have a name — e.g. `Point { x = 1, y = 2 }`")
                 .with_suggestion("add a field name followed by `= <value>`, e.g. `field = value`")
                 .with_span(self.span())),
-                Err(()) => {
+                None => {
                     return Err(
                         Diagnostic::error("unexpected end of file in struct literal")
-                            .with_code_str("E002")
+                            .with_code_str(ErrCode::E002)
                             .with_help(
                                 "struct literal is incomplete — expected a field name or `}`",
                             )
@@ -955,8 +1002,8 @@ impl<'src, 'input> Parser<'src, 'input> {
             self.expect(Token::Assign)?;
             let value = self.parse_expr(bump)?;
             fields.push((field_name, value));
-            if matches!(self.peek(), Ok(Token::Comma)) {
-                self.advance().ok();
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.advance();
             } else {
                 self.expect(Token::RBrace)?;
                 break;
@@ -964,7 +1011,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         }
         let end = self.span().end;
         Ok(Expr::StructLit {
-            path,
+            path: bump.alloc_slice_clone(&path),
             fields: fields.into_bump_slice(),
             span: Span::new(self.file_id, start, end),
         })
@@ -978,27 +1025,30 @@ impl<'src, 'input> Parser<'src, 'input> {
         bump: &'input bumpalo::Bump,
     ) -> Result<Expr<'input>, Diagnostic<'src>> {
         self.expect(Token::LParen)?;
-        if matches!(self.peek(), Ok(Token::RParen)) {
-            self.advance().ok();
+        if matches!(self.peek(), Some(Token::RParen)) {
+            self.advance();
             let end = self.span().end;
             return Ok(Expr::EnumLit {
-                path,
+                path: bump.alloc_slice_clone(&path),
                 variant,
                 payload: None,
                 span: Span::new(self.file_id, start, end),
             });
         }
         let payload = self.parse_expr(bump)?;
-        if matches!(self.peek(), Ok(Token::Comma)) {
+        if matches!(self.peek(), Some(Token::Comma)) {
             let mut args = bumpalo::collections::Vec::with_capacity_in(4, bump);
             args.push(payload);
-            while matches!(self.peek(), Ok(Token::Comma)) {
-                self.advance().ok();
+            while matches!(self.peek(), Some(Token::Comma)) {
+                self.advance();
                 args.push(self.parse_expr(bump)?);
             }
             self.expect(Token::RParen)?;
             let end = self.span().end;
-            let callee = Expr::Path(smallvec::SmallVec::from(path), Span::new(self.file_id, start, end));
+            let callee = Expr::Path(
+                bump.alloc_slice_clone(&path),
+                Span::new(self.file_id, start, end),
+            );
             return Ok(Expr::Call {
                 callee: Self::alloc_shared(bump, callee),
                 args: args.into_bump_slice(),
@@ -1009,7 +1059,7 @@ impl<'src, 'input> Parser<'src, 'input> {
         self.expect(Token::RParen)?;
         let end = self.span().end;
         Ok(Expr::EnumLit {
-            path,
+            path: bump.alloc_slice_clone(&path),
             variant,
             payload: Some(Self::alloc_shared(bump, payload)),
             span: Span::new(self.file_id, start, end),
@@ -1024,11 +1074,11 @@ impl<'src, 'input> Parser<'src, 'input> {
     ) -> Result<Expr<'input>, Diagnostic<'src>> {
         self.expect(Token::LParen)?;
         let mut args = bumpalo::collections::Vec::with_capacity_in(4, bump);
-        if !matches!(self.peek(), Ok(Token::RParen)) {
+        if !matches!(self.peek(), Some(Token::RParen)) {
             loop {
                 args.push(self.parse_expr(bump)?);
-                if matches!(self.peek(), Ok(Token::Comma)) {
-                    self.advance().ok();
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    self.advance();
                 } else {
                     break;
                 }
@@ -1048,11 +1098,14 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Literal parsing
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_literal(&mut self) -> Result<Expr<'input>, Diagnostic<'src>> {
+    pub(super) fn parse_literal(
+        &mut self,
+        bump: &'input bumpalo::Bump,
+    ) -> Result<Expr<'input>, Diagnostic<'src>> {
         let start = self.span().start;
-        let token = self.advance().map_err(|_| {
+        let token = self.advance().ok_or_else(|| {
             Diagnostic::error("unexpected token")
-                .with_code_str("E003")
+                .with_code_str(ErrCode::E003)
                 .with_help("expected a literal value (number, string, char, bool, or byte string)")
                 .with_span(Span::new(self.file_id, 0, 0))
         })?;
@@ -1064,30 +1117,36 @@ impl<'src, 'input> Parser<'src, 'input> {
         // the lex-time callback used to store in the token's `Err` payload,
         // anchored on the literal's own span.
         match token {
-            Token::IntLiteral(s) => match parse_int_literal(s, 10, "integer literal overflow") {
-                Ok(v) => Ok(Expr::Literal(Literal::Int(v), span)),
-                Err(e) => {
-                    self.diagnostics
-                        .push(Diagnostic::error(e.as_str()).with_span(span));
-                    Ok(Expr::Error(span))
+            Token::IntLiteral(s) => {
+                match parse_int_literal(bump, s, 10, "integer literal overflow") {
+                    Ok(v) => Ok(Expr::Literal(Literal::Int(v), span)),
+                    Err(e) => {
+                        self.diagnostics
+                            .push(Diagnostic::error(e.as_str()).with_span(span));
+                        Ok(Expr::Error(span))
+                    }
                 }
-            },
-            Token::HexLiteral(s) => match parse_int_literal(&s[2..], 16, "hex literal overflow") {
-                Ok(v) => Ok(Expr::Literal(Literal::Int(v), span)),
-                Err(e) => {
-                    self.diagnostics
-                        .push(Diagnostic::error(e.as_str()).with_span(span));
-                    Ok(Expr::Error(span))
+            }
+            Token::HexLiteral(s) => {
+                match parse_int_literal(bump, &s[2..], 16, "hex literal overflow") {
+                    Ok(v) => Ok(Expr::Literal(Literal::Int(v), span)),
+                    Err(e) => {
+                        self.diagnostics
+                            .push(Diagnostic::error(e.as_str()).with_span(span));
+                        Ok(Expr::Error(span))
+                    }
                 }
-            },
-            Token::BinLiteral(s) => match parse_int_literal(&s[2..], 2, "binary literal overflow") {
-                Ok(v) => Ok(Expr::Literal(Literal::Int(v), span)),
-                Err(e) => {
-                    self.diagnostics
-                        .push(Diagnostic::error(e.as_str()).with_span(span));
-                    Ok(Expr::Error(span))
+            }
+            Token::BinLiteral(s) => {
+                match parse_int_literal(bump, &s[2..], 2, "binary literal overflow") {
+                    Ok(v) => Ok(Expr::Literal(Literal::Int(v), span)),
+                    Err(e) => {
+                        self.diagnostics
+                            .push(Diagnostic::error(e.as_str()).with_span(span));
+                        Ok(Expr::Error(span))
+                    }
                 }
-            },
+            }
             Token::FloatLiteral(s) => match parse_float_literal(s) {
                 Ok(v) => Ok(Expr::Literal(Literal::Float(v), span)),
                 // Float default `trap` (aligned with integers): a
@@ -1115,7 +1174,16 @@ impl<'src, 'input> Parser<'src, 'input> {
                 }
             },
             Token::StringLiteral(s) => match parse_string_literal(s) {
-                Ok(c) => Ok(Expr::Literal(Literal::String(c.into_owned()), span)),
+                Ok(c) => {
+                    // Arena-copy the decoded text: `Literal::String` holds
+                    // `&'input str`, and borrowing the token slice directly
+                    // would tie the AST to the source-text lifetime, which
+                    // the arena is not guaranteed to outlive.  The escape
+                    // path already produced an owned `String`, so only the
+                    // common escape-free case pays a small copy.
+                    let s: &'input str = bump.alloc_str(c.as_ref());
+                    Ok(Expr::Literal(Literal::String(s), span))
+                }
                 Err(e) => {
                     self.diagnostics
                         .push(Diagnostic::error(e.as_str()).with_span(span));
@@ -1123,7 +1191,13 @@ impl<'src, 'input> Parser<'src, 'input> {
                 }
             },
             Token::ByteStringLiteral(s) => match parse_byte_string_literal(s) {
-                Ok(c) => Ok(Expr::Literal(Literal::ByteString(c.into_owned()), span)),
+                Ok(c) => {
+                    // Always arena-copy: the `Borrowed` case borrows the
+                    // token slice with the source lifetime, which the AST
+                    // arena is not guaranteed to outlive.
+                    let b: &'input [u8] = bump.alloc_slice_clone(c.as_ref());
+                    Ok(Expr::Literal(Literal::ByteString(b), span))
+                }
                 Err(e) => {
                     self.diagnostics
                         .push(Diagnostic::error(e.as_str()).with_span(span));
@@ -1140,21 +1214,26 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Infix parsing
     // -------------------------------------------------------------------------
 
-    fn parse_infix(&mut self, lhs: Expr<'input>, bp: u8, bump: &'input bumpalo::Bump) -> Result<Expr<'input>, Diagnostic<'src>> {
+    fn parse_infix(
+        &mut self,
+        lhs: Expr<'input>,
+        bp: u8,
+        bump: &'input bumpalo::Bump,
+    ) -> Result<Expr<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         match self.peek() {
-            Ok(Token::Bang) => {
+            Some(Token::Bang) => {
                 if matches!(lhs, Expr::Ident(..) | Expr::Path(..))
                     && matches!(self.peek_next(), Some(Token::LParen))
                 {
-                    self.advance().ok();
-                    self.advance().ok();
+                    self.advance();
+                    self.advance();
                     let mut args = bumpalo::collections::Vec::with_capacity_in(4, bump);
-                    if !matches!(self.peek(), Ok(Token::RParen)) {
+                    if !matches!(self.peek(), Some(Token::RParen)) {
                         loop {
                             args.push(self.parse_expr(bump)?);
-                            if matches!(self.peek(), Ok(Token::Comma)) {
-                                self.advance().ok();
+                            if matches!(self.peek(), Some(Token::Comma)) {
+                                self.advance();
                             } else {
                                 break;
                             }
@@ -1169,45 +1248,45 @@ impl<'src, 'input> Parser<'src, 'input> {
                     })
                 } else {
                     Err(Diagnostic::error("unexpected !")
-                        .with_code_str("E007")
+                        .with_code_str(ErrCode::E007)
                         .with_help("`!` as a postfix operator is only used for comptime calls — e.g. `func!()`")
                         .with_suggestion("use `func!()` for comptime calls, or remove the `!`")
                         .with_span(self.span()))
                 }
             }
-            Ok(Token::Question) => {
-                self.advance().ok();
+            Some(Token::Question) => {
+                self.advance();
                 let end = self.span().end;
                 Ok(Expr::Try {
                     expr: Self::alloc_shared(bump, lhs),
                     span: Span::new(self.file_id, start, end),
                 })
             }
-            Ok(Token::As) => {
-                self.advance().ok();
-                let safe = !matches!(self.peek(), Ok(Token::Bang));
+            Some(Token::As) => {
+                self.advance();
+                let safe = !matches!(self.peek(), Some(Token::Bang));
                 if !safe {
-                    self.advance().ok();
+                    self.advance();
                 }
                 let ty = self.parse_type(bump)?;
                 // `round` / `trunc` / `ceil` / `floor` are contextual
                 // keywords (not in SYNTAX.md's keyword list) — matched on
                 // the identifier, never globally reserved.
                 let rounding = match self.peek() {
-                    Ok(Token::Ident(s)) if s.eq_str("round") => {
-                        self.advance().ok();
+                    Some(Token::Ident(s)) if s.eq_str("round") => {
+                        self.advance();
                         Some(Rounding::Round)
                     }
-                    Ok(Token::Ident(s)) if s.eq_str("trunc") => {
-                        self.advance().ok();
+                    Some(Token::Ident(s)) if s.eq_str("trunc") => {
+                        self.advance();
                         Some(Rounding::Trunc)
                     }
-                    Ok(Token::Ident(s)) if s.eq_str("ceil") => {
-                        self.advance().ok();
+                    Some(Token::Ident(s)) if s.eq_str("ceil") => {
+                        self.advance();
                         Some(Rounding::Ceil)
                     }
-                    Ok(Token::Ident(s)) if s.eq_str("floor") => {
-                        self.advance().ok();
+                    Some(Token::Ident(s)) if s.eq_str("floor") => {
+                        self.advance();
                         Some(Rounding::Floor)
                     }
                     _ => None,
@@ -1221,119 +1300,122 @@ impl<'src, 'input> Parser<'src, 'input> {
                     span: Span::new(self.file_id, start, end),
                 })
             }
-            Ok(Token::Plus) => {
-                self.advance().ok();
+            Some(Token::Plus) => {
+                self.advance();
                 self.binary(lhs, BinOp::Add, bp + 1, start, bump)
             }
-            Ok(Token::Minus) => {
-                self.advance().ok();
+            Some(Token::Minus) => {
+                self.advance();
                 self.binary(lhs, BinOp::Sub, bp + 1, start, bump)
             }
-            Ok(Token::Star) => {
-                self.advance().ok();
+            Some(Token::Star) => {
+                self.advance();
                 self.binary(lhs, BinOp::Mul, bp + 1, start, bump)
             }
-            Ok(Token::Slash) => {
-                self.advance().ok();
+            Some(Token::Slash) => {
+                self.advance();
                 self.binary(lhs, BinOp::Div, bp + 1, start, bump)
             }
-            Ok(Token::Percent) => {
-                self.advance().ok();
+            Some(Token::Percent) => {
+                self.advance();
                 self.binary(lhs, BinOp::Rem, bp + 1, start, bump)
             }
-            Ok(Token::PlusWrap) => {
-                self.advance().ok();
+            Some(Token::PlusWrap) => {
+                self.advance();
                 self.binary(lhs, BinOp::AddWrap, bp + 1, start, bump)
             }
-            Ok(Token::MinusWrap) => {
-                self.advance().ok();
+            Some(Token::MinusWrap) => {
+                self.advance();
                 self.binary(lhs, BinOp::SubWrap, bp + 1, start, bump)
             }
-            Ok(Token::StarWrap) => {
-                self.advance().ok();
+            Some(Token::StarWrap) => {
+                self.advance();
                 self.binary(lhs, BinOp::MulWrap, bp + 1, start, bump)
             }
-            Ok(Token::PlusSaturate) => {
-                self.advance().ok();
+            Some(Token::PlusSaturate) => {
+                self.advance();
                 self.binary(lhs, BinOp::AddSaturate, bp + 1, start, bump)
             }
-            Ok(Token::MinusSaturate) => {
-                self.advance().ok();
+            Some(Token::MinusSaturate) => {
+                self.advance();
                 self.binary(lhs, BinOp::SubSaturate, bp + 1, start, bump)
             }
-            Ok(Token::StarSaturate) => {
-                self.advance().ok();
+            Some(Token::StarSaturate) => {
+                self.advance();
                 self.binary(lhs, BinOp::MulSaturate, bp + 1, start, bump)
             }
-            Ok(Token::PlusTrap) => {
-                self.advance().ok();
+            Some(Token::PlusTrap) => {
+                self.advance();
                 self.binary(lhs, BinOp::AddTrap, bp + 1, start, bump)
             }
-            Ok(Token::MinusTrap) => {
-                self.advance().ok();
+            Some(Token::MinusTrap) => {
+                self.advance();
                 self.binary(lhs, BinOp::SubTrap, bp + 1, start, bump)
             }
-            Ok(Token::StarTrap) => {
-                self.advance().ok();
+            Some(Token::StarTrap) => {
+                self.advance();
                 self.binary(lhs, BinOp::MulTrap, bp + 1, start, bump)
             }
-            Ok(Token::Ampersand) => {
-                self.advance().ok();
+            Some(Token::Ampersand) => {
+                self.advance();
                 self.binary(lhs, BinOp::BitAnd, bp + 1, start, bump)
             }
-            Ok(Token::Pipe) => {
-                self.advance().ok();
+            Some(Token::Pipe) => {
+                self.advance();
                 self.binary(lhs, BinOp::BitOr, bp + 1, start, bump)
             }
-            Ok(Token::Caret) => {
-                self.advance().ok();
+            Some(Token::Caret) => {
+                self.advance();
                 self.binary(lhs, BinOp::BitXor, bp + 1, start, bump)
             }
-            Ok(Token::Shl) => {
-                self.advance().ok();
+            Some(Token::Shl) => {
+                self.advance();
                 self.binary(lhs, BinOp::Shl, bp + 1, start, bump)
             }
-            Ok(Token::Shr) => {
-                self.advance().ok();
+            Some(Token::Shr) => {
+                self.advance();
                 self.binary(lhs, BinOp::Shr, bp + 1, start, bump)
             }
-            Ok(Token::EqEq) => {
-                self.advance().ok();
+            Some(Token::EqEq) => {
+                self.advance();
                 self.binary(lhs, BinOp::Eq, bp + 1, start, bump)
             }
-            Ok(Token::Neq) => {
-                self.advance().ok();
+            Some(Token::Neq) => {
+                self.advance();
                 self.binary(lhs, BinOp::Neq, bp + 1, start, bump)
             }
-            Ok(Token::Lt) => {
-                self.advance().ok();
+            Some(Token::Lt) => {
+                self.advance();
                 self.binary(lhs, BinOp::Lt, bp + 1, start, bump)
             }
-            Ok(Token::Gt) => {
-                self.advance().ok();
+            Some(Token::Gt) => {
+                self.advance();
                 self.binary(lhs, BinOp::Gt, bp + 1, start, bump)
             }
-            Ok(Token::Le) => {
-                self.advance().ok();
+            Some(Token::Le) => {
+                self.advance();
                 self.binary(lhs, BinOp::Le, bp + 1, start, bump)
             }
-            Ok(Token::Ge) => {
-                self.advance().ok();
+            Some(Token::Ge) => {
+                self.advance();
                 self.binary(lhs, BinOp::Ge, bp + 1, start, bump)
             }
-            Ok(Token::And) => {
-                self.advance().ok();
+            Some(Token::And) => {
+                self.advance();
                 self.binary(lhs, BinOp::And, bp + 1, start, bump)
             }
-            Ok(Token::Or) => {
-                self.advance().ok();
+            Some(Token::Or) => {
+                self.advance();
                 self.binary(lhs, BinOp::Or, bp + 1, start, bump)
             }
-            Ok(Token::DotDot) => {
-                self.advance().ok();
+            Some(Token::DotDot) => {
+                self.advance();
                 let end = if !matches!(
                     self.peek(),
-                    Ok(Token::Semicolon) | Ok(Token::RBrace) | Ok(Token::Comma) | Ok(Token::RParen)
+                    Some(Token::Semicolon)
+                        | Some(Token::RBrace)
+                        | Some(Token::Comma)
+                        | Some(Token::RParen)
                 ) {
                     Some(Self::alloc_shared(bump, self.parse_expr_bp(0, bump)?))
                 } else {
@@ -1346,8 +1428,8 @@ impl<'src, 'input> Parser<'src, 'input> {
                     span: Span::new(self.file_id, start, self.span().end),
                 })
             }
-            Ok(Token::DotDotEq) => {
-                self.advance().ok();
+            Some(Token::DotDotEq) => {
+                self.advance();
                 let end = self.parse_expr_bp(0, bump)?;
                 Ok(Expr::Range {
                     start: Some(Self::alloc_shared(bump, lhs)),
@@ -1356,14 +1438,14 @@ impl<'src, 'input> Parser<'src, 'input> {
                     span: Span::new(self.file_id, start, self.span().end),
                 })
             }
-            Ok(Token::LParen) => {
-                self.advance().ok();
+            Some(Token::LParen) => {
+                self.advance();
                 let mut args = bumpalo::collections::Vec::with_capacity_in(4, bump);
-                if !matches!(self.peek(), Ok(Token::RParen)) {
+                if !matches!(self.peek(), Some(Token::RParen)) {
                     loop {
                         args.push(self.parse_expr(bump)?);
-                        if matches!(self.peek(), Ok(Token::Comma)) {
-                            self.advance().ok();
+                        if matches!(self.peek(), Some(Token::Comma)) {
+                            self.advance();
                         } else {
                             break;
                         }
@@ -1377,8 +1459,8 @@ impl<'src, 'input> Parser<'src, 'input> {
                     span: Span::new(self.file_id, start, self.span().end),
                 })
             }
-            Ok(Token::LBracket) => {
-                self.advance().ok();
+            Some(Token::LBracket) => {
+                self.advance();
                 let index = self.parse_expr(bump)?;
                 self.expect(Token::RBracket)?;
                 Ok(Expr::Index {
@@ -1387,14 +1469,14 @@ impl<'src, 'input> Parser<'src, 'input> {
                     span: Span::new(self.file_id, start, self.span().end),
                 })
             }
-            Ok(Token::Dot) => {
-                self.advance().ok();
-                if let Ok(Token::Ident(field)) = self.advance() {
-                    if field.eq_str("freeze") && matches!(self.peek(), Ok(Token::Bang)) {
+            Some(Token::Dot) => {
+                self.advance();
+                if let Some(Token::Ident(field)) = self.advance() {
+                    if field.eq_str("freeze") && matches!(self.peek(), Some(Token::Bang)) {
                         // `.freeze!()` — explicit read-only freeze, equivalent
                         // to `&ro expr` (SYNTAX.md: ".freeze!() ... behaves
                         // identically and is preferred in method chains").
-                        self.advance().ok();
+                        self.advance();
                         self.expect(Token::LParen)?;
                         self.expect(Token::RParen)?;
                         Ok(Expr::UnaryOp {
@@ -1411,15 +1493,15 @@ impl<'src, 'input> Parser<'src, 'input> {
                     }
                 } else {
                     Err(Diagnostic::error("expected field name after '.'")
-                        .with_code_str("E004")
+                        .with_code_str(ErrCode::E004)
                         .with_help("`.` must be followed by a field name — e.g. `object.field`")
                         .with_suggestion("add a field name after `.`, or remove the `.`")
                         .with_span(self.span()))
                 }
             }
-            Ok(Token::Apostrophe) => {
-                self.advance().ok();
-                if let Ok(Token::Ident(attr)) = self.advance() {
+            Some(Token::Apostrophe) => {
+                self.advance();
+                if let Some(Token::Ident(attr)) = self.advance() {
                     Ok(Expr::AttrAccess {
                         base: Self::alloc_shared(bump, lhs),
                         attr,
@@ -1427,30 +1509,30 @@ impl<'src, 'input> Parser<'src, 'input> {
                     })
                 } else {
                     Err(Diagnostic::error("expected attribute name after '''")
-                        .with_code_str("E004")
+                        .with_code_str(ErrCode::E004)
                         .with_help("`'` must be followed by an attribute name — e.g. `object'attr`")
                         .with_suggestion("add an attribute name after `'`, or remove the `'`")
                         .with_span(self.span()))
                 }
             }
-            Ok(Token::Catch) => {
-                self.advance().ok();
+            Some(Token::Catch) => {
+                self.advance();
                 let mut branches = bumpalo::collections::Vec::with_capacity_in(4, bump);
                 self.expect(Token::LBrace)?;
                 loop {
-                    if matches!(self.peek(), Ok(Token::RBrace)) {
-                        self.advance().ok();
+                    if matches!(self.peek(), Some(Token::RBrace)) {
+                        self.advance();
                         break;
                     }
                     let branch_start = self.span().start;
                     self.expect(Token::Pipe)?;
                     let pattern = self.parse_pattern(bump)?;
-                    let bind = if matches!(self.peek(), Ok(Token::As)) {
-                        self.advance().ok();
+                    let bind = if matches!(self.peek(), Some(Token::As)) {
+                        self.advance();
                         match self.advance() {
-                            Ok(Token::Ident(name)) => Some(name),
+                            Some(Token::Ident(name)) => Some(name),
                             _ => return Err(Diagnostic::error("expected binding name after 'as'")
-                                .with_code_str("E004")
+                                .with_code_str(ErrCode::E004)
                                 .with_help("`as` in a catch pattern must be followed by a binding name — e.g. `|NetworkError as e|`")
                                 .with_suggestion("add a capture variable name after `as`, like `|Pattern as var_name|`")
                                 .with_span(self.span())),
@@ -1459,8 +1541,8 @@ impl<'src, 'input> Parser<'src, 'input> {
                         None
                     };
                     self.expect(Token::Pipe)?;
-                    let body = if matches!(self.peek(), Ok(Token::FatArrow)) {
-                        self.advance().ok();
+                    let body = if matches!(self.peek(), Some(Token::FatArrow)) {
+                        self.advance();
                         let expr = self.parse_expr(bump)?;
                         Self::alloc_slice(bump, &[Stmt::Expression(expr)])
                     } else {
@@ -1510,11 +1592,14 @@ impl<'src, 'input> Parser<'src, 'input> {
     // `if` expression
     // -------------------------------------------------------------------------
 
-    fn parse_if_expr(&mut self, bump: &'input bumpalo::Bump) -> Result<Expr<'input>, Diagnostic<'src>> {
+    fn parse_if_expr(
+        &mut self,
+        bump: &'input bumpalo::Bump,
+    ) -> Result<Expr<'input>, Diagnostic<'src>> {
         let start = self.span().start;
-        self.advance().ok();
-        if matches!(self.peek(), Ok(Token::Let)) {
-            self.advance().ok();
+        self.advance();
+        if matches!(self.peek(), Some(Token::Let)) {
+            self.advance();
             let pattern = self.parse_or_pattern(bump)?;
             self.expect(Token::Assign)?;
             let scrutinee = self
@@ -1522,13 +1607,17 @@ impl<'src, 'input> Parser<'src, 'input> {
                     this.parse_expr(bump)
                 })?;
             self.expect(Token::LBrace)?;
-            let then_branch =
-                self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block(bump))?;
+            let then_branch = self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| {
+                this.parse_block(bump)
+            })?;
             self.expect(Token::RBrace)?;
-            let else_branch = if matches!(self.peek(), Ok(Token::Else)) {
-                self.advance().ok();
-                if matches!(self.peek(), Ok(Token::If)) {
-                    Some(Self::alloc_slice(bump, &[Stmt::Expression(self.parse_if_expr(bump)?)]))
+            let else_branch = if matches!(self.peek(), Some(Token::Else)) {
+                self.advance();
+                if matches!(self.peek(), Some(Token::If)) {
+                    Some(Self::alloc_slice(
+                        bump,
+                        &[Stmt::Expression(self.parse_if_expr(bump)?)],
+                    ))
                 } else {
                     self.expect(Token::LBrace)?;
                     let block = self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| {
@@ -1554,17 +1643,22 @@ impl<'src, 'input> Parser<'src, 'input> {
             this.parse_expr(bump)
         })?;
         self.expect(Token::LBrace)?;
-        let then_branch =
-            self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block(bump))?;
+        let then_branch = self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| {
+            this.parse_block(bump)
+        })?;
         self.expect(Token::RBrace)?;
-        let else_branch = if matches!(self.peek(), Ok(Token::Else)) {
-            self.advance().ok();
-            if matches!(self.peek(), Ok(Token::If)) {
-                Some(Self::alloc_slice(bump, &[Stmt::Expression(self.parse_if_expr(bump)?)]))
+        let else_branch = if matches!(self.peek(), Some(Token::Else)) {
+            self.advance();
+            if matches!(self.peek(), Some(Token::If)) {
+                Some(Self::alloc_slice(
+                    bump,
+                    &[Stmt::Expression(self.parse_if_expr(bump)?)],
+                ))
             } else {
                 self.expect(Token::LBrace)?;
-                let block = self
-                    .with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| this.parse_block(bump))?;
+                let block = self.with_restrictions(ParseRestrictions::VALUE_BLOCK, |this| {
+                    this.parse_block(bump)
+                })?;
                 self.expect(Token::RBrace)?;
                 Some(block)
             }
@@ -1585,23 +1679,26 @@ impl<'src, 'input> Parser<'src, 'input> {
     // Match expression
     // -------------------------------------------------------------------------
 
-    pub(super) fn parse_match_expr(&mut self, bump: &'input bumpalo::Bump) -> Result<Expr<'input>, Diagnostic<'src>> {
+    pub(super) fn parse_match_expr(
+        &mut self,
+        bump: &'input bumpalo::Bump,
+    ) -> Result<Expr<'input>, Diagnostic<'src>> {
         let start = self.span().start;
-        self.advance().ok();
+        self.advance();
         let scrutinee = self.with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
             this.parse_expr(bump)
         })?;
         self.expect(Token::LBrace)?;
         let mut arms = bumpalo::collections::Vec::with_capacity_in(4, bump);
         loop {
-            if matches!(self.peek(), Ok(Token::RBrace)) {
-                self.advance().ok();
+            if matches!(self.peek(), Some(Token::RBrace)) {
+                self.advance();
                 break;
             }
             let arm_start = self.span().start;
             let pattern = self.parse_or_pattern(bump)?;
-            let guard = if matches!(self.peek(), Ok(Token::If)) {
-                self.advance().ok();
+            let guard = if matches!(self.peek(), Some(Token::If)) {
+                self.advance();
                 Some(Self::alloc_shared(bump, self.parse_expr(bump)?))
             } else {
                 None
@@ -1617,11 +1714,11 @@ impl<'src, 'input> Parser<'src, 'input> {
                 body,
                 span: Span::new(self.file_id, arm_start, self.span().end),
             });
-            if matches!(self.peek(), Ok(Token::Comma)) {
-                self.advance().ok();
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.advance();
             }
-            if matches!(self.peek(), Ok(Token::RBrace)) {
-                self.advance().ok();
+            if matches!(self.peek(), Some(Token::RBrace)) {
+                self.advance();
                 break;
             }
         }

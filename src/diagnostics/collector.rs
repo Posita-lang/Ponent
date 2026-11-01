@@ -169,7 +169,10 @@ impl<'src> DiagCtxt<'src> {
     /// (a partial write to a fallible sink) WILL be emitted again —
     /// callers whose sinks can partially flush should tolerate that, not
     /// assume exactly-once output.
-    pub fn emit<R: Renderer, M: MakeSink>(&mut self, emitter: &mut Emitter<R, M>) -> io::Result<()> {
+    pub fn emit<R: Renderer, M: MakeSink>(
+        &mut self,
+        emitter: &mut Emitter<R, M>,
+    ) -> io::Result<()> {
         emitter.emit_all(&mut self.diags[self.reported_len..])?;
         self.reported_len = self.diags.len();
         Ok(())
@@ -177,31 +180,30 @@ impl<'src> DiagCtxt<'src> {
 
     /// Drain all diagnostics and return them as a Result.
     /// Returns Ok(()) if no errors, Err(self) if any errors present.
-    #[must_use]
     pub fn check(self) -> Result<(), Self> {
         if self.has_errors() { Err(self) } else { Ok(()) }
     }
 
     // ── Accessors ───────────────────────────────────────────────────
 
-    /// All error-level diagnostics (reported + unreported).
-    pub fn errors(&self) -> Vec<&Diagnostic<'src>> {
-        self.iter().filter(|d| d.is_error()).collect()
+    /// Iterate over all error-level diagnostics (reported + unreported).
+    pub fn errors(&self) -> impl Iterator<Item = &Diagnostic<'src>> + '_ {
+        self.iter().filter(|d| d.is_error())
     }
 
-    /// All warning-level diagnostics (reported + unreported).
-    pub fn warnings(&self) -> Vec<&Diagnostic<'src>> {
-        self.iter().filter(|d| d.is_warning()).collect()
+    /// Iterate over all warning-level diagnostics (reported + unreported).
+    pub fn warnings(&self) -> impl Iterator<Item = &Diagnostic<'src>> + '_ {
+        self.iter().filter(|d| d.is_warning())
     }
 
     /// Iterate over all error-level diagnostics without allocating.
     pub fn for_each_error<F: FnMut(&Diagnostic<'src>)>(&self, mut f: F) {
-        self.iter().filter(|d| d.is_error()).for_each(|d| f(d))
+        self.iter().filter(|d| d.is_error()).for_each(f)
     }
 
     /// Iterate over all warning-level diagnostics without allocating.
     pub fn for_each_warning<F: FnMut(&Diagnostic<'src>)>(&self, mut f: F) {
-        self.iter().filter(|d| d.is_warning()).for_each(|d| f(d))
+        self.iter().filter(|d| d.is_warning()).for_each(f)
     }
 
     /// Iterate over all diagnostics, yielding them with 1-based index.
@@ -217,6 +219,27 @@ impl<'src> DiagCtxt<'src> {
     /// Total count of warning diagnostics.
     pub fn warning_count(&self) -> usize {
         self.iter().filter(|d| d.is_warning()).count()
+    }
+
+    /// One-pass `(error_count, warning_count)`.
+    ///
+    /// `error_count` + `warning_count` are each a full scan; callers that
+    /// need both (summary renderers, tests) can share this single pass
+    /// instead of paying two.  `is_error` and `is_warning` are disjoint
+    /// (Fatal/Error vs Warning), so the `else if` is exact.  Note `check`
+    /// still uses `has_errors`, which short-circuits on the first error and
+    /// is therefore strictly cheaper than this full pass.
+    pub fn summary(&self) -> (usize, usize) {
+        let mut errors = 0usize;
+        let mut warnings = 0usize;
+        for d in &self.diags {
+            if d.is_error() {
+                errors += 1;
+            } else if d.is_warning() {
+                warnings += 1;
+            }
+        }
+        (errors, warnings)
     }
 
     /// Get a mutable reference to the last **unreported** diagnostic, if any.
@@ -266,6 +289,16 @@ impl<'src> DiagCtxt<'src> {
 
     /// Drain the reported list and return it.
     pub fn drain_reported(&mut self) -> Vec<Diagnostic<'src>> {
+        // Fast paths avoid a whole-buffer memmove when the split is at
+        // either end: `split_off(0)` and `split_off(len)` would each move
+        // the entire vec for nothing.
+        if self.reported_len == 0 {
+            return Vec::new();
+        }
+        if self.reported_len == self.diags.len() {
+            self.reported_len = 0;
+            return std::mem::take(&mut self.diags);
+        }
         let mut all = std::mem::take(&mut self.diags);
         let unreported = all.split_off(self.reported_len);
         self.diags = unreported;
@@ -388,6 +421,33 @@ mod tests {
     }
 
     #[test]
+    fn drain_reported_edge_splits() {
+        // reported_len == 0: nothing to drain, the buffer stays intact.
+        let mut c = DiagCtxt::new();
+        c.push(Diagnostic::error("a"));
+        c.push(Diagnostic::warning("b"));
+        let drained = c.drain_reported();
+        assert!(drained.is_empty());
+        assert_eq!(c.len(), 2, "unreported diags must remain untouched");
+
+        // reported_len == len: everything drains, the buffer is emptied.
+        c.mark_all_reported();
+        let drained = c.drain_reported();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(c.len(), 0);
+
+        // Mixed split: one reported, one unreported.
+        c.push(Diagnostic::error("c"));
+        c.mark_all_reported();
+        c.push(Diagnostic::warning("d"));
+        let drained = c.drain_reported();
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].is_error());
+        assert_eq!(c.len(), 1);
+        assert!(c.unreported()[0].is_warning());
+    }
+
+    #[test]
     fn truncate_unreported_keeps_reported() {
         let mut c = DiagCtxt::new();
         c.push(Diagnostic::error("a"));
@@ -416,10 +476,10 @@ mod tests {
 
     #[test]
     fn emit_advances_partition_and_does_not_duplicate() {
+        use crate::diagnostics::DiagOpts;
         use crate::diagnostics::emitter::Emitter;
         use crate::diagnostics::renderers::JsonRenderer;
         use crate::diagnostics::sink::DiagnosticSink;
-        use crate::diagnostics::DiagOpts;
         use std::cell::RefCell;
         use std::rc::Rc;
 

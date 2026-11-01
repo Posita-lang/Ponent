@@ -211,7 +211,7 @@ pub enum HirStmt<'input> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirExpr<'input> {
-    Literal(Literal, TypeId, Span),
+    Literal(Literal<'input>, TypeId, Span),
     Ident(Symbol, TypeId, Span),
     TypeAnnotated {
         expr: Box<HirExpr<'input>>,

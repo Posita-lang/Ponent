@@ -89,13 +89,17 @@ impl DiagnosticLevel {
     }
 
     pub fn label(&self) -> Cow<'static, str> {
-        match self {
-            DiagnosticLevel::Fatal => crate::tr!("level-fatal"),
-            DiagnosticLevel::Error => crate::tr!("level-error"),
-            DiagnosticLevel::Warning => crate::tr!("level-warning"),
-            DiagnosticLevel::Help => crate::tr!("level-help"),
-            DiagnosticLevel::Note => crate::tr!("level-note"),
-            DiagnosticLevel::Info => crate::tr!("level-info"),
+        crate::diagnostics::i18n::cached_label! {
+            n = 6,
+            variant = *self as usize,
+            init = [
+                crate::diagnostics::i18n::fluent::level_info().into_owned(),
+                crate::diagnostics::i18n::fluent::level_note().into_owned(),
+                crate::diagnostics::i18n::fluent::level_help().into_owned(),
+                crate::diagnostics::i18n::fluent::level_warning().into_owned(),
+                crate::diagnostics::i18n::fluent::level_error().into_owned(),
+                crate::diagnostics::i18n::fluent::level_fatal().into_owned(),
+            ],
         }
     }
 }

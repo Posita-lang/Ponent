@@ -1,5 +1,6 @@
 use crate::ast::FileId;
 use crate::ast::{Attribute, BinOp, Expr, Literal, UnaryOp};
+use crate::diagnostics::ErrCode;
 use crate::diagnostics::{DiagCtxt, Diagnostic};
 use crate::hir::target::Target;
 use crate::sat::{SolveResult, Solver};
@@ -49,7 +50,7 @@ pub fn eval_cfg<'input>(
         let mut warned_keys: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
         for (key, value) in &attr.named_args {
             let val_str = match value {
-                Expr::Literal(Literal::String(s), _) => s.as_str(),
+                Expr::Literal(Literal::String(s), _) => *s,
                 _ => {
                     // Non-string literal (e.g. @cfg(target_os = 42)) —
                     // the condition is clearly not met.
@@ -138,7 +139,7 @@ fn eval_cfg_expr<'input>(
                         _ => return false,
                     };
                     let val = match right {
-                        Expr::Literal(Literal::String(s), _) => s.as_str(),
+                        Expr::Literal(Literal::String(s), _) => s,
                         _ => return false,
                     };
                     eval_cfg_key(
@@ -156,7 +157,7 @@ fn eval_cfg_expr<'input>(
                         _ => return false,
                     };
                     let val = match right {
-                        Expr::Literal(Literal::String(s), _) => s.as_str(),
+                        Expr::Literal(Literal::String(s), _) => s,
                         _ => return false,
                     };
                     !eval_cfg_key(
@@ -318,8 +319,8 @@ pub fn is_provably_reachable<'input>(
         std::collections::HashMap::new();
     for (key, value) in &attr.named_args {
         if let Expr::Literal(Literal::String(s), _) = value {
-            let lit = var_for(key.as_str(), s.as_str());
-            var_keyvals.insert(lit, (key.as_str().to_string(), s.clone()));
+            let lit = var_for(key.as_str(), s);
+            var_keyvals.insert(lit, (key.as_str().to_string(), s.to_string()));
             solver.add_unit(lit);
         }
     }
@@ -341,7 +342,7 @@ pub fn is_provably_reachable<'input>(
                     "@cfg condition is too complex for precise satisfiability checking — \
                      some constraints were skipped; the result may be a false positive",
                 )
-                .with_code_str("W091"),
+                .with_code_str(ErrCode::W091),
             );
             if strict_mode {
                 return false;
@@ -382,7 +383,7 @@ pub fn is_provably_reachable<'input>(
         if let Some(&arch_lit) = var_map.get(&arch_name) {
             // Look up the pointer width from target specs instead of
             // hardcoding arch→pointer_width mappings here.
-            if let Some(width) = crate::hir::target::Target::arch_pointer_width(s.as_str()) {
+            if let Some(width) = crate::hir::target::Target::arch_pointer_width(s) {
                 let width_name = format!("cfg_target_pointer_width_{}", width);
                 if let Some(&width_lit) = var_map.get(&width_name) {
                     solver.add_implies(arch_lit, width_lit);
@@ -401,7 +402,7 @@ pub fn is_provably_reachable<'input>(
                  consider simplifying the condition with fewer or simpler terms"
             );
             if strict_mode {
-                diag.push(Diagnostic::error(msg).with_code_str("E092"));
+                diag.push(Diagnostic::error(msg).with_code_str(ErrCode::E092));
                 // Error halts compilation — return value is moot, but
                 // returning false avoids downstream panic on broken state.
                 false
@@ -412,7 +413,7 @@ pub fn is_provably_reachable<'input>(
                          to suppress this warning, simplify the condition",
                         msg,
                     ))
-                    .with_code_str("W092"),
+                    .with_code_str(ErrCode::W092),
                 );
                 // Conservatively treat as reachable so complex but valid
                 // cfg conditions don't silently eliminate code.
@@ -601,7 +602,7 @@ fn build_clauses_inner<'input>(
                 });
                 var_keyvals
                     .entry(lit)
-                    .or_insert_with(|| (key.as_str().to_string(), val.clone()));
+                    .or_insert_with(|| (key.as_str().to_string(), val.to_string()));
                 if negated {
                     clauses.push(vec![-lit]);
                 } else {
@@ -622,7 +623,7 @@ fn build_clauses_inner<'input>(
                 });
                 var_keyvals
                     .entry(lit)
-                    .or_insert_with(|| (key.as_str().to_string(), val.clone()));
+                    .or_insert_with(|| (key.as_str().to_string(), val.to_string()));
                 if negated {
                     clauses.push(vec![lit]);
                 } else {
@@ -686,7 +687,7 @@ fn push_literals<'input>(
                 (Expr::Ident(key, _), Expr::Literal(Literal::String(val), _)) => {
                     add_literal(
                         key.as_str(),
-                        val.as_str(),
+                        val,
                         var_map,
                         var_counter,
                         clause,
@@ -726,7 +727,12 @@ mod tests {
                 .map(|(k, v)| {
                     (
                         Symbol::intern(k),
-                        Expr::Literal(Literal::String(v.into()), Span::new(FileId::DUMMY, 0, 0)),
+                        Expr::Literal(
+                            // Leak into `'static`: the test strings outlive the
+                            // diagnostic and `Literal::String` now borrows.
+                            Literal::String(Box::leak(v.to_string().into_boxed_str())),
+                            Span::new(FileId::DUMMY, 0, 0),
+                        ),
                     )
                 })
                 .collect(),
@@ -815,7 +821,10 @@ mod tests {
         let target = make_target();
         let attr = Attribute {
             name: Symbol::intern("cfg"),
-            args: vec![Expr::Ident(Symbol::intern("debug"), Span::new(FileId::DUMMY, 0, 0))],
+            args: vec![Expr::Ident(
+                Symbol::intern("debug"),
+                Span::new(FileId::DUMMY, 0, 0),
+            )],
             named_args: Vec::new(),
             span: Span::new(FileId::DUMMY, 0, 0),
         };
@@ -834,7 +843,10 @@ mod tests {
         let target = make_target();
         let attr = Attribute {
             name: Symbol::intern("cfg"),
-            args: vec![Expr::Ident(Symbol::intern("debug"), Span::new(FileId::DUMMY, 0, 0))],
+            args: vec![Expr::Ident(
+                Symbol::intern("debug"),
+                Span::new(FileId::DUMMY, 0, 0),
+            )],
             named_args: Vec::new(),
             span: Span::new(FileId::DUMMY, 0, 0),
         };

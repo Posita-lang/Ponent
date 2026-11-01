@@ -3,8 +3,9 @@
 use super::*;
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
-use crate::lexer::literal::parse_string_literal;
+use crate::diagnostics::ErrCode;
 use crate::lexer::Token;
+use crate::lexer::literal::parse_string_literal;
 use crate::symbol::Symbol;
 
 impl<'src, 'input> Parser<'src, 'input> {
@@ -17,13 +18,13 @@ impl<'src, 'input> Parser<'src, 'input> {
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
         bump: &'input bumpalo::Bump,
-    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
+    ) -> Result<Item<'input>, Diagnostic<'src>> {
         let start = self.span().start;
-        self.advance().ok();
+        self.advance();
         let name = match self.advance() {
-            Ok(Token::Ident(name)) => name,
+            Some(Token::Ident(name)) => name,
             _ => return Err(Diagnostic::error("expected type name")
-                .with_code_str("E004")
+                .with_code_str(ErrCode::E004)
                 .with_help(
                     "after `type`, a type name (identifier) is expected — e.g. `type MyType = ...`",
                 )
@@ -33,22 +34,22 @@ impl<'src, 'input> Parser<'src, 'input> {
         let params = if self
             .restrictions
             .contains(ParseRestrictions::ALLOW_TYPE_PARAMS)
-            && matches!(self.peek(), Ok(Token::Lt))
+            && matches!(self.peek(), Some(Token::Lt))
         {
             self.parse_type_params(bump)?
         } else {
             Vec::new()
         };
         self.expect(Token::Assign)?;
-        let mut ty = if let Ok(Token::Ident(s)) = self.peek().clone() {
+        let mut ty = if let Some(Token::Ident(s)) = self.peek().clone() {
             if s.eq_str("struct") {
-                self.advance().ok();
+                self.advance();
                 return self.parse_struct_def(start, name, params, attributes, doc, bump);
             } else if s.eq_str("impl") {
-                self.advance().ok();
+                self.advance();
                 return self.parse_opaque_def(start, name, params, attributes, doc, bump);
             } else if s.eq_str("enum") {
-                self.advance().ok();
+                self.advance();
                 return self.parse_enum_def(start, name, params, attributes, doc, bump);
             } else {
                 self.parse_type(bump)?
@@ -57,8 +58,8 @@ impl<'src, 'input> Parser<'src, 'input> {
             self.parse_type(bump)?
         };
 
-        if matches!(self.peek(), Ok(Token::Where)) {
-            self.advance().ok();
+        if matches!(self.peek(), Some(Token::Where)) {
+            self.advance();
             let invariant = self.parse_expr(bump)?;
             ty = Type::WhereShorthand {
                 base: Self::alloc_shared(bump, ty),
@@ -67,28 +68,31 @@ impl<'src, 'input> Parser<'src, 'input> {
             };
         }
 
-        if matches!(self.peek(), Ok(Token::Pipe)) {
+        if matches!(self.peek(), Some(Token::Pipe)) {
             let mut types = vec![ty];
-            while matches!(self.peek(), Ok(Token::Pipe)) {
-                self.advance().ok();
+            while matches!(self.peek(), Some(Token::Pipe)) {
+                self.advance();
                 types.push(self.parse_type(bump)?);
             }
-            ty = Type::Union(types, Span::new(self.file_id, start, self.span().end));
+            ty = Type::Union(
+                bump.alloc_slice_clone(&types),
+                Span::new(self.file_id, start, self.span().end),
+            );
         }
 
         let modifiers = self.parse_type_modifiers(bump)?;
-        if matches!(self.peek(), Ok(Token::Semicolon)) {
-            self.advance().ok();
+        if matches!(self.peek(), Some(Token::Semicolon)) {
+            self.advance();
         }
         let end = self.span().end;
-        Ok(Stmt::TypeDef {
+        Ok(Item::TypeDef {
             span: Span::new(self.file_id, start, end),
-            attributes,
+            attributes: bump.alloc_slice_clone(&attributes),
             doc,
             name,
-            params,
-            definition: TypeDefinition::Alias(ty, modifiers),
-            contracts: Vec::new(),
+            params: bump.alloc_slice_clone(&params),
+            definition: TypeDefinition::Alias(ty, bump.alloc_slice_clone(&modifiers)),
+            contracts: &[],
         })
     }
 
@@ -104,19 +108,19 @@ impl<'src, 'input> Parser<'src, 'input> {
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
         bump: &'input bumpalo::Bump,
-    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
+    ) -> Result<Item<'input>, Diagnostic<'src>> {
         self.expect(Token::LBrace)?;
         let mut fields = Vec::new();
         loop {
-            if matches!(self.peek(), Ok(Token::RBrace)) {
-                self.advance().ok();
+            if matches!(self.peek(), Some(Token::RBrace)) {
+                self.advance();
                 break;
             }
             let field_name = match self.advance() {
-                Ok(Token::Ident(n)) => n,
+                Some(Token::Ident(n)) => n,
                 _ => {
                     return Err(Diagnostic::error("expected field name")
-                        .with_code_str("E004")
+                        .with_code_str(ErrCode::E004)
                         .with_help("struct fields must have a name — e.g. `name: String`")
                         .with_suggestion("add a field name like `name`, `age`, or `value`")
                         .with_span(self.span()));
@@ -124,8 +128,8 @@ impl<'src, 'input> Parser<'src, 'input> {
             };
             self.expect(Token::Colon)?;
             let field_ty = self.parse_type(bump)?;
-            let default = if matches!(self.peek(), Ok(Token::Assign)) {
-                self.advance().ok();
+            let default = if matches!(self.peek(), Some(Token::Assign)) {
+                self.advance();
                 Some(self.parse_expr(bump)?)
             } else {
                 None
@@ -136,8 +140,8 @@ impl<'src, 'input> Parser<'src, 'input> {
                 default,
                 span: Span::new(self.file_id, start, self.span().end),
             });
-            if matches!(self.peek(), Ok(Token::Comma)) {
-                self.advance().ok();
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.advance();
             } else {
                 self.expect(Token::RBrace)?;
                 break;
@@ -145,14 +149,17 @@ impl<'src, 'input> Parser<'src, 'input> {
         }
         let modifiers = self.parse_type_modifiers(bump)?;
         let end = self.span().end;
-        Ok(Stmt::TypeDef {
+        Ok(Item::TypeDef {
             span: Span::new(self.file_id, start, end),
-            attributes,
+            attributes: bump.alloc_slice_clone(&attributes),
             doc,
             name,
-            params,
-            definition: TypeDefinition::Struct(fields, modifiers),
-            contracts: Vec::new(),
+            params: bump.alloc_slice_clone(&params),
+            definition: TypeDefinition::Struct(
+                bump.alloc_slice_clone(&fields),
+                bump.alloc_slice_clone(&modifiers),
+            ),
+            contracts: &[],
         })
     }
 
@@ -168,21 +175,21 @@ impl<'src, 'input> Parser<'src, 'input> {
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
         bump: &'input bumpalo::Bump,
-    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
+    ) -> Result<Item<'input>, Diagnostic<'src>> {
         let trait_ty = self.parse_type(bump)?;
         let modifiers = self.parse_type_modifiers(bump)?;
-        if matches!(self.peek(), Ok(Token::Semicolon)) {
-            self.advance().ok();
+        if matches!(self.peek(), Some(Token::Semicolon)) {
+            self.advance();
         }
         let end = self.span().end;
-        Ok(Stmt::TypeDef {
+        Ok(Item::TypeDef {
             span: Span::new(self.file_id, start, end),
-            attributes,
+            attributes: bump.alloc_slice_clone(&attributes),
             doc,
             name,
-            params,
-            definition: TypeDefinition::Opaque(trait_ty, modifiers),
-            contracts: Vec::new(),
+            params: bump.alloc_slice_clone(&params),
+            definition: TypeDefinition::Opaque(trait_ty, bump.alloc_slice_clone(&modifiers)),
+            contracts: &[],
         })
     }
 
@@ -198,40 +205,40 @@ impl<'src, 'input> Parser<'src, 'input> {
         attributes: Vec<Attribute<'input>>,
         doc: Option<String>,
         bump: &'input bumpalo::Bump,
-    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
+    ) -> Result<Item<'input>, Diagnostic<'src>> {
         self.expect(Token::LBrace)?;
         let mut variants = Vec::new();
         loop {
-            if matches!(self.peek(), Ok(Token::RBrace)) {
-                self.advance().ok();
+            if matches!(self.peek(), Some(Token::RBrace)) {
+                self.advance();
                 break;
             }
             let v_name = match self.advance() {
-                Ok(Token::Ident(n)) => n,
+                Some(Token::Ident(n)) => n,
                 _ => {
                     return Err(Diagnostic::error("expected variant name")
-                        .with_code_str("E004")
+                        .with_code_str(ErrCode::E004)
                         .with_help("enum variants must have a name — e.g. `enum { A, B }`")
                         .with_suggestion("add a variant name like `VariantA`, `None`, or `Some`")
                         .with_span(self.span()));
                 }
             };
             let mut variant_exists_params = Vec::new();
-            let payload = if matches!(self.peek(), Ok(Token::LParen)) {
-                self.advance().ok();
-                if matches!(self.peek(), Ok(Token::Exists)) {
-                    self.advance().ok();
+            let payload = if matches!(self.peek(), Some(Token::LParen)) {
+                self.advance();
+                if matches!(self.peek(), Some(Token::Exists)) {
+                    self.advance();
                     loop {
                         match self.advance() {
-                            Ok(Token::Ident(name)) => variant_exists_params.push(name),
-                            Ok(tok) => {
+                            Some(Token::Ident(name)) => variant_exists_params.push(name),
+                            Some(tok) => {
                                 return Err(Diagnostic::error(format!(
                                     "expected type variable name in `exists` clause, found {:?}",
                                     tok
                                 ))
                                 .with_span(self.span()));
                             }
-                            Err(()) => {
+                            None => {
                                 return Err(Diagnostic::error(
                                     "unexpected end of file in `exists` clause",
                                 )
@@ -239,12 +246,12 @@ impl<'src, 'input> Parser<'src, 'input> {
                             }
                         }
                         match self.peek() {
-                            Ok(Token::Comma) => {
-                                self.advance().ok();
+                            Some(Token::Comma) => {
+                                self.advance();
                                 continue;
                             }
-                            Ok(Token::Colon) => {
-                                self.advance().ok();
+                            Some(Token::Colon) => {
+                                self.advance();
                                 break;
                             }
                             _ => {
@@ -258,7 +265,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                     }
                 }
                 let ty = self.parse_type(bump)?;
-                if !variant_exists_params.is_empty() && matches!(self.peek(), Ok(Token::Comma)) {
+                if !variant_exists_params.is_empty() && matches!(self.peek(), Some(Token::Comma)) {
                     return Err(Diagnostic::error("expected `)` after the `exists` variable type")
                         .with_help("multiple `exists` variables share ONE type — use `exists X, Y: Type` (comma-separated names, then a single `:` and one type), not `exists X: T, exists Y: T`")
                         .with_span(self.span()));
@@ -268,8 +275,8 @@ impl<'src, 'input> Parser<'src, 'input> {
             } else {
                 None
             };
-            let eq_spec = if matches!(self.peek(), Ok(Token::When)) {
-                self.advance().ok();
+            let eq_spec = if matches!(self.peek(), Some(Token::When)) {
+                self.advance();
                 self.parse_gadt_constraints(bump)?
             } else {
                 Vec::new()
@@ -281,29 +288,29 @@ impl<'src, 'input> Parser<'src, 'input> {
                 exists_params: variant_exists_params,
                 span: Span::new(self.file_id, start, self.span().end),
             });
-            if matches!(self.peek(), Ok(Token::Comma)) {
-                self.advance().ok();
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.advance();
             } else {
                 self.expect(Token::RBrace)?;
                 break;
             }
         }
-        let missing_match = if matches!(self.peek(), Ok(Token::With))
+        let missing_match = if matches!(self.peek(), Some(Token::With))
             && matches!(self.peek_next(), Some(Token::MissingMatch))
         {
-            self.advance().ok();
+            self.advance();
             self.expect(Token::MissingMatch)?;
             self.expect(Token::Assign)?;
             let msg = match self.advance() {
                 // The token carries the raw slice; parse at consumption time.
-                Ok(Token::StringLiteral(s)) => match parse_string_literal(s) {
+                Some(Token::StringLiteral(s)) => match parse_string_literal(s) {
                     Ok(c) => c.into_owned(),
                     Err(e) => {
                         return Err(Diagnostic::error(format!(
                             "invalid string for missing_match: {}",
                             e
                         ))
-                        .with_code_str("E004")
+                        .with_code_str(ErrCode::E004)
                         .with_help(
                             "`missing_match` expects a string literal — e.g. `with missing_match = \"message\"`",
                         )
@@ -313,7 +320,7 @@ impl<'src, 'input> Parser<'src, 'input> {
                 },
                 _ => {
                     return Err(Diagnostic::error("expected string for missing_match")
-                        .with_code_str("E004")
+                        .with_code_str(ErrCode::E004)
                         .with_help(
                             "`missing_match` expects a string literal — e.g. `with missing_match = \"message\"`",
                         )
@@ -328,14 +335,18 @@ impl<'src, 'input> Parser<'src, 'input> {
         };
         let enum_modifiers = self.parse_type_modifiers(bump)?;
         let end = self.span().end;
-        Ok(Stmt::TypeDef {
+        Ok(Item::TypeDef {
             span: Span::new(self.file_id, start, end),
-            attributes,
+            attributes: bump.alloc_slice_clone(&attributes),
             doc,
             name,
-            params,
-            definition: TypeDefinition::Enum(variants, missing_match, enum_modifiers),
-            contracts: Vec::new(),
+            params: bump.alloc_slice_clone(&params),
+            definition: TypeDefinition::Enum(
+                bump.alloc_slice_clone(&variants),
+                missing_match,
+                bump.alloc_slice_clone(&enum_modifiers),
+            ),
+            contracts: &[],
         })
     }
 
@@ -350,21 +361,21 @@ impl<'src, 'input> Parser<'src, 'input> {
         let mut constraints = Vec::new();
         loop {
             let param_name = match self.advance() {
-                Ok(Token::Ident(name)) => name,
-                Ok(tok) => {
+                Some(Token::Ident(name)) => name,
+                Some(tok) => {
                     return Err(Diagnostic::error(format!(
                         "expected type parameter name in GADT constraint, found {:?}",
                         tok
                     ))
-                    .with_code_str("E004")
+                    .with_code_str(ErrCode::E004)
                     .with_help("GADT constraints use `Param == ConcreteType` syntax")
                     .with_suggestion("use `T == Int<32>` where `T` is a type parameter of the enum")
                     .with_span(self.span()));
                 }
-                Err(()) => {
+                None => {
                     return Err(
                         Diagnostic::error("unexpected end of file in GADT constraint")
-                            .with_code_str("E002")
+                            .with_code_str(ErrCode::E002)
                             .with_help("GADT constraints use `Param == ConcreteType` syntax")
                             .with_span(self.span()),
                     );
@@ -374,8 +385,8 @@ impl<'src, 'input> Parser<'src, 'input> {
             let concrete_ty = self.parse_type(bump)?;
             constraints.push((param_name, concrete_ty));
             match self.peek() {
-                Ok(Token::And) => {
-                    self.advance().ok();
+                Some(Token::And) => {
+                    self.advance();
                     continue;
                 }
                 _ => break,
@@ -393,64 +404,64 @@ impl<'src, 'input> Parser<'src, 'input> {
         bump: &'input bumpalo::Bump,
     ) -> Result<Vec<TypeModifier<'input>>, Diagnostic<'src>> {
         let mut modifiers = Vec::new();
-        while matches!(self.peek(), Ok(Token::With)) {
-            self.advance().ok();
+        while matches!(self.peek(), Some(Token::With)) {
+            self.advance();
             match self.peek() {
-                Ok(Token::Ident(_)) | Ok(Token::Default) | Ok(Token::NoDefault) => {
-                    let tok = self.advance().map_err(|_| Diagnostic::error("unexpected token")
-                        .with_code_str("E003")
+                Some(Token::Ident(_)) | Some(Token::Default) | Some(Token::NoDefault) => {
+                    let tok = self.advance().ok_or_else(|| Diagnostic::error("unexpected token")
+                        .with_code_str(ErrCode::E003)
                         .with_help("expected a type modifier name (`overflow`, `validate`, `default`, `no_default`) after `with`")
                         .with_span(Span::new(self.file_id, 0, 0)))?;
                     match tok {
                         Token::Ident(ref s) if s.eq_str("overflow") => {
                             self.expect(Token::Assign)?;
                             let policy = match self.advance() {
-                                Ok(Token::Wrap) => OverflowPolicy::Wrap,
-                                Ok(Token::Saturate) => OverflowPolicy::Saturate,
-                                Ok(Token::Trap) => OverflowPolicy::Trap,
-                                Ok(Token::Ieee) => OverflowPolicy::Ieee,
+                                Some(Token::Wrap) => OverflowPolicy::Wrap,
+                                Some(Token::Saturate) => OverflowPolicy::Saturate,
+                                Some(Token::Trap) => OverflowPolicy::Trap,
+                                Some(Token::Ieee) => OverflowPolicy::Ieee,
                                 _ => return Err(Diagnostic::error("expected overflow policy (wrap, saturate, trap, ieee)")
-                                    .with_code_str("E007")
+                                    .with_code_str(ErrCode::E007)
                                     .with_help("`overflow` policy must be one of: `wrap`, `saturate`, `trap`, or `ieee` (floats only)")
                                     .with_suggestion("use one of: `wrap`, `saturate`, `trap`, or `ieee`")
                                     .with_span(self.span())),
                             };
                             modifiers.push(TypeModifier::Overflow(policy));
-                            if matches!(self.peek(), Ok(Token::Semicolon)) {
-                                self.advance().ok();
+                            if matches!(self.peek(), Some(Token::Semicolon)) {
+                                self.advance();
                             }
                         }
                         Token::Ident(ref s) if s.eq_str("validate") => {
                             self.expect(Token::Assign)?;
                             let closure = self.parse_closure(self.span().start, bump)?;
                             modifiers.push(TypeModifier::Validate(closure));
-                            if matches!(self.peek(), Ok(Token::Semicolon)) {
-                                self.advance().ok();
+                            if matches!(self.peek(), Some(Token::Semicolon)) {
+                                self.advance();
                             }
                         }
                         Token::Default => {
                             self.expect(Token::Assign)?;
                             let expr = self.parse_expr(bump)?;
                             modifiers.push(TypeModifier::Default(expr));
-                            if matches!(self.peek(), Ok(Token::Semicolon)) {
-                                self.advance().ok();
+                            if matches!(self.peek(), Some(Token::Semicolon)) {
+                                self.advance();
                             }
                         }
                         Token::NoDefault => {
                             modifiers.push(TypeModifier::NoDefault);
-                            if matches!(self.peek(), Ok(Token::Semicolon)) {
-                                self.advance().ok();
+                            if matches!(self.peek(), Some(Token::Semicolon)) {
+                                self.advance();
                             }
                         }
                         _ => {
                             while !matches!(
                                 self.peek(),
-                                Ok(Token::Semicolon) | Ok(Token::RBrace) | Err(())
+                                Some(Token::Semicolon) | Some(Token::RBrace) | None
                             ) {
-                                self.advance().ok();
+                                self.advance();
                             }
-                            if matches!(self.peek(), Ok(Token::Semicolon)) {
-                                self.advance().ok();
+                            if matches!(self.peek(), Some(Token::Semicolon)) {
+                                self.advance();
                             }
                         }
                     }
@@ -458,12 +469,12 @@ impl<'src, 'input> Parser<'src, 'input> {
                 _ => {
                     while !matches!(
                         self.peek(),
-                        Ok(Token::Semicolon) | Ok(Token::RBrace) | Err(())
+                        Some(Token::Semicolon) | Some(Token::RBrace) | None
                     ) {
-                        self.advance().ok();
+                        self.advance();
                     }
-                    if matches!(self.peek(), Ok(Token::Semicolon)) {
-                        self.advance().ok();
+                    if matches!(self.peek(), Some(Token::Semicolon)) {
+                        self.advance();
                     }
                 }
             }
@@ -478,47 +489,48 @@ impl<'src, 'input> Parser<'src, 'input> {
     pub(super) fn parse_layout_def(
         &mut self,
         mut attributes: Vec<Attribute<'input>>,
-    ) -> Result<Stmt<'input>, Diagnostic<'src>> {
+        bump: &'input bumpalo::Bump,
+    ) -> Result<Item<'input>, Diagnostic<'src>> {
         let start = self.span().start;
         let name = match self.advance() {
-            Ok(Token::Ident(name)) => name,
-            Ok(tok) => self
+            Some(Token::Ident(name)) => name,
+            Some(tok) => self
                 .keyword_to_ident(&tok)
                 .unwrap_or_else(|| Symbol::intern(&format!("{:?}", tok))),
-            Err(()) => {
+            None => {
                 return Err(
                     Diagnostic::error("unexpected end of file in layout definition")
-                        .with_code_str("E002")
+                        .with_code_str(ErrCode::E002)
                         .with_span(self.span()),
                 );
             }
         };
         self.expect(Token::LBrace)?;
         loop {
-            if matches!(self.peek(), Ok(Token::Comma)) {
-                self.advance().ok();
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.advance();
                 continue;
             }
-            if matches!(self.peek(), Ok(Token::Semicolon)) {
-                self.advance().ok();
+            if matches!(self.peek(), Some(Token::Semicolon)) {
+                self.advance();
                 break;
             }
             let attr_name = match self.advance() {
-                Ok(Token::Ident(name)) => name,
-                Ok(tok) => self
+                Some(Token::Ident(name)) => name,
+                Some(tok) => self
                     .keyword_to_ident(&tok)
                     .unwrap_or_else(|| Symbol::intern(&format!("{:?}", tok))),
-                Err(()) => break,
+                None => break,
             };
             let mut args = Vec::new();
-            if matches!(self.peek(), Ok(Token::LParen)) {
-                self.advance().ok();
+            if matches!(self.peek(), Some(Token::LParen)) {
+                self.advance();
                 let arg_name = match self.advance() {
-                    Ok(Token::Ident(name)) => name,
-                    Ok(tok) => self
+                    Some(Token::Ident(name)) => name,
+                    Some(tok) => self
                         .keyword_to_ident(&tok)
                         .unwrap_or_else(|| Symbol::intern(&format!("{:?}", tok))),
-                    Err(()) => Symbol::INVALID,
+                    None => Symbol::INVALID,
                 };
                 args.push(crate::ast::Expr::Ident(arg_name, self.span()));
                 self.expect(Token::RParen)?;
@@ -532,9 +544,9 @@ impl<'src, 'input> Parser<'src, 'input> {
         }
         self.expect(Token::RBrace)?;
         let end = self.span().end;
-        Ok(Stmt::LayoutDef {
+        Ok(Item::LayoutDef {
             name,
-            attributes,
+            attributes: bump.alloc_slice_clone(&attributes),
             span: Span::new(self.file_id, start, end),
         })
     }
@@ -546,26 +558,26 @@ impl<'src, 'input> Parser<'src, 'input> {
     pub(super) fn parse_type_capture_params(
         &mut self,
     ) -> Result<Vec<TypeParam<'input>>, Diagnostic<'src>> {
-        self.advance().ok();
+        self.advance();
         let mut params = Vec::new();
         loop {
             match self.peek() {
-                Ok(Token::Gt) | Ok(Token::Shr) => {
+                Some(Token::Gt) | Some(Token::Shr) => {
                     self.expect_gt()?;
                     break;
                 }
-                Ok(Token::Ident(name)) => {
+                Some(Token::Ident(name)) => {
                     let name = *name;
-                    self.advance().ok();
+                    self.advance();
                     params.push(TypeParam {
                         name,
-                        bounds: vec![],
+                        bounds: &[],
                         kind: TypeParamKind::Type,
                         span: self.span(),
                     });
-                    if matches!(self.peek(), Ok(Token::Comma)) {
-                        self.advance().ok();
-                    } else if matches!(self.peek(), Ok(Token::Gt) | Ok(Token::Shr)) {
+                    if matches!(self.peek(), Some(Token::Comma)) {
+                        self.advance();
+                    } else if matches!(self.peek(), Some(Token::Gt) | Some(Token::Shr)) {
                         self.expect_gt()?;
                         break;
                     } else {

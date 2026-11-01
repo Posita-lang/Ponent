@@ -34,6 +34,25 @@ struct KappaGraph {
     edges: Vec<(usize, usize, isize)>,
 }
 
+/// `base^exp` with saturation, WITHOUT truncating the exponent.
+///
+/// `usize::saturating_pow` takes a u32 exponent; the former call sites
+/// cast the exponent with `as u32`, which silently wraps any count
+/// ≥ 2^32: an `Int<32>` domain (2^32 wide) truncated to exp = 0 and
+/// reported κ(fn(Int<32>) → Bool) = 2^0 = 1 instead of ≥ 2^2^32. For
+/// base ≥ 2 the result saturates exactly when exp ≥ usize::BITS —
+/// decidable before any powering — and below that `exp as u32` is
+/// lossless.
+fn pow_saturating(base: usize, exp: usize) -> usize {
+    match base {
+        0 if exp == 0 => 1,
+        0 => 0,
+        1 => 1,
+        _ if exp >= usize::BITS as usize => usize::MAX,
+        _ => base.saturating_pow(exp as u32),
+    }
+}
+
 impl<'input> TypeContext<'input> {
     /// Compute the characteristic κ(A) of a type, used for exhaustiveness checking.
     ///
@@ -71,29 +90,34 @@ impl<'input> TypeContext<'input> {
         result
     }
 
-    /// B5a: true if a variant-payload expansion is registered for this
+    /// True if a variant-payload expansion is registered for this
     /// Adt `TypeId` (see `TypeContext::adt_expansions`).
     pub(crate) fn adt_expansion_known(&self, ty: TypeId) -> bool {
         self.adt_expansions.contains_key(&ty)
     }
 
-    /// B5a: the registered variant-payload expansion (per-variant payload
+    /// The registered variant-payload expansion (per-variant payload
     /// `TypeId`s, nullary variant = unit), if any.
     pub(crate) fn adt_expansion(&self, ty: TypeId) -> Option<&[TypeId]> {
         self.adt_expansions.get(&ty).map(|v| v.as_slice())
     }
 
-    /// B5a: register the variant-payload expansion for an Adt `TypeId`.
+    /// Register the variant-payload expansion for an Adt `TypeId`.
     /// Idempotent — the first registration wins (all use sites register
     /// the same payloads for the same instantiation).
     pub(crate) fn register_adt_expansion(&mut self, ty: TypeId, payloads: Vec<TypeId>) {
         self.adt_expansions.entry(ty).or_insert(payloads);
+        // The κ graph consumes the expansion's back-edges (recursion
+        // detection); a characteristic() computed BEFORE this registration
+        // was derived from an expansion-free graph, and the cache key (a
+        // resolved TypeId) cannot detect the change — clear it.
+        self.kappa_cache.clear();
     }
 
     /// Build the type graph from root, collecting all reachable nodes,
     /// variance edges, and axiom links for bound GenericParam occurrences.
     ///
-    /// Iterative (P3d): an explicit frame stack replaces recursion on type
+    /// Iterative: an explicit frame stack replaces recursion on type
     /// depth, so a pathologically deep type cannot overflow the call stack.
     /// Binder scopes are pushed/popped on the frame's enter/exit, which
     /// preserves exactly the path-dependent shadowing semantics of the
@@ -177,20 +201,21 @@ impl<'input> TypeContext<'input> {
                 } => {
                     // ∃X.A binds X: push it as a binder (like ∀/μ/ν) so that
                     // GenericParam occurrences of X in A register as bound,
-                    // not free (B5 counting gap).  Body edge stays covariant.
+                    // not free (counting gap).  Body edge stays covariant.
                     binder_stack.push((*param_index, idx));
                     (vec![(*body, 1)], 1)
                 }
                 TypeData::Adt {
-                    kind: AdtKind::Enum, ..
+                    kind: AdtKind::Enum,
+                    ..
                 } => {
                     // Enum ADT: the generic variance edges (invariant edges
-                    // to the nominal args), PLUS the B5a variant-payload
+                    // to the nominal args), PLUS the variant-payload
                     // expansion — a self-referential enum produces a
                     // back-edge here, classified by the Phase-2 SCC
                     // classifier (`solve_kappa`) by the cycle's variance.
                     // Unregistered ⇒ no expansion edges (fail-closed:
-                    // recursion not detected, the pre-B5a behavior).
+                    // recursion not detected, the pre-expansion behavior).
                     // Struct ADTs fall to the generic arm: their fields
                     // live in the symbol table (not in the TypeId), so
                     // struct recursion stays an honest boundary.
@@ -206,6 +231,26 @@ impl<'input> TypeContext<'input> {
                     }
                     (out, 0)
                 }
+                // ── κ-dependency severing: CONSTANT constructors ──────────
+                // combine_kappa returns a CONSTANT for these four (|Addr| /
+                // the borrow space — independent of the pointee) and never
+                // consumes child κ: their child edges are FALSE
+                // dependencies.  In a cycle they drag a constructor whose
+                // dependency direction is known-irrelevant into the Phase-2
+                // SCC classifier as "non-covariant": ever since the §2.4
+                // variance fix gave `*mut` an invariant edge,
+                // `enum M { Mk(*mut M) }` (truth |M| = |Addr|, IE)
+                // misreported Undecidable through the §2.4-invariant *mut
+                // edge — an inhabitant-count regression, refuting the
+                // earlier "lockstep diagnostics only" assessment.  Severing
+                // (not path-sign accumulation, which would push MORE cycles
+                // toward Undecidable) is the correct fix; must mirror
+                // combine_kappa's constant arms and leaf_kappa's matching
+                // arms below.
+                TypeData::Slice { .. }
+                | TypeData::Ref { .. }
+                | TypeData::Pointer { .. }
+                | TypeData::Ptr { .. } => (Vec::new(), 0),
                 _ => (
                     ctx.compute_variance_edges(ty)
                         .into_iter()
@@ -283,8 +328,7 @@ impl<'input> TypeContext<'input> {
             // order).  This is what keeps the parent the stack top the
             // moment its current child pops.
             if stack.last().unwrap().pending_pos < stack.last().unwrap().pending.len() {
-                let (slot, c) =
-                    stack.last().unwrap().pending[stack.last().unwrap().pending_pos];
+                let (slot, c) = stack.last().unwrap().pending[stack.last().unwrap().pending_pos];
                 stack.last_mut().unwrap().pending_pos += 1;
                 let cidx = {
                     let i = nodes.len();
@@ -412,7 +456,7 @@ impl<'input> TypeContext<'input> {
             return result[0].unwrap();
         }
 
-        // Phase 2 (B5b): classify the remaining undetermined nodes per
+        // Phase 2: classify the remaining undetermined nodes per
         // strongly connected component of the undetermined subgraph.
         //
         // Tarjan (iterative) emits SCCs in REVERSE topological order of the
@@ -421,7 +465,7 @@ impl<'input> TypeContext<'input> {
         // their predecessors" therefore means ASCENDING cid order: a
         // singleton that depends on a cycle is visited only after that
         // cycle's class is in `class_map`, so `combine_kappa` sees every
-        // child (the B5 fail-closed fallback never fires on a legitimate
+        // child (the fail-closed fallback never fires on a legitimate
         // graph).
         //
         // - A genuine cycle (SCC size > 1, or a self-loop) is classified by
@@ -508,14 +552,14 @@ impl<'input> TypeContext<'input> {
         let mut class_map: HashMap<TypeId, Characteristic> = type_kappa.clone();
         for cid in 0..n_comp {
             let scc = &scc_nodes[cid];
-            let has_self_loop = scc
-                .iter()
-                .any(|&v| adj[v].iter().any(|&(to, _)| to == v));
+            let has_self_loop = scc.iter().any(|&v| adj[v].iter().any(|&(to, _)| to == v));
             if scc.len() > 1 || has_self_loop {
                 // A genuine cycle: internal variance decides.
                 let scc_set: Set<usize> = scc.iter().copied().collect();
                 let non_covariant = scc.iter().any(|&v| {
-                    adj[v].iter().any(|&(to, sign)| scc_set.contains(&to) && sign != 1)
+                    adj[v]
+                        .iter()
+                        .any(|&(to, sign)| scc_set.contains(&to) && sign != 1)
                 });
                 let cls = if non_covariant {
                     Characteristic::Undecidable
@@ -585,6 +629,15 @@ impl<'input> TypeContext<'input> {
             TypeData::Adt { .. } => Characteristic::FiniteExhaustible(usize::MAX),
             TypeData::InferVar { .. } => Characteristic::FiniteExhaustible(usize::MAX),
             TypeData::DynTrait { .. } => Characteristic::InfiniteEnumerable,
+            // Constant-size constructors (edges severed in the κ graph —
+            // see resolve_children): inhabitant count is the address /
+            // borrow space, independent of the pointee.  Mirrors
+            // combine_kappa's constant arms; the old `_ => FE(usize::MAX)`
+            // fallback would under-report `*mut T` as "huge but finite".
+            TypeData::Slice { .. }
+            | TypeData::Ref { .. }
+            | TypeData::Pointer { .. }
+            | TypeData::Ptr { .. } => Characteristic::InfiniteEnumerable,
 
             // The following types are NOT leaf types in practice because they
             // have outgoing edges.  This arm is a fallback.
@@ -607,11 +660,12 @@ impl<'input> TypeContext<'input> {
             child: TypeId,
             map: &HashMap<TypeId, Characteristic>,
         ) -> Characteristic {
-            // Fail-closed (B5): a missing child κ (graph construction missed
+            // Fail-closed: a missing child κ (graph construction missed
             // a dependency edge) means the recursive κ can't be determined —
             // report it as infinite (never claim finite exhaustiveness)
             // instead of panicking and crashing the compiler.
-            *map.get(&child).unwrap_or(&Characteristic::InfiniteEnumerable)
+            *map.get(&child)
+                .unwrap_or(&Characteristic::InfiniteEnumerable)
         }
 
         let data = self.get(ty);
@@ -649,6 +703,22 @@ impl<'input> TypeContext<'input> {
                         Characteristic::Undecidable => return Characteristic::Undecidable,
                     }
                 }
+                // Registered variant payloads are the enum's
+                // sum-alternatives — the SAME children resolve_children
+                // emits as sign-1 graph edges — so combine must consume
+                // them too.  The former args-only walk ignored the payload
+                // κ the graph DOES resolve, so a severed-constant cycle
+                // (e.g. `enum M { Mk(*mut M) }`) collapsed to the
+                // FE(usize::MAX) fallback instead of |Addr| ⇒ IE.
+                if let Some(payloads) = self.adt_expansion(ty) {
+                    for &p in payloads {
+                        match ck(self, p, kappa_map) {
+                            Characteristic::FiniteExhaustible(_) => {}
+                            Characteristic::InfiniteEnumerable => has_infinite = true,
+                            Characteristic::Undecidable => return Characteristic::Undecidable,
+                        }
+                    }
+                }
                 if has_infinite {
                     Characteristic::InfiniteEnumerable
                 } else {
@@ -663,7 +733,7 @@ impl<'input> TypeContext<'input> {
 
                 match ck(self, *elem, kappa_map) {
                     Characteristic::FiniteExhaustible(n) => {
-                        Characteristic::FiniteExhaustible(n.saturating_pow(*size as u32))
+                        Characteristic::FiniteExhaustible(pow_saturating(n, *size as usize))
                     }
                     Characteristic::InfiniteEnumerable => Characteristic::InfiniteEnumerable,
                     Characteristic::Undecidable => Characteristic::Undecidable,
@@ -674,6 +744,15 @@ impl<'input> TypeContext<'input> {
             | TypeData::Pointer { .. }
             | TypeData::Ptr { .. } => Characteristic::InfiniteEnumerable,
             TypeData::Fn { params, ret } => {
+                // |B^A| = |B|^|A|.  A codomain of exactly one inhabitant
+                // pins the count (1^A = 1) for EVERY domain — even an
+                // undecidable one — and an EMPTY domain does the same
+                // (A ≅ ∅ ⇒ A → B ≅ 1, regardless of B); both must be
+                // tested before refusing on the other side.
+                let ret_k = ck(self, *ret, kappa_map);
+                if matches!(ret_k, Characteristic::FiniteExhaustible(1)) {
+                    return Characteristic::FiniteExhaustible(1);
+                }
                 let mut domain_product = 1usize;
                 let mut domain_infinite = false;
                 for &p in params {
@@ -685,18 +764,19 @@ impl<'input> TypeContext<'input> {
                         Characteristic::Undecidable => return Characteristic::Undecidable,
                     }
                 }
-                match ck(self, *ret, kappa_map) {
+                if domain_product == 0 {
+                    return Characteristic::FiniteExhaustible(1);
+                }
+                match ret_k {
                     Characteristic::Undecidable => Characteristic::Undecidable,
                     Characteristic::FiniteExhaustible(c) => {
-                        if domain_product == 0 {
-                            Characteristic::FiniteExhaustible(1)
-                        } else if domain_infinite {
+                        if domain_infinite {
                             if c == 0 {
                                 Characteristic::FiniteExhaustible(0)
                             } else if c == 1 {
                                 Characteristic::FiniteExhaustible(1)
                             } else {
-                                // B5b fix: an INFINITE domain with codomain
+                                // An INFINITE domain with codomain
                                 // c ≥ 2 gives |B^A| ≥ 2^ℵ₀ — UNCOUNTABLE.
                                 // The κ hierarchy has no "uncountable" grade,
                                 // so the honest verdict is Undecidable (the
@@ -706,16 +786,12 @@ impl<'input> TypeContext<'input> {
                                 Characteristic::Undecidable
                             }
                         } else {
-                            Characteristic::FiniteExhaustible(
-                                c.saturating_pow(domain_product as u32),
-                            )
+                            Characteristic::FiniteExhaustible(pow_saturating(c, domain_product))
                         }
                     }
                     Characteristic::InfiniteEnumerable => {
-                        if domain_product == 0 {
-                            Characteristic::FiniteExhaustible(1)
-                        } else if domain_infinite {
-                            // B5b fix: |B^A| with A infinite and
+                        if domain_infinite {
+                            // |B^A| with A infinite and
                             // |B| ≥ ℵ₀ is uncountable (≥ 2^ℵ₀) —
                             // Undecidable, symmetric with the
                             // FiniteExhaustible(c≥2) arm above.
@@ -749,5 +825,156 @@ impl<'input> TypeContext<'input> {
             TypeData::AssociatedType { self_ty, .. } => ck(self, *self_ty, kappa_map),
             _ => Characteristic::FiniteExhaustible(usize::MAX),
         }
+    }
+}
+
+#[cfg(all(test, not(feature = "shuttle")))]
+mod tests {
+    use super::*;
+
+    /// Exponent truncation + ∅-absorption + 1^A pins for the Fn/Array
+    /// combine arms.  A usize exponent cast `as u32` wraps mod 2^32 — an
+    /// `Int<63>` domain (2^63 wide) truncated to 0 and reported
+    /// κ = 1; the saturated helper decides saturation from the full
+    /// exponent.  A codomain of exactly 1 pins the count for EVERY
+    /// domain (1^A = 1, even undecidable), and an empty domain does the
+    /// same (A ≅ ∅ ⇒ A → B ≅ 1, even when B is undecidable).
+    #[test]
+    fn fn_and_array_exponent_no_truncation() {
+        let mut ctx = TypeContext::new();
+        let i63 = ctx.int(63, true);
+        // fn(Int<63>) → Int<63>: |A| = 2^63, truth 2^(2^63) ⇒ saturate
+        // (the former `as u32` cast turned the exponent into 0 ⇒ κ = 1).
+        let fn63 = ctx.function(smallvec![i63], i63);
+        assert_eq!(
+            ctx.characteristic(fn63),
+            Characteristic::FiniteExhaustible(usize::MAX),
+            "huge exponent saturates instead of truncating to 1"
+        );
+        // [Bool; 2^32]: same truncation shape at the array arm.
+        let b = ctx.bool();
+        let big_arr = ctx.array(b, 1u64 << 32);
+        assert_eq!(
+            ctx.characteristic(big_arr),
+            Characteristic::FiniteExhaustible(usize::MAX),
+            "array size 2^32 saturates (was truncated to 0 ⇒ κ = 1)"
+        );
+        // 1^A: a codomain of exactly one inhabitant pins the count even
+        // with an undecidable domain.
+        let unit_fn_x = ctx.function(smallvec![i63], ctx.unit());
+        assert_eq!(
+            ctx.characteristic(unit_fn_x),
+            Characteristic::FiniteExhaustible(1),
+            "Unit^A = 1 for every domain"
+        );
+        // ∅-absorption: fn(Never) → (κ=∞ type) ≅ 1 — the Undecidable
+        // codomain must not fire before the empty domain is tested.
+        let n = ctx.enum_ty(DefId(9101), smallvec![]);
+        let i = ctx.int(32, true);
+        let fn_n_i = ctx.function(smallvec![n], i); // N → Int: N's −1 edge
+        ctx.register_adt_expansion(n, vec![fn_n_i]);
+        assert_eq!(
+            ctx.characteristic(n),
+            Characteristic::Undecidable,
+            "premise: the codomain is genuinely undecidable"
+        );
+        let never = ctx.never();
+        let abs = ctx.function(smallvec![never], n);
+        assert_eq!(
+            ctx.characteristic(abs),
+            Characteristic::FiniteExhaustible(1),
+            "A ≅ ∅ ⇒ A → B ≅ 1 regardless of B"
+        );
+    }
+
+    /// Fix pin: `enum M { Mk(*mut M) }` — |M| = |Addr| ⇒ IE.  Once the
+    /// §2.4-invariant *mut edge existed, this cycle was misclassified
+    /// Undecidable (wrong); the
+    /// severed constant constructor keeps the cycle from forming.
+    #[test]
+    fn invariant_pointer_cycle_counts_infinite_not_undecidable() {
+        let mut ctx = TypeContext::new();
+        let m = ctx.enum_ty(DefId(9001), smallvec![]);
+        let pm = ctx.pointer_mut(m); // *mut M — the mutable form: even
+        // the §2.4-invariant slot must not matter
+        ctx.register_adt_expansion(m, vec![pm]);
+        assert!(matches!(
+            ctx.characteristic(m),
+            Characteristic::InfiniteEnumerable
+        ));
+        // The severed pointer node is a constant leaf itself.
+        assert!(matches!(
+            ctx.characteristic(pm),
+            Characteristic::InfiniteEnumerable
+        ));
+    }
+
+    /// Anti-overreach pin: the severing must NOT relax genuine cycles.
+    /// `enum N { Mk(N → Int) }` — N in a CONTRAVARIANT slot;
+    /// combine_kappa(Fn) CONSUMES child κ, the dependency is real,
+    /// the cycle keeps its -1 edge ⇒ Undecidable.
+    #[test]
+    fn contravariant_cycle_still_undecidable() {
+        let mut ctx = TypeContext::new();
+        let n = ctx.enum_ty(DefId(9002), smallvec![]);
+        let i = ctx.int(32, true);
+        let fn_n_i = ctx.function(smallvec![n], i); // N → Int
+        ctx.register_adt_expansion(n, vec![fn_n_i]);
+        assert!(matches!(ctx.characteristic(n), Characteristic::Undecidable));
+    }
+
+    /// Per-slot derived variance: ADT arg edges follow the DERIVED per-slot variance
+    /// instead of the former uniform-invariant derive.  Covariant
+    /// direction: `enum M { Mk(Wrap<M>) }` with Wrap<A>{body: A} — the
+    /// cycle is purely covariant, truth IE; under uniform-invariant the
+    /// Wrap<M> →(0) M edge polluted the ring and misreported
+    /// Undecidable.  Reverse control: a contravariant slot (fn(T)→Unit
+    /// field) keeps the ring Undecidable — the derive must not loosen
+    /// that.
+    #[test]
+    fn kappa_adt_arg_cycles_follow_derived_variance() {
+        let mut ctx = TypeContext::new();
+        let p0 = ctx.generic_param(0, "T".into());
+        // Wrap<A> { body: A }
+        ctx.register_adt(
+            DefId(8301),
+            AdtDef {
+                fields: vec![p0],
+                has_drop: false,
+            },
+        );
+        let m = ctx.enum_ty(DefId(8302), smallvec![]);
+        let wrap_m = ctx.struct_ty(DefId(8301), smallvec![m]);
+        ctx.register_adt_expansion(m, vec![wrap_m]);
+        // Covariant direction: Wrap's slot 0 is non-recursive ⇒ the derive
+        // is +1 ⇒ ring M→(+1)Wrap<M>→(+1)M ⇒ IE (under the former
+        // uniform-invariant derive this ring carried a 0 edge ⇒ the
+        // verdict was Undecidable — a real misclassification).
+        let sign = ctx
+            .compute_variance_edges(wrap_m)
+            .iter()
+            .find(|ve| ve.target == m)
+            .map(|ve| ve.sign);
+        assert_eq!(sign, Some(1), "Wrap's arg slot derives covariant");
+        assert!(matches!(
+            ctx.characteristic(m),
+            Characteristic::InfiniteEnumerable
+        ));
+        // Reverse control: fn(T)→Unit field ⇒ slot derives −1 ⇒ ring
+        // with a −1 edge ⇒ Undecidable is NOT loosened.
+        let q0 = ctx.generic_param(0, "T".into());
+        let i = ctx.int(32, true);
+        let fn_q0_i = ctx.function(smallvec![q0], i);
+        ctx.register_adt(
+            DefId(8303),
+            AdtDef {
+                fields: vec![fn_q0_i],
+                has_drop: false,
+            },
+        );
+        let c = ctx.enum_ty(DefId(8304), smallvec![]);
+        let wrapc_c = ctx.struct_ty(DefId(8303), smallvec![c]);
+        ctx.register_adt_expansion(c, vec![wrapc_c]);
+        assert!(matches!(ctx.characteristic(c), Characteristic::Undecidable));
     }
 }

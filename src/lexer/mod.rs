@@ -7,6 +7,7 @@
 //!   display.rs — `Token::to_user_string`: user-friendly token display
 
 pub mod display;
+pub mod handrolled;
 pub mod keyword;
 pub mod literal;
 pub mod token;

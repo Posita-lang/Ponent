@@ -1,4 +1,5 @@
 use crate::ast::FileId;
+use crate::diagnostics::ErrCode;
 use std::mem;
 
 use super::region::RegionTree;
@@ -162,7 +163,7 @@ impl<'a, 'src, 'input> TypeChecker<'a, 'src, 'input> {
             for msg in unresolved {
                 self.diagnostics.push(
                     Diagnostic::error(msg)
-                        .with_code_str("E030")
+                        .with_code_str(ErrCode::E030)
                         .with_span(Span::new(FileId::DUMMY, 0, 0)), // no span available from check_unresolved
                 );
             }

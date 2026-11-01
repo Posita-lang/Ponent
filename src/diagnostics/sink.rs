@@ -117,6 +117,17 @@ pub fn stderr() -> impl MakeSink<Sink = io::StderrLock<'static>> {
     || io::stderr().lock()
 }
 
+/// Like [`stderr`], but batches writes through a [`BufWriter`].
+///
+/// `io::stderr()` is unbuffered in Rust: every `write_str` is a `write(2)`
+/// syscall.  A batch of N diagnostics therefore costs ~2N syscalls; the
+/// buffered factory collapses them into 1–2.  The emitter calls
+/// `sink.flush()` at the end of every batch, so buffered output is never
+/// left behind on the happy path.
+pub fn stderr_buffered() -> impl MakeSink<Sink = io::BufWriter<io::StderrLock<'static>>> {
+    || io::BufWriter::with_capacity(16 * 1024, io::stderr().lock())
+}
+
 /// Test sink factory: produce a fresh [`StringSink`] per batch.
 pub fn string() -> impl MakeSink<Sink = StringSink> {
     StringSink::new
@@ -174,5 +185,25 @@ mod tests {
         sink.write_str("b").unwrap();
         assert_eq!(rx.recv().unwrap(), "a");
         assert_eq!(rx.recv().unwrap(), "b");
+    }
+
+    /// `BufWriter<W>` and `W` produce identical bytes for the same write
+    /// sequence — buffering only changes syscall granularity, not content.
+    /// This is the property `stderr_buffered` relies on.
+    #[test]
+    fn buffered_writer_preserves_byte_content() {
+        let mut direct = Vec::new();
+        let mut buffered = io::BufWriter::with_capacity(16, Vec::new());
+
+        let chunks = ["hello ", "world\n", "line 2\n", "x"];
+        for chunk in &chunks {
+            direct.write_all(chunk.as_bytes()).unwrap();
+            buffered.write_all(chunk.as_bytes()).unwrap();
+        }
+        // Disambiguate: `BufWriter` implements both `Write` and (via the
+        // blanket impl) `DiagnosticSink`, each with its own `flush`.
+        Write::flush(&mut buffered).unwrap();
+
+        assert_eq!(direct, buffered.into_inner().unwrap());
     }
 }

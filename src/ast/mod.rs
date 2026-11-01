@@ -1,8 +1,9 @@
 pub mod doc_map;
 pub mod visit;
-pub use doc_map::{DocEntry, DocMap, TriviaEntry, TriviaKind};
+pub use doc_map::{ByteOffset, DocEntry, DocMap, TokenIndex, TriviaEntry, TriviaKind};
 
 use num_bigint::{BigInt, Sign};
+use std::num::NonZeroU32;
 
 use crate::symbol::Symbol;
 use std::borrow::Cow;
@@ -11,27 +12,31 @@ use std::fmt;
 
 /// Identifies a source file.
 ///
-/// `FileId(0)` is a sentinel — never a real file — reserved for synthetic
-/// diagnostics (see [`FileId::DUMMY`]); the first real file gets
-/// [`FileId::FIRST_REAL`].
+/// `0` is reserved as the `Option<FileId>` niche and is therefore never a
+/// valid id.  Synthetic diagnostics use [`FileId::DUMMY`] instead; the first
+/// real file gets [`FileId::FIRST_REAL`].
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FileId(u32);
+pub struct FileId(NonZeroU32);
 
 impl FileId {
     /// Reserved for synthetic diagnostics; not a real file.
-    pub const DUMMY: FileId = FileId(0);
+    pub const DUMMY: FileId = FileId(NonZeroU32::MAX);
     /// The `FileId` value given to the first registered file.
     pub const FIRST_REAL: u32 = 1;
 
-    /// The raw registry value (0 for [`FileId::DUMMY`]).
+    /// The raw registry value.
     pub const fn as_u32(self) -> u32 {
-        self.0
+        self.0.get()
     }
 
     /// Construct from a raw registry index. Only [`SourceMap`](crate::sourcemap::SourceMap)
     /// should do this — everyone else gets ids from `SourceMap::add_file`.
     pub(crate) const fn from_raw(raw: u32) -> Self {
-        FileId(raw)
+        match NonZeroU32::new(raw) {
+            Some(id) => FileId(id),
+            None => panic!("FileId::from_raw(0): zero is reserved for Option<FileId>"),
+        }
     }
 }
 
@@ -49,7 +54,17 @@ pub struct Span {
 }
 
 impl Span {
+    /// Build a span from raw offsets.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds assert the `start <= end` invariant.  Every span in the
+    /// compiler comes from a token range or from joining two spans, so a
+    /// reversal means a caller computed the ends in the wrong order; the
+    /// renderers would then draw an empty or inverted underline, which is
+    /// hard to trace back to its origin.  Release builds stay unchecked.
     pub const fn new(file: FileId, start: u32, end: u32) -> Self {
+        debug_assert!(start <= end, "Span::new: start must not exceed end");
         Span { file, start, end }
     }
 
@@ -96,18 +111,33 @@ impl PartialOrd for Span {
 /// diagnostic emitters treat it as an unanchored location.
 pub const DUMMY_SPAN: Span = Span::DUMMY;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum IntLit {
+// Type-design regressions should be caught at compile time, not in a
+// benchmark: the `FileId` niche is what makes `Option<FileId>` and
+// `Option<Span>` cheap.
+const _: () = {
+    use std::mem::size_of;
+    assert!(size_of::<FileId>() == 4);
+    assert!(size_of::<Option<FileId>>() == 4);
+    assert!(size_of::<Span>() == 12);
+    assert!(size_of::<Option<Span>>() == 12);
+};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IntLit<'input> {
     Small(i128),
-    Large(Box<BigInt>),
+    /// Values above `i128::MAX` (up to `u128::MAX`, the widest integer
+    /// type).  Arena-allocated so the whole AST stays `Copy`.
+    Large(&'input BigInt),
 }
 
-impl IntLit {
-    pub fn normalize(v: BigInt) -> Self {
+impl<'input> IntLit<'input> {
+    /// Split an owned `BigInt` into the small/large representation.
+    /// Large values are allocated in `bump` so the result is `Copy`.
+    pub fn normalize(bump: &'input bumpalo::Bump, v: BigInt) -> Self {
         use num_traits::ToPrimitive;
         match v.to_i128() {
             Some(n) => IntLit::Small(n),
-            None => IntLit::Large(Box::new(v)),
+            None => IntLit::Large(bump.alloc(v)),
         }
     }
 
@@ -130,7 +160,7 @@ impl IntLit {
             },
             IntLit::Large(b) => {
                 let half = BigInt::from(1) << ((bits - 1) as usize); // 2^(N-1)
-                *b >= Box::new(-&half) && *b < Box::new(half)
+                **b >= -&half && **b < half
             }
         }
     }
@@ -151,6 +181,35 @@ impl IntLit {
             IntLit::Large(b) => {
                 use num_traits::ToPrimitive;
                 b.to_i128()
+            }
+        }
+    }
+
+    /// Whether `-self` fits the given integer shape, WITHOUT allocating
+    /// the negated value.  Lexer-produced `Large` values are always
+    /// positive, so their negation is negative and can only ever fit a
+    /// signed type (fails closed on unsigned).  `bits` must be ≥ 1.
+    pub fn negated_fits(&self, bits: u64, unsigned: bool) -> bool {
+        match self {
+            IntLit::Small(n) => match n.checked_neg() {
+                // `i128::MIN` negation overflows — cannot fit any type.
+                None => false,
+                Some(m) => {
+                    let neg = IntLit::Small(m);
+                    if unsigned {
+                        neg.fits_unsigned(bits)
+                    } else {
+                        neg.fits_signed(bits)
+                    }
+                }
+            },
+            IntLit::Large(b) => {
+                if unsigned {
+                    return false;
+                }
+                // `-b >= -2^(N-1)`  ⇔  `b <= 2^(N-1)`.
+                let half = BigInt::from(1) << ((bits - 1) as usize);
+                **b <= half
             }
         }
     }
@@ -189,7 +248,7 @@ impl IntLit {
 /// Unary negation of a borrowed literal — used in i128 constant contexts
 /// (`-c` for descending counters); Large values fail closed to
 /// `i128::MIN` (they cannot fit i128).
-impl std::ops::Neg for &IntLit {
+impl<'input> std::ops::Neg for &'input IntLit<'input> {
     type Output = i128;
     fn neg(self) -> i128 {
         match self {
@@ -199,7 +258,7 @@ impl std::ops::Neg for &IntLit {
     }
 }
 
-impl std::fmt::Display for IntLit {
+impl<'input> std::fmt::Display for IntLit<'input> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             IntLit::Small(n) => write!(f, "{n}"),
@@ -208,16 +267,16 @@ impl std::fmt::Display for IntLit {
     }
 }
 
-impl From<IntLit> for BigInt {
-    fn from(v: IntLit) -> Self {
+impl<'input> From<IntLit<'input>> for BigInt {
+    fn from(v: IntLit<'input>) -> Self {
         match v {
             IntLit::Small(n) => BigInt::from(n),
-            IntLit::Large(b) => *b,
+            IntLit::Large(b) => b.clone(),
         }
     }
 }
 
-impl PartialOrd<i32> for IntLit {
+impl<'input> PartialOrd<i32> for IntLit<'input> {
     fn partial_cmp(&self, other: &i32) -> Option<Ordering> {
         Some(match self {
             IntLit::Small(n) => n.cmp(&i128::from(*other)),
@@ -226,7 +285,7 @@ impl PartialOrd<i32> for IntLit {
     }
 }
 
-impl PartialEq<i32> for IntLit {
+impl<'input> PartialEq<i32> for IntLit<'input> {
     fn eq(&self, other: &i32) -> bool {
         match self {
             IntLit::Small(n) => *n == i128::from(*other),
@@ -235,7 +294,7 @@ impl PartialEq<i32> for IntLit {
     }
 }
 
-impl PartialEq<i64> for IntLit {
+impl<'input> PartialEq<i64> for IntLit<'input> {
     fn eq(&self, other: &i64) -> bool {
         match self {
             IntLit::Small(n) => *n == i128::from(*other),
@@ -244,7 +303,7 @@ impl PartialEq<i64> for IntLit {
     }
 }
 
-impl PartialOrd<i128> for IntLit {
+impl<'input> PartialOrd<i128> for IntLit<'input> {
     fn partial_cmp(&self, other: &i128) -> Option<Ordering> {
         Some(match self {
             IntLit::Small(n) => n.cmp(other),
@@ -253,7 +312,7 @@ impl PartialOrd<i128> for IntLit {
     }
 }
 
-impl PartialEq<i128> for IntLit {
+impl<'input> PartialEq<i128> for IntLit<'input> {
     fn eq(&self, other: &i128) -> bool {
         match self {
             IntLit::Small(n) => *n == *other,
@@ -262,7 +321,7 @@ impl PartialEq<i128> for IntLit {
     }
 }
 
-impl PartialOrd<i64> for IntLit {
+impl<'input> PartialOrd<i64> for IntLit<'input> {
     fn partial_cmp(&self, other: &i64) -> Option<Ordering> {
         Some(match self {
             IntLit::Small(n) => n.cmp(&i128::from(*other)),
@@ -271,15 +330,17 @@ impl PartialOrd<i64> for IntLit {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Literal {
-    Int(IntLit),
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Literal<'input> {
+    Int(IntLit<'input>),
     Float(f64),
     Char(u32),
     /// Byte character literal `b'x'` — type `Byte` (alias for `UInt<8>`).
     Byte(u8),
-    String(String),
-    ByteString(Vec<u8>),
+    /// Escape-free literals borrow the source text; escaped ones are
+    /// arena-allocated (`bump.alloc_str`) so the AST stays `Copy`.
+    String(&'input str),
+    ByteString(&'input [u8]),
     Bool(bool),
 }
 
@@ -346,9 +407,9 @@ pub enum Quantifier {
     Exists,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Expr<'input> {
-    Literal(Literal, Span),
+    Literal(Literal<'input>, Span),
     Ident(Symbol, Span),
     TypeAnnotated {
         expr: &'input Expr<'input>,
@@ -401,12 +462,12 @@ pub enum Expr<'input> {
         span: Span,
     },
     StructLit {
-        path: Vec<Symbol>,
+        path: &'input [Symbol],
         fields: &'input [(Symbol, Expr<'input>)],
         span: Span,
     },
     EnumLit {
-        path: Vec<Symbol>,
+        path: &'input [Symbol],
         variant: Symbol,
         payload: Option<&'input Expr<'input>>,
         span: Span,
@@ -415,7 +476,7 @@ pub enum Expr<'input> {
     /// Multi-segment path: `Module::Type::item`. Preserves `::` semantics,
     /// distinct from FieldAccess (`.`). Used for associated fn calls,
     /// enum variant construction, etc.
-    Path(smallvec::SmallVec<[Symbol; 4]>, Span),
+    Path(&'input [Symbol], Span),
     Tuple(&'input [Expr<'input>], Span),
     Array(&'input [Expr<'input>], Span),
     Closure {
@@ -513,7 +574,7 @@ pub enum Expr<'input> {
     /// Compile-time error: `@compile_error!("msg")` unconditionally halts
     /// compilation with the given message when evaluated (comptime-only).
     /// Parsed as an expression so it can be guarded by `if` / `match`.
-    CompileError(String, Span),
+    CompileError(&'input str, Span),
     Error(Span),
 }
 
@@ -548,11 +609,144 @@ pub enum CaptureMode {
     ByMove,
 }
 
+/// A top-level or block-level item (declaration).
+///
+/// Items are named definitions that introduce entities into scope:
+/// functions, types, traits, impl blocks, imports, extern functions,
+/// constraints, edition declarations, layout aliases, and comptime
+/// blocks.  An item parsed at top level appears in
+/// [`Program::items`](Program); an item parsed inside a block appears
+/// as [`Stmt::Item`].
+///
+/// This mirrors rustc's `StmtKind::Item` design: the AST statically
+/// distinguishes "this node is an item" from "this node is a statement",
+/// so `parse_item` cannot accidentally produce a statement and
+/// `parse_stmt` can wrap an item with a single pointer.
 #[derive(Debug, Clone, PartialEq)]
-// `#[non_exhaustive]` forces DOWNSTREAM matches to add a `_` arm for
-// future variants (within this crate, matches stay exhaustive).  The
-// `@auto_ro`/`@auto_coerce` placement validation is kept fail-closed
-// via its own wildcard arm (see `validate_auto_ro_placement`).
+pub enum Item<'input> {
+    /// `def name(params) -> Ret { body }` — a function definition.
+    FunctionDef {
+        span: Span,
+        attributes: &'input [Attribute<'input>],
+        contracts: &'input [Contract<'input>],
+        doc: Option<String>,
+        name: Symbol,
+        params: &'input [Param<'input>],
+        return_type: Option<Type<'input>>,
+        body: Option<&'input [Stmt<'input>]>,
+        type_params: &'input [TypeParam<'input>],
+        where_clause: Option<WhereClause<'input>>,
+        finally: Option<&'input [Stmt<'input>]>,
+        is_comptime: bool,
+        is_async: bool,
+    },
+    /// `type Name = ...` — a type definition (alias, struct, enum,
+    /// trait body, impl block, constraint, or opaque type).
+    TypeDef {
+        span: Span,
+        attributes: &'input [Attribute<'input>],
+        doc: Option<String>,
+        name: Symbol,
+        params: &'input [TypeParam<'input>],
+        definition: TypeDefinition<'input>,
+        contracts: &'input [Contract<'input>],
+    },
+    /// `trait Name { ... }` — a trait definition.
+    TraitDef {
+        span: Span,
+        attributes: &'input [Attribute<'input>],
+        doc: Option<String>,
+        name: Symbol,
+        methods: &'input [TraitMethod<'input>],
+        associated_types: &'input [AssociatedType<'input>],
+    },
+    /// `impl Trait for Type { ... }` — an impl block.
+    ImplBlock {
+        span: Span,
+        attributes: &'input [Attribute<'input>],
+        /// The trait path (`Add<Int<32>>`), or `None` for inherent impls.
+        trait_path: Option<&'input Type<'input>>,
+        for_type: Type<'input>,
+        methods: &'input [ImplMethod<'input>],
+        associated_types: &'input [AssociatedType<'input>],
+        where_clause: Option<WhereClause<'input>>,
+        type_params: &'input [TypeParam<'input>],
+    },
+    /// `import a::b::c` or `import a::b::{x, y}` — a module import.
+    Import {
+        path: &'input [Symbol],
+        items: Option<&'input [Symbol]>,
+        alias: Option<Symbol>,
+        span: Span,
+    },
+    /// `extern "ABI" def name(params) -> Ret;` — a foreign function
+    /// declaration.
+    ExternFunction {
+        abi: String,
+        name: Symbol,
+        params: &'input [Param<'input>],
+        return_type: Type<'input>,
+        span: Span,
+        attributes: &'input [Attribute<'input>],
+    },
+    /// `constraint Name<T> { T: Bound + ... }` — a named constraint
+    /// (where-clause bundle).
+    Constraint {
+        name: Symbol,
+        params: &'input [TypeParam<'input>],
+        predicates: &'input [WherePredicate<'input>],
+        span: Span,
+    },
+    /// `edition = "2024";` — language edition declaration.
+    Edition(String, Span),
+    /// `layout Name { packed, little_endian; }` — a layout alias.
+    LayoutDef {
+        name: Symbol,
+        attributes: &'input [Attribute<'input>],
+        span: Span,
+    },
+    /// `comptime { ... }` — a comptime evaluation block.
+    ComptimeBlock {
+        captures: &'input [(Symbol, Span)],
+        trusted: bool,
+        attributes: &'input [Attribute<'input>],
+        body: &'input [Stmt<'input>],
+        span: Span,
+    },
+    /// `generate for Type { ... }` — a declarative code-generation
+    /// block attached to a type.
+    Generate {
+        attributes: &'input [Attribute<'input>],
+        for_type: &'input Type<'input>,
+        body: &'input [Stmt<'input>],
+        span: Span,
+    },
+    /// Parse error sentinel — a top-level item that failed to parse.
+    /// The span is always `Span::new(file_id, 0, 0)`.
+    Error(Span),
+}
+
+impl<'input> Item<'input> {
+    /// The source span of the item.
+    pub fn span(&self) -> Span {
+        match self {
+            Item::FunctionDef { span, .. }
+            | Item::TypeDef { span, .. }
+            | Item::TraitDef { span, .. }
+            | Item::ImplBlock { span, .. }
+            | Item::Import { span, .. }
+            | Item::ExternFunction { span, .. }
+            | Item::Constraint { span, .. }
+            | Item::LayoutDef { span, .. }
+            | Item::ComptimeBlock { span, .. }
+            | Item::Generate { span, .. } => *span,
+            Item::Edition(_, span) => *span,
+            Item::Error(span) => *span,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum Stmt<'input> {
     VariableDef {
@@ -564,69 +758,23 @@ pub enum Stmt<'input> {
         value: Option<Expr<'input>>,
         else_branch: Option<&'input [Stmt<'input>]>,
         span: Span,
-        attributes: Vec<Attribute<'input>>,
-        doc: Option<String>,
+        attributes: &'input [Attribute<'input>],
+        doc: Option<&'input str>,
         /// Type/const captures: `set auto<T, N, L> = expr`.
         /// Bound at comptime after inferring `expr`'s type.
-        type_captures: Vec<TypeParam<'input>>,
+        type_captures: &'input [TypeParam<'input>],
         /// Type-level modifiers (`with overflow = saturate` etc.) on the
         /// annotated type — applied by the checker when the type is
         /// resolved.
-        type_modifiers: Vec<TypeModifier<'input>>,
+        type_modifiers: &'input [TypeModifier<'input>],
     },
-    FunctionDef {
-        span: Span,
-        attributes: Vec<Attribute<'input>>,
-        contracts: Vec<Contract<'input>>,
-        doc: Option<String>,
-        name: Symbol,
-        params: &'input [Param<'input>],
-        return_type: Option<Type<'input>>,
-        body: Option<&'input [Stmt<'input>]>,
-        type_params: Vec<TypeParam<'input>>,
-        where_clause: Option<WhereClause<'input>>,
-        finally: Option<&'input [Stmt<'input>]>,
-        is_comptime: bool,
-        is_async: bool,
-    },
-    TypeDef {
-        span: Span,
-        attributes: Vec<Attribute<'input>>,
-        doc: Option<String>,
-        name: Symbol,
-        params: Vec<TypeParam<'input>>,
-        definition: TypeDefinition<'input>,
-        contracts: Vec<Contract<'input>>,
-    },
-    TraitDef {
-        span: Span,
-        attributes: Vec<Attribute<'input>>,
-        doc: Option<String>,
-        name: Symbol,
-        methods: Vec<TraitMethod<'input>>,
-        associated_types: Vec<AssociatedType<'input>>,
-    },
-    Import {
-        path: Vec<Symbol>,
-        items: Option<Vec<Symbol>>,
-        alias: Option<Symbol>,
-        span: Span,
-    },
-    ExternFunction {
-        abi: String,
-        name: Symbol,
-        params: &'input [Param<'input>],
-        return_type: Type<'input>,
-        span: Span,
-        attributes: Vec<Attribute<'input>>,
-    },
-    Constraint {
-        name: Symbol,
-        params: Vec<TypeParam<'input>>,
-        predicates: smallvec::SmallVec<[WherePredicate<'input>; 2]>,
-        span: Span,
-    },
-    Edition(String, Span),
+    /// A block-level item (function, type, trait, impl, import, etc.).
+    ///
+    /// Items parsed inside a block are arena-allocated and wrapped here
+    /// so that `Stmt` stays a flat, cache-friendly enum with a single
+    /// pointer payload for items.  Top-level items appear in
+    /// [`Program::items`] instead of being wrapped.
+    Item(&'input Item<'input>),
     Expression(Expr<'input>),
     If {
         cond: Expr<'input>,
@@ -684,30 +832,13 @@ pub enum Stmt<'input> {
         value: Option<Expr<'input>>,
         /// Path labels attached to this return: `return @label1 @label2 expr`.
         /// Used to match specific return paths to `ensures @label` clauses.
-        labels: Vec<Symbol>,
+        labels: &'input [Symbol],
         span: Span,
     },
     Assign {
-        target: &'input Expr<'input>,
+        target: LValue<'input>,
         op: Option<BinOp>,
         value: Expr<'input>,
-        span: Span,
-    },
-    ComptimeBlock {
-        captures: &'input [(Symbol, Span)],
-        trusted: bool,
-        attributes: Vec<Attribute<'input>>,
-        body: &'input [Stmt<'input>],
-        span: Span,
-    },
-    /// A `generate` block: declarative, auditable code generation
-    /// attached to a type.  The block is expanded at compile time
-    /// to produce module-level declarations (impl, def, type, const).
-    /// See SYNTAX.md §1029.
-    Generate {
-        attributes: Vec<Attribute<'input>>,
-        for_type: &'input Type<'input>,
-        body: &'input [Stmt<'input>],
         span: Span,
     },
     ScopeCleanup {
@@ -731,30 +862,55 @@ pub enum Stmt<'input> {
         span: Span,
     },
     Isolate {
-        attributes: Vec<Attribute<'input>>,
+        attributes: &'input [Attribute<'input>],
         body: &'input [Stmt<'input>],
         span: Span,
     },
-    ImplBlock {
-        span: Span,
-        attributes: Vec<Attribute<'input>>,
-        /// The trait path (`Add<Int<32>>`), or `None` for inherent impls.
-        /// Stored as a `Type` so that generic arguments on the trait are
-        /// preserved in the AST (e.g. `impl Add<Int<32>> for Type`).
-        trait_path: Option<&'input Type<'input>>,
-        for_type: Type<'input>,
-        methods: &'input [ImplMethod<'input>],
-        associated_types: Vec<AssociatedType<'input>>,
-        where_clause: Option<WhereClause<'input>>,
-        type_params: Vec<TypeParam<'input>>,
-    },
-    /// A layout alias definition: `layout Name { packed, little_endian; }`
-    LayoutDef {
-        name: Symbol,
-        attributes: Vec<Attribute<'input>>,
-        span: Span,
-    },
     Error(Span),
+}
+
+/// An assignment TARGET — the subset of expressions that may appear on
+/// the left of `=`: identifiers, paths, field/index accesses, and `*deref`.
+/// The parser validates this when building the [`Stmt::Assign`] node, so
+/// downstream matching never re-checks "is this an lvalue" (the checker's
+/// `1 = 2` rejection happens at parse time, with the span in hand).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LValue<'input>(&'input Expr<'input>);
+
+impl<'input> LValue<'input> {
+    /// Validate `e` as an assignment target and wrap it.
+    /// `Err(span)` carries the expression's own span for the diagnostic.
+    pub fn try_from_expr(e: &'input Expr<'input>) -> Result<Self, Span> {
+        match e {
+            Expr::Ident(..)
+            | Expr::Path(..)
+            | Expr::FieldAccess { .. }
+            | Expr::Index { .. }
+            | Expr::AttrAccess { .. }
+            | Expr::UnaryOp {
+                op: UnaryOp::Deref, ..
+            } => Ok(LValue(e)),
+            _ => Err(e.span()),
+        }
+    }
+
+    /// The wrapped expression (for inference — the target IS an expression
+    /// once the lvalue invariant is established).
+    pub fn expr(&self) -> &'input Expr<'input> {
+        self.0
+    }
+
+    pub fn span(&self) -> Span {
+        self.0.span()
+    }
+}
+
+impl<'input> TryFrom<&'input Expr<'input>> for LValue<'input> {
+    type Error = Span;
+
+    fn try_from(e: &'input Expr<'input>) -> Result<Self, Span> {
+        LValue::try_from_expr(e)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -784,7 +940,7 @@ pub enum TypeParamKind<'input> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeParam<'input> {
     pub name: Symbol,
-    pub bounds: Vec<Type<'input>>,
+    pub bounds: &'input [Type<'input>],
     pub kind: TypeParamKind<'input>,
     pub span: Span,
 }
@@ -799,26 +955,29 @@ pub struct AnonConst<'input> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeDefinition<'input> {
-    Struct(Vec<StructField<'input>>, Vec<TypeModifier<'input>>),
+    Struct(
+        &'input [StructField<'input>],
+        &'input [TypeModifier<'input>],
+    ),
     Enum(
-        Vec<EnumVariant<'input>>,
+        &'input [EnumVariant<'input>],
         Option<String>,
-        Vec<TypeModifier<'input>>,
+        &'input [TypeModifier<'input>],
     ),
     TraitDef {
         methods: &'input [TraitMethod<'input>],
-        associated_types: Vec<AssociatedType<'input>>,
+        associated_types: &'input [AssociatedType<'input>],
     },
     ImplBlock {
-        trait_path: Option<Vec<Symbol>>,
+        trait_path: Option<&'input [Symbol]>,
         for_type: Type<'input>,
         methods: &'input [ImplMethod<'input>],
     },
-    Constraint(Vec<Type<'input>>),
-    Alias(Type<'input>, Vec<TypeModifier<'input>>),
+    Constraint(&'input [Type<'input>]),
+    Alias(Type<'input>, &'input [TypeModifier<'input>]),
     /// Type alias with `impl Trait` (TAIT) — opaque type.
     /// The `Type` is the trait bound (e.g. `Iterator<Item = u32>`).
-    Opaque(Type<'input>, Vec<TypeModifier<'input>>),
+    Opaque(Type<'input>, &'input [TypeModifier<'input>]),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -856,7 +1015,7 @@ pub enum BitOrder {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WherePredicate<'input> {
     pub ty: Type<'input>,
-    pub bounds: Vec<Type<'input>>,
+    pub bounds: &'input [Type<'input>],
     pub span: Span,
 }
 
@@ -872,10 +1031,10 @@ pub struct WhereEquality<'input> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WhereClause<'input> {
-    pub predicates: smallvec::SmallVec<[WherePredicate<'input>; 2]>,
+    pub predicates: &'input [WherePredicate<'input>],
     /// Equality constraints: `where T == Int<32>`.
     /// Params constrained here are exempt from the E104 generality check.
-    pub equalities: Vec<WhereEquality<'input>>,
+    pub equalities: &'input [WhereEquality<'input>],
     /// LIFETIME outlives constraints: `where 'a: 'b` (each entry is the
     /// left lifetime followed by the lifetimes it must outlive — rustc's
     /// `WherePredicateKind::RegionPredicate` `'a: 'b + 'c`).  Collected
@@ -883,7 +1042,7 @@ pub struct WhereClause<'input> {
     /// signature boundary (SYNTAX.md §Explicit Lifetime Parameters —
     /// "verified by the borrow checker; mismatches cause compile
     /// errors").
-    pub lifetime_outlives: Vec<(Symbol, Vec<Symbol>)>,
+    pub lifetime_outlives: &'input [(Symbol, &'input [Symbol])],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -920,7 +1079,7 @@ impl<'input> EnumVariant<'input> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-    pub struct TraitMethod<'input> {
+pub struct TraitMethod<'input> {
     pub name: Symbol,
     pub params: &'input [Param<'input>],
     pub return_type: Type<'input>,
@@ -940,7 +1099,7 @@ pub struct AssociatedType<'input> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-    pub struct ImplMethod<'input> {
+pub struct ImplMethod<'input> {
     pub name: Symbol,
     pub attributes: Vec<Attribute<'input>>,
     pub params: &'input [Param<'input>],
@@ -966,10 +1125,10 @@ impl<'input> GenericArg<'input> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Type<'input> {
-    Path(smallvec::SmallVec<[Symbol; 4]>, Span),
-    Generic(&'input Type<'input>, Vec<GenericArg<'input>>, Span),
+    Path(&'input [Symbol], Span),
+    Generic(&'input Type<'input>, &'input [GenericArg<'input>], Span),
     Reference {
         inner: &'input Type<'input>,
         mutable: bool,
@@ -979,9 +1138,9 @@ pub enum Type<'input> {
     Pointer(&'input Type<'input>, Span),
     Slice(&'input Type<'input>, Span),
     Array(&'input Type<'input>, &'input Expr<'input>, Span),
-    Tuple(Vec<Type<'input>>, Span),
+    Tuple(&'input [Type<'input>], Span),
     Function {
-        params: Vec<Type<'input>>,
+        params: &'input [Type<'input>],
         ret: &'input Type<'input>,
         span: Span,
     },
@@ -992,7 +1151,7 @@ pub enum Type<'input> {
         assoc_name: Symbol,
         span: Span,
     },
-    DynTrait(Vec<Type<'input>>, Span),
+    DynTrait(&'input [Type<'input>], Span),
     /// Higher-ranked type: `for<'a> T` (SYNTAX.md §Higher-Ranked Trait
     /// Bounds — "for<'a> introduces one or more lifetime parameters scoped
     /// over the subsequent trait bound").  The lifetime is universally
@@ -1018,37 +1177,37 @@ pub enum Type<'input> {
     },
     Literal(&'input Expr<'input>, Span),
     Never(Span),
-    Union(Vec<Type<'input>>, Span),
+    Union(&'input [Type<'input>], Span),
     /// A constant expression where a type is expected, e.g. array sizes
     /// `[Int<32>; N + 1]` or generic const args `<Array<Int, N>>`.
     Expr(&'input Expr<'input>, Span),
     /// A compile-time validated regular expression: `Regex<"pattern">`.
-    Regex(String, Span),
+    Regex(&'input str, Span),
     Error(Span),
 }
 
 /// A polymorphic type scheme: `forall T1, T2, ... . body`
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TypeScheme<'input> {
-    pub quantifiers: Vec<(Span, Symbol)>,
+    pub quantifiers: &'input [(Span, Symbol)],
     pub body: &'input Type<'input>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Pattern<'input> {
     Wildcard(Span),
     Ident(Symbol, Span),
     Literal(&'input Expr<'input>, Span),
     Tuple(&'input [Pattern<'input>], Span),
     Struct {
-        path: Vec<Symbol>,
+        path: &'input [Symbol],
         fields: &'input [(Symbol, Pattern<'input>)],
         rest: bool,
         span: Span,
     },
     Enum {
-        path: Vec<Symbol>,
+        path: &'input [Symbol],
         variant: Symbol,
         inner: Option<&'input Pattern<'input>>,
         span: Span,
@@ -1105,7 +1264,11 @@ pub enum Contract<'input> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program<'input, 'src> {
-    pub items: Vec<Stmt<'input>>,
+    /// Top-level items — the document's primary structure.  Each entry is
+    /// an `Item` (function, type, trait, impl, import, extern fn,
+    /// constraint, edition, layout, comptime block, or generate block),
+    /// NOT a `Stmt`.  Block-level items appear inside `Stmt::Item`.
+    pub items: Vec<Item<'input>>,
     pub span: Span,
     /// Doc/trivia side channel (never part of any query fingerprint).
     pub doc_map: DocMap<'src>,
@@ -1147,13 +1310,7 @@ impl<'input> Stmt<'input> {
     pub fn span(&self) -> Span {
         match self {
             Stmt::VariableDef { span, .. } => *span,
-            Stmt::FunctionDef { span, .. } => *span,
-            Stmt::TypeDef { span, .. } => *span,
-            Stmt::TraitDef { span, .. } => *span,
-            Stmt::Import { span, .. } => *span,
-            Stmt::ExternFunction { span, .. } => *span,
-            Stmt::Constraint { span, .. } => *span,
-            Stmt::Edition(_, span) => *span,
+            Stmt::Item(item) => item.span(),
             Stmt::Expression(expr) => expr.span(),
             Stmt::If { span, .. } => *span,
             Stmt::IfLet { span, .. } => *span,
@@ -1165,15 +1322,11 @@ impl<'input> Stmt<'input> {
             Stmt::Continue { span, .. } => *span,
             Stmt::Return { span, .. } => *span,
             Stmt::Assign { span, .. } => *span,
-            Stmt::ComptimeBlock { span, .. } => *span,
             Stmt::ScopeCleanup { span, .. } => *span,
             Stmt::Trigger { span, .. } => *span,
             Stmt::Unsafe { span, .. } => *span,
             Stmt::GhostVariableDef { span, .. } => *span,
             Stmt::Isolate { span, .. } => *span,
-            Stmt::ImplBlock { span, .. } => *span,
-            Stmt::LayoutDef { span, .. } => *span,
-            Stmt::Generate { span, .. } => *span,
             Stmt::Error(span) => *span,
         }
     }

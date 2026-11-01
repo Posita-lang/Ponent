@@ -175,3 +175,13 @@ impl Stylesheet {
         )
     }
 }
+
+/// The dark-theme CSS, computed once and reused for the process lifetime.
+///
+/// Both the HTML renderer's `begin` (once per batch) and the explain server
+/// (once per request) share this cache, so the `~40`-field `format!` inside
+/// [`Stylesheet::to_html_css`] runs only on the first call.
+pub fn dark_css_cached() -> &'static str {
+    static CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSS.get_or_init(|| Stylesheet::dark().to_html_css())
+}

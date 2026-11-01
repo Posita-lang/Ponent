@@ -1,10 +1,11 @@
 use crate::ast::Span;
 use crate::diagnostics::DiagMessage;
-use crate::diagnostics::i18n::DisplayArg;
 use crate::diagnostics::i18n::LiftCow;
 use crate::diagnostics::label::{AnnotationKind, Label};
-use crate::smallvec::{SmallVec, smallvec};
+use crate::smallvec::smallvec;
+use covariant_vec::CovariantVec;
 use std::borrow::Cow;
+use std::fmt::Write as _;
 
 /// Describes the context in which a type was expected.
 /// Inspired by Elm's `Expected` type which carries `Context` — knowing
@@ -73,7 +74,7 @@ impl std::fmt::Display for TypeCtx {
 ///     span: some_span,
 ///     found_span: some_other_span,
 /// })
-/// .with_code(ErrCode::new("E030"));
+/// .with_code_str(ErrCode::E030);
 /// ```
 pub enum DiagnosticKind<'src> {
     /// A value of one type was used where another type was expected.
@@ -168,14 +169,18 @@ impl ComptimeReason {
     /// through Fluent so it follows the active
     /// [`Lang`](super::i18n::Lang).
     pub fn as_str(&self) -> Cow<'static, str> {
-        match self {
-            ComptimeReason::ComptimeBlock => crate::tr!("comptime-reason-block"),
-            ComptimeReason::ComptimeFnDef => crate::tr!("comptime-reason-fndef"),
-            ComptimeReason::ComptimeFnCall => crate::tr!("comptime-reason-fncall"),
-            ComptimeReason::ComptimeTest => crate::tr!("comptime-reason-test"),
-            ComptimeReason::Assertion => crate::tr!("comptime-reason-assert"),
-            ComptimeReason::TypeInfo => crate::tr!("comptime-reason-typeinfo"),
-            ComptimeReason::LayoutOf => crate::tr!("comptime-reason-layoutof"),
+        crate::diagnostics::i18n::cached_label! {
+            n = 7,
+            variant = *self as usize,
+            init = [
+                crate::diagnostics::i18n::fluent::comptime_reason_block().into_owned(),
+                crate::diagnostics::i18n::fluent::comptime_reason_fndef().into_owned(),
+                crate::diagnostics::i18n::fluent::comptime_reason_fncall().into_owned(),
+                crate::diagnostics::i18n::fluent::comptime_reason_test().into_owned(),
+                crate::diagnostics::i18n::fluent::comptime_reason_assert().into_owned(),
+                crate::diagnostics::i18n::fluent::comptime_reason_typeinfo().into_owned(),
+                crate::diagnostics::i18n::fluent::comptime_reason_layoutof().into_owned(),
+            ],
         }
     }
 }
@@ -228,7 +233,14 @@ pub trait Humanizer<'src> {
     fn message(&self) -> DiagMessage<'src>;
 
     /// Produce labels (annotations) for source-context rendering.
-    fn labels(&self) -> Vec<Label<'src>>;
+    ///
+    /// Returns the same inline-capacity container [`Diagnostic::labels`]
+    /// stores, so `humanize` moves it straight in: a single-label kind —
+    /// the overwhelming majority — never touches the heap, and a two-label
+    /// kind skips the intermediate `Vec` allocation the old `Vec` return
+    /// forced.  (The inline capacity stays 1: widening it to 2 grows every
+    /// `Diagnostic` past its 384-byte size guard.)
+    fn labels(&self) -> CovariantVec<'src, Label<'src>, 1>;
 
     /// Optional help text.
     fn help(&self) -> Option<Cow<'src, str>> {
@@ -251,17 +263,22 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
                 context,
                 ..
             } => {
-                // Fluent slug for the base sentence (word order lives in
-                // locales/*.ftl; the en entry is verbatim the old
-                // format! template).  The context/reason suffixes are
-                // NOT part of the .ftl pattern, and Fluent silently
-                // drops arguments its template never mentions — so a
-                // suffixed message composes the owned form to stay
-                // byte-identical with the old output.
+                // Base sentence goes through the `type-mismatch` Fluent slug
+                // (word order lives in locales/*.ftl), so it follows the
+                // active language.  The context/reason suffixes are
+                // structural ASCII (parentheses, em dash) wrapping content
+                // that is itself English (TypeCtx::Display, free-form
+                // reason), so they are appended verbatim — localizing the
+                // punctuation alone would mix scripts mid-sentence.
                 let has_suffix =
                     reason.is_some() || context.is_some_and(|c| !matches!(c, TypeCtx::Unspecified));
                 if has_suffix {
-                    let mut msg = format!("type mismatch: expected `{expected}`, found `{found}`");
+                    let mut msg = String::new();
+                    crate::diagnostics::i18n::render_into(
+                        "type-mismatch",
+                        &[("expected", expected.clone()), ("found", found.clone())],
+                        &mut msg,
+                    );
                     if let Some(ctx) = context
                         && !matches!(ctx, TypeCtx::Unspecified)
                     {
@@ -359,29 +376,28 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
                 if traceback.is_empty() {
                     msg
                 } else {
-                    let tb_lines: Vec<String> = traceback
-                        .iter()
-                        .map(|(reason, span)| {
-                            let reason_str = reason.as_str();
-                            match span {
-                                Some(span) => {
-                                    format!("  · {reason_str} at offset {}", span.start)
-                                }
-                                None => format!("  · {reason_str}"),
+                    let mut s = String::with_capacity(64 + traceback.len() * 32);
+                    msg.render_into(&mut s);
+                    s.push_str("\n\ncomptime call stack (most recent first):\n");
+                    for (i, (reason, span)) in traceback.iter().enumerate() {
+                        if i > 0 {
+                            s.push('\n');
+                        }
+                        let reason_str = reason.as_str();
+                        match span {
+                            Some(span) => {
+                                write!(s, "  · {reason_str} at offset {}", span.start).ok()
                             }
-                        })
-                        .collect();
-                    format!(
-                        "{msg}\n\ncomptime call stack (most recent first):\n{}",
-                        tb_lines.join("\n")
-                    )
-                    .into()
+                            None => write!(s, "  · {reason_str}").ok(),
+                        };
+                    }
+                    s.into()
                 }
             }
         }
     }
 
-    fn labels(&self) -> Vec<Label<'src>> {
+    fn labels(&self) -> CovariantVec<'src, Label<'src>, 1> {
         match self {
             DiagnosticKind::TypeMismatch {
                 span,
@@ -390,20 +406,29 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
                 found,
                 ..
             } => {
-                let mut labels = vec![Label::new(
+                let mut labels = CovariantVec::new();
+                // Pass the `Cow` straight through: the generated wrapper is
+                // lifetime-parametric, so a borrowed type name stays borrowed
+                // instead of being formatted into a fresh `String`.
+                labels.push(Label::new(
                     *span,
-                    crate::tr!("label-expected", expected = DisplayArg(expected)).lift(),
-                )];
+                    crate::diagnostics::i18n::fluent::label_expected(expected.clone()).lift(),
+                ));
                 if let Some(fs) = found_span {
-                    labels.push(Label::secondary(*fs, format!("{found}")));
+                    // `found` is already a `Cow`: a borrowed type name
+                    // clones as a pointer copy with no `format!` buffer.
+                    // (An owned one still copies, exactly as before.)
+                    labels.push(Label::secondary(*fs, found.clone()));
                 }
                 labels
             }
             DiagnosticKind::NoSuchField { span, .. } => {
-                vec![Label::new(
+                let mut labels = CovariantVec::new();
+                labels.push(Label::new(
                     *span,
-                    crate::tr!("label-field-not-found").lift(),
-                )]
+                    crate::diagnostics::i18n::fluent::label_field_not_found().lift(),
+                ));
+                labels
             }
             DiagnosticKind::ArgumentTypeMismatch {
                 span,
@@ -412,75 +437,80 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
                 found,
                 ..
             } => {
-                let mut labels = vec![Label::new(
+                let mut labels = CovariantVec::new();
+                labels.push(Label::new(
                     *span,
-                    crate::tr!(
-                        "label-expected-found",
-                        expected = DisplayArg(expected),
-                        found = DisplayArg(found)
+                    crate::diagnostics::i18n::fluent::label_expected_found(
+                        expected.clone(),
+                        found.clone(),
                     )
                     .lift(),
-                )];
+                ));
                 if let Some(ps) = param_span {
                     labels.push(Label::secondary(
                         *ps,
-                        crate::tr!("label-declared-here", expected = DisplayArg(expected))
+                        crate::diagnostics::i18n::fluent::label_declared_here(expected.clone())
                             .lift(),
                     ));
                 }
                 labels
             }
             DiagnosticKind::NameNotFound { span, .. } => {
-                vec![Label::new(
+                let mut labels = CovariantVec::new();
+                labels.push(Label::new(
                     *span,
-                    crate::tr!("label-not-in-scope").lift(),
-                )]
+                    crate::diagnostics::i18n::fluent::label_not_in_scope().lift(),
+                ));
+                labels
             }
             DiagnosticKind::DuplicateDefinition {
                 this_span,
                 original_span,
                 ..
             } => {
-                vec![
-                    Label::new(
-                        *this_span,
-                        crate::tr!("label-duplicate-definition").lift(),
-                    ),
-                    Label::secondary(
-                        *original_span,
-                        crate::tr!("label-first-defined-here").lift(),
-                    ),
-                ]
+                let mut labels = CovariantVec::new();
+                labels.push(Label::new(
+                    *this_span,
+                    crate::diagnostics::i18n::fluent::label_duplicate_definition().lift(),
+                ));
+                labels.push(Label::secondary(
+                    *original_span,
+                    crate::diagnostics::i18n::fluent::label_first_defined_here().lift(),
+                ));
+                labels
             }
             DiagnosticKind::ContractNonBool { span, .. } => {
-                vec![Label::new(
+                let mut labels = CovariantVec::new();
+                labels.push(Label::new(
                     *span,
-                    crate::tr!("label-expected-bool").lift(),
-                )]
+                    crate::diagnostics::i18n::fluent::label_expected_bool().lift(),
+                ));
+                labels
             }
             DiagnosticKind::ImplMissingMethod {
                 impl_span,
                 trait_span,
                 ..
             } => {
-                vec![
-                    Label::new(
-                        *impl_span,
-                        crate::tr!("label-method-missing").lift(),
-                    ),
-                    Label::secondary(
-                        *trait_span,
-                        crate::tr!("label-required-by-trait").lift(),
-                    ),
-                ]
+                let mut labels = CovariantVec::new();
+                labels.push(Label::new(
+                    *impl_span,
+                    crate::diagnostics::i18n::fluent::label_method_missing().lift(),
+                ));
+                labels.push(Label::secondary(
+                    *trait_span,
+                    crate::diagnostics::i18n::fluent::label_required_by_trait().lift(),
+                ));
+                labels
             }
             DiagnosticKind::Comptime {
                 span, traceback, ..
             } => {
-                let mut labels = vec![Label::new(
+                let mut labels = CovariantVec::new();
+                labels.push(Label::new(
                     *span,
-                    crate::tr!("label-comptime-eval-error").lift(),
-                )];
+                    crate::diagnostics::i18n::fluent::label_comptime_eval_error().lift(),
+                ));
                 // Surface each positioned traceback frame as a secondary
                 // annotation so the comptime call stack is visible in the
                 // source area, not just in the message text.  `None`
@@ -503,18 +533,15 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
     fn help(&self) -> Option<Cow<'src, str>> {
         match self {
             DiagnosticKind::TypeMismatch { .. } => {
-                Some(crate::tr!("help-cast-or-change").lift())
+                Some(crate::diagnostics::i18n::fluent::help_cast_or_change().lift())
             }
             DiagnosticKind::NameNotFound { suggestions, .. } => {
                 if suggestions.is_empty() {
                     None
                 } else {
                     Some(
-                        crate::tr!(
-                            "did-you-mean",
-                            candidates = DisplayArg(suggestions.join("` or `"))
-                        )
-                        .lift(),
+                        crate::diagnostics::i18n::fluent::did_you_mean(suggestions.join("` or `"))
+                            .lift(),
                     )
                 }
             }
@@ -524,5 +551,257 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
 
     fn suggestions(&self) -> Vec<Cow<'src, str>> {
         vec![]
+    }
+}
+
+impl<'src> DiagnosticKind<'src> {
+    /// Consume the kind, producing `(message, labels, help, suggestions)`
+    /// in one pass.  Shared fields (e.g. `TypeMismatch.expected`, used by
+    /// both the message pairs and a label) move into one output and clone
+    /// into the other — one clone instead of the two (`message` + `labels`
+    /// each cloning under `&self`) that the separate `Humanizer` methods
+    /// paid.  Paired with `DiagMessage::render_into_owned`, the Fluent
+    /// argument map receives the pairs by move too, so a `Cow::Owned` pair
+    /// skips its `String::clone` entirely.
+    pub(crate) fn humanize_into(
+        self,
+    ) -> (
+        DiagMessage<'src>,
+        CovariantVec<'src, Label<'src>, 1>,
+        Option<Cow<'src, str>>,
+        Vec<Cow<'src, str>>,
+    ) {
+        use crate::diagnostics::i18n::LiftCow;
+        use crate::diagnostics::i18n::fluent;
+        match self {
+            DiagnosticKind::TypeMismatch {
+                expected,
+                found,
+                span,
+                found_span,
+                reason,
+                context,
+            } => {
+                let has_suffix =
+                    reason.is_some() || context.is_some_and(|c| !matches!(c, TypeCtx::Unspecified));
+                let message = if has_suffix {
+                    let mut msg = String::new();
+                    crate::diagnostics::i18n::render_into(
+                        "type-mismatch",
+                        &[("expected", expected.clone()), ("found", found.clone())],
+                        &mut msg,
+                    );
+                    if let Some(ctx) = context
+                        && !matches!(ctx, TypeCtx::Unspecified)
+                    {
+                        use std::fmt::Write;
+                        let _ = write!(msg, " ({ctx})");
+                    }
+                    if let Some(r) = reason {
+                        use std::fmt::Write;
+                        let _ = write!(msg, " — {r}");
+                    }
+                    msg.into()
+                } else {
+                    DiagMessage::Slug {
+                        slug: "type-mismatch",
+                        pairs: smallvec![("expected", expected.clone()), ("found", found.clone()),],
+                    }
+                };
+                let mut labels = CovariantVec::new();
+                labels.push(Label::new(span, fluent::label_expected(expected).lift()));
+                if let Some(fs) = found_span {
+                    labels.push(Label::secondary(fs, found));
+                }
+                (
+                    message,
+                    labels,
+                    Some(fluent::help_cast_or_change().lift()),
+                    vec![],
+                )
+            }
+            DiagnosticKind::NoSuchField {
+                field_name,
+                type_name,
+                span,
+            } => {
+                let message: DiagMessage =
+                    format!("no field `{field_name}` on type `{type_name}`").into();
+                let mut labels = CovariantVec::new();
+                labels.push(Label::new(span, fluent::label_field_not_found().lift()));
+                (message, labels, None, vec![])
+            }
+            DiagnosticKind::ArgumentTypeMismatch {
+                callee,
+                param_name,
+                expected,
+                found,
+                span,
+                param_span,
+            } => {
+                let message = DiagMessage::Slug {
+                    slug: "argument-type-mismatch",
+                    pairs: smallvec![
+                        ("callee", callee),
+                        ("param", param_name),
+                        ("expected", expected.clone()),
+                        ("found", found.clone()),
+                    ],
+                };
+                let mut labels = CovariantVec::new();
+                labels.push(Label::new(
+                    span,
+                    fluent::label_expected_found(expected.clone(), found).lift(),
+                ));
+                if let Some(ps) = param_span {
+                    labels.push(Label::secondary(
+                        ps,
+                        fluent::label_declared_here(expected).lift(),
+                    ));
+                }
+                (message, labels, None, vec![])
+            }
+            DiagnosticKind::NameNotFound {
+                name,
+                span,
+                suggestions,
+            } => {
+                let message: DiagMessage = format!("name not found: `{name}`").into();
+                let mut labels = CovariantVec::new();
+                labels.push(Label::new(span, fluent::label_not_in_scope().lift()));
+                let help = if suggestions.is_empty() {
+                    None
+                } else {
+                    Some(fluent::did_you_mean(suggestions.join("` or `")).lift())
+                };
+                (message, labels, help, vec![])
+            }
+            DiagnosticKind::DuplicateDefinition {
+                name,
+                this_span,
+                original_span,
+            } => {
+                let message = DiagMessage::Slug {
+                    slug: "duplicate-definition",
+                    pairs: smallvec![("name", name)],
+                };
+                let mut labels = CovariantVec::new();
+                labels.push(Label::new(
+                    this_span,
+                    fluent::label_duplicate_definition().lift(),
+                ));
+                labels.push(Label::secondary(
+                    original_span,
+                    fluent::label_first_defined_here().lift(),
+                ));
+                (message, labels, None, vec![])
+            }
+            DiagnosticKind::ContractNonBool {
+                clause,
+                found,
+                span,
+            } => {
+                let message = DiagMessage::Slug {
+                    slug: "contract-non-bool",
+                    pairs: smallvec![("clause", clause), ("found", found)],
+                };
+                let mut labels = CovariantVec::new();
+                labels.push(Label::new(span, fluent::label_expected_bool().lift()));
+                (message, labels, None, vec![])
+            }
+            DiagnosticKind::ImplMissingMethod {
+                trait_name,
+                method_name,
+                impl_span,
+                trait_span,
+            } => {
+                let message = DiagMessage::Slug {
+                    slug: "impl-missing-method",
+                    pairs: smallvec![("trait", trait_name), ("method", method_name)],
+                };
+                let mut labels = CovariantVec::new();
+                labels.push(Label::new(impl_span, fluent::label_method_missing().lift()));
+                labels.push(Label::secondary(
+                    trait_span,
+                    fluent::label_required_by_trait().lift(),
+                ));
+                (message, labels, None, vec![])
+            }
+            DiagnosticKind::Comptime {
+                kind,
+                span,
+                traceback,
+            } => {
+                let message: DiagMessage = {
+                    let msg = match kind {
+                        ComptimeErrorKind::StepLimitExceeded => DiagMessage::static_str(
+                            "comptime step limit exceeded (possible infinite loop)",
+                        ),
+                        ComptimeErrorKind::DivisionByZero => {
+                            DiagMessage::static_str("division by zero in comptime expression")
+                        }
+                        ComptimeErrorKind::Overflow => {
+                            DiagMessage::static_str("integer overflow in comptime expression")
+                        }
+                        ComptimeErrorKind::TypeError(s) => {
+                            format!("comptime type error: {s}").into()
+                        }
+                        ComptimeErrorKind::AssertionFailed(s) => {
+                            format!("comptime assertion failed: {s}").into()
+                        }
+                        ComptimeErrorKind::UnknownIdentifier(s) => {
+                            format!("unknown identifier in comptime: {s}").into()
+                        }
+                        ComptimeErrorKind::NotComptimeAllowed(s) => {
+                            format!("not allowed in comptime: {s}").into()
+                        }
+                        ComptimeErrorKind::Deferred => DiagMessage::static_str(
+                            "expression cannot be evaluated at compile time",
+                        ),
+                        ComptimeErrorKind::SandboxViolation(s) => {
+                            format!("comptime sandbox violation: {s}").into()
+                        }
+                        ComptimeErrorKind::MemoryLimitExceeded(s) => {
+                            format!("comptime memory limit exceeded: {s}").into()
+                        }
+                        ComptimeErrorKind::Internal(s) => {
+                            format!("internal comptime error: {s}").into()
+                        }
+                    };
+                    if traceback.is_empty() {
+                        msg
+                    } else {
+                        let mut s = String::with_capacity(64 + traceback.len() * 32);
+                        msg.render_into(&mut s);
+                        s.push_str("\n\ncomptime call stack (most recent first):\n");
+                        for (i, (reason, sp)) in traceback.iter().enumerate() {
+                            if i > 0 {
+                                s.push('\n');
+                            }
+                            let reason_str = reason.as_str();
+                            match sp {
+                                Some(sp) => {
+                                    write!(s, "  · {reason_str} at offset {}", sp.start).ok()
+                                }
+                                None => write!(s, "  · {reason_str}").ok(),
+                            };
+                        }
+                        s.into()
+                    }
+                };
+                let mut labels = CovariantVec::new();
+                labels.push(Label::new(span, fluent::label_comptime_eval_error().lift()));
+                for (reason, tb_span) in &traceback {
+                    let Some(tb) = tb_span else {
+                        continue;
+                    };
+                    if *tb == span {
+                        continue;
+                    }
+                    labels.push(Label::secondary(*tb, reason.as_str().lift()));
+                }
+                (message, labels, None, vec![])
+            }
+        }
     }
 }

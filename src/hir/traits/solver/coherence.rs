@@ -102,11 +102,11 @@ fn freshen_generics_bound<'input>(
             let new_elem = freshen_generics_bound(elem, ctx, map, bound);
             ctx.slice(new_elem)
         }
-        TypeData::Pointer { ty } => {
+        TypeData::Pointer { ty, .. } => {
             let new_ty = freshen_generics_bound(ty, ctx, map, bound);
             ctx.pointer(new_ty)
         }
-        TypeData::Ptr { size, pointee } => {
+        TypeData::Ptr { size, pointee, .. } => {
             let new_size = freshen_generics_bound(size, ctx, map, bound);
             let new_pointee = freshen_generics_bound(pointee, ctx, map, bound);
             ctx.ptr(new_size, new_pointee)
@@ -338,8 +338,8 @@ fn generic_params_untouched_all<'input>(
             }
             TypeData::Array { elem, .. } => gp_untouched(*elem, ctx),
             TypeData::Slice { elem } => gp_untouched(*elem, ctx),
-            TypeData::Pointer { ty } => gp_untouched(*ty, ctx),
-            TypeData::Ptr { size, pointee } => {
+            TypeData::Pointer { ty, .. } => gp_untouched(*ty, ctx),
+            TypeData::Ptr { size, pointee, .. } => {
                 gp_untouched(*size, ctx) && gp_untouched(*pointee, ctx)
             }
             TypeData::AssociatedType { self_ty, .. } => gp_untouched(*self_ty, ctx),
@@ -629,7 +629,7 @@ fn contains_generic_param<'input>(data: &TypeData, ctx: &TypeContext<'input>) ->
             params.iter().any(|p| contains_generic_param_by_id(*p, ctx))
                 || contains_generic_param_by_id(*ret, ctx)
         }
-        TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+        TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
             contains_generic_param_by_id(*ty, ctx)
         }
         TypeData::Ptr { pointee, .. } => contains_generic_param_by_id(*pointee, ctx),

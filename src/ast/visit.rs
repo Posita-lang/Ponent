@@ -39,6 +39,12 @@ pub trait Visitor<'ast, 'input>: Sized {
     fn visit_stmt(&mut self, stmt: &'ast Stmt<'input>) -> Self::Result {
         walk_stmt(self, stmt)
     }
+    /// Visit an `Item` (top-level or block-level).  The default delegates
+    /// to `walk_item`; visitors that only care about statements can
+    /// override `visit_stmt` and leave `visit_item` at the default.
+    fn visit_item(&mut self, item: &'ast Item<'input>) -> Self::Result {
+        walk_item(self, item)
+    }
     fn visit_ty(&mut self, ty: &'ast Type<'input>) -> Self::Result {
         walk_ty(self, ty)
     }
@@ -283,12 +289,12 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
                     visitor.visit_stmt(s);
                 }
             }
-            for attr in attributes {
+            for attr in attributes.iter() {
                 visitor.visit_attribute(attr);
             }
-            for tp in type_captures {
+            for tp in type_captures.iter() {
                 visitor.visit_ident(tp.name, &tp.span);
-                for b in &tp.bounds {
+                for b in tp.bounds {
                     visitor.visit_ty(b);
                 }
                 match tp.kind {
@@ -301,7 +307,7 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
                     TypeParamKind::Type | TypeParamKind::Lifetime => {}
                 }
             }
-            for m in type_modifiers {
+            for m in type_modifiers.iter() {
                 match m {
                     TypeModifier::Default(e) | TypeModifier::Validate(e) => {
                         visitor.visit_expr(e);
@@ -311,71 +317,7 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
             }
             V::Result::output()
         }
-        Stmt::FunctionDef {
-            span,
-            attributes,
-            contracts,
-            name,
-            params,
-            return_type,
-            body,
-            type_params,
-            where_clause,
-            finally,
-            ..
-        } => {
-            visitor.visit_ident(*name, span);
-            for attr in attributes {
-                visitor.visit_attribute(attr);
-            }
-            for c in contracts {
-                visitor.visit_contract(c);
-            }
-            for p in *params {
-                visitor.visit_param(p);
-            }
-            if let Some(rt) = return_type {
-                visitor.visit_ty(rt);
-            }
-            if let Some(b) = body {
-                for s in *b {
-                    visitor.visit_stmt(s);
-                }
-            }
-            if let Some(f) = finally {
-                for s in *f {
-                    visitor.visit_stmt(s);
-                }
-            }
-            for tp in type_params {
-                visitor.visit_ident(tp.name, &tp.span);
-                for b in &tp.bounds {
-                    visitor.visit_ty(b);
-                }
-                match tp.kind {
-                    TypeParamKind::Const { ref ty, default } => {
-                        visitor.visit_ty(&ty);
-                        if let Some(d) = default {
-                            visitor.visit_expr(d);
-                        }
-                    }
-                    TypeParamKind::Type | TypeParamKind::Lifetime => {}
-                }
-            }
-            if let Some(wc) = where_clause {
-                for p in &wc.predicates {
-                    visitor.visit_ty(&p.ty);
-                    for b in &p.bounds {
-                        visitor.visit_ty(b);
-                    }
-                }
-                for eq in &wc.equalities {
-                    visitor.visit_ty(&eq.left);
-                    visitor.visit_ty(&eq.right);
-                }
-            }
-            V::Result::output()
-        }
+        Stmt::Item(item) => visitor.visit_item(item),
         Stmt::Expression(expr) => visitor.visit_expr(expr),
         Stmt::If {
             cond,
@@ -488,32 +430,13 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
             }
         }
         Stmt::Assign { target, value, .. } => {
-            visitor.visit_expr(target);
+            visitor.visit_expr(target.expr());
             visitor.visit_expr(value)
         }
-        Stmt::ComptimeBlock {
-            captures,
-            attributes,
-            body,
-            ..
-        } => {
-            for attr in attributes {
-                visitor.visit_attribute(attr);
-            }
-            for (sym, span) in *captures {
-                visitor.visit_ident(*sym, span);
-            }
-            for s in *body {
-                visitor.visit_stmt(s);
-            }
-            V::Result::output()
-        }
         Stmt::Isolate {
-            attributes,
-            body,
-            ..
+            attributes, body, ..
         } => {
-            for attr in attributes {
+            for attr in attributes.iter() {
                 visitor.visit_attribute(attr);
             }
             for s in *body {
@@ -544,35 +467,87 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
             V::Result::output()
         }
         Stmt::GhostVariableDef { inner, .. } => visitor.visit_stmt(inner),
-        Stmt::Leave { .. }
-        | Stmt::Continue { .. }
-        | Stmt::Trigger { .. }
-        | Stmt::Edition(..)
-        | Stmt::Import { .. } => V::Result::output(),
-        Stmt::Generate {
+        Stmt::Leave { .. } | Stmt::Continue { .. } | Stmt::Trigger { .. } => V::Result::output(),
+        Stmt::Error(_) => V::Result::output(),
+    }
+}
+
+/// Walk an `Item` — the top-level / block-level declaration walker.
+///
+/// This is the single entry point for visiting items.  `walk_stmt`
+/// delegates to the visitor's `visit_item` method (which defaults to
+/// this function), so statement-level consumers need no changes.
+pub fn walk_item<'ast, 'input, V: Visitor<'ast, 'input>>(
+    visitor: &mut V,
+    item: &'ast Item<'input>,
+) -> V::Result {
+    match item {
+        Item::FunctionDef {
+            span,
             attributes,
-            for_type,
+            contracts,
+            name,
+            params,
+            return_type,
             body,
+            type_params,
+            where_clause,
+            finally,
             ..
         } => {
-            for attr in attributes {
-                visitor.visit_attribute(attr);
-            }
-            visitor.visit_ty(for_type);
-            for s in *body {
-                visitor.visit_stmt(s);
-            }
-            V::Result::output()
-        }
-        Stmt::LayoutDef { name, span, attributes } => {
             visitor.visit_ident(*name, span);
-            for attr in attributes {
+            for attr in attributes.iter() {
                 visitor.visit_attribute(attr);
+            }
+            for c in contracts.iter() {
+                visitor.visit_contract(c);
+            }
+            for p in *params {
+                visitor.visit_param(p);
+            }
+            if let Some(rt) = return_type {
+                visitor.visit_ty(rt);
+            }
+            if let Some(b) = body {
+                for s in *b {
+                    visitor.visit_stmt(s);
+                }
+            }
+            if let Some(f) = finally {
+                for s in *f {
+                    visitor.visit_stmt(s);
+                }
+            }
+            for tp in type_params.iter() {
+                visitor.visit_ident(tp.name, &tp.span);
+                for b in tp.bounds {
+                    visitor.visit_ty(b);
+                }
+                match tp.kind {
+                    TypeParamKind::Const { ref ty, default } => {
+                        visitor.visit_ty(&ty);
+                        if let Some(d) = default {
+                            visitor.visit_expr(d);
+                        }
+                    }
+                    TypeParamKind::Type | TypeParamKind::Lifetime => {}
+                }
+            }
+            if let Some(wc) = where_clause {
+                for p in wc.predicates {
+                    visitor.visit_ty(&p.ty);
+                    for b in p.bounds {
+                        visitor.visit_ty(b);
+                    }
+                }
+                for eq in wc.equalities {
+                    visitor.visit_ty(&eq.left);
+                    visitor.visit_ty(&eq.right);
+                }
             }
             V::Result::output()
         }
-        Stmt::Error(_) => V::Result::output(),
-        Stmt::TypeDef {
+        Item::TypeDef {
             name,
             params,
             definition,
@@ -582,12 +557,12 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
             ..
         } => {
             visitor.visit_ident(*name, span);
-            for attr in attributes {
+            for attr in attributes.iter() {
                 visitor.visit_attribute(attr);
             }
-            for tp in params {
+            for tp in params.iter() {
                 visitor.visit_ident(tp.name, &tp.span);
-                for b in &tp.bounds {
+                for b in tp.bounds {
                     visitor.visit_ty(b);
                 }
                 match tp.kind {
@@ -601,12 +576,12 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
                 }
             }
             walk_ty_definition(visitor, definition);
-            for c in contracts {
+            for c in contracts.iter() {
                 visitor.visit_contract(c);
             }
             V::Result::output()
         }
-        Stmt::TraitDef {
+        Item::TraitDef {
             name,
             methods,
             associated_types,
@@ -615,17 +590,17 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
             ..
         } => {
             visitor.visit_ident(*name, span);
-            for attr in attributes {
+            for attr in attributes.iter() {
                 visitor.visit_attribute(attr);
             }
-            for m in methods {
+            for m in methods.iter() {
                 visitor.visit_ident(m.name, &m.span);
                 for p in m.params {
                     visitor.visit_param(p);
                 }
                 visitor.visit_ty(&m.return_type);
             }
-            for at in associated_types {
+            for at in associated_types.iter() {
                 visitor.visit_ident(at.name, &at.span);
                 if let Some(d) = &at.default {
                     visitor.visit_ty(d);
@@ -633,7 +608,7 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
             }
             V::Result::output()
         }
-        Stmt::ImplBlock {
+        Item::ImplBlock {
             span,
             attributes,
             trait_path,
@@ -643,7 +618,7 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
             where_clause,
             type_params,
         } => {
-            for attr in attributes {
+            for attr in attributes.iter() {
                 visitor.visit_attribute(attr);
             }
             if let Some(t) = trait_path {
@@ -665,15 +640,15 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
                     }
                 }
             }
-            for at in associated_types {
+            for at in associated_types.iter() {
                 visitor.visit_ident(at.name, &at.span);
                 if let Some(d) = &at.default {
                     visitor.visit_ty(d);
                 }
             }
-            for tp in type_params {
+            for tp in type_params.iter() {
                 visitor.visit_ident(tp.name, &tp.span);
-                for b in &tp.bounds {
+                for b in tp.bounds {
                     visitor.visit_ty(b);
                 }
                 match tp.kind {
@@ -687,20 +662,21 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
                 }
             }
             if let Some(wc) = where_clause {
-                for p in &wc.predicates {
+                for p in wc.predicates {
                     visitor.visit_ty(&p.ty);
-                    for b in &p.bounds {
+                    for b in p.bounds {
                         visitor.visit_ty(b);
                     }
                 }
-                for eq in &wc.equalities {
+                for eq in wc.equalities {
                     visitor.visit_ty(&eq.left);
                     visitor.visit_ty(&eq.right);
                 }
             }
             V::Result::output()
         }
-        Stmt::ExternFunction {
+        Item::Import { .. } => V::Result::output(),
+        Item::ExternFunction {
             name,
             params,
             return_type,
@@ -709,7 +685,7 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
             ..
         } => {
             visitor.visit_ident(*name, span);
-            for attr in attributes {
+            for attr in attributes.iter() {
                 visitor.visit_attribute(attr);
             }
             for p in *params {
@@ -717,16 +693,16 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
             }
             visitor.visit_ty(return_type)
         }
-        Stmt::Constraint {
+        Item::Constraint {
             name,
             params,
             predicates,
             span,
         } => {
             visitor.visit_ident(*name, span);
-            for tp in params {
+            for tp in params.iter() {
                 visitor.visit_ident(tp.name, &tp.span);
-                for b in &tp.bounds {
+                for b in tp.bounds {
                     visitor.visit_ty(b);
                 }
                 match tp.kind {
@@ -739,14 +715,59 @@ pub fn walk_stmt<'ast, 'input, V: Visitor<'ast, 'input>>(
                     TypeParamKind::Type | TypeParamKind::Lifetime => {}
                 }
             }
-            for p in predicates {
+            for p in predicates.iter() {
                 visitor.visit_ty(&p.ty);
-                for b in &p.bounds {
+                for b in p.bounds {
                     visitor.visit_ty(b);
                 }
             }
             V::Result::output()
         }
+        Item::Edition(..) => V::Result::output(),
+        Item::LayoutDef {
+            name,
+            span,
+            attributes,
+        } => {
+            visitor.visit_ident(*name, span);
+            for attr in attributes.iter() {
+                visitor.visit_attribute(attr);
+            }
+            V::Result::output()
+        }
+        Item::ComptimeBlock {
+            captures,
+            attributes,
+            body,
+            ..
+        } => {
+            for attr in attributes.iter() {
+                visitor.visit_attribute(attr);
+            }
+            for (sym, span) in *captures {
+                visitor.visit_ident(*sym, span);
+            }
+            for s in *body {
+                visitor.visit_stmt(s);
+            }
+            V::Result::output()
+        }
+        Item::Generate {
+            attributes,
+            for_type,
+            body,
+            ..
+        } => {
+            for attr in attributes.iter() {
+                visitor.visit_attribute(attr);
+            }
+            visitor.visit_ty(for_type);
+            for s in *body {
+                visitor.visit_stmt(s);
+            }
+            V::Result::output()
+        }
+        Item::Error(_) => V::Result::output(),
     }
 }
 
@@ -755,13 +776,12 @@ pub fn walk_ty<'ast, 'input, V: Visitor<'ast, 'input>>(
     ty: &'ast Type<'input>,
 ) -> V::Result {
     match ty {
-        Type::Path(_, _)
-        | Type::Never(_)
-        | Type::Regex(_, _)
-        | Type::Error(_) => V::Result::output(),
+        Type::Path(_, _) | Type::Never(_) | Type::Regex(_, _) | Type::Error(_) => {
+            V::Result::output()
+        }
         Type::Generic(base, args, _) => {
             visitor.visit_ty(base);
-            for arg in args {
+            for arg in args.iter() {
                 match arg {
                     GenericArg::Positional(t) | GenericArg::Named(_, t) => {
                         visitor.visit_ty(t);
@@ -773,21 +793,21 @@ pub fn walk_ty<'ast, 'input, V: Visitor<'ast, 'input>>(
             }
             V::Result::output()
         }
-        Type::Reference { inner, .. }
-        | Type::Pointer(inner, _)
-        | Type::Slice(inner, _) => visitor.visit_ty(inner),
+        Type::Reference { inner, .. } | Type::Pointer(inner, _) | Type::Slice(inner, _) => {
+            visitor.visit_ty(inner)
+        }
         Type::Array(elem, size, _) => {
             visitor.visit_ty(elem);
             visitor.visit_expr(size)
         }
         Type::Tuple(ts, _) | Type::Union(ts, _) | Type::DynTrait(ts, _) => {
-            for t in ts {
+            for t in ts.iter() {
                 visitor.visit_ty(t);
             }
             V::Result::output()
         }
         Type::Function { params, ret, .. } => {
-            for p in params {
+            for p in params.iter() {
                 visitor.visit_ty(p);
             }
             visitor.visit_ty(ret)
@@ -801,7 +821,12 @@ pub fn walk_ty<'ast, 'input, V: Visitor<'ast, 'input>>(
             visitor.visit_ty(trait_path)
         }
         Type::Forall { body, .. } => visitor.visit_ty(body),
-        Type::Exists { base, invariant, .. } | Type::WhereShorthand { base, invariant, .. } => {
+        Type::Exists {
+            base, invariant, ..
+        }
+        | Type::WhereShorthand {
+            base, invariant, ..
+        } => {
             visitor.visit_ty(base);
             visitor.visit_expr(invariant)
         }
@@ -818,20 +843,20 @@ pub fn walk_ty_definition<'ast, 'input, V: Visitor<'ast, 'input>>(
 ) -> V::Result {
     match definition {
         TypeDefinition::Struct(fields, modifiers) => {
-            for f in fields {
+            for f in fields.iter() {
                 visitor.visit_ident(f.name, &f.span);
                 visitor.visit_ty(&f.ty);
                 if let Some(d) = &f.default {
                     visitor.visit_expr(d);
                 }
             }
-            for m in modifiers {
+            for m in modifiers.iter() {
                 walk_type_modifier(visitor, m);
             }
             V::Result::output()
         }
         TypeDefinition::Enum(variants, _, modifiers) => {
-            for v in variants {
+            for v in variants.iter() {
                 visitor.visit_ident(v.name, &v.span);
                 if let Some(p) = &v.payload {
                     visitor.visit_ty(p);
@@ -840,7 +865,7 @@ pub fn walk_ty_definition<'ast, 'input, V: Visitor<'ast, 'input>>(
                     visitor.visit_ty(bound_ty);
                 }
             }
-            for m in modifiers {
+            for m in modifiers.iter() {
                 walk_type_modifier(visitor, m);
             }
             V::Result::output()
@@ -856,7 +881,7 @@ pub fn walk_ty_definition<'ast, 'input, V: Visitor<'ast, 'input>>(
                 }
                 visitor.visit_ty(&m.return_type);
             }
-            for at in associated_types {
+            for at in associated_types.iter() {
                 visitor.visit_ident(at.name, &at.span);
                 if let Some(d) = &at.default {
                     visitor.visit_ty(d);
@@ -888,15 +913,14 @@ pub fn walk_ty_definition<'ast, 'input, V: Visitor<'ast, 'input>>(
             V::Result::output()
         }
         TypeDefinition::Constraint(preds) => {
-            for p in preds {
+            for p in preds.iter() {
                 visitor.visit_ty(p);
             }
             V::Result::output()
         }
-        TypeDefinition::Alias(t, modifiers)
-        | TypeDefinition::Opaque(t, modifiers) => {
+        TypeDefinition::Alias(t, modifiers) | TypeDefinition::Opaque(t, modifiers) => {
             visitor.visit_ty(t);
-            for m in modifiers {
+            for m in modifiers.iter() {
                 walk_type_modifier(visitor, m);
             }
             V::Result::output()
@@ -922,7 +946,7 @@ pub fn walk_type_scheme<'ast, 'input, V: Visitor<'ast, 'input>>(
     visitor: &mut V,
     scheme: &'ast TypeScheme<'input>,
 ) -> V::Result {
-    for (span, sym) in &scheme.quantifiers {
+    for (span, sym) in scheme.quantifiers {
         visitor.visit_ident(*sym, span);
     }
     visitor.visit_ty(scheme.body)
@@ -1089,7 +1113,7 @@ pub fn replace_ident_in_expr<'input>(
             Expr::Ident(name, span) => {
                 arena.alloc(Expr::Ident(if *name == old { new } else { *name }, *span))
             }
-            Expr::Literal(l, s) => arena.alloc(Expr::Literal(l.clone(), *s)),
+            Expr::Literal(l, s) => arena.alloc(Expr::Literal(*l, *s)),
             Expr::TypeAnnotated { expr, ty, span } => arena.alloc(Expr::TypeAnnotated {
                 expr: go(arena, expr, old, new),
                 // The type annotation is NOT renamed — the desugar only
@@ -1122,8 +1146,10 @@ pub fn replace_ident_in_expr<'input>(
                 span,
             } => arena.alloc(Expr::Call {
                 callee: go(arena, callee, old, new),
-                args: alloc_slice(arena,
-                    args.iter().map(|a| (*go(arena, a, old, new)).clone()).collect()),
+                args: alloc_slice(
+                    arena,
+                    args.iter().map(|a| *go(arena, a, old, new)).collect(),
+                ),
                 comptime: *comptime,
                 span: *span,
             }),
@@ -1167,9 +1193,14 @@ pub fn replace_ident_in_expr<'input>(
                 span: *span,
             }),
             Expr::StructLit { path, fields, span } => arena.alloc(Expr::StructLit {
-                path: path.clone(),
-                fields: alloc_slice(arena,
-                    fields.iter().map(|(n, e)| (*n, (*go(arena, e, old, new)).clone())).collect()),
+                path: *path,
+                fields: alloc_slice(
+                    arena,
+                    fields
+                        .iter()
+                        .map(|(n, e)| (*n, *go(arena, e, old, new)))
+                        .collect(),
+                ),
                 span: *span,
             }),
             Expr::EnumLit {
@@ -1178,19 +1209,19 @@ pub fn replace_ident_in_expr<'input>(
                 payload,
                 span,
             } => arena.alloc(Expr::EnumLit {
-                path: path.clone(),
+                path: *path,
                 variant: *variant,
                 payload: payload.as_ref().map(|p| go(arena, p, old, new)),
                 span: *span,
             }),
             Expr::Move(e, s) => arena.alloc(Expr::Move(go(arena, e, old, new), *s)),
-            Expr::Path(p, s) => arena.alloc(Expr::Path(p.clone(), *s)),
+            Expr::Path(p, s) => arena.alloc(Expr::Path(*p, *s)),
             Expr::Tuple(es, s) => arena.alloc(Expr::Tuple(
-                alloc_slice(arena, es.iter().map(|x| (*go(arena, x, old, new)).clone()).collect()),
+                alloc_slice(arena, es.iter().map(|x| *go(arena, x, old, new)).collect()),
                 *s,
             )),
             Expr::Array(es, s) => arena.alloc(Expr::Array(
-                alloc_slice(arena, es.iter().map(|x| (*go(arena, x, old, new)).clone()).collect()),
+                alloc_slice(arena, es.iter().map(|x| *go(arena, x, old, new)).collect()),
                 *s,
             )),
             Expr::Closure {
@@ -1206,16 +1237,19 @@ pub fn replace_ident_in_expr<'input>(
                 // binder).
                 let shadowed = params.iter().any(|p| p.name == old);
                 arena.alloc(Expr::Closure {
-                    params: params.clone(),
-                    return_type: return_type.clone(),
-                    captures: captures.clone(),
-                    body: alloc_slice(arena, if shadowed {
-                        body.iter().map(|s| (*s).clone()).collect()
-                    } else {
-                        body.iter()
-                            .map(|s| replace_ident_in_stmt(arena, s, old, new))
-                            .collect()
-                    }),
+                    params: *params,
+                    return_type: *return_type,
+                    captures: *captures,
+                    body: alloc_slice(
+                        arena,
+                        if shadowed {
+                            body.iter().map(|s| *s).collect()
+                        } else {
+                            body.iter()
+                                .map(|s| replace_ident_in_stmt(arena, s, old, new))
+                                .collect()
+                        },
+                    ),
                     span: *span,
                 })
             }
@@ -1224,7 +1258,12 @@ pub fn replace_ident_in_expr<'input>(
                 span: *span,
             }),
             Expr::UnsafeBlock { body, span } => arena.alloc(Expr::UnsafeBlock {
-                body: alloc_slice(arena, body.iter().map(|s| replace_ident_in_stmt(arena, s, old, new)).collect()),
+                body: alloc_slice(
+                    arena,
+                    body.iter()
+                        .map(|s| replace_ident_in_stmt(arena, s, old, new))
+                        .collect(),
+                ),
                 span: *span,
             }),
             Expr::Catch {
@@ -1233,28 +1272,34 @@ pub fn replace_ident_in_expr<'input>(
                 span,
             } => arena.alloc(Expr::Catch {
                 expr: go(arena, expr, old, new),
-                branches: alloc_slice(arena, branches
-                    .iter()
-                    .map(|b| {
-                        // Capture avoidance (same as Match/IfLet): a branch
-                        // binding `old` via its pattern or `as` binder
-                        // shadows the rename target inside the branch body.
-                        let shadowed = pattern_binds(&b.pattern, old) || b.bind == Some(old);
-                        CatchBranch {
-                            pattern: b.pattern.clone(),
-                            bind: b.bind,
-                            body: alloc_slice(arena, if shadowed {
-                                b.body.iter().map(|s| (*s).clone()).collect()
-                            } else {
-                                b.body
-                                    .iter()
-                                    .map(|s| replace_ident_in_stmt(arena, s, old, new))
-                                    .collect()
-                            }),
-                            span: b.span,
-                        }
-                    })
-                    .collect()),
+                branches: alloc_slice(
+                    arena,
+                    branches
+                        .iter()
+                        .map(|b| {
+                            // Capture avoidance (same as Match/IfLet): a branch
+                            // binding `old` via its pattern or `as` binder
+                            // shadows the rename target inside the branch body.
+                            let shadowed = pattern_binds(&b.pattern, old) || b.bind == Some(old);
+                            CatchBranch {
+                                pattern: b.pattern,
+                                bind: b.bind,
+                                body: alloc_slice(
+                                    arena,
+                                    if shadowed {
+                                        b.body.iter().map(|s| *s).collect()
+                                    } else {
+                                        b.body
+                                            .iter()
+                                            .map(|s| replace_ident_in_stmt(arena, s, old, new))
+                                            .collect()
+                                    },
+                                ),
+                                span: b.span,
+                            }
+                        })
+                        .collect(),
+                ),
                 span: *span,
             }),
             Expr::LeaveWith {
@@ -1278,8 +1323,21 @@ pub fn replace_ident_in_expr<'input>(
                 span,
             } => arena.alloc(Expr::If {
                 cond: go(arena, cond, old, new),
-                then_branch: alloc_slice(arena, then_branch.iter().map(|s| replace_ident_in_stmt(arena, s, old, new)).collect()),
-                else_branch: else_branch.as_ref().map(|eb| alloc_slice(arena, eb.iter().map(|s| replace_ident_in_stmt(arena, s, old, new)).collect())),
+                then_branch: alloc_slice(
+                    arena,
+                    then_branch
+                        .iter()
+                        .map(|s| replace_ident_in_stmt(arena, s, old, new))
+                        .collect(),
+                ),
+                else_branch: else_branch.as_ref().map(|eb| {
+                    alloc_slice(
+                        arena,
+                        eb.iter()
+                            .map(|s| replace_ident_in_stmt(arena, s, old, new))
+                            .collect(),
+                    )
+                }),
                 is_expression: *is_expression,
                 span: *span,
             }),
@@ -1291,19 +1349,32 @@ pub fn replace_ident_in_expr<'input>(
                 is_expression,
                 span,
             } => arena.alloc(Expr::IfLet {
-                pattern: pattern.clone(),
+                pattern: *pattern,
                 scrutinee: go(arena, scrutinee, old, new),
-                then_branch: alloc_slice(arena, if pattern_binds(pattern, old) {
-                    then_branch.iter().map(|s| (*s).clone()).collect()
-                } else {
-                    then_branch.iter().map(|s| replace_ident_in_stmt(arena, s, old, new)).collect()
-                }),
+                then_branch: alloc_slice(
+                    arena,
+                    if pattern_binds(pattern, old) {
+                        then_branch.iter().map(|s| *s).collect()
+                    } else {
+                        then_branch
+                            .iter()
+                            .map(|s| replace_ident_in_stmt(arena, s, old, new))
+                            .collect()
+                    },
+                ),
                 // The pattern's bindings are scoped to the THEN branch
                 // only (checked after the `with_gadt_arm` scope pops in
                 // the checker) — the else branch is in the OUTER scope,
                 // so references to `old` there refer to the rename target
                 // and MUST be renamed regardless of what the pattern binds.
-                else_branch: else_branch.as_ref().map(|eb| alloc_slice(arena, eb.iter().map(|s| replace_ident_in_stmt(arena, s, old, new)).collect())),
+                else_branch: else_branch.as_ref().map(|eb| {
+                    alloc_slice(
+                        arena,
+                        eb.iter()
+                            .map(|s| replace_ident_in_stmt(arena, s, old, new))
+                            .collect(),
+                    )
+                }),
                 is_expression: *is_expression,
                 span: *span,
             }),
@@ -1313,48 +1384,56 @@ pub fn replace_ident_in_expr<'input>(
                 span,
             } => arena.alloc(Expr::Match {
                 scrutinee: go(arena, scrutinee, old, new),
-                arms: alloc_slice(arena, arms
-                    .iter()
-                    .map(|arm| {
-                        // Capture avoidance: a pattern that binds `old`
-                        // shadows the outer name — its body must NOT be
-                        // renamed (the reference is to the local binding).
-                        let shadowed = pattern_binds(&arm.pattern, old);
-                        MatchArm {
-                            pattern: arm.pattern.clone(),
-                            // The guard is evaluated in the scope of the
-                            // pattern bindings (like Rust) — if the pattern
-                            // binds `old`, the guard's reference must NOT be
-                            // renamed either (same capture avoidance as the
-                            // body).
-                            guard: if shadowed {
-                                arm.guard.clone()
-                            } else {
-                                arm.guard.as_ref().map(|g| go(arena, g, old, new))
-                            },
-                            body: if shadowed {
-                                arm.body.clone()
-                            } else {
-                                (*go(arena, &arm.body, old, new)).clone()
-                            },
-                            span: arm.span,
-                        }
-                    })
-                    .collect()),
+                arms: alloc_slice(
+                    arena,
+                    arms.iter()
+                        .map(|arm| {
+                            // Capture avoidance: a pattern that binds `old`
+                            // shadows the outer name — its body must NOT be
+                            // renamed (the reference is to the local binding).
+                            let shadowed = pattern_binds(&arm.pattern, old);
+                            MatchArm {
+                                pattern: arm.pattern,
+                                // The guard is evaluated in the scope of the
+                                // pattern bindings (like Rust) — if the pattern
+                                // binds `old`, the guard's reference must NOT be
+                                // renamed either (same capture avoidance as the
+                                // body).
+                                guard: if shadowed {
+                                    arm.guard
+                                } else {
+                                    arm.guard.as_ref().map(|g| go(arena, g, old, new))
+                                },
+                                body: if shadowed {
+                                    arm.body
+                                } else {
+                                    *go(arena, &arm.body, old, new)
+                                },
+                                span: arm.span,
+                            }
+                        })
+                        .collect(),
+                ),
                 span: *span,
             }),
             Expr::Block(stmts, s) => arena.alloc(Expr::Block(
-                alloc_slice(arena, stmts.iter().map(|x| replace_ident_in_stmt(arena, x, old, new)).collect()),
+                alloc_slice(
+                    arena,
+                    stmts
+                        .iter()
+                        .map(|x| replace_ident_in_stmt(arena, x, old, new))
+                        .collect(),
+                ),
                 *s,
             )),
             Expr::PolyBox { expr, scheme, span } => arena.alloc(Expr::PolyBox {
                 expr: go(arena, expr, old, new),
-                scheme: scheme.clone(),
+                scheme: *scheme,
                 span: *span,
             }),
             Expr::PolyUnbox { expr, scheme, span } => arena.alloc(Expr::PolyUnbox {
                 expr: go(arena, expr, old, new),
-                scheme: scheme.clone(),
+                scheme: *scheme,
                 span: *span,
             }),
             Expr::Quantified {
@@ -1384,12 +1463,17 @@ pub fn replace_ident_in_expr<'input>(
             }
             Expr::Old(e, s) => arena.alloc(Expr::Old(go(arena, e, old, new), *s)),
             Expr::Task { body, span } => arena.alloc(Expr::Task {
-                body: alloc_slice(arena, body.iter().map(|s| replace_ident_in_stmt(arena, s, old, new)).collect()),
+                body: alloc_slice(
+                    arena,
+                    body.iter()
+                        .map(|s| replace_ident_in_stmt(arena, s, old, new))
+                        .collect(),
+                ),
                 span: *span,
             }),
             Expr::TypeInfo(t, s) => arena.alloc(Expr::TypeInfo(*t, *s)),
             Expr::LayoutOf(t, s) => arena.alloc(Expr::LayoutOf(*t, *s)),
-            Expr::CompileError(m, s) => arena.alloc(Expr::CompileError(m.clone(), *s)),
+            Expr::CompileError(m, s) => arena.alloc(Expr::CompileError(*m, *s)),
             Expr::Error(s) => arena.alloc(Expr::Error(*s)),
         }
     }
@@ -1424,7 +1508,8 @@ pub fn replace_ident_in_stmt<'input>(
         // binder and must NOT be renamed (a stateless map would sever
         // them, leaving dangling references).
         let mut shadowed = false;
-        let v: Vec<Stmt<'a>> = ss.iter()
+        let v: Vec<Stmt<'a>> = ss
+            .iter()
             .map(|s| {
                 if shadowed {
                     return (*s).clone();
@@ -1513,127 +1598,7 @@ pub fn replace_ident_in_stmt<'input>(
             type_captures: type_captures.clone(),
             type_modifiers: type_modifiers.clone(),
         },
-        Stmt::FunctionDef {
-            span,
-            attributes,
-            contracts,
-            doc,
-            name,
-            params,
-            return_type,
-            body,
-            type_params,
-            where_clause,
-            finally,
-            is_comptime,
-            is_async,
-        } => Stmt::FunctionDef {
-            span: *span,
-            attributes: attributes.clone(),
-            contracts: contracts
-                .iter()
-                .map(|c| go_contract(arena, c, old_name, new_name))
-                .collect(),
-            doc: doc.clone(),
-            name: *name,
-            params: params.clone(),
-            return_type: return_type.clone(),
-            // Capture avoidance (same as the Closure arm): if a parameter
-            // shadows the renamed identifier, the body's bound occurrences
-            // must NOT be renamed — otherwise the parameter name survives
-            // while its uses point at the fresh name (dangling
-            // references).
-            body: if params.iter().any(|p| p.name == old_name) {
-                body.clone()
-            } else {
-                body.as_ref()
-                    .map(|ss| go_stmts(arena, ss, old_name, new_name))
-            },
-            type_params: type_params.clone(),
-            where_clause: where_clause.clone(),
-            finally: if params.iter().any(|p| p.name == old_name) {
-                finally.clone()
-            } else {
-                finally
-                    .as_ref()
-                    .map(|ss| go_stmts(arena, ss, old_name, new_name))
-            },
-            is_comptime: *is_comptime,
-            is_async: *is_async,
-        },
-        Stmt::TypeDef {
-            span,
-            attributes,
-            doc,
-            name,
-            params,
-            definition,
-            contracts,
-        } => Stmt::TypeDef {
-            span: *span,
-            attributes: attributes.clone(),
-            doc: doc.clone(),
-            name: *name,
-            params: params.clone(),
-            definition: definition.clone(),
-            contracts: contracts
-                .iter()
-                .map(|c| go_contract(arena, c, old_name, new_name))
-                .collect(),
-        },
-        Stmt::TraitDef {
-            span,
-            attributes,
-            doc,
-            name,
-            methods,
-            associated_types,
-        } => Stmt::TraitDef {
-            span: *span,
-            attributes: attributes.clone(),
-            doc: doc.clone(),
-            name: *name,
-            methods: methods.clone(),
-            associated_types: associated_types.clone(),
-        },
-        Stmt::Import {
-            path,
-            items,
-            alias,
-            span,
-        } => Stmt::Import {
-            path: path.clone(),
-            items: items.clone(),
-            alias: *alias,
-            span: *span,
-        },
-        Stmt::ExternFunction {
-            abi,
-            name,
-            params,
-            return_type,
-            span,
-            attributes,
-        } => Stmt::ExternFunction {
-            abi: abi.clone(),
-            name: *name,
-            params: params.clone(),
-            return_type: return_type.clone(),
-            span: *span,
-            attributes: attributes.clone(),
-        },
-        Stmt::Constraint {
-            name,
-            params,
-            predicates,
-            span,
-        } => Stmt::Constraint {
-            name: *name,
-            params: params.clone(),
-            predicates: predicates.clone(),
-            span: *span,
-        },
-        Stmt::Edition(s, span) => Stmt::Edition(s.clone(), *span),
+        Stmt::Item(item) => Stmt::Item(replace_ident_in_item(arena, item, old_name, new_name)),
         Stmt::Expression(e) => Stmt::Expression(go_expr(arena, e, old_name, new_name)),
         Stmt::If {
             cond,
@@ -1787,33 +1752,18 @@ pub fn replace_ident_in_stmt<'input>(
             value,
             span,
         } => Stmt::Assign {
-            target: replace_ident_in_expr(arena, target, old_name, new_name),
+            // Renaming only rewrites identifiers inside the target, and an
+            // lvalue stays an lvalue under renaming — re-validate and fall
+            // back to the (already validated) original for defense.
+            target: LValue::try_from_expr(replace_ident_in_expr(
+                arena,
+                target.expr(),
+                old_name,
+                new_name,
+            ))
+            .unwrap_or(*target),
             op: *op,
             value: go_expr(arena, value, old_name, new_name),
-            span: *span,
-        },
-        Stmt::ComptimeBlock {
-            captures,
-            trusted,
-            attributes,
-            body,
-            span,
-        } => Stmt::ComptimeBlock {
-            captures: captures.clone(),
-            trusted: *trusted,
-            attributes: attributes.clone(),
-            body: go_stmts(arena, body, old_name, new_name),
-            span: *span,
-        },
-        Stmt::Generate {
-            attributes,
-            for_type,
-            body,
-            span,
-        } => Stmt::Generate {
-            attributes: attributes.clone(),
-            for_type: &**for_type,
-            body: go_stmts(arena, body, old_name, new_name),
             span: *span,
         },
         Stmt::ScopeCleanup {
@@ -1854,7 +1804,148 @@ pub fn replace_ident_in_stmt<'input>(
             body: go_stmts(arena, body, old_name, new_name),
             span: *span,
         },
-        Stmt::ImplBlock {
+        Stmt::Error(span) => Stmt::Error(*span),
+    }
+}
+
+/// Rename all occurrences of `old_name` to `new_name` in an `Item` tree,
+/// allocating the new tree in `arena`.  Returns a shared `&'input Item`.
+pub fn replace_ident_in_item<'input>(
+    arena: &crate::arena::SyncArena<'input>,
+    item: &Item<'input>,
+    old_name: Symbol,
+    new_name: Symbol,
+) -> &'input Item<'input> {
+    fn go_contract<'a>(
+        arena: &crate::arena::SyncArena<'a>,
+        c: &Contract<'a>,
+        old: Symbol,
+        new: Symbol,
+    ) -> Contract<'a> {
+        match c {
+            Contract::Requires(e, s) => {
+                Contract::Requires(replace_ident_in_expr(arena, e, old, new).clone(), *s)
+            }
+            Contract::Ensures {
+                expr,
+                span,
+                target,
+                labels,
+            } => Contract::Ensures {
+                expr: replace_ident_in_expr(arena, expr, old, new).clone(),
+                span: *span,
+                target: target.clone(),
+                labels: labels.clone(),
+            },
+            Contract::Invariant(e, s) => {
+                Contract::Invariant(replace_ident_in_expr(arena, e, old, new).clone(), *s)
+            }
+            Contract::Decreases(e, s) => {
+                Contract::Decreases(replace_ident_in_expr(arena, e, old, new).clone(), *s)
+            }
+            Contract::Terminates(e, s) => {
+                Contract::Terminates(replace_ident_in_expr(arena, e, old, new).clone(), *s)
+            }
+        }
+    }
+    fn go_stmts_in_arena<'input>(
+        arena: &crate::arena::SyncArena<'input>,
+        ss: &[Stmt<'input>],
+        old: Symbol,
+        new: Symbol,
+    ) -> &'input [Stmt<'input>] {
+        let v: Vec<Stmt<'input>> = ss
+            .iter()
+            .map(|s| replace_ident_in_stmt(arena, s, old, new))
+            .collect();
+        arena.alloc_slice_clone(&v)
+    }
+    match item {
+        Item::FunctionDef {
+            span,
+            attributes,
+            contracts,
+            doc,
+            name,
+            params,
+            return_type,
+            body,
+            type_params,
+            where_clause,
+            finally,
+            is_comptime,
+            is_async,
+        } => {
+            let shadowed = params.iter().any(|p| p.name == old_name);
+            arena.alloc(Item::FunctionDef {
+                span: *span,
+                attributes: attributes.clone(),
+                contracts: {
+                    let mapped: Vec<Contract<'input>> = contracts
+                        .iter()
+                        .map(|c| go_contract(arena, c, old_name, new_name))
+                        .collect();
+                    arena.alloc_slice_clone(&mapped)
+                },
+                doc: doc.clone(),
+                name: *name,
+                params: params.clone(),
+                return_type: return_type.clone(),
+                body: if shadowed {
+                    body.clone()
+                } else {
+                    body.map(|ss| go_stmts_in_arena(arena, ss, old_name, new_name))
+                },
+                type_params: type_params.clone(),
+                where_clause: where_clause.clone(),
+                finally: if shadowed {
+                    finally.clone()
+                } else {
+                    finally.map(|ss| go_stmts_in_arena(arena, ss, old_name, new_name))
+                },
+                is_comptime: *is_comptime,
+                is_async: *is_async,
+            })
+        }
+        Item::TypeDef {
+            span,
+            attributes,
+            doc,
+            name,
+            params,
+            definition,
+            contracts,
+        } => arena.alloc(Item::TypeDef {
+            span: *span,
+            attributes: attributes.clone(),
+            doc: doc.clone(),
+            name: *name,
+            params: params.clone(),
+            definition: definition.clone(),
+            contracts: {
+                let mapped: Vec<Contract<'input>> = contracts
+                    .iter()
+                    .map(|c| go_contract(arena, c, old_name, new_name))
+                    .collect();
+                arena.alloc_slice_clone(&mapped)
+            },
+        }),
+        Item::TraitDef {
+            span,
+            attributes,
+            doc,
+            name,
+            methods,
+            associated_types,
+        } => arena.alloc(Item::TraitDef {
+            span: *span,
+            attributes: attributes.clone(),
+            doc: doc.clone(),
+            name: *name,
+            methods: methods.clone(),
+            associated_types: associated_types.clone(),
+        }),
+        Item::ImplBlock {
             span,
             attributes,
             trait_path,
@@ -1863,7 +1954,7 @@ pub fn replace_ident_in_stmt<'input>(
             associated_types,
             where_clause,
             type_params,
-        } => Stmt::ImplBlock {
+        } => arena.alloc(Item::ImplBlock {
             span: *span,
             attributes: attributes.clone(),
             trait_path: trait_path.clone(),
@@ -1872,17 +1963,79 @@ pub fn replace_ident_in_stmt<'input>(
             associated_types: associated_types.clone(),
             where_clause: where_clause.clone(),
             type_params: type_params.clone(),
-        },
-        Stmt::LayoutDef {
+        }),
+        Item::Import {
+            path,
+            items,
+            alias,
+            span,
+        } => arena.alloc(Item::Import {
+            path: path.clone(),
+            items: items.clone(),
+            alias: *alias,
+            span: *span,
+        }),
+        Item::ExternFunction {
+            abi,
+            name,
+            params,
+            return_type,
+            span,
+            attributes,
+        } => arena.alloc(Item::ExternFunction {
+            abi: abi.clone(),
+            name: *name,
+            params: params.clone(),
+            return_type: return_type.clone(),
+            span: *span,
+            attributes: attributes.clone(),
+        }),
+        Item::Constraint {
+            name,
+            params,
+            predicates,
+            span,
+        } => arena.alloc(Item::Constraint {
+            name: *name,
+            params: params.clone(),
+            predicates: predicates.clone(),
+            span: *span,
+        }),
+        Item::Edition(s, span) => arena.alloc(Item::Edition(s.clone(), *span)),
+        Item::LayoutDef {
             name,
             attributes,
             span,
-        } => Stmt::LayoutDef {
+        } => arena.alloc(Item::LayoutDef {
             name: *name,
             attributes: attributes.clone(),
             span: *span,
-        },
-        Stmt::Error(span) => Stmt::Error(*span),
+        }),
+        Item::ComptimeBlock {
+            captures,
+            trusted,
+            attributes,
+            body,
+            span,
+        } => arena.alloc(Item::ComptimeBlock {
+            captures: captures.clone(),
+            trusted: *trusted,
+            attributes: attributes.clone(),
+            body: go_stmts_in_arena(arena, body, old_name, new_name),
+            span: *span,
+        }),
+        Item::Generate {
+            attributes,
+            for_type,
+            body,
+            span,
+        } => arena.alloc(Item::Generate {
+            attributes: attributes.clone(),
+            for_type: *for_type,
+            body: go_stmts_in_arena(arena, body, old_name, new_name),
+            span: *span,
+        }),
+        Item::Error(span) => arena.alloc(Item::Error(*span)),
     }
 }
 
@@ -1957,9 +2110,11 @@ mod tests {
 
     /// Parse a function body and return its first statement.  Top level
     /// only accepts items, so test statements live inside `def f() { ... }`.
-    fn first_fn_stmt(source: &'static str) -> (Stmt<'static>, &'static crate::arena::SyncArena<'static>) {
+    fn first_fn_stmt(
+        source: &'static str,
+    ) -> (Stmt<'static>, &'static crate::arena::SyncArena<'static>) {
         let (prog, arena) = parse_program(source);
-        let Stmt::FunctionDef {
+        let Item::FunctionDef {
             body: Some(body), ..
         } = &prog.items[0]
         else {
@@ -2171,7 +2326,7 @@ def f(x: Int<32> = 1) -> Int<32> requires x > 0 ensures result > 0 {
         let (prog, _) = parse_program(source);
         let mut v = CountVisitor::default();
         for item in &prog.items {
-            walk_stmt(&mut v, item);
+            walk_item(&mut v, item);
         }
         // Identifiers: f, x, y, result — 4 unique symbols.
         assert!(v.idents.contains(&Symbol::intern("f")));
@@ -2220,7 +2375,7 @@ impl Int<32> {
         let (prog, _) = parse_program(source);
         let mut v = CountVisitor::default();
         for item in &prog.items {
-            walk_stmt(&mut v, item);
+            walk_item(&mut v, item);
         }
         // `double`'s body must be reachable.
         assert!(v.idents.contains(&Symbol::intern("double")));
@@ -2241,7 +2396,7 @@ def f(x: Int<32>) -> Int<32> requires x > 0 ensures result > x {
         let (prog, _) = parse_program(source);
         let mut v = CountVisitor::default();
         for item in &prog.items {
-            walk_stmt(&mut v, item);
+            walk_item(&mut v, item);
         }
         assert!(v.contracts >= 2, "contracts not walked: {}", v.contracts);
         assert!(v.exprs >= 3);
@@ -2262,11 +2417,14 @@ def f(x: Int<32>) -> Int<32> {
         let (prog, _) = parse_program(source);
         let mut v = CountVisitor::default();
         for item in &prog.items {
-            walk_stmt(&mut v, item);
+            walk_item(&mut v, item);
         }
         // The `x` inside the poly box must be visited — before the fix
         // `PolyBox` shared its arm with `Task`/`Path` and both were no-ops.
-        assert!(v.idents.contains(&Symbol::intern("x")), "poly inner expr invisible");
+        assert!(
+            v.idents.contains(&Symbol::intern("x")),
+            "poly inner expr invisible"
+        );
         assert!(v.exprs >= 2, "poly inner expr invisible: {}", v.exprs);
     }
 }

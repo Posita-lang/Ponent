@@ -1,5 +1,4 @@
-use crate::ast::{FileId, Span};
-use crate::sourcemap::SourceMap;
+use crate::ast::Span;
 use std::borrow::Cow;
 
 /// Kind of annotation underline.
@@ -101,15 +100,6 @@ pub struct SourcePos {
     pub line: usize,
     /// 0-based byte offset from the start of the line.
     pub col: usize,
-}
-
-/// Convert byte offset to human-readable "line:col" string (1-based).
-///
-/// Delegates to the [`SourceMap`]'s precomputed line table for `file`
-/// rather than rescanning text, so offsets must be into that file.
-pub fn byte_offset_to_string(map: &SourceMap, file: FileId, byte_offset: u32) -> String {
-    let pos = map.file(file).line_col(byte_offset);
-    format!("{}:{}", pos.line + 1, pos.col + 1)
 }
 
 // ── Snippet: a contiguous slice of source code with annotations ──

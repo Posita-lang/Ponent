@@ -303,7 +303,7 @@ fn collect_generic_params_rec<'input>(
         }
         TypeData::Array { elem, .. } => collect_generic_params_rec(*elem, ctx, set, bound),
         TypeData::Slice { elem } => collect_generic_params_rec(*elem, ctx, set, bound),
-        TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+        TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
             collect_generic_params_rec(*ty, ctx, set, bound)
         }
         TypeData::Ptr { pointee, .. } => collect_generic_params_rec(*pointee, ctx, set, bound),
@@ -404,7 +404,7 @@ fn collect_bare_generic_params<'input>(
                 set.extend(collect_bare_generic_params(*elem, ctx));
             }
         }
-        TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+        TypeData::Ref { ty, .. } | TypeData::Pointer { ty, .. } => {
             if let TypeData::GenericParam { index, .. } = ctx.get(*ty) {
                 set.insert(*index);
             } else {
@@ -756,7 +756,11 @@ mod tests {
             pad: None,
         };
         symbols
-            .insert_type("TestType".into(), binding, crate::ast::Span::new(FileId::DUMMY, 0, 0))
+            .insert_type(
+                "TestType".into(),
+                binding,
+                crate::ast::Span::new(FileId::DUMMY, 0, 0),
+            )
             .ok();
 
         // Register the def_id → type_id mapping so the orphan rule check

@@ -42,10 +42,7 @@ impl QuietPanics {
 
 impl Drop for QuietPanics {
     fn drop(&mut self) {
-        std::panic::set_hook(std::mem::replace(
-            &mut self.prev,
-            Box::new(|_| {}),
-        ));
+        std::panic::set_hook(std::mem::replace(&mut self.prev, Box::new(|_| {})));
     }
 }
 #[test]

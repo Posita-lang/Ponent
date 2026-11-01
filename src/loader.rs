@@ -13,13 +13,13 @@
 //! it ends.  This mirrors the `Box::leak` pattern already used
 //! throughout the checker tests.
 
-use crate::ast::{FileId, Program, Stmt};
-use crate::source_map::{ModulePath, SourceMap};
-use crate::vfs::VfsBackend;
+use crate::ast::{FileId, Item, Program};
 use crate::diagnostics::Diagnostic;
 use crate::hir::types::Edition;
 use crate::parser::Parser;
+use crate::source_map::{ModulePath, SourceMap};
 use crate::symbol::Symbol;
+use crate::vfs::VfsBackend;
 use std::path::{Path, PathBuf};
 
 /// One parsed file plus everything needed to keep its memory alive
@@ -71,24 +71,20 @@ pub fn load_and_parse(
             );
         }
     };
-    let id = match sourcemap.insert_or_get(
-        path.clone(),
-        module,
-        raw.as_bytes(),
-        default_edition,
-        mtime,
-    ) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                None,
-                vec![Diagnostic::fatal(format!(
-                    "cannot register '{}': {e}",
-                    path.display()
-                ))],
-            );
-        }
-    };
+    let id =
+        match sourcemap.insert_or_get(path.clone(), module, raw.as_bytes(), default_edition, mtime)
+        {
+            Ok(id) => id,
+            Err(e) => {
+                return (
+                    None,
+                    vec![Diagnostic::fatal(format!(
+                        "cannot register '{}': {e}",
+                        path.display()
+                    ))],
+                );
+            }
+        };
 
     // Session-lifetime text + private arena per file (Box::leak pattern
     // as in the checker tests; `LoadedFile` tracks both for the session
@@ -111,25 +107,27 @@ pub fn load_and_parse(
                     ..Default::default()
                 },
             };
+            // `text` was leaked to `'static` above, so the parser was
+            // instantiated at `'static` and `diags` already has the
+            // session lifetime — no coercion needed.
             return (
-                Some(LoadedFile { id, program, _arena: arena }),
-                coerce_diags(diags),
+                Some(LoadedFile {
+                    id,
+                    program,
+                    _arena: arena,
+                }),
+                diags,
             );
         }
     };
-    (Some(LoadedFile { id, program, _arena: arena }), Vec::new())
-}
-
-/// Erase the borrow the parser hangs on the (leaked) source text.
-fn coerce_diags(diags: Vec<Diagnostic<'_>>) -> Vec<Diagnostic<'static>> {
-    // SAFETY: the diagnostics borrow only the file's source text, which
-    // was `Box::leak`ed for the whole session above, so every borrow is
-    // valid for `'static` as far as any observer can tell.  Kept in one
-    // place so an owned-`Diagnostic` refactor touches a single fn.
-    diags
-        .into_iter()
-        .map(|d| unsafe { std::mem::transmute::<Diagnostic<'_>, Diagnostic<'static>>(d) })
-        .collect()
+    (
+        Some(LoadedFile {
+            id,
+            program,
+            _arena: arena,
+        }),
+        Vec::new(),
+    )
 }
 
 /// Parse a whole module plan, in parallel.
@@ -198,13 +196,19 @@ pub fn site_module_path(site: &ImportSite) -> ModulePath {
 pub fn import_sites(prog: &Program<'_, '_>) -> Vec<ImportSite> {
     let mut sites = Vec::new();
     for item in &prog.items {
-        if let Stmt::Import { path, items, alias, span } = item {
+        if let Item::Import {
+            path,
+            items,
+            alias,
+            span,
+        } = item
+        {
             sites.push(ImportSite {
                 from: span.file,
                 span: *span,
-                path: path.clone(),
+                path: path.to_vec(),
                 alias: *alias,
-                items: items.clone(),
+                items: items.map(|i| i.to_vec()),
             });
         }
     }
@@ -226,8 +230,7 @@ pub fn resolve_and_check(
     programs: &[&Program<'_, '_>],
     sourcemap: &SourceMap,
 ) -> Vec<Diagnostic<'static>> {
-    let all_sites: Vec<Vec<ImportSite>> =
-        programs.iter().map(|p| import_sites(p)).collect();
+    let all_sites: Vec<Vec<ImportSite>> = programs.iter().map(|p| import_sites(p)).collect();
     let flat: Vec<&ImportSite> = all_sites.iter().flatten().collect();
 
     let mut diags = Vec::new();
@@ -241,18 +244,16 @@ pub fn resolve_and_check(
         match sourcemap.file_id_by_module(&target) {
             Some(to) => edges.push((site.from, to, site)),
             None => {
-                let mut diag = Diagnostic::error(format!(
-                    "unresolved module `{target}`"
-                ))
-                .with_code_str("E-import-unresolved")
-                .with_span(site.span)
-                .with_help(format!("no module `{target}` is registered in this build"));
+                let mut diag = Diagnostic::error(format!("unresolved module `{target}`"))
+                    .with_code_str("E-import-unresolved")
+                    .with_span(site.span)
+                    .with_help(format!("no module `{target}` is registered in this build"));
                 if let Some(near) = closest_module(&target, sourcemap) {
                     diag = diag.with_suggestion(format!(
                         "a similarly named module exists: `{near}` — did you mean it?"
                     ));
                 }
-                diags.push(coerce_one(diag));
+                diags.push(diag);
             }
         }
     }
@@ -262,13 +263,12 @@ pub fn resolve_and_check(
         // `cycle` is a list of import sites forming the ring (site i's
         // target imports site i+1's source).  One primary anchor, one
         // secondary label per contributing site.
-        let mut diag = Diagnostic::error("cyclic module import")
-            .with_code_str("E-import-cycle");
+        let mut diag = Diagnostic::error("cyclic module import").with_code_str("E-import-cycle");
         let mut first = true;
         for site in &cycle {
             let msg = format!("`{}` imports `{}`", site_module_path(site), {
                 // the module this site's file lives in
-                let from = sourcemap.file(site.from).module_path.clone();
+                let from = sourcemap.file_or_dummy(site.from).module_path.clone();
                 from.to_string()
             });
             diag = if first {
@@ -278,10 +278,9 @@ pub fn resolve_and_check(
                 diag.with_secondary_label(site.span, msg)
             };
         }
-        diag = diag.with_help(
-            "break the cycle by moving shared declarations into a lower-level module",
-        );
-        diags.push(coerce_one(diag));
+        diag = diag
+            .with_help("break the cycle by moving shared declarations into a lower-level module");
+        diags.push(diag);
     }
 
     diags.sort_by(|a, b| {
@@ -292,31 +291,28 @@ pub fn resolve_and_check(
     diags
 }
 
-fn coerce_one(d: Diagnostic<'_>) -> Diagnostic<'static> {
-    // SAFETY: the message strings are owned `String`s and no source text
-    // has been attached yet at load time, so the `'src` parameter is
-    // vacuous here.  Single conversion point, as in `coerce_diags`.
-    unsafe { std::mem::transmute::<Diagnostic<'_>, Diagnostic<'static>>(d) }
-}
-
 /// The registered module path closest to `name` (OSA distance ≤ 2),
 /// or `None`.  Ties break on the lexicographically smaller path so the
 /// suggestion is deterministic.
 fn closest_module(name: &ModulePath, sourcemap: &SourceMap) -> Option<String> {
+    use smallvec::SmallVec;
     let chars: Vec<char> = name.as_str().chars().collect();
     let mut best: Option<(usize, String)> = None;
-    let mut p1 = Vec::new();
-    let mut p2 = Vec::new();
-    let mut p3 = Vec::new();
+    let mut p1: SmallVec<[usize; 16]> = SmallVec::new();
+    let mut p2: SmallVec<[usize; 16]> = SmallVec::new();
+    let mut p3: SmallVec<[usize; 16]> = SmallVec::new();
     for module in sourcemap.module_paths() {
         if module == *name {
             continue;
         }
         let cand: Vec<char> = module.as_str().chars().collect();
-        let d = crate::parser::osa_distance_limited_into(
-            &mut p1, &mut p2, &mut p3, &chars, &cand, 2,
-        );
-        if d <= 2 && best.as_ref().map_or(true, |(bd, _)| d < *bd || (d == *bd && module.as_str() < best.as_ref().unwrap().1.as_str())) {
+        let d =
+            crate::parser::osa_distance_limited_into(&mut p1, &mut p2, &mut p3, &chars, &cand, 2);
+        if d <= 2
+            && best.as_ref().map_or(true, |(bd, _)| {
+                d < *bd || (d == *bd && module.as_str() < best.as_ref().unwrap().1.as_str())
+            })
+        {
             best = Some((d, module.as_str().to_string()));
         }
     }
@@ -418,20 +414,17 @@ fn cycles_in(edges: &[(FileId, FileId, &ImportSite)]) -> Vec<Vec<ImportSite>> {
         let mut cur = start;
         loop {
             visited.insert(cur);
-            let next = adj
-                .get(&cur)
-                .and_then(|outs| {
-                    outs.iter()
-                        .filter(|(w, _)| set.contains(w))
-                        .find(|(w, _)| {
-                            // New node, or the edge that closes the ring
-                            // back to start (a self-loop is the degenerate
-                            // case: scc.len() == 1, closable immediately).
-                            !visited.contains(w)
-                                || (*w == start && ring.len() + 1 >= scc.len())
-                        })
-                        .copied()
-                });
+            let next = adj.get(&cur).and_then(|outs| {
+                outs.iter()
+                    .filter(|(w, _)| set.contains(w))
+                    .find(|(w, _)| {
+                        // New node, or the edge that closes the ring
+                        // back to start (a self-loop is the degenerate
+                        // case: scc.len() == 1, closable immediately).
+                        !visited.contains(w) || (*w == start && ring.len() + 1 >= scc.len())
+                    })
+                    .copied()
+            });
             match next {
                 Some((w, site)) => {
                     ring.push(site.clone());
@@ -514,7 +507,10 @@ mod tests {
             "/src/main.pos",
             "import utils::math;\ndef main() -> Int<32> { return 0; }",
         );
-        b.insert_file("/src/utils/math.pos", "def add(a: Int<32>, b: Int<32>) -> Int<32> { return a + b; }");
+        b.insert_file(
+            "/src/utils/math.pos",
+            "def add(a: Int<32>, b: Int<32>) -> Int<32> { return a + b; }",
+        );
         Arc::new(b)
     }
 
@@ -526,7 +522,11 @@ mod tests {
         assert_eq!(plan.len(), 2);
 
         let outcome = load_tree(b.as_ref(), &sm, plan, Edition::Year2026);
-        assert!(outcome.fatal.is_empty(), "no fatal diags: {:?}", outcome.fatal);
+        assert!(
+            outcome.fatal.is_empty(),
+            "no fatal diags: {:?}",
+            outcome.fatal
+        );
         assert_eq!(outcome.loaded.len(), 2);
         // Plan order (sorted by path): main.pos before utils/math.pos.
         assert_eq!(outcome.loaded[0].program.items.len(), 2); // import + def
@@ -534,7 +534,10 @@ mod tests {
 
         // Both registered in the SourceMap under their module paths.
         assert!(sm.file_id_by_module(&ModulePath::new("main")).is_some());
-        assert!(sm.file_id_by_module(&ModulePath::new("utils::math")).is_some());
+        assert!(
+            sm.file_id_by_module(&ModulePath::new("utils::math"))
+                .is_some()
+        );
     }
 
     #[test]
@@ -563,15 +566,24 @@ mod tests {
         let sm_seq = SourceMap::new();
         let mut seq_counts = Vec::new();
         for (m, p) in plan.clone() {
-            let (loaded, fatal) =
-                load_and_parse(b.as_ref(), &sm_seq, m, p, Edition::Year2026);
+            let (loaded, fatal) = load_and_parse(b.as_ref(), &sm_seq, m, p, Edition::Year2026);
             assert!(fatal.is_empty());
-            seq_counts.push(loaded.expect("sequential load succeeded").program.items.len());
+            seq_counts.push(
+                loaded
+                    .expect("sequential load succeeded")
+                    .program
+                    .items
+                    .len(),
+            );
         }
 
         let sm_par = SourceMap::new();
         let outcome = load_tree(b.as_ref(), &sm_par, plan, Edition::Year2026);
-        let par_counts: Vec<_> = outcome.loaded.iter().map(|l| l.program.items.len()).collect();
+        let par_counts: Vec<_> = outcome
+            .loaded
+            .iter()
+            .map(|l| l.program.items.len())
+            .collect();
         assert_eq!(seq_counts, par_counts);
     }
 
@@ -586,12 +598,15 @@ mod tests {
             (ModulePath::new("bad"), PathBuf::from("/src/bad.pos")),
         ];
         let outcome = load_tree(&b, &sm, plan, Edition::Year2026);
-        assert!(!outcome.fatal.is_empty(), "bad.pos must produce fatal diags");
+        assert!(
+            !outcome.fatal.is_empty(),
+            "bad.pos must produce fatal diags"
+        );
         assert_eq!(outcome.loaded.len(), 2, "both files yield programs");
         let good = outcome
             .loaded
             .iter()
-            .find(|l| sm.file(l.id).module_path == ModulePath::new("good"))
+            .find(|l| sm.file_or_dummy(l.id).module_path == ModulePath::new("good"))
             .expect("good.pos loaded");
         assert_eq!(good.program.items.len(), 1);
     }
@@ -599,7 +614,13 @@ mod tests {
     fn parse_registered(b: &MemoryBackend, sm: &SourceMap, path: &str, module: &str) -> LoadedFile {
         let raw = b.read_file(path).expect("file exists");
         let id = sm
-            .insert_or_get(PathBuf::from(path), ModulePath::new(module), raw.as_bytes(), Edition::Year2026, None)
+            .insert_or_get(
+                PathBuf::from(path),
+                ModulePath::new(module),
+                raw.as_bytes(),
+                Edition::Year2026,
+                None,
+            )
             .expect("register");
         let text: &'static str = Box::leak(raw.into_boxed_str());
         let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
@@ -607,13 +628,20 @@ mod tests {
             Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
         let mut parser = Parser::new(text, id, arena);
         let program = parser.parse_program().expect("parse ok");
-        LoadedFile { id, program, _arena: arena }
+        LoadedFile {
+            id,
+            program,
+            _arena: arena,
+        }
     }
 
     #[test]
     fn unresolved_import_reports_and_suggests() {
         let mut b = MemoryBackend::new();
-        b.insert_file("/src/a.pos", "import utils::mathh;\ndef f() -> Int<32> { return 0; }");
+        b.insert_file(
+            "/src/a.pos",
+            "import utils::mathh;\ndef f() -> Int<32> { return 0; }",
+        );
         b.insert_file("/src/utils/math.pos", "def g() -> Int<32> { return 1; }");
         let sm = SourceMap::new();
         let a = parse_registered(&b, &sm, "/src/a.pos", "a");
@@ -622,7 +650,9 @@ mod tests {
         let diags = resolve_and_check(&[&a.program], &sm);
         assert_eq!(diags.len(), 1, "{:?}", diags);
         assert!(
-            diags[0].message().contains("unresolved module `utils::mathh`"),
+            diags[0]
+                .message()
+                .contains("unresolved module `utils::mathh`"),
             "{:?}",
             diags[0]
         );
@@ -690,6 +720,10 @@ mod tests {
         let outcome = load_tree(b.as_ref(), &sm, plan, Edition::Year2026);
         let refs: Vec<&Program<'_, '_>> = outcome.loaded.iter().map(|l| &l.program).collect();
         let diags = resolve_and_check(&refs, &sm);
-        assert!(diags.is_empty(), "clean tree must have no import diags: {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "clean tree must have no import diags: {:?}",
+            diags
+        );
     }
 }

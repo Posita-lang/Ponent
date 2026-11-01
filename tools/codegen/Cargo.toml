@@ -1,0 +1,20 @@
+[package]
+name = "ponent-codegen"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Build-time validation and code generation for ponent's error-code registry and Fluent locales."
+
+[features]
+default = ["site"]
+site = ["dep:pulldown-cmark"]
+
+[dependencies]
+toml = { version = "0.8", features = ["preserve_order"] }
+fluent-syntax = "0.12"
+pulldown-cmark = { version = "0.13", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

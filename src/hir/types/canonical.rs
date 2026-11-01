@@ -149,10 +149,20 @@ const FREE_OFFSET: usize = usize::MAX / 2;
 fn alpha_normalize_neg(neg: &Neg, scope: &mut Vec<usize>) -> Neg {
     match neg {
         Neg::Atom(p) => Neg::Atom(alpha_normalize_pos(p, scope)),
-        Neg::Arrow(params, ret) => Neg::Arrow(
-            params.iter().map(|p| alpha_normalize_pos(p, scope)).collect(),
-            Box::new(alpha_normalize_neg(ret, scope)),
-        ),
+        Neg::Arrow(params, ret) => {
+            let mut ps: Vec<Pos> = params
+                .iter()
+                .map(|p| alpha_normalize_pos(p, scope))
+                .collect();
+            // Re-sort on the α-NORMALIZED key: the pre-α sorts order by RAW
+            // binder index, which is not α-invariant (same spine, permuted
+            // index allocations sort oppositely, and α-renaming cannot
+            // repair the ORDER afterwards). Sorting the level-based forms
+            // here makes the permutation law (Fig. 4b) and α-invariance
+            // hold simultaneously.
+            ps.sort();
+            Neg::Arrow(ps, Box::new(alpha_normalize_neg(ret, scope)))
+        }
         Neg::Forall(idx, body) => {
             scope.push(*idx);
             let nb = alpha_normalize_neg(body, scope);
@@ -170,12 +180,18 @@ fn alpha_normalize_pos(pos: &Pos, scope: &mut Vec<usize>) -> Pos {
             None => Pos::Var(i + FREE_OFFSET),
         },
         Pos::Unit => Pos::Unit,
-        Pos::Opaque(id, args) => Pos::Opaque(
-            *id,
-            args.iter().map(|p| alpha_normalize_pos(p, scope)).collect(),
-        ),
+        Pos::Opaque(id, args) => {
+            let mut ps: Vec<Pos> = args.iter().map(|p| alpha_normalize_pos(p, scope)).collect();
+            ps.sort(); // see alpha_normalize_neg: α-normalized sort key
+            Pos::Opaque(*id, ps)
+        }
         Pos::Prod(items) => {
-            Pos::Prod(items.iter().map(|p| alpha_normalize_pos(p, scope)).collect())
+            let mut ps: Vec<Pos> = items
+                .iter()
+                .map(|p| alpha_normalize_pos(p, scope))
+                .collect();
+            ps.sort(); // see alpha_normalize_neg: α-normalized sort key
+            Pos::Prod(ps)
         }
         Pos::Mu(idx, body) => {
             scope.push(*idx);
@@ -197,7 +213,7 @@ impl<'input> TypeContext<'input> {
         self.to_neg_fv(ty).0
     }
 
-    /// P3c: `to_neg` with the INCREMENTAL FV pass — returns the canonical
+    /// `to_neg` with the INCREMENTAL FV pass — returns the canonical
     /// tree together with the free-variable set of the tree it produced,
     /// accumulated bottom-up in ONE structural pass.  Each child returns
     /// the FV set of exactly its own subtree (binders remove their index,
@@ -227,8 +243,7 @@ impl<'input> TypeContext<'input> {
             TypeData::Fn { params, ret } => {
                 // Currying: flatten nested single-param arrows and tuple
                 // params into one sorted spine (Fig. 4a + 4b).
-                let mut set: std::collections::HashSet<usize> =
-                    std::collections::HashSet::new();
+                let mut set: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 let mut spine: Vec<Pos> = Vec::new();
                 let mut collect = |t: TypeId, ctx: &Self| {
                     let (p, sv) = ctx.to_pos_fv(t);
@@ -255,23 +270,40 @@ impl<'input> TypeContext<'input> {
                     }
                     other => (spine, other),
                 };
-                // Quantifier hoisting (Fig. 4a): A⇒∀X.B ≡ ∀X.(A⇒B).
-                // When the hoisted body is itself an arrow (the ∀ sat over a
-                // nested spine, e.g. Fn(A, Fn(B, C)) with ret ∀X.Fn([B],C)),
-                // merge the spines into ONE flat spine — a nested
-                // Arrow(spine, Arrow(spine2, ret)) would break the
+                // Quantifier hoisting (Fig. 4a): A⇒∀X.∀Y.B ≡ ∀X.∀Y.(A⇒B).
+                // Hoist the WHOLE quantifier chain, then merge the spine of
+                // an Arrow under the innermost ∀ into ONE flat spine.
+                // Hoisting only one level leaves
+                // Forall(X, Arrow(sp, Forall(Y, …))) behind, which is NOT
+                // the canonical form of ∀X.∀Y.(sp ⇒ …) — breaking the
                 // βη-invariance of Lemma 4.1 (A ≅_βη B ⟺ t(A) = t(B)).
                 match ret_neg {
                     Neg::Forall(idx, body) => {
-                        let body = match *body {
-                            Neg::Arrow(spine2, ret2) => {
-                                spine.extend(spine2);
-                                spine.sort();
-                                Neg::Arrow(spine, ret2)
+                        let mut qs: Vec<usize> = vec![idx];
+                        let mut cur: Neg = *body;
+                        loop {
+                            match cur {
+                                Neg::Forall(idx2, body2) => {
+                                    qs.push(idx2);
+                                    cur = *body2;
+                                }
+                                Neg::Arrow(spine2, ret2) => {
+                                    spine.extend(spine2);
+                                    spine.sort();
+                                    cur = Neg::Arrow(spine, ret2);
+                                    break;
+                                }
+                                other => {
+                                    cur = Neg::Arrow(spine, Box::new(other));
+                                    break;
+                                }
                             }
-                            other => Neg::Arrow(spine, Box::new(other)),
-                        };
-                        (Neg::Forall(idx, Box::new(body)), set)
+                        }
+                        let mut res = cur;
+                        for i in qs.into_iter().rev() {
+                            res = Neg::Forall(i, Box::new(res));
+                        }
+                        (res, set)
                     }
                     other => (Neg::Arrow(spine, Box::new(other)), set),
                 }
@@ -289,7 +321,7 @@ impl<'input> TypeContext<'input> {
         self.to_pos_fv(ty).0
     }
 
-    /// P3c: `to_pos` with the INCREMENTAL FV pass (see `to_neg_fv`): one
+    /// `to_pos` with the INCREMENTAL FV pass (see `to_neg_fv`): one
     /// structural pass yields both the canonical tree and its free-
     /// variable set; the μ-binder test is an O(1) `contains` on the
     /// child's returned set instead of a `inner.fvs()` rescan.
@@ -298,8 +330,7 @@ impl<'input> TypeContext<'input> {
         let data = self.get_arc(resolved);
         match &*data {
             TypeData::GenericParam { index, .. } => {
-                let mut s: std::collections::HashSet<usize> =
-                    std::collections::HashSet::new();
+                let mut s: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 s.insert(*index);
                 (Pos::Var(*index), s)
             }
@@ -308,8 +339,7 @@ impl<'input> TypeContext<'input> {
                 // Product: flatten nested tuples, sort (commutativity Fig. 4b),
                 // drop unit factors (A×1 ≡ A).
                 let mut flat: Vec<Pos> = Vec::new();
-                let mut set: std::collections::HashSet<usize> =
-                    std::collections::HashSet::new();
+                let mut set: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 for &e in elems {
                     let (p, sv) = self.to_pos_fv(e);
                     set.extend(sv);
@@ -343,8 +373,7 @@ impl<'input> TypeContext<'input> {
             _ => {
                 // Opaque positive atom: primitives, ADTs, Coproduct, Never,
                 // InferVar, …  Recurse into children as canonical args.
-                let mut set: std::collections::HashSet<usize> =
-                    std::collections::HashSet::new();
+                let mut set: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 let args: Vec<Pos> = {
                     let mut acc = Vec::new();
                     visit_type_children(ty, self, &mut |c| {
@@ -468,7 +497,7 @@ impl<'input> TypeContext<'input> {
     /// §3): two types are equivalent iff their α-normalized canonical forms
     /// are equal.
     ///
-    /// The comparison is **α-invariant** (B4): binder indices are renamed to
+    /// The comparison is **α-invariant**: binder indices are renamed to
     /// de Bruijn levels before comparing, so two α-equivalent types with
     /// different `param_index` allocations (the same shape built at different
     /// times, or from different items) compare equal.  Free variables keep
@@ -594,7 +623,7 @@ mod tests {
 
     #[test]
     fn neg_beta_eta_equiv_alpha_invariant() {
-        // B4: two α-equivalent types with DIFFERENT binder indices must
+        // Two α-equivalent types with DIFFERENT binder indices must
         // compare equal: ∀X_0.X_0→X_0 ≅ ∀Y_5.Y_5→Y_5.
         let mut ctx = TypeContext::new();
         let x0 = ctx.generic_param(0, "X".into());
@@ -603,7 +632,10 @@ mod tests {
         let y5 = ctx.generic_param(5, "Y".into());
         let b_body = ctx.function(smallvec![y5], y5);
         let b = ctx.forall(5, "Y".into(), b_body);
-        assert!(ctx.neg_beta_eta_equiv(a, b), "α-equivalent types must be equal");
+        assert!(
+            ctx.neg_beta_eta_equiv(a, b),
+            "α-equivalent types must be equal"
+        );
         // A genuinely different type must not be equal: ∀X.X→X ≠ ∀X.X→1.
         let x0b = ctx.generic_param(0, "X".into());
         let u = ctx.unit();
@@ -636,15 +668,54 @@ mod tests {
         let n2 = ctx.to_neg(expected);
         assert_eq!(n1, n2);
         match &n1 {
-            Neg::Forall(_, body) => {
-                match body.as_ref() {
-                    Neg::Arrow(spine, _) => {
-                        assert_eq!(spine.len(), 2, "spine must be flat: [Int, Bool]");
-                    }
-                    other => panic!("expected flat Arrow under Forall, got {other:?}"),
+            Neg::Forall(_, body) => match body.as_ref() {
+                Neg::Arrow(spine, _) => {
+                    assert_eq!(spine.len(), 2, "spine must be flat: [Int, Bool]");
                 }
-            }
+                other => panic!("expected flat Arrow under Forall, got {other:?}"),
+            },
             other => panic!("expected Forall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn canonical_hoist_nested_quantifiers() {
+        // A⇒∀X.∀Y.B ≡ ∀X.∀Y.(A⇒B) — the nested-∀ chain must be hoisted in
+        // full (Lemma 4.1: βη-equal writings share one canonical form).
+        let mut ctx = TypeContext::new();
+        let a = ctx.int(32, true);
+        let x = ctx.generic_param(0, "X".into());
+        let y = ctx.generic_param(1, "Y".into());
+        let body = ctx.tuple(smallvec![x, y]); // B mentions both ⇒ neither ∀ is vacuous
+        let inner_all = ctx.forall(1, "Y".into(), body);
+        let forall_x = ctx.forall(0, "X".into(), inner_all);
+        let lifted = ctx.function(smallvec![a], forall_x);
+        let inner_fn = ctx.function(smallvec![a], body);
+        let inner_exp = ctx.forall(1, "Y".into(), inner_fn);
+        let expected = ctx.forall(0, "X".into(), inner_exp);
+        assert!(ctx.neg_beta_eta_equiv(lifted, expected));
+    }
+
+    #[test]
+    fn neg_beta_eta_equiv_alpha_invariant_permuted_allocation() {
+        // ∀X.∀Y.(Y⇒X⇒Unit) written with binder indices allocated in OPPOSITE
+        // relative order: the raw-index pre-sort orders the spines differently;
+        // only a post-α re-sort repairs it.
+        let mut ctx = TypeContext::new();
+        let u = ctx.unit();
+        let x0 = ctx.generic_param(0, "X".into());
+        let y1 = ctx.generic_param(1, "Y".into());
+        let a_body = ctx.function(smallvec![y1, x0], u);
+        let a_inner = ctx.forall(1, "Y".into(), a_body);
+        let a = ctx.forall(0, "X".into(), a_inner);
+        let x7 = ctx.generic_param(7, "X".into());
+        let y3 = ctx.generic_param(3, "Y".into());
+        let b_body = ctx.function(smallvec![y3, x7], u);
+        let b_inner = ctx.forall(3, "Y".into(), b_body);
+        let b = ctx.forall(7, "X".into(), b_inner);
+        assert!(
+            ctx.neg_beta_eta_equiv(a, b),
+            "α-equivalent writings must compare equal"
+        );
     }
 }

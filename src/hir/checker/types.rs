@@ -29,14 +29,15 @@ pub enum TypingContext {
 }
 
 /// Convert a `TypingContext` to a `TypeCtx` for use in `TypeMismatch` diagnostics.
-pub fn typing_context_to_type_ctx(ctx: &TypingContext) -> TypeCtx {
+///
+/// `None` means "no specific context" — the same state the `Option<TypeCtx>`
+/// field already carries, so there is no separate `Unspecified` variant.
+pub fn typing_context_to_type_ctx(ctx: &TypingContext) -> Option<TypeCtx> {
     match ctx {
-        TypingContext::None => TypeCtx::Unspecified,
-        TypingContext::Argument { .. } => TypeCtx::FunctionArg,
-        TypingContext::ClosureBody => TypeCtx::Inference,
-        TypingContext::Condition => TypeCtx::Unspecified,
-        TypingContext::StructFieldInit => TypeCtx::Field,
-        TypingContext::ReturnValue => TypeCtx::ReturnType,
-        TypingContext::Index => TypeCtx::Unspecified,
+        TypingContext::None | TypingContext::Condition | TypingContext::Index => None,
+        TypingContext::Argument { .. } => Some(TypeCtx::FunctionArg),
+        TypingContext::ClosureBody => Some(TypeCtx::Inference),
+        TypingContext::StructFieldInit => Some(TypeCtx::Field),
+        TypingContext::ReturnValue => Some(TypeCtx::ReturnType),
     }
 }

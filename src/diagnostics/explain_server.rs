@@ -4,6 +4,8 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use crate::diagnostics::error_code::ErrCode;
+use crate::smallvec::SmallVec;
+use compact_str::CompactString;
 
 /// Serve the explanation for `code` on an already-bound `listener`.
 /// The listener must have been bound to `127.0.0.1:<port>` by the caller
@@ -74,7 +76,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
     // non-blocking accept is cheap insurance: drain the request if a
     // connection is already pending, otherwise skip immediately.
     if let Ok((mut extra, _)) = listener.accept() {
-        let _ = drain_request(&mut extra);
+        drain_request(&mut extra, &[]);
         let _ = extra.shutdown(Shutdown::Both);
     }
 
@@ -94,7 +96,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
 /// carried into the comparison with the next chunk — a per-chunk
 /// `windows(4)` scan alone misses the split and stalls a normal browser
 /// request until the timeout.
-fn drain_request(stream: &mut TcpStream) {
+fn drain_request(stream: &mut TcpStream, prefix: &[u8]) {
     const DRAIN_BUDGET: Duration = Duration::from_secs(1);
     let deadline = Instant::now() + DRAIN_BUDGET;
     let mut buf = [0u8; 4096];
@@ -105,6 +107,21 @@ fn drain_request(stream: &mut TcpStream) {
     // is enough to complete a split terminator).
     let mut carry = [0u8; 3];
     let mut carry_len = 0usize;
+
+    // Bytes the request-line reader already pulled past the `\n` may already
+    // contain the `\r\n\r\n` terminator (or a split piece of it), so check
+    // them before touching the stream.  Only the trailing 3 bytes can
+    // participate in a split terminator, so carry those into the loop —
+    // matching the inter-read carry below.
+    if !prefix.is_empty() {
+        if prefix.windows(4).any(|w| w == b"\r\n\r\n") {
+            return;
+        }
+        let take = prefix.len().min(3);
+        carry[..take].copy_from_slice(&prefix[prefix.len() - take..]);
+        carry_len = take;
+    }
+
     loop {
         if Instant::now() >= deadline {
             break;
@@ -151,7 +168,7 @@ fn serve_page(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
     //    `drain_request` bounds the drain by *wall-clock* time, not an
     //    iteration count: a byte-at-a-time client could otherwise keep
     //    `read` returning `Ok(1)` and hold the CLI for ~50 s.
-    drain_request(stream);
+    drain_request(stream, &[]);
 
     // 2) Respond.  Header and body are written as two chunks so the full
     //    HTML body is not copied into a combined `response` buffer.
@@ -215,15 +232,39 @@ fn build_explain_page(ec: &ErrCode) -> String {
     let url_owned = ec.url();
     let url = escape_html(&url_owned);
 
-    // `Cow` values are used directly in `format!` — they borrow the input
-    // on the clean fast path, so no intermediate `String` is allocated when
-    // the fields contain no HTML-special characters.
-    //
-    // The colour values come from the shared `Stylesheet` (dark theme) so
-    // the explain page stays in sync with the HTML renderer's palette; the
-    // `:root` / `body.light` variable blocks are emitted first, then every
-    // rule below references the variables instead of hard-coding hex.
-    let css_vars = crate::diagnostics::emitter::stylesheet::Stylesheet::dark().to_html_css();
+    // Curated or category-sibling related codes for a "see also"
+    // section — the same source of truth used by the terminal renderer.
+    let explicit = crate::diagnostics::error_code::related_codes_of(ec.code());
+    let related: SmallVec<[&'static str; 4]> = if explicit.is_empty() {
+        crate::diagnostics::error_code::category_siblings_of(ec.code(), 4)
+    } else {
+        SmallVec::from_slice(explicit)
+    };
+    let see_also = if related.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from("<div class=\"see-also\"><h3>See also</h3><ul>\n");
+        for rel in &related {
+            let title = crate::diagnostics::error_code::lookup(rel)
+                .map(|e| e.title)
+                .unwrap_or("(unknown)");
+            let _ = std::fmt::Write::write_fmt(
+                &mut s,
+                format_args!(
+                    "<li><a href=\"/{code}\"><span class=\"code\">{code}</span></a> — {title}</li>\n",
+                    code = escape_html(rel),
+                    title = escape_html(title),
+                ),
+            );
+        }
+        s.push_str("</ul></div>\n");
+        s
+    };
+
+    // Dark theme is the `:root` default; `body.light` overrides it.  The
+    // toggle below flips the class and persists the choice in localStorage,
+    // matching `HtmlRenderer`'s theme toggle.
+    let css_vars = crate::diagnostics::emitter::stylesheet::dark_css_cached();
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -233,6 +274,8 @@ fn build_explain_page(ec: &ErrCode) -> String {
 <style>
 {css_vars}
   body {{ font-family: 'DejaVu Sans Mono', 'Consolas', monospace; background: var(--bg); color: var(--fg); padding: 40px; max-width: 800px; margin: auto; }}
+  #theme-toggle {{ position: fixed; top: 16px; right: 16px; background: var(--bg); color: var(--fg); border: 1px solid var(--fg); border-radius: 6px; padding: 6px 14px; cursor: pointer; font-family: inherit; font-size: 0.85em; }}
+  #theme-toggle:hover {{ opacity: 0.8; }}
   h1 {{ color: var(--error-border); }}
   .code {{ color: var(--accent); font-weight: bold; font-size: 1.2em; }}
   .title {{ color: var(--fg); font-size: 1.1em; }}
@@ -240,17 +283,303 @@ fn build_explain_page(ec: &ErrCode) -> String {
   .explain {{ background: var(--diag-bg); padding: 20px; border-radius: 8px; line-height: 1.6; white-space: pre-wrap; color: var(--explain-fg); }}
   .url {{ color: var(--muted); margin-top: 20px; font-size: 0.85em; }}
   a {{ color: var(--accent); }}
+  .see-also {{ margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--fg); }}
+  .see-also h3 {{ color: var(--accent); font-size: 1em; margin: 0 0 8px 0; }}
+  .see-also ul {{ list-style: none; padding: 0; margin: 0; }}
+  .see-also li {{ margin: 4px 0; }}
+  .see-also .code {{ font-weight: bold; }}
 </style>
+<script>
+(function(){{
+  var t = localStorage.getItem('ponent-theme');
+  if (t === 'light' || (!t && matchMedia('(prefers-color-scheme: light)').matches)) {{
+    document.body.classList.add('light');
+  }}
+}})();
+</script>
 </head>
 <body>
+<button id="theme-toggle" type="button">Toggle theme</button>
 <h1>{code}</h1>
 <div class="code">{code}</div>
 <div class="title">{title}</div>
 <div class="category">{category}</div>
 <div class="explain">{explain}</div>
-<div class="url"><a href="{url}">{url}</a></div>
+{see_also}<div class="url"><a href="{url}">{url}</a></div>
+<script>
+(function(){{
+  document.getElementById('theme-toggle').addEventListener('click', function(){{
+    var light = document.body.classList.toggle('light');
+    localStorage.setItem('ponent-theme', light ? 'light' : 'dark');
+  }});
+}})();
+</script>
 </body>
 </html>"#,
+    )
+}
+
+/// Serve the explain index and per-code pages until the process is
+/// killed (Ctrl+C terminates the process; no explicit signal handling is
+/// installed).
+///
+/// Unlike [`serve_explain`] (which waits for one browser connection,
+/// serves one page, and returns), this blocks forever.  Requests are
+/// dispatched by path:
+///
+/// - `GET /` → index page listing every error code, grouped by category
+/// - `GET /<code>` → that code's explanation page
+/// - anything else → a minimal 404 page
+///
+/// The HTTP handling is deliberately minimal: request line only, no
+/// keep-alive, no chunked transfer, one connection per request.
+pub fn serve_explain_persistent(listener: &TcpListener) -> std::io::Result<()> {
+    if !listener
+        .local_addr()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(false)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "explain server: listener is not bound to a loopback address",
+        ));
+    }
+    for incoming in listener.incoming() {
+        match incoming {
+            Ok(mut stream) => {
+                // Per-connection errors must not kill the server.
+                let _ = handle_persistent_connection(&mut stream);
+            }
+            // EAGAIN/EINTR on some platforms — retry.
+            Err(_) => continue,
+        }
+    }
+    Ok(())
+}
+
+fn handle_persistent_connection(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let request_line = read_request_line(stream);
+    let (line, leftover) = match request_line {
+        Some(pair) => pair,
+        None => return Ok(()),
+    };
+    // Drain the rest of the request before responding; closing a socket
+    // with unread inbound data makes the kernel send RST instead of FIN.
+    // `leftover` is the bytes `read_request_line` already consumed past
+    // the request `\n` — hand them to `drain_request` so they are not lost
+    // (the next `read` would otherwise miss them).
+    drain_request(stream, &leftover);
+    let body = dispatch_request(&line);
+    let header = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len(),
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()?;
+    let _ = stream.shutdown(Shutdown::Write);
+    Ok(())
+}
+
+/// Read one line (up to and including the `\r\n`) from the stream, plus any
+/// bytes the same read pulled past the `\n`.
+///
+/// Returns `(line, leftover)`: `line` is the request line without the
+/// trailing CRLF, and `leftover` is everything after the `\n` that arrived
+/// in the same `read` chunk.  Those bytes belong to the request headers and
+/// must be handed to [`drain_request`] as its `prefix` — otherwise the next
+/// `read` would skip them and the drain could miss the `\r\n\r\n` terminator.
+///
+/// Reads in 512-byte chunks (one `read` syscall per chunk) instead of one
+/// byte at a time, so a typical ~20–80 byte request line is one syscall.
+/// `line` is a `SmallVec<[u8; 512]>` so it stays on the stack for the common
+/// request-line length, and `leftover` is bounded by the chunk size so its
+/// `SmallVec<[u8; 512]>` is inline too.  The returned `CompactString` is
+/// built from the validated `&str`, so a short request line also inlines
+/// (≤24 bytes) and the common path makes zero heap allocations.
+fn read_request_line(stream: &mut TcpStream) -> Option<(CompactString, SmallVec<[u8; 512]>)> {
+    let mut line: SmallVec<[u8; 512]> = SmallVec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        let n = match stream.read(&mut buf) {
+            Ok(0) => return None,
+            Ok(n) => n,
+            Err(_) => return None,
+        };
+        let chunk = &buf[..n];
+        match memchr::memchr(b'\n', chunk) {
+            Some(nl) => {
+                if line.len() + nl > 8192 {
+                    return None;
+                }
+                line.extend_from_slice(&chunk[..nl]);
+                if line.ends_with(b"\r") {
+                    line.pop();
+                }
+                let mut leftover: SmallVec<[u8; 512]> = SmallVec::new();
+                leftover.extend_from_slice(&chunk[nl + 1..]);
+                let line = std::str::from_utf8(&line[..]).ok()?.into();
+                return Some((line, leftover));
+            }
+            None => {
+                if line.len() + n > 8192 {
+                    return None;
+                }
+                line.extend_from_slice(chunk);
+            }
+        }
+    }
+}
+
+/// Serve a cached explain page for `ec`.
+///
+/// `build_explain_page` is a pure function of the static error-code tables,
+/// so each code's page is built at most once and reused for the lifetime of
+/// the persistent server.  The first request for a code pays one build
+/// (escaping + sibling lookup + `format!`); every later request is an
+/// `Arc<str>` refcount bump instead of a full `String` clone.  The read
+/// guard is dropped before building so two concurrent requests for different
+/// codes do not serialize their builds.
+fn explain_page_cached(ec: &ErrCode) -> std::sync::Arc<str> {
+    static PAGES: std::sync::OnceLock<
+        std::sync::Mutex<rustc_hash::FxHashMap<CompactString, std::sync::Arc<str>>>,
+    > = std::sync::OnceLock::new();
+    let pages = PAGES.get_or_init(|| std::sync::Mutex::new(rustc_hash::FxHashMap::default()));
+    let key = CompactString::from(ec.code());
+    {
+        let guard = pages.lock().unwrap();
+        if let Some(page) = guard.get(&key) {
+            return std::sync::Arc::clone(page);
+        }
+    }
+    let page: std::sync::Arc<str> = std::sync::Arc::from(build_explain_page(ec));
+    pages
+        .lock()
+        .unwrap()
+        .insert(key, std::sync::Arc::clone(&page));
+    page
+}
+
+fn dispatch_request(request_line: &str) -> std::sync::Arc<str> {
+    // `GET /E030 HTTP/1.1` → path `/E030`
+    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+    // Strip query string.
+    let path = path.split('?').next().unwrap_or("/");
+    let decoded = percent_decode(path);
+    if decoded == "/" || decoded.is_empty() {
+        return build_index_page();
+    }
+    let code = decoded.trim_start_matches('/');
+    match ErrCode::try_new(code) {
+        Ok(ec) => explain_page_cached(&ec),
+        Err(_) => std::sync::Arc::from(build_not_found_page(code)),
+    }
+}
+
+/// Percent-decode `%XX` sequences.  Browsers occasionally send encoded
+/// paths; without decoding, `/E030%0A` would miss the registry lookup.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+            && let Ok(b) = u8::from_str_radix(hex, 16)
+        {
+            out.push(b);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    // HTTP paths are almost always ASCII after `%XX` decoding, so the common
+    // case takes `String::from_utf8`'s zero-allocation `Ok` path; the lossy
+    // fallback runs only on genuinely malformed UTF-8.
+    match String::from_utf8(out) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
+}
+
+fn build_index_page() -> std::sync::Arc<str> {
+    // The index is a pure function of the static CODE_TABLE, so build it
+    // once and bump the refcount per request — cloning one ~10 KB `Arc<str>`
+    // is far cheaper than re-escaping 452 codes and re-formatting every
+    // entry on each `GET /`.
+    static INDEX: std::sync::OnceLock<std::sync::Arc<str>> = std::sync::OnceLock::new();
+    std::sync::Arc::clone(INDEX.get_or_init(|| std::sync::Arc::from(build_index_page_uncached())))
+}
+
+fn build_index_page_uncached() -> String {
+    let mut body = String::with_capacity(8 * 1024);
+    body.push_str(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ponent error codes</title>
+<style>
+body { font-family: 'DejaVu Sans Mono', 'Consolas', monospace; background: #1e1e2e; color: #cdd6f4; padding: 40px; max-width: 900px; margin: auto; }
+h1 { color: #f38ba8; }
+h2 { color: #89b4fa; margin-top: 28px; }
+ul { list-style: none; padding: 0; }
+li { margin: 4px 0; }
+a { color: #89b4fa; text-decoration: none; }
+a:hover { text-decoration: underline; }
+.code { font-weight: bold; }
+.title { color: #bac2de; }
+</style>
+</head>
+<body>
+<h1>Ponent error codes</h1>
+"#,
+    );
+    for (cat, entries) in crate::diagnostics::error_code::code_entries_by_category() {
+        body.push_str(&format!("<h2>{}</h2>\n<ul>\n", escape_html(&cat.label())));
+        for entry in entries {
+            let code = escape_html(entry.code);
+            let title = escape_html(entry.title);
+            body.push_str(&format!(
+                "<li><a href=\"/{code}\"><span class=\"code\">{code}</span></a> — \
+                 <span class=\"title\">{title}</span></li>\n",
+            ));
+        }
+        body.push_str("</ul>\n");
+    }
+    body.push_str("</body>\n</html>\n");
+    body
+}
+
+fn build_not_found_page(code: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Not found — Ponent</title>
+<style>
+body {{ font-family: monospace; background: #1e1e2e; color: #cdd6f4; padding: 40px; }}
+h1 {{ color: #f38ba8; }}
+a {{ color: #89b4fa; }}
+</style>
+</head>
+<body>
+<h1>404 — not found</h1>
+<p>No error code <code>{}</code> is registered.</p>
+<p><a href="/">Back to the index</a></p>
+</body>
+</html>"#,
+        escape_html(code),
     )
 }
 

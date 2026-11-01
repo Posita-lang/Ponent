@@ -5,7 +5,6 @@ use super::*;
 use crate::ast::IntLit;
 use crate::lexer::Token;
 use crate::symbol::Symbol;
-use logos::Logos;
 
 fn check_tokens(source: &str, expected: Vec<Token>) {
     let mut lexer = Token::lexer(source);
@@ -463,6 +462,13 @@ fn integer_literals() {
     );
 }
 
+/// A leaked scratch arena for literal-parse tests: `IntLit::Large` values
+/// are arena references now, so the tests need an arena that outlives the
+/// returned literals.  Leaking is fine — the tests run once.
+fn int_test_bump() -> &'static bumpalo::Bump {
+    Box::leak(Box::new(bumpalo::Bump::new()))
+}
+
 #[test]
 fn integer_overflow_errors() {
     // These values overflow i128.  The lexer now emits the raw slice and
@@ -476,18 +482,21 @@ fn integer_overflow_errors() {
     check_tokens_borrowed(huge_hex, |s| vec![Token::HexLiteral(s)]);
     check_tokens_borrowed(&huge_bin, |s| vec![Token::BinLiteral(s)]);
     // The parse function must still report the overflow errors.
+    let bump = int_test_bump();
     assert_eq!(
-        parse_int_literal(huge_int, 10, "integer literal overflow").unwrap_err().as_str(),
+        parse_int_literal(bump, huge_int, 10, "integer literal overflow")
+            .unwrap_err()
+            .as_str(),
         "integer literal overflow"
     );
     assert_eq!(
-        parse_int_literal(&huge_hex[2..], 16, "hex literal overflow")
+        parse_int_literal(bump, &huge_hex[2..], 16, "hex literal overflow")
             .unwrap_err()
             .as_str(),
         "hex literal overflow"
     );
     assert_eq!(
-        parse_int_literal(&huge_bin[2..], 2, "binary literal overflow")
+        parse_int_literal(bump, &huge_bin[2..], 2, "binary literal overflow")
             .unwrap_err()
             .as_str(),
         "binary literal overflow"
@@ -509,7 +518,12 @@ fn integer_overflow_errors() {
 fn parse_int_literal_matches_checked_reference() {
     // Ungated per-digit checked u128 accumulation; the error ordering
     // (invalid digit before overflow) matches the slow path.
-    fn checked_reference(s: &str, radix: u32, overflow_msg: &str) -> Result<IntLit, LitError> {
+    fn checked_reference(
+        bump: &'static bumpalo::Bump,
+        s: &str,
+        radix: u32,
+        overflow_msg: &str,
+    ) -> Result<IntLit<'static>, LitError> {
         let overflow_err = LitError::from(overflow_msg);
         let mut acc: u128 = 0;
         for c in s.chars() {
@@ -524,7 +538,7 @@ fn parse_int_literal_matches_checked_reference() {
                 .and_then(|v| v.checked_add(d))
                 .ok_or(overflow_err)?;
         }
-        Ok(IntLit::normalize(num_bigint::BigInt::from(acc)))
+        Ok(IntLit::normalize(bump, num_bigint::BigInt::from(acc)))
     }
     fn xorshift(state: &mut u64) -> u64 {
         let mut x = *state;
@@ -570,8 +584,9 @@ fn parse_int_literal_matches_checked_reference() {
     cases.push(("9_".repeat(19), 10)); // 38 bytes / 19 digits
 
     for (s, radix) in &cases {
-        let expected = checked_reference(s, *radix, "overflow under test");
-        let got = parse_int_literal(s, *radix, "overflow under test");
+        let bump = int_test_bump();
+        let expected = checked_reference(bump, s, *radix, "overflow under test");
+        let got = parse_int_literal(bump, s, *radix, "overflow under test");
         assert_eq!(expected, got, "radix {radix}, input {s:?}");
     }
 }
@@ -585,7 +600,11 @@ fn parse_int_literal_matches_checked_reference() {
 /// parse of the `[0-9]+` run.
 #[test]
 fn parse_suffixed_int_literal_matches_reference() {
-    fn reference(s: &str, radix: u32) -> Option<(IntLit, u32)> {
+    fn reference(
+        bump: &'static bumpalo::Bump,
+        s: &str,
+        radix: u32,
+    ) -> Option<(IntLit<'static>, u32)> {
         let body = match radix {
             16 | 2 => s.get(2..)?,
             _ => s,
@@ -605,7 +624,10 @@ fn parse_suffixed_int_literal_matches_reference() {
         // WIDTH — a plain u32 parse of the `[0-9]+` run, failing closed
         // on empty/overflow.
         let width: u32 = body[marker + 1..].parse().ok()?;
-        Some((IntLit::normalize(num_bigint::BigInt::from(acc)), width))
+        Some((
+            IntLit::normalize(bump, num_bigint::BigInt::from(acc)),
+            width,
+        ))
     }
     fn xorshift(state: &mut u64) -> u64 {
         let mut x = *state;
@@ -617,51 +639,52 @@ fn parse_suffixed_int_literal_matches_reference() {
     }
 
     // Pinned values for the tokens the lexer suite already exercises.
+    let bump = int_test_bump();
     assert_eq!(
-        parse_suffixed_int_literal("42i32", 10),
+        parse_suffixed_int_literal(bump, "42i32", 10),
         Some((IntLit::Small(42), 32))
     );
     assert_eq!(
-        parse_suffixed_int_literal("1_000u8", 10),
+        parse_suffixed_int_literal(bump, "1_000u8", 10),
         Some((IntLit::Small(1000), 8))
     );
     assert_eq!(
-        parse_suffixed_int_literal("0xFFu8", 16),
+        parse_suffixed_int_literal(bump, "0xFFu8", 16),
         Some((IntLit::Small(255), 8))
     );
     assert_eq!(
-        parse_suffixed_int_literal("0b1010u8", 2),
+        parse_suffixed_int_literal(bump, "0b1010u8", 2),
         Some((IntLit::Small(10), 8))
     );
     // An out-of-range width is NOT a lexer failure: the scanner returns
     // it and the resolver rejects `Int<999>` / `Int<0>` with a proper
     // diagnostic (parity with the hand-written `42: Int<999>`).
     assert_eq!(
-        parse_suffixed_int_literal("42i999", 10),
+        parse_suffixed_int_literal(bump, "42i999", 10),
         Some((IntLit::Small(42), 999))
     );
     assert_eq!(
-        parse_suffixed_int_literal("42i0", 10),
+        parse_suffixed_int_literal(bump, "42i0", 10),
         Some((IntLit::Small(42), 0))
     );
     // The `UInt<128>` top half is representable (Large), matching the
     // unsuffixed scanner — `…u128` is sugar for `…: UInt<128>`.
     assert_eq!(
-        parse_suffixed_int_literal("340282366920938463463374607431768211455u128", 10),
+        parse_suffixed_int_literal(bump, "340282366920938463463374607431768211455u128", 10),
         Some((
-            IntLit::Large(Box::new(num_bigint::BigInt::from(u128::MAX))),
+            IntLit::Large(Box::leak(Box::new(num_bigint::BigInt::from(u128::MAX)))),
             128
         ))
     );
     // A width that cannot be represented at all fails closed...
     assert_eq!(
-        parse_suffixed_int_literal("42i99999999999999999999", 10),
+        parse_suffixed_int_literal(bump, "42i99999999999999999999", 10),
         None
     );
     // ...as do malformed shapes the regexes cannot produce: no `i`/`u`
     // marker, and an empty width run.
-    assert_eq!(parse_suffixed_int_literal("42", 10), None);
-    assert_eq!(parse_suffixed_int_literal("42i", 10), None);
+    assert_eq!(parse_suffixed_int_literal(bump, "42", 10), None);
+    assert_eq!(parse_suffixed_int_literal(bump, "42i", 10), None);
 
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     let mut cases: Vec<(String, u32)> = Vec::new();
@@ -693,7 +716,11 @@ fn parse_suffixed_int_literal_matches_reference() {
             for _ in 0..rest {
                 s.push(alphabet[(xorshift(&mut state) as usize) % alphabet.len()] as char);
             }
-            s.push(if xorshift(&mut state) % 2 == 0 { 'i' } else { 'u' });
+            s.push(if xorshift(&mut state) % 2 == 0 {
+                'i'
+            } else {
+                'u'
+            });
             // `[0-9]+` width — never empty, never underscored.
             let wlen = (xorshift(&mut state) % 6 + 1) as usize;
             for _ in 0..wlen {
@@ -733,8 +760,9 @@ fn parse_suffixed_int_literal_matches_reference() {
     ]);
 
     for (s, radix) in &cases {
-        let expected = reference(s, *radix);
-        let got = parse_suffixed_int_literal(s, *radix);
+        let bump = int_test_bump();
+        let expected = reference(bump, s, *radix);
+        let got = parse_suffixed_int_literal(bump, s, *radix);
         assert_eq!(expected, got, "radix {radix}, input {s:?}");
     }
 }
@@ -894,6 +922,160 @@ fn block_comment_skip() {
     );
 }
 
+/// logos longest-match: `///[^\n]*` and `//[^\n]*` both match `////x` to
+/// end-of-line; the `///` (DocComment) variant wins (defined after
+/// `WhitespaceOrComment`).  Pin this so the hand-rolled lexer reproduces
+/// it — the tie-break is on definition order, not regex length.
+#[test]
+fn doc_comment_beats_line_comment_on_equal_length() {
+    check_tokens("////x", vec![Token::DocComment("/x")]);
+    check_tokens("/////x", vec![Token::DocComment("//x")]);
+    check_tokens("///x", vec![Token::DocComment("x")]);
+    check_tokens("//x", vec![]);
+    check_tokens("//!x", vec![Token::ModuleDocComment("x")]);
+}
+
+/// Differential oracle: the hand-rolled lexer must produce a byte-identical
+/// `(Token, Span)` stream to the live `logos` `Token::lexer` on a corpus
+/// covering every token class and the P0/P1 edge cases.  This is the gate
+/// that lets us swap `#[derive(Logos)]` for `handrolled::Lexer` without
+/// re-trusting 1800 lines of lexer tests one by one.
+#[test]
+fn differential_lexer_matches_logos() {
+    use super::handrolled;
+    let corpus: &[&str] = &[
+        "x",
+        "hello world",
+        "def set type const",
+        "if else for in while loop",
+        "ro codomain",
+        "Self no_default ieee_contracts scope_cleanup apply_lemma",
+        "defx defxy",
+        "returnx move",
+        "by io mut pub let",
+        "  \t\n  x",
+        "a\u{0B}b",
+        "  \x0C  ",
+        "\r\n\t ",
+        "// line\nx",
+        "/// doc\nx",
+        "//! moddoc\nx",
+        "/* block */x",
+        "/* nested /* inner */ end */x",
+        "////x",
+        "/////x",
+        "//",
+        "///",
+        "//!",
+        "/**/",
+        "/* * */",
+        "/* / */",
+        "/* unterminated",
+        "\u{FEFF}x",
+        "a\u{FEFF}b",
+        "0",
+        "42",
+        "1_000",
+        "0xFF",
+        "0b101",
+        "0x_1",
+        "0b12",
+        "0x",
+        "0b",
+        "0X",
+        "0B",
+        "3.14",
+        "1e10",
+        "1.5e-3",
+        "1E+10",
+        "42i32",
+        "1_000u64",
+        "0xFFu8",
+        "0b101i8",
+        "0xDEADBEEFi64",
+        "0b1111_0000_0101u16",
+        "999999999999999999999999999",
+        "0.0",
+        "1.0e0",
+        "0.0e0",
+        "'a'",
+        "'\\n'",
+        "'\\x41'",
+        "'\\x41A'",
+        "'\\u{41}'",
+        "'\\u{41'",
+        "'\\u{}'",
+        "'\\q'",
+        "'ab'",
+        "'len",
+        "'\\'",
+        "x'len",
+        "'\\u{1F600}'",
+        "b'a'",
+        "b'\\n'",
+        "b'\\'",
+        "b''",
+        "b'xx'",
+        "b'",
+        "b'\\\n'",
+        "\"abc\"",
+        "\"a\\nb\"",
+        "\"\"",
+        "\"unterminated",
+        "\"\\u{1F600}\"",
+        "b\"abc\"",
+        "b\"\"",
+        "b\"unterminated",
+        "+ - * / % & | ^ ~",
+        "<< <<= >> >>= < <= > >= = == != ! ?",
+        ". .. ..= ... : :: ; , ( ) { } [ ] @ -> =>",
+        "+% +? +! -% -? -! *% *? *! /=",
+        "` hello",
+        "$",
+        "def main() -> Result<(), AppError> { }",
+        "type Age = exists n: UInt<8> invariant n >= 18;",
+        "x = 0xFF; y = 0b101; z = -1.5e-3;",
+        "T::default() T::move() T::type",
+    ];
+    'outer: for &src in corpus {
+        let mut logos_lex = Token::lexer(src);
+        let mut hand_lex = handrolled::Lexer::new(src);
+        loop {
+            let l = logos_lex.next();
+            let h = hand_lex.next();
+            match (l, h) {
+                (None, None) => continue 'outer,
+                (Some(Ok(lt)), Some(Ok(ht))) => {
+                    assert_eq!(
+                        lt, ht,
+                        "token mismatch in {:?}: logos {:?} vs hand {:?}",
+                        src, lt, ht
+                    );
+                    assert_eq!(
+                        logos_lex.span(),
+                        hand_lex.span(),
+                        "span mismatch after {:?} in {:?}",
+                        lt,
+                        src
+                    );
+                }
+                (Some(Err(())), Some(Err(()))) => {
+                    assert_eq!(
+                        logos_lex.span(),
+                        hand_lex.span(),
+                        "error span mismatch in {:?}",
+                        src
+                    );
+                }
+                (lo, ha) => panic!(
+                    "stream mismatch in {:?}: logos {:?} vs hand {:?}",
+                    src, lo, ha
+                ),
+            }
+        }
+    }
+}
+
 #[test]
 fn invalid_char_error() {
     let source = "` hello";
@@ -1018,10 +1200,7 @@ fn test_unicode_escape_handling() {
     assert_eq!(parse_char_literal(r"'\u{7F}'").unwrap(), 0x7F);
     assert_eq!(parse_char_literal(r"'\u{80}'").unwrap(), 0x80);
     assert!(parse_char_literal(r"'\u{41").is_err());
-    check_tokens(
-        r#""\u{41}BC""#,
-        vec![Token::StringLiteral(r#""\u{41}BC""#)],
-    );
+    check_tokens(r#""\u{41}BC""#, vec![Token::StringLiteral(r#""\u{41}BC""#)]);
     let src = r#""\u{41""#;
     check_tokens_borrowed(src, |s| vec![Token::StringLiteral(s)]);
     // The error now surfaces at consumption time through the parse fn.
@@ -1042,7 +1221,8 @@ fn numeric_literal_safety_does_not_panic_on_overflow() {
         .collect();
     assert_eq!(tokens, vec![Token::IntLiteral(huge_int)]);
     // Consumption must still surface the overflow error.
-    let err = parse_int_literal(huge_int, 10, "integer literal overflow").unwrap_err();
+    let bump = int_test_bump();
+    let err = parse_int_literal(bump, huge_int, 10, "integer literal overflow").unwrap_err();
     assert_eq!(err.as_str(), "integer literal overflow");
 
     let huge_hex = "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
@@ -1051,7 +1231,7 @@ fn numeric_literal_safety_does_not_panic_on_overflow() {
         .filter(|t| *t != Token::WhitespaceOrComment)
         .collect();
     assert_eq!(tokens, vec![Token::HexLiteral(huge_hex)]);
-    let err = parse_int_literal(&huge_hex[2..], 16, "hex literal overflow").unwrap_err();
+    let err = parse_int_literal(bump, &huge_hex[2..], 16, "hex literal overflow").unwrap_err();
     assert_eq!(err.as_str(), "hex literal overflow");
 
     let huge_float = "1e9999";
@@ -1376,19 +1556,10 @@ fn all_overflow_operators() {
 
 #[test]
 fn float_special_values_are_rejected() {
-    check_tokens(
-        "1e9999",
-        vec![Token::FloatLiteral("1e9999")],
-    );
+    check_tokens("1e9999", vec![Token::FloatLiteral("1e9999")]);
     let err = parse_float_literal("1e9999").unwrap_err();
     assert_eq!(err.as_str(), "float literal overflow");
-    check_tokens(
-        "-1e9999",
-        vec![
-            Token::Minus,
-            Token::FloatLiteral("1e9999"),
-        ],
-    );
+    check_tokens("-1e9999", vec![Token::Minus, Token::FloatLiteral("1e9999")]);
 }
 
 #[test]
@@ -1438,18 +1609,15 @@ fn apostrophe_in_attribute_access() {
 #[test]
 fn apostrophe_not_confusing_with_char_literal() {
     let source = "'a' x'len";
-    check_tokens_borrowed(
-        source,
-        |s| {
-            let char_slice = s.split_whitespace().next().unwrap();
-            vec![
-                Token::CharLiteral(char_slice),
-                Token::Ident(Symbol::intern("x")),
-                Token::Apostrophe,
-                Token::Ident(Symbol::intern("len")),
-            ]
-        },
-    );
+    check_tokens_borrowed(source, |s| {
+        let char_slice = s.split_whitespace().next().unwrap();
+        vec![
+            Token::CharLiteral(char_slice),
+            Token::Ident(Symbol::intern("x")),
+            Token::Apostrophe,
+            Token::Ident(Symbol::intern("len")),
+        ]
+    });
 }
 
 #[test]
@@ -1738,10 +1906,7 @@ fn token_class_table() {
         (Token::False, TC::EXPR_START),
         (Token::CharLiteral("'a'"), TC::EXPR_START),
         (Token::StringLiteral(r#""s""#), TC::EXPR_START),
-        (
-            Token::ByteStringLiteral(r#"b"b""#),
-            TC::EXPR_START,
-        ),
+        (Token::ByteStringLiteral(r#"b"b""#), TC::EXPR_START),
         (Token::LParen, TC::EXPR_START),
         (Token::LBracket, TC::EXPR_START),
         (Token::Bang, TC::EXPR_START),
@@ -1864,14 +2029,10 @@ fn lax_numeric_lexes_are_pinned() {
     // A leading underscore is not a hex digit either: `0x_1` → same split.
     check_tokens(
         "0x_1",
-        vec![
-            Token::IntLiteral("0"),
-            Token::Ident(Symbol::intern("x_1")),
-        ],
+        vec![Token::IntLiteral("0"), Token::Ident(Symbol::intern("x_1"))],
     );
     // The suffix width is NOT validated by the lexer — `i999` matches the
     // IntSuffix regex; the parser desugars it to `Int<999>` and the
     // checker rejects the width there.
     check_tokens("42i999", vec![Token::IntSuffix("42i999")]);
 }
-

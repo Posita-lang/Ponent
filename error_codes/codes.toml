@@ -1,0 +1,457 @@
+# Error-code registry — consumed by build.rs, which validates it and
+# generates OUT_DIR/error_codes_gen.rs (the CODE_TABLE const).
+# Fields: title (short display title), category (parse|resolution|type|
+# contract|trait|inference|internal|generic), explain (path to the
+# Markdown explanation, relative to this file, build-time include_str!).
+
+schema = 1
+
+[codes.E001]
+title = "expected token"
+category = "parse"
+explain = "E001.md"
+
+[codes.E002]
+title = "unexpected end of input"
+category = "parse"
+explain = "E002.md"
+
+[codes.E003]
+title = "unexpected token"
+category = "parse"
+explain = "E003.md"
+
+[codes.E004]
+title = "parse error"
+category = "parse"
+explain = "E004.md"
+
+[codes.E005]
+title = "expected identifier"
+category = "parse"
+explain = "E005.md"
+
+[codes.E006]
+title = "recursion limit exceeded"
+category = "parse"
+explain = "E006.md"
+
+[codes.E007]
+title = "expected expression"
+category = "parse"
+explain = "E007.md"
+
+[codes.E008]
+title = "return Err is not valid; use leave with"
+category = "parse"
+explain = "E008.md"
+
+[codes.E009]
+title = "invalid character literal"
+category = "parse"
+explain = "E009.md"
+
+[codes.E010]
+title = "no such field"
+category = "resolution"
+explain = "E010.md"
+
+[codes.E011]
+title = "type not found"
+category = "resolution"
+explain = "E011.md"
+
+[codes.E012]
+title = "name not found"
+category = "resolution"
+explain = "E012.md"
+
+[codes.E013]
+title = "undefined type"
+category = "resolution"
+explain = "E013.md"
+
+[codes.E014]
+title = "generic args on non-generic"
+category = "resolution"
+explain = "E014.md"
+
+[codes.E015]
+title = "cannot resolve import"
+category = "resolution"
+explain = "E015.md"
+
+[codes.E016]
+title = "no default value"
+category = "resolution"
+explain = "E016.md"
+
+[codes.E017]
+title = "array size not constant"
+category = "resolution"
+explain = "E017.md"
+
+[codes.E018]
+title = "unexpected top-level item"
+category = "resolution"
+explain = "E018.md"
+
+[codes.E019]
+title = "duplicate definition"
+category = "resolution"
+explain = "E019.md"
+
+[codes.E020]
+title = "contract condition must be boolean"
+category = "contract"
+explain = "E020.md"
+
+[codes.E021]
+title = "ensures clause must be boolean"
+category = "contract"
+explain = "E021.md"
+
+[codes.E022]
+title = "decreases expression must be integer"
+category = "contract"
+explain = "E022.md"
+
+[codes.E023]
+title = "contract boolean at return"
+category = "contract"
+explain = "E023.md"
+
+[codes.E030]
+title = "type mismatch"
+category = "type"
+explain = "E030.md"
+
+[codes.E031]
+title = "kind mismatch"
+category = "type"
+explain = "E031.md"
+
+[codes.E032]
+title = "operator type error"
+category = "type"
+explain = "E032.md"
+
+[codes.E033]
+title = "cannot infer type"
+category = "type"
+explain = "E033.md"
+
+[codes.E034]
+title = "infinite type"
+category = "type"
+explain = "E034.md"
+
+[codes.E035]
+title = "type annotation needed"
+category = "type"
+explain = "E035.md"
+
+[codes.E036]
+title = "return type mismatch"
+category = "type"
+explain = "E036.md"
+
+[codes.E037]
+title = "argument type mismatch"
+category = "type"
+explain = "E037.md"
+
+[codes.E038]
+title = "condition must be boolean"
+category = "type"
+explain = "E038.md"
+
+[codes.E039]
+title = "index must be integer"
+category = "type"
+explain = "E039.md"
+
+[codes.E040]
+title = "trait not found"
+category = "trait"
+explain = "E040.md"
+
+[codes.E041]
+title = "trait not implemented"
+category = "trait"
+explain = "E041.md"
+
+[codes.E042]
+title = "orphan impl"
+category = "trait"
+explain = "E042.md"
+
+[codes.E043]
+title = "conflicting impl"
+category = "trait"
+explain = "E043.md"
+
+[codes.E044]
+title = "missing return statement"
+category = "inference"
+explain = "E044.md"
+
+[codes.E045]
+title = "cannot assign to immutable variable"
+category = "type"
+explain = "E045.md"
+
+[codes.E050]
+title = "inference error"
+category = "inference"
+explain = "E050.md"
+
+[codes.E051]
+title = "add type annotation"
+category = "inference"
+explain = "E051.md"
+
+[codes.E052]
+title = "interrupt must satisfy @no_alloc"
+category = "resolution"
+explain = "E052.md"
+
+[codes.E053]
+title = "interrupt must satisfy @no_panic"
+category = "resolution"
+explain = "E053.md"
+
+[codes.E054]
+title = "interrupt cannot have @alloc"
+category = "resolution"
+explain = "E054.md"
+
+[codes.E055]
+title = "interrupt cannot have @io"
+category = "resolution"
+explain = "E055.md"
+
+[codes.E060]
+title = "GADT variant constraint violation"
+category = "type"
+explain = "E060.md"
+
+[codes.E061]
+title = "unreachable code"
+category = "internal"
+explain = "E061.md"
+
+[codes.E062]
+title = "main function not found"
+category = "resolution"
+explain = "E062.md"
+
+[codes.E063]
+title = "existential variable shadows enum type parameter"
+category = "resolution"
+explain = "E063.md"
+
+[codes.E064]
+title = "GADT `when` constraint right-hand side references a same-enum type parameter"
+category = "resolution"
+explain = "E064.md"
+
+[codes.E065]
+title = "conflicting GADT `when` constraints in variant"
+category = "resolution"
+explain = "E065.md"
+
+[codes.E066]
+title = "conflicting GADT refinements in or-pattern"
+category = "resolution"
+explain = "E066.md"
+
+[codes.E067]
+title = "cannot bind type variables in a wobbly pattern annotation"
+category = "resolution"
+explain = "E067.md"
+
+[codes.E070]
+title = "unknown edition"
+category = "resolution"
+explain = "E070.md"
+
+[codes.E100]
+title = "trait not found in impl or bound"
+category = "trait"
+explain = "E100.md"
+
+[codes.E101]
+title = "trait impl missing method"
+category = "trait"
+explain = "E101.md"
+
+[codes.E102]
+title = "orphan impl or bare type variable"
+category = "trait"
+explain = "E102.md"
+
+[codes.E103]
+title = "trait impl wrong parameter count"
+category = "trait"
+explain = "E103.md"
+
+[codes.E104]
+title = "generic parameter constrained by function body"
+category = "resolution"
+explain = "E104.md"
+
+[codes.E105]
+title = "or-pattern alternatives must bind the same variables"
+category = "resolution"
+explain = "E105.md"
+
+[codes.E106]
+title = "or-pattern binding type mismatch"
+category = "resolution"
+explain = "E106.md"
+
+[codes.E107]
+title = "contradictory where equality"
+category = "resolution"
+explain = "E107.md"
+
+[codes.E108]
+title = "strict mode must_handle violation"
+category = "resolution"
+explain = "E108.md"
+
+[codes.E109]
+title = "read of a variable frozen by an active `&mut` borrow"
+category = "type"
+explain = "E109.md"
+
+[codes.E110]
+title = "mutation of a variable frozen by an active borrow"
+category = "type"
+explain = "E110.md"
+
+[codes.E111]
+title = "read-only borrow requires a reference operand"
+category = "type"
+explain = "E111.md"
+
+[codes.E112]
+title = "overlapping exclusive borrows"
+category = "type"
+explain = "E112.md"
+
+[codes.E113]
+title = "the function's CFG exceeds the point-encoding capacity"
+category = "internal"
+explain = "E113.md"
+
+[codes.E114]
+title = "use of moved value"
+category = "type"
+explain = "E114.md"
+
+[codes.E115]
+title = "region subset not declared in signature"
+category = "type"
+explain = "E115.md"
+
+[codes.E116]
+title = "cannot drop a value while its borrow is still live"
+category = "type"
+explain = "E116.md"
+
+[codes.E117]
+title = "side effect in a @pure function"
+category = "resolution"
+explain = "E117.md"
+
+[codes.W004]
+title = "must_handle error propagated via `?`"
+category = "generic"
+explain = "W004.md"
+
+[codes.W005]
+title = "must_handle variant not explicitly caught"
+category = "generic"
+explain = "W005.md"
+
+[codes.W006]
+title = "must_handle with wildcard-only catch"
+category = "generic"
+explain = "W006.md"
+
+[codes.W090]
+title = "use of deprecated function"
+category = "generic"
+explain = "W090.md"
+
+[codes.W091]
+title = "@cfg condition too complex for precise satisfiability checking"
+category = "generic"
+explain = "W091.md"
+
+[codes.W092]
+title = "conservative reachability treatment"
+category = "generic"
+explain = "W092.md"
+
+[codes.W113]
+title = "variable shadowing"
+category = "generic"
+explain = "W113.md"
+
+[codes.W114]
+title = "redundant &ro on immutable reference"
+category = "generic"
+explain = "W114.md"
+
+[codes.E091]
+title = "strict mode violation"
+category = "generic"
+explain = "E091.md"
+
+[codes.E080]
+title = "comptime evaluation error"
+category = "generic"
+explain = "E080.md"
+
+[codes.E081]
+title = "comptime sandbox violation"
+category = "generic"
+explain = "E081.md"
+
+[codes.E082]
+title = "comptime block accesses mutable or unknown state"
+category = "generic"
+explain = "E082.md"
+
+[codes.E090]
+title = "invalid @comptime_test function"
+category = "resolution"
+explain = "E090.md"
+
+[codes.E092]
+title = "cfg condition unreachable in strict mode"
+category = "generic"
+explain = "E092.md"
+
+[codes.E093]
+title = "isolate block accesses external mutable state"
+category = "generic"
+explain = "E093.md"
+
+[codes.E094]
+title = "use of experimental trait"
+category = "trait"
+explain = "E094.md"
+
+[codes.E099]
+title = "`@compile_error` triggered"
+category = "generic"
+explain = "E099.md"
+
+[codes.E601]
+title = "invalid safe cast"
+category = "type"
+explain = "E601.md"

@@ -1,5 +1,5 @@
-use crate::ast::FileId;
 use super::*;
+use crate::ast::FileId;
 
 impl<'input> TypeContext<'input> {
     /// Unify with a span hint: like `unify`, but records the operation
@@ -104,8 +104,8 @@ impl<'input> TypeContext<'input> {
         self.unify_seen.clear();
         self.unify_internal(a, b, Variance::Invariant, region_tree, 0)
     }
-    /// Stage 5a (Pistone & Tranchini roadmap): structural unification
-    /// fallback — canonical-form (βη) equivalence query.
+    /// Structural unification
+    /// fallback (Pistone & Tranchini roadmap) — canonical-form (βη) equivalence query.
     ///
     /// When `try_unify`/`can_unify` fails structurally, the types may still
     /// be Yoneda/βη-isomorphic (e.g. `∀X.(A⇒X)⇒B ≡ B[A/X]`).  This pure
@@ -250,7 +250,11 @@ impl<'input> TypeContext<'input> {
         if self.occurs_check(var, target) {
             return Err(TypeError::RecursiveType {
                 ty: var,
-                span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                    FileId::DUMMY,
+                    0,
+                    0,
+                )),
             });
         }
         // GADT skolem escape guard: don't bind a variable to a type
@@ -260,7 +264,11 @@ impl<'input> TypeContext<'input> {
                 var_id: usize::MAX,
                 var_level: Self::GADT_SKOLEM_UNIVERSE,
                 current_level: 0,
-                span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                    FileId::DUMMY,
+                    0,
+                    0,
+                )),
             });
         }
         // Structural bias: walk into compound types to bind nested
@@ -352,7 +360,7 @@ impl<'input> TypeContext<'input> {
                 }
             }
             // Both pointers: bias inner type.
-            (TypeData::Pointer { ty: ve }, TypeData::Pointer { ty: te }) => {
+            (TypeData::Pointer { ty: ve, .. }, TypeData::Pointer { ty: te, .. }) => {
                 if self.is_infer_var(*ve) {
                     self.bias_fresh_vars(*ve, *te)?;
                 } else {
@@ -454,8 +462,8 @@ impl<'input> TypeContext<'input> {
             TypeData::Tuple { elems } => elems.iter().any(|&e| self.contains_gadt_skolem(e)),
             TypeData::Adt { args, .. } => args.iter().any(|&a| self.contains_gadt_skolem(a)),
             TypeData::Array { elem, .. } => self.contains_gadt_skolem(*elem),
-            TypeData::Pointer { ty: inner } => self.contains_gadt_skolem(*inner),
-            TypeData::Ptr { size, pointee } => {
+            TypeData::Pointer { ty: inner, .. } => self.contains_gadt_skolem(*inner),
+            TypeData::Ptr { size, pointee, .. } => {
                 self.contains_gadt_skolem(*size) || self.contains_gadt_skolem(*pointee)
             }
             TypeData::Fn { params, ret, .. } => {
@@ -515,8 +523,10 @@ impl<'input> TypeContext<'input> {
                 .iter()
                 .any(|&a| self.type_contains_unrefined_generic_param(a)),
             TypeData::Array { elem, .. } => self.type_contains_unrefined_generic_param(*elem),
-            TypeData::Pointer { ty: inner } => self.type_contains_unrefined_generic_param(*inner),
-            TypeData::Ptr { size, pointee } => {
+            TypeData::Pointer { ty: inner, .. } => {
+                self.type_contains_unrefined_generic_param(*inner)
+            }
+            TypeData::Ptr { size, pointee, .. } => {
                 self.type_contains_unrefined_generic_param(*size)
                     || self.type_contains_unrefined_generic_param(*pointee)
             }
@@ -654,7 +664,11 @@ impl<'input> TypeContext<'input> {
                     var_id: usize::MAX,
                     var_level: *u1,
                     current_level: 0,
-                    span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                    span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                        FileId::DUMMY,
+                        0,
+                        0,
+                    )),
                 });
             }
             (
@@ -667,7 +681,11 @@ impl<'input> TypeContext<'input> {
                     var_id: usize::MAX,
                     var_level: *u2,
                     current_level: 0,
-                    span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                    span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                        FileId::DUMMY,
+                        0,
+                        0,
+                    )),
                 });
             }
             (TypeData::GenericParam { index, .. }, _) => {
@@ -677,7 +695,11 @@ impl<'input> TypeContext<'input> {
                 if self.binder_stack.contains(index) {
                     return Err(TypeError::ScopeEscape {
                         index: *index,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                            FileId::DUMMY,
+                            0,
+                            0,
+                        )),
                     });
                 }
                 // A GADT skolem must not be bound into a variable through a
@@ -689,13 +711,21 @@ impl<'input> TypeContext<'input> {
                         var_id: usize::MAX,
                         var_level: Self::GADT_SKOLEM_UNIVERSE,
                         current_level: 0,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                            FileId::DUMMY,
+                            0,
+                            0,
+                        )),
                     });
                 }
                 if self.occurs_check(a, b) {
                     return Err(TypeError::RecursiveType {
                         ty: a,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                            FileId::DUMMY,
+                            0,
+                            0,
+                        )),
                     });
                 }
                 if !self.set_binding(a, b) {
@@ -712,7 +742,11 @@ impl<'input> TypeContext<'input> {
                 if self.binder_stack.contains(index) {
                     return Err(TypeError::ScopeEscape {
                         index: *index,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                            FileId::DUMMY,
+                            0,
+                            0,
+                        )),
                     });
                 }
                 if self.contains_gadt_skolem(a) {
@@ -720,13 +754,21 @@ impl<'input> TypeContext<'input> {
                         var_id: usize::MAX,
                         var_level: Self::GADT_SKOLEM_UNIVERSE,
                         current_level: 0,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                            FileId::DUMMY,
+                            0,
+                            0,
+                        )),
                     });
                 }
                 if self.occurs_check(b, a) {
                     return Err(TypeError::RecursiveType {
                         ty: b,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                            FileId::DUMMY,
+                            0,
+                            0,
+                        )),
                     });
                 }
                 if !self.set_binding(b, a) {
@@ -765,15 +807,22 @@ impl<'input> TypeContext<'input> {
                             var_id: *id,
                             var_level,
                             current_level: cur_level,
-                            span: (*&self.current_unify_span)
-                                .unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                            span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                                FileId::DUMMY,
+                                0,
+                                0,
+                            )),
                         });
                     }
                 }
                 if self.occurs_check(a, b) {
                     return Err(TypeError::RecursiveType {
                         ty: a,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                            FileId::DUMMY,
+                            0,
+                            0,
+                        )),
                     });
                 }
                 // A GADT skolem must not be bound into an InferVar through
@@ -783,7 +832,11 @@ impl<'input> TypeContext<'input> {
                         var_id: usize::MAX,
                         var_level: Self::GADT_SKOLEM_UNIVERSE,
                         current_level: 0,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                            FileId::DUMMY,
+                            0,
+                            0,
+                        )),
                     });
                 }
                 // Per-variable universe escape check (rustc `can_define`):
@@ -799,7 +852,11 @@ impl<'input> TypeContext<'input> {
                         var_id: usize::MAX,
                         var_level: *universe,
                         current_level: 0,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                            FileId::DUMMY,
+                            0,
+                            0,
+                        )),
                     });
                 }
                 if !self.set_binding(a, b) {
@@ -828,15 +885,22 @@ impl<'input> TypeContext<'input> {
                             var_id: *id,
                             var_level,
                             current_level: cur_level,
-                            span: (*&self.current_unify_span)
-                                .unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                            span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                                FileId::DUMMY,
+                                0,
+                                0,
+                            )),
                         });
                     }
                 }
                 if self.occurs_check(b, a) {
                     return Err(TypeError::RecursiveType {
                         ty: b,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                            FileId::DUMMY,
+                            0,
+                            0,
+                        )),
                     });
                 }
                 // The FOREIGN-UNIVERSE guard (mirrors the `(InferVar, _)`
@@ -861,7 +925,11 @@ impl<'input> TypeContext<'input> {
                         var_id: usize::MAX,
                         var_level: *universe,
                         current_level: 0,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                            FileId::DUMMY,
+                            0,
+                            0,
+                        )),
                     });
                 }
                 if !self.set_binding(b, a) {
@@ -1035,8 +1103,11 @@ impl<'input> TypeContext<'input> {
                         return Err(TypeError::Mismatch {
                             expected: b,
                             found: a,
-                            span: (*&self.current_unify_span)
-                                .unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                            span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                                FileId::DUMMY,
+                                0,
+                                0,
+                            )),
                         });
                     }
                 }
@@ -1052,7 +1123,11 @@ impl<'input> TypeContext<'input> {
                     return Err(TypeError::Mismatch {
                         expected: b,
                         found: a,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                            FileId::DUMMY,
+                            0,
+                            0,
+                        )),
                     });
                 }
                 let ty_variance = variance.xform(Variance::Invariant);
@@ -1070,7 +1145,7 @@ impl<'input> TypeContext<'input> {
             // Pointer: INVARIANT (per compute_variance_edges signing it sign: 0).
             // While some languages treat raw pointers as covariant, this design
             // conservatively marks them invariant for type safety.
-            (TypeData::Pointer { ty: t1 }, TypeData::Pointer { ty: t2 }) => {
+            (TypeData::Pointer { ty: t1, .. }, TypeData::Pointer { ty: t2, .. }) => {
                 let ty_variance = variance.xform(Variance::Invariant);
                 self.unify_internal(*t1, *t2, ty_variance, region_tree, coercion_depth + 1)?;
                 if !self.set_binding(a, b) {
@@ -1088,10 +1163,12 @@ impl<'input> TypeContext<'input> {
                 TypeData::Ptr {
                     size: s1,
                     pointee: p1,
+                    ..
                 },
                 TypeData::Ptr {
                     size: s2,
                     pointee: p2,
+                    ..
                 },
             ) => {
                 self.unify_internal(
@@ -1484,7 +1561,11 @@ impl<'input> TypeContext<'input> {
                     Err(TypeError::Mismatch {
                         expected: b,
                         found: a,
-                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                        span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                            FileId::DUMMY,
+                            0,
+                            0,
+                        )),
                     })
                 }
             }
@@ -1492,7 +1573,11 @@ impl<'input> TypeContext<'input> {
             _ => Err(TypeError::Mismatch {
                 expected: b,
                 found: a,
-                span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(FileId::DUMMY, 0, 0)),
+                span: (*&self.current_unify_span).unwrap_or(crate::ast::Span::new(
+                    FileId::DUMMY,
+                    0,
+                    0,
+                )),
             }),
         }
     }
